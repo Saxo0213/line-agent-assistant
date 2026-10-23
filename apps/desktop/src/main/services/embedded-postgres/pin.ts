@@ -9,7 +9,7 @@ export const EMBEDDED_PG_PIN = Object.freeze({
 });
 
 /** Server manifest (preferred source). Empty would disable the manifest step. */
-export const EMBEDDED_PG_MANIFEST_URL = 'https://raw.githubusercontent.com/Saxo0213/linejs-manifest/main/manifest.json';
+export const EMBEDDED_PG_MANIFEST_URL = 'https://raw.githubusercontent.com/Saxo0213/line-agent-assistant/main/manifest.json';
 
 export const EMBEDDED_PG_MANIFEST_URL_PATTERN = /^https:\/\/get\.enterprisedb\.com\/postgresql\/postgresql-(18\.\d+)-\d+-windows-x64-binaries\.zip$/;
 export const EMBEDDED_PG_ADMIN_USER = 'line_agent_admin';
