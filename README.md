@@ -4,7 +4,12 @@
 
 ## Features
 
-A Windows desktop app for working with LINE conversations and locally installed Codex or Claude command-line agents. It includes conversation and attachment views, agent task controls, account monitoring, and optional local MCP access to conversation data.
+Using LINE Chrome-type client sessions, the app lets two LINE accounts serve different roles on the same Windows computer:
+
+- **Agent account:** Signs in to LINE, receives instructions from the administrator, and runs tasks through a locally installed Codex or Claude agent.
+- **Administrator account:** Supports sign-in or monitoring mode. Monitoring reads message records stored locally by LINE.
+- **Message assistant:** Shows conversations and attachments from both accounts in one place, searches message history, and lets the administrator ask the Agent to summarize conversations.
+- **Conversation assistant:** Lets the Agent participate in conversations, help download files and images, and set up automatic reply rules.
 
 ## Installation
 
