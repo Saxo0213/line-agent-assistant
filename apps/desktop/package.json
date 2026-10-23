@@ -1,0 +1,35 @@
+{
+  "name": "@line-agent/desktop",
+  "private": true,
+  "type": "module",
+  "version": "1.0.206",
+  "description": "Windows desktop console for LINE account automation with subscription agent CLIs",
+  "author": "LINE Agent Assistant contributors",
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "vite --config vite.config.ts",
+    "start": "electron .",
+    "build": "node scripts/build.mjs",
+    "build:native:js-external-reader": "node scripts/build-js-external-reader.mjs",
+    "typecheck": "tsc --noEmit --project tsconfig.json",
+    "test": "vitest run src"
+  },
+  "dependencies": {
+    "@line-agent/contracts": "0.0.0",
+    "lucide-react": "^0.468.0",
+    "qrcode": "1.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.3",
+    "@types/qrcode": "1.5.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^44.7.2",
+    "esbuild": "^0.25.12",
+    "jsdom": "^27.4.0",
+    "vite": "^8.3.4"
+  }
+}

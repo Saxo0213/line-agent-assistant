@@ -1,0 +1,4 @@
+ALTER TABLE mcp_agent_audit DROP CONSTRAINT mcp_agent_audit_disposition_check;
+ALTER TABLE mcp_agent_audit ADD CONSTRAINT mcp_agent_audit_disposition_check CHECK (
+  disposition IN ('ISSUED', 'REVOKED_BY_OPERATOR', 'ALLOWED', 'AUTH_INVALID', 'REVOKED', 'EXPIRED', 'SCOPE_DENIED', 'RATE_LIMITED', 'INVALID_INPUT', 'PERMISSION_DENIED', 'CONTROL_CHANGED', 'APPROVAL_REQUIRED')
+);

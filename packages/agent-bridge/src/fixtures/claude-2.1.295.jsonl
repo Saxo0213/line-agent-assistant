@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"22222222-2222-4222-8222-222222222222","tools":["Read","Glob","Grep"],"model":"fixture","permissionMode":"dontAsk"}
+{"type":"stream_event","session_id":"22222222-2222-4222-8222-222222222222","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}}
+{"type":"stream_event","session_id":"22222222-2222-4222-8222-222222222222","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"世界"}}}
+{"type":"assistant","session_id":"22222222-2222-4222-8222-222222222222","message":{"content":[{"type":"text","text":"Hello 世界"}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"22222222-2222-4222-8222-222222222222","result":"Hello 世界","usage":{"input_tokens":12,"output_tokens":4}}

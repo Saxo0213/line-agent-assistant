@@ -1,0 +1,413 @@
+import { z } from 'zod';
+import { AgentAttachmentSummarySchema, AgentAttachmentUploadsSchema, AgentEventSchema, AgentProviderSchema } from './agent.js';
+import { AgentStatusIconsSchema } from './agent-status-icons.js';
+import { AutoResponderRuleSchema, AutoResponderSettingsSchema, validateAutoresponderConfig } from './autoresponder.js';
+import { AccountModeSchema, ChatTypeSchema, ConversationKeySchema, WritableConversationKeySchema } from './account.js';
+import { MentionRangeSchema, MessageContentSchema, MessageKindSchema, SticonRangeSchema } from './line.js';
+import {
+  AgentPermissionsViewSchema,
+  ChatFolderChatTypeSchema,
+  ChatFolderSummarySchema,
+  SetAgentFolderLinkInputSchema,
+  SetAgentPermissionInputSchema,
+  AgentPermissionDefaultsViewSchema,
+  SetAgentPermissionDefaultInputSchema,
+  SetAgentExecutionPolicyInputSchema,
+  AgentExecutionPolicySchema,
+  AgentToolAllowlistEntrySchema,
+} from './agent-permissions.js';
+import {
+  McpPlaintextTokenSchema,
+  McpServerStatusSchema,
+  McpTokenSummarySchema,
+  McpTokenExpirationSchema,
+  McpToolInputUnionSchema,
+  McpToolNameSchema,
+  McpToolOutputUnionSchema,
+  McpLocalClientKindSchema,
+  McpLocalClientStatusSchema,
+} from './mcp.js';
+
+const IdSchema = z.string().min(1);
+const TimestampSchema = z.iso.datetime({ offset: true });
+const RequestIdSchema = z.strictObject({ requestId: IdSchema });
+const PageSchema = z.strictObject({ before: IdSchema.nullable(), limit: z.number().int().min(1).max(100) });
+export const AgentJobSearchCursorSchema = z.strictObject({ createdAt: TimestampSchema, jobId: IdSchema });
+export const AgentJobSearchQuerySchema = z.strictObject({
+  keyword: z.string().max(500).optional(), searchPrompt: z.boolean(), searchReply: z.boolean(),
+  provider: AgentProviderSchema.optional(), status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']).optional(),
+  createdFrom: TimestampSchema.optional(), createdToExclusive: TimestampSchema.optional(),
+  limit: z.number().int().min(1).max(100), cursor: AgentJobSearchCursorSchema.optional(),
+}).superRefine((query, context) => {
+  if (query.keyword?.trim() && !query.searchPrompt && !query.searchReply) {
+    context.addIssue({ code: 'custom', message: 'Select prompt or reply search', path: ['searchPrompt'] });
+  }
+  if (query.createdFrom && query.createdToExclusive && Date.parse(query.createdFrom) >= Date.parse(query.createdToExclusive)) {
+    context.addIssue({ code: 'custom', message: 'Invalid creation date range', path: ['createdToExclusive'] });
+  }
+});
+export type AgentJobSearchQuery = z.infer<typeof AgentJobSearchQuerySchema>;
+
+export const LineMediaTargetSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('account'), accountId: IdSchema }),
+  z.strictObject({ type: z.literal('conversation') }).merge(ConversationKeySchema),
+  z.strictObject({ type: z.literal('member'), memberId: IdSchema }).merge(ConversationKeySchema),
+  z.strictObject({ type: z.literal('sticker'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, messageId: IdSchema }),
+  z.strictObject({ type: z.literal('sticon'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, messageId: IdSchema,
+    index: z.number().int().nonnegative().max(63) }),
+  z.strictObject({ type: z.literal('attachment'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, attachmentId: IdSchema }),
+  /** Paid-reaction icon: served only when the message really carries that reaction; same sticon source and disk cache. */
+  z.strictObject({ type: z.literal('reaction'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, messageId: IdSchema,
+    productId: z.string().regex(/^[0-9a-f]{24}$/), emojiId: z.string().regex(/^[0-9]{1,6}$/) }),
+]);
+export type LineMediaTarget = z.infer<typeof LineMediaTargetSchema>;
+
+/** Operator answer to a pending Agent tool approval card. What gets remembered is derived by Main, never by the renderer. */
+export const AgentApprovalDecisionSchema = z.enum(['once', 'session', 'always', 'deny']);
+export type AgentApprovalDecision = z.infer<typeof AgentApprovalDecisionSchema>;
+export const AgentApprovalOutcomeSchema = z.enum(['allowed', 'denied', 'timeout', 'cancelled']);
+export type AgentApprovalOutcome = z.infer<typeof AgentApprovalOutcomeSchema>;
+/** Error-result codes of decideAgentApproval. */
+export const AgentApprovalErrorCodeSchema = z.enum(['APPROVAL_NOT_PENDING', 'APPROVAL_REMEMBER_UNAVAILABLE']);
+/** Global pending bound held by the Main approval broker. */
+export const MAX_PENDING_AGENT_APPROVALS = 32;
+/**
+ * A Bash summary is the whole command and is never truncated (the operator approves exactly what runs); commands
+ * longer than the remember limit (2000) are still shown but cannot be remembered. An event beyond this bound is
+ * dropped by the preload validator, so the request fails closed by timing out to deny.
+ */
+export const PendingAgentApprovalSchema = z.strictObject({
+  approvalId: IdSchema,
+  jobId: IdSchema,
+  tool: z.string().min(1).max(128),
+  summary: z.string().max(100_000),
+  deadline: TimestampSchema,
+  canRemember: z.boolean(),
+});
+export type PendingAgentApproval = z.infer<typeof PendingAgentApprovalSchema>;
+
+export const IpcRequestSchema = z.discriminatedUnion('type', [
+  RequestIdSchema.extend({ type: z.literal('getSnapshot') }),
+  RequestIdSchema.extend({ type: z.literal('searchAgentJobs'), query: AgentJobSearchQuerySchema }),
+  RequestIdSchema.extend({ type: z.literal('lineAddAccountQr'), confirmOfficialLogout: z.boolean().optional() }),
+  RequestIdSchema.extend({ type: z.literal('lineLoginQr'), accountId: IdSchema, confirmOfficialLogout: z.boolean().optional() }),
+  RequestIdSchema.extend({ type: z.literal('lineLogout'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('lineSetAutoLogin'), accountId: IdSchema, enabled: z.boolean() }),
+  RequestIdSchema.extend({ type: z.literal('lineBeginAdminPairing'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('lineStart'), accountId: IdSchema, confirmOfficialLogout: z.boolean().optional() }),
+  RequestIdSchema.extend({ type: z.literal('externalImportStart'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('externalImportStop'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('previewExternalAdminBinding') }),
+  RequestIdSchema.extend({ type: z.literal('startExternalMonitorAsAdmin'), mid: z.string().regex(/^u[0-9a-f]{32}$/) }),
+  RequestIdSchema.extend({ type: z.literal('officialLineApproveSigner') }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('lineSyncHistory'), cursor: IdSchema.nullable(),
+    limit: z.number().int().min(1).max(100).default(50) }),
+  // The shared Agent room belongs to the operator, not to a LINE account: none of these calls carries an account.
+  // The prompt may be empty only when files are attached (Main then stores the default attachment prompt).
+  RequestIdSchema.extend({ type: z.literal('submitAgentRoomPrompt'), provider: AgentProviderSchema, prompt: z.string(),
+    attachments: AgentAttachmentUploadsSchema.optional() })
+    .refine((request) => request.prompt.trim().length > 0 || (request.attachments?.length ?? 0) > 0, { message: 'Prompt or attachment required', path: ['prompt'] }),
+  RequestIdSchema.extend({ type: z.literal('stopAgentRoomJob'), jobId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('retryAgentRoomJob'), jobId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('getAgentRoomJobEvents'), jobId: IdSchema }),
+  RequestIdSchema.merge(ConversationKeySchema).merge(PageSchema).extend({ type: z.literal('listMessages') }),
+  RequestIdSchema.merge(ConversationKeySchema).merge(PageSchema).extend({ type: z.literal('listAttachments') }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('sendText'), text: z.string().min(1) }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('replyText'), replyToMessageId: IdSchema, text: z.string().min(1) }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('stopJob'), jobId: IdSchema }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('retryJob'), jobId: IdSchema }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('newSession'), provider: AgentProviderSchema }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('getJobEvents'), jobId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('searchMessages'), query: z.strictObject({ key: ConversationKeySchema.optional(), accountId: IdSchema.optional(), senderId: IdSchema.optional(), text: z.string().optional(), from: TimestampSchema.optional(), to: TimestampSchema.optional(), hasAttachment: z.boolean().optional(), attachmentKind: z.enum(['image', 'video', 'audio', 'file']).optional(), limit: z.number().int().positive().max(500) }) }),
+  RequestIdSchema.extend({ type: z.literal('openExternalUrl'), url: z.string().min(1).max(8192) }),
+  RequestIdSchema.extend({ type: z.literal('openAttachment'), attachmentId: IdSchema }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('downloadAttachment'), attachmentId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('revealAttachment'), attachmentId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('resolveFileTypeIcon'), extension: z.string().regex(/^[a-z0-9]{1,12}$/) }),
+  RequestIdSchema.extend({ type: z.literal('subscribeEvents'), topics: z.array(z.enum(['snapshot', 'agentEvent', 'message', 'attachment', 'control', 'health'])).min(1) }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('setConversationAgent'), enabled: z.boolean(), provider: AgentProviderSchema }),
+  RequestIdSchema.extend({ type: z.literal('switchControl'), accountId: IdSchema, expectedEpoch: z.number().int().nonnegative() }),
+  RequestIdSchema.extend({ type: z.literal('setDefaultAgent'), provider: AgentProviderSchema }),
+  RequestIdSchema.extend({ type: z.literal('setWorkspace'), workspacePath: z.string().min(1) }),
+  RequestIdSchema.extend({ type: z.literal('getConversationSettings') }),
+  RequestIdSchema.extend({ type: z.literal('setConversationSettings'), settings: z.strictObject({
+    attachmentAutoAttemptLimit: z.number().int().min(3).max(10), showAgentStatusMarkers: z.boolean(), agentStatusIcons: AgentStatusIconsSchema,
+  }) }),
+  RequestIdSchema.extend({ type: z.literal('getAutoResponderSettings') }),
+  z.strictObject({ type: z.literal('setAutoResponderSettings'), requestId: IdSchema,
+    expectedVersion: z.number().int().nonnegative(), displayName: z.string().min(1).max(80), fallback: z.string().min(1).max(2000),
+    rules: z.array(AutoResponderRuleSchema).max(50) }).superRefine((value, context) => {
+      const error = validateAutoresponderConfig(value);
+      if (error) context.addIssue({ code: 'custom', message: error });
+    }),
+  RequestIdSchema.extend({ type: z.literal('agentLogin'), provider: AgentProviderSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentLogout'), provider: AgentProviderSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentRefreshStatus'), provider: AgentProviderSchema }),
+  RequestIdSchema.extend({ type: z.literal('mcpGetStatus') }),
+  RequestIdSchema.extend({ type: z.literal('mcpLocalClientStatus') }),
+  RequestIdSchema.extend({ type: z.literal('mcpLocalClientConnect'), client: McpLocalClientKindSchema, accountScopes: z.array(IdSchema).min(1).max(16) }),
+  RequestIdSchema.extend({ type: z.literal('mcpLocalClientDisconnect'), client: McpLocalClientKindSchema }),
+  RequestIdSchema.extend({ type: z.literal('mcpListTokens') }),
+  RequestIdSchema.extend({
+    type: z.literal('mcpIssueToken'),
+    deviceLabel: z.string().trim().min(1).max(120),
+    principalId: z.string().trim().min(1).max(128).optional(),
+    accountScopes: z.array(IdSchema).min(1).max(16),
+    toolScopes: z.array(McpToolNameSchema).min(1).max(3),
+    expiration: McpTokenExpirationSchema,
+  }),
+  RequestIdSchema.extend({ type: z.literal('mcpRevokeToken'), tokenId: z.uuid() }),
+  RequestIdSchema.extend({ type: z.literal('mcpCallInternalTool'), tool: McpToolInputUnionSchema }),
+  RequestIdSchema.extend({ type: z.literal('getAgentPermissions'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('getAgentPermissionDefaults') }),
+  RequestIdSchema.merge(SetAgentPermissionDefaultInputSchema).extend({ type: z.literal('setAgentPermissionDefault') }),
+  RequestIdSchema.extend({ type: z.literal('revokeAgentWhitelistUser'), accountId: IdSchema, targetMid: IdSchema.max(512) }),
+  RequestIdSchema.merge(SetAgentPermissionInputSchema).extend({ type: z.literal('setAgentPermission') }),
+  RequestIdSchema.extend({ type: z.literal('getAgentExecutionPolicy') }),
+  RequestIdSchema.merge(SetAgentExecutionPolicyInputSchema).extend({ type: z.literal('setAgentExecutionPolicy') }),
+  RequestIdSchema.extend({ type: z.literal('listAgentToolAllowlist') }),
+  RequestIdSchema.extend({ type: z.literal('removeAgentToolAllowlistEntry'), id: z.uuid() }),
+  RequestIdSchema.extend({ type: z.literal('clearAgentToolAllowlist') }),
+  RequestIdSchema.extend({ type: z.literal('decideAgentApproval'), approvalId: IdSchema, decision: AgentApprovalDecisionSchema }),
+  RequestIdSchema.extend({ type: z.literal('listPendingAgentApprovals') }),
+  RequestIdSchema.merge(SetAgentFolderLinkInputSchema).extend({ type: z.literal('setAgentFolderLink') }),
+  RequestIdSchema.extend({ type: z.literal('createChatFolder'), accountId: IdSchema, chatType: ChatFolderChatTypeSchema, chatId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('openChatFolder'), folderId: z.uuid() }),
+]).superRefine((request, context) => {
+  if (request.type === 'switchControl') context.addIssue({ code: 'custom', message: 'Account control is managed internally.' });
+});
+export type IpcRequest = z.infer<typeof IpcRequestSchema>;
+
+export const ComponentHealthSchema = z.strictObject({
+  name: z.enum(['database', 'lineWorker', 'codex', 'claude']),
+  status: z.enum(['ready', 'degraded', 'stopped']),
+  message: z.string().nullable(),
+  lastSuccessAt: TimestampSchema.nullable(),
+  restartCount: z.number().int().nonnegative(),
+});
+export type ComponentHealth = z.infer<typeof ComponentHealthSchema>;
+
+export const LineAccountSummarySchema = z.strictObject({
+  accountId: IdSchema,
+  displayName: z.string(),
+  status: z.enum(['connected', 'disconnected', 'degraded', 'reauth_required']),
+  lastSyncedAt: TimestampSchema.nullable(),
+  mode: AccountModeSchema,
+  productRole: z.enum(['AGENT', 'PRIMARY_ADMIN']).nullable().optional(),
+  hasPrimaryAdmin: z.boolean().optional(),
+  autoLoginOnStartup: z.boolean().optional(),
+  hasVerifiedLineIdentity: z.boolean().optional(),
+  avatarAvailable: z.boolean().optional(),
+  canSendManually: z.boolean().optional(),
+  canStartExternalImport: z.boolean().optional(),
+  /** Primary Admin only: the official LINE build seen by the last reader session. Never carries paths, hashes or keys. */
+  officialLineBuild: z.strictObject({
+    version: z.string().regex(/^\d{1,5}(\.\d{1,5}){3}$/).nullable(),
+    status: z.enum(['accepted', 'candidate', 'key_scan_failed', 'schema_changed', 'rotation', 'untrusted']),
+  }).nullable().optional(),
+  externalImportProgress: z.strictObject({
+    stage: z.enum(['checking_source', 'closing_line_window', 'copying_snapshot', 'counting_rows', 'importing_history', 'syncing', 'monitoring', 'complete', 'failed']),
+    copiedBytes: z.string().regex(/^\d+$/).nullable(),
+    totalBytes: z.string().regex(/^\d+$/).nullable(),
+    committedRows: z.string().regex(/^\d+$/),
+    eligibleRows: z.string().regex(/^\d+$/).nullable(),
+    message: z.string().max(500).nullable(),
+  }).nullable().optional(),
+});
+export type LineAccountSummary = z.infer<typeof LineAccountSummarySchema>;
+
+/** Display-only metadata. Original preview text and persisted messages remain unchanged. */
+export const GeneratedPreviewSchema = z.strictObject({
+  kind: z.enum(['deleted', 'unsent', 'image', 'video', 'audio', 'file', 'sticker', 'contact', 'location', 'rich', 'unsupported', 'call', 'gift', 'post', 'chat_event', 'system', 'message']),
+  name: z.string().optional(),
+  status: z.enum(['queued', 'downloading', 'ready', 'failed', 'expired']).optional(),
+});
+export type GeneratedPreview = z.infer<typeof GeneratedPreviewSchema>;
+export const ConversationSummarySchema = z.strictObject({
+  accountId: IdSchema,
+  chatId: IdSchema,
+  chatType: ChatTypeSchema,
+  title: z.string(),
+  agentEnabled: z.boolean(),
+  defaultProvider: AgentProviderSchema,
+  unreadCount: z.number().int().nonnegative(),
+  localOnly: z.boolean().optional(),
+  latestMessagePreview: z.string().nullable().optional(),
+  latestMessageDisplay: GeneratedPreviewSchema.optional(),
+  latestMessageAt: TimestampSchema.nullable().optional(),
+  /** Message id of the latest row; the target of `latestSticonRanges` sticon media. */
+  latestMessageId: IdSchema.nullable().optional(),
+  /** Sticon ranges over `latestMessagePreview` (one U+FFFC placeholder each); range i is sticon i of that message. */
+  latestSticonRanges: z.array(SticonRangeSchema).max(16).optional(),
+  latestAttachmentStatus: z.enum(['queued', 'downloading', 'ready', 'failed', 'expired']).nullable().optional(),
+  avatarAvailable: z.boolean().optional(),
+});
+export type ConversationSummary = z.infer<typeof ConversationSummarySchema>;
+
+export const AgentJobSummarySchema = z.strictObject({
+  jobId: IdSchema,
+  /** null for the shared Agent room's jobs (they belong to no LINE account); LINE jobs always carry all three. */
+  accountId: IdSchema.nullable(),
+  chatType: ChatTypeSchema.nullable(),
+  chatId: IdSchema.nullable(),
+  provider: AgentProviderSchema,
+  prompt: z.string(),
+  status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']),
+  createdAt: TimestampSchema,
+  /** At most 240 Unicode code points from a stored completed reply, projected by Main for the Tasks list. */
+  replyPreview: z.string().max(480).refine((value) => Array.from(value).length <= 240).optional(),
+  /** Stamped by Main for jobs the Agent room shows: its own, or the admin's direct LINE chat while that chat is shared. */
+  origin: z.enum(['agent_room', 'line_admin_direct']).optional(),
+  /** Files attached in the Agent room, for display only (no paths). Absent when there are none. */
+  attachments: z.array(AgentAttachmentSummarySchema).max(10).optional(),
+});
+export type AgentJobSummary = z.infer<typeof AgentJobSummarySchema>;
+
+export const ProviderStatusSchema = z.strictObject({
+  provider: AgentProviderSchema,
+  status: z.enum(['unknown', 'logged_in', 'logged_out', 'not_installed', 'error']),
+  detail: z.string().nullable(),
+});
+export type ProviderStatus = z.infer<typeof ProviderStatusSchema>;
+
+export const ControlSnapshotSchema = z.strictObject({
+  epoch: z.number().int().nonnegative(),
+  activeAccountId: IdSchema.nullable(),
+  phase: z.enum(['idle', 'revoking', 'granting', 'failed']),
+  targetAccountId: IdSchema.nullable(),
+});
+export type ControlSnapshot = z.infer<typeof ControlSnapshotSchema>;
+
+export const AppSnapshotSchema = z.strictObject({
+  control: ControlSnapshotSchema,
+  defaultProvider: AgentProviderSchema,
+  components: z.array(ComponentHealthSchema),
+  queueDepth: z.number().int().nonnegative(),
+  accounts: z.array(LineAccountSummarySchema),
+  conversations: z.array(ConversationSummarySchema),
+  jobs: z.array(AgentJobSummarySchema),
+  providers: z.array(ProviderStatusSchema),
+});
+export type AppSnapshot = z.infer<typeof AppSnapshotSchema>;
+
+export const IpcEventSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('snapshotChanged'), snapshot: AppSnapshotSchema }),
+  z.strictObject({ type: z.literal('agentEvent'), jobId: IdSchema, event: AgentEventSchema }),
+  z.strictObject({ type: z.literal('agentJobStatusChanged'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, sourceMessageId: IdSchema, jobId: IdSchema, status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']), revision: z.string().regex(/^\d{1,20}$/) }),
+  z.strictObject({ type: z.literal('messageStored'), key: ConversationKeySchema, messageId: IdSchema,
+    conversation: ConversationSummarySchema }),
+  z.strictObject({ type: z.literal('externalMonitorRoundComplete'), accountId: IdSchema }),
+  /** Reading phase of the official-LINE identity read behind the external-monitor dialog. */
+  z.strictObject({ type: z.literal('externalAdminBindingProgress'), phase: z.enum(['locating', 'reading_identity']) }),
+  z.strictObject({ type: z.literal('attachmentChanged'), attachmentId: IdSchema }),
+  z.strictObject({ type: z.literal('controlChanged'), control: ControlSnapshotSchema }),
+  z.strictObject({ type: z.literal('healthChanged'), component: ComponentHealthSchema }),
+  z.strictObject({ type: z.literal('lineQr'), accountId: IdSchema, loginAttemptId: IdSchema,
+    imageDataUrl: z.string().max(256_000).regex(/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/) }),
+  z.strictObject({ type: z.literal('linePin'), accountId: IdSchema, loginAttemptId: IdSchema, pin: IdSchema }),
+  z.strictObject({ type: z.literal('lineLoginState'), accountId: IdSchema, loginAttemptId: IdSchema.nullable(),
+    state: z.enum(['connecting', 'connected', 'disconnected', 'degraded', 'reauth_required']), message: z.string().nullable() }),
+  ConversationKeySchema.extend({ type: z.literal('lineHistorySynced'), requestId: IdSchema,
+    nextCursor: IdSchema.nullable() }),
+  z.strictObject({ type: z.literal('agentApprovalRequested'), approval: PendingAgentApprovalSchema }),
+  z.strictObject({ type: z.literal('agentApprovalResolved'), approvalId: IdSchema, jobId: IdSchema, outcome: AgentApprovalOutcomeSchema }),
+  /** The execution policy changed (operator UI or LINE /權限); subscribers re-read it. Carries no policy data. */
+  z.strictObject({ type: z.literal('agentExecutionPolicyChanged') }),
+]);
+export type IpcEvent = z.infer<typeof IpcEventSchema>;
+
+export const MessageSearchResultSchema = z.strictObject({
+  accountId: IdSchema,
+  chatType: ChatTypeSchema,
+  chatId: IdSchema,
+  messageId: IdSchema,
+  senderId: z.string(),
+  senderName: z.string().nullable().optional(),
+  /** Read-only ownership projection; absent only in older payloads. */
+  isOwn: z.boolean().optional(),
+  conversationTitle: z.string().nullable().optional(),
+  text: z.string().nullable(),
+  occurredAt: TimestampSchema,
+});
+export type MessageSearchResult = z.infer<typeof MessageSearchResultSchema>;
+
+export const StickerDescriptorSchema = z.strictObject({
+  stickerId: z.string().regex(/^\d{1,20}$/),
+  animated: z.boolean(),
+  altText: z.string().max(200).nullable(),
+});
+export type StickerDescriptor = z.infer<typeof StickerDescriptorSchema>;
+
+export const MessageListResultSchema = MessageSearchResultSchema.extend({
+  kind: MessageKindSchema,
+  content: MessageContentSchema.nullable().optional(),
+  sticker: StickerDescriptorSchema.nullable(),
+  mentionRanges: z.array(MentionRangeSchema).optional(),
+  agentJobStatus: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']).nullable().optional(),
+});
+export type MessageListResult = z.infer<typeof MessageListResultSchema>;
+
+export const AttachmentSummarySchema = z.strictObject({
+  attachmentId: IdSchema, accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema,
+  messageId: IdSchema, kind: z.enum(['image', 'video', 'audio', 'file']), name: z.string().nullable(),
+  mimeType: z.string().nullable(), status: z.enum(['queued', 'downloading', 'ready', 'failed', 'expired']),
+  sizeBytes: z.number().int().nonnegative().nullable(),
+});
+
+export const IpcResultSchema = z.union([
+  z.discriminatedUnion('type', [
+    z.strictObject({ type: z.literal('getSnapshot'), requestId: IdSchema, ok: z.literal(true), snapshot: AppSnapshotSchema }),
+    z.strictObject({ type: z.literal('searchAgentJobs'), requestId: IdSchema, ok: z.literal(true), jobs: z.array(AgentJobSummarySchema).max(100), nextCursor: AgentJobSearchCursorSchema.nullable() }),
+    z.strictObject({ type: z.literal('getAutoResponderSettings'), requestId: IdSchema, ok: z.literal(true), settings: AutoResponderSettingsSchema }),
+    z.strictObject({ type: z.literal('getConversationSettings'), requestId: IdSchema, ok: z.literal(true), settings: z.strictObject({
+      attachmentAutoAttemptLimit: z.number().int().min(3).max(10), showAgentStatusMarkers: z.boolean(), agentStatusIcons: AgentStatusIconsSchema,
+    }) }),
+    z.strictObject({ type: z.literal('setConversationSettings'), requestId: IdSchema, ok: z.literal(true), settings: z.strictObject({
+      attachmentAutoAttemptLimit: z.number().int().min(3).max(10), showAgentStatusMarkers: z.boolean(), agentStatusIcons: AgentStatusIconsSchema,
+    }) }),
+    z.strictObject({ type: z.literal('setAutoResponderSettings'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().positive() }),
+    z.strictObject({ type: z.literal('accepted'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('lineAdminPairing'), requestId: IdSchema, ok: z.literal(true), token: z.string().regex(/^\d{6}$/), expiresAt: TimestampSchema }),
+    z.strictObject({ type: z.literal('submitAgentRoomPrompt'), requestId: IdSchema, ok: z.literal(true), jobId: IdSchema }),
+    z.strictObject({ type: z.literal('getAgentRoomJobEvents'), requestId: IdSchema, ok: z.literal(true), events: z.array(AgentEventSchema) }),
+    z.strictObject({ type: z.literal('previewExternalAdminBinding'), requestId: IdSchema, ok: z.literal(true),
+      identity: z.strictObject({ mid: z.string().regex(/^u[0-9a-f]{32}$/), displayName: z.string().min(1).max(256).nullable(), picturePath: z.string().max(2048).nullable().optional() }),
+      otherCandidates: z.number().int().min(0).max(7) }),
+    z.strictObject({ type: z.literal('startExternalMonitorAsAdmin'), requestId: IdSchema, ok: z.literal(true),
+      bound: z.literal(true), started: z.boolean(), message: z.string().nullable() }),
+    z.strictObject({ type: z.literal('searchMessages'), requestId: IdSchema, ok: z.literal(true), messages: z.array(MessageSearchResultSchema) }),
+    z.strictObject({ type: z.literal('listMessages'), requestId: IdSchema, ok: z.literal(true), messages: z.array(MessageListResultSchema), nextCursor: IdSchema.nullable() }),
+    z.strictObject({ type: z.literal('listAttachments'), requestId: IdSchema, ok: z.literal(true), attachments: z.array(AttachmentSummarySchema), nextCursor: IdSchema.nullable() }),
+    z.strictObject({ type: z.literal('getJobEvents'), requestId: IdSchema, ok: z.literal(true), events: z.array(AgentEventSchema) }),
+    z.strictObject({ type: z.literal('openAttachment'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
+    z.strictObject({ type: z.literal('openExternalUrl'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('revealAttachment'), requestId: IdSchema, ok: z.literal(true), revealed: z.boolean() }),
+    z.strictObject({ type: z.literal('resolveFileTypeIcon'), requestId: IdSchema, ok: z.literal(true), dataUrl: z.string().nullable() }),
+    z.strictObject({ type: z.literal('mcpGetStatus'), requestId: IdSchema, ok: z.literal(true), status: McpServerStatusSchema }),
+    z.strictObject({ type: z.literal('mcpLocalClientStatus'), requestId: IdSchema, ok: z.literal(true), clients: z.array(McpLocalClientStatusSchema) }),
+    z.strictObject({ type: z.literal('mcpLocalClientConnect'), requestId: IdSchema, ok: z.literal(true), status: McpLocalClientStatusSchema }),
+    z.strictObject({ type: z.literal('mcpLocalClientDisconnect'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('mcpListTokens'), requestId: IdSchema, ok: z.literal(true), tokens: z.array(McpTokenSummarySchema) }),
+    z.strictObject({ type: z.literal('mcpIssueToken'), requestId: IdSchema, ok: z.literal(true), token: McpTokenSummarySchema, plaintextToken: McpPlaintextTokenSchema }),
+    z.strictObject({ type: z.literal('mcpRevokeToken'), requestId: IdSchema, ok: z.literal(true), revoked: z.boolean() }),
+    z.strictObject({ type: z.literal('mcpCallInternalTool'), requestId: IdSchema, ok: z.literal(true), result: McpToolOutputUnionSchema }),
+    z.strictObject({ type: z.literal('getAgentPermissions'), requestId: IdSchema, ok: z.literal(true), view: AgentPermissionsViewSchema }),
+    z.strictObject({ type: z.literal('getAgentPermissionDefaults'), requestId: IdSchema, ok: z.literal(true), defaults: AgentPermissionDefaultsViewSchema }),
+    z.strictObject({ type: z.literal('setAgentPermissionDefault'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().nonnegative() }),
+    z.strictObject({ type: z.literal('revokeAgentWhitelistUser'), requestId: IdSchema, ok: z.literal(true), revoked: z.number().int().nonnegative() }),
+    z.strictObject({ type: z.literal('setAgentPermission'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().nonnegative() }),
+    z.strictObject({ type: z.literal('getAgentExecutionPolicy'), requestId: IdSchema, ok: z.literal(true), policy: AgentExecutionPolicySchema }),
+    z.strictObject({ type: z.literal('setAgentExecutionPolicy'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().positive() }),
+    z.strictObject({ type: z.literal('listAgentToolAllowlist'), requestId: IdSchema, ok: z.literal(true), entries: z.array(AgentToolAllowlistEntrySchema) }),
+    z.strictObject({ type: z.literal('removeAgentToolAllowlistEntry'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('clearAgentToolAllowlist'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('decideAgentApproval'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('listPendingAgentApprovals'), requestId: IdSchema, ok: z.literal(true),
+      approvals: z.array(PendingAgentApprovalSchema).max(MAX_PENDING_AGENT_APPROVALS) }),
+    z.strictObject({ type: z.literal('setAgentFolderLink'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().nonnegative() }),
+    z.strictObject({ type: z.literal('createChatFolder'), requestId: IdSchema, ok: z.literal(true), folder: ChatFolderSummarySchema }),
+    z.strictObject({ type: z.literal('openChatFolder'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
+  ]),
+  z.strictObject({ type: z.literal('error'), requestId: IdSchema, ok: z.literal(false), code: z.string().min(1), message: z.string().min(1), retryable: z.boolean(), detail: z.enum(['same_account', 'unknown']).optional() }),
+]);
+export type IpcResult = z.infer<typeof IpcResultSchema>;

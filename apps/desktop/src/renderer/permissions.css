@@ -1,0 +1,60 @@
+.perm-card-stack { display: grid; gap: 16px; align-content: start; max-width: 960px; }
+.perm-settings { max-width: 960px; }
+.perm-card-title { margin: 0 0 12px; font-size: 16px; }
+.perm-whitelist-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.perm-whitelist-header .perm-card-title { margin: 0; }
+.perm-message-slot { min-height: 42px; margin-bottom: 8px; }
+.perm-message-slot:empty { display: none; }
+.perm-message-slot > * { margin: 0; }
+.perm-subjects { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.perm-subject { border-radius: 999px; min-height: 36px; padding: 6px 14px; }
+.perm-subject.active { background: var(--subtle); border-color: var(--primary); color: var(--primary); font-weight: 600; }
+.perm-scope-selectors { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 0 0 12px; }
+.perm-scope-mode { display: inline-flex; gap: 6px; }
+.perm-scope-field { display: inline-flex; align-items: center; gap: 8px; margin: 0; white-space: nowrap; }
+.perm-whitelist-card label.perm-scope-field { flex-direction: row; align-items: center; margin: 0; }
+.perm-scope-field select { min-width: 180px; max-width: min(360px, 55vw); }
+.perm-revoke-button { margin-left: auto; }
+@media (max-width: 640px) {
+  .perm-whitelist-header { align-items: flex-start; flex-wrap: wrap; }
+  .perm-whitelist-header .perm-scope-mode { margin-left: auto; }
+  .perm-scope-selectors { align-items: stretch; }
+  .perm-scope-field { flex: 1 1 100%; justify-content: space-between; }
+  .perm-scope-field select { flex: 1 1 auto; min-width: 0; max-width: none; }
+  .perm-revoke-button { margin-left: auto; }
+}
+.perm-locked { color: var(--secondary); margin: 0 0 12px; }
+.perm-list { list-style: none; margin: 0 0 16px; padding: 0; border: 1px solid var(--border); border-radius: 8px; }
+.perm-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 14px; border-top: 1px solid var(--border); min-height: 64px; }
+.perm-row:first-child { border-top: 0; }
+.perm-row-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.perm-row-copy small { color: var(--secondary); }
+.perm-settings .perm-execution-levels label.perm-execution-option { flex-direction: row; justify-content: flex-start; align-items: flex-start; gap: 12px; }
+.perm-execution-option input[type="radio"] { margin-top: 4px; }
+.perm-segmented { display: inline-flex; flex: none; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.perm-seg { border: 0; border-radius: 0; background: var(--surface); min-width: 84px; white-space: nowrap; }
+.perm-seg + .perm-seg { border-left: 1px solid var(--border); }
+.perm-seg-inherit { min-width: 148px; }
+.perm-seg.active { background: var(--subtle); font-weight: 600; box-shadow: inset 0 -3px 0 var(--secondary); }
+.perm-seg-allow.active { color: var(--primary); box-shadow: inset 0 -3px 0 var(--primary); }
+.perm-seg-deny.active { color: var(--danger); box-shadow: inset 0 -3px 0 var(--danger); }
+.perm-heading { margin: 20px 0 6px; font-size: 15px; }
+.perm-subheading { margin: 12px 0 6px; font-size: 13px; color: var(--secondary); }
+.perm-hint { color: var(--secondary); margin: 0 0 10px; }
+.perm-timeout { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 12px 0 4px; }
+.perm-timeout>label { display: inline-flex; flex-direction: row; align-items: center; gap: 6px; margin: 0; white-space: nowrap; }
+.perm-timeout input { width: 7rem; }
+.perm-timeout select { min-width: 112px; }
+.perm-allowlist-open { margin-left: auto; }
+.perm-dialog-scrim { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px; background: #17232666; }
+.perm-allowlist-dialog { width: min(720px, 100%); max-height: min(80vh, 720px); overflow: auto; }
+.perm-allowlist-dialog-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+.perm-allowlist-dialog-header h3 { margin: 0; }
+.perm-command { white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-approval-list { display: grid; gap: 10px; margin: 0 0 12px; }
+.agent-approval-card { border: 2px solid var(--primary); border-radius: 10px; padding: 14px; background: var(--surface); color: var(--text); }
+.agent-approval-card h3 { margin: 0 0 8px; }
+.agent-approval-card pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 14rem; overflow: auto; padding: 10px; border-radius: 6px; background: var(--subtle); }
+.agent-approval-countdown { font-weight: 700; }
+.agent-approval-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.agent-approval-notice { margin: 0; color: var(--secondary); }

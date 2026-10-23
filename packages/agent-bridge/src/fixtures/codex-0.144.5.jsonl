@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"11111111-1111-4111-8111-111111111111"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"agent_message","text":""}}
+{"type":"item.updated","item":{"id":"item_0","type":"agent_message","text":"Hello "}}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello 世界"}}
+{"type":"turn.completed","usage":{"input_tokens":12,"cached_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":0}}

@@ -1,0 +1,2 @@
+.virtual-list { position: relative; }
+.virtual-list .conversation-row { left: 0; right: 0; overflow: hidden; }

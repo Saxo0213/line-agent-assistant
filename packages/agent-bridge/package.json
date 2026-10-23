@@ -1,0 +1,14 @@
+{
+  "name": "@line-agent/agent-bridge",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": { ".": { "types": "./src/index.ts", "import": "./dist/index.js" } },
+  "scripts": {
+    "build": "npm run build:native && tsc --project tsconfig.json",
+    "build:native": "node scripts/build-native.mjs",
+    "typecheck": "tsc --noEmit --project tsconfig.json"
+  },
+  "dependencies": { "@line-agent/contracts": "0.0.0" },
+  "devDependencies": { "@types/node": "^22.0.0" }
+}
