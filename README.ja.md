@@ -13,7 +13,13 @@ LINE の Chrome 型クライアントのセッションを利用し、同じ Win
 
 ## インストール
 
-このリポジトリにはソースコードが含まれています。Windows x64 と対応する Node.js を用意し、[ソースからのビルド](docs/BUILDING.md)に記載された要件を満たしてください。その後、次を実行します。
+### Windows インストーラー
+
+[最新のリリース](https://github.com/Saxo0213/line-agent-assistant/releases/latest)を開き、**Assets** からファイル名が `Setup-x64.exe` で終わるインストーラーをダウンロードして実行してください。
+
+### ソースからのビルド
+
+Windows x64 と対応する Node.js を用意し、[ソースからのビルド](docs/BUILDING.md)に記載された要件を満たしてください。その後、次を実行します。
 
 ```powershell
 npm ci

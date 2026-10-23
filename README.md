@@ -13,7 +13,13 @@ Using LINE Chrome-type client sessions, the app lets two LINE accounts serve dif
 
 ## Installation
 
-This repository provides source code. To build and run it, use Windows x64, install a supported Node.js version, and follow the prerequisites in [Building from source](docs/BUILDING.md). Then run:
+### Windows installer
+
+Open the [latest release](https://github.com/Saxo0213/line-agent-assistant/releases/latest), download the installer whose filename ends in `Setup-x64.exe` under **Assets**, and run it.
+
+### Build from source
+
+To build and run the source code, use Windows x64, install a supported Node.js version, and follow the prerequisites in [Building from source](docs/BUILDING.md). Then run:
 
 ```powershell
 npm ci

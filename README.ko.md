@@ -13,7 +13,13 @@ LINE Chrome 유형 클라이언트 세션을 사용하여 한 대의 Windows 컴
 
 ## 설치
 
-이 저장소는 소스 코드를 제공합니다. Windows x64와 지원되는 Node.js 버전을 준비하고 [소스에서 빌드하기](docs/BUILDING.md)에 안내된 사전 요구 사항을 충족하세요. 그런 다음 다음 명령을 실행합니다.
+### Windows 설치 파일
+
+[최신 릴리스](https://github.com/Saxo0213/line-agent-assistant/releases/latest)를 열고 **Assets**에서 파일 이름이 `Setup-x64.exe`로 끝나는 설치 파일을 다운로드한 다음 실행하세요.
+
+### 소스에서 빌드
+
+Windows x64와 지원되는 Node.js 버전을 준비하고 [소스에서 빌드하기](docs/BUILDING.md)에 안내된 사전 요구 사항을 충족하세요. 그런 다음 다음 명령을 실행합니다.
 
 ```powershell
 npm ci

@@ -13,7 +13,13 @@
 
 ## 安裝
 
-本儲存庫提供原始碼。請使用 Windows x64、安裝支援的 Node.js 版本，並依照[從原始碼建置](docs/BUILDING.md)準備必要項目。接著執行：
+### Windows 安裝檔
+
+前往[最新版本](https://github.com/Saxo0213/line-agent-assistant/releases/latest)，在 **Assets** 下載檔名結尾為 `Setup-x64.exe` 的安裝檔，執行後依畫面指示安裝。
+
+### 從原始碼建置
+
+請使用 Windows x64、安裝支援的 Node.js 版本，並依照[從原始碼建置](docs/BUILDING.md)準備必要項目。接著執行：
 
 ```powershell
 npm ci
