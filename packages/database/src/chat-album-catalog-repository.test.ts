@@ -51,6 +51,30 @@ database('ChatAlbumCatalogRepository with PostgreSQL', () => {
     await expect(repository.savedPhoto(key, albumId, photoId)).resolves.toEqual(file);
   });
 
+  it('reuses the readable folder mapping with the current binding and reconciles mapped saved photos', async () => {
+    const albumId = 'album-readable-mapping', photoId = 'photo-readable-mapping';
+    const albumGeneration = await repository.beginAlbumScan(key, binding);
+    await repository.appendAlbumPage(key, albumGeneration, null, [{ albumId, chatId: key.chatId, title: 'Trip', photoCount: 1,
+      createTime: null, updateTime: null }], null, binding);
+    const firstFolder = await repository.ensureReadableFolderName(key, albumId, 'Trip__0123456789', binding);
+    await expect(repository.ensureReadableFolderName(key, albumId, 'Renamed Trip__0123456789', binding)).resolves.toBe(firstFolder);
+
+    const photoGeneration = await repository.beginPhotoScan(key, albumId, binding);
+    await repository.appendPhotoPage(key, albumId, photoGeneration, null, [{ photoId, oid: 'oid', prefix: 'album/a', shotTime: null, width: 10, height: 10 }], null, binding);
+    const file = { folderName: 'a'.repeat(64), fileName: 'record_f_saved.jpg', contentHash: 'b'.repeat(64), byteCount: 12, revision: 1,
+      savedAt: '2026-10-25T00:00:00.000Z' };
+    await repository.savePhoto(key, albumId, photoId, file, binding);
+    const readableName = 'LINE_ALBUM_Trip_00000000_0001_0123456789.jpg';
+    await repository.saveReadablePhotoName(key, albumId, photoId, readableName, binding);
+    await expect(repository.listSavedPhotosForReadableReconciliation(key, albumId, null)).resolves.toMatchObject({
+      items: [{ photoId, scanOrdinal: 0 }], nextCursor: null,
+    });
+    await expect(repository.readableExportState(key, albumId)).resolves.toEqual({ cursor: -1, sweepFailed: false });
+    await repository.saveReadableExportProgress(key, albumId, -1, false, 0, true, binding);
+    await expect(repository.readableExportState(key, albumId)).resolves.toEqual({ cursor: 0, sweepFailed: true });
+    await expect(repository.saveReadableExportProgress(key, albumId, -1, false, 1, false, binding)).rejects.toThrow('progress changed');
+  });
+
   it('rejects a catalog write after the account binding changes', async () => {
     await pool.query("UPDATE line_accounts SET worker_instance_id='replacement-worker' WHERE account_id=$1", [key.accountId]);
     await expect(repository.beginAlbumScan(key, binding)).rejects.toThrow('Album catalog binding changed');

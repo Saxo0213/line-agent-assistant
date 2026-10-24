@@ -50,6 +50,7 @@ export type DesktopServiceFacade = {
   listChatAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null, refresh?: boolean): Promise<{ photos: ChatResourcePhoto[]; nextCursor: string | null }>;
   downloadChatAlbumPhoto(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: string): Promise<{ albumId: string; photoId: string; sizeBytes: number }>;
   openChatAlbum(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<AlbumOpenResult>;
+  openReadableChatAlbumFolder(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<import('./services/chat-resources.js').ReadableAlbumFolderResult>;
   listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[]): Promise<AttachmentState[]>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: NonNullable<TimelineMessage['agentJobStatus']>; revision: string }>>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: NonNullable<TimelineMessage['agentJobStatus']>; revision: string }>>;
@@ -87,6 +88,7 @@ export function createDisconnectedFacade(reason = '服務尚未接入；請完�
     async listChatAlbumPhotos() { return { photos: [], nextCursor: null }; },
     async downloadChatAlbumPhoto() { throw new Error(reason); },
     async openChatAlbum() { throw new Error(reason); },
+    async openReadableChatAlbumFolder() { throw new Error(reason); },
     async listAttachmentStates() { return []; },
     async listAgentStatuses() { return []; },
     async openAttachment() { return false; },

@@ -30,6 +30,222 @@ describe('ChatResourceArchiveService', () => {
   const services = new Set<ChatResourceArchiveService>();
   afterEach(async () => { await Promise.all([...services].map((service) => service.shutdown())); services.clear(); });
 
+  it('lazily exports already-saved photos from the catalog without LINE reads or duplicate catalog rows', async () => {
+    const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const canonical = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: createHash('sha256').update(bytes).digest('hex'), byteCount: bytes.byteLength, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = {
+      getAlbum: vi.fn(async () => album), ensureReadableFolderName: vi.fn(async (_key: ConversationKey, _albumId: string, name: string) => name),
+      listSavedPhotosForReadableReconciliation: vi.fn(async () => ({ items: [{ ...photo, scanOrdinal: 0 }], nextCursor: null })),
+      savedPhoto: vi.fn(async () => canonical), savePhoto: vi.fn(async () => {}), readablePhotoName: vi.fn(async () => null),
+      saveReadablePhotoName: vi.fn(async () => {}),
+      readableExportState: vi.fn(async () => ({ cursor: -1, sweepFailed: false })), saveReadableExportProgress: vi.fn(async () => {}), hasPhotosNeedingReadableExport: vi.fn(async () => false),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const ensureFolder = vi.fn(async () => {}), materialize = vi.fn(async () => ({ unchanged: false }));
+    const { service, readChatResource } = await setup({ catalog }, { inspectAlbumPhoto: vi.fn(async () => canonical),
+      ensureReadableAlbumFolder: ensureFolder, materializeAlbumPhoto: materialize });
+
+    await expect(service.openReadableAlbumFolder(key, album.albumId)).resolves.toMatchObject({ exportedCount: 1, failedCount: 0, totalCount: 1, complete: true });
+    expect(materialize).toHaveBeenCalledWith(expect.objectContaining({ canonicalFile: canonical, viewFileName: expect.stringMatching(/LINE_ALBUM_Photos_20231114_0001_[0-9a-f]{10}\.jpg/) }));
+    expect(catalog.saveReadablePhotoName).toHaveBeenCalledOnce();
+    expect(catalog.savePhoto).not.toHaveBeenCalled();
+    expect(readChatResource).not.toHaveBeenCalled();
+  });
+
+  it('backfills saved photos during album selection from local catalog and archive only', async () => {
+    const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const canonical = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: createHash('sha256').update(bytes).digest('hex'), byteCount: bytes.byteLength, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = {
+      photoScan: vi.fn(async () => ({ complete: true, generation: 1, cursor: null, previousCursor: null, nextOrdinal: 1 })),
+      listPhotos: vi.fn(async () => ({ items: [photo], nextCursor: null })),
+      getAlbum: vi.fn(async () => album), ensureReadableFolderName: vi.fn(async (_key: ConversationKey, _albumId: string, name: string) => name),
+      listSavedPhotosForReadableReconciliation: vi.fn(async () => ({ items: [{ ...photo, scanOrdinal: 0 }], nextCursor: null })),
+      savedPhoto: vi.fn(async () => canonical), savePhoto: vi.fn(async () => {}), readablePhotoName: vi.fn(async () => null), saveReadablePhotoName: vi.fn(async () => {}),
+      readableExportState: vi.fn(async () => ({ cursor: -1, sweepFailed: false })), saveReadableExportProgress: vi.fn(async () => {}), hasPhotosNeedingReadableExport: vi.fn(async () => false),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const materialize = vi.fn(async () => ({ unchanged: false }));
+    const { service, readChatResource } = await setup({ catalog }, { inspectAlbumPhoto: vi.fn(async () => canonical),
+      ensureReadableAlbumFolder: vi.fn(async () => {}), materializeAlbumPhoto: materialize });
+
+    await expect(service.listAlbumPhotos(key, album.albumId, null)).resolves.toMatchObject({ photos: [photo], nextCursor: null });
+    expect(materialize).toHaveBeenCalledOnce();
+    const nextCursor = `db-photo:${Buffer.from(JSON.stringify({ generation: 1, ordinal: 0 })).toString('base64url')}`;
+    await service.listAlbumPhotos(key, album.albumId, nextCursor);
+    expect(materialize).toHaveBeenCalledOnce();
+    expect(readChatResource).not.toHaveBeenCalled();
+    expect(catalog.savePhoto).not.toHaveBeenCalled();
+  });
+
+  it('eventually completes readable reconciliation of 501 and 1001 saved photos', async () => {
+    for (const total of [501, 1001]) {
+      const photos = Array.from({ length: total }, (_, index) => ({ ...photo, photoId: `photo-${String(index + 1).padStart(4, '0')}`, scanOrdinal: index }));
+      const exported = new Set<string>(); let progress = { cursor: -1, sweepFailed: false };
+      const canonical = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+        contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), byteCount: 3, revision: 1, savedAt: new Date().toISOString() };
+      const catalog = {
+        getAlbum: vi.fn(async () => album), ensureReadableFolderName: vi.fn(async (_key: ConversationKey, _albumId: string, name: string) => name),
+        listSavedPhotosForReadableReconciliation: vi.fn(async (_key: ConversationKey, _albumId: string, cursor: string | null, limit = 50) => {
+          const rows = photos.filter((item) => item.scanOrdinal > (cursor === null ? -1 : Number(cursor)));
+          const items = rows.slice(0, limit);
+          return { items, nextCursor: rows.length > limit ? String(items.at(-1)!.scanOrdinal) : null };
+        }),
+        savedPhoto: vi.fn(async () => canonical), savePhoto: vi.fn(async () => {}),
+        readablePhotoName: vi.fn(async (_key: ConversationKey, _albumId: string, photoId: string) => exported.has(photoId) ? 'LINE_ALBUM_Photos_20231114_0001_aaaaaaaaaa.jpg' : null),
+        saveReadablePhotoName: vi.fn(async (_key: ConversationKey, _albumId: string, photoId: string) => { exported.add(photoId); }),
+        readableExportState: vi.fn(async () => ({ ...progress })),
+        receiverToken: 'catalog-receiver',
+        saveReadableExportProgress: vi.fn(async function (this: { receiverToken: string }, _key: ConversationKey, _albumId: string, expectedCursor: number, expectedFailed: boolean, cursor: number, sweepFailed: boolean) {
+          expect(this.receiverToken).toBe('catalog-receiver');
+          if (progress.cursor !== expectedCursor || progress.sweepFailed !== expectedFailed) throw new Error('progress changed');
+          progress = { cursor, sweepFailed };
+        }),
+        hasPhotosNeedingReadableExport: vi.fn(async () => exported.size < total),
+      } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+      const materialize = vi.fn(async () => ({ unchanged: false }));
+      const { service } = await setup({ catalog }, { inspectAlbumPhoto: vi.fn(async () => canonical), ensureReadableAlbumFolder: vi.fn(async () => {}), materializeAlbumPhoto: materialize });
+
+      let result = await service.openReadableAlbumFolder(key, album.albumId);
+      expect(result).toMatchObject({ complete: false, failureCodes: ['PAGE_LIMIT'] });
+      for (let attempt = 0; attempt < 4 && !result.complete; attempt += 1) result = await service.openReadableAlbumFolder(key, album.albumId);
+      expect(result).toMatchObject({ complete: true, failedCount: 0 });
+      expect(exported.size).toBe(total);
+      expect(materialize).toHaveBeenCalledTimes(total);
+      expect(progress).toEqual({ cursor: -1, sweepFailed: false });
+    }
+  });
+
+  it('advances past early failures and keeps sweep completion false until a later retry succeeds', async () => {
+    const total = 501;
+    const photos = Array.from({ length: total }, (_, index) => ({ ...photo, photoId: `photo-${String(index + 1).padStart(4, '0')}`, scanOrdinal: index }));
+    const exported = new Set<string>(); let progress = { cursor: -1, sweepFailed: false };
+    const canonical = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), byteCount: 3, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = {
+      getAlbum: vi.fn(async () => album), ensureReadableFolderName: vi.fn(async (_key: ConversationKey, _albumId: string, name: string) => name),
+      listSavedPhotosForReadableReconciliation: vi.fn(async (_key: ConversationKey, _albumId: string, cursor: string | null, limit = 50) => {
+        const rows = photos.filter((item) => item.scanOrdinal > (cursor === null ? -1 : Number(cursor)));
+        const items = rows.slice(0, limit);
+        return { items, nextCursor: rows.length > limit ? String(items.at(-1)!.scanOrdinal) : null };
+      }),
+      savedPhoto: vi.fn(async () => canonical), savePhoto: vi.fn(async () => {}),
+      readablePhotoName: vi.fn(async (_key: ConversationKey, _albumId: string, photoId: string) => `LINE_ALBUM_Photos_20231114_${String(Number(photoId.slice(-4))).padStart(4, '0')}_${'a'.repeat(10)}.jpg`),
+      saveReadablePhotoName: vi.fn(async (_key: ConversationKey, _albumId: string, photoId: string) => { exported.add(photoId); }),
+      readableExportState: vi.fn(async () => ({ ...progress })),
+      saveReadableExportProgress: vi.fn(async (_key: ConversationKey, _albumId: string, expectedCursor: number, expectedFailed: boolean, cursor: number, sweepFailed: boolean) => {
+        if (progress.cursor !== expectedCursor || progress.sweepFailed !== expectedFailed) throw new Error('progress changed');
+        progress = { cursor, sweepFailed };
+      }),
+      hasPhotosNeedingReadableExport: vi.fn(async () => false),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    let repaired = false;
+    const materialize = vi.fn(async ({ photoId }: { photoId: string }) => {
+      if (photoId === 'photo-0001' && !repaired) throw Object.assign(new Error('edited readable file'), { code: 'NO_REPLACE_CONFLICT' });
+      return { unchanged: false };
+    });
+    const { service } = await setup({ catalog }, { inspectAlbumPhoto: vi.fn(async () => canonical), ensureReadableAlbumFolder: vi.fn(async () => {}), materializeAlbumPhoto: materialize });
+
+    const first = await service.openReadableAlbumFolder(key, album.albumId);
+    expect(first).toMatchObject({ failedCount: 1, complete: false });
+    const tail = await service.openReadableAlbumFolder(key, album.albumId);
+    expect(tail).toMatchObject({ exportedCount: 1, complete: false });
+    expect(tail.failureCodes).toContain('PENDING_RETRY');
+    expect(progress).toEqual({ cursor: -1, sweepFailed: true });
+    repaired = true;
+    const retryFirst = await service.openReadableAlbumFolder(key, album.albumId);
+    expect(retryFirst).toMatchObject({ failedCount: 0, complete: false, failureCodes: ['PAGE_LIMIT'] });
+    const retryTail = await service.openReadableAlbumFolder(key, album.albumId);
+    expect(retryTail).toMatchObject({ failedCount: 0, complete: true });
+    expect(progress).toEqual({ cursor: -1, sweepFailed: false });
+  });
+
+  it('serializes concurrent album selection and folder reconciliation against the durable cursor', async () => {
+    let progress = { cursor: -1, sweepFailed: false }, attempts = 0;
+    const canonical = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), byteCount: 3, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = {
+      photoScan: vi.fn(async () => ({ complete: true, generation: 1, cursor: null, previousCursor: null, nextOrdinal: 1 })),
+      listPhotos: vi.fn(async () => ({ items: [photo], nextCursor: null })),
+      getAlbum: vi.fn(async () => album), ensureReadableFolderName: vi.fn(async (_key: ConversationKey, _albumId: string, name: string) => name),
+      listSavedPhotosForReadableReconciliation: vi.fn(async () => ({ items: [{ ...photo, scanOrdinal: 0 }], nextCursor: null })),
+      savedPhoto: vi.fn(async () => canonical), savePhoto: vi.fn(async () => {}), readablePhotoName: vi.fn(async () => 'LINE_ALBUM_Photos_20231114_0001_0123456789.jpg'),
+      saveReadablePhotoName: vi.fn(async () => {}), readableExportState: vi.fn(async () => ({ ...progress })),
+      saveReadableExportProgress: vi.fn(async (_key: ConversationKey, _albumId: string, expectedCursor: number, expectedFailed: boolean, cursor: number, sweepFailed: boolean) => {
+        if (progress.cursor !== expectedCursor || progress.sweepFailed !== expectedFailed) throw new Error('progress changed');
+        progress = { cursor, sweepFailed };
+      }), hasPhotosNeedingReadableExport: vi.fn(async () => false),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const materialize = vi.fn(async () => {
+      if (++attempts === 1) throw Object.assign(new Error('edited readable file'), { code: 'NO_REPLACE_CONFLICT' });
+      return { unchanged: false };
+    });
+    const { service } = await setup({ catalog }, { inspectAlbumPhoto: vi.fn(async () => canonical), ensureReadableAlbumFolder: vi.fn(async () => {}), materializeAlbumPhoto: materialize });
+
+    const [selection, folder] = await Promise.all([service.listAlbumPhotos(key, album.albumId, null), service.openReadableAlbumFolder(key, album.albumId)]);
+    expect(selection).toMatchObject({ photos: [photo] });
+    expect(folder).toMatchObject({ exportedCount: 1, failedCount: 0, complete: true });
+    expect(materialize).toHaveBeenCalledTimes(2);
+    expect(progress).toEqual({ cursor: -1, sweepFailed: false });
+  });
+
+  it('revalidates a stored readable filename and reports an edited copy conflict', async () => {
+    const canonical = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), byteCount: 3, revision: 1, savedAt: new Date().toISOString() };
+    const storedName = 'LINE_ALBUM_Photos_20231114_0001_0123456789.jpg';
+    const catalog = {
+      getAlbum: vi.fn(async () => album), ensureReadableFolderName: vi.fn(async (_key: ConversationKey, _albumId: string, name: string) => name),
+      listSavedPhotosForReadableReconciliation: vi.fn(async () => ({ items: [{ ...photo, scanOrdinal: 0 }], nextCursor: null })),
+      savedPhoto: vi.fn(async () => canonical), savePhoto: vi.fn(async () => {}), readablePhotoName: vi.fn(async () => storedName),
+      saveReadablePhotoName: vi.fn(async () => {}), readableExportState: vi.fn(async () => ({ cursor: -1, sweepFailed: false })), saveReadableExportProgress: vi.fn(async () => {}),
+      hasPhotosNeedingReadableExport: vi.fn(async () => false),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const materialize = vi.fn(async () => { throw Object.assign(new Error('edited readable file'), { code: 'NO_REPLACE_CONFLICT' }); });
+    const { service } = await setup({ catalog }, { inspectAlbumPhoto: vi.fn(async () => canonical), ensureReadableAlbumFolder: vi.fn(async () => {}), materializeAlbumPhoto: materialize });
+
+    await expect(service.openReadableAlbumFolder(key, album.albumId)).resolves.toMatchObject({ exportedCount: 0, failedCount: 1, totalCount: 1, complete: false });
+    expect(materialize).toHaveBeenCalledWith(expect.objectContaining({ viewFileName: storedName }));
+    expect(catalog.saveReadablePhotoName).not.toHaveBeenCalled();
+  });
+
+  it('exports newly archived photos after the canonical catalog save without changing saved status on copy failure', async () => {
+    const canonical = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), byteCount: 3, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = {
+      beginPhotoScan: vi.fn(async () => 4), appendPhotoPage: vi.fn(async () => ({ nextOrdinal: 1, complete: true })),
+      photoScan: vi.fn(async () => null), savedPhoto: vi.fn(async () => null), savePhoto: vi.fn(async () => {}),
+      getAlbum: vi.fn(async () => album), photoWithOrdinal: vi.fn(async () => ({ ...photo, scanOrdinal: 0 })),
+      ensureReadableFolderName: vi.fn(async (_key: ConversationKey, _albumId: string, name: string) => name),
+      readablePhotoName: vi.fn(async () => null), saveReadablePhotoName: vi.fn(async () => {}),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const { service, store } = await setup({ catalog }, { ensureAlbumFolder: vi.fn(async () => {}), inspectAlbumPhoto: vi.fn(async () => null),
+      publishAlbumPhoto: vi.fn(async () => canonical), ensureReadableAlbumFolder: vi.fn(async () => {}),
+      materializeAlbumPhoto: vi.fn(async () => { throw Object.assign(new Error('edited readable file'), { code: 'NO_REPLACE_CONFLICT' }); }) });
+
+    await expect(service.openAlbum(key, album.albumId)).resolves.toMatchObject({ savedCount: 1, failedCount: 0, complete: true });
+    expect(catalog.savePhoto).toHaveBeenCalledOnce();
+    expect(store.materializeAlbumPhoto).toHaveBeenCalledOnce();
+    expect(catalog.saveReadablePhotoName).not.toHaveBeenCalled();
+  });
+
+  it('materializes a readable copy after an explicit photo download', async () => {
+    const canonical = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), byteCount: 3, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = {
+      savedPhoto: vi.fn(async () => null), savePhoto: vi.fn(async () => {}), getAlbum: vi.fn(async () => album),
+      photoWithOrdinal: vi.fn(async () => ({ ...photo, scanOrdinal: 0 })),
+      ensureReadableFolderName: vi.fn(async (_key: ConversationKey, _albumId: string, name: string) => name),
+      readablePhotoName: vi.fn(async () => null), saveReadablePhotoName: vi.fn(async () => {}),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const materialize = vi.fn(async () => ({ unchanged: false }));
+    const { service } = await setup({ catalog }, { inspectAlbumPhoto: vi.fn(async () => null),
+      publishAlbumPhoto: vi.fn(async () => canonical), ensureReadableAlbumFolder: vi.fn(async () => {}), materializeAlbumPhoto: materialize });
+
+    await expect(service.downloadAlbumPhoto(key, album.albumId, photo.photoId, photo.oid, photo.prefix)).resolves.toMatchObject({ sizeBytes: 3 });
+    expect(catalog.savePhoto).toHaveBeenCalledOnce();
+    expect(materialize).toHaveBeenCalledOnce();
+    expect(catalog.saveReadablePhotoName).toHaveBeenCalledOnce();
+  });
+
   async function setup(overrides: Partial<ChatResourceArchiveDependencies> = {}, storeOverrides: Partial<ChatResourceStore> = {}) {
     const { readChatResource: readOverride, ...dependencyOverrides } = overrides;
     const revisions = new Map<string, ChatResourceArchiveVersion[]>();

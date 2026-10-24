@@ -46,6 +46,10 @@ internal static class ChatResourceArchiveHost {
     [DataMember(Name="limit")] public int limit=0;
     [DataMember(Name="cursor")] public string cursor="";
     [DataMember(Name="stageId")] public string stageId="";
+    [DataMember(Name="canonicalFileName")] public string canonicalFileName="";
+    [DataMember(Name="viewFolderName")] public string viewFolderName="";
+    [DataMember(Name="viewFileName")] public string viewFileName="";
+    [DataMember(Name="expectedHash")] public string expectedHash="";
   }
   [DataContract] sealed class Entry {
     [DataMember(Name="resourceId")] public string resourceId="";
@@ -170,7 +174,7 @@ internal static class ChatResourceArchiveHost {
     if(info.VolumeSerialNumber.ToString()!=request.volumeSerial||id.ToString("x16")!=request.fileId) throw new Failure("CHAT_IDENTITY_CHANGED");
     Stage="RESOURCE_DIRECTORY";
     uint resourceAccess=FileTraverse|FileListDirectory|FileReadAttributes|FileAddFile; if(request.kind=="album-photo") resourceAccess|=FileAddSubdirectory;
-    try { SafeFileHandle directory=OpenRelative(current,KindDirectory(request.kind),true,(request.op=="stage"||request.op=="album-open")?FileOpenIf:FileOpen,resourceAccess,0,ShareReadWrite); opened.Add(directory);
+    try { SafeFileHandle directory=OpenRelative(current,KindDirectory(request.kind),true,(request.op=="stage"||request.op=="album-open"||request.op=="readable-folder-open")?FileOpenIf:FileOpen,resourceAccess,0,ShareReadWrite); opened.Add(directory);
       if(request.kind!="album-photo") return directory;
       if(!System.Text.RegularExpressions.Regex.IsMatch(request.albumKey??"", "^[0-9a-f]{64}$")) throw new Failure("INVALID_ALBUM_KEY");
       try { SafeFileHandle album=OpenRelative(directory,request.albumKey,true,(request.op=="stage"||request.op=="album-open")?FileOpenIf:FileOpen,FileTraverse|FileListDirectory|FileReadAttributes|FileAddFile,0,ShareReadWrite); opened.Add(album); return album; }
@@ -226,6 +230,55 @@ internal static class ChatResourceArchiveHost {
     throw new Failure("UNSUPPORTED_MEDIA");
   }
   static bool ValidPayload(string kind,string extension,byte[] content) { try { return PayloadExtension(kind,content)==extension; } catch { return false; } }
+  static string ReadableExtension(string name) { string extension=Path.GetExtension(name).TrimStart('.').ToLowerInvariant(); return extension=="jpg"||extension=="png"||extension=="webp"||extension=="gif"?extension:null; }
+  static void ValidateReadableNames(Request request) {
+    ValidateReadableFolderName(request.viewFolderName); ValidateName(request.viewFileName); ValidateName(request.canonicalFileName);
+    if(request.viewFileName.Length>240||!System.Text.RegularExpressions.Regex.IsMatch(request.viewFileName,"^LINE_ALBUM_[^\\\\/:*?\"<>|\\x00-\\x1f]{1,56}_[0-9]{8}_[0-9]{4,6}_[0-9a-f]{10}\\.(jpg|png|webp|gif)$")
+      ||!System.Text.RegularExpressions.Regex.IsMatch(request.expectedHash??"","^[0-9a-f]{64}$")) throw new Failure("INVALID_READABLE_EXPORT");
+  }
+  static void ValidateReadableFolderName(string name) {
+    ValidateName(name); if(name.Length>96||!System.Text.RegularExpressions.Regex.IsMatch(name,"^[^\\\\/:*?\"<>|\\x00-\\x1f]{1,80}__[0-9a-f]{10}$")) throw new Failure("INVALID_READABLE_EXPORT");
+  }
+  static string Hash(byte[] payload) { using(SHA256 sha=SHA256.Create()) return Hex(sha.ComputeHash(payload)); }
+  static Result ExportReadablePhoto(SafeFileHandle archiveDirectory,Request request,List<SafeFileHandle> opened) {
+    Stage="READABLE_VALIDATE"; ValidateReadableNames(request);
+    List<CommitItem> commits=ValidCommits(archiveDirectory,ResourceKey(request)); CommitItem sourceRecord=null;
+    foreach(CommitItem item in commits) if(item.record==request.canonicalFileName) sourceRecord=item;
+    if(sourceRecord==null||sourceRecord.commit.kind!="photo"||sourceRecord.commit.contentHash!=request.expectedHash||sourceRecord.commit.byteLength>20*1024*1024) throw new Failure("ARCHIVE_RECORD_MISSING");
+    Stage="READABLE_SOURCE"; SafeFileHandle source=OpenRelative(archiveDirectory,request.canonicalFileName,false,FileOpen,GenericRead|Delete,0,ShareRead); opened.Add(source);
+    if(HandleIdentity(source)!=sourceRecord.identity) throw new Failure("CONTENT_INVALID");
+    byte[] content=ReadRecordFromHandle(source); if(content==null||content.Length!=sourceRecord.commit.byteLength||Hash(content)!=request.expectedHash
+      ||ReadableExtension(request.canonicalFileName)!=PayloadExtension("album-photo",content)) throw new Failure("CONTENT_INVALID");
+    SafeFileHandle chat=opened[opened.Count-4]; Stage="READABLE_DIRECTORY";
+    SafeFileHandle readableRoot=OpenRelative(chat,"saved-albums",true,FileOpenIf,FileTraverse|FileListDirectory|FileReadAttributes|FileAddFile,0,ShareReadWrite); opened.Add(readableRoot);
+    SafeFileHandle view=OpenRelative(readableRoot,request.viewFolderName,true,FileOpenIf,FileTraverse|FileListDirectory|FileReadAttributes|FileAddFile,0,ShareReadWrite); opened.Add(view);
+    try {
+      Stage="READABLE_EXISTING";
+      try {
+        using(SafeFileHandle existing=OpenRelative(view,request.viewFileName,false,FileOpen,GenericRead,0,ShareRead)) {
+          byte[] old=ReadRecordFromHandle(existing); if(old!=null&&Hash(old)==request.expectedHash&&ReadableExtension(request.viewFileName)==PayloadExtension("album-photo",old))
+            return new Result{requestId=request.requestId,ok=true,unchanged=true};
+          throw new Failure("NO_REPLACE_CONFLICT");
+        }
+      } catch(Win32Exception error) { if(error.NativeErrorCode!=2) throw; }
+      PauseBoundary("readable-copy",request.viewFileName);
+      Stage="READABLE_STAGE"; string temporaryName="."+Guid.NewGuid().ToString("N")+".part";
+      using(SafeFileHandle temporary=OpenRelative(view,temporaryName,false,FileCreate,GenericRead|GenericWrite|Delete,FileDeleteOnClose,0x5)) {
+        using(SafeFileHandle output=Duplicate(temporary)) using(FileStream stream=new FileStream(output,FileAccess.Write,65536,false)) { stream.Write(content,0,content.Length); stream.Flush(); }
+        if(!FlushFileBuffers(temporary)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        byte[] copied=ReadRecordFromHandle(temporary); if(copied==null||copied.Length!=content.Length||Hash(copied)!=request.expectedHash) throw new Failure("COPY_VERIFY_FAILED");
+        Stage="READABLE_PUBLISH"; int status=LinkNoReplace(temporary,view,request.viewFileName);
+        if(status==StatusNameCollision||status==StatusNameExists) throw new Failure("NO_REPLACE_CONFLICT"); if(status<0) FailNt(status);
+      }
+      return new Result{requestId=request.requestId,ok=true,unchanged=false};
+    } finally { view.Dispose(); opened.Remove(view); }
+  }
+  static Result EnsureReadableFolder(Request request,List<SafeFileHandle> opened) {
+    ValidateReadableFolderName(request.viewFolderName); Stage="READABLE_DIRECTORY";
+    SafeFileHandle chat=opened[opened.Count-2]; SafeFileHandle readableRoot=OpenRelative(chat,"saved-albums",true,FileOpenIf,FileTraverse|FileListDirectory|FileReadAttributes|FileAddFile,0,ShareReadWrite); opened.Add(readableRoot);
+    SafeFileHandle view=OpenRelative(readableRoot,request.viewFolderName,true,FileOpenIf,FileTraverse|FileListDirectory|FileReadAttributes|FileAddFile,0,ShareReadWrite);
+    opened.Add(view); return new Result{requestId=request.requestId,ok=true};
+  }
   static string RecordName(string key,long revision,string savedAt,string hash,string extension) { return "record_"+key+"_"+revision.ToString("D20")+"_"+FileSavedAt(savedAt)+"_"+hash+"."+extension; }
   static Commit ReadRecord(SafeFileHandle directory,string name,out byte[] payload,out string identity) {
     payload=null; identity=null; System.Text.RegularExpressions.Match match=System.Text.RegularExpressions.Regex.Match(name,"^record_([napf]_[A-Za-z0-9_-]+)_([0-9]{20})_([0-9]{8}T[0-9]{9}Z)_([0-9a-f]{64})\\.(md|json|jpg|png|webp|gif)$");
@@ -274,13 +327,15 @@ internal static class ChatResourceArchiveHost {
     payload=null; List<SafeFileHandle> opened=new List<SafeFileHandle>(); bool keepOpened=false;
     try {
       string key=String.IsNullOrEmpty(request.resourceId)?null:ResourceKey(request);
-      if(request.op!="list"&&request.op!="album-open"&&key==null) throw new Failure("INVALID_RESOURCE_ID");
+      if(request.op!="list"&&request.op!="album-open"&&request.op!="readable-folder-open"&&key==null) throw new Failure("INVALID_RESOURCE_ID");
       SafeFileHandle directory=OpenChat(root,request,opened);
       if(directory==null) {
         if(request.op=="read"||request.op=="contains") return new Result{requestId=request.requestId,ok=true,revision=0,payloadLength=0};
         if(request.op=="list") return new Result{requestId=request.requestId,ok=true,items=new Entry[0],nextCursor=""};
         throw new Failure("RESOURCE_DIRECTORY_MISSING");
       }
+      if(request.op=="readable-folder-open") return EnsureReadableFolder(request,opened);
+      if(request.op=="readable-export") return ExportReadablePhoto(directory,request,opened);
       if(request.op=="album-open") return new Result{requestId=request.requestId,ok=true};
       List<CommitItem> commits=ValidCommits(directory,key); CommitItem latest=commits.Count==0?null:commits[commits.Count-1];
       if(request.op=="contains") return new Result{requestId=request.requestId,ok=true,revision=latest==null?0:latest.commit.revision,

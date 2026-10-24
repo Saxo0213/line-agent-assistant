@@ -27,6 +27,7 @@ function api(): ChatResourceApi {
     listChatAlbumPhotos: vi.fn(async () => ({ photos: [photo], nextCursor: null })),
     downloadChatAlbumPhoto: vi.fn(async () => ({ albumId: album.albumId, photoId: photo.photoId, sizeBytes: 1200 })),
     openChatAlbum: vi.fn(async () => ({ albumId: album.albumId, savedCount: 1, failedCount: 0, totalCount: 1, byteCount: 1200, complete: true, failureCodes: [], errorCode: null })),
+    openReadableChatAlbumFolder: vi.fn(async () => ({ exportedCount: 1, failedCount: 0, totalCount: 1, complete: true, failureCodes: [], opened: true })),
     cancelChatResourceRequest: vi.fn(async () => true),
   };
 }
@@ -150,6 +151,17 @@ describe('ChatResources', () => {
     await waitFor(() => expect(client.listChatAlbumPhotos).toHaveBeenCalledTimes(2));
     expect(client.openChatAlbum).not.toHaveBeenCalled();
     expect(screen.queryByText('Saving album photos…')).toBeNull();
+  });
+
+  it('opens the saved readable folder for a selected group album and reports partial exports', async () => {
+    const client = api();
+    client.openReadableChatAlbumFolder = vi.fn(async () => ({ exportedCount: 1, failedCount: 1, totalCount: 2, complete: false, failureCodes: ['NO_REPLACE_CONFLICT'], opened: true }));
+    renderControls(client);
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Open saved album folder' }));
+    await waitFor(() => expect(client.openReadableChatAlbumFolder).toHaveBeenCalledWith(route, album.albumId, expect.any(String)));
+    expect(await screen.findByRole('status')).toHaveProperty('textContent', 'Saved 1 of 2; 1 could not be exported.');
   });
 
   it('marks an explicit album photo refresh as a LINE refresh request', async () => {

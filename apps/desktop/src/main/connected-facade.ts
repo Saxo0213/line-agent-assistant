@@ -2481,6 +2481,17 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           failureCodes: result.failureCodes, errorCode: result.errorCode,
           ...(result.failureContext ? { failureContext: result.failureContext } : {}) };
       }
+      if (request.type === 'openReadableChatAlbumFolder') {
+        const result = await chatResources.dispatchIpc(request, signal);
+        const folder = await chatFolders.resolveExisting(request.accountId, request.chatType, request.chatId);
+        if (!folder) return failure(request.requestId, 'CHAT_FOLDER_NOT_FOUND', '找不到這個聊天室資料夾。');
+        const parent = path.join(folder.path, 'saved-albums', result.folderName);
+        const open = options.openFolderPath ?? options.openAttachmentPath;
+        const opened = open ? (await open(parent)) === '' : false;
+        return { type: request.type, requestId: request.requestId, ok: true, albumId: result.albumId,
+          exportedCount: result.exportedCount, failedCount: result.failedCount, totalCount: result.totalCount,
+          complete: result.complete, failureCodes: result.failureCodes, folderName: result.folderName, opened };
+      }
       if (request.type === 'getAutoResponderSettings') {
         return { type: request.type, requestId, ok: true, settings: await autoresponders.get() };
       }
@@ -2981,6 +2992,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     async listChatAlbumPhotos(key, albumId, cursor, refresh) { return chatResources.listAlbumPhotos(key, albumId, cursor, undefined, refresh); },
     async downloadChatAlbumPhoto(key, albumId, photoId, oid, prefix) { return chatResources.downloadAlbumPhoto(key, albumId, photoId, oid, prefix); },
     async openChatAlbum(key, albumId, signal) { return chatResources.openAlbum(key, albumId, signal); },
+    async openReadableChatAlbumFolder(key, albumId, signal) { return chatResources.openReadableAlbumFolder(key, albumId, signal); },
     async listAttachmentStates(key, attachmentIds) {
       return messages.listAttachmentStates(key, attachmentIds, conversationSettings.attachmentAutoAttemptLimit);
     },
@@ -3091,6 +3103,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       { operation: 'album_photos', identity: { accountId: key.accountId } }),
     downloadChatAlbumPhoto: (...args) => admitted(() => chatResources.downloadAlbumPhoto(...args), { operation: 'photo_download', identity: { accountId: args[0].accountId } }),
     openChatAlbum: (...args) => admitted(() => chatResources.openAlbum(...args), { operation: 'chat_resource', identity: { accountId: args[0].accountId } }),
+    openReadableChatAlbumFolder: (...args) => admitted(() => chatResources.openReadableAlbumFolder(...args), { operation: 'chat_resource', identity: { accountId: args[0].accountId } }),
     listAttachmentStates: (...args) => admitted(() => facade.listAttachmentStates(...args), { operation: 'attachment', identity: { accountId: args[0].accountId } }),
     listAgentStatuses: (...args) => admitted(() => facade.listAgentStatuses(...args), { operation: 'agent', identity: { accountId: args[0].accountId } }),
     listWorkRecords: (...args) => admitted(() => facade.listWorkRecords(...args), { operation: 'agent' }),

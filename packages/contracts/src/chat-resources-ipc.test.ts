@@ -34,6 +34,13 @@ describe('chat resource IPC contracts', () => {
       savedCount: 501, failedCount: 0, totalCount: 501, byteCount: 0, complete: true, failureCodes: [], errorCode: null }).success).toBe(false);
   });
 
+  it('accepts readable album folder actions without accepting renderer paths', () => {
+    expect(IpcRequestSchema.safeParse({ type: 'openReadableChatAlbumFolder', ...base, albumId: 'album-1' }).success).toBe(true);
+    expect(IpcRequestSchema.safeParse({ type: 'openReadableChatAlbumFolder', ...base, albumId: 'album-1', path: 'C:\\private' }).success).toBe(false);
+    expect(IpcResultSchema.safeParse({ type: 'openReadableChatAlbumFolder', requestId: base.requestId, ok: true, albumId: 'album-1',
+      exportedCount: 1, failedCount: 1, totalCount: 2, complete: false, failureCodes: ['NO_REPLACE_CONFLICT'], folderName: 'Trip__0123456789', opened: true }).success).toBe(true);
+  });
+
   it('accepts only bounded display DTOs and download metadata', () => {
     expect(IpcResultSchema.safeParse({ type: 'listChatNotes', requestId: 'request-1', ok: true, notes: [
       { postId: 'post-1', createdTime: null, text: null, content: { value: 'plain data' } },

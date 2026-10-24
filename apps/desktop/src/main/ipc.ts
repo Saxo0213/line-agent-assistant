@@ -6,7 +6,7 @@ import { DesktopReadRequestSchema, DesktopReadResultSchema } from '../desktop-pr
 
 type Sender = { senderId: number; url: string };
 type IpcFacade = Pick<DesktopServiceFacade, 'dispatch'> & Partial<Pick<DesktopServiceFacade, 'openAttachment' | 'downloadAttachment'>>;
-const RESOURCE_REQUEST_TYPES = new Set(['listChatNotes', 'getChatNote', 'listChatAlbums', 'listChatAlbumPhotos', 'downloadChatAlbumPhoto', 'openChatAlbum']);
+const RESOURCE_REQUEST_TYPES = new Set(['listChatNotes', 'getChatNote', 'listChatAlbums', 'listChatAlbumPhotos', 'downloadChatAlbumPhoto', 'openChatAlbum', 'openReadableChatAlbumFolder']);
 const MAX_ACTIVE_CHAT_RESOURCE_REQUESTS = 32;
 type AdapterOptions = { webContentsId: number; rendererUrl: string; service?: IpcFacade; resolveService?: () => IpcFacade;
   onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void;

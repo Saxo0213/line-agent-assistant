@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { AlbumFailureContextDto, ConversationKey, InboundEnvelope } from '@line-agent/contracts';
 import type { OperationalAudit } from './operational-audit.js';
 import type { ChatAlbumCatalogAlbum, ChatAlbumCatalogPhoto, ChatAlbumCatalogBinding, ChatAlbumSavedFile } from '@line-agent/database';
+import { readableAlbumDirectoryName, readableAlbumPhotoName } from './album-readable-view.js';
 
 export const CHAT_RESOURCE_PAGE_LIMIT = 50;
 export const CHAT_RESOURCE_PHOTO_LIMIT = 50;
@@ -69,6 +70,7 @@ export type ChatResourceArchivePage = { items: ChatResourceArchiveItem[]; nextCu
 export type AlbumOpenResult = { albumId: string; savedCount: number; failedCount: number; totalCount: number; byteCount: number;
   complete: boolean; failureCodes: string[]; errorCode: string | null; nextCursor: string | null; nextPhotoIndex: number;
   failureContext?: AlbumFailureContext };
+export type ReadableAlbumFolderResult = { albumId: string; folderName: string; exportedCount: number; failedCount: number; totalCount: number; complete: boolean; failureCodes: string[] };
 
 /** Main-facing boundary implemented by the one bounded native archive owner. Paths never cross this seam.
  * `publish` stages first, invokes guard immediately before final commit, and serializes commit/cancel messages. */
@@ -83,6 +85,9 @@ export interface ChatResourceStore {
   hasAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; signal: AbortSignal; guard: () => void }): Promise<boolean>;
   publishAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; content: Uint8Array; signal: AbortSignal;
     guard: () => void }): Promise<ChatResourceAlbumPhotoFile | void>;
+  materializeAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; canonicalFile: ChatResourceAlbumPhotoFile;
+    viewFolderName: string; viewFileName: string; signal: AbortSignal; guard: () => void }): Promise<{ unchanged: boolean }>;
+  ensureReadableAlbumFolder?(input: { key: ConversationKey; viewFolderName: string; signal: AbortSignal; guard: () => void }): Promise<void>;
   close(): Promise<void>;
   /** Synchronously terminates the bounded native owner after close/drain grace expires. */
   forceClose(): void;
@@ -102,6 +107,17 @@ export type ChatResourceArchiveDependencies = {
     photoScan(key: ConversationKey, albumId: string): Promise<{ complete: boolean; generation: number; cursor: string | null; previousCursor: string | null; nextOrdinal: number } | null>;
     listPhotos(key: ConversationKey, albumId: string, cursor: string | null, limit?: number): Promise<{ items: ChatAlbumCatalogPhoto[]; nextCursor: string | null }>;
     savedPhoto(key: ConversationKey, albumId: string, photoId: string): Promise<ChatAlbumSavedFile | null>;
+    getAlbum?(key: ConversationKey, albumId: string): Promise<ChatAlbumCatalogAlbum | null>;
+    ensureReadableFolderName?(key: ConversationKey, albumId: string, candidate: string, binding: ChatAlbumCatalogBinding): Promise<string>;
+    saveReadablePhotoName?(key: ConversationKey, albumId: string, photoId: string, fileName: string, binding: ChatAlbumCatalogBinding): Promise<void>;
+    readablePhotoName?(key: ConversationKey, albumId: string, photoId: string): Promise<string | null>;
+    listPhotosWithOrdinal?(key: ConversationKey, albumId: string, cursor: string | null, limit?: number): Promise<{ items: Array<ChatAlbumCatalogPhoto & { scanOrdinal: number }>; nextCursor: string | null }>;
+    listSavedPhotosForReadableReconciliation?(key: ConversationKey, albumId: string, cursor: string | null, limit?: number): Promise<{ items: Array<ChatAlbumCatalogPhoto & { scanOrdinal: number }>; nextCursor: string | null }>;
+    readableExportState?(key: ConversationKey, albumId: string): Promise<{ cursor: number; sweepFailed: boolean }>;
+    saveReadableExportProgress?(key: ConversationKey, albumId: string, expectedCursor: number, expectedFailed: boolean, cursor: number, sweepFailed: boolean,
+      binding: ChatAlbumCatalogBinding): Promise<void>;
+    hasPhotosNeedingReadableExport?(key: ConversationKey, albumId: string): Promise<boolean>;
+    photoWithOrdinal?(key: ConversationKey, albumId: string, photoId: string): Promise<(ChatAlbumCatalogPhoto & { scanOrdinal: number }) | null>;
     savePhoto(key: ConversationKey, albumId: string, photoId: string, file: ChatAlbumSavedFile, binding: ChatAlbumCatalogBinding): Promise<void>;
     clearSavedPhoto(key: ConversationKey, albumId: string, photoId: string, binding: ChatAlbumCatalogBinding): Promise<void>;
   };
@@ -143,7 +159,7 @@ export function chatResourcePhotoPageId(albumId: string, cursor: string | null):
 export function chatResourcePhotoId(albumId: string, photoId: string): string {
   return createHash('sha256').update(JSON.stringify([boundedId(albumId, 'album ID'), boundedId(photoId, 'photo ID')])).digest('hex');
 }
-export type ChatResourceIpcRequest = ConversationKey & { requestId: string; type: 'listChatNotes' | 'getChatNote' | 'listChatAlbums' | 'listChatAlbumPhotos' | 'downloadChatAlbumPhoto' | 'openChatAlbum';
+export type ChatResourceIpcRequest = ConversationKey & { requestId: string; type: 'listChatNotes' | 'getChatNote' | 'listChatAlbums' | 'listChatAlbumPhotos' | 'downloadChatAlbumPhoto' | 'openChatAlbum' | 'openReadableChatAlbumFolder';
   cursor?: string | null; postId?: string; albumId?: string; photoId?: string; oid?: string; prefix?: string; refresh?: boolean };
 
 /** Fails closed until the handle-anchored native archive adapter is supplied by the desktop host. */
@@ -312,9 +328,10 @@ export class ChatResourceArchiveService {
   dispatchIpc(request: ChatResourceIpcRequest & { type: 'listChatAlbumPhotos' }, signal?: AbortSignal): Promise<{ photos: PhotoDto[]; nextCursor: string | null }>;
   dispatchIpc(request: ChatResourceIpcRequest & { type: 'downloadChatAlbumPhoto' }, signal?: AbortSignal): Promise<{ albumId: string; photoId: string; sizeBytes: number }>;
   dispatchIpc(request: ChatResourceIpcRequest & { type: 'openChatAlbum' }, signal?: AbortSignal): Promise<AlbumOpenResult>;
+  dispatchIpc(request: ChatResourceIpcRequest & { type: 'openReadableChatAlbumFolder' }, signal?: AbortSignal): Promise<ReadableAlbumFolderResult>;
   async dispatchIpc(request: ChatResourceIpcRequest, signal?: AbortSignal): Promise<{ notes: NoteDto[]; nextCursor: string | null } | { note: NoteDto }
     | { albums: AlbumDto[]; nextCursor: string | null } | { photos: PhotoDto[]; nextCursor: string | null }
-    | { albumId: string; photoId: string; sizeBytes: number } | AlbumOpenResult> {
+    | { albumId: string; photoId: string; sizeBytes: number } | AlbumOpenResult | ReadableAlbumFolderResult> {
     const key = chatResourceConversationKey(request);
     if (request.type === 'listChatNotes') return this.listNotes(key, request.cursor ?? null, signal);
     if (request.type === 'getChatNote') return { note: await this.getNote(key, request.postId ?? '', signal) };
@@ -322,6 +339,7 @@ export class ChatResourceArchiveService {
     if (request.type === 'listChatAlbumPhotos') return this.listAlbumPhotos(key, request.albumId ?? '', request.cursor ?? null, signal, request.refresh === true);
     if (request.type === 'downloadChatAlbumPhoto') return this.downloadAlbumPhoto(key, request.albumId ?? '', request.photoId ?? '', request.oid ?? '', request.prefix ?? '', signal);
     if (request.type === 'openChatAlbum') return this.openAlbum(key, request.albumId ?? '', signal);
+    if (request.type === 'openReadableChatAlbumFolder') return this.openReadableAlbumFolder(key, request.albumId ?? '', signal);
     throw new Error('Unsupported chat resource request.');
   }
 
@@ -544,6 +562,7 @@ export class ChatResourceArchiveService {
       this.assertCurrent(key.accountId, generation, requestBinding, signal);
       const nextOrdinal = page.nextCursor === null ? scan.nextOrdinal - 1 : Number(page.nextCursor);
       const nextCursor = page.nextCursor !== null || !scan.complete ? encodeCatalogCursor('db-photo:', scan.generation, nextOrdinal) : null;
+      if (cursor === null) await this.reconcileReadableAlbumOnAlbumOpen(key, id, signal, generation);
       return { photos: page.items, nextCursor };
     }
     const { value, binding } = await this.read(key, 'listAlbumPhotos', { albumId: id, cursor, limit: CHAT_RESOURCE_PHOTO_LIMIT }, signal, generation);
@@ -666,6 +685,7 @@ export class ChatResourceArchiveService {
             : null;
           if (existing) {
             if (catalog && !sameAlbumSavedFile(saved, existing)) await catalog.savePhoto(key, albumId, photo.photoId, existing, firstBinding);
+            await this.exportReadablePhotoBestEffort(key, albumId, photo.photoId, existing, firstBinding, signal, generation, source);
             guard(); savedCount += 1; continue;
           }
           if (!store.inspectAlbumPhoto && store.hasAlbumPhoto && await store.hasAlbumPhoto({ key, albumId, photoId: photo.photoId, signal, guard })) {
@@ -688,6 +708,7 @@ export class ChatResourceArchiveService {
           failureStage = 'archive_write';
           const archived = await store.publishAlbumPhoto({ key, albumId, photoId: photo.photoId, content: image, signal, guard: () => this.assertCurrent(key.accountId, generation, binding, signal) });
           if (catalog && archived) await catalog.savePhoto(key, albumId, photo.photoId, archived, binding);
+          if (archived) await this.exportReadablePhotoBestEffort(key, albumId, photo.photoId, archived, binding, signal, generation, source);
           guard(); savedCount += 1;
           this.recordAlbumPhotoOutcome(key, 'succeeded');
         } catch (error) {
@@ -728,6 +749,148 @@ export class ChatResourceArchiveService {
       nextCursor: stopCode === 'PAGE_LIMIT' || stopCode === 'BYTE_LIMIT' ? cursor : null, nextPhotoIndex,
       ...(failureContext ? { failureContext } : {}) };
   }
+
+  openReadableAlbumFolder(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<ReadableAlbumFolderResult> {
+    const id = boundedId(albumId, 'album ID');
+    return this.admit(key, signal, (operationSignal, generation) => this.openReadableAlbumFolderImpl(key, id, operationSignal, generation));
+  }
+
+  private async reconcileReadableAlbumOnAlbumOpen(key: ConversationKey, albumId: string, signal: AbortSignal, generation: number): Promise<void> {
+    const catalog = this.deps.catalog, store = this.deps.store;
+    if (!catalog?.getAlbum || !catalog.ensureReadableFolderName || !catalog.listSavedPhotosForReadableReconciliation || !catalog.readableExportState
+      || !catalog.saveReadableExportProgress || !catalog.hasPhotosNeedingReadableExport || !catalog.readablePhotoName
+      || !catalog.saveReadablePhotoName || !catalog.savedPhoto || !catalog.savePhoto || !store?.ensureReadableAlbumFolder
+      || !store.materializeAlbumPhoto || !store.inspectAlbumPhoto) return;
+    try {
+      await this.openReadableAlbumFolderImpl(key, albumId, signal, generation);
+    } catch (error) {
+      if (signal.aborted || generation !== (this.accountGeneration.get(key.accountId) ?? 0) || this.stopped) throw error;
+      this.logDiagnostic({ source: 'modal', accountId: key.accountId, chatId: key.chatId, albumId, action: 'album_photos',
+        occurredAt: new Date().toISOString(), durationMs: 0, status: 'failure', errorCode: diagnosticErrorCode(error),
+        failureStage: 'archive_write', failureReason: 'photo_write_failed', failureCategory: 'unknown', itemCount: 0, byteCount: 0, responseFields: [] });
+    }
+  }
+
+  private async exportReadablePhotoBestEffort(key: ConversationKey, albumId: string, photoId: string, canonicalFile: ChatAlbumSavedFile,
+    binding: ChatResourceBinding, signal: AbortSignal, generation: number, source: 'modal' | 'notification'): Promise<void> {
+    const catalog = this.deps.catalog, store = this.deps.store;
+    if (!catalog?.getAlbum || !catalog.ensureReadableFolderName || !catalog.photoWithOrdinal || !catalog.readablePhotoName || !catalog.saveReadablePhotoName
+      || !store?.ensureReadableAlbumFolder || !store.materializeAlbumPhoto) return;
+    const guard = () => this.assertCurrent(key.accountId, generation, binding, signal);
+    try {
+      guard();
+      const [album, photo] = await Promise.all([catalog.getAlbum(key, albumId), catalog.photoWithOrdinal(key, albumId, photoId)]);
+      if (!album || !photo) return;
+      const folderName = await catalog.ensureReadableFolderName(key, albumId, readableAlbumDirectoryName(album.title, albumId), binding);
+      guard();
+      await store.ensureReadableAlbumFolder({ key, viewFolderName: folderName, signal, guard });
+      const extension = /\.(jpg|png|webp|gif)$/.exec(canonicalFile.fileName)?.[1];
+      if (!extension) throw new Error('INVALID_IMAGE_EXTENSION');
+      const storedName = await catalog.readablePhotoName(key, albumId, photoId);
+      const fileName = storedName ?? readableAlbumPhotoName({ title: folderName.slice(0, -12), shotTime: photo.shotTime,
+        sequence: photo.scanOrdinal + 1, photoId, extension });
+      await store.materializeAlbumPhoto({ key, albumId, photoId, canonicalFile, viewFolderName: folderName, viewFileName: fileName, signal, guard });
+      guard(); await catalog.saveReadablePhotoName(key, albumId, photoId, fileName, binding);
+    } catch (error) {
+      if (signal.aborted || generation !== (this.accountGeneration.get(key.accountId) ?? 0) || this.stopped || !this.deps.isCurrentBinding(binding)) return;
+      this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, albumId, action: 'album_photos', occurredAt: new Date().toISOString(),
+        durationMs: 0, status: 'failure', errorCode: diagnosticErrorCode(error), failureStage: 'archive_write', failureReason: 'photo_write_failed',
+        failureCategory: 'unknown', itemCount: 1, byteCount: canonicalFile.byteCount, responseFields: [] });
+    }
+  }
+
+  private async openReadableAlbumFolderImpl(key: ConversationKey, albumId: string, signal: AbortSignal, generation: number): Promise<ReadableAlbumFolderResult> {
+    const binding = await this.authorize(key, signal, generation);
+    const catalog = this.deps.catalog, store = this.deps.store;
+    if (!catalog?.getAlbum || !catalog.ensureReadableFolderName || !catalog.listSavedPhotosForReadableReconciliation || !catalog.readableExportState
+      || !catalog.saveReadableExportProgress || !catalog.hasPhotosNeedingReadableExport || !catalog.readablePhotoName
+      || !catalog.saveReadablePhotoName || !catalog.savedPhoto || !catalog.savePhoto || !store?.ensureReadableAlbumFolder
+      || !store.materializeAlbumPhoto || !store.inspectAlbumPhoto) throw new Error('READABLE_ALBUM_EXPORT_UNAVAILABLE');
+    const album = await catalog.getAlbum(key, albumId);
+    if (!album) throw new Error('ALBUM_NOT_FOUND');
+    const folderName = await catalog.ensureReadableFolderName(key, albumId, readableAlbumDirectoryName(album.title, albumId), binding);
+    const guard = () => this.assertCurrent(key.accountId, generation, binding, signal);
+    guard(); await store.ensureReadableAlbumFolder({ key, viewFolderName: folderName, signal, guard });
+    const initialProgress = await catalog.readableExportState(key, albumId);
+    let scanCursor = initialProgress.cursor, sweepFailed = initialProgress.sweepFailed;
+    let persistedCursor = scanCursor, persistedFailed = sweepFailed;
+    if (scanCursor < 0 && sweepFailed) {
+      await catalog.saveReadableExportProgress!(key, albumId, persistedCursor, persistedFailed, -1, false, binding);
+      persistedFailed = false; sweepFailed = false;
+    }
+    const saveProgress = async (cursor: number, failed: boolean) => {
+      guard();
+      await catalog.saveReadableExportProgress!(key, albumId, persistedCursor, persistedFailed, cursor, failed, binding);
+      persistedCursor = cursor; persistedFailed = failed; scanCursor = cursor; sweepFailed = failed;
+    };
+    let pageCount = 0, visited = 0, totalCount = 0, exportedCount = 0, failedCount = 0;
+    let complete = true;
+    const failureCodes: string[] = [];
+    const displayTitle = folderName.slice(0, -12);
+    while (true) {
+      guard();
+      if (pageCount >= MAX_ALBUM_OPEN_PAGES || visited >= CHAT_RESOURCE_ALBUM_OPEN_ITEM_LIMIT) {
+        complete = false; failureCodes.push('PAGE_LIMIT'); break;
+      }
+      const page = await catalog.listSavedPhotosForReadableReconciliation(key, albumId, scanCursor < 0 ? null : String(scanCursor), CHAT_RESOURCE_PHOTO_LIMIT);
+      if (page.items.length === 0) {
+        if (scanCursor >= 0) {
+          await saveProgress(-1, sweepFailed);
+          complete = false; failureCodes.push('PENDING_RETRY');
+        } else if (sweepFailed || await catalog.hasPhotosNeedingReadableExport(key, albumId)) {
+          complete = false; failureCodes.push('PENDING_RETRY');
+        }
+        break;
+      }
+      pageCount += 1;
+      for (const photo of page.items) {
+        if (visited >= CHAT_RESOURCE_ALBUM_OPEN_ITEM_LIMIT) { complete = false; failureCodes.push('PAGE_LIMIT'); break; }
+        visited += 1;
+        guard();
+        scanCursor = photo.scanOrdinal;
+        try {
+          let saved = await catalog.savedPhoto(key, albumId, photo.photoId);
+          const actual = await store.inspectAlbumPhoto({ key, albumId, photoId: photo.photoId, signal, guard });
+          if (!actual) {
+            failedCount += 1; complete = false; sweepFailed = true;
+            if (failureCodes.length < 100) failureCodes.push('ARCHIVE_RECORD_MISSING');
+            continue;
+          }
+          if (!sameAlbumSavedFile(saved, actual)) {
+            await catalog.savePhoto(key, albumId, photo.photoId, actual, binding);
+          }
+          saved = actual;
+          totalCount += 1;
+          const extension = /\.(jpg|png|webp|gif)$/.exec(saved.fileName)?.[1];
+          if (!extension) throw new Error('INVALID_IMAGE_EXTENSION');
+          const storedName = await catalog.readablePhotoName(key, albumId, photo.photoId);
+          const fileName = storedName ?? readableAlbumPhotoName({ title: displayTitle, shotTime: photo.shotTime,
+            sequence: photo.scanOrdinal + 1, photoId: photo.photoId, extension });
+          await store.materializeAlbumPhoto({ key, albumId, photoId: photo.photoId, canonicalFile: saved, viewFolderName: folderName,
+            viewFileName: fileName, signal, guard });
+          guard(); await catalog.saveReadablePhotoName(key, albumId, photo.photoId, fileName, binding);
+          exportedCount += 1;
+        } catch (error) {
+          if (signal.aborted || generation !== (this.accountGeneration.get(key.accountId) ?? 0) || this.stopped || !this.deps.isCurrentBinding(binding)) throw error;
+          failedCount += 1; complete = false; sweepFailed = true;
+          if (failureCodes.length < 100) failureCodes.push(archiveFailureCode(error));
+          this.logDiagnostic({ source: 'modal', accountId: key.accountId, chatId: key.chatId, albumId, action: 'album_photos',
+            occurredAt: new Date().toISOString(), durationMs: 0, status: 'failure', errorCode: diagnosticErrorCode(error), failureStage: 'archive_write',
+            failureReason: 'photo_write_failed', failureCategory: 'unknown', itemCount: 1, byteCount: 0, responseFields: [] });
+        }
+      }
+      const reachedTail = !page.nextCursor;
+      await saveProgress(reachedTail ? -1 : scanCursor, sweepFailed);
+      if (reachedTail) {
+        const unresolved = await catalog.hasPhotosNeedingReadableExport(key, albumId);
+        if (sweepFailed || unresolved) { complete = false; if (failureCodes.length < 100) failureCodes.push('PENDING_RETRY'); }
+        break;
+      }
+      if (visited >= CHAT_RESOURCE_ALBUM_OPEN_ITEM_LIMIT) { complete = false; failureCodes.push('PAGE_LIMIT'); break; }
+    }
+    guard();
+    return { albumId, folderName, exportedCount, failedCount, totalCount, complete: complete && failedCount === 0 && !sweepFailed, failureCodes };
+  }
   private async downloadAlbumPhotoImpl(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: string, signal: AbortSignal, generation: number) {
     const aid = boundedId(albumId, 'album ID');
     const pid = boundedId(photoId, 'photo ID');
@@ -744,6 +907,7 @@ export class ChatResourceArchiveService {
     guard();
     if (existing) {
       if (!sameAlbumSavedFile(saved, existing)) await this.deps.catalog?.savePhoto(key, aid, pid, existing, binding);
+      await this.exportReadablePhotoBestEffort(key, aid, pid, existing, binding, signal, generation, 'modal');
       guard();
       return { albumId: aid, photoId: pid, sizeBytes: sameAlbumSavedFile(saved, existing) ? saved!.byteCount : existing.byteCount };
     }
@@ -757,6 +921,7 @@ export class ChatResourceArchiveService {
       guard: () => this.assertCurrent(key.accountId, generation, readBinding, signal) });
     if (!archived) throw new Error('ALBUM_PHOTO_ARCHIVE_METADATA_UNAVAILABLE');
     await this.deps.catalog?.savePhoto(key, aid, pid, archived, readBinding);
+    await this.exportReadablePhotoBestEffort(key, aid, pid, archived, readBinding, signal, generation, 'modal');
     this.assertCurrent(key.accountId, generation, readBinding, signal);
     return { albumId: aid, photoId: pid, sizeBytes: image.byteLength };
   }

@@ -4,6 +4,7 @@ import type { ConversationKey } from '@line-agent/contracts';
 
 export type ChatAlbumCatalogAlbum = Readonly<{ albumId: string; chatId: string; title: string | null; photoCount: number | null; createTime: number | null; updateTime: number | null }>;
 export type ChatAlbumCatalogPhoto = Readonly<{ photoId: string; oid: string; prefix: 'album/a' | 'album/v'; shotTime: number | null; width: number | null; height: number | null }>;
+export type ChatAlbumCatalogPhotoWithOrdinal = ChatAlbumCatalogPhoto & Readonly<{ scanOrdinal: number }>;
 export type ChatAlbumSavedFile = Readonly<{ folderName: string; fileName: string; contentHash: string; byteCount: number; revision: number; savedAt: string }>;
 export type ChatAlbumCatalogPage<T> = Readonly<{ items: T[]; nextCursor: string | null }>;
 export type ChatAlbumCatalogBinding = Readonly<{ workerInstanceId: string; controlEpoch: number; mode: string }>;
@@ -125,6 +126,64 @@ export class ChatAlbumCatalogRepository {
       nextCursor: result.rows.length > bounded ? String(rows.at(-1)!.list_ordinal) : null };
   }
 
+  async getAlbum(key: ConversationKey, albumId: string): Promise<ChatAlbumCatalogAlbum | null> {
+    const result = await this.pool.query<{ album_id: string; chat_id: string; title: string | null; photo_count: number | null; create_time: Date | null; update_time: Date | null }>(
+      'SELECT album_id,chat_id,title,photo_count,create_time,update_time FROM chat_albums WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND album_id=$4',
+      [key.accountId,key.chatType,key.chatId,albumId]);
+    const row = result.rows[0];
+    return row ? { albumId: row.album_id, chatId: row.chat_id, title: row.title, photoCount: row.photo_count,
+      createTime: numberOrNull(row.create_time), updateTime: numberOrNull(row.update_time) } : null;
+  }
+
+  async ensureReadableFolderName(key: ConversationKey, albumId: string, candidate: string, binding: ChatAlbumCatalogBinding): Promise<string> {
+    const [controlEpoch,workerInstanceId]=this.bindingValues(binding);
+    if (candidate.length < 1 || candidate.length > 96 || /[\\/:*?"<>|\u0000-\u001f]/.test(candidate) || /[. ]$/.test(candidate)) throw new Error('Invalid readable album folder name.');
+    const result = await this.pool.query<{ readable_folder_name: string }>(`${this.bindingCte(6,7)} UPDATE chat_albums SET readable_folder_name=$5,updated_at=now()
+      WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND album_id=$4 AND readable_folder_name IS NULL AND EXISTS(SELECT 1 FROM authority) RETURNING readable_folder_name`,
+    [key.accountId,key.chatType,key.chatId,albumId,candidate,controlEpoch,workerInstanceId]);
+    if (result.rows[0]) return result.rows[0].readable_folder_name;
+    const existing = await this.pool.query<{ readable_folder_name: string | null }>(`${this.bindingCte(5,6)} SELECT readable_folder_name FROM chat_albums
+      WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND album_id=$4 AND EXISTS(SELECT 1 FROM authority)`,
+      [key.accountId,key.chatType,key.chatId,albumId,controlEpoch,workerInstanceId]);
+    if (!existing.rows[0]) throw new Error('Album is missing or its active binding changed.');
+    if (existing.rows[0].readable_folder_name) return existing.rows[0].readable_folder_name;
+    throw new Error('Album readable folder name could not be saved.');
+  }
+
+  async saveReadablePhotoName(key: ConversationKey, albumId: string, photoId: string, fileName: string, binding: ChatAlbumCatalogBinding): Promise<void> {
+    const [controlEpoch,workerInstanceId]=this.bindingValues(binding);
+    if (fileName.length < 1 || fileName.length > 240 || /[\\/:*?"<>|\u0000-\u001f]/.test(fileName) || /[. ]$/.test(fileName)) throw new Error('Invalid readable album photo filename.');
+    const result=await this.pool.query<{readable_file_name:string}>(`${this.bindingCte(7,8)} UPDATE chat_album_photos SET readable_file_name=COALESCE(readable_file_name,$6),updated_at=now()
+      WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND album_id=$4 AND photo_id=$5 AND EXISTS(SELECT 1 FROM authority) RETURNING readable_file_name`,
+    [key.accountId,key.chatType,key.chatId,albumId,photoId,fileName,controlEpoch,workerInstanceId]);
+    if(!result.rows[0]||result.rows[0].readable_file_name!==fileName) throw new Error('Album photo readable filename changed or binding is stale.');
+  }
+
+  async readablePhotoName(key: ConversationKey, albumId: string, photoId: string): Promise<string | null> {
+    const result=await this.pool.query<{readable_file_name:string|null}>(
+      'SELECT readable_file_name FROM chat_album_photos WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND album_id=$4 AND photo_id=$5',
+      [key.accountId,key.chatType,key.chatId,albumId,photoId]);
+    return result.rows[0]?.readable_file_name ?? null;
+  }
+
+  async photoOrdinal(key: ConversationKey, albumId: string, photoId: string): Promise<number | null> {
+    const result = await this.pool.query<{ photo_scan_ordinal: string }>(
+      `SELECT p.photo_scan_ordinal FROM chat_album_photos p JOIN chat_albums a USING(account_id,chat_type,chat_id,album_id)
+       WHERE p.account_id=$1 AND p.chat_type=$2 AND p.chat_id=$3 AND p.album_id=$4 AND p.photo_id=$5
+         AND p.photo_scan_generation=a.photo_scan_generation`, [key.accountId,key.chatType,key.chatId,albumId,photoId]);
+    return result.rows[0] ? Number(result.rows[0].photo_scan_ordinal) : null;
+  }
+
+  async photoWithOrdinal(key: ConversationKey, albumId: string, photoId: string): Promise<ChatAlbumCatalogPhotoWithOrdinal | null> {
+    const result = await this.pool.query<{ photo_id: string; oid: string; prefix: 'album/a' | 'album/v'; shot_time: Date | null; width: number | null; height: number | null; photo_scan_ordinal: string }>(
+      `SELECT p.photo_id,p.oid,p.prefix,p.shot_time,p.width,p.height,p.photo_scan_ordinal FROM chat_album_photos p JOIN chat_albums a USING(account_id,chat_type,chat_id,album_id)
+       WHERE p.account_id=$1 AND p.chat_type=$2 AND p.chat_id=$3 AND p.album_id=$4 AND p.photo_id=$5 AND p.photo_scan_generation=a.photo_scan_generation`,
+      [key.accountId,key.chatType,key.chatId,albumId,photoId]);
+    const row = result.rows[0];
+    return row ? { photoId: row.photo_id, oid: row.oid, prefix: row.prefix, shotTime: numberOrNull(row.shot_time), width: row.width, height: row.height,
+      scanOrdinal: Number(row.photo_scan_ordinal) } : null;
+  }
+
   async firstPhotoIds(key: ConversationKey, albumIds: readonly string[], limit = 2): Promise<Map<string, string[]>> {
     const ids = albumIds.slice(0, 50);
     if (!ids.length) return new Map();
@@ -145,7 +204,7 @@ export class ChatAlbumCatalogRepository {
   async beginPhotoScan(key: ConversationKey, albumId: string, binding: ChatAlbumCatalogBinding): Promise<number> {
     const [controlEpoch, workerInstanceId] = this.bindingValues(binding);
     const result = await this.pool.query<{ photo_scan_generation: string }>(
-      `${this.bindingCte(5, 6)} UPDATE chat_albums SET photo_scan_generation=photo_scan_generation+1,photo_scan_cursor=NULL,photo_scan_previous_cursor=NULL,photo_scan_previous_page_hash=NULL,photo_scan_next_ordinal=0,photo_list_complete=false,updated_at=now()
+      `${this.bindingCte(5, 6)} UPDATE chat_albums SET photo_scan_generation=photo_scan_generation+1,photo_scan_cursor=NULL,photo_scan_previous_cursor=NULL,photo_scan_previous_page_hash=NULL,photo_scan_next_ordinal=0,photo_list_complete=false,readable_export_cursor=-1,readable_export_sweep_failed=false,updated_at=now()
        WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND album_id=$4 AND EXISTS(SELECT 1 FROM authority) RETURNING photo_scan_generation`,
       [key.accountId, key.chatType, key.chatId, albumId, controlEpoch, workerInstanceId]);
     if (!result.rows[0]) throw new Error('Album is missing from the chat catalog.');
@@ -209,6 +268,62 @@ export class ChatAlbumCatalogRepository {
     const rows = result.rows.slice(0, bounded);
     return { items: rows.map((row) => ({ photoId: row.photo_id, oid: row.oid, prefix: row.prefix, shotTime: numberOrNull(row.shot_time), width: row.width, height: row.height })),
       nextCursor: result.rows.length > bounded ? String(rows.at(-1)!.photo_scan_ordinal) : null };
+  }
+
+  async listPhotosWithOrdinal(key: ConversationKey, albumId: string, cursor: string | null, limit = 50): Promise<ChatAlbumCatalogPage<ChatAlbumCatalogPhotoWithOrdinal>> {
+    const bounded=pageSize(limit);
+    const result=await this.pool.query<{photo_id:string;oid:string;prefix:'album/a'|'album/v';shot_time:Date|null;width:number|null;height:number|null;photo_scan_ordinal:string}>(
+      `SELECT p.photo_id,p.oid,p.prefix,p.shot_time,p.width,p.height,p.photo_scan_ordinal FROM chat_album_photos p JOIN chat_albums a USING(account_id,chat_type,chat_id,album_id)
+       WHERE p.account_id=$1 AND p.chat_type=$2 AND p.chat_id=$3 AND p.album_id=$4 AND p.photo_scan_generation=a.photo_scan_generation AND p.photo_scan_ordinal>$5
+       ORDER BY p.photo_scan_ordinal LIMIT $6`,[key.accountId,key.chatType,key.chatId,albumId,cursor===null?-1:Number(cursor),bounded+1]);
+    const rows=result.rows.slice(0,bounded);
+    return {items:rows.map(row=>({photoId:row.photo_id,oid:row.oid,prefix:row.prefix,shotTime:numberOrNull(row.shot_time),width:row.width,height:row.height,scanOrdinal:Number(row.photo_scan_ordinal)})),
+      nextCursor:result.rows.length>bounded?String(rows.at(-1)!.photo_scan_ordinal):null};
+  }
+
+  async listSavedPhotosForReadableReconciliation(key: ConversationKey, albumId: string, cursor: string | null, limit = 50): Promise<ChatAlbumCatalogPage<ChatAlbumCatalogPhotoWithOrdinal>> {
+    const bounded=pageSize(limit);
+    const result=await this.pool.query<{photo_id:string;oid:string;prefix:'album/a'|'album/v';shot_time:Date|null;width:number|null;height:number|null;photo_scan_ordinal:string}>(
+      `SELECT p.photo_id,p.oid,p.prefix,p.shot_time,p.width,p.height,p.photo_scan_ordinal FROM chat_album_photos p JOIN chat_albums a USING(account_id,chat_type,chat_id,album_id)
+       WHERE p.account_id=$1 AND p.chat_type=$2 AND p.chat_id=$3 AND p.album_id=$4 AND p.photo_scan_generation=a.photo_scan_generation
+         AND p.archive_file_name IS NOT NULL AND p.photo_scan_ordinal>$5
+       ORDER BY p.photo_scan_ordinal LIMIT $6`,[key.accountId,key.chatType,key.chatId,albumId,cursor===null?-1:Number(cursor),bounded+1]);
+    const rows=result.rows.slice(0,bounded);
+    return {items:rows.map(row=>({photoId:row.photo_id,oid:row.oid,prefix:row.prefix,shotTime:numberOrNull(row.shot_time),width:row.width,height:row.height,scanOrdinal:Number(row.photo_scan_ordinal)})),
+      nextCursor:result.rows.length>bounded?String(rows.at(-1)!.photo_scan_ordinal):null};
+  }
+
+  async readableExportState(key: ConversationKey, albumId: string): Promise<{ cursor: number; sweepFailed: boolean }> {
+    const result=await this.pool.query<{readable_export_cursor:string;readable_export_sweep_failed:boolean}>(
+      'SELECT readable_export_cursor,readable_export_sweep_failed FROM chat_albums WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND album_id=$4',
+      [key.accountId,key.chatType,key.chatId,albumId]);
+    if (!result.rows[0]) throw new Error('Album is missing.');
+    return { cursor: Number(result.rows[0].readable_export_cursor), sweepFailed: result.rows[0].readable_export_sweep_failed };
+  }
+
+  async saveReadableExportProgress(key: ConversationKey, albumId: string, expectedCursor: number, expectedFailed: boolean, cursor: number,
+    sweepFailed: boolean, binding: ChatAlbumCatalogBinding): Promise<void> {
+    const [controlEpoch,workerInstanceId]=this.bindingValues(binding);
+    if (!Number.isSafeInteger(expectedCursor) || expectedCursor < -1 || !Number.isSafeInteger(cursor) || cursor < -1) throw new Error('Invalid readable export cursor.');
+    const updated=await this.pool.query(`${this.bindingCte(9,10)} UPDATE chat_albums SET readable_export_cursor=$7,readable_export_sweep_failed=$8
+      WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND album_id=$4 AND readable_export_cursor=$5 AND readable_export_sweep_failed=$6
+        AND EXISTS(SELECT 1 FROM authority) RETURNING album_id`,
+      [key.accountId,key.chatType,key.chatId,albumId,expectedCursor,expectedFailed,cursor,sweepFailed,controlEpoch,workerInstanceId]);
+    if(updated.rowCount!==1) throw new Error('Album readable export progress changed or binding is stale.');
+    const current=await this.pool.query<{readable_export_cursor:string;readable_export_sweep_failed:boolean}>(`${this.bindingCte(5,6)} SELECT readable_export_cursor,readable_export_sweep_failed FROM chat_albums
+      WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND album_id=$4 AND EXISTS(SELECT 1 FROM authority)`,
+      [key.accountId,key.chatType,key.chatId,albumId,controlEpoch,workerInstanceId]);
+    if (!current.rows[0] || Number(current.rows[0].readable_export_cursor)!==cursor || current.rows[0].readable_export_sweep_failed!==sweepFailed) {
+      throw new Error('Album readable export progress or binding changed.');
+    }
+  }
+
+  async hasPhotosNeedingReadableExport(key: ConversationKey, albumId: string): Promise<boolean> {
+    const result=await this.pool.query<{pending:boolean}>(
+      `SELECT EXISTS(SELECT 1 FROM chat_album_photos p JOIN chat_albums a USING(account_id,chat_type,chat_id,album_id)
+       WHERE p.account_id=$1 AND p.chat_type=$2 AND p.chat_id=$3 AND p.album_id=$4 AND p.photo_scan_generation=a.photo_scan_generation
+         AND p.archive_file_name IS NOT NULL AND p.readable_file_name IS NULL) AS pending`,[key.accountId,key.chatType,key.chatId,albumId]);
+    return result.rows[0]?.pending===true;
   }
 
   async savePhoto(key: ConversationKey, albumId: string, photoId: string, file: ChatAlbumSavedFile, binding: ChatAlbumCatalogBinding): Promise<void> {

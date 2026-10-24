@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { ChatResourceArchive, isCanonicalChatResourceTimestamp, resolveChatResourceArchiveHelperPath } from './chat-resource-archive.js';
+import { readableAlbumDirectoryName, readableAlbumPhotoName } from './album-readable-view.js';
 
 const desktopRoot = resolve(import.meta.dirname, '../../../');
 const helper = join(desktopRoot, '..', '..', 'node_modules', '.cache', 'chat-resource-archive', 'ChatResourceArchiveHost.Test.exe');
@@ -121,6 +122,37 @@ describe.runIf(process.platform === 'win32')('ChatResourceArchive', () => {
     const otherChat = await broker!.bindChat({ canonicalPath: otherChatPath, segments: ['chats', 'folder-two'] });
     await broker!.ensureAlbumFolder({ chat: otherChat, albumId: injectedAlbumId });
     expect(await readdir(join(otherChatPath, 'albums', firstFolder))).toEqual([]);
+  });
+
+  it('exports verified album photos as independent readable copies without replacing edited files', async () => {
+    const { chat, chatPath } = await fixture();
+    const bytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const saved = await broker!.publishAlbumPhoto({ chat, albumId: 'album-a', photoId: 'photo-a', content: bytes });
+    const exportInput = { chat, albumId: 'album-a', photoId: 'photo-a', canonicalFile: saved,
+      viewFolderName: readableAlbumDirectoryName('旅行 😀 # @', 'album-a'),
+      viewFileName: readableAlbumPhotoName({ title: '旅行 😀 # @', shotTime: 1_735_689_600_000, sequence: 1, photoId: 'photo-a', extension: 'jpg' }) };
+    await broker!.ensureReadableAlbumFolder({ chat, viewFolderName: exportInput.viewFolderName });
+    await expect(broker!.materializeAlbumPhoto(exportInput)).resolves.toEqual({ unchanged: false });
+    const viewPath = join(chatPath, 'saved-albums', exportInput.viewFolderName, exportInput.viewFileName);
+    expect(await readFile(viewPath)).toEqual(bytes);
+    expect((await readFile(viewPath)).buffer).not.toBe((await readFile(join(chatPath, 'albums', saved.folderName, saved.fileName))).buffer);
+    await expect(broker!.materializeAlbumPhoto(exportInput)).resolves.toEqual({ unchanged: true });
+    await rm(viewPath);
+    await expect(broker!.materializeAlbumPhoto(exportInput)).resolves.toEqual({ unchanged: false });
+    expect(await readFile(viewPath)).toEqual(bytes);
+    await writeFile(viewPath, Buffer.from('edited'));
+    await expect(broker!.materializeAlbumPhoto(exportInput)).rejects.toMatchObject({ code: 'NO_REPLACE_CONFLICT' });
+    expect(await broker!.readAlbumPhoto({ chat, albumId: 'album-a', photoId: 'photo-a' })).toMatchObject({ content: bytes });
+
+    const longAlbumId = 'album-long', longPhotoId = 'photo-long';
+    const longTitle = '😀'.repeat(100);
+    const longCanonical = await broker!.publishAlbumPhoto({ chat, albumId: longAlbumId, photoId: longPhotoId, content: bytes });
+    const longFolderName = readableAlbumDirectoryName(longTitle, longAlbumId);
+    const longFileName = readableAlbumPhotoName({ title: longTitle, shotTime: null, sequence: 2, photoId: longPhotoId, extension: 'jpg' });
+    await broker!.ensureReadableAlbumFolder({ chat, viewFolderName: longFolderName });
+    await expect(broker!.materializeAlbumPhoto({ chat, albumId: longAlbumId, photoId: longPhotoId, canonicalFile: longCanonical,
+      viewFolderName: longFolderName, viewFileName: longFileName })).resolves.toEqual({ unchanged: false });
+    expect(await readFile(join(chatPath, 'saved-albums', longFolderName, longFileName))).toEqual(bytes);
   });
 
   it('rejects a reparse point substituted for an album folder', async () => {

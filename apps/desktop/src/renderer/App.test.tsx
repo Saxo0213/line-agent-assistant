@@ -192,6 +192,7 @@ function fakeApi(): DesktopApi {
     listChatAlbumPhotos: vi.fn(async () => ({ photos: [], nextCursor: null })),
     downloadChatAlbumPhoto: vi.fn(async (key, albumId, photoId) => ({ albumId, photoId, sizeBytes: 1 })),
     openChatAlbum: vi.fn(async (_key, albumId) => ({ albumId, savedCount: 0, failedCount: 0, totalCount: 0, byteCount: 0, complete: true, failureCodes: [], errorCode: null })),
+    openReadableChatAlbumFolder: vi.fn(async (_key, albumId) => ({ albumId, exportedCount: 0, failedCount: 0, totalCount: 0, complete: true, failureCodes: [], folderName: 'Trip__0123456789', opened: true })),
     cancelChatResourceRequest: vi.fn(async () => true),
     listAttachmentStates: vi.fn(async () => []),
     listAgentStatuses: vi.fn(async () => []),

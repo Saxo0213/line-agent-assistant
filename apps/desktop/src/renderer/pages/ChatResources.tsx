@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Download, Image as ImageIcon, NotebookPen, RotateCw, X } from 'lucide-react';
+import { Download, FolderOpen, Image as ImageIcon, NotebookPen, RotateCw, X } from 'lucide-react';
 import type { AlbumFailureContextDto, ConversationKey } from '@line-agent/contracts';
 import { lineMediaUrl } from '@line-agent/contracts';
 import { useDesktopLocale } from '../desktop-i18n.js';
@@ -15,14 +15,15 @@ export type ChatResourceApi = {
   listChatAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null, requestId?: string, refresh?: boolean): Promise<{ photos: ChatAlbumPhoto[]; nextCursor: string | null }>;
   downloadChatAlbumPhoto(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: 'album/a' | 'album/v', requestId?: string): Promise<{ albumId: string; photoId: string; sizeBytes: number }>;
   openChatAlbum(key: ConversationKey, albumId: string, requestId?: string): Promise<{ savedCount: number; failedCount: number; totalCount: number; complete: boolean; failureCodes: string[]; errorCode: string | null; failureContext?: AlbumFailureContextDto }>;
+  openReadableChatAlbumFolder(key: ConversationKey, albumId: string, requestId?: string): Promise<{ exportedCount: number; failedCount: number; totalCount: number; complete: boolean; failureCodes: string[]; opened: boolean }>;
   cancelChatResourceRequest(targetRequestId: string): Promise<boolean>;
 };
 
 const COPY = {
-  en: { notes: 'Notes', albums: 'Albums', close: 'Close', refresh: 'Refresh', loading: 'Loading…', loadNotesError: 'Unable to load notes.', loadAlbumsError: 'Unable to load albums.', loadPhotosError: 'Unable to load photos.', loadNoteError: 'Unable to load this note.', emptyNotes: 'No notes in this chat.', emptyAlbums: 'No albums in this chat.', emptyPhotos: 'No photos in this album.', more: 'Load more', retry: 'Retry', saved: 'Image saved', saveError: 'Unable to save this image.', back: 'Back', photos: '{n} photo', photosPlural: '{n} photos', photo: 'LINE photo', download: 'Download photo', untitled: 'Untitled note', unnamedAlbum: 'Untitled album', openNotes: 'Open chat notes', openAlbums: 'Open chat albums', archivingAlbum: 'Saving album photos…', albumArchiveComplete: 'Saved {saved} of {total} photos.', albumArchivePartial: 'Saved {saved} of {total}; {failed} failed.', albumArchiveCancelled: 'Album archive cancelled.', albumArchiveFailed: 'Album archive failed ({code}).', albumArchiveStage: 'Failure stage: {action} / {stage}.' },
-  'zh-TW': { notes: '記事本', albums: '相簿', close: '關閉', refresh: '重新整理', loading: '載入中…', loadNotesError: '無法載入記事。', loadAlbumsError: '無法載入相簿。', loadNoteError: '無法載入這則記事。', loadPhotosError: '無法載入照片。', emptyNotes: '此聊天室沒有記事。', emptyAlbums: '此聊天室沒有相簿。', emptyPhotos: '此相簿沒有照片。', more: '載入更多', retry: '重試', saved: '圖片已儲存', saveError: '無法儲存這張圖片。', back: '返回', photos: '{n} 張照片', photosPlural: '{n} 張照片', photo: 'LINE 照片', download: '下載照片', untitled: '未命名記事', unnamedAlbum: '未命名相簿', openNotes: '開啟聊天室記事', openAlbums: '開啟聊天室相簿', archivingAlbum: '正在儲存相簿照片…', albumArchiveComplete: '已儲存 {saved}/{total} 張照片。', albumArchivePartial: '已儲存 {saved}/{total} 張；{failed} 張失敗。', albumArchiveCancelled: '已取消相簿封存。', albumArchiveFailed: '相簿封存失敗（{code}）。', albumArchiveStage: '失敗階段：{action} / {stage}。' },
-  ja: { notes: 'ノート', albums: 'アルバム', close: '閉じる', refresh: '更新', loading: '読み込み中…', loadNotesError: 'ノートを読み込めません。', loadAlbumsError: 'アルバムを読み込めません。', loadPhotosError: '写真を読み込めません。', loadNoteError: 'このノートを読み込めません。', emptyNotes: 'このチャットにノートはありません。', emptyAlbums: 'このチャットにアルバムはありません。', emptyPhotos: 'このアルバムに写真はありません。', more: 'さらに読み込む', retry: '再試行', saved: '画像を保存しました', saveError: 'この画像を保存できません。', back: '戻る', photos: '写真 {n} 枚', photosPlural: '写真 {n} 枚', photo: 'LINE 写真', download: '写真を保存', untitled: '無題のノート', unnamedAlbum: '無題のアルバム', openNotes: 'チャットのノートを開く', openAlbums: 'チャットのアルバムを開く', archivingAlbum: 'アルバムの写真を保存中…', albumArchiveComplete: '{total} 枚中 {saved} 枚を保存しました。', albumArchivePartial: '{total} 枚中 {saved} 枚を保存、{failed} 枚失敗しました。', albumArchiveCancelled: 'アルバム保存をキャンセルしました。', albumArchiveFailed: 'アルバム保存に失敗しました（{code}）。', albumArchiveStage: '失敗段階：{action} / {stage}。' },
-  ko: { notes: '노트', albums: '앨범', close: '닫기', refresh: '새로고침', loading: '불러오는 중…', loadNotesError: '노트를 불러올 수 없습니다.', loadAlbumsError: '앨범을 불러올 수 없습니다.', loadPhotosError: '사진을 불러올 수 없습니다.', loadNoteError: '이 노트를 불러올 수 없습니다.', emptyNotes: '이 대화에 노트가 없습니다.', emptyAlbums: '이 대화에 앨범이 없습니다.', emptyPhotos: '이 앨범에 사진이 없습니다.', more: '더 불러오기', retry: '다시 시도', saved: '이미지를 저장했습니다', saveError: '이 이미지를 저장할 수 없습니다.', back: '뒤로', photos: '사진 {n}장', photosPlural: '사진 {n}장', photo: 'LINE 사진', download: '사진 저장', untitled: '제목 없는 노트', unnamedAlbum: '제목 없는 앨범', openNotes: '대화 노트 열기', openAlbums: '대화 앨범 열기', archivingAlbum: '앨범 사진 저장 중…', albumArchiveComplete: '사진 {saved}/{total}장 저장 완료.', albumArchivePartial: '{total}장 중 {saved}장 저장, {failed}장 실패.', albumArchiveCancelled: '앨범 저장을 취소했습니다.', albumArchiveFailed: '앨범 저장 실패 ({code}).', albumArchiveStage: '실패 단계: {action} / {stage}.' },
+  en: { notes: 'Notes', albums: 'Albums', close: 'Close', refresh: 'Refresh', loading: 'Loading…', loadNotesError: 'Unable to load notes.', loadAlbumsError: 'Unable to load albums.', loadPhotosError: 'Unable to load photos.', loadNoteError: 'Unable to load this note.', emptyNotes: 'No notes in this chat.', emptyAlbums: 'No albums in this chat.', emptyPhotos: 'No photos in this album.', more: 'Load more', retry: 'Retry', saved: 'Image saved', saveError: 'Unable to save this image.', back: 'Back', photos: '{n} photo', photosPlural: '{n} photos', photo: 'LINE photo', download: 'Download photo', untitled: 'Untitled note', unnamedAlbum: 'Untitled album', openNotes: 'Open chat notes', openAlbums: 'Open chat albums', archivingAlbum: 'Saving album photos…', albumArchiveComplete: 'Saved {saved} of {total} photos.', albumArchivePartial: 'Saved {saved} of {total}; {failed} failed.', albumArchiveCancelled: 'Album archive cancelled.', albumArchiveFailed: 'Album archive failed ({code}).', albumArchiveStage: 'Failure stage: {action} / {stage}.', openSavedAlbum: 'Open saved album folder', openingSavedAlbum: 'Preparing folder…', savedAlbumResult: 'Saved {saved} of {total} photos.', savedAlbumPartial: 'Saved {saved} of {total}; {failed} could not be exported.', savedAlbumOpenFailed: 'Could not open the saved album folder.' },
+  'zh-TW': { notes: '記事本', albums: '相簿', close: '關閉', refresh: '重新整理', loading: '載入中…', loadNotesError: '無法載入記事。', loadAlbumsError: '無法載入相簿。', loadNoteError: '無法載入這則記事。', loadPhotosError: '無法載入照片。', emptyNotes: '此聊天室沒有記事。', emptyAlbums: '此聊天室沒有相簿。', emptyPhotos: '此相簿沒有照片。', more: '載入更多', retry: '重試', saved: '圖片已儲存', saveError: '無法儲存這張圖片。', back: '返回', photos: '{n} 張照片', photosPlural: '{n} 張照片', photo: 'LINE 照片', download: '下載照片', untitled: '未命名記事', unnamedAlbum: '未命名相簿', openNotes: '開啟聊天室記事', openAlbums: '開啟聊天室相簿', archivingAlbum: '正在儲存相簿照片…', albumArchiveComplete: '已儲存 {saved}/{total} 張照片。', albumArchivePartial: '已儲存 {saved}/{total} 張；{failed} 張失敗。', albumArchiveCancelled: '已取消相簿封存。', albumArchiveFailed: '相簿封存失敗（{code}）。', albumArchiveStage: '失敗階段：{action} / {stage}。', openSavedAlbum: '開啟已儲存的相簿資料夾', openingSavedAlbum: '正在準備資料夾…', savedAlbumResult: '已儲存 {saved}/{total} 張照片。', savedAlbumPartial: '已儲存 {saved}/{total} 張；{failed} 張無法匯出。', savedAlbumOpenFailed: '無法開啟已儲存的相簿資料夾。' },
+  ja: { notes: 'ノート', albums: 'アルバム', close: '閉じる', refresh: '更新', loading: '読み込み中…', loadNotesError: 'ノートを読み込めません。', loadAlbumsError: 'アルバムを読み込めません。', loadPhotosError: '写真を読み込めません。', loadNoteError: 'このノートを読み込めません。', emptyNotes: 'このチャットにノートはありません。', emptyAlbums: 'このチャットにアルバムはありません。', emptyPhotos: 'このアルバムに写真はありません。', more: 'さらに読み込む', retry: '再試行', saved: '画像を保存しました', saveError: 'この画像を保存できません。', back: '戻る', photos: '写真 {n} 枚', photosPlural: '写真 {n} 枚', photo: 'LINE 写真', download: '写真を保存', untitled: '無題のノート', unnamedAlbum: '無題のアルバム', openNotes: 'チャットのノートを開く', openAlbums: 'チャットのアルバムを開く', archivingAlbum: 'アルバムの写真を保存中…', albumArchiveComplete: '{total} 枚中 {saved} 枚を保存しました。', albumArchivePartial: '{total} 枚中 {saved} 枚を保存、{failed} 枚失敗しました。', albumArchiveCancelled: 'アルバム保存をキャンセルしました。', albumArchiveFailed: 'アルバム保存に失敗しました（{code}）。', albumArchiveStage: '失敗段階：{action} / {stage}。', openSavedAlbum: '保存したアルバムフォルダーを開く', openingSavedAlbum: 'フォルダーを準備中…', savedAlbumResult: '{total} 枚中 {saved} 枚を保存しました。', savedAlbumPartial: '{total} 枚中 {saved} 枚を保存、{failed} 枚を出力できませんでした。', savedAlbumOpenFailed: '保存したアルバムフォルダーを開けません。' },
+  ko: { notes: '노트', albums: '앨범', close: '닫기', refresh: '새로고침', loading: '불러오는 중…', loadNotesError: '노트를 불러올 수 없습니다.', loadAlbumsError: '앨범을 불러올 수 없습니다.', loadPhotosError: '사진을 불러올 수 없습니다.', loadNoteError: '이 노트를 불러올 수 없습니다.', emptyNotes: '이 대화에 노트가 없습니다.', emptyAlbums: '이 대화에 앨범이 없습니다.', emptyPhotos: '이 앨범에 사진이 없습니다.', more: '더 불러오기', retry: '다시 시도', saved: '이미지를 저장했습니다', saveError: '이 이미지를 저장할 수 없습니다.', back: '뒤로', photos: '사진 {n}장', photosPlural: '사진 {n}장', photo: 'LINE 사진', download: '사진 저장', untitled: '제목 없는 노트', unnamedAlbum: '제목 없는 앨범', openNotes: '대화 노트 열기', openAlbums: '대화 앨범 열기', archivingAlbum: '앨범 사진 저장 중…', albumArchiveComplete: '사진 {saved}/{total}장 저장 완료.', albumArchivePartial: '{total}장 중 {saved}장 저장, {failed}장 실패.', albumArchiveCancelled: '앨범 저장을 취소했습니다.', albumArchiveFailed: '앨범 저장 실패 ({code}).', albumArchiveStage: '실패 단계: {action} / {stage}.', openSavedAlbum: '저장된 앨범 폴더 열기', openingSavedAlbum: '폴더 준비 중…', savedAlbumResult: '사진 {saved}/{total}장 저장.', savedAlbumPartial: '{total}장 중 {saved}장 저장, {failed}장 내보내지 못했습니다.', savedAlbumOpenFailed: '저장된 앨범 폴더를 열 수 없습니다.' },
 } satisfies Record<Locale, Record<string, string>>;
 type ResourceKind = 'notes' | 'albums';
 type ReadState = 'idle' | 'loading' | 'error' | 'ready';
@@ -50,6 +51,8 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
   const [selectedAlbum, setSelectedAlbum] = useState<ChatAlbum | null>(null);
   const [noteDetailState, setNoteDetailState] = useState<ReadState>('idle');
   const [downloadState, setDownloadState] = useState<Record<string, 'loading' | 'saved' | 'error'>>({});
+  const [readableFolderState, setReadableFolderState] = useState<'idle' | 'loading' | 'saved' | 'partial' | 'error'>('idle');
+  const [readableFolderCounts, setReadableFolderCounts] = useState({ saved: 0, failed: 0, total: 0 });
   const dialog = useRef<HTMLDivElement | null>(null);
   const openButton = useRef<HTMLButtonElement | null>(null);
   const albumButton = useRef<HTMLButtonElement | null>(null);
@@ -190,7 +193,7 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
     cancelRequests();
     const generation = ++viewGeneration.current;
     selectedAlbumRef.current = album;
-    setSelectedAlbum(album); setPhotos([]); setPhotoCursor(null); setPhotoState('idle'); setDownloadState({});
+    setSelectedAlbum(album); setPhotos([]); setPhotoCursor(null); setPhotoState('idle'); setDownloadState({}); setReadableFolderState('idle');
     void loadPhotos(album, false, generation);
   }
   function backFromNote() {
@@ -200,7 +203,7 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
   function backFromAlbum() {
     cancelRequests();
     ++viewGeneration.current; selectedAlbumRef.current = null; pendingPhotos.current = null;
-    setSelectedAlbum(null); setPhotos([]); setPhotoCursor(null); setPhotoState('idle');
+    setSelectedAlbum(null); setPhotos([]); setPhotoCursor(null); setPhotoState('idle'); setReadableFolderState('idle');
   }
   async function download(photo: ChatAlbumPhoto) {
     if (!selectedAlbum || requestLocks.current.has('download')) return;
@@ -213,6 +216,16 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
         ? { ...album, coverPhotoIds: [photo.photoId, ...(album.coverPhotoIds ?? []).filter((id) => id !== photo.photoId)].slice(0, 2) } : album));
     } catch { setDownloadState((current) => ({ ...current, [photo.photoId]: 'error' })); }
     finally { requestLocks.current.delete('download'); }
+  }
+  async function openReadableAlbumFolder() {
+    if (!selectedAlbum || requestLocks.current.has('readable-folder')) return;
+    requestLocks.current.add('readable-folder'); setReadableFolderState('loading');
+    try {
+      const result = await withRequestId((requestId) => api.openReadableChatAlbumFolder(route, selectedAlbum.albumId, requestId));
+      setReadableFolderCounts({ saved: result.exportedCount, failed: result.failedCount, total: result.totalCount });
+      setReadableFolderState(!result.opened ? 'error' : result.complete ? 'saved' : 'partial');
+    } catch { setReadableFolderState('error'); }
+    finally { requestLocks.current.delete('readable-folder'); }
   }
 
   useEffect(() => { if (kind) dialog.current?.focus(); }, [kind]);
@@ -270,6 +283,10 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
           </>}
           {kind === 'albums' && <>
             {selectedAlbum ? <div className="chat-resource-detail"><button type="button" className="chat-resource-back" onClick={backFromAlbum}>{copy.back}</button><h3>{selectedAlbum.title?.trim() || copy.unnamedAlbum}</h3>
+              <button type="button" disabled={readableFolderState === 'loading'} onClick={() => void openReadableAlbumFolder()}><FolderOpen size={16} aria-hidden="true" />{readableFolderState === 'loading' ? copy.openingSavedAlbum : copy.openSavedAlbum}</button>
+              {readableFolderState === 'saved' && <p role="status">{copy.savedAlbumResult.replace('{saved}', String(readableFolderCounts.saved)).replace('{total}', String(readableFolderCounts.total))}</p>}
+              {readableFolderState === 'partial' && <p role="status">{copy.savedAlbumPartial.replace('{saved}', String(readableFolderCounts.saved)).replace('{total}', String(readableFolderCounts.total)).replace('{failed}', String(readableFolderCounts.failed))}</p>}
+              {readableFolderState === 'error' && <p role="alert">{copy.savedAlbumOpenFailed}</p>}
               <p className="muted">{photoCountText(locale, copy, selectedAlbum.photoCount)}</p>
               {selectedAlbum && photoState === 'ready' && photos.length === 0 && <p className="chat-resources-state muted">{copy.emptyPhotos}</p>}
               {photoState === 'loading' && <p className="chat-resources-state muted" role="status">{copy.loading}</p>}

@@ -5,6 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ConversationKey } from '@line-agent/contracts';
 import { chatLayerDirectory, type ChatFolderService } from './chat-folders.js';
+import { isReadableAlbumFolderName, isReadableAlbumPhotoName } from './album-readable-view.js';
 
 const PROTOCOL = 'chat-resource-archive/v1';
 const QUEUE_LIMIT = 16;
@@ -49,6 +50,10 @@ export interface ChatResourceStoreAdapter {
   readAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; signal: AbortSignal; guard: () => void }): Promise<(ChatResourceAlbumPhotoFile & { content: Uint8Array }) | null>;
   hasAlbumPhoto(input: { key: ConversationKey; albumId: string; photoId: string; signal: AbortSignal; guard: () => void }): Promise<boolean>;
   publishAlbumPhoto(input: { key: ConversationKey; albumId: string; photoId: string; content: Uint8Array; signal: AbortSignal; guard: () => void }): Promise<ChatResourceAlbumPhotoFile>;
+  materializeAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; canonicalFile: ChatResourceAlbumPhotoFile; viewFolderName: string; viewFileName: string; signal: AbortSignal; guard: () => void }): Promise<{ unchanged: boolean }>;
+  ensureReadableAlbumFolder?(input: { key: ConversationKey; viewFolderName: string; signal: AbortSignal; guard: () => void }): Promise<void>;
+  materializeAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; canonicalFile: ChatResourceAlbumPhotoFile;
+    viewFolderName: string; viewFileName: string; signal: AbortSignal; guard: () => void }): Promise<{ unchanged: boolean }>;
   read(input: { key: ConversationKey; kind: ChatResourceKind; resourceId: string; signal?: AbortSignal }): Promise<(ChatResourceMetadata & { content: Uint8Array }) | null>;
   list(input: { key: ConversationKey; kind: ChatResourceKind; limit: number; cursor?: string | null; signal?: AbortSignal }): Promise<{ items: ChatResourceMetadata[]; nextCursor: string | null }>;
   close(): Promise<void>;
@@ -73,7 +78,8 @@ function assertResourceId(resourceId: unknown): asserts resourceId is string {
 }
 
 interface RequestBase { readonly protocol: typeof PROTOCOL; readonly requestId: string; readonly op: string; readonly chatSegments: readonly string[]; readonly volumeSerial: string; readonly fileId: string; readonly kind: ChatResourceKind; }
-interface ArchiveRequest extends RequestBase { readonly resourceId?: string; readonly albumKey?: string; readonly limit?: number; readonly cursor?: string; readonly stageId?: string; }
+interface ArchiveRequest extends RequestBase { readonly resourceId?: string; readonly albumKey?: string; readonly limit?: number; readonly cursor?: string; readonly stageId?: string;
+  readonly canonicalFileName?: string; readonly viewFolderName?: string; readonly viewFileName?: string; readonly expectedHash?: string; }
 interface NativeResult {
   readonly protocol: typeof PROTOCOL;
   readonly requestId: string;
@@ -186,6 +192,12 @@ export class ChatResourceArchive {
     if (!result.ok) throw new ChatResourceArchiveError('NATIVE_FAILURE');
   }
 
+  async ensureReadableAlbumFolder(input: { readonly chat: BoundChatResourceFolder; readonly viewFolderName: string; readonly signal?: AbortSignal; readonly guard?: () => void }): Promise<void> {
+    if (!isReadableAlbumFolderName(input.viewFolderName)) throw new ChatResourceArchiveError('INVALID_READABLE_EXPORT');
+    const { result } = await this.#submitRaw(input.chat, 'album', 'readable-folder-open', { viewFolderName: input.viewFolderName }, undefined, input.signal, input.guard);
+    if (!result.ok) throw new ChatResourceArchiveError('NATIVE_FAILURE');
+  }
+
   async publishAlbumPhoto(input: { readonly chat: BoundChatResourceFolder; readonly albumId: string; readonly photoId: string; readonly content: Uint8Array;
     readonly signal?: AbortSignal; readonly guard?: () => void }): Promise<ChatResourceAlbumPhotoFile> {
     const resourceId = createHash('sha256').update(input.photoId, 'utf8').digest('hex');
@@ -216,6 +228,25 @@ export class ChatResourceArchive {
     const file = this.#albumPhotoFile(input.albumId, input.photoId, result);
     if (payload.byteLength !== file.byteCount || createHash('sha256').update(payload).digest('hex') !== file.contentHash) throw new ChatResourceArchiveError('CONTENT_MISMATCH');
     return { ...file, content: payload };
+  }
+
+  async materializeAlbumPhoto(input: { readonly chat: BoundChatResourceFolder; readonly albumId: string; readonly photoId: string;
+    readonly canonicalFile: ChatResourceAlbumPhotoFile; readonly viewFolderName: string; readonly viewFileName: string;
+    readonly signal?: AbortSignal; readonly guard?: () => void }): Promise<{ unchanged: boolean }> {
+    if (!input.canonicalFile || !/^[0-9a-f]{64}$/.test(input.canonicalFile.contentHash) || !Number.isSafeInteger(input.canonicalFile.byteCount)
+      || input.canonicalFile.byteCount < 1 || input.canonicalFile.byteCount > 20 * 1024 * 1024
+      || input.canonicalFile.folderName !== createHash('sha256').update(input.albumId, 'utf8').digest('hex')
+      || !/^record_f_[A-Za-z0-9_-]+_[0-9]{20}_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{64}\.(jpg|png|webp|gif)$/.test(input.canonicalFile.fileName)
+      || !isReadableAlbumFolderName(input.viewFolderName) || !isReadableAlbumPhotoName(input.viewFileName)) {
+      throw new ChatResourceArchiveError('INVALID_READABLE_EXPORT');
+    }
+    const albumKey = createHash('sha256').update(input.albumId, 'utf8').digest('hex');
+    const resourceId = createHash('sha256').update(input.photoId, 'utf8').digest('hex');
+    const result = await this.#submitRaw(input.chat, 'album-photo', 'readable-export', { albumKey, resourceId,
+      canonicalFileName: input.canonicalFile.fileName, viewFolderName: input.viewFolderName, viewFileName: input.viewFileName,
+      expectedHash: input.canonicalFile.contentHash }, undefined, input.signal, input.guard);
+    if (result.payload.byteLength !== 0) throw new ChatResourceArchiveError('MALFORMED_RESULT');
+    return { unchanged: result.result.unchanged === true };
   }
 
   async hasAlbumPhoto(input: { readonly chat: BoundChatResourceFolder; readonly albumId: string; readonly photoId: string; readonly signal?: AbortSignal;
@@ -472,6 +503,11 @@ export function createChatResourceStoreAdapter(input: {
       if (!chat) throw new ChatResourceArchiveError('CHAT_FOLDER_UNAVAILABLE');
       await input.archive.ensureAlbumFolder({ chat, albumId: value.albumId, signal: value.signal, guard: value.guard });
     },
+    async ensureReadableAlbumFolder(value) {
+      const chat = await bind(value.key, true);
+      if (!chat) throw new ChatResourceArchiveError('CHAT_FOLDER_UNAVAILABLE');
+      await input.archive.ensureReadableAlbumFolder({ chat, viewFolderName: value.viewFolderName, signal: value.signal, guard: value.guard });
+    },
     async publishAlbumPhoto(value) {
       const chat = await bind(value.key, true);
       if (!chat) throw new ChatResourceArchiveError('CHAT_FOLDER_UNAVAILABLE');
@@ -487,6 +523,12 @@ export function createChatResourceStoreAdapter(input: {
       const chat = await bind(value.key, false);
       if (!chat) return null;
       return input.archive.readAlbumPhoto({ chat, albumId: value.albumId, photoId: value.photoId, signal: value.signal, guard: value.guard });
+    },
+    async materializeAlbumPhoto(value) {
+      const chat = await bind(value.key, false);
+      if (!chat) throw new ChatResourceArchiveError('CHAT_FOLDER_UNAVAILABLE');
+      return input.archive.materializeAlbumPhoto({ chat, albumId: value.albumId, photoId: value.photoId, canonicalFile: value.canonicalFile,
+        viewFolderName: value.viewFolderName, viewFileName: value.viewFileName, signal: value.signal, guard: value.guard });
     },
     async hasAlbumPhoto(value) {
       const chat = await bind(value.key, false);
