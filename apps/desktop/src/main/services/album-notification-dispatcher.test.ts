@@ -16,13 +16,25 @@ describe('AlbumNotificationDispatcher', () => {
   it('keeps earlier chunk failures retryable even when the final continuation completes', async () => {
     const results: AlbumOpenResult[] = [
       { albumId: 'album', savedCount: 4, failedCount: 1, totalCount: 5, byteCount: 10, complete: false,
-        failureCodes: ['NETWORK_ERROR'], errorCode: 'BYTE_LIMIT', nextCursor: 'page-2', nextPhotoIndex: 0 },
+        failureCodes: ['NETWORK_ERROR'], errorCode: 'BYTE_LIMIT', nextCursor: 'page-2', nextPhotoIndex: 0,
+        failureContext: { action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' } },
       { albumId: 'album', savedCount: 5, failedCount: 0, totalCount: 5, byteCount: 10, complete: true,
         failureCodes: [], errorCode: null, nextCursor: null, nextPhotoIndex: 0 },
     ];
     const openSegment = vi.fn(async () => results.shift()!);
-    await expect(archiveAlbumContinuations(openSegment)).rejects.toThrow('ALBUM_PHOTO_SAVE_INCOMPLETE');
+    await expect(archiveAlbumContinuations(openSegment)).rejects.toMatchObject({ failureContext: {
+      action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED',
+    } });
     expect(openSegment).toHaveBeenCalledTimes(2);
+  });
+
+  it('classifies a repeated photo cursor as pagination failure', async () => {
+    const openSegment = vi.fn(async (): Promise<AlbumOpenResult> => ({ albumId: 'album', savedCount: 0, failedCount: 0, totalCount: 0,
+      byteCount: 0, complete: false, failureCodes: [], errorCode: 'CURSOR_LOOP', nextCursor: 'page-2', nextPhotoIndex: 0,
+      failureContext: { action: 'album_photos', stage: 'pagination', code: 'ALBUM_PHOTO_CURSOR_LOOP' } }));
+    await expect(archiveAlbumContinuations(openSegment)).rejects.toMatchObject({ failureContext: {
+      action: 'album_photos', stage: 'pagination', code: 'ALBUM_PHOTO_CURSOR_LOOP',
+    } });
   });
 
   it('retries an incomplete continuation without another notification', async () => {

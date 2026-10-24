@@ -28,6 +28,17 @@ it('filters account-wide album responses to the exact selected chat before emitt
   expect(events.at(-1)).toMatchObject({ type: 'chatResourceResult', ok: true, albums: [{ albumId: 'visible', chatId }], nextCursor: 'page-2' });
 });
 
+it('passes bounded photo-page shape through the existing worker result', async () => {
+  const { worker, transport, events } = setup();
+  await ready(worker);
+  const photoPageShape = { rawPhotoCount: 0, hasMorePresent: false as const, nextCursorRelation: 'same' as const };
+  transport.enqueueChatResource({ photos: [], nextCursor: 'opaque-native-cursor', photoPageShape });
+  await worker.handle({ type: 'chatResourceRead', ...binding, chatType: 'group', chatId, requestId: 'photos-shape',
+    action: 'listAlbumPhotos', albumId: 'album-1', cursor: 'opaque-native-cursor', timeoutMs: 10_000 });
+  expect(events.at(-1)).toMatchObject({ type: 'chatResourceResult', ok: true, photos: [], photoPageShape });
+  expect(JSON.stringify((events.at(-1) as { photoPageShape: unknown }).photoPageShape)).not.toContain('opaque-native-cursor');
+});
+
 it('rejects malformed LINE metadata and oversized image data without emitting it', async () => {
   const { worker, transport, events } = setup();
   await ready(worker);

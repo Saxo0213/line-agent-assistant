@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ConversationKey } from '@line-agent/contracts';
-import { ChatResourceArchiveService, isNativeNotePostNotification, nativePostNotificationSubtype, type ChatResourceArchiveDependencies, type ChatResourceArchiveItem,
+import { AlbumArchiveFailure, ChatResourceArchiveService, isNativeNotePostNotification, nativePostNotificationSubtype, type ChatResourceArchiveDependencies, type ChatResourceArchiveItem,
   type ChatResourceArchiveVersion, type ChatResourceBinding, type ChatResourceKind, type ChatResourceReadResult, type ChatResourceRequest,
   type ChatResourceStore } from './chat-resources.js';
 import { ChatResourceAccountAdmission } from './chat-resource-admission.js';
@@ -157,6 +157,37 @@ describe('ChatResourceArchiveService', () => {
     expect(store.ensureAlbumFolder).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps a repeated nonterminal photo cursor as an incomplete archive failure', async () => {
+    const secondPage = { ...photo, photoId: 'photo-two', oid: 'oid-two' };
+    const pages: Array<{ cursor: string | null; photos: typeof photo[]; nextCursor: string | null }> = [
+      { cursor: null, photos: [photo], nextCursor: 'page-2' },
+      { cursor: 'page-2', photos: [secondPage], nextCursor: 'page-2' },
+    ];
+    const worker = vi.fn(async (command: Parameters<ChatResourceArchiveDependencies['readChatResource']>[0]) => {
+      if (command.action === 'listAlbumPhotos') {
+        const page = pages.find(({ cursor }) => cursor === (command.cursor ?? null))!;
+        return { type: 'chatResourceResult' as const, requestId: command.requestId, action: command.action, ok: true,
+          accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+          chatType: command.chatType, chatId: command.chatId, photos: page.photos, nextCursor: page.nextCursor } as ChatResourceReadResult;
+      }
+      return { type: 'chatResourceResult' as const, requestId: command.requestId, action: command.action, ok: true,
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId, bytes: new Uint8Array([1]) } as ChatResourceReadResult;
+    });
+    const published: string[] = [];
+    const { service } = await setup({ readChatResource: worker }, {
+      ensureAlbumFolder: vi.fn(async () => {}),
+      publishAlbumPhoto: vi.fn(async ({ photoId }: { photoId: string }) => { published.push(photoId); }),
+    });
+
+    const result = await service.openAlbum(key, album.albumId);
+
+    expect(result).toMatchObject({ savedCount: 2, failedCount: 0, complete: false, errorCode: 'CURSOR_LOOP' });
+    expect(published).toEqual([photo.photoId, secondPage.photoId]);
+    expect(worker.mock.calls.filter(([command]) => command.action === 'listAlbumPhotos').map(([command]) => command.cursor ?? null))
+      .toEqual([null, 'page-2']);
+  });
+
   it('rejects a duplicate album open instead of joining the first caller’s cancellation lifetime', async () => {
     let resolvePage!: (value: ChatResourceReadResult) => void;
     const pageReady = new Promise<ChatResourceReadResult>((resolve) => { resolvePage = resolve; });
@@ -246,7 +277,7 @@ describe('ChatResourceArchiveService', () => {
     } }, store);
     const result = await service.openAlbum(key, album.albumId);
     expect(result).toMatchObject({ savedCount: 1, failedCount: 1, totalCount: 2, complete: false, errorCode: null,
-      failureCodes: ['LINE_READ_FAILED'] });
+      failureCodes: ['LINE_READ_FAILED'], failureContext: { action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' } });
     expect(readChatResource.mock.calls.filter(([command]) => command.action === 'downloadAlbumPhoto')).toHaveLength(2);
     expect(store.publishAlbumPhoto).toHaveBeenCalledOnce();
   });
@@ -281,6 +312,19 @@ describe('ChatResourceArchiveService', () => {
     const stored = (await readFile(diagnostics.filePath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
     expect(stored).toContainEqual(expect.objectContaining({ failureStage: 'archive_scan', failureReason: 'archive_incomplete' }));
     await rm(root, { recursive: true, force: true });
+  });
+
+  it('keeps album-list, photo-download, and pagination failure summaries distinct', async () => {
+    const diagnostics: unknown[] = [];
+    const { service } = await setup({ recordDiagnostic: (record) => diagnostics.push(record) });
+    service.recordNotificationFailure(key, new AlbumArchiveFailure({ action: 'album_list', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' }));
+    service.recordNotificationFailure(key, new AlbumArchiveFailure({ action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' }));
+    service.recordNotificationFailure(key, new AlbumArchiveFailure({ action: 'album_photos', stage: 'pagination', code: 'ALBUM_PHOTO_CURSOR_LOOP' }));
+    expect(diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: 'album_list', failureStage: 'resource_read', failureReason: 'worker_response_error' }),
+      expect.objectContaining({ action: 'photo_download', failureStage: 'resource_read', failureReason: 'worker_response_error' }),
+      expect.objectContaining({ action: 'album_photos', failureStage: 'photo_pagination', failureReason: 'cursor_loop' }),
+    ]));
   });
 
   it('resumes at the first unsaved photo after a per-pass byte budget', async () => {
@@ -362,7 +406,9 @@ describe('ChatResourceArchiveService', () => {
     const folderFailure = await setup({ recordDiagnostic: (record) => diagnostics.push(record) }, {
       ensureAlbumFolder: async () => { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }); }, publishAlbumPhoto: async () => {},
     });
-    await expect(folderFailure.service.openAlbum(key, album.albumId, undefined, 'notification')).rejects.toThrow('permission denied');
+    await expect(folderFailure.service.openAlbum(key, album.albumId, undefined, 'notification')).rejects.toMatchObject({ failureContext: {
+      action: 'album_photos', stage: 'archive_write', code: 'ALBUM_ARCHIVE_INCOMPLETE',
+    } });
     expect(diagnostics).toContainEqual(expect.objectContaining({ source: 'notification', action: 'album_photos', failureStage: 'archive_write', failureReason: 'folder_write_failed' }));
 
     diagnostics.length = 0;

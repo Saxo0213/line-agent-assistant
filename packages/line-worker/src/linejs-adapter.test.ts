@@ -86,6 +86,39 @@ it('normalizes a successful fake LINEJS Note list response without using the net
 });
 
 it.each([
+  [{ photos: [], hasMore: false, nextCursor: 'v1_advanced' }, 'v1_requested', null,
+    { rawPhotoCount: 0, hasMorePresent: true, hasMore: false, nextCursorRelation: 'advanced' }],
+  [{ photos: [], hasMore: false, nextCursor: 'v1_requested' }, 'v1_requested', null,
+    { rawPhotoCount: 0, hasMorePresent: true, hasMore: false, nextCursorRelation: 'same' }],
+  [{ photos: [], hasMore: true, cursor: 'v1_next' }, null, 'v1_next', { rawPhotoCount: 0, hasMorePresent: true, hasMore: true, nextCursorRelation: 'absent' }],
+  [{ photos: [], nextCursor: 'v1_prev' }, 'v1_prev', 'v1_prev', { rawPhotoCount: 0, hasMorePresent: false, nextCursorRelation: 'same' }],
+  [{ photos: [{ oid: 'private-photo-oid', photoId: 'private-photo-id' }], nextCursor: 'v1_next' }, null, 'v1_next',
+    { rawPhotoCount: 1, hasMorePresent: false, nextCursorRelation: 'advanced' }],
+])('captures bounded Moa photo-page shape without cursor or photo identifiers (%j)', async (result, requestCursor, expectedCursor, expectedShape) => {
+  const { Login } = await import(new URL('../../../node_modules/@evex/linejs/base/login/mod.js', import.meta.url).href) as {
+    Login: { prototype: { login: (...args: any[]) => Promise<unknown> } };
+  };
+  const { MoaService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/moa/mod.js', import.meta.url).href) as {
+    MoaService: { prototype: { getAlbumChannelToken: (...args: any[]) => Promise<string>; getPhotos: (...args: any[]) => Promise<unknown> } };
+  };
+  const login = vi.spyOn(Login.prototype, 'login').mockImplementation(async function (this: { client: BaseClient }) {
+    this.client.profile = { mid: `u${'a'.repeat(32)}` } as never;
+    this.client.authToken = jwt;
+  });
+  const token = vi.spyOn(MoaService.prototype, 'getAlbumChannelToken').mockResolvedValue('fixture-token');
+  const photos = vi.spyOn(MoaService.prototype, 'getPhotos').mockResolvedValue({ code: 0, result } as never);
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async () => { throw new Error('fake Moa response must not use the network'); } });
+  try {
+    await adapter.loginToken(jwt);
+    await expect(adapter.readChatResource({ type: 'chatResourceRead', ...lease, chatType: 'group', chatId: attachmentIdentity.chatId,
+      requestId: 'photo-page-completion', action: 'listAlbumPhotos', albumId: 'album-1', cursor: requestCursor ?? undefined, timeoutMs: 5000 },
+    { signal: new AbortController().signal })).resolves.toMatchObject({ nextCursor: expectedCursor, photoPageShape: expectedShape });
+    expect(photos).toHaveBeenCalledOnce();
+  } finally { adapter.revoke(); login.mockRestore(); token.mockRestore(); photos.mockRestore(); }
+});
+
+it.each([
   { label: 'LINE response code', nativeError: new InternalError('MoaError', 'private Moa message token=secret', { code: 102001, message: 'private Moa message token=secret' }), upstreamCode: 102001, upstreamStatus: undefined },
   { label: 'HTTP status', nativeError: new InternalError('MoaError', 'private HTTP message token=secret', { status: 503 }), upstreamCode: undefined, upstreamStatus: 503 },
   { label: 'invalid zero status and fractional code', nativeError: new InternalError('MoaError', 'private invalid response token=secret', { status: 0, code: 1.5 }), upstreamCode: 'non_numeric', upstreamStatus: undefined },

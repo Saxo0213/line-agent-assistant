@@ -99,6 +99,12 @@ export const ChatResourceReadCommandSchema = Conversation.extend({ type: z.liter
   for (const key of required[command.action] ?? []) if (command[key] === undefined) context.addIssue({ code: 'custom', path: [key], message: 'Required for action' });
 });
 export type ChatResourceReadCommand = z.infer<typeof ChatResourceReadCommandSchema>;
+export const ChatResourcePhotoPageShapeSchema = z.strictObject({ rawPhotoCount: z.number().int().min(0).max(1_000_000),
+  hasMorePresent: z.boolean(), hasMore: z.boolean().optional(), nextCursorRelation: z.enum(['absent', 'same', 'advanced']) })
+  .superRefine((shape, context) => {
+    if (!shape.hasMorePresent && shape.hasMore !== undefined) context.addIssue({ code: 'custom', path: ['hasMore'], message: 'A missing hasMore field cannot have a value' });
+  });
+export type ChatResourcePhotoPageShape = z.infer<typeof ChatResourcePhotoPageShapeSchema>;
 export const ChatResourceReadResultSchema = Conversation.extend({ type: z.literal('chatResourceResult'), requestId: Id.max(128),
   action: ChatResourceAction, ok: z.boolean(), error: z.string().max(80).nullable(),
   responseCode: z.union([z.number().finite().min(-1_000_000_000).max(1_000_000_000), z.enum(['missing', 'non_numeric'])]).optional(),
@@ -106,10 +112,14 @@ export const ChatResourceReadResultSchema = Conversation.extend({ type: z.litera
   upstreamStatus: z.number().int().min(100).max(599).optional(),
   upstreamCode: z.union([z.number().finite().min(-1_000_000_000).max(1_000_000_000), z.enum(['missing', 'non_numeric'])]).optional(),
   nextCursor: ResourceCursor.optional(),
+  photoPageShape: ChatResourcePhotoPageShapeSchema.optional(),
   notes: z.array(ChatResourceNote).max(50).optional(), note: ChatResourceNote.optional(), albums: z.array(ChatResourceAlbum).max(50).optional(),
   photos: z.array(ChatResourcePhoto).max(50).optional(), bytes: z.custom<Uint8Array>((value) => value instanceof Uint8Array)
     .refine((value) => value.byteLength <= CHAT_RESOURCE_MAX_BYTES).optional() }).superRefine((result, context) => {
   const payload = ['notes', 'note', 'albums', 'photos', 'bytes'].some((key) => Object.hasOwn(result, key));
+  if (result.photoPageShape !== undefined && (result.action !== 'listAlbumPhotos' || !result.ok)) {
+    context.addIssue({ code: 'custom', path: ['photoPageShape'], message: 'Photo page shape is restricted to successful album photo reads' });
+  }
   if (result.responseCode !== undefined && (result.ok || result.error !== 'response_code_invalid'
     || (result.action !== 'listNotes' && result.action !== 'getNote'))) {
     context.addIssue({ code: 'custom', path: ['responseCode'], message: 'Response code is restricted to failed Note reads' });

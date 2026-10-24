@@ -25,6 +25,12 @@ describe('chat resource IPC contracts', () => {
     expect(IpcResultSchema.safeParse({ type: 'openChatAlbum', requestId: base.requestId, ok: true, albumId: 'album-1',
       savedCount: 1, failedCount: 1, totalCount: 2, byteCount: 4096, complete: false, failureCodes: ['LINE_READ_FAILED'], errorCode: null }).success).toBe(true);
     expect(IpcResultSchema.safeParse({ type: 'openChatAlbum', requestId: base.requestId, ok: true, albumId: 'album-1',
+      savedCount: 1, failedCount: 1, totalCount: 2, byteCount: 4096, complete: false, failureCodes: [], errorCode: null,
+      failureContext: { action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' } }).success).toBe(true);
+    expect(IpcResultSchema.safeParse({ type: 'openChatAlbum', requestId: base.requestId, ok: true, albumId: 'album-1',
+      savedCount: 1, failedCount: 1, totalCount: 2, byteCount: 4096, complete: false, failureCodes: [], errorCode: null,
+      failureContext: { action: 'photo_download', stage: 'resource_read', code: 'EFFECT_DENIED', rawError: 'secret' } }).success).toBe(false);
+    expect(IpcResultSchema.safeParse({ type: 'openChatAlbum', requestId: base.requestId, ok: true, albumId: 'album-1',
       savedCount: 501, failedCount: 0, totalCount: 501, byteCount: 0, complete: true, failureCodes: [], errorCode: null }).success).toBe(false);
   });
 

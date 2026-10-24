@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { ConversationKey, InboundEnvelope } from '@line-agent/contracts';
+import type { AlbumFailureContextDto, ConversationKey, InboundEnvelope } from '@line-agent/contracts';
 import type { OperationalAudit } from './operational-audit.js';
 
 export const CHAT_RESOURCE_PAGE_LIMIT = 50;
@@ -16,6 +16,24 @@ const GENERATED_NOTE_MARKER = '<!-- linejs-generated-note:v1 -->';
 
 export type ChatResourceAction = 'listNotes' | 'getNote' | 'listAlbums' | 'listAlbumPhotos' | 'downloadAlbumPhoto';
 export type ChatResourceKind = 'note' | 'album' | 'photo-page' | 'photo';
+export type AlbumFailureAction = 'album_list' | 'album_photos' | 'photo_download';
+export type AlbumFailureStage = 'resource_read' | 'pagination' | 'archive_contains' | 'archive_write' | 'archive_scan';
+export type AlbumTaskFailureStage = 'archive_scan' | 'album_list' | 'album_list_pagination' | 'album_photos'
+  | 'photo_download' | 'photo_pagination' | 'archive_contains' | 'archive_write' | 'source_validation' | 'unknown';
+export type AlbumTaskFailureCode = 'ALBUM_RECONCILIATION_FAILED' | 'ALBUM_ARCHIVE_INCOMPLETE' | 'ALBUM_PHOTO_CURSOR_LOOP';
+export type AlbumFailureContext = AlbumFailureContextDto;
+export class AlbumArchiveFailure extends Error {
+  constructor(readonly failureContext: AlbumFailureContext) { super(failureContext.code); this.name = 'AlbumArchiveFailure'; }
+}
+export function albumTaskFailureStage(context: AlbumFailureContext): AlbumTaskFailureStage {
+  if (context.stage === 'pagination') return context.action === 'album_list' ? 'album_list_pagination' : 'photo_pagination';
+  if (context.stage === 'archive_contains' || context.stage === 'archive_write' || context.stage === 'archive_scan') return context.stage;
+  return context.action;
+}
+export function albumFailureContextFrom(error: unknown): AlbumFailureContext | undefined {
+  if (error instanceof AlbumArchiveFailure) return error.failureContext;
+  return undefined;
+}
 export type ChatResourceRequest = ConversationKey & { requestId: string; type: 'chatResourceRead'; action: ChatResourceAction;
   workerInstanceId: string; controlEpoch: number; transportOwnerId: string; transportGeneration: number; writeGrantVersion: number;
   timeoutMs: number; limit?: number; maxBytes?: number; cursor?: string;
@@ -26,6 +44,7 @@ export type ChatResourceReadResult = { type: 'chatResourceResult'; requestId: st
   upstreamStatus?: number | undefined; upstreamCode?: number | 'missing' | 'non_numeric' | undefined;
   accountId: string; workerInstanceId: string; controlEpoch: number; chatType: ConversationKey['chatType']; chatId: string;
   notes?: NoteDto[] | undefined; note?: NoteDto | undefined; albums?: AlbumDto[] | undefined; photos?: PhotoDto[] | undefined;
+  photoPageShape?: { rawPhotoCount: number; hasMorePresent: boolean; hasMore?: boolean | undefined; nextCursorRelation: 'absent' | 'same' | 'advanced' } | undefined;
   nextCursor?: string | null | undefined; bytes?: Uint8Array | undefined };
 export type ChatResourceBinding = { accountId: string; workerInstanceId: string; controlEpoch: number; transportOwnerId: string;
   transportGeneration: number; writeGrantVersion: number; mode: string };
@@ -33,7 +52,8 @@ export type ChatResourceArchiveVersion = { revision: number; savedAt: string; co
 export type ChatResourceArchiveItem = { resourceId: string; revision: number; savedAt: string; contentHash: string; byteLength: number };
 export type ChatResourceArchivePage = { items: ChatResourceArchiveItem[]; nextCursor: string | null };
 export type AlbumOpenResult = { albumId: string; savedCount: number; failedCount: number; totalCount: number; byteCount: number;
-  complete: boolean; failureCodes: string[]; errorCode: string | null; nextCursor: string | null; nextPhotoIndex: number };
+  complete: boolean; failureCodes: string[]; errorCode: string | null; nextCursor: string | null; nextPhotoIndex: number;
+  failureContext?: AlbumFailureContext };
 
 /** Main-facing boundary implemented by the one bounded native archive owner. Paths never cross this seam.
  * `publish` stages first, invokes guard immediately before final commit, and serializes commit/cancel messages. */
@@ -199,6 +219,7 @@ function contentBytes(value: unknown, maxBytes: number): Uint8Array {
 }
 function validRevision(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) > 0; }
 function archiveFailureCode(error: unknown): string {
+  if (error instanceof AlbumArchiveFailure) return error.failureContext.code;
   const value = error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined;
   if (typeof value === 'string' && /^[A-Z][A-Z0-9_]{1,47}$/.test(value)) return value;
   const message = error instanceof Error ? error.message : '';
@@ -427,22 +448,35 @@ export class ChatResourceArchiveService {
     const failureCodes: string[] = [];
     let complete = true;
     let stopCode: string | null = null;
+    let failureContext: AlbumFailureContext | undefined;
     let pageCount = 0;
     let nextPhotoIndex = 0;
     do {
       guard();
       if (pageCount >= MAX_ALBUM_OPEN_PAGES) { complete = false; stopCode = 'PAGE_LIMIT'; break; }
       if (cursor !== null) {
-        if (seenCursors.has(cursor)) { complete = false; stopCode = 'CURSOR_LOOP'; break; }
+        if (seenCursors.has(cursor)) {
+          complete = false; stopCode = 'CURSOR_LOOP';
+          failureContext = { action: 'album_photos', stage: 'pagination', code: 'ALBUM_PHOTO_CURSOR_LOOP' };
+          break;
+        }
         seenCursors.add(cursor);
       }
       let page: { value: ChatResourceReadResult; binding: ChatResourceBinding };
       try { page = await this.read(key, 'listAlbumPhotos', { albumId, cursor, limit: CHAT_RESOURCE_PHOTO_LIMIT }, signal, generation, source, firstBinding); }
-      catch (error) { complete = false; stopCode = archiveFailureCode(error); break; }
+      catch (error) {
+        complete = false; stopCode = archiveFailureCode(error);
+        failureContext = { action: 'album_photos', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' };
+        break;
+      }
       pageCount += 1;
       let rows: PhotoDto[];
       try { rows = arrayResult<unknown>(page.value, 'photos', CHAT_RESOURCE_PHOTO_LIMIT).rows.map(photoDto); }
-      catch (error) { complete = false; stopCode = archiveFailureCode(error); break; }
+      catch (error) {
+        complete = false; stopCode = archiveFailureCode(error);
+        failureContext = { action: 'album_photos', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' };
+        break;
+      }
       let photoIndex = 0;
       if (pageCount === 1) {
         const folderStartedAt = Date.now();
@@ -452,7 +486,9 @@ export class ChatResourceArchiveService {
             occurredAt: new Date(folderStartedAt).toISOString(), durationMs: Date.now() - folderStartedAt, status: 'failure', errorCode: 'UNKNOWN',
             failureStage: 'archive_write', failureReason: 'folder_write_failed', failureCategory: 'unknown', itemCount: 0, byteCount: 0, responseFields: [] });
           markChatResourceDiagnosticLogged(error);
-          throw error;
+          const failure = new AlbumArchiveFailure({ action: 'album_photos', stage: 'archive_write', code: 'ALBUM_ARCHIVE_INCOMPLETE' });
+          markChatResourceDiagnosticLogged(failure);
+          throw failure;
         }
       }
       for (const photo of rows) {
@@ -490,6 +526,11 @@ export class ChatResourceArchiveService {
         } catch (error) {
           this.recordAlbumPhotoOutcome(key, 'failed');
           const failureCode = archiveFailureCode(error);
+          failureContext ??= failureStage === 'resource_read'
+            ? { action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' }
+            : failureStage === 'archive_write'
+              ? { action: 'album_photos', stage: 'archive_write', code: 'ALBUM_ARCHIVE_INCOMPLETE' }
+              : { action: 'album_photos', stage: 'archive_contains', code: 'ALBUM_RECONCILIATION_FAILED' };
           if (failureStage === 'archive_write') this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, albumId,
             action: 'album_photos', occurredAt: new Date().toISOString(), durationMs: 0, status: 'failure', errorCode: 'UNKNOWN',
             failureStage: 'archive_write', failureReason: 'photo_write_failed', failureCategory: 'unknown', itemCount: 1,
@@ -517,7 +558,8 @@ export class ChatResourceArchiveService {
     guard();
     return { albumId, savedCount, failedCount, totalCount: itemCount, byteCount: totalBytes, complete: complete && failedCount === 0,
       failureCodes: failureCodes.slice(0, CHAT_RESOURCE_ALBUM_OPEN_ITEM_LIMIT), errorCode: stopCode,
-      nextCursor: stopCode === 'PAGE_LIMIT' || stopCode === 'BYTE_LIMIT' ? cursor : null, nextPhotoIndex };
+      nextCursor: stopCode === 'PAGE_LIMIT' || stopCode === 'BYTE_LIMIT' ? cursor : null, nextPhotoIndex,
+      ...(failureContext ? { failureContext } : {}) };
   }
   private async downloadAlbumPhotoImpl(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: string, signal: AbortSignal, generation: number) {
     const aid = boundedId(albumId, 'album ID');
@@ -555,11 +597,14 @@ export class ChatResourceArchiveService {
 
   recordNotificationFailure(key: ConversationKey, error: unknown): void {
     if (wasChatResourceDiagnosticLogged(error)) return;
-    const message = error instanceof Error ? error.message.toLowerCase() : '';
-    this.logDiagnostic({ source: 'notification', accountId: key.accountId, chatId: key.chatId, action: 'album_list',
+    const context = albumFailureContextFrom(error) ?? { action: 'album_list' as const, stage: 'archive_scan' as const,
+      code: error instanceof Error && error.message === 'ALBUM_ARCHIVE_INCOMPLETE' ? 'ALBUM_ARCHIVE_INCOMPLETE' as const : 'ALBUM_RECONCILIATION_FAILED' as const };
+    this.logDiagnostic({ source: 'notification', accountId: key.accountId, chatId: key.chatId, action: context.action,
       occurredAt: new Date().toISOString(), durationMs: 0, status: 'failure', errorCode: diagnosticErrorCode(error),
-      failureStage: 'archive_scan', failureReason: message.includes('cursor_loop') ? 'cursor_loop'
-        : message.includes('binding') ? 'stale_binding' : message.includes('incomplete') ? 'archive_incomplete' : 'archive_reconciliation_failed',
+      failureStage: context.stage === 'pagination' ? 'photo_pagination' : context.stage,
+      failureReason: context.stage === 'pagination' ? 'cursor_loop' : context.stage === 'archive_write' ? 'photo_write_failed'
+        : error instanceof Error && error.message === 'ALBUM_ARCHIVE_INCOMPLETE' ? 'archive_incomplete'
+        : context.stage === 'archive_scan' ? 'archive_reconciliation_failed' : context.stage === 'resource_read' ? 'worker_response_error' : 'unknown',
       failureCategory: 'unknown', itemCount: 0, byteCount: 0, responseFields: [] });
     markChatResourceDiagnosticLogged(error);
   }
@@ -703,7 +748,8 @@ export class ChatResourceArchiveService {
         ...(response.upstreamCode === undefined ? {} : { upstreamCode: response.upstreamCode }),
         ...(source === 'modal' && (action === 'listNotes' || action === 'getNote') && response.error === 'response_code_invalid'
           && response.responseCode !== undefined ? { responseCode: response.responseCode } : {}),
-      } : {}), itemCount: rows?.length ?? (response.note ? 1 : 0), byteCount, responseFields });
+      } : {}), ...(response.photoPageShape ? { photoPageShape: response.photoPageShape } : {}),
+      itemCount: rows?.length ?? (response.note ? 1 : 0), byteCount, responseFields });
     this.assertCurrent(key.accountId, generation, binding, signal);
     if (response.type !== 'chatResourceResult' || response.requestId !== command.requestId || response.action !== action
       || response.accountId !== key.accountId || response.workerInstanceId !== binding.workerInstanceId || response.controlEpoch !== binding.controlEpoch

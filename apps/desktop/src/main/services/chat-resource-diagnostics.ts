@@ -6,7 +6,8 @@ export const CHAT_RESOURCE_DIAGNOSTIC_ERRORS = [
   'UNKNOWN', 'REQUEST_REJECTED', 'RESPONSE_INVALID', 'RESPONSE_TOO_LARGE', 'TIMEOUT', 'CANCELLED',
   'ACCOUNT_DISCONNECTED', 'ACCOUNT_BINDING_CHANGED', 'WORKER_UNAVAILABLE', 'NETWORK_ERROR', 'NOT_FOUND',
 ] as const;
-export const CHAT_RESOURCE_DIAGNOSTIC_STAGES = ['gateway_admission', 'pending_request', 'worker_response', 'resource_read', 'archive_scan', 'archive_contains', 'archive_write'] as const;
+export const CHAT_RESOURCE_DIAGNOSTIC_STAGES = ['gateway_admission', 'pending_request', 'worker_response', 'resource_read', 'archive_scan',
+  'photo_pagination', 'archive_contains', 'archive_write'] as const;
 export const CHAT_RESOURCE_DIAGNOSTIC_REASONS = ['missing_worker', 'not_ready_worker', 'stale_binding', 'pending_stopped', 'worker_response_error',
   'page_limit', 'cursor_loop', 'folder_write_failed', 'photo_write_failed', 'archive_incomplete', 'archive_reconciliation_failed', 'unknown'] as const;
 export const CHAT_RESOURCE_FAILURE_CATEGORIES = ['bootstrap_failure', 'list_get_transport_failure', 'response_code_invalid', 'response_shape_invalid',
@@ -34,6 +35,7 @@ export type ChatResourceDiagnostic = {
   currentBindingMatch?: boolean;
   currentEpochMatch?: boolean;
   workerReady?: boolean;
+  photoPageShape?: { rawPhotoCount: number; hasMorePresent: boolean; hasMore?: boolean; nextCursorRelation: 'absent' | 'same' | 'advanced' };
   itemCount: number;
   byteCount: number;
   responseFields: Array<{ name: string; type: 'null' | 'boolean' | 'number' | 'string' | 'array' | 'object' }>;
@@ -80,6 +82,20 @@ export function parseChatResourceDiagnostic(value: unknown): ChatResourceDiagnos
   for (const field of ['currentBindingMatch', 'currentEpochMatch', 'workerReady'] as const) {
     if (input[field] !== undefined && typeof input[field] !== 'boolean') return null;
   }
+  let photoPageShape: ChatResourceDiagnostic['photoPageShape'];
+  if (input.photoPageShape !== undefined) {
+    if (!input.photoPageShape || typeof input.photoPageShape !== 'object' || Array.isArray(input.photoPageShape)) return null;
+    const shape = input.photoPageShape as Record<string, unknown>;
+    if (Object.keys(shape).some((key) => !['rawPhotoCount', 'hasMorePresent', 'hasMore', 'nextCursorRelation'].includes(key))
+      || !Number.isSafeInteger(shape.rawPhotoCount) || (shape.rawPhotoCount as number) < 0 || (shape.rawPhotoCount as number) > 1_000_000
+      || typeof shape.hasMorePresent !== 'boolean' || (shape.hasMore !== undefined && typeof shape.hasMore !== 'boolean')
+      || (!shape.hasMorePresent && shape.hasMore !== undefined)
+      || !['absent', 'same', 'advanced'].includes(shape.nextCursorRelation as string)
+      || input.action !== 'album_photos') return null;
+    photoPageShape = { rawPhotoCount: shape.rawPhotoCount as number, hasMorePresent: shape.hasMorePresent,
+      ...(shape.hasMore === undefined ? {} : { hasMore: shape.hasMore }),
+      nextCursorRelation: shape.nextCursorRelation as NonNullable<ChatResourceDiagnostic['photoPageShape']>['nextCursorRelation'] };
+  }
   const responseFields: ChatResourceDiagnostic['responseFields'] = [];
   for (const field of input.responseFields) {
     if (!field || typeof field !== 'object' || Array.isArray(field)) return null;
@@ -110,6 +126,7 @@ export function parseChatResourceDiagnostic(value: unknown): ChatResourceDiagnos
   if (input.currentBindingMatch !== undefined) result.currentBindingMatch = input.currentBindingMatch as boolean;
   if (input.currentEpochMatch !== undefined) result.currentEpochMatch = input.currentEpochMatch as boolean;
   if (input.workerReady !== undefined) result.workerReady = input.workerReady as boolean;
+  if (photoPageShape !== undefined) result.photoPageShape = photoPageShape;
   if (Buffer.byteLength(JSON.stringify(result), 'utf8') > maxRecordBytes) return null;
   return result;
 }

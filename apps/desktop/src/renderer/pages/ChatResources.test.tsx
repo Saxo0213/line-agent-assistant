@@ -128,6 +128,18 @@ describe('ChatResources', () => {
     expect(client.openChatAlbum).toHaveBeenCalledWith(route, album.albumId, expect.any(String));
   });
 
+  it('shows the allowlisted album failure action and stage', async () => {
+    const client = api();
+    client.openChatAlbum = vi.fn(async () => ({ albumId: album.albumId, savedCount: 0, failedCount: 1, totalCount: 1,
+      byteCount: 0, complete: false, failureCodes: [], errorCode: null,
+      failureContext: { action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' } as const }));
+    renderControls(client);
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('photo_download / resource_read');
+  });
+
   it.each(['resolve', 'reject'] as const)('settles archive status after Refresh when the archive later %s', async (outcome) => {
     const client = api();
     const pending = deferred<Awaited<ReturnType<ChatResourceApi['openChatAlbum']>>>();

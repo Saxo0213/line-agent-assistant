@@ -373,7 +373,7 @@ export class MutationGate<Call, RpcResult, TransportResult> {
     const noteMatch = /^(\/(?:mh|sn)\/api\/v57\/post\/(list|get)\.json)$/.exec(path);
     const albumListPath = path === "/ext/album/moa/v2/albums";
     const albumPhotosMatch = /^\/ext\/album\/api\/v6\/albums\/([A-Za-z0-9_-]{1,128})\/photos$/.exec(path);
-    const photoMatch = /^\/oa\/r\/album\/(a|v)\/([A-Za-z0-9_-]{1,256})$/.exec(path);
+    const photoMatch = /^\/oa\/r\/album\/(a|v)\/((?=[A-Za-z0-9._-]{1,256}$)[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)$/.exec(path);
     const notePath = noteMatch !== null;
     const albumsPath = albumListPath || albumPhotosMatch !== null;
     const photoPath = photoMatch !== null;

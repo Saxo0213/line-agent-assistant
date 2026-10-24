@@ -1,5 +1,5 @@
 import type { ConversationKey } from '@line-agent/contracts';
-import type { AlbumOpenResult, ChatResourceBinding } from './chat-resources.js';
+import { AlbumArchiveFailure, type AlbumFailureContext, type AlbumOpenResult, type ChatResourceBinding } from './chat-resources.js';
 
 type DispatchDemand = { key: ConversationKey; binding: ChatResourceBinding; sweep: boolean; recover: boolean; backfill: boolean };
 type AccountFlight = { binding: ChatResourceBinding; dirty: boolean; sweep: boolean; recover: boolean; backfill: boolean;
@@ -10,18 +10,24 @@ export async function archiveAlbumContinuations(openSegment: (cursor: string | n
   let cursor: string | null = null;
   let photoIndex = 0;
   let failedCount = 0;
+  let failureContext: AlbumFailureContext | undefined;
   let anchor: string | undefined;
   let power = 1;
   let cycleLength = 0;
   for (;;) {
     const result = await openSegment(cursor, photoIndex);
     failedCount += result.failedCount;
+    failureContext ??= result.failureContext;
     if (result.complete) {
-      if (failedCount > 0) throw new Error('ALBUM_PHOTO_SAVE_INCOMPLETE');
+      if (failedCount > 0) throw new AlbumArchiveFailure(failureContext ?? {
+        action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' });
       return;
     }
     if (result.nextCursor === null && result.nextPhotoIndex === 0) {
-      throw new Error(result.errorCode ?? (failedCount > 0 ? 'ALBUM_PHOTO_SAVE_INCOMPLETE' : 'ALBUM_ARCHIVE_INCOMPLETE'));
+      throw new AlbumArchiveFailure(failureContext ?? (result.errorCode === 'CURSOR_LOOP'
+        ? { action: 'album_photos', stage: 'pagination', code: 'ALBUM_PHOTO_CURSOR_LOOP' }
+        : failedCount > 0 ? { action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' }
+          : { action: 'album_photos', stage: 'archive_scan', code: 'ALBUM_ARCHIVE_INCOMPLETE' }));
     }
     if (result.nextPhotoIndex > 0) { cursor = result.nextCursor; photoIndex = result.nextPhotoIndex; }
     else if (result.nextCursor !== cursor) { cursor = result.nextCursor; photoIndex = 0; }
@@ -30,7 +36,7 @@ export async function archiveAlbumContinuations(openSegment: (cursor: string | n
     if (anchor === undefined) anchor = checkpoint;
     else {
       cycleLength += 1;
-      if (checkpoint === anchor) throw new Error('ALBUM_PHOTO_CURSOR_LOOP');
+      if (checkpoint === anchor) throw new AlbumArchiveFailure({ action: 'album_photos', stage: 'pagination', code: 'ALBUM_PHOTO_CURSOR_LOOP' });
       if (cycleLength === power) { anchor = checkpoint; power *= 2; cycleLength = 0; }
     }
   }

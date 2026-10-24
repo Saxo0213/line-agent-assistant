@@ -24,6 +24,7 @@ import { AttachmentPreviewService } from './attachment-preview.js';
 import { LineMediaService } from './line-media.js';
 import { createDisconnectedFacade } from './service-facade.js';
 import { createIpcAdapter } from './ipc.js';
+import { createDesktopApi } from '../preload/api.js';
 import { ExternalMonitorDiagnosticFailure } from './services/external-monitor-diagnostics.js';
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
@@ -2425,6 +2426,11 @@ database('connected facade account login semantics', () => {
     const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', onDiagnostic,
       service: { dispatch: (request, signal) => facade.dispatch(request, signal) } });
     const sender = { senderId: 7, url: 'file:///app/index.html' };
+    let wireResult: unknown;
+    const preloadApi = createDesktopApi({ async invoke(_channel, payload) {
+      wireResult = await adapter(sender, payload);
+      return wireResult;
+    }, on() {}, removeListener() {} });
     const openRequest = (requestId: string) => ({ type: 'openChatAlbum', requestId, accountId: 'account-a',
       chatType: 'group', chatId: 'archive-chat', albumId: 'album-a' });
     const auditEventsBeforeCancel = auditEvents.length;
@@ -2452,15 +2458,93 @@ database('connected facade account login semantics', () => {
         accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
         chatType: command.chatType, chatId: command.chatId, photos: [], nextCursor: null };
     };
-    await expect(adapter(sender, openRequest('album-after-cancel'))).resolves.toMatchObject({ type: 'openChatAlbum', ok: true,
-      albumId: 'album-a', savedCount: 0, failedCount: 0, totalCount: 0, complete: true, errorCode: null });
+    await expect(preloadApi.openChatAlbum({ accountId: 'account-a', chatType: 'group', chatId: 'archive-chat' }, 'album-a', 'album-after-cancel'))
+      .resolves.toMatchObject({ albumId: 'album-a', savedCount: 0, failedCount: 0, totalCount: 0, complete: true, errorCode: null });
+    expect(IpcResultSchema.safeParse(wireResult).success).toBe(true);
+    expect(wireResult).not.toHaveProperty('nextCursor');
+    expect(wireResult).not.toHaveProperty('nextPhotoIndex');
     expect(archiveReads).toBe(readsAfterCancel + 1);
+
+    workers.readChatResource = async (command) => command.action === 'listAlbumPhotos'
+      ? { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true,
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId,
+        photos: [{ photoId: 'denied-photo', oid: 'denied-oid', prefix: 'album/a', shotTime: null, width: null, height: null }], nextCursor: null }
+      : { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: false, error: 'response_shape_invalid',
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId };
+    await expect(preloadApi.openChatAlbum({ accountId: 'account-a', chatType: 'group', chatId: 'archive-chat' }, 'album-a', 'album-failed'))
+      .resolves.toMatchObject({ complete: false, savedCount: 0, failedCount: 1, totalCount: 1,
+        failureContext: { action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' } });
+    expect(IpcResultSchema.safeParse(wireResult).success).toBe(true);
+    expect(wireResult).not.toHaveProperty('nextCursor');
+    expect(wireResult).not.toHaveProperty('nextPhotoIndex');
 
     archiveStore.ensureAlbumFolder = async () => { throw new Error('unexpected archive failure'); };
     await expect(adapter(sender, openRequest('album-unexpected'))).resolves.toMatchObject({ type: 'error', code: 'SERVICE_ERROR' });
     await audit.flush();
     expect(auditEvents).toContainEqual(expect.objectContaining({ action: 'runtime_error', requestId: 'album-unexpected',
       diagnostic: expect.objectContaining({ category: 'unknown' }) }));
+  });
+
+  it('recovers an overdue album retry only after the current Agent binding is authenticated and ready', async () => {
+    const accountId = 'startup-album-recovery';
+    const chatId = 'startup-album-chat';
+    const messageId = 'startup-album-notification';
+    await addStoredAccounts(accountId);
+    secretStore.beginLogin(accountId, 'startup-secret-seed', 'startup-secret-seed-attempt');
+    expect(await secretStore.saveRotation(accountId, 'startup-secret-seed', 'startup-secret-seed-attempt',
+      { token: 'startup-test-token', qrCert: null, e2eeStorage: null })).toBe(true);
+    await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES ($1,'group',$2,'Startup archive') ON CONFLICT DO NOTHING",
+      [accountId, chatId]);
+    await pool.query(`INSERT INTO messages(account_id,message_id,event_id,chat_type,chat_id,sender_id,kind,ingestion_source,occurred_at,raw)
+      VALUES ($1,$2,$3,'group',$4,'friend-mid','event','live',now(),$5::jsonb)`,
+    [accountId, messageId, `${messageId}-event`, chatId,
+      JSON.stringify({ message: { id: messageId, from: 'friend-mid', to: chatId, toType: 2, contentType: 16,
+        contentMetadata: { serviceType: 'AB' } } })]);
+    await pool.query(`INSERT INTO album_notification_tasks(account_id,chat_type,chat_id,message_id,status,attempt_count,next_attempt_at,error_stage,error_code)
+      VALUES ($1,'group',$2,$3,'retry',9,clock_timestamp()-interval '1 second','archive_scan','ALBUM_RECONCILIATION_FAILED')`,
+    [accountId, chatId, messageId]);
+
+    let savedPhotos = 0;
+    const actions: string[] = [];
+    archiveStore.ensureAlbumFolder = async () => undefined;
+    archiveStore.hasAlbumPhoto = async () => false;
+    archiveStore.publishAlbumPhoto = async () => { savedPhotos++; };
+    workers.readChatResource = async (command) => {
+      actions.push(command.action);
+      const data = command.action === 'listAlbums' ? { albums: [{ albumId: 'startup-album', chatId, title: 'Album',
+        photoCount: 1, createTime: 1, updateTime: 2 }], nextCursor: null }
+        : command.action === 'listAlbumPhotos' ? { photos: [{ photoId: 'startup-photo', oid: 'startup-oid', prefix: 'album/a',
+          shotTime: 1, width: 2, height: 3 }], nextCursor: null } : { bytes: new Uint8Array([1, 2, 3]) };
+      return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true,
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId, ...data } as ChatResourceReadResult;
+    };
+
+    await activate(accountId);
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect((await pool.query<{ attempt_count: number; status: string }>(
+      'SELECT attempt_count,status FROM album_notification_tasks WHERE account_id=$1 AND message_id=$2', [accountId, messageId])).rows[0])
+      .toEqual({ attempt_count: 9, status: 'retry' });
+    expect(actions).toEqual([]);
+
+    const binding = bindings.get(accountId)!;
+    Object.assign(binding, { transportOwnerId: 'startup-album-owner', transportGeneration: 1, writeGrantVersion: 1 });
+    const tokenLogin = [...commands].reverse().find((command) => command.type === 'loginToken' && command.accountId === accountId);
+    if (tokenLogin?.type !== 'loginToken') throw new Error('Startup did not dispatch token login');
+    const loginAttemptId = tokenLogin.loginAttemptId;
+    await workerEventHandler!(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId,
+      ownMid: `own-${accountId}`, displayName: 'Agent' });
+    expect(actions).toEqual([]);
+    await workerEventHandler!(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
+    await vi.waitFor(async () => {
+      const row = await pool.query<{ attempt_count: number; status: string }>(
+        'SELECT attempt_count,status FROM album_notification_tasks WHERE account_id=$1 AND message_id=$2', [accountId, messageId]);
+      expect(row.rows[0]).toEqual({ attempt_count: 10, status: 'completed' });
+    });
+    expect(actions).toEqual(['listAlbums', 'listAlbumPhotos', 'downloadAlbumPhoto']);
+    expect(savedPhotos).toBe(1);
   });
 
   it.each(['group', 'direct'] as const)('archives a committed live Album POSTNOTIFICATION in a %s chat without renderer action or Note reads', async (chatType) => {

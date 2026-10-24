@@ -52,6 +52,19 @@ describe('chat resource diagnostics', () => {
       .toMatchObject({ failureStage: 'archive_contains', failureReason: 'unknown' });
   });
 
+  it('persists only bounded photo-page shape facts and never cursor or row identifiers', () => {
+    const page = parseChatResourceDiagnostic({ ...validRecord, action: 'album_photos', photoPageShape: {
+      rawPhotoCount: 2, hasMorePresent: false, nextCursorRelation: 'same',
+    } });
+    expect(page?.photoPageShape).toEqual({ rawPhotoCount: 2, hasMorePresent: false, nextCursorRelation: 'same' });
+    expect(parseChatResourceDiagnostic({ ...validRecord, action: 'album_photos', photoPageShape: {
+      rawPhotoCount: 2, hasMorePresent: true, hasMore: true, nextCursorRelation: 'advanced', cursor: 'opaque-cursor',
+    } })).toBeNull();
+    expect(parseChatResourceDiagnostic({ ...validRecord, action: 'photo_download', photoPageShape: {
+      rawPhotoCount: 2, hasMorePresent: false, nextCursorRelation: 'same',
+    } })).toBeNull();
+  });
+
   it('persists only allowlisted worker failure categories', () => {
     expect(parseChatResourceDiagnostic({ ...validRecord, status: 'failure', failureCategory: 'bootstrap_failure' })?.failureCategory)
       .toBe('bootstrap_failure');

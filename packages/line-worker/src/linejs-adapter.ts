@@ -999,7 +999,8 @@ export class LinejsAdapter implements LineTransport {
   }
   async readChatResource(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>): Promise<{
     nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[];
-    photos?: readonly unknown[]; bytes?: Uint8Array;
+    photos?: readonly unknown[]; photoPageShape?: { rawPhotoCount: number; hasMorePresent: boolean; hasMore?: boolean;
+      nextCursorRelation: 'absent' | 'same' | 'advanced' }; bytes?: Uint8Array;
   }> {
     if (!this.#base.authToken || !this.#base.profile?.mid) throw new EffectDeniedError('chat resources require a logged-in account');
     if (options.signal.aborted) throw options.signal.reason;
@@ -1083,13 +1084,23 @@ export class LinejsAdapter implements LineTransport {
       const photoResult = response.result;
       const photos = photoResult?.photos;
       if (!photoResult || !Array.isArray(photos)) throw new ChatResourceFailure('response_shape_invalid');
+      const nativePhotoPage = photoResult as typeof photoResult & { hasMore?: boolean; cursor?: string };
+      const hasMorePresent = Object.hasOwn(photoResult, 'hasMore');
+      const hasMore = typeof nativePhotoPage.hasMore === 'boolean' ? nativePhotoPage.hasMore : undefined;
+      const rawNextCursor = typeof photoResult.nextCursor === 'string' ? photoResult.nextCursor : null;
+      const photoPageShape = { rawPhotoCount: photos.length, hasMorePresent, ...(hasMore === undefined ? {} : { hasMore }),
+        nextCursorRelation: rawNextCursor === null ? 'absent' as const
+          : rawNextCursor === (command.cursor ?? null) ? 'same' as const : 'advanced' as const };
+      const nextCursor = nativePhotoPage.hasMore === false ? null : typeof photoResult.nextCursor === 'string' ? photoResult.nextCursor
+        : nativePhotoPage.hasMore === true && typeof nativePhotoPage.cursor === 'string' ? nativePhotoPage.cursor : null;
       return await stage('normalization_failure', () => ({ photos: photos.slice(0, command.limit ?? 50).flatMap((photo) => {
         const oid = photo.oid ?? photo.obsResourceId?.oid;
         const photoId = photo.photoId ?? photo.id ?? oid;
         if (oid === undefined || photoId === undefined) return [];
         return [{ photoId: String(photoId), oid: String(oid), prefix: photo.obsResourceId?.sid === 'v' || photo.resourceType === 'VIDEO' ? 'album/v' as const : 'album/a' as const,
           shotTime: finiteNonnegative(photo.shotTime), width: finitePositive(photo.width), height: finitePositive(photo.height) }];
-      }), nextCursor: typeof photoResult.nextCursor === 'string' ? photoResult.nextCursor : null }));
+      }), nextCursor,
+      photoPageShape }));
     }
     const bytes = await listGet(() => withFetch(() => this.#base.moa.downloadPhoto({ chatId: command.chatId, albumId: command.albumId!,
       oid: command.oid!, prefix: command.prefix! })));

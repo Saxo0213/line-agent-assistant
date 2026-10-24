@@ -1,4 +1,4 @@
-import type { ChatResourceReadCommand, ConversationCatalogItem } from '@line-agent/contracts';
+import type { ChatResourceReadCommand, ChatResourcePhotoPageShape, ConversationCatalogItem } from '@line-agent/contracts';
 import type { HistoryCursorV1 } from './cursor.js';
 import type { FriendAddResult, FriendRelation, LineTransport, SyncResult, TransportIdentity } from './worker-loop.js';
 
@@ -13,7 +13,8 @@ export class FakeLineTransport implements LineTransport {
   readonly friendCheckCalls: unknown[] = [];
   readonly friendAddCalls: unknown[] = [];
   readonly chatResourceCalls: unknown[] = [];
-  readonly #chatResourceQueue: Array<Readonly<{ nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[]; photos?: readonly unknown[]; bytes?: Uint8Array }>> = [];
+  readonly #chatResourceQueue: Array<Readonly<{ nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[];
+    photos?: readonly unknown[]; photoPageShape?: ChatResourcePhotoPageShape; bytes?: Uint8Array }>> = [];
   catalogCalls = 0;
   catalogError?: Error;
   readonly #historyQueue: (readonly unknown[])[] = [];
@@ -67,7 +68,8 @@ export class FakeLineTransport implements LineTransport {
     this.historyCalls.push({ conversation, cursor, limit });
     return this.#historyQueue.shift() ?? [];
   }
-  enqueueChatResource(result: Readonly<{ nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[]; photos?: readonly unknown[]; bytes?: Uint8Array }>): void {
+  enqueueChatResource(result: Readonly<{ nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[];
+    photos?: readonly unknown[]; photoPageShape?: ChatResourcePhotoPageShape; bytes?: Uint8Array }>): void {
     this.#chatResourceQueue.push(result);
   }
   async readChatResource(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>) {

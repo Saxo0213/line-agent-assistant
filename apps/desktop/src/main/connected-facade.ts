@@ -26,7 +26,8 @@ import { AgentAttachmentError } from './services/agent-attachments.js';
 import { loadLinejsMcpSkill } from './services/mcp-skill.js';
 import { AgentJobEnvironmentService } from './services/agent-job-environment.js';
 import { ChatFolderError, ChatFolderService } from './services/chat-folders.js';
-import { ChatResourceArchiveService, nativePostNotificationSubtype, type ChatResourceBinding, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
+import { AlbumArchiveFailure, albumFailureContextFrom, albumTaskFailureStage, ChatResourceArchiveService, nativePostNotificationSubtype,
+  type ChatResourceBinding, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
 import { AlbumNotificationDispatcher, archiveAlbumContinuations } from './services/album-notification-dispatcher.js';
 import { ChatResourceAccountAdmission } from './services/chat-resource-admission.js';
 import { ChatResourceArchive, createChatResourceStoreAdapter } from './services/chat-resource-archive.js';
@@ -558,13 +559,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     let albumCursor: string | null = null;
     const albumCursorRepeats = cursorCycleDetector();
     do {
-      const albums = await chatResources.listAlbums(key, albumCursor, undefined, 'notification', binding);
+      let albums: Awaited<ReturnType<typeof chatResources.listAlbums>>;
+      try { albums = await chatResources.listAlbums(key, albumCursor, undefined, 'notification', binding); }
+      catch (error) {
+        if (!options.workers.isCurrentActiveControlBinding(binding)) throw error;
+        throw new AlbumArchiveFailure({ action: 'album_list', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' });
+      }
       for (const album of albums.albums) {
         await archiveAlbumContinuations((cursor, photoIndex) =>
           chatResources.openAlbum(key, album.albumId, undefined, 'notification', binding, cursor, photoIndex));
       }
       albumCursor = albums.nextCursor;
-      if (albumCursor !== null && albumCursorRepeats(albumCursor)) throw new Error('ALBUM_LIST_CURSOR_LOOP');
+      if (albumCursor !== null && albumCursorRepeats(albumCursor)) throw new AlbumArchiveFailure({ action: 'album_list', stage: 'pagination', code: 'ALBUM_RECONCILIATION_FAILED' });
     } while (albumCursor !== null);
   };
   const albumNotificationTasks = new AlbumNotificationTaskRepository(options.pool);
@@ -610,10 +616,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         if (!await albumNotificationTasks.completeClaimedChat(key, binding)) return 'stale';
       } catch (error) {
         chatResources.recordNotificationFailure(key, error);
-        const safeCode: AlbumNotificationTaskErrorCode = error instanceof Error && error.message === 'ALBUM_ARCHIVE_INCOMPLETE'
+        const failureContext = albumFailureContextFrom(error);
+        const safeCode: AlbumNotificationTaskErrorCode = failureContext?.code ?? (error instanceof Error && error.message === 'ALBUM_ARCHIVE_INCOMPLETE'
           ? 'ALBUM_ARCHIVE_INCOMPLETE' : error instanceof Error && error.message === 'ALBUM_PHOTO_CURSOR_LOOP'
-            ? 'ALBUM_PHOTO_CURSOR_LOOP' : 'ALBUM_RECONCILIATION_FAILED';
-        const retryAt = await albumNotificationTasks.retryClaimedChat(key, binding, { stage: 'archive_scan', code: safeCode });
+            ? 'ALBUM_PHOTO_CURSOR_LOOP' : 'ALBUM_RECONCILIATION_FAILED');
+        const retryAt = await albumNotificationTasks.retryClaimedChat(key, binding, { stage: failureContext ? albumTaskFailureStage(failureContext) : 'archive_scan', code: safeCode });
         if (retryAt === null && !isCurrent()) return 'stale';
         if (retryAt !== null) { nextRetryAt = retryAt; return 'retry'; }
       }
@@ -1244,6 +1251,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       || binding.controlEpoch !== event.controlEpoch || !lineService.isCurrentWorkerEvent(instance, event)) return;
     if (event.type === 'login') chatResourceAdmission.authenticated(binding);
     else if (event.state === 'ready') chatResourceAdmission.ready(binding);
+    if (lineService.isAuthenticatedReady(binding)) {
+      void track(() => recoverPendingAfterReady(binding)).catch(() => undefined);
+    }
   }
 
   unsubscribeEvent = options.workers.onEvent((instance, event) => closing ? Promise.resolve() : track(async () => {
@@ -1406,7 +1416,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       await lineService.bind(binding, signal);
       if (signal.aborted) throw new Error('Worker binding cancelled');
       schedulePrimaryAdministratorFriendship(binding, signal);
-      if (!closing) void track(() => recoverPendingAfterReady(binding, signal)).catch(() => undefined);
     });
   });
   if (unsubscribeBinding) startupCleanup.add(unsubscribeBinding);
@@ -1454,6 +1463,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           || current.controlEpoch !== binding.controlEpoch || current.mode !== mode) return;
         chatResourceAdmission.ready(current);
         chatResourceAdmission.modeReady(current);
+        if (mode === 'ACTIVE_CONTROL' && lineService.isAuthenticatedReady(current)) {
+          void track(() => recoverPendingAfterReady(current, signal)).catch(() => undefined);
+        }
       }).catch(() => undefined);
       if (binding.mode === 'ACTIVE_CONTROL') schedulePendingDeliveryRecovery(binding.accountId);
     });
@@ -1461,16 +1473,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   if (unsubscribeModeChange) startupCleanup.add(unsubscribeModeChange);
 
   async function recoverPendingAfterReady(binding: Bound, signal?: AbortSignal): Promise<void> {
-    if (signal?.aborted) return;
-    if (binding.mode !== 'ACTIVE_CONTROL'
-      || !await options.workers.waitModeAck(binding.accountId, 'ACTIVE_CONTROL', 3000)) return;
+    if (signal?.aborted || closing || binding.mode !== 'ACTIVE_CONTROL'
+      || !lineService.isAuthenticatedReady(binding) || !options.workers.isCurrentActiveControlBinding(binding)) return;
+    if (!await options.workers.waitModeAck(binding.accountId, 'ACTIVE_CONTROL', 3000)) return;
     if (signal?.aborted) return;
     const current = await options.workers.binding(binding.accountId);
     if (!current || current.mode !== 'ACTIVE_CONTROL' || current.accountId !== binding.accountId
-      || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch) return;
+      || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch
+      || !lineService.isAuthenticatedReady(current) || !options.workers.isCurrentActiveControlBinding(current)) return;
     await delivery.recoverPending(binding.accountId);
     if ((await accounts.getAccount(binding.accountId))?.productRole !== 'AGENT') return;
-    if (signal?.aborted || closing || !options.workers.isCurrentActiveControlBinding(current)) return;
+    if (signal?.aborted || closing || !lineService.isAuthenticatedReady(current)
+      || !options.workers.isCurrentActiveControlBinding(current)) return;
     const archiveBinding = asChatResourceBinding(current);
     if (archiveBinding) albumDispatcher.recover(binding.accountId, archiveBinding);
   }
@@ -1506,7 +1520,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       await auditWorkerStop(binding, () => options.workers.stopBinding(binding));
       throw new Error('無法恢復主操作帳號控制權。');
     }
-    if (!closing) void track(() => recoverPendingAfterReady(binding)).catch(() => undefined);
     return binding;
   }
 
@@ -2449,8 +2462,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         ...await chatResources.dispatchIpc(request, signal) };
       if (request.type === 'downloadChatAlbumPhoto') return { type: request.type, requestId: request.requestId, ok: true,
         ...await chatResources.dispatchIpc(request, signal) };
-      if (request.type === 'openChatAlbum') return { type: request.type, requestId: request.requestId, ok: true,
-        ...await chatResources.dispatchIpc(request, signal) };
+      if (request.type === 'openChatAlbum') {
+        const result = await chatResources.dispatchIpc(request, signal);
+        return { type: request.type, requestId: request.requestId, ok: true, albumId: result.albumId, savedCount: result.savedCount,
+          failedCount: result.failedCount, totalCount: result.totalCount, byteCount: result.byteCount, complete: result.complete,
+          failureCodes: result.failureCodes, errorCode: result.errorCode,
+          ...(result.failureContext ? { failureContext: result.failureContext } : {}) };
+      }
       if (request.type === 'getAutoResponderSettings') {
         return { type: request.type, requestId, ok: true, settings: await autoresponders.get() };
       }

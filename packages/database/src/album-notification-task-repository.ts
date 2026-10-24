@@ -2,7 +2,8 @@ import type { Pool } from 'pg';
 import type { ConversationKey } from '@line-agent/contracts';
 
 export type AlbumNotificationTaskStatus = 'pending' | 'running' | 'retry' | 'completed' | 'skipped';
-export type AlbumNotificationTaskErrorStage = 'archive_scan' | 'source_validation' | 'unknown';
+export type AlbumNotificationTaskErrorStage = 'archive_scan' | 'album_list' | 'album_list_pagination' | 'album_photos'
+  | 'photo_download' | 'photo_pagination' | 'archive_contains' | 'archive_write' | 'source_validation' | 'unknown';
 export type AlbumNotificationTaskErrorCode = 'ALBUM_RECONCILIATION_FAILED' | 'ALBUM_ARCHIVE_INCOMPLETE'
   | 'ALBUM_PHOTO_CURSOR_LOOP' | 'missing_source' | 'source_deleted' | 'unknown';
 

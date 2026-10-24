@@ -187,13 +187,13 @@ database('AlbumNotificationTaskRepository with PostgreSQL', () => {
     await repository.enqueueCommitted({ accountId, chatType: 'group', chatId: 'g1', messageId: 'failed' });
     await repository.claimChat({ accountId, chatType: 'group', chatId: 'g1' });
     const retryAt = await repository.retryClaimedChat({ accountId, chatType: 'group', chatId: 'g1' }, binding,
-      { stage: 'archive_scan', code: 'ALBUM_RECONCILIATION_FAILED' });
+      { stage: 'photo_download', code: 'ALBUM_RECONCILIATION_FAILED' });
     expect(retryAt).toBeGreaterThan(Date.now());
     await repository.enqueueCommitted({ accountId, chatType: 'direct', chatId: 'g2', messageId: 'newer' });
     await expect(repository.claimChat({ accountId, chatType: 'direct', chatId: 'g2' })).resolves.toMatchObject({ claimed: false, retryAt });
     await pool.query("UPDATE album_notification_tasks SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE account_id=$1 AND status='retry'", [accountId]);
     await expect(repository.claimChat({ accountId, chatType: 'direct', chatId: 'g2' })).resolves.toMatchObject({ claimed: true, retryAt: null });
-    expect(await task(accountId, 'failed')).toMatchObject({ status: 'retry', error_stage: 'archive_scan', attempt_count: 1 });
+    expect(await task(accountId, 'failed')).toMatchObject({ status: 'retry', error_stage: 'photo_download', attempt_count: 1 });
     await pool.query("DELETE FROM messages WHERE account_id=$1 AND message_id='failed'", [accountId]);
     await repository.skipInvalidPage({ accountId });
     expect(await task(accountId, 'failed')).toMatchObject({ status: 'skipped', error_code: 'missing_source' });

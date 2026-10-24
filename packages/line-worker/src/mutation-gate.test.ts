@@ -165,6 +165,39 @@ function encryptedClient(options: Partial<ConstructorParameters<typeof FidelityR
 }
 
 describe("trusted RequestClient boundary", () => {
+  it("allows the native dotted album photo OID while keeping the request narrowly bound", async () => {
+    const { gate, physicalTransport } = setup({ requestClient: encryptedClient() });
+    const effect = { accountId: ACCOUNT, workerInstanceId: WORKER, controlEpoch: 7,
+      signal: new AbortController().signal, maxBytes: 1024, chatId: "c-chat", ownMid: "u-self",
+      action: "downloadAlbumPhoto" as const, albumId: "album-1", oid: "b6f9402bca1644e08ce1e443d8874729.26102421",
+      prefix: "album/a" as const };
+    const request = new Request(`https://legy.line-apps.com/oa/r/album/a/${effect.oid}`, { method: "POST", redirect: "error",
+      headers: { "X-Line-ChannelToken": "fixture-token", "X-Line-Mid": effect.chatId, "X-Line-Album": effect.albumId }, body: new Uint8Array() });
+
+    await expect(gate.runChatResourceFetch(effect, request)).resolves.toMatchObject({ status: 200 });
+    expect(physicalTransport).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["path separator", "https://legy.line-apps.com/oa/r/album/a/oid%2Fother", "b6f9402bca1644e08ce1e443d8874729.26102421", "c-chat", "album-1"],
+    ["traversal", "https://legy.line-apps.com/oa/r/album/a/%2e%2e", "b6f9402bca1644e08ce1e443d8874729.26102421", "c-chat", "album-1"],
+    ["foreign host", "https://example.com/oa/r/album/a/b6f9402bca1644e08ce1e443d8874729.26102421", "b6f9402bca1644e08ce1e443d8874729.26102421", "c-chat", "album-1"],
+    ["wrong chat header", "https://legy.line-apps.com/oa/r/album/a/b6f9402bca1644e08ce1e443d8874729.26102421", "b6f9402bca1644e08ce1e443d8874729.26102421", "c-other", "album-1"],
+    ["wrong album header", "https://legy.line-apps.com/oa/r/album/a/b6f9402bca1644e08ce1e443d8874729.26102421", "b6f9402bca1644e08ce1e443d8874729.26102421", "c-chat", "album-other"],
+    ["OID mismatch", "https://legy.line-apps.com/oa/r/album/a/other.26102421", "b6f9402bca1644e08ce1e443d8874729.26102421", "c-chat", "album-1"],
+  ])("rejects album photo request with %s", async (_label, url, oid, chatHeader, albumHeader) => {
+    const { gate, physicalTransport } = setup({ requestClient: encryptedClient() });
+    const effect = { accountId: ACCOUNT, workerInstanceId: WORKER, controlEpoch: 7,
+      signal: new AbortController().signal, maxBytes: 1024, chatId: "c-chat", ownMid: "u-self",
+      action: "downloadAlbumPhoto" as const, albumId: "album-1", oid,
+      prefix: "album/a" as const };
+    const request = new Request(url, { method: "POST", redirect: "error",
+      headers: { "X-Line-ChannelToken": "fixture-token", "X-Line-Mid": chatHeader, "X-Line-Album": albumHeader }, body: new Uint8Array() });
+
+    await expect(gate.runChatResourceFetch(effect, request)).rejects.toMatchObject({ code: "SIDE_EFFECT_DENIED" });
+    expect(physicalTransport).not.toHaveBeenCalled();
+  });
+
   it("requires a current matching lease for manual sends", async () => {
     const client = encryptedClient();
     const { gate, physicalTransport, validateControlLease } = setup({ requestClient: client, leaseResults: [false] });

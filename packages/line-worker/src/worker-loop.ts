@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   isLocalAgentRoom, MEDIA_FILE_MAX_BYTES, MEDIA_IMAGE_MAX_BYTES, LineWorkerCommandSchema, LineWorkerEventSchema,
   WORKER_PROTOCOL_VERSION, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue as ContractJsonValue, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto,
-  type ChatResourceReadCommand,
+  type ChatResourceReadCommand, type ChatResourcePhotoPageShape,
 } from '@line-agent/contracts';
 import { DurableCursorSession, decodeHistoryCursor, encodeHistoryCursor,
   type HistoryCursorV1, type JsonValue } from './cursor.js';
@@ -39,7 +39,7 @@ export interface LineTransport {
     cursor: HistoryCursorV1 | null, limit: number): Promise<readonly unknown[]>;
   readChatResource?(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>): Promise<Readonly<{
     nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[];
-    photos?: readonly unknown[]; bytes?: Uint8Array;
+    photos?: readonly unknown[]; photoPageShape?: ChatResourcePhotoPageShape; bytes?: Uint8Array;
   }>>;
   download(kind: 'image' | 'video' | 'audio' | 'file', messageId: string,
     externalAttachmentId: string, lineMessage: ContractJsonValue,

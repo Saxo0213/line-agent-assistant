@@ -41,6 +41,12 @@ export const ChatResourceAlbumSchema = z.strictObject({ albumId: IdSchema.max(25
   photoCount: z.number().int().min(0).max(100000).nullable(), createTime: z.number().nullable(), updateTime: z.number().nullable() });
 export const ChatResourcePhotoSchema = z.strictObject({ photoId: IdSchema.max(256), oid: IdSchema.max(256), prefix: z.string().max(512),
   shotTime: z.number().nullable(), width: z.number().int().min(0).nullable(), height: z.number().int().min(0).nullable() });
+export const AlbumFailureContextSchema = z.strictObject({
+  action: z.enum(['album_list', 'album_photos', 'photo_download']),
+  stage: z.enum(['resource_read', 'pagination', 'archive_contains', 'archive_write', 'archive_scan']),
+  code: z.enum(['ALBUM_RECONCILIATION_FAILED', 'ALBUM_ARCHIVE_INCOMPLETE', 'ALBUM_PHOTO_CURSOR_LOOP']),
+});
+export type AlbumFailureContextDto = z.infer<typeof AlbumFailureContextSchema>;
 export type ChatResourceNote = z.infer<typeof ChatResourceNoteSchema>;
 export type ChatResourceAlbum = z.infer<typeof ChatResourceAlbumSchema>;
 export type ChatResourcePhoto = z.infer<typeof ChatResourcePhotoSchema>;
@@ -420,7 +426,7 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('openChatAlbum'), requestId: IdSchema, ok: z.literal(true), albumId: IdSchema.max(256),
       savedCount: z.number().int().min(0).max(500), failedCount: z.number().int().min(0).max(500), totalCount: z.number().int().min(0).max(500),
       byteCount: z.number().int().min(0).max(268435456), complete: z.boolean(), failureCodes: z.array(z.string().regex(/^[A-Z][A-Z0-9_]{1,47}$/)).max(500),
-      errorCode: z.string().regex(/^[A-Z][A-Z0-9_]{1,47}$/).nullable() }),
+      errorCode: z.string().regex(/^[A-Z][A-Z0-9_]{1,47}$/).nullable(), failureContext: AlbumFailureContextSchema.optional() }),
     z.strictObject({ type: z.literal('cancelChatResourceRequest'), requestId: IdSchema, ok: z.literal(true), cancelled: z.boolean() }),
     z.strictObject({ type: z.literal('getJobEvents'), requestId: IdSchema, ok: z.literal(true), events: z.array(AgentEventSchema) }),
     z.strictObject({ type: z.literal('openAttachment'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),

@@ -19,6 +19,8 @@
 </tr>
 </table>
 
+The v1.0.244 release improves Album photo loading, pagination, and recovery after LINE becomes ready. See the [v1.0.244 release notes](docs/releases/v1.0.244.md).
+
 ## Installation
 
 ### Windows installer

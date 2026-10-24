@@ -32,6 +32,7 @@ import {
   type AgentEvent,
   type AgentProvider,
   type AppSnapshot,
+  type AlbumFailureContextDto,
   type AutoResponderRule,
   type AutoResponderSettings,
   type ConversationKey,
@@ -69,7 +70,7 @@ export type DesktopApi = {
   listChatAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null, requestId?: string): Promise<{ photos: ChatResourcePhoto[]; nextCursor: string | null }>;
   downloadChatAlbumPhoto(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: 'album/a' | 'album/v', requestId?: string): Promise<{ albumId: string; photoId: string; sizeBytes: number }>;
   openChatAlbum(key: ConversationKey, albumId: string, requestId?: string): Promise<{ albumId: string; savedCount: number; failedCount: number; totalCount: number;
-    byteCount: number; complete: boolean; failureCodes: string[]; errorCode: string | null }>;
+    byteCount: number; complete: boolean; failureCodes: string[]; errorCode: string | null; failureContext?: AlbumFailureContextDto }>;
   cancelChatResourceRequest(targetRequestId: string): Promise<boolean>;
   listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[]): Promise<ReturnType<typeof AttachmentStateListSchema.parse>>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'; revision: string }>>;
@@ -223,7 +224,8 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async listChatAlbumPhotos(key, albumId, cursor, requestId) { const result = await request({ type: 'listChatAlbumPhotos', ...key, albumId, cursor }, requestId); if (result.type !== 'listChatAlbumPhotos') throwIpcErrorOrUnexpected(result, 'Unexpected Album photo response'); return { photos: ChatResourcePhotoSchema.array().max(50).parse(result.photos), nextCursor: result.nextCursor }; },
     async downloadChatAlbumPhoto(key, albumId, photoId, oid, prefix, requestId) { const result = await request({ type: 'downloadChatAlbumPhoto', ...key, albumId, photoId, oid, prefix }, requestId); if (result.type !== 'downloadChatAlbumPhoto') throwIpcErrorOrUnexpected(result, 'Unexpected Album photo download response'); return { albumId: result.albumId, photoId: result.photoId, sizeBytes: result.sizeBytes }; },
     async openChatAlbum(key, albumId, requestId) { const result = await request({ type: 'openChatAlbum', ...key, albumId }, requestId); if (result.type !== 'openChatAlbum') throwIpcErrorOrUnexpected(result, 'Unexpected Album archive response'); return { albumId: result.albumId, savedCount: result.savedCount, failedCount: result.failedCount, totalCount: result.totalCount,
-      byteCount: result.byteCount, complete: result.complete, failureCodes: result.failureCodes, errorCode: result.errorCode }; },
+      byteCount: result.byteCount, complete: result.complete, failureCodes: result.failureCodes, errorCode: result.errorCode,
+      ...(result.failureContext ? { failureContext: result.failureContext } : {}) }; },
     async cancelChatResourceRequest(targetRequestId) { const result = await request({ type: 'cancelChatResourceRequest', targetRequestId }); return result.type === 'cancelChatResourceRequest' && result.cancelled; },
     async listAttachmentStates(key, attachmentIds) { if (attachmentIds.length > 225) throw new Error('Attachment state lookup exceeds 225 IDs'); if (attachmentIds.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) throw new Error('Invalid attachment ID'); const result = await read({ type: 'listAttachmentStates', key, attachmentIds: [...new Set(attachmentIds)] }); return AttachmentStateListSchema.parse(result.attachments); },
     async listAgentStatuses(key, messageIds) { if (messageIds.length > 225) throw new Error('Agent status lookup exceeds 225 IDs'); const result = await read({ type: 'listAgentStatuses', key, messageIds: [...new Set(messageIds)] }); return result.statuses; },
