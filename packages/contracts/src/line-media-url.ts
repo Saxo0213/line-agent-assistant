@@ -42,6 +42,7 @@ export function lineMediaUrl(input: LineMediaTarget): string | null {
     : target.type === 'conversation' ? [target.accountId, target.chatId]
     : target.type === 'member' ? [target.accountId, target.chatId, target.memberId]
     : target.type === 'sticker' || target.type === 'sticon' || target.type === 'reaction' ? [target.accountId, target.chatId, target.messageId]
+    : target.type === 'albumPhoto' ? [target.accountId, target.chatId, target.albumId, target.photoId]
     : [target.accountId, target.chatId, target.attachmentId];
   if (ids.some((id) => !wellFormed(id))) return null;
   switch (target.type) {
@@ -52,13 +53,14 @@ export function lineMediaUrl(input: LineMediaTarget): string | null {
     case 'sticon': return `line-media://sticon/${encode(target.accountId)}/${target.chatType}/${encode(target.chatId)}/${encode(target.messageId)}/${target.index}`;
     case 'reaction': return `line-media://reaction/${encode(target.accountId)}/${target.chatType}/${encode(target.chatId)}/${encode(target.messageId)}/${target.productId}/${target.emojiId}`;
     case 'attachment': return `line-media://attachment/${encode(target.accountId)}/${target.chatType}/${encode(target.chatId)}/${encode(target.attachmentId)}`;
+    case 'albumPhoto': return `line-media://album-photo/${encode(target.accountId)}/${target.chatType}/${encode(target.chatId)}/${encode(target.albumId)}/${encode(target.photoId)}`;
   }
   } catch { return null; }
 }
 
 export function parseLineMediaUrl(value: string): LineMediaTarget | null {
   if (typeof value !== 'string' || !value.startsWith('line-media://') || /[?#]/.test(value)) return null;
-  const match = /^line-media:\/\/(avatar|sticker|sticon|reaction|attachment)\/([^?#]*)$/.exec(value);
+  const match = /^line-media:\/\/(avatar|sticker|sticon|reaction|attachment|album-photo)\/([^?#]*)$/.exec(value);
   if (!match) return null;
   const route = match[1]!;
   const segments = match[2]!.split('/');
@@ -81,6 +83,10 @@ export function parseLineMediaUrl(value: string): LineMediaTarget | null {
     if (accountId === null || !ct || chatId === null || last === null) return null;
     target = route === 'sticker' ? { type: route, accountId, chatType: ct, chatId, messageId: last }
       : { type: route, accountId, chatType: ct, chatId, attachmentId: last };
+  } else if (route === 'album-photo' && segments.length === 5) {
+    const accountId = id(segments[0]), ct = chatType(segments[1]), chatId = id(segments[2]), albumId = id(segments[3]), photoId = id(segments[4]);
+    if (accountId === null || !ct || chatId === null || albumId === null || photoId === null) return null;
+    target = { type: 'albumPhoto', accountId, chatType: ct, chatId, albumId, photoId };
   } else if (route === 'sticon' && segments.length === 5) {
     const accountId = id(segments[0]), ct = chatType(segments[1]), chatId = id(segments[2]), messageId = id(segments[3]);
     if (accountId === null || !ct || chatId === null || messageId === null || !/^\d+$/.test(segments[4]!)) return null;

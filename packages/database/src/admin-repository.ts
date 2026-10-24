@@ -40,6 +40,31 @@ export class AdminRepository {
     return row ? { chatId: row.chat_id, userId: row.user_id } : null;
   }
 
+  async hasPrimaryAdministratorFriendConfirmation(accountId: string, userId: string, version: number): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1 FROM primary_administrator_friend_confirmations confirmation
+       JOIN account_administrator_versions version_row ON version_row.account_id=confirmation.account_id
+       JOIN account_administrators administrator ON administrator.account_id=confirmation.account_id
+         AND administrator.user_id=confirmation.user_id AND administrator.role='PRIMARY_ADMIN'
+       WHERE confirmation.account_id=$1 AND confirmation.user_id=$2 AND confirmation.admin_version=$3
+         AND version_row.version=$3`, [accountId, userId, version]);
+    return result.rowCount === 1;
+  }
+
+  async confirmPrimaryAdministratorFriendship(accountId: string, userId: string, version: number): Promise<boolean> {
+    const result = await this.pool.query(
+      `INSERT INTO primary_administrator_friend_confirmations(account_id,user_id,admin_version,confirmed_at)
+       SELECT $1,$2,$3,clock_timestamp()
+       WHERE EXISTS (SELECT 1 FROM account_administrators administrator
+         JOIN account_administrator_versions version_row ON version_row.account_id=administrator.account_id
+         WHERE administrator.account_id=$1 AND administrator.user_id=$2 AND administrator.role='PRIMARY_ADMIN'
+           AND version_row.version=$3)
+       ON CONFLICT (account_id) DO UPDATE SET user_id=EXCLUDED.user_id,
+         admin_version=EXCLUDED.admin_version, confirmed_at=EXCLUDED.confirmed_at
+       RETURNING account_id`, [accountId, userId, version]);
+    return result.rowCount === 1;
+  }
+
   async bindPrimary(accountId: string, chatId: string, userId: string): Promise<boolean> {
     const result = await this.pool.query(
       `INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)

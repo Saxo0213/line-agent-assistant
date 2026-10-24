@@ -4212,6 +4212,26 @@ database('connected facade account login semantics', () => {
     expect(auditEvents.some((event) => event.action === 'worker_operation_error')).toBe(false);
   });
 
+  it('attributes generic worker callback failures without exposing error text', async () => {
+    await addStoredAccounts('diagnostic-account');
+    expect(await facade.dispatch({ type: 'lineStart', requestId: 'diagnostic-start', accountId: 'diagnostic-account' }))
+      .toMatchObject({ ok: true });
+    const binding = bindings.get('diagnostic-account')!;
+    const failure = new Error('private message and token=secret-value');
+    vi.spyOn(workers, 'binding').mockRejectedValueOnce(failure);
+
+    await expect(workerEventHandler!(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null }))
+      .rejects.toBe(failure);
+    await waitForState(() => expect(auditEvents.some((event) => event.action === 'runtime_error'
+      && event.diagnostic?.operation === 'line_ingest')).toBe(true));
+
+    const event = auditEvents.find((item) => item.action === 'runtime_error' && item.diagnostic?.operation === 'line_ingest');
+    expect(event).toMatchObject({ accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+      diagnostic: { operation: 'line_ingest', stage: 'execute', category: 'unknown' } });
+    expect(JSON.stringify(event)).not.toContain('private message');
+    expect(JSON.stringify(event)).not.toContain('secret-value');
+  });
+
   it('does not turn a generic worker operation error into degraded account status', async () => {
     await addStoredAccounts('account-a');
     await facade.dispatch({ type: 'lineStart', requestId: 'start-a', accountId: 'account-a' });
@@ -4714,6 +4734,21 @@ database('connected facade account login semantics', () => {
           expect(JSON.stringify(result)).not.toContain('random text');
         }
       } finally { warning.mockRestore(); }
+    });
+
+    it('audits a thrown native-reader failure once with its request ID and without exception text', async () => {
+      await addAgentOnly();
+      await restartFacadeWithImporter(importer(() => { throw new Error('private reader failure token=secret'); }));
+      const result = await facade.dispatch({ type: 'previewExternalAdminBinding', requestId: 'native-reader-diagnostic' });
+      expect(result).toMatchObject({ ok: false, code: 'OFFICIAL_IDENTITY_UNAVAILABLE', message: 'reader_failed' });
+
+      const readerEvents = auditEvents.filter((event) => event.action === 'runtime_error'
+        && event.diagnostic?.operation === 'native_reader' && event.diagnostic?.stage === 'read');
+      expect(readerEvents).toHaveLength(1);
+      expect(readerEvents[0]).toMatchObject({ requestId: 'native-reader-diagnostic',
+        diagnostic: { operation: 'native_reader', stage: 'read', category: 'unknown' } });
+      expect(JSON.stringify(readerEvents)).not.toContain('private reader failure');
+      expect(JSON.stringify(readerEvents)).not.toContain('secret');
     });
 
     it('yields identity_invalid for a malformed MID and reader_missing without a reader', async () => {

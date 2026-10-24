@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { AlbumFailureContextDto, ConversationKey, InboundEnvelope } from '@line-agent/contracts';
 import type { OperationalAudit } from './operational-audit.js';
+import type { ChatAlbumCatalogAlbum, ChatAlbumCatalogPhoto, ChatAlbumCatalogBinding, ChatAlbumSavedFile } from '@line-agent/database';
 
 export const CHAT_RESOURCE_PAGE_LIMIT = 50;
 export const CHAT_RESOURCE_PHOTO_LIMIT = 50;
@@ -11,7 +12,20 @@ const MAX_NOTE_TEXT = 256 * 1024;
 const MAX_METADATA_TEXT = 20_000;
 const MAX_ARCHIVE_PENDING = 32;
 const MAX_ARCHIVE_ACTIVE = 4;
-const MAX_ALBUM_OPEN_PAGES = Math.ceil(CHAT_RESOURCE_ALBUM_OPEN_ITEM_LIMIT / CHAT_RESOURCE_PHOTO_LIMIT);
+const MAX_ALBUM_OPEN_PAGES = 10;
+function decodeCatalogCursor(value: string | null, prefix: 'db-album:' | 'db-photo:'): { generation: number; ordinal: number } | null {
+  if (!value?.startsWith(prefix)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value.slice(prefix.length), 'base64url').toString('utf8')) as { generation?: unknown; ordinal?: unknown };
+    if (Number.isSafeInteger(parsed.generation) && Number(parsed.generation) > 0 && Number.isSafeInteger(parsed.ordinal) && Number(parsed.ordinal) >= -1) {
+      return { generation: Number(parsed.generation), ordinal: Number(parsed.ordinal) };
+    }
+  } catch { /* malformed cursor is rejected below */ }
+  throw new Error('Invalid album catalog cursor.');
+}
+function encodeCatalogCursor(prefix: 'db-album:' | 'db-photo:', generation: number, ordinal: number): string {
+  return `${prefix}${Buffer.from(JSON.stringify({ generation, ordinal }), 'utf8').toString('base64url')}`;
+}
 const GENERATED_NOTE_MARKER = '<!-- linejs-generated-note:v1 -->';
 
 export type ChatResourceAction = 'listNotes' | 'getNote' | 'listAlbums' | 'listAlbumPhotos' | 'downloadAlbumPhoto';
@@ -49,6 +63,7 @@ export type ChatResourceReadResult = { type: 'chatResourceResult'; requestId: st
 export type ChatResourceBinding = { accountId: string; workerInstanceId: string; controlEpoch: number; transportOwnerId: string;
   transportGeneration: number; writeGrantVersion: number; mode: string };
 export type ChatResourceArchiveVersion = { revision: number; savedAt: string; content: Uint8Array; contentHash: string; byteLength: number };
+export type ChatResourceAlbumPhotoFile = ChatAlbumSavedFile;
 export type ChatResourceArchiveItem = { resourceId: string; revision: number; savedAt: string; contentHash: string; byteLength: number };
 export type ChatResourceArchivePage = { items: ChatResourceArchiveItem[]; nextCursor: string | null };
 export type AlbumOpenResult = { albumId: string; savedCount: number; failedCount: number; totalCount: number; byteCount: number;
@@ -63,9 +78,11 @@ export interface ChatResourceStore {
   read(input: { key: ConversationKey; kind: ChatResourceKind; resourceId: string; signal?: AbortSignal }): Promise<ChatResourceArchiveVersion | null>;
   list(input: { key: ConversationKey; kind: ChatResourceKind; limit: number; cursor?: string | null; signal?: AbortSignal }): Promise<ChatResourceArchivePage>;
   ensureAlbumFolder?(input: { key: ConversationKey; albumId: string; signal: AbortSignal; guard: () => void }): Promise<void>;
+  inspectAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; signal: AbortSignal; guard: () => void }): Promise<ChatResourceAlbumPhotoFile | null>;
+  readAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; signal: AbortSignal; guard: () => void }): Promise<(ChatResourceAlbumPhotoFile & { content: Uint8Array }) | null>;
   hasAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; signal: AbortSignal; guard: () => void }): Promise<boolean>;
   publishAlbumPhoto?(input: { key: ConversationKey; albumId: string; photoId: string; content: Uint8Array; signal: AbortSignal;
-    guard: () => void }): Promise<void>;
+    guard: () => void }): Promise<ChatResourceAlbumPhotoFile | void>;
   close(): Promise<void>;
   /** Synchronously terminates the bounded native owner after close/drain grace expires. */
   forceClose(): void;
@@ -74,6 +91,20 @@ export interface ChatResourceStore {
 export type ChatResourceArchiveDependencies = {
   readChatResource(command: ChatResourceRequest, signal?: AbortSignal): Promise<ChatResourceReadResult>;
   store?: ChatResourceStore;
+  catalog?: {
+    albumScanState(key: ConversationKey): Promise<{ complete: boolean; generation: number; cursor: string | null; previousCursor: string | null; nextOrdinal: number }>;
+    beginAlbumScan(key: ConversationKey, binding: ChatAlbumCatalogBinding): Promise<number>;
+    appendAlbumPage(key: ConversationKey, generation: number, expectedCursor: string | null, albums: readonly ChatAlbumCatalogAlbum[], nextCursor: string | null, binding: ChatAlbumCatalogBinding): Promise<{ nextOrdinal: number; complete: boolean }>;
+    listAlbums(key: ConversationKey, cursor: string | null, limit?: number): Promise<{ items: ChatAlbumCatalogAlbum[]; nextCursor: string | null }>;
+    firstPhotoIds?(key: ConversationKey, albumIds: readonly string[], limit?: number): Promise<Map<string, string[]>>;
+    beginPhotoScan(key: ConversationKey, albumId: string, binding: ChatAlbumCatalogBinding): Promise<number>;
+    appendPhotoPage(key: ConversationKey, albumId: string, generation: number, expectedCursor: string | null, photos: readonly ChatAlbumCatalogPhoto[], nextCursor: string | null, binding: ChatAlbumCatalogBinding): Promise<{ nextOrdinal: number; complete: boolean }>;
+    photoScan(key: ConversationKey, albumId: string): Promise<{ complete: boolean; generation: number; cursor: string | null; previousCursor: string | null; nextOrdinal: number } | null>;
+    listPhotos(key: ConversationKey, albumId: string, cursor: string | null, limit?: number): Promise<{ items: ChatAlbumCatalogPhoto[]; nextCursor: string | null }>;
+    savedPhoto(key: ConversationKey, albumId: string, photoId: string): Promise<ChatAlbumSavedFile | null>;
+    savePhoto(key: ConversationKey, albumId: string, photoId: string, file: ChatAlbumSavedFile, binding: ChatAlbumCatalogBinding): Promise<void>;
+    clearSavedPhoto(key: ConversationKey, albumId: string, photoId: string, binding: ChatAlbumCatalogBinding): Promise<void>;
+  };
   isWritableAccount(accountId: string): Promise<boolean>;
   getBinding(accountId: string): Promise<ChatResourceBinding | null>;
   isCurrentBinding(binding: ChatResourceBinding): boolean;
@@ -100,8 +131,8 @@ async function settlesWithin(promise: Promise<unknown>, milliseconds: number): P
 }
 
 export type NoteDto = { postId: string; createdTime: number | null; text: string | null; content?: Record<string, unknown> | undefined };
-export type AlbumDto = { albumId: string; chatId: string; title: string | null; photoCount: number | null; createTime: number | null; updateTime: number | null };
-export type PhotoDto = { photoId: string; oid: string; prefix: string; shotTime: number | null; width: number | null; height: number | null };
+export type AlbumDto = { albumId: string; chatId: string; title: string | null; photoCount: number | null; createTime: number | null; updateTime: number | null; coverPhotoIds?: string[] };
+export type PhotoDto = { photoId: string; oid: string; prefix: 'album/a' | 'album/v'; shotTime: number | null; width: number | null; height: number | null };
 export function chatResourceConversationKey(value: { accountId: string; chatType: ConversationKey['chatType']; chatId: string }): ConversationKey {
   return { accountId: value.accountId, chatType: value.chatType, chatId: value.chatId };
 }
@@ -113,7 +144,7 @@ export function chatResourcePhotoId(albumId: string, photoId: string): string {
   return createHash('sha256').update(JSON.stringify([boundedId(albumId, 'album ID'), boundedId(photoId, 'photo ID')])).digest('hex');
 }
 export type ChatResourceIpcRequest = ConversationKey & { requestId: string; type: 'listChatNotes' | 'getChatNote' | 'listChatAlbums' | 'listChatAlbumPhotos' | 'downloadChatAlbumPhoto' | 'openChatAlbum';
-  cursor?: string | null; postId?: string; albumId?: string; photoId?: string; oid?: string; prefix?: string };
+  cursor?: string | null; postId?: string; albumId?: string; photoId?: string; oid?: string; prefix?: string; refresh?: boolean };
 
 /** Fails closed until the handle-anchored native archive adapter is supplied by the desktop host. */
 export const unavailableChatResourceStore: ChatResourceStore = {
@@ -208,14 +239,19 @@ function photoDto(value: unknown): PhotoDto {
   const shotTime = row.shotTime === null ? null : boundedTimestamp(row.shotTime);
   const width = nullableInt(row.width), height = nullableInt(row.height);
   if ((width !== null && !Number.isFinite(width)) || (height !== null && !Number.isFinite(height))) throw new Error('Invalid photo dimensions.');
+  if (row.prefix !== 'album/a' && row.prefix !== 'album/v') throw new Error('Invalid album photo prefix.');
   return { photoId: boundedId(row.photoId as string, 'photo ID'), oid: boundedId(row.oid as string, 'photo object ID'),
-    prefix: boundedText(row.prefix, 512, 'photo prefix'), shotTime, width, height };
+    prefix: row.prefix, shotTime, width, height };
 }
 function contentBytes(value: unknown, maxBytes: number): Uint8Array {
   const json = JSON.stringify(value);
   const bytes = Buffer.from(json, 'utf8');
   if (bytes.byteLength > maxBytes) throw new Error('Chat resource archive record exceeds its size limit.');
   return bytes;
+}
+function sameAlbumSavedFile(left: ChatAlbumSavedFile | null, right: ChatAlbumSavedFile | null): boolean {
+  return !!left && !!right && left.folderName === right.folderName && left.fileName === right.fileName && left.contentHash === right.contentHash
+    && left.byteCount === right.byteCount && left.revision === right.revision && left.savedAt === right.savedAt;
 }
 function validRevision(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) > 0; }
 function archiveFailureCode(error: unknown): string {
@@ -282,8 +318,8 @@ export class ChatResourceArchiveService {
     const key = chatResourceConversationKey(request);
     if (request.type === 'listChatNotes') return this.listNotes(key, request.cursor ?? null, signal);
     if (request.type === 'getChatNote') return { note: await this.getNote(key, request.postId ?? '', signal) };
-    if (request.type === 'listChatAlbums') return this.listAlbums(key, request.cursor ?? null, signal);
-    if (request.type === 'listChatAlbumPhotos') return this.listAlbumPhotos(key, request.albumId ?? '', request.cursor ?? null, signal);
+    if (request.type === 'listChatAlbums') return this.listAlbums(key, request.cursor ?? null, signal, 'modal', undefined, request.refresh === true);
+    if (request.type === 'listChatAlbumPhotos') return this.listAlbumPhotos(key, request.albumId ?? '', request.cursor ?? null, signal, request.refresh === true);
     if (request.type === 'downloadChatAlbumPhoto') return this.downloadAlbumPhoto(key, request.albumId ?? '', request.photoId ?? '', request.oid ?? '', request.prefix ?? '', signal);
     if (request.type === 'openChatAlbum') return this.openAlbum(key, request.albumId ?? '', signal);
     throw new Error('Unsupported chat resource request.');
@@ -389,23 +425,127 @@ export class ChatResourceArchiveService {
     return note;
   }
 
-  async listAlbums(key: ConversationKey, cursor: string | null, signal?: AbortSignal, source: 'modal' | 'notification' = 'modal', expectedBinding?: ChatResourceBinding) {
-    return this.admit(key, signal, (operationSignal, generation) => this.listAlbumsImpl(key, cursor, operationSignal, generation, source, expectedBinding));
+  async listAlbums(key: ConversationKey, cursor: string | null, signal?: AbortSignal, source: 'modal' | 'notification' = 'modal', expectedBinding?: ChatResourceBinding, refresh = false) {
+    return this.admit(key, signal, (operationSignal, generation) => this.listAlbumsImpl(key, cursor, operationSignal, generation, source, expectedBinding, refresh));
   }
-  private async listAlbumsImpl(key: ConversationKey, cursor: string | null, signal: AbortSignal, generation: number, source: 'modal' | 'notification', expectedBinding?: ChatResourceBinding) {
+  private async listAlbumsImpl(key: ConversationKey, cursor: string | null, signal: AbortSignal, generation: number, source: 'modal' | 'notification', expectedBinding?: ChatResourceBinding, refresh = false) {
+    const catalog = this.deps.catalog;
+    const catalogCursor = decodeCatalogCursor(cursor, 'db-album:');
+    if (source === 'modal' && catalog && (cursor === null || catalogCursor !== null)) {
+      const requestBinding = await this.authorize(key, signal, generation, expectedBinding);
+      let scan = await catalog.albumScanState(key);
+      if (refresh || scan.generation === 0) {
+        const listGeneration = await catalog.beginAlbumScan(key, requestBinding);
+        scan = { complete: false, generation: listGeneration, cursor: null, previousCursor: null, nextOrdinal: 0 };
+      }
+      if (catalogCursor && catalogCursor.generation !== scan.generation) throw new Error('Album catalog cursor belongs to an expired scan. Refresh the list.');
+      if (!scan.complete) {
+        const seen = new Set<string>();
+        let lineCursor = scan.cursor;
+        for (let pageIndex = 0; pageIndex < MAX_ALBUM_OPEN_PAGES; pageIndex += 1) {
+          if (lineCursor !== null) seen.add(lineCursor);
+          const { value, binding } = await this.read(key, 'listAlbums', { cursor: lineCursor, limit: CHAT_RESOURCE_PAGE_LIMIT }, signal, generation, 'modal', requestBinding);
+          const page = arrayResult<unknown>(value, 'albums', CHAT_RESOURCE_PAGE_LIMIT);
+          const albums = page.rows.map((row) => albumDto(row, key.chatId));
+          for (const album of albums) await this.publish(key, 'album', album.albumId, contentBytes({ _linejsGenerated: 'album-v1', ...album }, MAX_METADATA_TEXT * 2), signal, generation, binding);
+          if (page.nextCursor !== null && seen.has(page.nextCursor)) throw new Error('Album list scan exceeded its bounded page sequence.');
+          await catalog.appendAlbumPage(key, scan.generation, lineCursor, albums, page.nextCursor, binding);
+          this.assertCurrent(key.accountId, generation, binding, signal);
+          lineCursor = page.nextCursor;
+          scan = { ...scan, cursor: lineCursor, previousCursor: lineCursor === null ? (seen.size ? [...seen].at(-1)! : null) : null,
+            nextOrdinal: scan.nextOrdinal + albums.length, complete: lineCursor === null };
+          if (scan.complete) break;
+        }
+      }
+      if (catalogCursor && catalogCursor.ordinal >= scan.nextOrdinal && catalogCursor.ordinal !== -1) throw new Error('Album catalog cursor is ahead of the current scan.');
+      const after = catalogCursor?.ordinal.toString() ?? null;
+      const page = await catalog.listAlbums(key, after, CHAT_RESOURCE_PAGE_LIMIT);
+      this.assertCurrent(key.accountId, generation, requestBinding, signal);
+      const covers = catalog.firstPhotoIds ? await catalog.firstPhotoIds(key, page.items.map(({ albumId }) => albumId), 2) : new Map<string, string[]>();
+      const albums = page.items.map((album) => ({ ...album, coverPhotoIds: covers.get(album.albumId) ?? [] }));
+      const nextOrdinal = page.nextCursor === null ? scan.nextOrdinal - 1 : Number(page.nextCursor);
+      const nextCursor = page.nextCursor !== null || !scan.complete ? encodeCatalogCursor('db-album:', scan.generation, nextOrdinal) : null;
+      return { albums, nextCursor };
+    }
     const { value, binding } = await this.read(key, 'listAlbums', { cursor, limit: CHAT_RESOURCE_PAGE_LIMIT }, signal, generation, source, expectedBinding);
     const page = arrayResult<unknown>(value, 'albums', CHAT_RESOURCE_PAGE_LIMIT);
     const albums = page.rows.map((row) => albumDto(row, key.chatId));
     for (const album of albums) await this.publish(key, 'album', album.albumId, contentBytes({ _linejsGenerated: 'album-v1', ...album }, MAX_METADATA_TEXT * 2), signal, generation, binding);
+    if (source === 'notification' && this.deps.catalog) {
+      const scan = cursor === null ? null : await this.deps.catalog.albumScanState(key);
+      const listGeneration = cursor === null ? await this.deps.catalog.beginAlbumScan(key, binding) : scan?.generation ?? 0;
+      await this.deps.catalog.appendAlbumPage(key, listGeneration, cursor, albums, page.nextCursor, binding);
+    }
     this.assertCurrent(key.accountId, generation, binding, signal);
     return { albums, nextCursor: page.nextCursor };
   }
 
-  async listAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null, signal?: AbortSignal) {
-    return this.admit(key, signal, (operationSignal, generation) => this.listAlbumPhotosImpl(key, albumId, cursor, operationSignal, generation));
+  async listAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null, signal?: AbortSignal, refresh = false) {
+    return this.admit(key, signal, (operationSignal, generation) => this.listAlbumPhotosImpl(key, albumId, cursor, operationSignal, generation, refresh));
   }
-  private async listAlbumPhotosImpl(key: ConversationKey, albumId: string, cursor: string | null, signal: AbortSignal, generation: number) {
+
+  async readSavedAlbumPhoto(key: ConversationKey, albumId: string, photoId: string, signal?: AbortSignal): Promise<{ bytes: Uint8Array; mimeType: string } | null> {
+    return this.admit(key, signal, async (operationSignal, generation) => {
+      const id = boundedId(albumId, 'album ID'), pid = boundedId(photoId, 'photo ID');
+      const binding = await this.authorize(key, operationSignal, generation);
+      const catalog = this.deps.catalog, store = this.deps.store;
+      if (!catalog?.savedPhoto || !store?.readAlbumPhoto) return null;
+      const saved = await catalog.savedPhoto(key, id, pid);
+      if (!saved) return null;
+      const archived = await store.readAlbumPhoto({ key, albumId: id, photoId: pid, signal: operationSignal,
+        guard: () => this.assertCurrent(key.accountId, generation, binding, operationSignal) });
+      this.assertCurrent(key.accountId, generation, binding, operationSignal);
+      if (!archived || !sameAlbumSavedFile(saved, archived)) return null;
+      const bytes = archived.content;
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength !== saved.byteCount) return null;
+      const mimeType = bytes[0] === 0xff && bytes[1] === 0xd8 ? 'image/jpeg'
+        : bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71 ? 'image/png'
+        : new TextDecoder().decode(bytes.subarray(8, 12)) === 'WEBP' ? 'image/webp'
+        : ['GIF87a', 'GIF89a'].includes(new TextDecoder().decode(bytes.subarray(0, 6))) ? 'image/gif' : null;
+      return mimeType ? { bytes, mimeType } : null;
+    });
+  }
+  private async listAlbumPhotosImpl(key: ConversationKey, albumId: string, cursor: string | null, signal: AbortSignal, generation: number, refresh = false) {
     const id = boundedId(albumId, 'album ID');
+    const catalog = this.deps.catalog;
+    const catalogCursor = decodeCatalogCursor(cursor, 'db-photo:');
+    if (catalog && (cursor === null || catalogCursor !== null)) {
+      const requestBinding = await this.authorize(key, signal, generation);
+      let scan = await catalog.photoScan(key, id);
+      if (refresh || !scan || scan.generation === 0) {
+        const photoGeneration = await catalog.beginPhotoScan(key, id, requestBinding);
+        scan = { complete: false, generation: photoGeneration, cursor: null, previousCursor: null, nextOrdinal: 0 };
+      }
+      if (catalogCursor && catalogCursor.generation !== scan.generation) throw new Error('Album photo cursor belongs to an expired scan. Refresh the album.');
+      if (!scan.complete) {
+        const photoGeneration = scan.generation;
+        const seen = new Set<string>();
+        let lineCursor = scan.cursor;
+        for (let pageIndex = 0; pageIndex < MAX_ALBUM_OPEN_PAGES; pageIndex += 1) {
+          if (pageIndex > 0 && lineCursor === null) break;
+          if (lineCursor !== null && seen.has(lineCursor)) throw new Error('Album photo scan exceeded its bounded page sequence.');
+          if (lineCursor !== null) seen.add(lineCursor);
+          const { value, binding } = await this.read(key, 'listAlbumPhotos', { albumId: id, cursor: lineCursor, limit: CHAT_RESOURCE_PHOTO_LIMIT }, signal, generation, 'modal', requestBinding);
+          const page = arrayResult<unknown>(value, 'photos', CHAT_RESOURCE_PHOTO_LIMIT);
+          const photos = page.rows.map(photoDto);
+          const content = contentBytes({ _linejsGenerated: 'album-photos-v1', albumId: id, cursor: lineCursor, nextCursor: page.nextCursor, photos }, MAX_METADATA_TEXT * 20);
+          await this.publish(key, 'photo-page', chatResourcePhotoPageId(id, lineCursor), content, signal, generation, binding);
+          if (page.nextCursor !== null && seen.has(page.nextCursor)) throw new Error('Album photo scan exceeded its bounded page sequence.');
+          await catalog.appendPhotoPage(key, id, photoGeneration, lineCursor, photos, page.nextCursor, binding);
+          this.assertCurrent(key.accountId, generation, binding, signal);
+          lineCursor = page.nextCursor;
+          scan = { ...scan, complete: lineCursor === null, generation: photoGeneration, cursor: lineCursor,
+            previousCursor: lineCursor === null ? (seen.size ? [...seen].at(-1)! : null) : null, nextOrdinal: scan.nextOrdinal + photos.length };
+          if (scan.complete) break;
+        }
+      }
+      if (catalogCursor && catalogCursor.ordinal >= scan.nextOrdinal && catalogCursor.ordinal !== -1) throw new Error('Album photo cursor is ahead of the current scan.');
+      const page = await catalog.listPhotos(key, id, catalogCursor?.ordinal.toString() ?? null, CHAT_RESOURCE_PHOTO_LIMIT);
+      this.assertCurrent(key.accountId, generation, requestBinding, signal);
+      const nextOrdinal = page.nextCursor === null ? scan.nextOrdinal - 1 : Number(page.nextCursor);
+      const nextCursor = page.nextCursor !== null || !scan.complete ? encodeCatalogCursor('db-photo:', scan.generation, nextOrdinal) : null;
+      return { photos: page.items, nextCursor };
+    }
     const { value, binding } = await this.read(key, 'listAlbumPhotos', { albumId: id, cursor, limit: CHAT_RESOURCE_PHOTO_LIMIT }, signal, generation);
     const page = arrayResult<unknown>(value, 'photos', CHAT_RESOURCE_PHOTO_LIMIT);
     const photos = page.rows.map(photoDto);
@@ -441,6 +581,21 @@ export class ChatResourceArchiveService {
     if (!store.ensureAlbumFolder || !store.publishAlbumPhoto) throw new Error('ALBUM_FOLDER_ARCHIVE_UNAVAILABLE');
     const guard = () => this.assertCurrent(key.accountId, generation, firstBinding, signal);
     guard();
+    const catalog = this.deps.catalog;
+    let photoCatalogGeneration: number | null = null;
+    let mayCompletePhotoScan = false;
+    if (catalog) {
+      if (startCursor === null) {
+        photoCatalogGeneration = await catalog.beginPhotoScan(key, albumId, firstBinding);
+        mayCompletePhotoScan = true;
+      } else {
+        const currentScan = await catalog.photoScan(key, albumId);
+        if (currentScan) {
+          photoCatalogGeneration = currentScan.generation;
+          mayCompletePhotoScan = (!currentScan.complete && currentScan.cursor === startCursor) || currentScan.previousCursor === startCursor;
+        }
+      }
+    }
     let cursor: string | null = startCursor;
     const seenCursors = new Set<string>();
     const seenPhotos = new Set<string>();
@@ -477,6 +632,9 @@ export class ChatResourceArchiveService {
         failureContext = { action: 'album_photos', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' };
         break;
       }
+      if (catalog && photoCatalogGeneration !== null && mayCompletePhotoScan) {
+        await catalog.appendPhotoPage(key, albumId, photoCatalogGeneration, cursor, rows, page.value.nextCursor ?? null, page.binding);
+      }
       let photoIndex = 0;
       if (pageCount === 1) {
         const folderStartedAt = Date.now();
@@ -502,7 +660,15 @@ export class ChatResourceArchiveService {
         if (remainingBytes <= 0) { complete = false; stopCode = 'BYTE_LIMIT'; nextPhotoIndex = currentPhotoIndex; break; }
         let failureStage: 'archive_contains' | 'resource_read' | 'archive_write' = 'archive_contains';
         try {
-          if (store.hasAlbumPhoto && await store.hasAlbumPhoto({ key, albumId, photoId: photo.photoId, signal, guard })) {
+          const saved = catalog?.savedPhoto ? await catalog.savedPhoto(key, albumId, photo.photoId) : null;
+          const existing = store.inspectAlbumPhoto
+            ? await store.inspectAlbumPhoto({ key, albumId, photoId: photo.photoId, signal, guard })
+            : null;
+          if (existing) {
+            if (catalog && !sameAlbumSavedFile(saved, existing)) await catalog.savePhoto(key, albumId, photo.photoId, existing, firstBinding);
+            guard(); savedCount += 1; continue;
+          }
+          if (!store.inspectAlbumPhoto && store.hasAlbumPhoto && await store.hasAlbumPhoto({ key, albumId, photoId: photo.photoId, signal, guard })) {
             guard(); savedCount += 1; continue;
           }
           failureStage = 'resource_read';
@@ -520,7 +686,8 @@ export class ChatResourceArchiveService {
           }
           guard();
           failureStage = 'archive_write';
-          await store.publishAlbumPhoto({ key, albumId, photoId: photo.photoId, content: image, signal, guard: () => this.assertCurrent(key.accountId, generation, binding, signal) });
+          const archived = await store.publishAlbumPhoto({ key, albumId, photoId: photo.photoId, content: image, signal, guard: () => this.assertCurrent(key.accountId, generation, binding, signal) });
+          if (catalog && archived) await catalog.savePhoto(key, albumId, photo.photoId, archived, binding);
           guard(); savedCount += 1;
           this.recordAlbumPhotoOutcome(key, 'succeeded');
         } catch (error) {
@@ -567,11 +734,30 @@ export class ChatResourceArchiveService {
     const objectId = boundedId(oid, 'photo object ID');
     const photoPrefix = boundedText(prefix, 512, 'photo prefix');
     if (photoPrefix !== 'album/a' && photoPrefix !== 'album/v') throw new Error('Invalid photo prefix.');
-    const { value, binding } = await this.read(key, 'downloadAlbumPhoto', { albumId: aid, photoId: pid, oid: objectId, prefix: photoPrefix, maxBytes: CHAT_RESOURCE_IMAGE_LIMIT }, signal, generation);
+    const store = this.store();
+    if (!store.inspectAlbumPhoto || !store.publishAlbumPhoto) throw new Error('ALBUM_PHOTO_ARCHIVE_INSPECTION_UNAVAILABLE');
+    const binding = await this.authorize(key, signal, generation);
+    const guard = () => this.assertCurrent(key.accountId, generation, binding, signal);
+    guard();
+    const saved = await this.deps.catalog?.savedPhoto(key, aid, pid) ?? null;
+    const existing = await store.inspectAlbumPhoto({ key, albumId: aid, photoId: pid, signal, guard });
+    guard();
+    if (existing) {
+      if (!sameAlbumSavedFile(saved, existing)) await this.deps.catalog?.savePhoto(key, aid, pid, existing, binding);
+      guard();
+      return { albumId: aid, photoId: pid, sizeBytes: sameAlbumSavedFile(saved, existing) ? saved!.byteCount : existing.byteCount };
+    }
+    if (saved) await this.deps.catalog?.clearSavedPhoto(key, aid, pid, binding);
+    guard();
+    const { value, binding: readBinding } = await this.read(key, 'downloadAlbumPhoto', { albumId: aid, photoId: pid, oid: objectId,
+      prefix: photoPrefix, maxBytes: CHAT_RESOURCE_IMAGE_LIMIT }, signal, generation, 'modal', binding);
     const image = (value as { bytes?: unknown })?.bytes;
     if (!(image instanceof Uint8Array) || image.byteLength < 1 || image.byteLength > CHAT_RESOURCE_IMAGE_LIMIT) throw new Error('Invalid or oversized album image.');
-    await this.publish(key, 'photo', chatResourcePhotoId(aid, pid), image, signal, generation, binding);
-    this.assertCurrent(key.accountId, generation, binding, signal);
+    const archived = await store.publishAlbumPhoto({ key, albumId: aid, photoId: pid, content: image, signal,
+      guard: () => this.assertCurrent(key.accountId, generation, readBinding, signal) });
+    if (!archived) throw new Error('ALBUM_PHOTO_ARCHIVE_METADATA_UNAVAILABLE');
+    await this.deps.catalog?.savePhoto(key, aid, pid, archived, readBinding);
+    this.assertCurrent(key.accountId, generation, readBinding, signal);
     return { albumId: aid, photoId: pid, sizeBytes: image.byteLength };
   }
 

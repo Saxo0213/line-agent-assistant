@@ -68,6 +68,8 @@ internal static class ChatResourceArchiveHost {
     [DataMember(Name="nextCursor",EmitDefaultValue=false)] public string nextCursor="";
     [DataMember(Name="payloadLength",EmitDefaultValue=false)] public int payloadLength;
     [DataMember(Name="stageId",EmitDefaultValue=false)] public string stageId="";
+    [DataMember(Name="folderName",EmitDefaultValue=false)] public string folderName="";
+    [DataMember(Name="fileName",EmitDefaultValue=false)] public string fileName="";
   }
   [DataContract] sealed class Commit {
     [DataMember(Name="protocol")] public string protocol=Protocol;
@@ -281,14 +283,17 @@ internal static class ChatResourceArchiveHost {
       }
       if(request.op=="album-open") return new Result{requestId=request.requestId,ok=true};
       List<CommitItem> commits=ValidCommits(directory,key); CommitItem latest=commits.Count==0?null:commits[commits.Count-1];
-      if(request.op=="contains") return new Result{requestId=request.requestId,ok=true,revision=latest==null?0:latest.commit.revision};
+      if(request.op=="contains") return new Result{requestId=request.requestId,ok=true,revision=latest==null?0:latest.commit.revision,
+        folderName=latest==null?"":request.albumKey,fileName=latest==null?"":latest.record,
+        savedAt=latest==null?"":latest.commit.savedAt,contentHash=latest==null?"":latest.commit.contentHash,byteLength=latest==null?0:latest.commit.byteLength};
       if(request.op=="stage") {
         if(pendingCommit!=null) throw new Failure("STAGE_BUSY");
         PauseBoundary("stage-open");
         byte[] content=ReadPayload(input); if(content.Length>MaxPayload) throw new Failure("PAYLOAD_LIMIT");
         long revision=latest==null?1:latest.commit.revision+1; if(revision<1) throw new Failure("REVISION_LIMIT");
         string savedAt=DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'",CultureInfo.InvariantCulture); string hash; using(SHA256 sha=SHA256.Create()) hash=Hex(sha.ComputeHash(content));
-        if(latest!=null&&latest.commit.contentHash==hash&&latest.commit.byteLength==content.Length) return new Result{requestId=request.requestId,ok=true,unchanged=true,revision=latest.commit.revision,savedAt=latest.commit.savedAt,contentHash=latest.commit.contentHash,byteLength=latest.commit.byteLength};
+        if(latest!=null&&latest.commit.contentHash==hash&&latest.commit.byteLength==content.Length) return new Result{requestId=request.requestId,ok=true,unchanged=true,revision=latest.commit.revision,savedAt=latest.commit.savedAt,contentHash=latest.commit.contentHash,byteLength=latest.commit.byteLength,
+          folderName=request.kind=="album-photo"?request.albumKey:"",fileName=request.kind=="album-photo"?latest.record:""};
         Commit marker=new Commit{kind=request.kind,resourceKey=key,revision=revision,savedAt=savedAt,contentHash=hash,byteLength=content.Length};
         string extension=PayloadExtension(request.kind,content); string staging="."+Guid.NewGuid().ToString("N")+".part";
         SafeFileHandle temporary=OpenRelative(directory,staging,false,FileCreate,GenericRead|GenericWrite|Delete,FileDeleteOnClose,0x5);
@@ -308,13 +313,15 @@ internal static class ChatResourceArchiveHost {
         // Like AttachmentBroker, the staging name stays delete-on-close while
         // the final hard link survives closing this handle.
         candidate.staging.Dispose(); pendingCommit=null; DisposeHandles(candidate.ancestry);
-        return new Result{requestId=request.requestId,ok=true,revision=candidate.commit.revision,savedAt=candidate.commit.savedAt,contentHash=candidate.commit.contentHash,byteLength=candidate.commit.byteLength};
+        return new Result{requestId=request.requestId,ok=true,revision=candidate.commit.revision,savedAt=candidate.commit.savedAt,contentHash=candidate.commit.contentHash,byteLength=candidate.commit.byteLength,
+          folderName=request.kind=="album-photo"?request.albumKey:"",fileName=request.kind=="album-photo"?candidate.record:""};
       }
       if(request.op=="read") {
         if(latest==null) return new Result{requestId=request.requestId,ok=true,revision=0,payloadLength=0};
         PauseBoundary("read-open");
         string readIdentity; Commit verifiedRead=ReadRecord(directory,latest.record,out payload,out readIdentity); if(verifiedRead==null||verifiedRead.revision!=latest.commit.revision||readIdentity!=latest.identity) throw new Failure("CONTENT_INVALID");
-        return new Result{requestId=request.requestId,ok=true,revision=latest.commit.revision,savedAt=latest.commit.savedAt,contentHash=latest.commit.contentHash,byteLength=latest.commit.byteLength,payloadLength=payload.Length};
+        return new Result{requestId=request.requestId,ok=true,revision=latest.commit.revision,savedAt=latest.commit.savedAt,contentHash=latest.commit.contentHash,byteLength=latest.commit.byteLength,payloadLength=payload.Length,
+          folderName=request.kind=="album-photo"?request.albumKey:"",fileName=request.kind=="album-photo"?latest.record:""};
       }
       if(request.op=="list") {
         PauseBoundary("list-open");

@@ -74,6 +74,7 @@ export const LineMediaTargetSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('sticon'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, messageId: IdSchema,
     index: z.number().int().nonnegative().max(63) }),
   z.strictObject({ type: z.literal('attachment'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, attachmentId: IdSchema }),
+  z.strictObject({ type: z.literal('albumPhoto'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, albumId: IdSchema, photoId: IdSchema }),
   /** Paid-reaction icon: served only when the message really carries that reaction; same sticon source and disk cache. */
   z.strictObject({ type: z.literal('reaction'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, messageId: IdSchema,
     productId: z.string().regex(/^[0-9a-f]{24}$/), emojiId: z.string().regex(/^[0-9]{1,6}$/) }),
@@ -134,8 +135,8 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.merge(ConversationKeySchema).merge(PageSchema).extend({ type: z.literal('listAttachments') }),
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('listChatNotes'), cursor: ChatResourceCursorSchema }),
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('getChatNote'), postId: IdSchema.max(256) }),
-  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('listChatAlbums'), cursor: ChatResourceCursorSchema }),
-  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('listChatAlbumPhotos'), albumId: IdSchema.max(256), cursor: ChatResourceCursorSchema }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('listChatAlbums'), cursor: ChatResourceCursorSchema, refresh: z.boolean().optional() }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('listChatAlbumPhotos'), albumId: IdSchema.max(256), cursor: ChatResourceCursorSchema, refresh: z.boolean().optional() }),
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('downloadChatAlbumPhoto'), albumId: IdSchema.max(256), photoId: IdSchema.max(256),
     oid: IdSchema.max(256), prefix: z.enum(['album/a', 'album/v']) }),
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('openChatAlbum'), albumId: IdSchema.max(256) }),

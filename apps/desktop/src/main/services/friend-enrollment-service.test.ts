@@ -58,10 +58,17 @@ function setup(locale: Locale | string = 'zh-TW') {
   let now = 1_000;
   let currentBinding: (WorkerBinding & { mode: 'ACTIVE_CONTROL' }) | null = binding;
   const adminCurrent = { value: true };
+  const friendConfirmation = { userId: null as string | null, version: null as number | null };
+  let adminVersion = 1;
   const controlCurrent = { activeAccountId: 'account-a', controlEpoch: 3 };
   let generatedCode = 'LW-ABCDEFG2';
   const admins = {
-    getPrimaryAdministratorVersion: vi.fn(async () => 1),
+    getPrimaryAdministratorVersion: vi.fn(async () => adminVersion),
+    hasPrimaryAdministratorFriendConfirmation: vi.fn(async (_accountId: string, userId: string, version: number) =>
+      friendConfirmation.userId === userId && friendConfirmation.version === version),
+    confirmPrimaryAdministratorFriendship: vi.fn(async (_accountId: string, userId: string, version: number) => {
+      friendConfirmation.userId = userId; friendConfirmation.version = version; return true;
+    }),
     isPrimaryAdministrator: vi.fn(async (accountId: string, chatId: string, senderId: string) =>
       adminCurrent.value && accountId === primary.accountId && chatId === primary.chatId && senderId === primary.senderId),
     isPrimaryUser: vi.fn(async (accountId: string, senderId: string) =>
@@ -112,7 +119,8 @@ function setup(locale: Locale | string = 'zh-TW') {
   const service = new FriendEnrollmentService({ admins, whitelist, accounts, workers,
     audit: audit as never,
     now: () => now, digestKey: randomBytes(32), makeCode: () => generatedCode, locale });
-  return { service, admins, whitelist, accounts, workers, adminCurrent, controlCurrent,
+  return { service, admins, whitelist, accounts, workers, adminCurrent, controlCurrent, friendConfirmation,
+    setAdminVersion(value: number) { adminVersion = value; },
     audit, auditEvents,
     setNow(value: number) { now = value; }, setBinding(value: typeof currentBinding) { currentBinding = value; },
     setCode(value: string) { generatedCode = value; } };
@@ -138,6 +146,32 @@ describe('FriendEnrollmentService', () => {
     expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
     expect(ctx.workers.addFriendByMid).toHaveBeenCalledTimes(1);
     expect(ctx.workers.addFriendByMid).toHaveBeenCalledWith(expect.objectContaining({ targetMid }));
+    expect(ctx.admins.confirmPrimaryAdministratorFriendship).toHaveBeenCalledWith('account-a', targetMid, 1);
+  });
+
+  it('persists a friend result and skips relation and add RPCs on a later ready start', async () => {
+    const ctx = setup();
+    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
+    const controller = new AbortController();
+    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
+    expect(ctx.friendConfirmation).toEqual({ userId: targetMid, version: 1 });
+    const restartedService = new FriendEnrollmentService({ admins: ctx.admins, whitelist: ctx.whitelist, accounts: ctx.accounts,
+      workers: ctx.workers, digestKey: randomBytes(32) });
+    await restartedService.ensurePrimaryAdministratorFriendship(binding, controller.signal);
+    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
+    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
+  });
+
+  it('checks again when the administrator version changes', async () => {
+    const ctx = setup();
+    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
+    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
+    const controller = new AbortController();
+    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
+    ctx.setAdminVersion(2);
+    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
+    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(2);
+    expect(ctx.admins.confirmPrimaryAdministratorFriendship).toHaveBeenCalledTimes(2);
   });
 
   it('retries the once-per-binding check after a primary administrator binds to an already-ready worker', async () => {
@@ -183,6 +217,7 @@ describe('FriendEnrollmentService', () => {
     heldRelation.resolve(event('friendRelationResult', { requestId: command.requestId, targetMid, status: 'not_friend', error: null }));
     await job;
     expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
+    expect(ctx.admins.confirmPrimaryAdministratorFriendship).not.toHaveBeenCalled();
   });
 
   it.each(['removed', 'replaced'] as const)('does not add the captured primary after it is %s during relation lookup', async (change) => {
@@ -201,6 +236,7 @@ describe('FriendEnrollmentService', () => {
     held.resolve(event('friendRelationResult', { requestId: command.requestId, targetMid, status: 'not_friend', error: null }));
     await job;
     expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
+    expect(ctx.admins.confirmPrimaryAdministratorFriendship).not.toHaveBeenCalled();
   });
 
   it('fails closed for unknown relation and does not retry on the same binding', async () => {
@@ -211,6 +247,7 @@ describe('FriendEnrollmentService', () => {
     }));
     await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toThrow();
     expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
+    expect(ctx.admins.confirmPrimaryAdministratorFriendship).not.toHaveBeenCalled();
     await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toThrow();
     expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
   });
@@ -227,6 +264,7 @@ describe('FriendEnrollmentService', () => {
     await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toThrow();
     await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toThrow();
     expect(ctx.workers.addFriendByMid).toHaveBeenCalledTimes(1);
+    expect(ctx.admins.confirmPrimaryAdministratorFriendship).not.toHaveBeenCalled();
   });
 
   it('does not continue a cancelled binding job and allows a restarted binding to check once', async () => {

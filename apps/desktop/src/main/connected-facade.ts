@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 import type {
-  AgentEvent, AgentProvider, AgentRunRequest, ConversationKey, DownloadAuthProbe, IpcEvent, IpcRequest, IpcResult, LineWorkerCommand,
+  AgentEvent, AgentProvider, AgentRunRequest, ConversationKey, DiagnosticIdentity, DownloadAuthProbe, IpcEvent, IpcRequest, IpcResult, LineWorkerCommand,
   LineWorkerEvent, WorkerBinding, ComponentHealth,
 } from '@line-agent/contracts';
 import { realpath } from 'node:fs/promises';
@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType } from '@line-agent/contracts';
 import {
-  AccountRepository, AdminRepository, AgentPermissionError, AgentPermissionRepository, AgentRepository, resolveJobPolicy, AlbumNotificationTaskRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, RoomActivationRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
+  AccountRepository, AdminRepository, AgentPermissionError, AgentPermissionRepository, AgentRepository, resolveJobPolicy, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, RoomActivationRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
 import type { Attachment, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
@@ -33,6 +33,7 @@ import { ChatResourceAccountAdmission } from './services/chat-resource-admission
 import { ChatResourceArchive, createChatResourceStoreAdapter } from './services/chat-resource-archive.js';
 import { createChatResourceDiagnostics, parseChatResourceDiagnostic } from './services/chat-resource-diagnostics.js';
 import { createMcpChatResourceArchiveReader } from './services/mcp-chat-resource-reader.js';
+import { trackOperation, type TrackedOperationContext } from './tracked-operation.js';
 import { WorkspaceAuthority, InvalidWorkspaceError } from './services/workspace-authority.js';
 import { AttachmentService } from './services/attachment-service.js';
 import { DeliveryService } from './services/delivery-service.js';
@@ -57,7 +58,7 @@ import { createCoalescedSnapshotPublisher } from './domain-event-publisher.js';
 import type { OfficialBuildTrustService } from './services/official-build-trust.js';
 import {probeInitialProviderAuth} from './provider-auth.js';
 import { AUDIT_ERROR_CODES, type AuditErrorCode, type OperationalAudit } from './services/operational-audit.js';
-import { diagnosticFailure, parseSafeDiagnostic } from '@line-agent/contracts';
+import { diagnosticFailure, parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AuditEventsReadResult } from './services/operational-audit-runtime.js';
 import { systemActivityResult, systemErrorsResult } from './services/system-records.js';
 import { createSingleFlightRead } from './services/system-read-flight.js';
@@ -446,17 +447,15 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     }
   });
   startupCleanup.add(() => { for (const timer of recoveryTimers) clearTimeout(timer); recoveryTimers.clear(); });
-  function track<T>(work: () => Promise<T>): Promise<T> {
-    const operation = Promise.resolve().then(work);
-    inFlight.add(operation);
-    void operation.then(() => inFlight.delete(operation), (error: unknown) => {
-      inFlight.delete(operation);
-      if (!closing) options.audit?.failure(diagnosticFailure('unknown', 'execute', error));
+  function track<T>(work: () => Promise<T>, context: TrackedOperationContext): Promise<T> {
+    return trackOperation(work, context, {
+      inFlight,
+      isClosing: () => closing,
+      onFailure: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
     });
-    return operation;
   }
-  function admitted<T>(work: () => Promise<T>): Promise<T> {
-    return closing ? Promise.reject(new Error('Service is closing')) : track(work);
+  function admitted<T>(work: () => Promise<T>, context: TrackedOperationContext): Promise<T> {
+    return closing ? Promise.reject(new Error('Service is closing')) : track(work, context);
   }
   function onceCleanup(action: () => void | Promise<void>): () => Promise<void> {
     let result: Promise<void> | undefined;
@@ -529,6 +528,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     },
     isWritableAccount: canWriteLine,
     ...(chatResourceStore ? { store: chatResourceStore } : {}),
+    catalog: new ChatAlbumCatalogRepository(options.pool),
     recordDiagnostic: (record) => {
       const safe = parseChatResourceDiagnostic(record);
       const correlationId = safe?.status === 'failure' && safe.errorCode !== 'CANCELLED' ? options.audit?.failure({
@@ -999,6 +999,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
     ...(options.mediaCacheRoot ? { cacheRoot: options.mediaCacheRoot } : {}),
     loadAttachment: async (key, attachmentId, signal) => previewService?.readImage(attachmentId, key, { senderId: 0 }, 8 * 1024 * 1024, signal) ?? null,
+    loadAlbumPhoto: async (key, albumId, photoId, signal) => chatResources.readSavedAlbumPhoto(key, albumId, photoId, signal),
   });
   stopLineMedia = onceCleanup(() => lineMedia.shutdown());
   startupCleanup.add(stopLineMedia);
@@ -1093,7 +1094,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const latestTask = primaryFriendshipReadiness.get(binding.accountId);
         if (latestTask?.abort !== abort || latestTask.trigger === consumedTrigger) break;
       }
-    }).catch((error) => {
+    }, { operation: 'line_ingest', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } }).catch((error) => {
       if (!lifetimeSignal.aborted && !closing) console.warn('[primary-admin-friendship] operational check failed', error);
     }).finally(() => {
       const latestTask = primaryFriendshipReadiness.get(binding.accountId);
@@ -1178,7 +1179,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           } catch {
             console.warn('[admin-pairing] welcome send failed');
           }
-        }).catch(() => console.warn('[admin-pairing] welcome send failed'));
+        }, { operation: 'line_ingest', identity: { accountId: envelope.accountId, background: true } })
+          .catch(() => console.warn('[admin-pairing] welcome send failed'));
       }
       const enrolled = await friendEnrollment.handle(envelope, secretCandidate, ownMid, capturedBinding);
       return paired || enrolled;
@@ -1201,7 +1203,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           const conversation = await health.conversation(change.key);
           if (conversation) options.publish?.({ type: 'messageStored', key: change.key, messageId: change.messageId, conversation });
         }
-      }).catch(() => undefined);
+      }, { operation: 'line_ingest', identity: { ...(changes[0] ? { accountId: changes[0].key.accountId } : {}), background: true } }).catch(() => undefined);
     }, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic));
   lineServiceReady = true;
   delivery = new DeliveryService(agents, {
@@ -1240,7 +1242,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     // defer replay until it has published full mode/binding readiness.
     const timer = setTimeout(() => {
       recoveryTimers.delete(timer);
-      if (!closing) void track(() => delivery.recoverPending(accountId)).catch(() => undefined);
+      if (!closing) void track(() => delivery.recoverPending(accountId),
+        { operation: 'delivery', identity: { accountId, background: true } }).catch(() => undefined);
     }, 0);
     recoveryTimers.add(timer);
   }
@@ -1252,7 +1255,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (event.type === 'login') chatResourceAdmission.authenticated(binding);
     else if (event.state === 'ready') chatResourceAdmission.ready(binding);
     if (lineService.isAuthenticatedReady(binding)) {
-      void track(() => recoverPendingAfterReady(binding)).catch(() => undefined);
+      void track(() => recoverPendingAfterReady(binding),
+        { operation: 'delivery', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } })
+        .catch(() => undefined);
     }
   }
 
@@ -1388,7 +1393,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         if (conversation) options.publish?.({ type: 'messageStored', key, messageId: envelope.messageId, conversation });
       }
     }
-  }));
+  }, { operation: 'line_ingest', identity: { accountId: event.accountId, workerInstanceId: instance,
+    ...('requestId' in event && typeof event.requestId === 'string' ? { requestId: event.requestId } : {}),
+    ...('loginAttemptId' in event && typeof event.loginAttemptId === 'string' ? { loginAttemptId: event.loginAttemptId } : {}),
+    background: true } }));
   if (unsubscribeEvent) startupCleanup.add(unsubscribeEvent);
   const bindsOnStart = options.workers.onBinding !== undefined;
   async function restoreTokenForBinding(binding: Bound, signal?: AbortSignal): Promise<void> {
@@ -1416,7 +1424,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       await lineService.bind(binding, signal);
       if (signal.aborted) throw new Error('Worker binding cancelled');
       schedulePrimaryAdministratorFriendship(binding, signal);
-    });
+    }, { operation: 'line_ingest', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } });
   });
   if (unsubscribeBinding) startupCleanup.add(unsubscribeBinding);
   unsubscribeRestartBinding = options.workers.onRestartBinding?.((binding, signal) => {
@@ -1444,7 +1452,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (signal.aborted) return;
       if (binding.mode === 'ACTIVE_CONTROL') schedulePendingDeliveryRecovery(binding.accountId);
       schedulePrimaryAdministratorFriendship(binding, signal);
-    });
+    }, { operation: 'line_ingest', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } });
   });
   if (unsubscribeRestartBinding) startupCleanup.add(unsubscribeRestartBinding);
   unsubscribeModeChange = options.workers.onModeChange?.((binding, signal) => {
@@ -1464,11 +1472,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         chatResourceAdmission.ready(current);
         chatResourceAdmission.modeReady(current);
         if (mode === 'ACTIVE_CONTROL' && lineService.isAuthenticatedReady(current)) {
-          void track(() => recoverPendingAfterReady(current, signal)).catch(() => undefined);
+          void track(() => recoverPendingAfterReady(current, signal),
+            { operation: 'delivery', identity: { accountId: current.accountId, workerInstanceId: current.workerInstanceId, background: true } })
+            .catch(() => undefined);
         }
-      }).catch(() => undefined);
+      }, { operation: 'line_ingest', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } })
+        .catch(() => undefined);
       if (binding.mode === 'ACTIVE_CONTROL') schedulePendingDeliveryRecovery(binding.accountId);
-    });
+    }, { operation: 'line_ingest', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } });
   });
   if (unsubscribeModeChange) startupCleanup.add(unsubscribeModeChange);
 
@@ -1925,7 +1936,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           if (externalImportOwner?.abort === abort) externalImportOwner = null;
           await publishSnapshot().catch(() => undefined);
         }
-      });
+      }, { operation: 'external_monitor', identity: { accountId, requestId } });
       externalImportOwner.task = task;
       void task.catch(() => undefined);
       return accepted(requestId);
@@ -2003,7 +2014,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         if (externalImportOwner?.abort === abort) externalImportOwner = null;
         await publishSnapshot().catch(() => undefined);
       }
-    });
+    }, { operation: 'external_monitor', identity: { accountId: candidate.account_id, background: true } });
     externalImportOwner.task = task;
     void task.catch(() => undefined);
     });
@@ -2039,7 +2050,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     identityReadAbort = abort;
     try {
       const read = await track(() => readIdentity({ signal: abort.signal,
-        onPhase: (phase) => { options.publish?.({ type: 'externalAdminBindingProgress', phase }); } }));
+        onPhase: (phase) => { options.publish?.({ type: 'externalAdminBindingProgress', phase }); } }),
+      { operation: 'native_reader', identity: { requestId }, reportFailure: false });
       if (read.status !== 'supported') {
         const code = typeof read.errorCode === 'string' && read.errorCode.length <= 120 && MACHINE_CODE_PATTERN.test(read.errorCode) ? read.errorCode : 'reader_unsupported';
         console.warn('[external-admin-binding] official identity read unsupported:', code);
@@ -2049,7 +2061,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return { identity: { mid: read.mid, displayName: read.displayName, ...(read.picturePath === undefined ? {} : { picturePath: read.picturePath }) }, candidateCount: read.candidateCount };
     } catch (error) {
       // Never log the MID; the reader error is a finite code.
-      options.audit?.failure(diagnosticFailure('native_reader', 'read', error));
+      options.audit?.failure(diagnosticFailure('native_reader', 'read', error), { requestId });
       // Only a finite machine code (bare, or `prefix:<code>`) reaches the renderer; any other text becomes `reader_failed`.
       const raw = error instanceof Error ? error.message : '';
       const last = raw.slice(raw.lastIndexOf(':') + 1);
@@ -2457,9 +2469,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (request.type === 'getChatNote') return { type: request.type, requestId: request.requestId, ok: true,
         ...await chatResources.dispatchIpc(request, signal) };
       if (request.type === 'listChatAlbums') return { type: request.type, requestId: request.requestId, ok: true,
-        ...await chatResources.dispatchIpc(request, signal) };
+        ...await chatResources.dispatchIpc({ ...request, refresh: request.refresh === true }, signal) };
       if (request.type === 'listChatAlbumPhotos') return { type: request.type, requestId: request.requestId, ok: true,
-        ...await chatResources.dispatchIpc(request, signal) };
+        ...await chatResources.dispatchIpc({ ...request, refresh: request.refresh === true }, signal) };
       if (request.type === 'downloadChatAlbumPhoto') return { type: request.type, requestId: request.requestId, ok: true,
         ...await chatResources.dispatchIpc(request, signal) };
       if (request.type === 'openChatAlbum') {
@@ -2759,11 +2771,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const facade: DesktopServiceFacade = {
     dispatch: (request, signal) => {
       if (closing) return Promise.resolve(failure(request.requestId, 'SERVICE_CLOSING', 'Service is closing.'));
-      if (request.type !== 'sendManualMedia') return track(() => dispatch(request, signal));
+      if (request.type !== 'sendManualMedia') return track(() => dispatch(request, signal),
+        { operation: 'ipc', identity: { requestId: request.requestId,
+          ...('accountId' in request && typeof request.accountId === 'string' ? { accountId: request.accountId } : {}) } });
       if (signal?.aborted) return Promise.resolve(failure(request.requestId, 'LINE_SEND_NOT_STARTED', 'LINE attachment send was cancelled before admission.'));
       const lease = manualMediaAdmission.acquire(request.accountId, signal);
       if (!lease) return Promise.resolve(failure(request.requestId, 'LINE_MEDIA_BUSY', 'Another attachment send is active or the media send limit is full.'));
-      return track(() => dispatch(request, lease.signal)).finally(() => lease.release());
+      return track(() => dispatch(request, lease.signal),
+        { operation: 'ipc', identity: { requestId: request.requestId, accountId: request.accountId } }).finally(() => lease.release());
     },
     async openAttachment(attachmentId, senderId = -1) {
       if (closing) return false;
@@ -2771,7 +2786,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     },
     async downloadAttachment(key: import('@line-agent/contracts').WritableConversationKey, attachmentId: string) {
       if (closing) return false;
-      return await track(() => attachmentService.downloadManually(key, attachmentId));
+      return await track(() => attachmentService.downloadManually(key, attachmentId),
+        { operation: 'attachment', identity: { accountId: key.accountId } });
     },
     async handleLineMedia(target, signal) {
       const serve = (source: import('./line-media.js').LineMediaSource | null) => lineMedia.handle(source, signal);
@@ -2814,6 +2830,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           || item.kind !== 'image' || item.status !== 'ready') return serve(null);
         return serve(lineMedia.attachmentSource(target.attachmentId, target));
       }
+      if (target.type === 'albumPhoto') return serve(lineMedia.albumPhotoSource(target.albumId, target.photoId, target));
       let result: { rows: Array<{ picture_path: string | null }> };
       if (target.type === 'account') {
         result = await options.pool.query('SELECT picture_path FROM line_accounts WHERE account_id=$1 AND own_mid IS NOT NULL', [target.accountId]);
@@ -2960,8 +2977,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     },
     async listChatNotes(key, cursor) { return chatResources.listNotes(key, cursor); },
     async getChatNote(key, postId) { return chatResources.getNote(key, postId); },
-    async listChatAlbums(key, cursor) { return chatResources.listAlbums(key, cursor); },
-    async listChatAlbumPhotos(key, albumId, cursor) { return chatResources.listAlbumPhotos(key, albumId, cursor); },
+    async listChatAlbums(key, cursor, refresh) { return chatResources.listAlbums(key, cursor, undefined, 'modal', undefined, refresh); },
+    async listChatAlbumPhotos(key, albumId, cursor, refresh) { return chatResources.listAlbumPhotos(key, albumId, cursor, undefined, refresh); },
     async downloadChatAlbumPhoto(key, albumId, photoId, oid, prefix) { return chatResources.downloadAlbumPhoto(key, albumId, photoId, oid, prefix); },
     async openChatAlbum(key, albumId, signal) { return chatResources.openAlbum(key, albumId, signal); },
     async listAttachmentStates(key, attachmentIds) {
@@ -3050,7 +3067,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   await options.beforeMcpListen?.();
   await mcpHttpServer.start();
   await agentService.recoverQueued();
-  void track(() => resumeExternalMonitorOnStartup()).catch((error: unknown) => {
+  void track(() => resumeExternalMonitorOnStartup(), { operation: 'external_monitor', identity: { background: true }, reportFailure: false })
+    .catch((error: unknown) => {
     const stage = error instanceof ExternalMonitorDiagnosticFailure ? error.stage : 'startup';
     const code = classifyExternalMonitorFailure(error, stage);
     void recordExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath, stage, code, externalMonitorFailureDetail(error),
@@ -3063,21 +3081,23 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   });
   ownAvatarRefreshScheduler.start(await accounts.listAuthenticatedAccounts());
   return { ...facade,
-    openAttachment: (...args) => admitted(() => facade.openAttachment!(...args)),
-    listMessages: (...args) => admitted(() => facade.listMessages(...args)),
-    listChatNotes: (...args) => admitted(() => chatResources.listNotes(...args)),
-    getChatNote: (...args) => admitted(() => chatResources.getNote(...args)),
-    listChatAlbums: (...args) => admitted(() => chatResources.listAlbums(...args)),
-    listChatAlbumPhotos: (...args) => admitted(() => chatResources.listAlbumPhotos(...args)),
-    downloadChatAlbumPhoto: (...args) => admitted(() => chatResources.downloadAlbumPhoto(...args)),
-    openChatAlbum: (...args) => admitted(() => chatResources.openAlbum(...args)),
-    listAttachmentStates: (...args) => admitted(() => facade.listAttachmentStates(...args)),
-    listAgentStatuses: (...args) => admitted(() => facade.listAgentStatuses(...args)),
-    listWorkRecords: (...args) => admitted(() => facade.listWorkRecords(...args)),
-    listFriends: (...args) => admitted(() => facade.listFriends!(...args)),
-    listMessageReaders: (...args) => admitted(() => facade.listMessageReaders!(...args)),
-    listSystemActivity: (...args) => admitted(() => facade.listSystemActivity!(...args)),
-    listSystemErrors: (...args) => admitted(() => facade.listSystemErrors!(...args)),
-    controlState: (...args) => admitted(() => facade.controlState(...args)),
+    openAttachment: (...args) => admitted(() => facade.openAttachment!(...args), { operation: 'attachment' }),
+    listMessages: (...args) => admitted(() => facade.listMessages(...args), { operation: 'ipc', identity: { accountId: args[0].accountId } }),
+    listChatNotes: (...args) => admitted(() => chatResources.listNotes(...args), { operation: 'note_list', identity: { accountId: args[0].accountId } }),
+    getChatNote: (...args) => admitted(() => chatResources.getNote(...args), { operation: 'note_detail', identity: { accountId: args[0].accountId } }),
+    listChatAlbums: (key, cursor, refresh) => admitted(() => chatResources.listAlbums(key, cursor, undefined, 'modal', undefined, refresh),
+      { operation: 'album_list', identity: { accountId: key.accountId } }),
+    listChatAlbumPhotos: (key, albumId, cursor, refresh) => admitted(() => chatResources.listAlbumPhotos(key, albumId, cursor, undefined, refresh),
+      { operation: 'album_photos', identity: { accountId: key.accountId } }),
+    downloadChatAlbumPhoto: (...args) => admitted(() => chatResources.downloadAlbumPhoto(...args), { operation: 'photo_download', identity: { accountId: args[0].accountId } }),
+    openChatAlbum: (...args) => admitted(() => chatResources.openAlbum(...args), { operation: 'chat_resource', identity: { accountId: args[0].accountId } }),
+    listAttachmentStates: (...args) => admitted(() => facade.listAttachmentStates(...args), { operation: 'attachment', identity: { accountId: args[0].accountId } }),
+    listAgentStatuses: (...args) => admitted(() => facade.listAgentStatuses(...args), { operation: 'agent', identity: { accountId: args[0].accountId } }),
+    listWorkRecords: (...args) => admitted(() => facade.listWorkRecords(...args), { operation: 'agent' }),
+    listFriends: (...args) => admitted(() => facade.listFriends!(...args), { operation: 'ipc', identity: { accountId: args[0] } }),
+    listMessageReaders: (...args) => admitted(() => facade.listMessageReaders!(...args), { operation: 'chat_resource', identity: { accountId: args[0].accountId } }),
+    listSystemActivity: (...args) => admitted(() => facade.listSystemActivity!(...args), { operation: 'ipc' }),
+    listSystemErrors: (...args) => admitted(() => facade.listSystemErrors!(...args), { operation: 'ipc' }),
+    controlState: (...args) => admitted(() => facade.controlState(...args), { operation: 'ipc' }),
   };
 }

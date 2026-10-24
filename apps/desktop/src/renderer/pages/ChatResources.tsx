@@ -1,17 +1,18 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Download, Image as ImageIcon, NotebookPen, RotateCw, X } from 'lucide-react';
 import type { AlbumFailureContextDto, ConversationKey } from '@line-agent/contracts';
+import { lineMediaUrl } from '@line-agent/contracts';
 import { useDesktopLocale } from '../desktop-i18n.js';
 import type { Locale } from '../../locale.js';
 
 export type ChatNote = { postId: string; createdTime: number | null; text: string | null; content?: Record<string, unknown> };
-export type ChatAlbum = { albumId: string; chatId: string; title: string | null; photoCount: number | null; createTime: number | null; updateTime: number | null };
+export type ChatAlbum = { albumId: string; chatId: string; title: string | null; photoCount: number | null; createTime: number | null; updateTime: number | null; coverPhotoIds?: string[] };
 export type ChatAlbumPhoto = { photoId: string; oid: string; prefix: 'album/a' | 'album/v'; shotTime: number | null; width: number | null; height: number | null };
 export type ChatResourceApi = {
   listChatNotes(key: ConversationKey, cursor: string | null, requestId?: string): Promise<{ notes: ChatNote[]; nextCursor: string | null }>;
   getChatNote(key: ConversationKey, postId: string, requestId?: string): Promise<ChatNote>;
-  listChatAlbums(key: ConversationKey, cursor: string | null, requestId?: string): Promise<{ albums: ChatAlbum[]; nextCursor: string | null }>;
-  listChatAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null, requestId?: string): Promise<{ photos: ChatAlbumPhoto[]; nextCursor: string | null }>;
+  listChatAlbums(key: ConversationKey, cursor: string | null, requestId?: string, refresh?: boolean): Promise<{ albums: ChatAlbum[]; nextCursor: string | null }>;
+  listChatAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null, requestId?: string, refresh?: boolean): Promise<{ photos: ChatAlbumPhoto[]; nextCursor: string | null }>;
   downloadChatAlbumPhoto(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: 'album/a' | 'album/v', requestId?: string): Promise<{ albumId: string; photoId: string; sizeBytes: number }>;
   openChatAlbum(key: ConversationKey, albumId: string, requestId?: string): Promise<{ savedCount: number; failedCount: number; totalCount: number; complete: boolean; failureCodes: string[]; errorCode: string | null; failureContext?: AlbumFailureContextDto }>;
   cancelChatResourceRequest(targetRequestId: string): Promise<boolean>;
@@ -26,6 +27,7 @@ const COPY = {
 type ResourceKind = 'notes' | 'albums';
 type ReadState = 'idle' | 'loading' | 'error' | 'ready';
 const keyId = (key: ConversationKey) => JSON.stringify([key.accountId, key.chatType, key.chatId]);
+const savedPhotoLabel = (locale: Locale) => locale === 'zh-TW' ? '已儲存的照片' : locale === 'ja' ? '保存済みの写真' : locale === 'ko' ? '저장된 사진' : 'Saved photo';
 
 /** Per-chat Note and Album controls. Calls are explicit and one cursor page per action. */
 export function ChatResources({ api, route, accountStatus, accountMode }: { api: ChatResourceApi; route: ConversationKey; accountStatus: string; accountMode: string }) {
@@ -48,14 +50,12 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
   const [selectedAlbum, setSelectedAlbum] = useState<ChatAlbum | null>(null);
   const [noteDetailState, setNoteDetailState] = useState<ReadState>('idle');
   const [downloadState, setDownloadState] = useState<Record<string, 'loading' | 'saved' | 'error'>>({});
-  const [albumArchive, setAlbumArchive] = useState<{ state: 'idle' | 'loading' | 'done' | 'partial' | 'error' | 'cancelled'; saved: number; failed: number; total: number; code: string | null; failureContext?: AlbumFailureContextDto }>({ state: 'idle', saved: 0, failed: 0, total: 0, code: null });
   const dialog = useRef<HTMLDivElement | null>(null);
   const openButton = useRef<HTMLButtonElement | null>(null);
   const albumButton = useRef<HTMLButtonElement | null>(null);
   const requestLocks = useRef(new Set<string>());
   const activeRequests = useRef(new Set<string>());
   const viewGeneration = useRef(0);
-  const albumArchiveGeneration = useRef(0);
   const notesGeneration = useRef(0);
   const albumsGeneration = useRef(0);
   const kindRef = useRef<ResourceKind | null>(null);
@@ -77,7 +77,6 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
 
   const open = (next: ResourceKind) => {
     cancelRequests();
-    ++albumArchiveGeneration.current;
     ++viewGeneration.current;
     const generation = next === 'notes' ? ++notesGeneration.current : ++albumsGeneration.current;
     kindRef.current = next;
@@ -98,7 +97,6 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
   };
   const close = () => {
     cancelRequests();
-    ++albumArchiveGeneration.current;
     ++viewGeneration.current; kindRef.current = null; selectedNoteId.current = null; selectedAlbumRef.current = null;
     ++notesGeneration.current; ++albumsGeneration.current;
     pendingNotes.current = null; pendingAlbums.current = null; pendingPhotos.current = null; pendingNoteDetail.current = null;
@@ -108,8 +106,8 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
     const generation = ++viewGeneration.current;
     selectedNoteId.current = null; pendingNoteDetail.current = null; setSelectedNote(null);
     if (kind === 'notes') { const listGeneration = ++notesGeneration.current; setNotes([]); setNoteCursor(null); void loadNotes(false, listGeneration); }
-    else if (selectedAlbum) { setPhotos([]); setPhotoCursor(null); void loadPhotos(selectedAlbum, false, generation); }
-    else if (kind === 'albums') { const listGeneration = ++albumsGeneration.current; setAlbums([]); setAlbumCursor(null); void loadAlbums(false, listGeneration); }
+    else if (selectedAlbum) { setPhotos([]); setPhotoCursor(null); void loadPhotos(selectedAlbum, false, generation, true); }
+    else if (kind === 'albums') { const listGeneration = ++albumsGeneration.current; setAlbums([]); setAlbumCursor(null); void loadAlbums(false, listGeneration, true); }
   };
 
   async function loadNotes(append: boolean, generation = notesGeneration.current) {
@@ -129,12 +127,14 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
       if (pending && pending.generation === notesGeneration.current && kindRef.current === 'notes') void loadNotes(pending.append, pending.generation);
     }
   }
-  async function loadAlbums(append: boolean, generation = albumsGeneration.current) {
+  async function loadAlbums(append: boolean, generation = albumsGeneration.current, refresh = false) {
     setAlbumState('loading'); setAlbumError(false);
     if (requestLocks.current.has('albums')) { pendingAlbums.current = { append, generation }; return; }
     requestLocks.current.add('albums');
     try {
-      const page = await withRequestId((requestId) => api.listChatAlbums(route, append ? albumCursor : null, requestId));
+      const page = await withRequestId((requestId) => refresh
+        ? api.listChatAlbums(route, append ? albumCursor : null, requestId, true)
+        : api.listChatAlbums(route, append ? albumCursor : null, requestId));
       if (generation === albumsGeneration.current && kindRef.current === 'albums') {
         setAlbums((current) => append ? [...current, ...page.albums] : page.albums);
         setAlbumCursor(page.nextCursor); setAlbumState('ready');
@@ -146,12 +146,14 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
       if (pending && pending.generation === albumsGeneration.current && kindRef.current === 'albums') void loadAlbums(pending.append, pending.generation);
     }
   }
-  async function loadPhotos(album: ChatAlbum, append: boolean, generation = viewGeneration.current) {
+  async function loadPhotos(album: ChatAlbum, append: boolean, generation = viewGeneration.current, refresh = false) {
     setPhotoState('loading'); setPhotoError(false);
     if (activePhotoReads.current >= 2) { pendingPhotos.current = { album, append, generation }; return; }
     activePhotoReads.current += 1;
     try {
-      const page = await withRequestId((requestId) => api.listChatAlbumPhotos(route, album.albumId, append ? photoCursor : null, requestId));
+      const page = await withRequestId((requestId) => refresh
+        ? api.listChatAlbumPhotos(route, album.albumId, append ? photoCursor : null, requestId, true)
+        : api.listChatAlbumPhotos(route, album.albumId, append ? photoCursor : null, requestId));
       if (generation === viewGeneration.current && kindRef.current === 'albums' && selectedAlbumRef.current?.albumId === album.albumId) {
         setPhotos((current) => append ? [...current, ...page.photos] : page.photos);
         setPhotoCursor(page.nextCursor); setPhotoState('ready');
@@ -187,22 +189,9 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
   async function selectAlbum(album: ChatAlbum) {
     cancelRequests();
     const generation = ++viewGeneration.current;
-    const archiveGeneration = ++albumArchiveGeneration.current;
     selectedAlbumRef.current = album;
     setSelectedAlbum(album); setPhotos([]); setPhotoCursor(null); setPhotoState('idle'); setDownloadState({});
     void loadPhotos(album, false, generation);
-    setAlbumArchive({ state: 'loading', saved: 0, failed: 0, total: 0, code: null });
-    try {
-      const result = await withRequestId((requestId) => api.openChatAlbum(route, album.albumId, requestId));
-      if (archiveGeneration === albumArchiveGeneration.current && selectedAlbumRef.current?.albumId === album.albumId) setAlbumArchive({ state: result.complete ? 'done' : 'partial', saved: result.savedCount,
-        failed: result.failedCount, total: result.totalCount, code: result.errorCode ?? result.failureCodes?.[0] ?? null,
-        ...(result.failureContext ? { failureContext: result.failureContext } : {}) });
-    } catch (error) {
-      if (archiveGeneration === albumArchiveGeneration.current && selectedAlbumRef.current?.albumId === album.albumId) {
-        const code = error instanceof Error && /^[A-Z][A-Z0-9_]{1,47}$/.test(error.name) ? error.name : 'ARCHIVE_FAILED';
-        setAlbumArchive({ state: code === 'CANCELLED' ? 'cancelled' : 'error', saved: 0, failed: 0, total: 0, code });
-      }
-    }
   }
   function backFromNote() {
     ++viewGeneration.current; selectedNoteId.current = null; pendingNoteDetail.current = null;
@@ -210,7 +199,6 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
   }
   function backFromAlbum() {
     cancelRequests();
-    ++albumArchiveGeneration.current;
     ++viewGeneration.current; selectedAlbumRef.current = null; pendingPhotos.current = null;
     setSelectedAlbum(null); setPhotos([]); setPhotoCursor(null); setPhotoState('idle');
   }
@@ -221,13 +209,14 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
     try {
       await withRequestId((requestId) => api.downloadChatAlbumPhoto(route, selectedAlbum.albumId, photo.photoId, photo.oid, photo.prefix, requestId));
       setDownloadState((current) => ({ ...current, [photo.photoId]: 'saved' }));
+      setAlbums((current) => current.map((album) => album.albumId === selectedAlbum.albumId
+        ? { ...album, coverPhotoIds: [photo.photoId, ...(album.coverPhotoIds ?? []).filter((id) => id !== photo.photoId)].slice(0, 2) } : album));
     } catch { setDownloadState((current) => ({ ...current, [photo.photoId]: 'error' })); }
     finally { requestLocks.current.delete('download'); }
   }
 
   useEffect(() => { if (kind) dialog.current?.focus(); }, [kind]);
   useEffect(() => {
-    ++albumArchiveGeneration.current;
     if (!kind) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') { event.stopPropagation(); close(); return; }
@@ -249,7 +238,6 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
     setNoteState('idle'); setAlbumState('idle'); setPhotoState('idle'); setNoteError(false); setAlbumError(false); setPhotoError(false);
     return () => {
       cancelRequests();
-      ++albumArchiveGeneration.current;
       ++viewGeneration.current; kindRef.current = null; selectedNoteId.current = null; selectedAlbumRef.current = null;
       ++notesGeneration.current; ++albumsGeneration.current;
       pendingNotes.current = null; pendingAlbums.current = null; pendingPhotos.current = null; pendingNoteDetail.current = null;
@@ -283,23 +271,33 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
           {kind === 'albums' && <>
             {selectedAlbum ? <div className="chat-resource-detail"><button type="button" className="chat-resource-back" onClick={backFromAlbum}>{copy.back}</button><h3>{selectedAlbum.title?.trim() || copy.unnamedAlbum}</h3>
               <p className="muted">{photoCountText(locale, copy, selectedAlbum.photoCount)}</p>
-              {albumArchive.state === 'loading' && <p className="chat-resources-state muted" role="status"><progress aria-label={copy.archivingAlbum} />{copy.archivingAlbum}</p>}
-              {albumArchive.state === 'done' && <p className="chat-resources-state muted" role="status">{copy.albumArchiveComplete.replace('{saved}', String(albumArchive.saved)).replace('{total}', String(albumArchive.total))}</p>}
-              {albumArchive.state === 'partial' && <p className="chat-resources-state" role="alert">{copy.albumArchivePartial.replace('{saved}', String(albumArchive.saved)).replace('{total}', String(albumArchive.total)).replace('{failed}', String(albumArchive.failed))}{albumArchive.code ? ` (${albumArchive.code})` : ''}{albumArchive.failureContext ? ` ${copy.albumArchiveStage.replace('{action}', albumArchive.failureContext.action).replace('{stage}', albumArchive.failureContext.stage)}` : ''}</p>}
-              {albumArchive.state === 'cancelled' && <p className="chat-resources-state muted" role="status">{copy.albumArchiveCancelled}</p>}
-              {albumArchive.state === 'error' && <p className="chat-resources-state" role="alert">{copy.albumArchiveFailed.replace('{code}', albumArchive.code ?? 'ARCHIVE_FAILED')}</p>}
               {selectedAlbum && photoState === 'ready' && photos.length === 0 && <p className="chat-resources-state muted">{copy.emptyPhotos}</p>}
               {photoState === 'loading' && <p className="chat-resources-state muted" role="status">{copy.loading}</p>}
               {photoState === 'error' && photoError && <div className="chat-resources-state" role="alert"><p>{copy.loadPhotosError}</p><button type="button" onClick={() => void loadPhotos(selectedAlbum, false)}>{copy.retry}</button></div>}
-              <ul className="chat-resource-photos">{photos.map((photo) => { const status = downloadState[photo.photoId]; return <li key={photo.photoId}><span>{photo.width && photo.height ? `${photo.width} × ${photo.height}` : copy.photo}</span><button type="button" disabled={status === 'loading' || Object.values(downloadState).includes('loading')} aria-label={copy.download} onClick={() => void download(photo)}><Download size={16} aria-hidden="true" />{status === 'loading' ? copy.loading : copy.download}</button>{status === 'saved' && <span role="status">{copy.saved}</span>}{status === 'error' && <span role="alert">{copy.saveError}</span>}</li>; })}</ul>
+              <ul className="chat-resource-photos">{photos.map((photo) => { const status = downloadState[photo.photoId]; return <li key={photo.photoId}>
+                <PhotoPreview key={status === 'saved' ? 'saved' : 'listed'} route={route} albumId={selectedAlbum.albumId} photoId={photo.photoId} alt={copy.photo} savedLabel={savedPhotoLabel(locale)} testId={`album-photo-preview-${photo.photoId}`} />
+                <span>{photo.width && photo.height ? `${photo.width} × ${photo.height}` : copy.photo}</span><button type="button" disabled={status === 'loading' || Object.values(downloadState).includes('loading')} aria-label={copy.download} onClick={() => void download(photo)}><Download size={16} aria-hidden="true" />{status === 'loading' ? copy.loading : copy.download}</button>{status === 'saved' && <span role="status">{copy.saved}</span>}{status === 'error' && <span role="alert">{copy.saveError}</span>}</li>; })}</ul>
               {stateLine(photoState, false, false, copy.emptyPhotos, copy.loadPhotosError, () => void loadPhotos(selectedAlbum, false), photoCursor !== null, () => void loadPhotos(selectedAlbum, true))}</div>
-              : <><ul className="chat-resource-list">{albums.map((album) => <li key={album.albumId}><button type="button" onClick={() => void selectAlbum(album)} aria-label={album.title?.trim() || copy.unnamedAlbum}><strong>{album.title?.trim() || copy.unnamedAlbum}</strong><span>{photoCountText(locale, copy, album.photoCount)}</span></button></li>)}</ul>
+              : <><ul className="chat-resource-list">{albums.map((album) => <li key={album.albumId}><button type="button" className="chat-resource-album" onClick={() => void selectAlbum(album)} aria-label={album.title?.trim() || copy.unnamedAlbum}>
+                  <span className="chat-resource-album-cover">{(album.coverPhotoIds ?? []).slice(0, 2).map((photoId) => <PhotoPreview key={photoId} route={route} albumId={album.albumId} photoId={photoId} alt="" savedLabel={savedPhotoLabel(locale)} />)}</span>
+                  <span className="chat-resource-album-meta"><strong>{album.title?.trim() || copy.unnamedAlbum}</strong><span>{photoCountText(locale, copy, album.photoCount)}</span></span>
+                </button></li>)}</ul>
                 {stateLine(albumState, albums.length === 0, albumError, copy.emptyAlbums, copy.loadAlbumsError, () => void loadAlbums(false), albumCursor !== null, () => void loadAlbums(true))}</>}
           </>}
         </div>
       </section>
     </div>}
   </>;
+}
+
+function PhotoPreview({ route, albumId, photoId, alt, savedLabel, testId }: { route: ConversationKey; albumId: string; photoId: string; alt: string; savedLabel: string; testId?: string }) {
+  const [loaded, setLoaded] = useState(false);
+  const src = lineMediaUrl({ type: 'albumPhoto', ...route, albumId, photoId });
+  return <span className="chat-resource-photo-preview">
+    {src && <img src={src} alt={alt} loading="lazy" decoding="async" referrerPolicy="no-referrer" data-testid={testId}
+      onLoad={() => setLoaded(true)} onError={(event) => { setLoaded(false); event.currentTarget.hidden = true; }} />}
+    {loaded && <span className="chat-resource-photo-saved" role="img" aria-label={savedLabel}>✓</span>}
+  </span>;
 }
 
 function photoCountText(locale: Locale, copy: typeof COPY[Locale], count: number | null): string {

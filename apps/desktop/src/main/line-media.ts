@@ -8,6 +8,7 @@ import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 const LINE_ORIGINS = new Set<string>(NATIVE_PICTURE_ORIGINS);
 const STICKER_ORIGIN = 'https://stickershop.line-scdn.net';
 const STICKER_ID = /^\d{1,20}$/;
+const MAX_ALBUM_PHOTO_BYTES = 20 * 1024 * 1024;
 const MIME_SIGNATURES = [
   { mimeType: 'image/png', valid: (bytes: Buffer) => bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) },
   { mimeType: 'image/jpeg', valid: (bytes: Buffer) => bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff },
@@ -16,13 +17,15 @@ const MIME_SIGNATURES = [
 ] as const;
 type ImageMime = typeof MIME_SIGNATURES[number]['mimeType'];
 type ImmutableAsset = { kind: 'sticker'; stickerId: string; animated: boolean } | { kind: 'sticon'; productId: string; sticonId: string; animated: boolean };
-type MediaSource = { type: 'remote'; url: string; asset?: ImmutableAsset } | { type: 'attachment'; key: ConversationKey; attachmentId: string };
+type MediaSource = { type: 'remote'; url: string; asset?: ImmutableAsset } | { type: 'attachment'; key: ConversationKey; attachmentId: string }
+  | { type: 'albumPhoto'; key: ConversationKey; albumId: string; photoId: string };
 type RemoteFlight = { promise: Promise<MediaBytes | null>; controller: AbortController; waiters: number };
 type MediaBytes = { bytes: Uint8Array; mimeType: string };
 type Options = {
   onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void;
   fetch?: typeof fetch;
   loadAttachment?: (key: ConversationKey, attachmentId: string, signal: AbortSignal) => Promise<MediaBytes | null>;
+  loadAlbumPhoto?: (key: ConversationKey, albumId: string, photoId: string, signal: AbortSignal) => Promise<MediaBytes | null>;
   now?: () => number;
   cacheRoot?: string;
   remoteTimeoutMs?: number;
@@ -74,6 +77,7 @@ export class LineMediaService {
   readonly #onDiagnostic: Options['onDiagnostic'];
   readonly #fetch: typeof fetch;
   readonly #loadAttachment?: Options['loadAttachment'];
+  readonly #loadAlbumPhoto?: Options['loadAlbumPhoto'];
   readonly #now: () => number;
   readonly #cacheRoot: string;
   readonly #remoteTimeoutMs: number;
@@ -99,6 +103,7 @@ export class LineMediaService {
     this.#onDiagnostic = options.onDiagnostic;
     this.#fetch = options.fetch ?? fetch;
     this.#loadAttachment = options.loadAttachment;
+    this.#loadAlbumPhoto = options.loadAlbumPhoto;
     this.#now = options.now ?? Date.now;
     this.#cacheRoot = options.cacheRoot ?? path.join(process.env.LOCALAPPDATA ?? process.cwd(), 'LINEJS', 'avatar-cache');
     this.#remoteTimeoutMs = options.remoteTimeoutMs ?? 5_000;
@@ -141,6 +146,11 @@ export class LineMediaService {
     if (this.#shutdown || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)
       || !this.#loadAttachment) return null;
     return { type: 'attachment', key: { ...key }, attachmentId };
+  }
+
+  albumPhotoSource(albumId: string, photoId: string, key: ConversationKey): MediaSource | null {
+    if (this.#shutdown || !this.#loadAlbumPhoto || !albumId || !photoId || albumId.length > 256 || photoId.length > 256) return null;
+    return { type: 'albumPhoto', key: { ...key }, albumId, photoId };
   }
 
   async handle(source: MediaSource | null, signal?: AbortSignal): Promise<Response> {
@@ -378,15 +388,17 @@ export class LineMediaService {
     } else this.#activeAttachments--;
   }
 
-  async #readAttachment(source: Extract<MediaSource, { type: 'attachment' }>, signal: AbortSignal): Promise<MediaBytes | null> {
-    if (signal.aborted || !this.#loadAttachment) return null;
+  async #readAttachment(source: Extract<MediaSource, { type: 'attachment' | 'albumPhoto' }>, signal: AbortSignal): Promise<MediaBytes | null> {
+    if (signal.aborted || (source.type === 'attachment' ? !this.#loadAttachment : !this.#loadAlbumPhoto)) return null;
     const release = await this.#acquireAttachment(signal);
     if (!release) return null;
-    const load = this.#loadAttachment;
     const loading = (async (): Promise<MediaBytes | null> => {
       try {
-        const result = await load(source.key, source.attachmentId, signal);
-        if (!result || signal.aborted || result.bytes.byteLength <= 0 || result.bytes.byteLength > this.#maxAttachmentBytes) return null;
+        const result = source.type === 'attachment'
+          ? await this.#loadAttachment!(source.key, source.attachmentId, signal)
+          : await this.#loadAlbumPhoto!(source.key, source.albumId, source.photoId, signal);
+        const maxBytes = source.type === 'albumPhoto' ? MAX_ALBUM_PHOTO_BYTES : this.#maxAttachmentBytes;
+        if (!result || signal.aborted || result.bytes.byteLength <= 0 || result.bytes.byteLength > maxBytes) return null;
         const bytes = Buffer.from(result.bytes);
         const mimeType = imageMime(bytes, result.mimeType);
         return mimeType ? { bytes, mimeType } : null;

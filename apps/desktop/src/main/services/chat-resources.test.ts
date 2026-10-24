@@ -4,6 +4,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ConversationKey } from '@line-agent/contracts';
+import { ChatAlbumCatalogRepository } from '@line-agent/database';
+import { createTestDatabase } from '../../../../../packages/database/src/test-database.js';
 import { AlbumArchiveFailure, ChatResourceArchiveService, isNativeNotePostNotification, nativePostNotificationSubtype, type ChatResourceArchiveDependencies, type ChatResourceArchiveItem,
   type ChatResourceArchiveVersion, type ChatResourceBinding, type ChatResourceKind, type ChatResourceReadResult, type ChatResourceRequest,
   type ChatResourceStore } from './chat-resources.js';
@@ -13,8 +15,9 @@ import { createChatResourceDiagnostics, parseChatResourceDiagnostic } from './ch
 
 const noteA = { postId: 'post/one', createdTime: 1_700_000_000_000, text: 'A', content: { html: '<b>data</b>' } };
 const album = { albumId: 'album:one', chatId: 'chat-1', title: 'Photos', photoCount: 1, createTime: 1_700_000_000_000, updateTime: 1_700_000_000_001 };
-const photo = { photoId: 'photo/one', oid: 'oid', prefix: 'album/a', shotTime: 1_700_000_000_000, width: 2, height: 3 };
+const photo = { photoId: 'photo/one', oid: 'oid', prefix: 'album/a' as const, shotTime: 1_700_000_000_000, width: 2, height: 3 };
 const key = { accountId: 'account-1', chatType: 'group' as const, chatId: 'chat-1' };
+const integrationTest = process.env.TEST_DATABASE_URL ? it : it.skip;
 
 type CommitGate = { started(): void; wait: Promise<void> };
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -102,8 +105,38 @@ describe('ChatResourceArchiveService', () => {
       setBinding: (binding: ChatResourceBinding | null) => { currentBinding = binding; } };
   }
 
+  it('serves a preview only when catalog metadata matches the native archive and never asks LINE to download', async () => {
+    const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const savedFile = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: createHash('sha256').update(bytes).digest('hex'), byteCount: bytes.byteLength, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = { savedPhoto: vi.fn(async () => savedFile) } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const readAlbumPhoto = vi.fn(async () => ({ ...savedFile, content: bytes }));
+    const { service, readChatResource } = await setup({ catalog }, { readAlbumPhoto });
+
+    await expect(service.readSavedAlbumPhoto(key, album.albumId, photo.photoId)).resolves.toEqual({ bytes, mimeType: 'image/jpeg' });
+    expect(catalog.savedPhoto).toHaveBeenCalledWith(key, album.albumId, photo.photoId);
+    expect(readAlbumPhoto).toHaveBeenCalledWith(expect.objectContaining({ key, albumId: album.albumId, photoId: photo.photoId }));
+    expect(readChatResource).not.toHaveBeenCalled();
+  });
+
+  it('rejects a stale catalog file record when reading an album preview', async () => {
+    const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const savedFile = { folderName: 'a'.repeat(64), fileName: 'record_f_old.jpg', contentHash: 'b'.repeat(64), byteCount: 100, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = { savedPhoto: vi.fn(async () => savedFile) } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const { service, readChatResource } = await setup({ catalog }, { readAlbumPhoto: vi.fn(async () => ({ ...savedFile, content: bytes,
+      fileName: 'record_f_replaced.jpg', contentHash: createHash('sha256').update(bytes).digest('hex'), byteCount: bytes.byteLength })) });
+
+    await expect(service.readSavedAlbumPhoto(key, album.albumId, photo.photoId)).resolves.toBeNull();
+    expect(readChatResource).not.toHaveBeenCalled();
+  });
+
   it('archives all five worker resource actions through the typed store seam', async () => {
-    const { service, readChatResource, published } = await setup();
+    const savedFile = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), byteCount: 3, revision: 1, savedAt: new Date().toISOString() };
+    const { service, readChatResource, published, store } = await setup({}, {
+      inspectAlbumPhoto: vi.fn(async () => null),
+      publishAlbumPhoto: vi.fn(async () => savedFile),
+    });
     await service.listNotes(key, null);
     await service.getNote(key, noteA.postId);
     await service.listAlbums(key, null);
@@ -115,8 +148,198 @@ describe('ChatResourceArchiveService', () => {
     expect(commands[2]).toMatchObject({ transportOwnerId: 'owner-1', transportGeneration: 2, writeGrantVersion: 3 });
     expect(commands[4]).toMatchObject({ prefix: 'album/a', maxBytes: 20 * 1024 * 1024 });
     expect(result).toMatchObject({ photoId: photo.photoId, sizeBytes: 3 });
-    expect(published.map(({ kind }) => kind)).toEqual(['note', 'note', 'album', 'photo-page', 'photo']);
+    expect(published.map(({ kind }) => kind)).toEqual(['note', 'note', 'album', 'photo-page']);
+    expect(store.publishAlbumPhoto).toHaveBeenCalledOnce();
     expect(Buffer.from(published[0]!.content).toString()).toContain('A');
+  });
+
+  it('repairs a missing saved-file catalog row from native inspection without reading LINE', async () => {
+    const savedFile = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_existing.jpg',
+      contentHash: 'a'.repeat(64), byteCount: 23, revision: 4, savedAt: new Date().toISOString() };
+    const catalog = { savedPhoto: vi.fn(async () => null), savePhoto: vi.fn(async () => {}) } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const { service, readChatResource, store } = await setup({ catalog }, {
+      inspectAlbumPhoto: vi.fn(async () => savedFile),
+      publishAlbumPhoto: vi.fn(async () => { throw new Error('existing photo must not be rewritten'); }),
+    });
+
+    const result = await service.downloadAlbumPhoto(key, album.albumId, photo.photoId, photo.oid, photo.prefix);
+
+    expect(result).toEqual({ albumId: album.albumId, photoId: photo.photoId, sizeBytes: savedFile.byteCount });
+    expect(readChatResource).not.toHaveBeenCalled();
+    expect(store.publishAlbumPhoto).not.toHaveBeenCalled();
+    expect(catalog.savedPhoto).toHaveBeenCalledWith(key, album.albumId, photo.photoId);
+    expect(catalog.savePhoto).toHaveBeenCalledWith(key, album.albumId, photo.photoId, savedFile, expect.objectContaining({ mode: 'ACTIVE_CONTROL' }));
+  });
+
+  it('uses an exact catalog file match only after native verification', async () => {
+    const savedFile = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_cached.jpg',
+      contentHash: 'c'.repeat(64), byteCount: 19, revision: 8, savedAt: new Date().toISOString() };
+    const catalog = { savedPhoto: vi.fn(async () => savedFile), savePhoto: vi.fn(async () => {}), clearSavedPhoto: vi.fn(async () => {}) } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const inspectAlbumPhoto = vi.fn(async () => savedFile);
+    const { service, readChatResource, store } = await setup({ catalog }, { inspectAlbumPhoto,
+      publishAlbumPhoto: vi.fn(async () => { throw new Error('verified existing file must not be rewritten'); }) });
+
+    await expect(service.downloadAlbumPhoto(key, album.albumId, photo.photoId, photo.oid, photo.prefix))
+      .resolves.toEqual({ albumId: album.albumId, photoId: photo.photoId, sizeBytes: savedFile.byteCount });
+    expect(catalog.savedPhoto).toHaveBeenCalledWith(key, album.albumId, photo.photoId);
+    expect(inspectAlbumPhoto).toHaveBeenCalledOnce();
+    expect(catalog.savePhoto).not.toHaveBeenCalled();
+    expect(catalog.clearSavedPhoto).not.toHaveBeenCalled();
+    expect(readChatResource).not.toHaveBeenCalled();
+    expect(store.publishAlbumPhoto).not.toHaveBeenCalled();
+  });
+
+  it('clears stale saved-file metadata when native inspection finds the file missing', async () => {
+    const staleFile = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_stale.jpg',
+      contentHash: 'e'.repeat(64), byteCount: 99, revision: 2, savedAt: new Date().toISOString() };
+    const repairedFile = { ...staleFile, fileName: 'record_f_repaired.jpg', contentHash: 'f'.repeat(64), byteCount: 3, revision: 3 };
+    const catalog = { savedPhoto: vi.fn(async () => staleFile), clearSavedPhoto: vi.fn(async () => {}), savePhoto: vi.fn(async () => {}) } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const inspectAlbumPhoto = vi.fn(async () => null);
+    const publishAlbumPhoto = vi.fn(async () => repairedFile);
+    const { service, readChatResource } = await setup({ catalog }, { inspectAlbumPhoto, publishAlbumPhoto });
+
+    await expect(service.downloadAlbumPhoto(key, album.albumId, photo.photoId, photo.oid, photo.prefix))
+      .resolves.toEqual({ albumId: album.albumId, photoId: photo.photoId, sizeBytes: 3 });
+    expect(catalog.clearSavedPhoto).toHaveBeenCalledOnce();
+    expect(readChatResource.mock.calls.filter(([command]) => command.action === 'downloadAlbumPhoto')).toHaveLength(1);
+    expect(publishAlbumPhoto).toHaveBeenCalledOnce();
+    expect(catalog.savePhoto).toHaveBeenCalledWith(key, album.albumId, photo.photoId, repairedFile, expect.anything());
+  });
+
+  it('repairs the catalog after native commit when the database write failed', async () => {
+    const savedFile = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_committed.jpg',
+      contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), byteCount: 3, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = { savedPhoto: vi.fn(async () => null), clearSavedPhoto: vi.fn(async () => {}),
+      savePhoto: vi.fn().mockRejectedValueOnce(new Error('database unavailable')).mockResolvedValue(undefined) } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const inspectAlbumPhoto = vi.fn().mockResolvedValueOnce(null).mockResolvedValue(savedFile);
+    const publishAlbumPhoto = vi.fn(async () => savedFile);
+    const { service, readChatResource } = await setup({ catalog }, { inspectAlbumPhoto, publishAlbumPhoto });
+
+    await expect(service.downloadAlbumPhoto(key, album.albumId, photo.photoId, photo.oid, photo.prefix)).rejects.toThrow('database unavailable');
+    await expect(service.downloadAlbumPhoto(key, album.albumId, photo.photoId, photo.oid, photo.prefix))
+      .resolves.toEqual({ albumId: album.albumId, photoId: photo.photoId, sizeBytes: savedFile.byteCount });
+
+    expect(readChatResource.mock.calls.filter(([command]) => command.action === 'downloadAlbumPhoto')).toHaveLength(1);
+    expect(publishAlbumPhoto).toHaveBeenCalledOnce();
+    expect(catalog.savePhoto).toHaveBeenCalledTimes(2);
+  });
+
+  it('serves a complete cached album scan repeatedly and refreshes only on request', async () => {
+    const cachedAlbum = { ...album, title: 'Cached title' };
+    let scanState = { complete: true, generation: 3, cursor: null as string | null, previousCursor: null as string | null, nextOrdinal: 1 };
+    const catalog = {
+      albumScan: vi.fn(async () => ({ complete: scanState.complete, generation: scanState.generation })),
+      albumScanState: vi.fn(async () => scanState),
+      listAlbums: vi.fn(async () => ({ items: [cachedAlbum], nextCursor: null })),
+      beginAlbumScan: vi.fn(async () => { scanState = { complete: false, generation: scanState.generation + 1, cursor: null, previousCursor: null, nextOrdinal: 0 }; return scanState.generation; }),
+      appendAlbumPage: vi.fn(async (_key: ConversationKey, generation: number, _expected: string | null, _albums: readonly unknown[], next: string | null) => {
+        scanState = { complete: next === null, generation, cursor: next, previousCursor: null, nextOrdinal: 1 };
+        return { complete: next === null, nextOrdinal: 1 };
+      }),
+      upsertAlbums: vi.fn(async () => {}), completeAlbumScan: vi.fn(async () => {}),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const { service, readChatResource } = await setup({ catalog });
+
+    await expect(service.listAlbums(key, null)).resolves.toMatchObject({ albums: [cachedAlbum], nextCursor: null });
+    await expect(service.listAlbums(key, null)).resolves.toMatchObject({ albums: [cachedAlbum], nextCursor: null });
+    expect(readChatResource).not.toHaveBeenCalled();
+    expect(catalog.listAlbums).toHaveBeenCalledTimes(2);
+
+    await service.listAlbums(key, null, undefined, 'modal', undefined, true);
+    expect(readChatResource.mock.calls.map(([command]) => command.action)).toEqual(['listAlbums']);
+    expect(catalog.appendAlbumPage).toHaveBeenCalledOnce();
+  });
+
+  it('resumes an uncached 501-photo list from saved LINE cursor progress without downloading photos', async () => {
+    const rows = Array.from({ length: 501 }, (_, index) => ({ ...photo, photoId: index === 500 ? 'a-tail' : `z-${String(index).padStart(3, '0')}`, oid: `oid-${index}` }));
+    let scan = { complete: false, generation: 0, cursor: null as string | null, previousCursor: null as string | null, nextOrdinal: 0 };
+    const catalogRows: Array<(typeof rows)[number]> = [];
+    const catalog = {
+      photoScan: vi.fn(async () => scan),
+      beginPhotoScan: vi.fn(async () => { scan = { complete: false, generation: scan.generation + 1, cursor: null, previousCursor: null, nextOrdinal: 0 }; return scan.generation; }),
+      appendPhotoPage: vi.fn(async (_key: ConversationKey, _albumId: string, generation: number, expected: string | null, photos: readonly (typeof rows)[number][], next: string | null) => {
+        if (scan.cursor !== expected) throw new Error('stale expected cursor');
+        catalogRows.push(...photos);
+        scan = { complete: next === null, generation, cursor: next, previousCursor: expected, nextOrdinal: scan.nextOrdinal + photos.length };
+        return { complete: scan.complete, nextOrdinal: scan.nextOrdinal };
+      }),
+      listPhotos: vi.fn(async (_key: ConversationKey, _albumId: string, after: string | null, limit = 50) => {
+        const afterOrdinal = after === null ? -1 : Number(after);
+        const remaining = catalogRows.filter((_, ordinal) => ordinal > afterOrdinal);
+        const page = remaining.slice(0, limit);
+        return { items: page, nextCursor: remaining.length > limit ? String(afterOrdinal + page.length) : null };
+      }),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const readChatResource = vi.fn(async (command: ChatResourceRequest) => {
+      if (command.action !== 'listAlbumPhotos') throw new Error(`Unexpected modal action: ${command.action}`);
+      const pageIndex = command.cursor === undefined ? 0 : Number(command.cursor.slice('page-'.length));
+      const pageRows = rows.slice(pageIndex * 50, (pageIndex + 1) * 50);
+      return { type: 'chatResourceResult' as const, requestId: command.requestId, action: command.action, ok: true,
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId, photos: pageRows,
+        nextCursor: (pageIndex + 1) * 50 < rows.length ? `page-${pageIndex + 1}` : null } as ChatResourceReadResult;
+    });
+    const { service } = await setup({ catalog, readChatResource });
+
+    const displayed = new Set<string>();
+    let cursor: string | null = null;
+    do {
+      const page = await service.listAlbumPhotos(key, album.albumId, cursor);
+      for (const item of page.photos) displayed.add(item.photoId);
+      cursor = page.nextCursor;
+    } while (cursor !== null && displayed.size <= 501);
+
+    expect(displayed.size).toBe(501);
+    expect(readChatResource.mock.calls.filter(([command]) => command.action === 'listAlbumPhotos')).toHaveLength(11);
+    expect(readChatResource.mock.calls.every(([command]) => command.action === 'listAlbumPhotos')).toBe(true);
+    expect(scan).toEqual({ complete: true, generation: 1, cursor: null, previousCursor: 'page-10', nextOrdinal: 501 });
+    expect(catalog.beginPhotoScan).toHaveBeenCalledOnce();
+    await service.listAlbumPhotos(key, album.albumId, null);
+    expect(readChatResource).toHaveBeenCalledTimes(11);
+  });
+
+  it('pages an uncached 501-album list in source order and then serves it from cache', async () => {
+    const rows = Array.from({ length: 501 }, (_, index) => ({ ...album, albumId: `album-${String(500 - index).padStart(3, '0')}` }));
+    let scan = { complete: false, generation: 0, cursor: null as string | null, previousCursor: null as string | null, nextOrdinal: 0 };
+    const imported: typeof rows = [];
+    const catalog = {
+      albumScan: vi.fn(async () => ({ complete: scan.complete, generation: scan.generation })),
+      albumScanState: vi.fn(async () => scan),
+      beginAlbumScan: vi.fn(async () => { scan = { complete: false, generation: scan.generation + 1, cursor: null, previousCursor: null, nextOrdinal: 0 }; return scan.generation; }),
+      appendAlbumPage: vi.fn(async (_key: ConversationKey, generation: number, expected: string | null, page: readonly typeof rows[number][], next: string | null) => {
+        if (scan.cursor !== expected) throw new Error('stale expected cursor');
+        imported.push(...page);
+        scan = { complete: next === null, generation, cursor: next, previousCursor: expected, nextOrdinal: scan.nextOrdinal + page.length };
+        return { nextOrdinal: scan.nextOrdinal, complete: scan.complete };
+      }),
+      listAlbums: vi.fn(async (_key: ConversationKey, after: string | null, limit = 50) => {
+        const ordinal = after === null ? -1 : Number(after);
+        const remaining = imported.filter((_, index) => index > ordinal);
+        const items = remaining.slice(0, limit);
+        return { items, nextCursor: remaining.length > limit ? String(ordinal + items.length) : null };
+      }),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const readChatResource = vi.fn(async (command: ChatResourceRequest) => {
+      if (command.action !== 'listAlbums') throw new Error(`Unexpected modal action: ${command.action}`);
+      const pageIndex = command.cursor == null ? 0 : Number(command.cursor.slice('albums-'.length));
+      const page = rows.slice(pageIndex * 50, (pageIndex + 1) * 50);
+      return { type: 'chatResourceResult' as const, requestId: command.requestId, action: command.action, ok: true,
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId, albums: page,
+        nextCursor: (pageIndex + 1) * 50 < rows.length ? `albums-${pageIndex + 1}` : null } as ChatResourceReadResult;
+    });
+    const { service } = await setup({ catalog, readChatResource });
+    const displayed: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await service.listAlbums(key, cursor);
+      displayed.push(...page.albums.map(({ albumId }) => albumId));
+      cursor = page.nextCursor;
+    } while (cursor);
+    expect(displayed).toEqual(rows.map(({ albumId }) => albumId));
+    expect(readChatResource).toHaveBeenCalledTimes(11);
+    await service.listAlbums(key, null);
+    expect(readChatResource).toHaveBeenCalledTimes(11);
   });
 
   it('opens an album across cursor pages and publishes each photo into its album folder', async () => {
@@ -155,6 +378,73 @@ describe('ChatResourceArchiveService', () => {
     expect(worker.mock.calls.filter(([command]) => command.action === 'downloadAlbumPhoto')).toHaveLength(2);
     expect(store.publishAlbumPhoto).toHaveBeenCalledTimes(2);
     expect(store.ensureAlbumFolder).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps an archival tail on the completed modal photo generation', async () => {
+    const file = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_tail.jpg',
+      contentHash: createHash('sha256').update(new Uint8Array([1])).digest('hex'), byteCount: 1, revision: 1, savedAt: new Date().toISOString() };
+    const catalog = {
+      photoScan: vi.fn(async () => ({ complete: true, generation: 7, cursor: null, previousCursor: 'page-tail', nextOrdinal: 10 })),
+      beginPhotoScan: vi.fn(async () => 8), appendPhotoPage: vi.fn(async () => ({ nextOrdinal: 11, complete: true })), upsertPhotos: vi.fn(async () => {}),
+      advancePhotoScan: vi.fn(async () => {}), savedPhoto: vi.fn(async () => null), savePhoto: vi.fn(async () => {}),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const readChatResource = vi.fn(async (command: ChatResourceRequest) => command.action === 'listAlbumPhotos'
+      ? { type: 'chatResourceResult' as const, requestId: command.requestId, action: command.action, ok: true,
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId, photos: [photo], nextCursor: null } as ChatResourceReadResult
+      : { type: 'chatResourceResult' as const, requestId: command.requestId, action: command.action, ok: true,
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId, bytes: new Uint8Array([1]) } as ChatResourceReadResult);
+    const { service } = await setup({ catalog, readChatResource }, {
+      ensureAlbumFolder: vi.fn(async () => {}), inspectAlbumPhoto: vi.fn(async () => null),
+      publishAlbumPhoto: vi.fn(async () => file),
+    });
+
+    await service.openAlbum(key, album.albumId, undefined, 'notification', undefined, 'page-tail', 0);
+
+    expect(catalog.photoScan).toHaveBeenCalledWith(key, album.albumId);
+    expect(catalog.beginPhotoScan).not.toHaveBeenCalled();
+    expect(catalog.appendPhotoPage).toHaveBeenCalledWith(key, album.albumId, 7, 'page-tail', [photo], null, expect.anything());
+    expect(catalog.savePhoto).toHaveBeenCalledWith(key, album.albumId, photo.photoId, file, expect.anything());
+  });
+
+  it('resumes an archival page-limit continuation on its original incomplete scan generation', async () => {
+    const photos = Array.from({ length: 501 }, (_, index) => ({ ...photo, photoId: `resume-${String(index).padStart(3, '0')}`, oid: `resume-oid-${index}` }));
+    const file = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
+      contentHash: 'd'.repeat(64), byteCount: 1, revision: 1, savedAt: new Date().toISOString() };
+    let scan = { complete: false, generation: 0, cursor: null as string | null, previousCursor: null as string | null, nextOrdinal: 0 };
+    const catalog = {
+      photoScan: vi.fn(async () => scan),
+      beginPhotoScan: vi.fn(async () => { scan = { complete: false, generation: scan.generation + 1, cursor: null, previousCursor: null, nextOrdinal: 0 }; return scan.generation; }),
+      appendPhotoPage: vi.fn(async (_key: ConversationKey, _albumId: string, generation: number, expected: string | null, rows: readonly unknown[], cursor: string | null) => {
+        if (scan.cursor !== expected) throw new Error('stale expected cursor');
+        scan = { complete: cursor === null, generation, cursor, previousCursor: expected, nextOrdinal: scan.nextOrdinal + rows.length };
+        return { complete: scan.complete, nextOrdinal: scan.nextOrdinal };
+      }),
+      savedPhoto: vi.fn(async () => file), savePhoto: vi.fn(async () => {}),
+    } as unknown as NonNullable<ChatResourceArchiveDependencies['catalog']>;
+    const readChatResource = vi.fn(async (command: ChatResourceRequest) => {
+      if (command.action !== 'listAlbumPhotos') throw new Error(`Unexpected automatic action: ${command.action}`);
+      const pageIndex = command.cursor === undefined ? 0 : Number(command.cursor.slice('page-'.length));
+      return { type: 'chatResourceResult' as const, requestId: command.requestId, action: command.action, ok: true,
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId, photos: photos.slice(pageIndex * 50, (pageIndex + 1) * 50),
+        nextCursor: (pageIndex + 1) * 50 < photos.length ? `page-${pageIndex + 1}` : null } as ChatResourceReadResult;
+    });
+    const { service } = await setup({ catalog, readChatResource }, { ensureAlbumFolder: vi.fn(async () => {}),
+      inspectAlbumPhoto: vi.fn(async () => file), publishAlbumPhoto: vi.fn(async () => file) });
+
+    const first = await service.openAlbum(key, album.albumId, undefined, 'notification');
+    expect(first).toMatchObject({ complete: false, errorCode: 'PAGE_LIMIT', nextCursor: 'page-10' });
+    expect(scan).toMatchObject({ complete: false, generation: 1, cursor: 'page-10', nextOrdinal: 500 });
+    const resumed = await service.openAlbum(key, album.albumId, undefined, 'notification', undefined, first.nextCursor, first.nextPhotoIndex);
+
+    expect(resumed).toMatchObject({ complete: true, errorCode: null });
+    expect(scan).toMatchObject({ complete: true, generation: 1, cursor: null, previousCursor: 'page-10', nextOrdinal: 501 });
+    expect(catalog.beginPhotoScan).toHaveBeenCalledOnce();
+    expect(readChatResource.mock.calls.map(([command]) => command.cursor ?? null).filter((cursor) => cursor !== null))
+      .toEqual(['page-1', 'page-2', 'page-3', 'page-4', 'page-5', 'page-6', 'page-7', 'page-8', 'page-9', 'page-10']);
+    expect(readChatResource.mock.calls.some(([command]) => command.action === 'downloadAlbumPhoto')).toBe(false);
   });
 
   it('keeps a repeated nonterminal photo cursor as an incomplete archive failure', async () => {
@@ -343,6 +633,58 @@ describe('ChatResourceArchiveService', () => {
     expect(second).toMatchObject({ complete: true, savedCount: 1, nextCursor: null });
     expect(published).toEqual(['photo-first', 'photo-second']);
     expect(readChatResource.mock.calls.filter(([command]) => command.action === 'downloadAlbumPhoto')).toHaveLength(3);
+  });
+
+  integrationTest('replays the byte-limited page into the catalog before continuing later archive pages', async () => {
+    const { pool, close } = await createTestDatabase();
+    try {
+      await pool.query("UPDATE account_control SET control_epoch=1 WHERE singleton=true");
+      await pool.query("INSERT INTO line_accounts(account_id,mode,worker_instance_id,worker_binding_epoch) VALUES($1,'ACTIVE_CONTROL','worker-1',1)", [key.accountId]);
+      const catalog = new ChatAlbumCatalogRepository(pool);
+      const listGeneration = await catalog.beginAlbumScan(key, { workerInstanceId: 'worker-1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+      await catalog.appendAlbumPage(key, listGeneration, null, [album], null,
+        { workerInstanceId: 'worker-1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+
+      const a = { ...photo, photoId: 'photo-a', oid: 'oid-a' };
+      const b = { ...photo, photoId: 'photo-b', oid: 'oid-b' };
+      const c = { ...photo, photoId: 'photo-c', oid: 'oid-c' };
+      const d = { ...photo, photoId: 'photo-d', oid: 'oid-d' };
+      const byteReads: string[] = [];
+      const physicalFiles = new Map<string, { folderName: string; fileName: string; contentHash: string; byteCount: number; revision: number; savedAt: string }>();
+      const { service } = await setup({ catalog, albumOpenByteLimit: 4, readChatResource: async (command) => {
+        if (command.action === 'listAlbumPhotos') {
+          const rows = command.cursor == null ? [a] : command.cursor === 'p1' ? [b, c] : [d];
+          const nextCursor = command.cursor == null ? 'p1' : command.cursor === 'p1' ? 'p2' : null;
+          return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true, accountId: command.accountId,
+            workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch, chatType: command.chatType, chatId: command.chatId,
+            photos: rows, nextCursor } as ChatResourceReadResult;
+        }
+        if (command.action === 'downloadAlbumPhoto') {
+          byteReads.push(command.photoId!);
+          const size = command.photoId === 'photo-a' || command.photoId === 'photo-b' ? 2 : 1;
+          return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true, accountId: command.accountId,
+            workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch, chatType: command.chatType, chatId: command.chatId,
+            bytes: new Uint8Array(size) } as ChatResourceReadResult;
+        }
+        throw new Error(`Unexpected action ${command.action}`);
+      } }, { ensureAlbumFolder: vi.fn(async () => {}),
+        inspectAlbumPhoto: vi.fn(async ({ photoId }: { photoId: string }) => physicalFiles.get(photoId) ?? null),
+        publishAlbumPhoto: vi.fn(async ({ photoId, content }: { photoId: string; content: Uint8Array }) => {
+          const saved = { folderName: 'a'.repeat(64), fileName: `record_f_${photoId}.jpg`, contentHash: createHash('sha256').update(content).digest('hex'),
+            byteCount: content.byteLength, revision: 1, savedAt: new Date().toISOString() };
+          physicalFiles.set(photoId, saved);
+          return saved;
+        }) });
+
+      const first = await service.openAlbum(key, album.albumId, undefined, 'notification');
+      expect(first).toMatchObject({ complete: false, errorCode: 'BYTE_LIMIT', nextCursor: 'p1', nextPhotoIndex: 1, savedCount: 2 });
+      const resumed = await service.openAlbum(key, album.albumId, undefined, 'notification', undefined, first.nextCursor, first.nextPhotoIndex);
+      expect(resumed).toMatchObject({ complete: true, errorCode: null, savedCount: 2 });
+      expect(byteReads).toEqual(['photo-a', 'photo-b', 'photo-c', 'photo-d']);
+      expect((await catalog.listPhotos(key, album.albumId, null, 50)).items.map(({ photoId }) => photoId)).toEqual(['photo-a', 'photo-b', 'photo-c', 'photo-d']);
+      await expect(catalog.photoScan(key, album.albumId)).resolves.toMatchObject({ complete: true, cursor: null, nextOrdinal: 4 });
+      await service.shutdown();
+    } finally { await close(); }
   });
 
   it('rejects monitor-only album opens before creating a folder or reading LINE', async () => {
@@ -560,7 +902,12 @@ describe('ChatResourceArchiveService', () => {
   });
 
   it('projects IPC envelopes into exact worker commands for every action', async () => {
-    const { service, readChatResource } = await setup();
+    const { service, readChatResource } = await setup({}, {
+      inspectAlbumPhoto: vi.fn(async () => null),
+      publishAlbumPhoto: vi.fn(async () => ({ folderName: createHash('sha256').update(album.albumId).digest('hex'),
+        fileName: 'record_f_saved.jpg', contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'),
+        byteCount: 3, revision: 1, savedAt: new Date().toISOString() })),
+    });
     const base = { accountId: key.accountId, chatType: key.chatType, chatId: key.chatId };
     await service.dispatchIpc({ ...base, requestId: 'renderer-list-notes', type: 'listChatNotes', cursor: null });
     await service.dispatchIpc({ ...base, requestId: 'renderer-get-note', type: 'getChatNote', postId: noteA.postId });
@@ -594,7 +941,12 @@ describe('ChatResourceArchiveService', () => {
 
   it('does not publish a late download response after its request is cancelled', async () => {
     let release!: (result: ChatResourceReadResult) => void;
-    const { service, published, readChatResource } = await setup({ readChatResource: (command) => new Promise((resolve) => { release = resolve; }) });
+    const { service, published, readChatResource } = await setup({ readChatResource: (command) => new Promise((resolve) => { release = resolve; }) }, {
+      inspectAlbumPhoto: vi.fn(async () => null),
+      publishAlbumPhoto: vi.fn(async () => ({ folderName: createHash('sha256').update(album.albumId).digest('hex'),
+        fileName: 'record_f_saved.jpg', contentHash: createHash('sha256').update(new Uint8Array([1])).digest('hex'),
+        byteCount: 1, revision: 1, savedAt: new Date().toISOString() })),
+    });
     const controller = new AbortController();
     const operation = service.dispatchIpc({ ...key, requestId: 'cancel-download', type: 'downloadChatAlbumPhoto', albumId: album.albumId,
       photoId: photo.photoId, oid: photo.oid, prefix: photo.prefix }, controller.signal);

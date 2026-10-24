@@ -113,50 +113,54 @@ describe('ChatResources', () => {
     expect(await screen.findByText('1 photo')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Download photo' }));
     expect(await screen.findByText('Image saved')).toBeTruthy();
+    const preview = await screen.findByTestId('album-photo-preview-photo-1');
+    fireEvent.load(preview);
+    expect(await screen.findByLabelText('Saved photo')).toBeTruthy();
     expect(client.downloadChatAlbumPhoto).toHaveBeenCalledWith(route, album.albumId, photo.photoId, photo.oid, photo.prefix, expect.any(String));
   });
 
-  it('archives the selected album and shows the bounded completion count', async () => {
+  it('shows saved album previews and marks a photo only after its archive image loads', async () => {
+    const client = api();
+    client.listChatAlbums = vi.fn(async () => ({ albums: [{ ...album, coverPhotoIds: ['photo-1', 'photo-2'] }], nextCursor: null }));
+    client.listChatAlbumPhotos = vi.fn(async () => ({ photos: [photo, { ...photo, photoId: 'photo-2' }], nextCursor: null }));
+    renderControls(client);
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    const card = await screen.findByRole('button', { name: 'Trip' });
+    expect(card.querySelectorAll('img')).toHaveLength(2);
+    expect(client.downloadChatAlbumPhoto).not.toHaveBeenCalled();
+    fireEvent.click(card);
+    const preview = await screen.findByTestId('album-photo-preview-photo-1');
+    expect(preview.getAttribute('src')).toMatch(/^line-media:\/\/album-photo\//);
+    expect(screen.queryByLabelText('Saved photo')).toBeNull();
+    fireEvent.load(preview);
+    expect(await screen.findByLabelText('Saved photo')).toBeTruthy();
+    expect(client.downloadChatAlbumPhoto).not.toHaveBeenCalled();
+  });
+
+  it('selects an album for display without starting archive reconciliation', async () => {
     const client = api();
     client.openChatAlbum = vi.fn(async () => ({ albumId: album.albumId, savedCount: 2, failedCount: 0, totalCount: 2,
       byteCount: 2400, complete: true, failureCodes: [], errorCode: null }));
     renderControls(client);
     fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
-    expect(await screen.findByRole('status')).toBeTruthy();
-    await screen.findByText('Saved 2 of 2 photos.');
-    expect(client.openChatAlbum).toHaveBeenCalledWith(route, album.albumId, expect.any(String));
-  });
-
-  it('shows the allowlisted album failure action and stage', async () => {
-    const client = api();
-    client.openChatAlbum = vi.fn(async () => ({ albumId: album.albumId, savedCount: 0, failedCount: 1, totalCount: 1,
-      byteCount: 0, complete: false, failureCodes: [], errorCode: null,
-      failureContext: { action: 'photo_download', stage: 'resource_read', code: 'ALBUM_RECONCILIATION_FAILED' } as const }));
-    renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    await screen.findByRole('button', { name: 'Download photo' });
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
-    const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toContain('photo_download / resource_read');
+    await waitFor(() => expect(client.listChatAlbumPhotos).toHaveBeenCalledTimes(2));
+    expect(client.openChatAlbum).not.toHaveBeenCalled();
+    expect(screen.queryByText('Saving album photos…')).toBeNull();
   });
 
-  it.each(['resolve', 'reject'] as const)('settles archive status after Refresh when the archive later %s', async (outcome) => {
+  it('marks an explicit album photo refresh as a LINE refresh request', async () => {
     const client = api();
-    const pending = deferred<Awaited<ReturnType<ChatResourceApi['openChatAlbum']>>>();
-    client.openChatAlbum = vi.fn(() => pending.promise);
     renderControls(client);
     fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
     await screen.findByRole('button', { name: 'Download photo' });
-    expect(screen.getByText('Saving album photos…')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
     await waitFor(() => expect(client.listChatAlbumPhotos).toHaveBeenCalledTimes(2));
-    if (outcome === 'resolve') pending.resolve({ savedCount: 1, failedCount: 0, totalCount: 1,
-      complete: true, failureCodes: [], errorCode: null });
-    else pending.reject(new Error('ARCHIVE_PUBLISH_FAILED'));
-    if (outcome === 'resolve') expect(await screen.findByText('Saved 1 of 1 photos.')).toBeTruthy();
-    else expect((await screen.findByRole('alert')).textContent).toContain('Album archive failed');
-    expect(screen.queryByText('Saving album photos…')).toBeNull();
+    expect(client.listChatAlbumPhotos).toHaveBeenLastCalledWith(route, album.albumId, null, expect.any(String), true);
   });
 
   it('shows a retryable error when a list read fails', async () => {

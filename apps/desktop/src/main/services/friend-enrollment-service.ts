@@ -111,12 +111,13 @@ function targetMention(envelope: InboundEnvelope, ownMid: string): string | null
 
 export class FriendEnrollmentService {
   private readonly flows = new Map<string, Flow>();
-  private readonly primaryFriendshipJobs = new Map<string, { bindingKey: string; promise: Promise<boolean>;
+  private readonly primaryFriendshipJobs = new Map<string, { bindingKey: string; adminVersion: number | null; promise: Promise<boolean>;
     adminBindingObserved: boolean; pending: boolean; result: boolean | null }>();
   private readonly digestKey: Buffer;
 
   constructor(private readonly deps: {
-    admins: Pick<AdminRepository, 'isPrimaryAdministrator' | 'isPrimaryUser' | 'getPrimaryAdministrator' | 'getPrimaryAdministratorVersion'>;
+    admins: Pick<AdminRepository, 'isPrimaryAdministrator' | 'isPrimaryUser' | 'getPrimaryAdministrator' | 'getPrimaryAdministratorVersion'
+      | 'hasPrimaryAdministratorFriendConfirmation' | 'confirmPrimaryAdministratorFriendship'>;
     whitelist: Pick<FriendWhitelistRepository, 'activateForEnrollment' | 'getActiveAuthorization'>;
     accounts: Pick<AccountRepository, 'getAccount' | 'getControlState' | 'resolveCapabilities'>;
     workers: EnrollmentWorker;
@@ -137,15 +138,21 @@ export class FriendEnrollmentService {
   /** Runs once for each ready worker binding; lifecycle owners pass their cancellation signal. */
   ensurePrimaryAdministratorFriendship(binding: ActiveBinding, signal: AbortSignal, trigger: 'worker-ready' | 'admin-bound' = 'worker-ready'): Promise<void> {
     const bindingKey = JSON.stringify(workerFields(binding));
+    const versionPromise = this.deps.admins.getPrimaryAdministratorVersion(binding.accountId);
+    return versionPromise.then((adminVersion) => this.ensurePrimaryAdministratorFriendshipAtVersion(binding, signal, trigger, bindingKey, adminVersion));
+  }
+
+  private ensurePrimaryAdministratorFriendshipAtVersion(binding: ActiveBinding, signal: AbortSignal,
+    trigger: 'worker-ready' | 'admin-bound', bindingKey: string, adminVersion: number | null): Promise<void> {
     const previous = this.primaryFriendshipJobs.get(binding.accountId);
-    if (previous?.bindingKey === bindingKey) {
+    if (previous?.bindingKey === bindingKey && previous.adminVersion === adminVersion) {
       if (trigger !== 'admin-bound' || previous.pending || previous.result !== false) {
         if (trigger === 'admin-bound' && previous.pending) previous.adminBindingObserved = true;
         return previous.promise.then(() => undefined);
       }
       this.primaryFriendshipJobs.delete(binding.accountId);
     }
-    const job = { bindingKey, promise: Promise.resolve(false), adminBindingObserved: trigger === 'admin-bound', pending: true, result: null as boolean | null };
+    const job = { bindingKey, adminVersion, promise: Promise.resolve(false), adminBindingObserved: trigger === 'admin-bound', pending: true, result: null as boolean | null };
     const promise = (async () => {
       try {
         const checked = await this.checkPrimaryAdministratorFriendship(binding, signal);
@@ -191,13 +198,21 @@ export class FriendEnrollmentService {
       const latest = await this.deps.admins.getPrimaryAdministrator(binding.accountId);
       return latest?.chatId === capturedPrimary.chatId && latest.userId === capturedPrimary.userId;
     };
+    const persistConfirmation = async () => {
+      if (!(await current()) || !(await primaryStillCurrent()) || !(await current())) return;
+      await this.deps.admins.confirmPrimaryAdministratorFriendship(binding.accountId, primary.userId, primaryVersion);
+    };
+    if (await this.deps.admins.hasPrimaryAdministratorFriendConfirmation(binding.accountId, primary.userId, primaryVersion)) return true;
     const fields = workerFields(binding);
     const requestId = randomUUID();
     const relation = await this.deps.workers.checkFriendRelation({ type: 'checkFriendRelation', ...fields, requestId, targetMid: primary.userId });
     if (!(await current())) return true;
     if (!matchesResult(relation, binding) || relation.requestId !== requestId || relation.targetMid !== primary.userId)
       throw new Error('primary administrator relation check returned a stale or mismatched result');
-    if (relation.status === 'friend') return true;
+    if (relation.status === 'friend') {
+      await persistConfirmation();
+      return true;
+    }
     if (relation.status !== 'not_friend') throw new Error(`primary administrator relation is unknown (${relation.error ?? 'unknown'})`);
     if (!(await current()) || !await primaryStillCurrent() || !(await current())
       || !await this.canWriteLine(binding.accountId) || !(await current())) return true;
@@ -206,6 +221,7 @@ export class FriendEnrollmentService {
     if (!(await current())) return true;
     if (!matchesResult(added, binding) || added.requestId !== addRequestId || added.targetMid !== primary.userId || added.status !== 'added')
       throw new Error(`primary administrator friend add failed (${added.error ?? added.status})`);
+    await persistConfirmation();
     return true;
   }
 

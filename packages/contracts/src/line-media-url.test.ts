@@ -11,6 +11,7 @@ describe('line media fixed URLs', () => {
     { type: 'sticker', accountId: unusual, chatType: 'group', chatId: unusual, messageId: unusual },
     { type: 'sticon', accountId: unusual, chatType: 'direct', chatId: unusual, messageId: unusual, index: 63 },
     { type: 'attachment', accountId: unusual, chatType: 'group', chatId: unusual, attachmentId: unusual },
+    { type: 'albumPhoto', accountId: unusual, chatType: 'group', chatId: unusual, albumId: unusual, photoId: unusual },
     { type: 'reaction', accountId: unusual, chatType: 'group', chatId: unusual, messageId: unusual, productId: '60ebfdc03cc24041bb139cf5', emojiId: '004' },
   ];
 

@@ -46,8 +46,8 @@ export type DesktopServiceFacade = {
   listMessages(key: ConversationKey, cursor: string | null, limit: number, exactMessageId?: string): Promise<MessagePage>;
   listChatNotes(key: ConversationKey, cursor: string | null): Promise<{ notes: ChatResourceNote[]; nextCursor: string | null }>;
   getChatNote(key: ConversationKey, postId: string): Promise<ChatResourceNote>;
-  listChatAlbums(key: ConversationKey, cursor: string | null): Promise<{ albums: ChatResourceAlbum[]; nextCursor: string | null }>;
-  listChatAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null): Promise<{ photos: ChatResourcePhoto[]; nextCursor: string | null }>;
+  listChatAlbums(key: ConversationKey, cursor: string | null, refresh?: boolean): Promise<{ albums: ChatResourceAlbum[]; nextCursor: string | null }>;
+  listChatAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null, refresh?: boolean): Promise<{ photos: ChatResourcePhoto[]; nextCursor: string | null }>;
   downloadChatAlbumPhoto(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: string): Promise<{ albumId: string; photoId: string; sizeBytes: number }>;
   openChatAlbum(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<AlbumOpenResult>;
   listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[]): Promise<AttachmentState[]>;

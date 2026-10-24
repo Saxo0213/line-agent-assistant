@@ -211,6 +211,41 @@ describe('fixed LINE media reads', () => {
     expect((await service.handle(service.attachmentSource(ATTACHMENT_ID, { ...key, accountId: 'other' }))).status).toBe(404);
   });
 
+  it('serves album-photo previews through bounded local image reads', async () => {
+    const service = createService({ loadAlbumPhoto: async (key, albumId, photoId) => key.accountId === 'account-A'
+      && key.chatType === 'group' && key.chatId === 'chat-A' && albumId === 'album-A' && photoId === 'photo-A'
+      ? { bytes: PNG, mimeType: 'image/jpeg' } : null });
+    services.push(service);
+    const key = { accountId: 'account-A', chatType: 'group' as const, chatId: 'chat-A' };
+    const response = await service.handle(service.albumPhotoSource('album-A', 'photo-A', key));
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('image/png');
+    expect((await service.handle(service.albumPhotoSource('other', 'photo-A', key))).status).toBe(404);
+  });
+
+  it('serves an archived album photo larger than the attachment preview budget', async () => {
+    const largeJpeg = Buffer.alloc(9 * 1024 * 1024);
+    largeJpeg.set([0xff, 0xd8, 0xff]);
+    const service = createService({ loadAlbumPhoto: async () => ({ bytes: largeJpeg, mimeType: 'image/jpeg' }) });
+    services.push(service);
+
+    const response = await service.handle(service.albumPhotoSource('album-A', 'photo-large', { accountId: 'account-A', chatType: 'group', chatId: 'chat-A' }));
+
+    expect(response.status).toBe(200);
+    expect(Number(response.headers.get('content-length'))).toBe(largeJpeg.byteLength);
+  });
+
+  it('keeps attachment previews capped at eight MiB', async () => {
+    const largeJpeg = Buffer.alloc(9 * 1024 * 1024);
+    largeJpeg.set([0xff, 0xd8, 0xff]);
+    const service = createService({ loadAttachment: async () => ({ bytes: largeJpeg, mimeType: 'image/jpeg' }) });
+    services.push(service);
+
+    const response = await service.handle(service.attachmentSource(ATTACHMENT_ID, { accountId: 'account-A', chatType: 'group', chatId: 'chat-A' }));
+
+    expect(response.status).toBe(404);
+  });
+
   it('serves more than 256 consecutive inline attachment images', async () => {
     const service = createService({
       loadAttachment: async () => ({ bytes: PNG, mimeType: 'image/png' }),
