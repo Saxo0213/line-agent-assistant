@@ -190,12 +190,12 @@ database('content bridge write-time conversion and re-projection (PostgreSQL)', 
     expect((await byId('ev-removal')).content_rule_version).toBe(0);
     const hashBefore = await layerOneHash();
     await reprojectContent(pool);
-    expect(await byId('ev-removal')).toMatchObject({ content: { format: 1, type: 'event', nativeContentType: 0, text: '甲已將乙強制退出社群。' }, content_rule_version: 1 });
-    expect(await byId('ev-text')).toMatchObject({ content: null, content_rule_version: 1 });
-    expect(await byId('ev-14')).toMatchObject({ content: null, content_rule_version: 1 });
+    expect(await byId('ev-removal')).toMatchObject({ content: { format: 1, type: 'event', nativeContentType: 0, text: '甲已將乙強制退出社群。' }, content_rule_version: 2 });
+    expect(await byId('ev-text')).toMatchObject({ content: null, content_rule_version: 2 });
+    expect(await byId('ev-14')).toMatchObject({ content: { format: 1, type: 'event', nativeContentType: 0, text: '甲加入聊天' }, content_rule_version: 2 });
     const kinds = await pool.query<{ message_id: string; kind: string }>(
       "SELECT message_id,kind FROM messages WHERE account_id=$1 AND message_id IN ('ev-removal','ev-text','ev-14') ORDER BY message_id", [ACCOUNT]);
-    expect(kinds.rows).toEqual([{ message_id: 'ev-14', kind: 'text' }, { message_id: 'ev-removal', kind: 'event' }, { message_id: 'ev-text', kind: 'text' }]);
+    expect(kinds.rows).toEqual([{ message_id: 'ev-14', kind: 'event' }, { message_id: 'ev-removal', kind: 'event' }, { message_id: 'ev-text', kind: 'text' }]);
     expect(await layerOneHash()).toBe(hashBefore);
     expect(await reprojectContent(pool)).toMatchObject({ rows: 0 });
   });

@@ -327,7 +327,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   async function openMessageUrl(url: string) {
     try {
       const result = await api.openExternalUrl(url);
-      if (result.type !== 'openExternalUrl') notify(result.type === 'error' ? safeErrorTextFor(locale, result) : desktopText('unableToOpenLink'));
+      if (result.type !== 'openExternalUrl') notify(result.type === 'error' ? safeErrorTextFor(locale, result, desktopText('unableToOpenLink')) : desktopText('unableToOpenLink'));
     } catch (error) {
       notify(safeErrorTextFor(locale, error, desktopText('unableToOpenLink')));
     }

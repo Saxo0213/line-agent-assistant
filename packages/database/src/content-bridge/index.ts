@@ -139,13 +139,21 @@ export function liveChatEventMids(rawValue: unknown): string[] {
     return args ? [args.actor, ...args.targets.slice(0, MAX_EVENT_TARGETS)] : [];
   } catch { return []; }
 }
-/** Native type 0 with `_eventInfo.type` 15: LINE's community member-removal system line; every other type-0 row has no projection. */
+/**
+ * Native type 0 with `_eventInfo.type` 15 (community member removal) or 14 with no targets (a member joined; `fromId` is the
+ * joiner): LINE's community system lines. Every other type-0 row has no projection.
+ */
 const convertNativeText = (f: BridgeFields): MessageContent | null => {
   const info = f.eventInfo;
-  if (info === null || (info.type !== 15 && info.type !== '15')) return null;
+  if (info === null) return null;
+  const eventType = Number(info.type);
+  if (eventType !== 15 && eventType !== 14) return null;
   const names = isRecord(info.displayNameMap) ? info.displayNameMap : {};
   const nameOf = (mid: unknown): string => (typeof mid === 'string' && Object.hasOwn(names, mid) ? boundedText(names[mid], 128) : null) ?? MEMBER_FALLBACK;
   const mids = Array.isArray(info.midList) ? info.midList.slice(0, MAX_EVENT_TARGETS) : [];
+  if (eventType === 14) {
+    return mids.length > 0 ? null : { format: 1, type: 'event', nativeContentType: 0, text: `${nameOf(info.fromId)}加入聊天` };
+  }
   const targets = mids.length > 0 ? mids.map(nameOf).join('、') : MEMBER_FALLBACK;
   return { format: 1, type: 'event', nativeContentType: 0, text: `${nameOf(info.fromId)}已將${targets}強制退出社群。` };
 };
@@ -162,7 +170,7 @@ const TYPE_TABLE: ReadonlyArray<readonly [number, (f: BridgeFields) => MessageCo
 /** The ordered bridge table: exact content-type rules first, the `*` fallback last, per source. */
 export const CONTENT_BRIDGE_RULES: readonly BridgeRule[] = (['native', 'live'] as const).flatMap((source): BridgeRule[] => [
   ...TYPE_TABLE.map(([contentType, convert, version]): BridgeRule => source === 'native' && contentType === 0
-    ? { source, contentType, version: 1, convert: convertNativeText } : { source, contentType, version, convert }),
+    ? { source, contentType, version: 2, convert: convertNativeText } : { source, contentType, version, convert }),
   { source, contentType: '*', version: 1, convert: convertUnsupported },
 ]);
 
@@ -221,7 +229,8 @@ export function bridgeLiveMessage(input: Readonly<{ raw: unknown; contact?: Cont
 
 /** Narrow, read-time subtype projection from an already stored raw message. No raw fields leave this module. */
 export function postNotificationSubtypeFromRaw(rawValue: unknown): 'note' | 'album' | null {
-  if (!isRecord(rawValue) || rawValue.sourceDeleted === true) return null;
+  // A source-deleted note/album notification is still its sender's message: the subtype stays so the timeline keeps the sender.
+  if (!isRecord(rawValue)) return null;
   if (rawValue.contentState !== undefined) return null;
   // Native history stores a sanitized `message` projection beside the authoritative
   // plain native row. Once native is present, never fall back to projection fields.
@@ -234,9 +243,14 @@ export function postNotificationSubtypeFromRaw(rawValue: unknown): 'note' | 'alb
     if (contentType !== 16) return null;
     const metadata = message.contentMetadata;
     if (!isRecord(metadata)) return null;
-    return metadata.serviceType === 'GB' ? 'note' : metadata.serviceType === 'AB' ? 'album' : null;
+    return postNotificationSubtypeFromMetadata(metadata);
   }
   return null;
+}
+
+/** Service tokens: `GB` group note and `SN` community (square) note are a member's note post; `AB` is an album. */
+function postNotificationSubtypeFromMetadata(metadata: Record<string, unknown>): 'note' | 'album' | null {
+  return metadata.serviceType === 'GB' || metadata.serviceType === 'SN' ? 'note' : metadata.serviceType === 'AB' ? 'album' : null;
 }
 
 function postNotificationSubtypeFromNative(native: unknown): 'note' | 'album' | null {
@@ -259,7 +273,7 @@ function postNotificationSubtypeFromNative(native: unknown): 'note' | 'album' | 
   try {
     const metadata: unknown = JSON.parse(metadataText);
     if (!isRecord(metadata)) return null;
-    return metadata.serviceType === 'GB' ? 'note' : metadata.serviceType === 'AB' ? 'album' : null;
+    return postNotificationSubtypeFromMetadata(metadata);
   } catch { return null; }
 }
 

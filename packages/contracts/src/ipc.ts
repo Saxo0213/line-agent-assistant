@@ -38,7 +38,8 @@ const ChatResourceCursorSchema = z.string().max(2048).nullable();
 export const ChatResourceNoteSchema = z.strictObject({ postId: IdSchema.max(256), createdTime: z.number().nullable(), text: z.string().max(262144).nullable(),
   content: z.record(z.string(), z.unknown()).optional() });
 export const ChatResourceAlbumSchema = z.strictObject({ albumId: IdSchema.max(256), chatId: IdSchema.max(256), title: z.string().max(20000).nullable(),
-  photoCount: z.number().int().min(0).max(100000).nullable(), createTime: z.number().nullable(), updateTime: z.number().nullable() });
+  photoCount: z.number().int().min(0).max(100000).nullable(), createTime: z.number().nullable(), updateTime: z.number().nullable(),
+  coverPhotoIds: z.array(IdSchema.max(256)).max(2).optional() });
 export const ChatResourcePhotoSchema = z.strictObject({ photoId: IdSchema.max(256), oid: IdSchema.max(256), prefix: z.string().max(512),
   shotTime: z.number().nullable(), width: z.number().int().min(0).nullable(), height: z.number().int().min(0).nullable() });
 export const AlbumFailureContextSchema = z.strictObject({

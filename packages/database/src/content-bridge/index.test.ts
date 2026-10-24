@@ -17,13 +17,24 @@ describe('content bridge rules', () => {
     expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: { serviceType: 'OTHER' } } })).toBeNull();
     expect(postNotificationSubtypeFromRaw({ message: { contentType: 'POSTNOTIFICATION', contentMetadata: { serviceType: 'GB' } }, unrelated: 'x'.repeat(1_000_000) })).toBe('note');
     expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: '{"serviceType":"GB"}' } })).toBeNull();
-    expect(postNotificationSubtypeFromRaw({ sourceDeleted: true, message: { contentType: 16, contentMetadata: { serviceType: 'GB' } } })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ sourceDeleted: true, message: { contentType: 16, contentMetadata: { serviceType: 'GB' } } })).toBe('note');
     const nativeEnvelope = plainEnvelope({ _id: 'post', _contentType: 16, _contentMetadata: '{"serviceType":"AB"}' });
     expect(postNotificationSubtypeFromRaw({ native: nativeEnvelope })).toBe('album');
     expect(postNotificationSubtypeFromRaw({ native: plainEnvelope({ _id: 'post-note', _contentType: 16, _contentMetadata: '{"serviceType":"GB"}' }),
       unrelated: 'x'.repeat(1_000_000) })).toBe('note');
     expect(postNotificationSubtypeFromRaw({ native: plainEnvelope({ _id: 'bad-meta', _contentType: 16, _contentMetadata: '{bad' }) })).toBeNull();
     expect(postNotificationSubtypeFromRaw({ native: { ...nativeEnvelope, encoding: 'dpapi' } })).toBeNull();
+  });
+  it('treats a community note notification (serviceType SN) as a note, including when source-deleted', () => {
+    const squareUrl = 'line://square/post?squareMid=s123&postId=p1&sourceType=TALKROOM_HOME';
+    const squarePost = (extra: Record<string, unknown>) => JSON.stringify({ contentType: 'P', officialName: 'x', 'push-temp-key': 'QPS', postEndUrl: squareUrl, ...extra });
+    const nativeSquare = (extra: Record<string, unknown>) => plainEnvelope({ _id: 'sq', _contentType: 16, _contentMetadata: squarePost(extra) });
+    expect(postNotificationSubtypeFromRaw({ sourceDeleted: { detectedAt: 'x' }, message: { contentType: 16 }, native: nativeSquare({ serviceType: 'SN' }) })).toBe('note');
+    expect(postNotificationSubtypeFromRaw({ native: nativeSquare({ serviceType: 'SN' }) })).toBe('note');
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: { serviceType: 'SN', postEndUrl: squareUrl } } })).toBe('note');
+    expect(postNotificationSubtypeFromRaw({ native: nativeSquare({ serviceType: 'sn' }) })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ native: nativeSquare({}) })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: { 'push-action-uri': squareUrl } } })).toBeNull();
   });
   it('uses native history subtype when sanitized raw also has a metadata-free message projection', () => {
     for (const [serviceType, expected] of [['AB', 'album'], ['GB', 'note']] as const) {
@@ -34,7 +45,7 @@ describe('content bridge rules', () => {
   });
   it('keeps native history subtype within source, state, type, and metadata boundaries', () => {
     const native = plainEnvelope({ _id: 'native-id', _contentType: 16, _contentMetadata: '{"serviceType":"GB"}' });
-    expect(postNotificationSubtypeFromRaw({ sourceDeleted: true, message: { contentType: 16 }, native })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ sourceDeleted: true, message: { contentType: 16 }, native })).toBe('note');
     expect(postNotificationSubtypeFromRaw({ contentState: 'decrypt_failed', message: { contentType: 16 }, native })).toBeNull();
     expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: { serviceType: 'GB' } },
       native: plainEnvelope({ _id: 'tampered-type', _contentType: 1, _contentMetadata: '{"serviceType":"GB"}' }) })).toBeNull();
@@ -59,7 +70,7 @@ describe('content bridge rules', () => {
       expect(rules.at(-1)?.contentType).toBe('*');
       expect(rules.filter((rule) => rule.contentType === '*')).toHaveLength(1);
       expect(rules.find((rule) => rule.contentType === 13)?.version).toBeGreaterThanOrEqual(1);
-      expect(rules.find((rule) => rule.contentType === 0)?.version).toBe(source === 'native' ? 1 : 0);
+      expect(rules.find((rule) => rule.contentType === 0)?.version).toBe(source === 'native' ? 2 : 0);
     }
     expect(bridgeRuleFor('native', 4242).contentType).toBe('*');
     expect(contentTypeAliases(15)).toEqual(['15', 'LOCATION']);
@@ -124,7 +135,7 @@ describe('content bridge rules', () => {
   });
 
   it('maps kinds, text types project nothing, and live content type names are understood', () => {
-    expect(native({ _contentType: 0, _text: 'hello' })).toMatchObject({ kind: 'text', content: null, version: 1 });
+    expect(native({ _contentType: 0, _text: 'hello' })).toMatchObject({ kind: 'text', content: null, version: 2 });
     expect(native({ _contentType: 1 })?.kind).toBe('image');
     expect(live({ contentType: 'IMAGE' })?.kind).toBe('image');
     expect(live({ contentType: 'FLEX', contentMetadata: { ALT_TEXT: 'x' } })).toMatchObject({ kind: 'rich', content: { variant: 'flex' } });
@@ -195,9 +206,14 @@ describe('content bridge rules', () => {
     const C = 'uc'.padEnd(33, 'c');
     it('projects the removal line as an event with the actor and target names', () => {
       expect(event({ type: 15, fromId: A, midList: [B], displayNameMap: { [A]: '甲', [B]: '乙' }, param: '' }))
-        .toMatchObject({ kind: 'event', version: 1, content: { format: 1, type: 'event', nativeContentType: 0, text: '甲已將乙強制退出社群。' } });
+        .toMatchObject({ kind: 'event', version: 2, content: { format: 1, type: 'event', nativeContentType: 0, text: '甲已將乙強制退出社群。' } });
       expect(event({ type: '15', fromId: A, midList: [B], displayNameMap: { [A]: '甲', [B]: '乙' } })?.content)
         .toMatchObject({ text: '甲已將乙強制退出社群。' });
+    });
+    it('projects a target-less type-14 row as a member-join system line from the joiner', () => {
+      expect(event({ type: 14, fromId: A, midList: [], displayNameMap: { [A]: 'Zoom' }, param: '' }))
+        .toMatchObject({ kind: 'event', version: 2, content: { format: 1, type: 'event', nativeContentType: 0, text: 'Zoom加入聊天' } });
+      expect(event({ type: '14', fromId: A, displayNameMap: {} })?.content).toMatchObject({ text: '成員加入聊天' });
     });
     it('joins several targets with 、 and falls back to 成員 for missing or invalid names', () => {
       expect(event({ type: 15, fromId: A, midList: [B, C], displayNameMap: { [A]: '甲', [B]: '乙', [C]: '丙' } })?.content)
@@ -217,11 +233,12 @@ describe('content bridge rules', () => {
       expect(text.startsWith(`${'x'.repeat(128)}已將`)).toBe(true);
     });
     it('keeps oversized, malformed, other-type and absent eventInfo as plain text', () => {
-      const plain = { kind: 'text', content: null, version: 1 };
+      const plain = { kind: 'text', content: null, version: 2 };
       expect(event('{not json')).toMatchObject(plain);
+      expect(event({ type: 14, fromId: A, midList: [B], displayNameMap: { [A]: '甲' } })).toMatchObject(plain);
       expect(event('[1,2]')).toMatchObject(plain);
       expect(event({ type: 15, fromId: A, midList: [B], displayNameMap: { [B]: 'x'.repeat(MAX_METADATA_BYTES) } })).toMatchObject(plain);
-      expect(event({ type: 14, fromId: A, midList: [], displayNameMap: {}, param: '' })).toMatchObject(plain);
+      expect(event({ type: 24, fromId: A, midList: [], displayNameMap: {}, param: '' })).toMatchObject(plain);
       expect(event('')).toMatchObject(plain);
       expect(native({ _contentType: 0, _text: 'hello', _eventInfo: null })).toMatchObject(plain);
       expect(native({ _contentType: 0, _text: 'hello' })).toMatchObject(plain);

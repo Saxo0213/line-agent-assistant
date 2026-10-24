@@ -79,6 +79,7 @@ const REPLY_SENDER_PICTURE_SQL = senderPictureSql({ m: 'qm', la: 'qla', c: 'qc',
 
 type Bound = WorkerBinding & { mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; purpose?: 'DOWNLOAD_ONLY'; expectedMid?: string; application?: string };
 type SendResult = Extract<LineWorkerEvent, { type: 'sendResult' }>;
+const NOTE_NOTIFICATION_AUTO_FETCH = false; // Paused at the user's request (2026-10-25): no automatic Note fetch from notifications.
 const MACHINE_CODE_PATTERN = /^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)*$/;
 function asChatResourceBinding(binding: (Bound | null) | undefined): ChatResourceBinding | null {
   if (!binding || binding.mode !== 'ACTIVE_CONTROL' || typeof binding.transportOwnerId !== 'string'
@@ -1137,8 +1138,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     { send: async (command) => { await sendLineCommand(command); } }, agentService, options.secretStore, attachmentService,
     async (envelope, secretCandidate, ownMid, capturedBinding) => {
       const postNotificationSubtype = nativePostNotificationSubtype(envelope);
-      if (!closing && capturedBinding?.mode === 'ACTIVE_CONTROL' && postNotificationSubtype === 'note') {
-        void chatResources.refreshNotesFromNotification({ accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId });
+      if (postNotificationSubtype === 'note') {
+        if (NOTE_NOTIFICATION_AUTO_FETCH && !closing && capturedBinding?.mode === 'ACTIVE_CONTROL') void chatResources.refreshNotesFromNotification({ accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId });
       } else if (!closing && capturedBinding?.mode === 'ACTIVE_CONTROL' && postNotificationSubtype === 'album') {
         const current = await options.workers.binding(envelope.accountId);
         const archiveBinding = asChatResourceBinding(current);

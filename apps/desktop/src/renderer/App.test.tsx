@@ -1186,6 +1186,32 @@ describe('operator console', () => {
     expect(container.querySelector('#message-membership .message-system-event')).toBeTruthy();
   });
 
+  it('keeps the sender identity and the deleted marker on a source-deleted note notification', async () => {
+    const api = fakeApi();
+    api.listMessages = vi.fn(async () => ({ messages: [
+      { ...message('account-A', 'note-deleted'), senderName: '小明', senderAvatarAvailable: true, postNotificationType: 'note' as const,
+        deleted: true, deletedAtSource: true,
+        content: { format: 1 as const, type: 'event' as const, nativeContentType: 16, text: 'POSTNOTIFICATION' } },
+    ], olderCursor: null }));
+    const { container } = await renderLineApp(api);
+    expect(await screen.findByText('小明')).toBeTruthy();
+    expect(container.querySelector('#message-note-deleted.message.inbound')).toBeTruthy();
+    expect(container.querySelector('#message-note-deleted.system-event-message')).toBeNull();
+    expect(container.querySelector('#message-note-deleted .message-system-event')).toBeNull();
+    expect(container.querySelector('.message-row:has(#message-note-deleted) .message-sender-name')?.textContent).toBe('小明');
+    expect(container.querySelector('.message-row:has(#message-note-deleted) .message-recalled-label')?.textContent).toContain('已刪除');
+  });
+
+  it('shows the link error copy when an unmapped error code comes back for a message link', async () => {
+    const api = fakeApi();
+    api.listMessages = vi.fn(async () => ({ messages: [{ ...message('account-A', 'link-msg'), text: 'see https://example.test/ now' }], olderCursor: null }));
+    api.openExternalUrl = vi.fn(async () => ({ type: 'error', requestId: 'x', code: 'INVALID_URL', message: 'private detail' } as never));
+    const { container } = await renderLineApp(api);
+    fireEvent.click(await waitFor(() => { const link = container.querySelector('a[href="https://example.test/"]'); if (!link) throw new Error('no link'); return link; }));
+    expect(await screen.findByText('無法開啟連結')).toBeTruthy();
+    expect(screen.queryByText('無法完成此操作，請重試。')).toBeNull();
+  });
+
   it('hides the core warning while waiting for LINE login', async () => {
     const api = fakeApi();
     api.getSnapshot = vi.fn(async () => ({

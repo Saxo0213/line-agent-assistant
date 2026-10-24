@@ -2,6 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { createDesktopApi } from './api.js';
 
 describe('sandbox preload API', () => {
+  it('parses cached album lists with cover photo IDs through the preload boundary', async () => {
+    const api = createDesktopApi({ async invoke(_channel, payload) {
+      const request = payload as { requestId: string };
+      return { type: 'listChatAlbums', requestId: request.requestId, ok: true, albums: [
+        { albumId: 'album-1', chatId: 'chat-1', title: 'Trip', photoCount: 2, createTime: null, updateTime: null, coverPhotoIds: ['photo-1', 'photo-2'] },
+      ], nextCursor: null };
+    }, on() {}, removeListener() {} });
+
+    await expect(api.listChatAlbums({ accountId: 'account-1', chatType: 'group', chatId: 'chat-1' }, null))
+      .resolves.toMatchObject({ albums: [{ albumId: 'album-1', coverPhotoIds: ['photo-1', 'photo-2'] }], nextCursor: null });
+  });
+
   it('reports a renderer failure with no exception, DOM or state payload', async () => {
     const calls: unknown[] = [];
     const api = createDesktopApi({ async invoke(channel, payload) {

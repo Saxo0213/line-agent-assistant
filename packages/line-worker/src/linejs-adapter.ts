@@ -555,6 +555,12 @@ class RotatingMemoryStorage extends MemoryStorage {
   }
 }
 
+type ChatResourceReadValue = {
+  nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[];
+  photos?: readonly unknown[]; photoPageShape?: { rawPhotoCount: number; hasMorePresent: boolean; hasMore?: boolean;
+    nextCursorRelation: 'absent' | 'same' | 'advanced' }; bytes?: Uint8Array;
+};
+
 export class LinejsAdapter implements LineTransport {
   readonly #base: BaseClient;
   readonly #storage: RotatingMemoryStorage;
@@ -997,11 +1003,16 @@ export class LinejsAdapter implements LineTransport {
     return decryptLinejsHistoryMessages(messages, async (message) => await this.#gate.invokeRpc(context,
       () => this.#base.e2ee.decryptE2EEMessage(message as Parameters<BaseClient['e2ee']['decryptE2EEMessage']>[0])));
   }
-  async readChatResource(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>): Promise<{
-    nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[];
-    photos?: readonly unknown[]; photoPageShape?: { rawPhotoCount: number; hasMorePresent: boolean; hasMore?: boolean;
-      nextCursorRelation: 'absent' | 'same' | 'advanced' }; bytes?: Uint8Array;
-  }> {
+  async readChatResource(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>): Promise<ChatResourceReadValue> {
+    try { return await this.#readChatResourceOnce(command, options); }
+    catch (error) {
+      // A failed read may have used a stale cached channel token. Drop both so the next request bootstraps fresh ones,
+      // as a restart would. Cancellation and local denial say nothing about token validity.
+      if (!options.signal.aborted && !(error instanceof EffectDeniedError)) this.#clearChatResourceTokens();
+      throw error;
+    }
+  }
+  async #readChatResourceOnce(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>): Promise<ChatResourceReadValue> {
     if (!this.#base.authToken || !this.#base.profile?.mid) throw new EffectDeniedError('chat resources require a logged-in account');
     if (options.signal.aborted) throw options.signal.reason;
     const context = this.#readContext();

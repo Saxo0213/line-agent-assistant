@@ -692,3 +692,17 @@ it('lets revokeControl and stop fence a relation add queued behind an in-flight 
     expect(transport.friendAddCalls).toHaveLength(0);
   }
 });
+
+it('names the rejected command type and a bounded requestId when the command fails schema parsing', async () => {
+  const channel = port();
+  runWorkerLoopOnPort(channel, async () => new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' }));
+  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'history', ...binding, chatType: 'direct', chatId: 'private-chat', requestId: 'bad-history', cursor: null, limit: 9999 });
+  expect(channel.events.at(-1)).toMatchObject({ type: 'error', code: 'INVALID_COMMAND', requestId: 'bad-history',
+    diagnostic: { operation: 'history', stage: 'admission' } });
+  expect(JSON.stringify(channel.events.at(-1))).not.toContain('private-chat');
+  await channel.send({ type: 'notACommand', ...binding, requestId: 'x'.repeat(129) });
+  const unknown = channel.events.at(-1) as { diagnostic: { operation: string }; requestId?: string };
+  expect(unknown).toMatchObject({ type: 'error', code: 'INVALID_COMMAND', diagnostic: { operation: 'unknown', stage: 'admission' } });
+  expect(unknown.requestId).toBeUndefined();
+});

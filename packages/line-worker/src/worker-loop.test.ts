@@ -69,6 +69,7 @@ describe('one-account worker loop', () => {
       await worker.handle({ type: 'chatResourceRead', ...binding, chatType: 'group', chatId: attachmentChat,
         requestId: `failure-${category}`, action: 'listNotes', timeoutMs: 5000 });
       expect(events.at(-1)).toMatchObject({ type: 'chatResourceResult', ok: false, error: category });
+      expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
       expect(JSON.stringify(events.at(-1))).not.toContain('secret');
       await worker.handle({ type: 'stop', ...binding });
     }

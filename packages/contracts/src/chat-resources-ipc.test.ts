@@ -47,4 +47,15 @@ describe('chat resource IPC contracts', () => {
     ], nextCursor: null }).success).toBe(true);
     expect(IpcResultSchema.safeParse({ type: 'downloadChatAlbumPhoto', requestId: 'request-1', albumId: 'album-1', photoId: 'photo-1', ok: true, sizeBytes: 1 }).success).toBe(true);
   });
+
+  it('accepts at most two bounded cover photo IDs in album list responses', () => {
+    const album = { albumId: 'album-1', chatId: 'chat-1', title: 'Trip', photoCount: 2, createTime: null, updateTime: null };
+    const result = (coverPhotoIds: unknown[]) => IpcResultSchema.safeParse({ type: 'listChatAlbums', requestId: base.requestId,
+      ok: true, albums: [{ ...album, coverPhotoIds }], nextCursor: null });
+
+    expect(result(['photo-1', 'photo-2']).success).toBe(true);
+    expect(result([]).success).toBe(true);
+    expect(result(['photo-1', 'photo-2', 'photo-3']).success).toBe(false);
+    expect(result(['']).success).toBe(false);
+  });
 });

@@ -86,6 +86,29 @@ it.each([
   }
 });
 
+it('drops the cached Moa channel token after a failed read so the next read bootstraps a fresh one', async () => {
+  let bootstrapCalls = 0;
+  let restCalls = 0;
+  const physicalTransport = vi.fn(async (request: Request) => {
+    if (new URL(request.url).pathname === '/CH4') { bootstrapCalls += 1; return await channelTokenResponse(); }
+    restCalls += 1;
+    return restCalls === 1 ? new Response('private body', { status: 500 }) : Response.json({ code: 0, result: { albums: [], nextCursor: null } });
+  });
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false, physicalTransport });
+  await adapter.loginToken(jwt);
+  const command = { action: 'listAlbums', chatId: 'c-selected-chat', limit: 10 } as ChatResourceReadCommand;
+  try {
+    await expect(adapter.readChatResource(command, { signal: new AbortController().signal })).rejects.toMatchObject({ category: 'list_get_transport_failure' });
+    expect(bootstrapCalls).toBe(1);
+    await expect(adapter.readChatResource(command, { signal: new AbortController().signal })).resolves.toMatchObject({ albums: [] });
+    expect(bootstrapCalls).toBe(2);
+    await adapter.readChatResource(command, { signal: new AbortController().signal });
+    expect(bootstrapCalls).toBe(2);
+  } finally {
+    adapter.revoke();
+  }
+});
+
 async function channelTokenResponse(): Promise<Response> {
   const thrift = (await import('thrift')).default;
   const chunks: Buffer[] = [];

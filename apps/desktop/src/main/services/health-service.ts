@@ -39,7 +39,7 @@ export const boundedNotificationProjectionSql = `CASE WHEN m.kind='event' AND m.
       AND m.raw#>>'{message,contentType}' IN ('16','POSTNOTIFICATION')
       AND m.raw->'contentState' IS NULL
       AND NOT (m.raw ? 'sourceDeleted')
-      AND m.raw#>>'{message,contentMetadata,serviceType}' IN ('GB','AB')
+      AND m.raw#>>'{message,contentMetadata,serviceType}' IN ('GB','AB','SN')
       THEN jsonb_build_object('serviceType', m.raw#>>'{message,contentMetadata,serviceType}')
       WHEN m.kind='event' AND m.content->>'type'='event' AND m.content->>'nativeContentType'='16'
         AND m.raw#>>'{native,encoding}'='plain' AND m.raw#>>'{native,table}'='_message'
@@ -96,7 +96,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function postNotificationSubtypeFromProjection(value: unknown): 'note' | 'album' | null {
   if (!isRecord(value)) return null;
   let metadata: unknown;
-  if (Object.keys(value).length === 1 && (value.serviceType === 'GB' || value.serviceType === 'AB')) {
+  if (Object.keys(value).length === 1 && (value.serviceType === 'GB' || value.serviceType === 'AB' || value.serviceType === 'SN')) {
     metadata = value;
   } else if (Object.keys(value).length === 2 && value.contentType === 16 && typeof value.metadataText === 'string') {
     let metadataText = value.metadataText;
@@ -110,7 +110,7 @@ function postNotificationSubtypeFromProjection(value: unknown): 'note' | 'album'
     try { metadata = JSON.parse(metadataText); } catch { return null; }
   } else return null;
   if (!isRecord(metadata)) return null;
-  return metadata.serviceType === 'GB' ? 'note' : metadata.serviceType === 'AB' ? 'album' : null;
+  return metadata.serviceType === 'GB' || metadata.serviceType === 'SN' ? 'note' : metadata.serviceType === 'AB' ? 'album' : null;
 }
 
 export function mapConversation(row: ConversationRow): ConversationSummary {

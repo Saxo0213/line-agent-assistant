@@ -226,7 +226,7 @@ export function AgentRoom({ api, conversation, jobs, providers }: {
 
   function openAgentLink(url: string) {
     void api.openExternalUrl(url).then((result) => {
-      if (result.type !== 'openExternalUrl') setError(result.type === 'error' ? safeErrorTextFor(locale, result) : desktopText('unableToOpenLink'));
+      if (result.type !== 'openExternalUrl') setError(result.type === 'error' ? safeErrorTextFor(locale, result, desktopText('unableToOpenLink')) : desktopText('unableToOpenLink'));
     }).catch((cause) => setError(safeErrorTextFor(locale, cause, desktopText('unableToOpenLink'))));
   }
 

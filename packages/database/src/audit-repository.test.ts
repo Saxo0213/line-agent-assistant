@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createTestDatabase } from './test-database.js';
 import { AuditRepository } from './audit-repository.js';
-import { DIAGNOSTIC_OPERATIONS, DIAGNOSTIC_STAGES, DIAGNOSTIC_CATEGORIES, DIAGNOSTIC_RECOVERIES, DIAGNOSTIC_REASONS } from '@line-agent/contracts';
+import { DIAGNOSTIC_OPERATIONS, DIAGNOSTIC_STAGES, DIAGNOSTIC_CATEGORIES, DIAGNOSTIC_RECOVERIES, DIAGNOSTIC_REASONS, DIAGNOSTIC_FAILURE_KINDS } from '@line-agent/contracts';
 
 it('keeps at most one audit connection waiter per shared pool during sustained exhaustion', async () => {
   vi.useFakeTimers();
@@ -83,6 +83,11 @@ database('AuditRepository', () => {
         ...DIAGNOSTIC_CATEGORIES.map((category) => ({ ...base, category })),
         ...DIAGNOSTIC_RECOVERIES.map((recovery) => ({ ...base, recovery })),
         ...DIAGNOSTIC_REASONS.map((reason) => ({ ...base, reason })),
+        ...DIAGNOSTIC_FAILURE_KINDS.map((failureKind) => ({ ...base, failureKind })),
+        { ...base, upstreamStatus: 100, upstreamCode: -1_000_000_000 },
+        { ...base, upstreamStatus: 599, upstreamCode: 1_000_000_000 },
+        { ...base, upstreamCode: 'missing' },
+        { ...base, upstreamCode: 'non_numeric' },
         { ...base, provider: 'codex', statusCode: -1_000_000_000, outcome: 'unknown' },
         { ...base, provider: 'claude', statusCode: 1_000_000_000, outcome: 'recovered' },
       ];
@@ -102,7 +107,12 @@ database('AuditRepository', () => {
         errorCode: 'HISTORY_READ_FAILED', diagnostic, createdAt: new Date().toISOString() });
       expect(await repository.list()).toMatchObject([{ diagnostic }]);
       for (const unsafe of [{ ...diagnostic, operation: 'secret-sentinel' }, { ...diagnostic, message: 'secret-sentinel' },
-        { ...diagnostic, statusCode: 1.5 }, { ...diagnostic, category: null }]) {
+        { ...diagnostic, statusCode: 1.5 }, { ...diagnostic, category: null },
+        { ...diagnostic, failureKind: 'secret-sentinel' }, { ...diagnostic, failureKind: 7 },
+        { ...diagnostic, upstreamStatus: 99 }, { ...diagnostic, upstreamStatus: 600 }, { ...diagnostic, upstreamStatus: 500.5 },
+        { ...diagnostic, upstreamStatus: '500' },
+        { ...diagnostic, upstreamCode: 1_000_000_001 }, { ...diagnostic, upstreamCode: 1.5 },
+        { ...diagnostic, upstreamCode: 'secret-sentinel' }, { ...diagnostic, upstreamCode: true }]) {
         await expect(pool.query('INSERT INTO audit_logs(action,actor,details) VALUES ($1,$2,$3::jsonb)',
           ['worker_operation_error', 'worker', JSON.stringify({ phase: 'observed', correlation_id: 'invalid-diagnostic', diagnostic: unsafe })]))
           .rejects.toThrow(/diagnostic/);

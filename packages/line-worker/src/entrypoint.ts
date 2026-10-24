@@ -3,7 +3,19 @@ import { LineWorkerCommandSchema, LineWorkerEventSchema, LOGIN_FAILURES,
 import { createLinejsAdapter } from './linejs-adapter.js';
 import { LineWorkerLoop, type LineTransport, type LineWorkerOptions } from './worker-loop.js';
 import { createWindowsAttachmentBroker } from './windows-attachment-broker.js';
-import { diagnosticFailure } from '@line-agent/contracts';
+import { DIAGNOSTIC_OPERATIONS, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+
+const COMMAND_TYPES: ReadonlySet<string> = new Set(LineWorkerCommandSchema.options.map((option) => option.shape.type.value));
+const DIAGNOSTIC_OPERATION_SET: ReadonlySet<string> = new Set(DIAGNOSTIC_OPERATIONS);
+/** Only a known command discriminator that is also a valid diagnostic operation; no other raw input value is read. */
+function rejectedOperation(input: unknown): SafeDiagnostic['operation'] {
+  const type = typeof input === 'object' && input !== null && !Array.isArray(input) ? (input as { type?: unknown }).type : undefined;
+  return typeof type === 'string' && COMMAND_TYPES.has(type) && DIAGNOSTIC_OPERATION_SET.has(type) ? type as SafeDiagnostic['operation'] : 'unknown';
+}
+function rejectedRequestId(input: unknown): string | undefined {
+  const id = typeof input === 'object' && input !== null && !Array.isArray(input) ? (input as { requestId?: unknown }).requestId : undefined;
+  return typeof id === 'string' && id.length > 0 && id.length <= 128 ? id : undefined;
+}
 
 type Init = Extract<LineWorkerCommand, { type: 'init' }>;
 
@@ -186,9 +198,10 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
         const diagnostic = commandExecutionStarted ? operationError(command)
           : { code: 'INVALID_COMMAND' as const, message: 'Worker command rejected' };
         await emit({ type: 'error', ...identity, ...diagnostic, retryable: false,
-          diagnostic: diagnosticFailure(command?.type ?? 'unknown', commandExecutionStarted ? 'execute'
+          diagnostic: diagnosticFailure(command?.type ?? rejectedOperation(input), commandExecutionStarted ? 'execute'
             : command?.type === 'init' && initializing ? 'bootstrap' : 'admission', error),
-          ...(command && 'requestId' in command ? { requestId: command.requestId } : {}) });
+          ...(command ? ('requestId' in command ? { requestId: command.requestId } : {})
+            : rejectedRequestId(input) !== undefined ? { requestId: rejectedRequestId(input)! } : {}) });
       }
     }
   };
