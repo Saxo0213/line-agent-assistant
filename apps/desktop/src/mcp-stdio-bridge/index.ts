@@ -107,7 +107,7 @@ export async function runBridge(env: NodeJS.ProcessEnv, input = stdin, output = 
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   void runBridge(process.env).catch((error: unknown) => {
-    process.stderr.write(`${error instanceof Error ? error.message : 'MCP bridge failed.'}\n`);
+    process.stderr.write('MCP bridge failed. Check the 127.0.0.1 endpoint configuration.\n');
     process.exitCode = 1;
   });
 }

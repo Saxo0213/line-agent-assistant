@@ -23,6 +23,8 @@ export const KOREAN_DESKTOP_COPY_PART3 = {
   call: '통화',
   gift: '선물',
   postNotification: '게시물 알림',
+  postNoteNotification: '노트 알림',
+  postAlbumNotification: '앨범 알림',
   chatEvent: '채팅 이벤트',
   systemMessage: '시스템 메시지',
   cancelledCall: '취소된 통화',

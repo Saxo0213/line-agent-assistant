@@ -10,7 +10,7 @@ import { createDisconnectedFacade } from './service-facade.js';
 import type { DesktopServiceFacade } from './service-facade.js';
 import { createConnectedFacade, type OfficialSnapshotImporter } from './connected-facade.js';
 import { createUtilityWorkerGateway, MAX_UTILITY_WORKERS } from './utility-worker-gateway.js';
-import { createWindowLifecycle } from './tray.js';
+import { createDesktopLifecycle, parseDesktopCommand, routeSecondInstance, shutdownServices, type DesktopLifecycleFailure } from './desktop-lifecycle.js';
 import { createElectronPreviewPresenter } from './electron-preview-presenter.js';
 import { createDomainEventPublisher } from './domain-event-publisher.js';
 import { APP_USER_MODEL_ID, resolveDefaultAppIcon } from './app-icon.js';
@@ -23,10 +23,13 @@ import { resolveDatabaseMigrations, resolveJobHost, resolveSkillsDirectory, reso
 import { BootstrapSettings, bootstrapFromEnvironment } from './services/bootstrap-settings.js';
 import { SecretStore } from './services/secret-store.js';
 import { createOperationalAuditRuntime } from './services/operational-audit-runtime.js';
+import { createOperationalAudit, type OperationalAudit } from './services/operational-audit.js';
+import { OperationalAuditFallback } from './services/operational-audit-fallback.js';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { DatabaseSetupService } from './services/database-setup.js';
 import { createAttachmentRootChange } from './services/attachment-root-change.js';
 import { WorkspaceAuthority } from './services/workspace-authority.js';
-import { createSetupAdapter, createSetupCutover, restartAfterShutdown, type EmbeddedSetupPort } from './setup-ipc.js';
+import { createSetupAdapter, createSetupCutover, type EmbeddedSetupPort } from './setup-ipc.js';
 import { createFirstRunSetupSession, decideFirstRunSetup, isFirstRunSetupMode } from './first-run-setup.js';
 import { SETUP_PROGRESS_CHANNEL } from '../setup-protocol.js';
 import { EmbeddedPostgresProvisioner } from './services/embedded-postgres/provisioner.js';
@@ -40,7 +43,6 @@ import { AgentRepository, MessageRepository, SettingsRepository, createPool, mig
 import { StartupCleanup } from './startup-cleanup.js';
 import { createJsOfficialSnapshotImporter } from './services/js-external-reader/runtime-importer.js';
 import { OfficialBuildTrustService } from './services/official-build-trust.js';
-import { createOfficialLineSessionGuard, listLineProcessImagePaths } from './services/official-line-session-guard.js';
 import { mainExternalSourceProbeAdmission } from './services/external-source-probe-admission.js';
 import { parseLineMediaUrl } from '@line-agent/contracts';
 import { createLocaleSettings, getEffectiveLocale, setEffectiveLocaleReader } from './locale-settings.js';
@@ -77,6 +79,24 @@ const migrationDirectory = resolveDatabaseMigrations(app.isPackaged, appDir, pro
 const jobHostFile = resolveJobHost(app.isPackaged, appDir, process.resourcesPath);
 let service: DesktopServiceFacade = createDisconnectedFacade();
 let connectedService: DesktopServiceFacade | undefined;
+let operationalAudit: OperationalAudit | undefined;
+let earlyAudit: OperationalAudit | undefined;
+function reportRuntimeFailure(diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity): void {
+  if (operationalAudit) { operationalAudit.failure(diagnostic, identity); return; }
+  if (!earlyAudit) {
+    const fallback = new OperationalAuditFallback(path.join(new BootstrapSettings().root, 'logs', 'operational'));
+    earlyAudit = createOperationalAudit({ append: (event) => fallback.append(event), appendFallback: (event) => fallback.append(event),
+      logSinkState: (state, errorCode, droppedCount) => console.warn(JSON.stringify({ event: 'early_audit_sink', state, errorCode, droppedCount })) });
+  }
+  earlyAudit.failure(diagnostic, identity);
+}
+async function persistLifecycleFailure(failure: DesktopLifecycleFailure): Promise<void> {
+  const diagnostic: SafeDiagnostic = failure === 'shutdown_timeout'
+    ? { operation: 'shutdown', stage: 'shutdown', category: 'timeout', recovery: 'retry' }
+    : { operation: 'shutdown', stage: 'shutdown', category: 'unknown', recovery: 'retry' };
+  reportRuntimeFailure(diagnostic);
+  await (operationalAudit ?? earlyAudit)?.flush();
+}
 let lineMediaProtocolRegistered = false;
 const setupCutover = createSetupCutover({
   isConnected: () => connectedService !== undefined,
@@ -86,7 +106,7 @@ const setupCutover = createSetupCutover({
 
 // One owner of the app-managed PostgreSQL postmaster (null for external databases).
 let embeddedServer: EmbeddedPostgresServer | undefined;
-const embeddedLog = (message: string) => console.error(`[embedded-postgres] ${message}`);
+const embeddedLog = (_message: string) => reportRuntimeFailure(diagnosticFailure('database', 'execute'));
 /** Stops the embedded server after services have shut down; bounded at 45 s by the server itself. */
 async function stopEmbeddedServer(): Promise<void> {
   const server = embeddedServer;
@@ -104,7 +124,20 @@ async function initializeLocaleSettings(): Promise<void> {
 }
 let windowGeometryPersistence: ReturnType<typeof createWindowGeometryPersistence> | undefined;
 let tray: Tray | null = null;
-let lifecycle: ReturnType<typeof createWindowLifecycle>;
+const lifecycle = createDesktopLifecycle({ starting: true,
+  hide: () => window?.hide(),
+  closeServices: () => shutdownServices([
+    () => (connectedService ?? service).shutdown(),
+    stopEmbeddedServer,
+  ]),
+  relaunch: () => app.relaunch({ execPath: process.execPath, args: process.argv.slice(1).filter((argument) => argument !== '--quit' && argument !== '--restart') }),
+  reportEvent: (event, command) => console.info(`[desktop-lifecycle] ${event.replaceAll('-', '_')} command=${command}`),
+  reportFailure: persistLifecycleFailure,
+  // Services have already drained. Do not route this through app.quit(): Electron's
+  // window close/unload path can be vetoed or kept alive by a renderer. The
+  // relauncher waits for this process to exit before starting the replacement.
+  exit: () => { windowGeometryPersistence?.flush(); tray?.destroy(); fileTypeIcons.disable(); app.exit(0); },
+});
 const fileTypeIcons = createFileTypeIconResolver({ platform: process.platform, tempDirectory: app.getPath('temp'),
   getFileIcon: (filePath, options) => app.getFileIcon(filePath, options) });
 app.once('will-quit', () => fileTypeIcons.disable());
@@ -150,6 +183,8 @@ async function initializeServices(): Promise<void> {
   startupCleanup.add(() => pool.end());
   await migrate(pool, migrationDirectory);
   const audit = createOperationalAuditRuntime(pool, path.join(bootstrapSettings.root, 'logs', 'operational'));
+  await earlyAudit?.flush();
+  operationalAudit = audit;
   startupCleanup.add(() => audit.flush());
   const settings = new SettingsRepository(pool);
   const environmentWorkspace = process.env.LINE_AGENT_WORKSPACE;
@@ -161,26 +196,27 @@ async function initializeServices(): Promise<void> {
   let officialSnapshotImporter: OfficialSnapshotImporter | undefined;
   // One persisted trust document (app_settings.official_line_build_trust); no timer or watcher.
   const officialBuildTrust = new OfficialBuildTrustService({
-    read: () => settings.getOfficialBuildTrust(),
-    write: (state) => settings.setOfficialBuildTrust(state),
+    read: async () => {
+      try { return await settings.getOfficialBuildTrust(); }
+      catch (error) { audit.failure(diagnosticFailure('native_reader', 'read', error)); throw error; }
+    },
+    write: async (state) => {
+      try { await settings.setOfficialBuildTrust(state); }
+      catch (error) { audit.failure(diagnosticFailure('native_reader', 'persist', error)); throw error; }
+    },
   });
   try {
     officialSnapshotImporter = await createJsOfficialSnapshotImporter({ packaged: app.isPackaged,
       appPath: app.getAppPath(), resourcesPath: process.resourcesPath, localAppData: process.env.LOCALAPPDATA,
       admission: mainExternalSourceProbeAdmission, buildTrust: officialBuildTrust });
   } catch (error) {
-    console.warn('[external-monitor] direct reader unavailable:', error instanceof Error ? error.message : 'unknown');
+    reportRuntimeFailure(diagnosticFailure('native_reader', 'bootstrap', error));
   }
-  const officialLineSessionGuard = createOfficialLineSessionGuard({
-    listLineProcessImagePaths, localAppData: process.env.LOCALAPPDATA,
-    ...(officialSnapshotImporter?.verifyOfficialSource
-      ? { verifyOfficialSource: (input) => officialSnapshotImporter!.verifyOfficialSource!(input) } : {}),
-  });
-  startupCleanup.add(() => officialLineSessionGuard.shutdown());
   const bridge = new AgentCliBridge({ enabled: agentBridgeEnabled(process.env), resolveWorkspaceRoots: async () => [await workspaceAuthority.current()], runner: new NodeProcessRunner({ hostFile: jobHostFile }),
     validateResumeSession: (request) => agents.validateResumeSession(request) });
   startupCleanup.add(() => bridge.shutdown());
   const workers = createUtilityWorkerGateway({
+    onDiagnostic: (diagnostic, accountId) => audit.failure(diagnostic, { ...(accountId ? { accountId } : {}) }),
     spawn(binding) {
       const child = utilityProcess.fork(workerEntry, [], {
         env: { SYSTEMROOT: process.env.SYSTEMROOT, WINDIR: process.env.WINDIR, TEMP: process.env.TEMP, TMP: process.env.TMP,
@@ -193,11 +229,13 @@ async function initializeServices(): Promise<void> {
   });
   startupCleanup.add(() => workers.shutdown());
   const previewPresenter = createElectronPreviewPresenter({
+    reportError: (error) => audit.failure(diagnosticFailure('attachment', 'publish', error)),
     createSession: (partition) => session.fromPartition(partition, { cache: false }),
     createWindow: (options) => new BrowserWindow(options),
   });
   const publish = createDomainEventPublisher((channel, event) => window?.webContents.send(channel, event));
   const connected = await createConnectedFacade({ pool, workers, agent: bridge, workspaceAuthority, attachmentRoot: bootstrap.attachmentRoot,
+    chatResourceDiagnosticsDirectory: app.getPath('userData'),
     locale: getEffectiveLocale(),
     mcpLocalClientAppPath: app.getAppPath(), mcpLocalClientPackaged: app.isPackaged,
     previewCacheRoot: path.join(app.getPath('userData'), 'cache', 'line-image-previews'),
@@ -206,9 +244,10 @@ async function initializeServices(): Promise<void> {
     closePoolOnShutdown: true, runMigrations: false, contentReprojection: true, officialBuildTrust,
     skillsDirectory: resolveSkillsDirectory(app.isPackaged, appDir, process.resourcesPath),
     ...(officialSnapshotImporter ? { officialSnapshotImporter } : {}),
-    officialLineSessionGuard,
     ...(officialSnapshotImporter && process.env.LOCALAPPDATA
       ? { externalImportProgressPath: path.join(process.env.LOCALAPPDATA, 'LINEJS', 'js-external-imports', 'first-import-progress.json') } : {}),
+    ...(officialSnapshotImporter
+      ? { externalMonitorDiagnosticPath: path.join(app.getPath('userData'), 'external-monitor-failure.json') } : {}),
     publish,
     beforeMcpListen: async () => {
       if (!lineMediaProtocolRegistered) {
@@ -229,6 +268,7 @@ async function initializeServices(): Promise<void> {
   connectedService = connected;
   startupCleanup.commit();
   } catch (error) {
+    reportRuntimeFailure(diagnosticFailure('startup', 'bootstrap', error));
     await startupCleanup.unwind(error);
     throw error;
   }
@@ -273,9 +313,10 @@ async function createWindow(setupOnly = false) {
   }
   const view = window.webContents;
   const request = createIpcAdapter({ webContentsId: view.id, rendererUrl, resolveService: () => service,
+    onDiagnostic: reportRuntimeFailure,
     resolveFileTypeIcon: (extension) => fileTypeIcons.resolve(extension),
     openExternalUrl: (url) => shell.openExternal(url) });
-  const read = createReadAdapter({ webContentsId: view.id, rendererUrl, resolveService: () => service });
+  const read = createReadAdapter({ webContentsId: view.id, rendererUrl, resolveService: () => service, onDiagnostic: reportRuntimeFailure });
   const bootstrapSettings = new BootstrapSettings();
   const defaultDataRoot = path.join(bootstrapSettings.root, 'data');
   const setup = new DatabaseSetupService({ createPool,
@@ -329,6 +370,7 @@ async function createWindow(setupOnly = false) {
   const setupSession = setupOnly ? createFirstRunSetupSession({ cancelProvision: () => embedded.cancel(),
     stopServices: () => stopEmbeddedServer(), exit: (code) => app.exit(code) }) : undefined;
   const setupRequest = createSetupAdapter({ webContentsId: view.id, rendererUrl, setup, embedded, attachmentRootChange,
+    onDiagnostic: reportRuntimeFailure,
     runSetupSave: setupCutover.save,
     chooseAttachmentRoot: async () => {
       const result = await dialog.showOpenDialog(window!, { title: nativeDesktopText(getEffectiveLocale(), 'attachmentFolder'), properties: ['openDirectory', 'createDirectory'] });
@@ -338,8 +380,7 @@ async function createWindow(setupOnly = false) {
       const result = await dialog.showOpenDialog(window!, { title: nativeDesktopText(getEffectiveLocale(), 'agentWorkspace'), properties: ['openDirectory', 'createDirectory'] });
       return result.canceled ? null : result.filePaths[0] ?? null;
     },
-    restartApplication: () => setupSession ? setupSession.succeeded() : restartAfterShutdown(async () => { await (connectedService ?? service).shutdown(); await stopEmbeddedServer(); }, () => app.relaunch(),
-      (code) => app.exit(code), 30_000),
+    restartApplication: () => setupSession ? setupSession.succeeded() : lifecycle.request('restart'),
   });
   const localeRequest = createLocaleIpcAdapter({ webContentsId: view.id, rendererUrl, settings: localeSettings! });
   ipcMain.removeHandler('line-agent:locale');
@@ -467,10 +508,14 @@ function createTray() {
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
 const firstRunSetupOnly = isFirstRunSetupMode(process.argv);
+const initialCommand = parseDesktopCommand(process.argv.slice(1));
 
 if (!hasSingleInstanceLock) {
   if (firstRunSetupOnly) app.exit(0);
   else app.quit();
+} else if (initialCommand === 'quit') {
+  // A command launched without another primary instance has nothing to drain.
+  app.exit(0);
 } else if (firstRunSetupOnly) {
   // Installer-time mode: only the setup window and the embedded provisioner; no services, tray or inventory.
   app.on('window-all-closed', () => { /* exit is owned by the setup session */ });
@@ -480,21 +525,23 @@ if (!hasSingleInstanceLock) {
     if (decision === 'exit') { app.exit(0); return; }
     installSecurity();
     await createWindow(true);
-  }).catch((error) => { console.error('First-run setup failed', error); app.exit(1); });
+  }).catch(async (error: unknown) => { reportRuntimeFailure(diagnosticFailure('startup', 'bootstrap', error)); await earlyAudit?.flush(); app.exit(1); });
 } else {
-  app.on('second-instance', () => {
-    if (!window) return;
-    if (window.isMinimized()) window.restore();
-    window.show();
-    window.focus();
+  app.on('second-instance', (_event, commandLine) => {
+    console.info('[desktop-lifecycle] second_instance_received');
+    routeSecondInstance(commandLine.slice(1), (command) => lifecycle.request(command), () => {
+      if (!window) return;
+      if (window.isMinimized()) window.restore();
+      window.show();
+      window.focus();
+    }, (classification, command) => console.info(`[desktop-lifecycle] second_instance_${classification}${command ? ` command=${command}` : ''}`));
   });
 
   app.whenReady().then(async () => {
     await initializeLocaleSettings();
     installSecurity();
     try { await initializeServices(); }
-    catch (error) { service = createDisconnectedFacade(error instanceof Error ? `啟動失敗：${error.message}` : '啟動失敗：未知服務錯誤'); }
-    lifecycle = createWindowLifecycle({ hide: () => window?.hide(), closeServices: async () => { await (connectedService ?? service).shutdown(); await stopEmbeddedServer(); }, exit: () => { tray?.destroy(); app.quit(); } });
+    catch (error) { reportRuntimeFailure(diagnosticFailure('startup', 'bootstrap', error)); service = createDisconnectedFacade('System startup failed. Check configuration and System Errors.'); }
     await createWindow();
     if (runtimeInventoryMode) {
       await runRuntimeInventorySession();
@@ -508,7 +555,12 @@ if (!hasSingleInstanceLock) {
       return;
     }
     if (!headlessPackagedSmoke) createTray();
-  }).catch((error) => { console.error('Desktop startup failed', error); app.quit(); });
+    lifecycle.markRunning();
+  }).catch(async (error: unknown) => {
+    reportRuntimeFailure(diagnosticFailure('startup', 'bootstrap', error));
+    try { await earlyAudit?.flush(); }
+    finally { lifecycle.request('quit'); lifecycle.markRunning(); }
+  });
   app.on('window-all-closed', () => { /* keep tray resident */ });
   app.on('activate', () => { if (headlessPackagedSmoke) return; if (window) window.show(); else void createWindow(); });
   app.on('before-quit', (event) => { windowGeometryPersistence?.flush(); if (lifecycle && !lifecycle.onBeforeQuit()) event.preventDefault(); });

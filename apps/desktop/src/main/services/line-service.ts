@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import type { AccountMode, ConversationKey, WritableConversationKey, LineWorkerCommand, LineWorkerEvent, WorkerBinding } from '@line-agent/contracts';
-import { isWritableChatType } from '@line-agent/contracts';
+import type { AccountMode, ConversationKey, InboundEnvelope, WritableConversationKey, LineWorkerCommand, LineWorkerEvent, WorkerBinding } from '@line-agent/contracts';
+import { isWritableChatType, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AccountRepository, AdminRepository, AgentJobStatusProjection, FriendWhitelistRepository, MessageRepository, RoutingDecision, SettingsRepository } from '@line-agent/database';
 import { hasOwnMention, routeTrigger, type TriggerDecision } from './trigger-router.js';
 import { classifyRoomControl, ownMentionBody, sanitizeRoomControlEnvelope, type RoomActivationCommand } from './room-control.js';
@@ -74,7 +74,12 @@ export class LineService {
     private readonly permissionCommands?: Pick<PermissionCommandService, 'classify' | 'enqueue'>,
     private readonly publishReadPositionChanges?: (changes: readonly Readonly<{ key: ConversationKey; messageId: string }>[]) => void,
     private readonly locale: Locale | string = 'en',
+    private readonly onDiagnostic?: (diagnostic: SafeDiagnostic) => void,
   ) {}
+
+  private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown): void {
+    try { this.onDiagnostic?.(diagnosticFailure('line_ingest', stage, error)); } catch { /* Preserve ingestion and replay ownership. */ }
+  }
 
   bind(binding: BoundWorker, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return Promise.reject(new Error('Worker binding cancelled'));
@@ -114,6 +119,7 @@ export class LineService {
       await this.accounts.bindWorker(binding, signal);
       if (signal?.aborted) throw new Error('Worker binding cancelled');
     }).catch((error) => {
+      if (!signal?.aborted) this.reportFailure('persist', error);
       if (signal?.aborted && this.bindings.get(binding.workerInstanceId) === binding) {
         this.unbind(binding.workerInstanceId);
         if (this.accountBindingReady.get(binding.accountId) === registered) this.accountBindingReady.delete(binding.accountId);
@@ -122,7 +128,7 @@ export class LineService {
     });
     const recovery = registered.then(() => {
       if (signal?.aborted) throw new Error('Worker binding cancelled');
-      return this.drainPendingActions(binding, signal);
+      return this.drainPendingActions(binding, signal).then(() => this.reconcileUnroutedLiveMessages(binding, signal));
     });
     // Retain the rejection for the event handler while preventing an early unhandled rejection.
     void recovery.catch(() => undefined);
@@ -130,6 +136,38 @@ export class LineService {
     this.recoveryReady.set(binding.workerInstanceId, recovery);
     this.accountBindingReady.set(binding.accountId, registered);
     return registered;
+  }
+
+  private async reconcileUnroutedLiveMessages(binding: BoundWorker, signal?: AbortSignal): Promise<void> {
+    const repository = this.messages as MessageRepository & {
+      listUnroutedLiveSourceMessages?: (input: { accountId: string; workerInstanceId: string; controlEpoch: number;
+        afterObservationId?: string; limit?: number }) => Promise<Array<{ observationId: string; envelope: InboundEnvelope | null;
+          receiptMode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; receiptControlEpoch: number; sensitive: boolean }>>;
+    };
+    if (binding.mode !== 'ACTIVE_CONTROL' || !repository.listUnroutedLiveSourceMessages) return;
+    let afterObservationId: string | undefined;
+    for (;;) {
+      if (signal?.aborted || this.bindings.get(binding.workerInstanceId) !== binding) return;
+      const page = await repository.listUnroutedLiveSourceMessages({ accountId: binding.accountId,
+        workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch,
+        ...(afterObservationId === undefined ? {} : { afterObservationId }), limit: 100 });
+      if (!page.length) return;
+      for (const item of page) {
+        afterObservationId = item.observationId;
+        if (!item.envelope || item.envelope.accountId !== binding.accountId || item.envelope.ingestion.source !== 'live') continue;
+        const currentReceipt = item.receiptMode === 'ACTIVE_CONTROL' && item.receiptControlEpoch === binding.controlEpoch;
+        const event: LineWorkerEvent = { type: 'batch', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+          controlEpoch: binding.controlEpoch, batchId: `recovery:${item.observationId}`,
+          cursorBefore: { version: 1, revision: '0', globalRev: '0', individualRev: '0' },
+          cursorAfter: { version: 1, revision: '0', globalRev: '0', individualRev: '0' }, envelopes: [item.envelope] };
+        try {
+          await this.handleWorkerEventInLane(binding.workerInstanceId, event, { recovered: true,
+            receiptCurrent: currentReceipt, sensitive: item.sensitive });
+        } catch { /* leave unmatched provenance for the next bind to retry */ }
+      }
+      if (page.length < 100) return;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
   }
   unbind(workerInstanceId: string): void {
     const binding = this.bindings.get(workerInstanceId);
@@ -309,14 +347,15 @@ export class LineService {
     await Promise.allSettled([...this.ingressLanes.values()].map((lane) => lane.tail));
   }
 
-  private async handleWorkerEventInLane(processInstanceId: string, event: LineWorkerEvent): Promise<readonly string[] | undefined> {
+  private async handleWorkerEventInLane(processInstanceId: string, event: LineWorkerEvent,
+    recovered?: { recovered: true; receiptCurrent: boolean; sensitive: boolean }): Promise<readonly string[] | undefined> {
     const binding = this.bindings.get(processInstanceId);
     if (!binding || !this.isCurrentWorkerEvent(processInstanceId, event)) return;
     if ((event.type === 'batch' || event.type === 'historyResult')
       && (await this.accounts.resolveCapabilities?.(event.accountId))?.connectionMode === 'EXTERNAL_MONITOR') return;
     await this.bindingReady.get(processInstanceId);
     if (!this.isCurrentWorkerEvent(processInstanceId, event)) return;
-    if (binding.mode === 'ACTIVE_CONTROL') {
+    if (binding.mode === 'ACTIVE_CONTROL' && !recovered) {
       const recovery = this.recoveryReady.get(processInstanceId) ?? this.drainPendingActions(binding);
       this.recoveryReady.set(processInstanceId, recovery);
       try { await recovery; } finally {
@@ -431,6 +470,7 @@ export class LineService {
     }
     if (event.type === 'historyResult') {
       const attachmentIds: string[] = [];
+      const changedMessageIds: string[] = [];
       for (const envelope of event.envelopes) {
         if (envelope.accountId !== binding.accountId || envelope.chatType !== event.chatType || envelope.chatId !== event.chatId) {
           throw new Error('History envelope source mismatch');
@@ -438,6 +478,7 @@ export class LineService {
         const historyEnvelope = sanitizeRoomControlEnvelope({ ...envelope, ingestion: { ...envelope.ingestion, source: 'history' as const } });
         const archived = sanitizeInbound(historyEnvelope).envelope;
         const result = await this.messages.ingestAndRoute(archived, { eligible: false });
+        if (result.disposition === 'inserted' || result.messageChanged) changedMessageIds.push(archived.messageId);
         if (result.disposition === 'inserted' && this.attachments) {
           for (const descriptor of archived.attachments) {
             const item = await this.messages.getAttachmentBySource(
@@ -449,7 +490,7 @@ export class LineService {
         }
       }
       for (const attachmentId of attachmentIds) this.queueAttachmentDownload(attachmentId);
-      return;
+      return changedMessageIds;
     }
     if (event.type !== 'batch') return;
     const account = await this.accounts.getAccount(event.accountId);
@@ -460,13 +501,29 @@ export class LineService {
       return { ...ingress, envelope: ingress.envelope,
         secretCandidate: original.accountId === binding.accountId && event.accountId === binding.accountId
           ? ingress.secretCandidate : null,
-        ownMid, control: classifyRoomControl(ingress.envelope, ownMid, binding.accountId) };
+        ownMid, control: classifyRoomControl(ingress.envelope, ownMid, binding.accountId),
+        ...(recovered ? { sensitive: recovered.sensitive } : {}) };
     });
+    const useIndependentIngest = typeof (this.messages as unknown as { ingestBatchSource?: unknown }).ingestBatchSource === 'function';
+    if (useIndependentIngest && !recovered) await this.messages.prepareBatchConversations({ ...event, envelopes: prepared.map(({ envelope }) => envelope) });
+    const sourceBatch = { ...event, envelopes: prepared.map(({ envelope }) => envelope) };
+    const workspacePromise = this.workspaceAuthority.inspect();
+    const storagePromise = useIndependentIngest && !recovered
+      ? this.messages.ingestBatchSource(sourceBatch, new Set(prepared.filter((item) => item.sensitive).map((item) => item.envelope.messageId)))
+      : null;
+    const existingRoutesPromise = useIndependentIngest
+      ? this.messages.existingLiveRoutes(sourceBatch)
+      : Promise.resolve(new Set<string>());
+    const ackPromise = storagePromise?.then(() => this.worker.send({ type: 'ackBatch', accountId: binding.accountId,
+      workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch, batchId: event.batchId,
+      cursorAfter: event.cursorAfter }));
+    if (ackPromise) void ackPromise.catch(() => undefined);
     const administrative = new Set<string>();
     for (const { envelope, secretCandidate, ownMid } of prepared) {
       if (await this.classifyInbound?.(envelope, secretCandidate, ownMid)) administrative.add(envelope.messageId);
     }
-    const workspace = await this.workspaceAuthority.inspect();
+    const existingRoutes = await existingRoutesPromise;
+    const workspace = await workspacePromise;
     const actions: Array<{ key: WritableConversationKey; decision: TriggerDecision }> = [];
     const decisions: RoutingDecision[] = [];
     const permissionTickets = new Map<object, PermissionTicket>();
@@ -516,10 +573,12 @@ export class LineService {
           roomGrantId: roomAuthorization.grantId, roomGrantVersion: roomAuthorization.version,
         }),
       } : undefined;
-      actions.push({ key, decision });
+      const routeIsClosed = existingRoutes.has(envelope.messageId) || (recovered && !recovered.receiptCurrent);
+      actions.push({ key, decision: routeIsClosed ? { type: 'ignore' } : decision });
       const primaryAdminAdmission = envelope.chatType !== 'direct' && primaryAdmin && decision.type !== 'ignore'
         ? { primaryAdminSenderId: envelope.senderId } : {};
-      if (permissionClaimed || control.type !== 'none' || administrative.has(envelope.messageId) || sensitive) {
+      if (existingRoutes.has(envelope.messageId) || (recovered && !recovered.receiptCurrent)
+        || permissionClaimed || control.type !== 'none' || administrative.has(envelope.messageId) || sensitive) {
         decisions.push({ eligible: false, action: 'ignore' });
       }
       else if (decision.type !== 'prompt') decisions.push({ eligible: false, action: decision.type, ...primaryAdminAdmission });
@@ -531,8 +590,61 @@ export class LineService {
           workspacePath: workspace.configuredPath, code: 'INVALID_WORKSPACE', reason: workspace.reason },
         ...primaryAdminAdmission });
     }
-    const result = await this.messages.ingestBatchAndRoute({ ...event, envelopes: prepared.map(({ envelope }) => envelope) }, decisions);
-    this.publishCommittedJobStatuses?.(result.jobStatuses);
+    const admissionPromise = useIndependentIngest
+      ? this.messages.admitLiveBatch(sourceBatch, decisions)
+      : null;
+    if (admissionPromise) void admissionPromise.catch(() => undefined);
+    // Auto-replies are an independent automation branch. Start the bounded effect
+    // from the inbound routing decision, without waiting for canonical storage.
+    if (useIndependentIngest && this.roomControl?.respond) {
+      for (const [index, { envelope, ownMid, control, sensitive }] of prepared.entries()) {
+        const decision = decisions[index]!;
+        const promptAdmitted = decision.eligible || 'workspaceFailure' in decision;
+        const primaryAdminAction = Boolean('action' in decision && decision.action !== 'ignore'
+          && 'primaryAdminSenderId' in decision && decision.primaryAdminSenderId);
+        if (envelope.ingestion.source !== 'live' || control.type !== 'none'
+          || (recovered && !recovered.receiptCurrent) || existingRoutes.has(envelope.messageId)
+          || administrative.has(envelope.messageId) || sensitive || primaryAdminAction || promptAdmitted
+          || primaryAdminLookupFailedIds.has(envelope.messageId)) continue;
+        const body = ownMentionBody(envelope, ownMid);
+        if (body !== null) this.scheduleRoomEffect(async () => {
+          const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
+          if (!await this.roomControl?.isEnabled?.(key)) await this.roomControl?.respond?.(envelope, body);
+        });
+      }
+    }
+    type StoredBatch = Awaited<ReturnType<MessageRepository['ingestBatchSource']>>;
+    type AdmittedBatch = Awaited<ReturnType<MessageRepository['admitLiveBatch']>>;
+    let result: StoredBatch & Partial<Pick<AdmittedBatch, 'jobIds' | 'jobMessageIds' | 'jobStatuses'
+      | 'primaryAdminActionMessageIds' | 'routeDecisions'>>;
+    let admissionResult: Awaited<ReturnType<MessageRepository['admitLiveBatch']>> | null = null;
+    if (useIndependentIngest && recovered) {
+      const admittedBatch: AdmittedBatch = await admissionPromise!.catch((error: unknown) => {
+        this.reportFailure('admission', error);
+        return { jobIds: [], jobMessageIds: [], jobStatuses: [], primaryAdminActionMessageIds: [], routeDecisions: decisions };
+      });
+      try { await this.messages.recordBatchRoutes(sourceBatch, admittedBatch.routeDecisions,
+        new Set(admittedBatch.jobStatuses.map((status) => status.sourceMessageId))); } catch (error) { this.reportFailure('persist', error); }
+      admissionResult = admittedBatch;
+      result = { inserted: 0, duplicate: 0, insertedMessageIds: [], changedMessageIds: [],
+        readPositionsChanged: 0, readPositionChanges: [], ...admittedBatch };
+    } else if (useIndependentIngest) {
+      try { result = await storagePromise!; }
+      catch (error) { await admissionPromise?.catch(() => undefined); throw error; }
+      await ackPromise;
+      const committedAdmission: AdmittedBatch = await admissionPromise!.then((value) => value,
+        (error: unknown) => { this.reportFailure('admission', error); return { jobIds: [], jobMessageIds: [], jobStatuses: [], primaryAdminActionMessageIds: [], routeDecisions: decisions }; });
+      admissionResult = committedAdmission;
+      try {
+        await this.messages.recordBatchRoutes(sourceBatch, committedAdmission.routeDecisions,
+          new Set(committedAdmission.jobStatuses.map((status) => status.sourceMessageId)));
+      } catch { /* route projection is best effort; source provenance remains available for replay */ }
+      result = { ...result, ...committedAdmission };
+    } else {
+      result = await this.messages.ingestBatchAndRoute(sourceBatch, decisions);
+      this.publishCommittedJobStatuses?.(result.jobStatuses);
+    }
+    if (admissionResult) this.publishCommittedJobStatuses?.(admissionResult.jobStatuses);
     // One refresh per affected conversation (deduplicated by the repository); a publish failure never blocks ingest or ACK.
     if (result.readPositionsChanged > 0 && result.readPositionChanges?.length) {
       try { this.publishReadPositionChanges?.(result.readPositionChanges); } catch { /* UI refresh is best effort */ }
@@ -569,10 +681,11 @@ export class LineService {
       if (queued.has(envelope.messageId)) this.agents.kick(action.key);
       await this.applyPendingAction(binding, action.key, envelope.messageId);
     }
-    // The worker may advance its durable cursor after the archive and routing effects commit.
-    // Attachment bytes remain durably queued and must not hold the LINE receive cursor open.
-    await this.worker.send({ type: 'ackBatch', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
-      controlEpoch: binding.controlEpoch, batchId: event.batchId, cursorAfter: event.cursorAfter });
+    if (!useIndependentIngest) {
+      // Keep the legacy path for narrow service test doubles; production ACK is issued from storagePromise above.
+      await this.worker.send({ type: 'ackBatch', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+        controlEpoch: binding.controlEpoch, batchId: event.batchId, cursorAfter: event.cursorAfter });
+    }
     // Only admitted (newly inserted) messages advance the /權限 dialogue, in batch order; duplicates and
     // failed ingestion never reach enqueue(), so a replay leaves the pending state untouched. enqueue() is
     // synchronous and bounded; replies go through the shared transport and never hold ingest or ack.
@@ -585,7 +698,7 @@ export class LineService {
       if (primaryAdminLookupFailedIds.has(envelope.messageId)) continue;
       if (control.type === 'command') {
         this.scheduleRoomEffect(() => this.roomControl?.handle(control.command));
-      } else if (control.type === 'none' && !administrative.has(envelope.messageId)
+      } else if (!useIndependentIngest && control.type === 'none' && !administrative.has(envelope.messageId)
         && !primaryAdminActions.has(envelope.messageId) && !committedAgentActions.has(envelope.messageId)
         && this.roomControl?.respond) {
         const body = ownMentionBody(envelope, ownMid);
@@ -595,7 +708,7 @@ export class LineService {
         });
       }
     }
-    return result.insertedMessageIds;
+    return [...new Set([...result.insertedMessageIds, ...(result.changedMessageIds ?? [])])];
   }
 
   async idleRoomEffects(): Promise<void> {
@@ -606,9 +719,9 @@ export class LineService {
     if (!work || this.roomEffects.size >= 64) return;
     let operation: Promise<void>;
     try { operation = Promise.resolve(work()).then(() => undefined); }
-    catch { return; }
+    catch (error) { this.reportFailure('execute', error); return; }
     this.roomEffects.add(operation);
-    void operation.finally(() => this.roomEffects.delete(operation)).catch(() => undefined);
+    void operation.finally(() => this.roomEffects.delete(operation)).catch((error: unknown) => this.reportFailure('execute', error));
   }
 }
 

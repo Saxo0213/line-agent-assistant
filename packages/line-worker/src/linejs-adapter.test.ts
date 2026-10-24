@@ -15,6 +15,75 @@ import type { Pool } from 'pg';
 import type { AttachmentDownloadIdentity } from './attachment-download.js';
 import { normalizeOperation } from './normalizer.js';
 import { validateAttachmentMessage } from './attachment-download.js';
+import { boundedChatResourceResponseCode, ChatResourceFailure } from './chat-resource-error.js';
+
+it.each([
+  [{ code: 0 }, 0],
+  [{ code: 73 }, 73],
+  [{ code: -73 }, -73],
+  [{}, 'missing'],
+  [{ code: 'private response' }, 'non_numeric'],
+  [{ code: 1_000_000_001 }, 'non_numeric'],
+])('classifies only a bounded numeric LINEJS Note response code (%j)', (response, expected) => {
+  expect(boundedChatResourceResponseCode(response.code, Object.hasOwn(response, 'code'))).toBe(expected);
+});
+
+it.each([
+  [{ code: 403, message: 'private response text', result: {} }, 403],
+  [{ result: {} }, 'missing'],
+  [{ code: 'private response text', result: {} }, 'non_numeric'],
+])('preserves a safe code from a fake LINEJS Note list response (%j)', async (response, expectedCode) => {
+  const { Login } = await import(new URL('../../../node_modules/@evex/linejs/base/login/mod.js', import.meta.url).href) as {
+    Login: { prototype: { login: (...args: any[]) => Promise<unknown> } };
+  };
+  const { Timeline } = await import(new URL('../../../node_modules/@evex/linejs/base/timeline/mod.js', import.meta.url).href) as {
+    Timeline: { prototype: { initTimeline: (...args: any[]) => Promise<unknown>; listPost: (...args: any[]) => Promise<unknown> } };
+  };
+  const login = vi.spyOn(Login.prototype, 'login').mockImplementation(async function (this: { client: BaseClient }) {
+    this.client.profile = { mid: `u${'a'.repeat(32)}` } as never;
+  });
+  const init = vi.spyOn(Timeline.prototype, 'initTimeline').mockResolvedValue(undefined);
+  const list = vi.spyOn(Timeline.prototype, 'listPost').mockResolvedValue(response as never);
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async () => { throw new Error('fake LINEJS response must not use the network'); } });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    await adapter.loginToken(jwt);
+    const failure = await adapter.readChatResource({ type: 'chatResourceRead', ...lease, chatType: 'group', chatId: attachmentIdentity.chatId,
+      requestId: 'note-response-code', action: 'listNotes', timeoutMs: 5000 }, { signal: new AbortController().signal })
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({ category: 'response_code_invalid', responseCode: expectedCode });
+    expect(failure).toBeInstanceOf(ChatResourceFailure);
+    expect((failure as Error).message).toBe('response_code_invalid');
+    expect(JSON.stringify(failure)).not.toContain('private response text');
+    expect(list).toHaveBeenCalledWith({ homeId: attachmentIdentity.chatId });
+  } finally { login.mockRestore(); init.mockRestore(); list.mockRestore(); }
+});
+
+it('normalizes a successful fake LINEJS Note list response without using the network', async () => {
+  const { Login } = await import(new URL('../../../node_modules/@evex/linejs/base/login/mod.js', import.meta.url).href) as {
+    Login: { prototype: { login: (...args: any[]) => Promise<unknown> } };
+  };
+  const { Timeline } = await import(new URL('../../../node_modules/@evex/linejs/base/timeline/mod.js', import.meta.url).href) as {
+    Timeline: { prototype: { initTimeline: (...args: any[]) => Promise<unknown>; listPost: (...args: any[]) => Promise<unknown> } };
+  };
+  const login = vi.spyOn(Login.prototype, 'login').mockImplementation(async function (this: { client: BaseClient }) {
+    this.client.profile = { mid: `u${'a'.repeat(32)}` } as never;
+  });
+  const init = vi.spyOn(Timeline.prototype, 'initTimeline').mockResolvedValue(undefined);
+  const list = vi.spyOn(Timeline.prototype, 'listPost').mockResolvedValue({ code: 0, result: {
+    posts: [{ postId: 'post-1', createdTime: 12, contents: { text: 'Safe title' } }], nextCursor: 'next-1',
+  } } as never);
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async () => { throw new Error('fake LINEJS response must not use the network'); } });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    await adapter.loginToken(jwt);
+    await expect(adapter.readChatResource({ type: 'chatResourceRead', ...lease, chatType: 'group', chatId: attachmentIdentity.chatId,
+      requestId: 'note-success', action: 'listNotes', timeoutMs: 5000 }, { signal: new AbortController().signal }))
+      .resolves.toEqual({ notes: [{ postId: 'post-1', createdTime: 12, text: 'Safe title', content: { text: 'Safe title' } }], nextCursor: 'next-1' });
+  } finally { login.mockRestore(); init.mockRestore(); list.mockRestore(); }
+});
 
 const openablePng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64');
 const archivedOid = `OID_123${'a'.repeat(56)}`;
@@ -60,6 +129,39 @@ const lease = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpo
 const cursor = { version: 1 as const, revision: '0', globalRev: '0', individualRev: '0' };
 const temporary: string[] = [];
 afterEach(async () => { for (const path of temporary.splice(0)) await rm(path, { recursive: true, force: true }); });
+async function linejsRefreshResponse(accessToken: string, refreshToken: string): Promise<Response> {
+  const { Protocols } = await import(new URL('../../../node_modules/@evex/linejs/base/thrift/mod.js', import.meta.url).href) as {
+    Protocols: Record<number, any>;
+  };
+  const client = new BaseClient({ device: 'DESKTOPWIN' });
+  const body = Buffer.from(client.thrift.writeThrift([[12, 0, [
+    [11, 1, accessToken], [10, 2, 3600], [10, 4, Math.floor(Date.now() / 1000)], [11, 5, refreshToken],
+  ]]], 'refresh', Protocols[4]!));
+  body[1] = 0x41; // Compact protocol version 1 with a REPLY message type.
+  client.thrift.readThrift(body, Protocols[4]!);
+  return new Response(body);
+}
+async function linejsRefreshDemandResponse(methodName: string): Promise<Response> {
+  const { Protocols } = await import(new URL('../../../node_modules/@evex/linejs/base/thrift/mod.js', import.meta.url).href) as {
+    Protocols: Record<number, any>;
+  };
+  const client = new BaseClient({ device: 'DESKTOPWIN' });
+  const body = Buffer.from(client.thrift.writeThrift([[12, 1, [[8, 1, 119], [11, 2, 'refresh required']]]], methodName, Protocols[4]!));
+  body[1] = 0x41; // Compact protocol version 1 with a REPLY message type.
+  const parsed = client.thrift.readThrift(body, Protocols[4]!);
+  client.thrift.rename_data(parsed);
+  expect(parsed.data.e.code).toBe('MUST_REFRESH_V3_TOKEN');
+  return new Response(body);
+}
+async function linejsProfileResponse(mid: string): Promise<Response> {
+  const { Protocols } = await import(new URL('../../../node_modules/@evex/linejs/base/thrift/mod.js', import.meta.url).href) as {
+    Protocols: Record<number, any>;
+  };
+  const client = new BaseClient({ device: 'DESKTOPWIN' });
+  const body = Buffer.from(client.thrift.writeThrift([[12, 0, [[11, 1, mid], [11, 20, 'Agent']]]], 'getProfile', Protocols[4]!));
+  body[1] = 0x41;
+  return new Response(body);
+}
 const attachmentIdentity = { accountId: 'account-A', chatType: 'group' as const, chatId: `c${'b'.repeat(32)}`,
   ownMid: `u${'a'.repeat(32)}`, messageId: '9', kind: 'file' as const, externalAttachmentId: 'OID_123' };
 function encryptedAttachmentMessage(kind: 'image' | 'file' | 'video' | 'audio' = 'file') {
@@ -1588,6 +1690,174 @@ it('keeps reads in monitor mode after control revocation while denying every LIN
 
     expect(requests).toHaveLength(5);
     expect(new URL(requests.at(-1)!.url).hostname).toBe('obs.line-apps.com');
+  } finally { profile.mockRestore(); }
+});
+
+it('pre-refreshes a due saved session with native linejs auth and emits one complete rotated snapshot', async () => {
+  const { TalkService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/talk/mod.js', import.meta.url).href) as {
+    TalkService: { prototype: { getProfile: (...args: any[]) => Promise<unknown> } };
+  };
+  const refreshedToken = [Buffer.from('{"alg":"HS256"}').toString('base64url'),
+    Buffer.from('{"sub":"u-self","v":"refreshed"}').toString('base64url'), 'signature'].join('.');
+  const profile = vi.spyOn(TalkService.prototype, 'getProfile').mockResolvedValue({ mid: 'u-self', displayName: 'Agent' });
+  const requests: Request[] = [];
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => { requests.push(request); return await linejsRefreshResponse(refreshedToken, 'rotated-refresh-token'); } });
+  const rotations: unknown[] = [];
+  const storageEvents: unknown[] = [];
+  adapter.on('credentials', (value) => rotations.push(value));
+  adapter.on('storage', (value) => storageEvents.push(value));
+  try {
+    await adapter.installSecrets({ token: jwt, qrCert: null,
+      e2eeStorage: { refreshToken: 'saved-refresh-token', expire: 1, retained: 'kept' } });
+    await adapter.loginToken(jwt);
+
+    expect(requests).toHaveLength(1);
+    expect(new URL(requests[0]!.url).pathname).toBe('/EXT/auth/tokenrefresh/v1');
+    expect(rotations).toEqual([{ token: refreshedToken, e2eeStorage: {
+      refreshToken: 'rotated-refresh-token', expire: expect.any(Number), retained: 'kept',
+    } }]);
+    expect(storageEvents).toEqual([]);
+  } finally { profile.mockRestore(); }
+});
+
+it('preserves the saved snapshot on a temporary native refresh failure', async () => {
+  const failure = new Error('fixture network unavailable');
+  const requests: Request[] = [];
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => { requests.push(request); throw failure; } });
+  const rotations: unknown[] = [];
+  const storageEvents: unknown[] = [];
+  adapter.on('credentials', (value) => rotations.push(value));
+  adapter.on('storage', (value) => storageEvents.push(value));
+  await adapter.installSecrets({ token: jwt, qrCert: null,
+    e2eeStorage: { refreshToken: 'saved-refresh-token', expire: 1, retained: 'kept' } });
+  await expect(adapter.loginToken(jwt)).rejects.toBe(failure);
+  expect(requests).toHaveLength(1);
+  expect(new URL(requests[0]!.url).pathname).toBe('/EXT/auth/tokenrefresh/v1');
+  expect(rotations).toEqual([]);
+  expect(storageEvents).toEqual([]);
+});
+
+it('classifies explicit refresh invalidation through the fake physical dispatcher', async () => {
+  const invalidation = Object.assign(new Error('fixture LINE invalidation'), { name: 'RequestError', type: 'RequestError',
+    data: { code: 'NOT_AUTHORIZED_DEVICE' } });
+  const requests: Request[] = [];
+  const invalidated = vi.fn();
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => { requests.push(request); throw invalidation; } });
+  adapter.on('authInvalidated', invalidated);
+  const rotations: unknown[] = [];
+  adapter.on('credentials', (value) => rotations.push(value));
+  await adapter.installSecrets({ token: jwt, qrCert: null,
+    e2eeStorage: { refreshToken: 'saved-refresh-token', expire: 1 } });
+
+  await expect(adapter.loginToken(jwt)).rejects.toBe(invalidation);
+
+  expect(requests).toHaveLength(1);
+  expect(new URL(requests[0]!.url).pathname).toBe('/EXT/auth/tokenrefresh/v1');
+  expect(invalidated).toHaveBeenCalledOnce();
+  expect(rotations).toEqual([]);
+});
+
+it('does not refresh or replay a mutation when the server demands token refresh', async () => {
+  const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
+    E2EE: { prototype: { encryptE2EEMessage: (...args: any[]) => Promise<Buffer[]> } };
+  };
+  const { LegyEncryptedTransport } = await import(new URL('../../../node_modules/@evex/linejs/base/request/legy.js', import.meta.url).href) as {
+    LegyEncryptedTransport: { prototype: { fetch: (request: Request, fetcher: (request: Request) => Promise<Response>,
+      options: { endpoint?: string }) => Promise<Response> } };
+  };
+  const encrypt = vi.spyOn(E2EE.prototype, 'encryptE2EEMessage').mockResolvedValue([Buffer.from([1])]);
+  let sends = 0;
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async function(_request, fetcher, options) {
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    sends += 1;
+    return await linejsRefreshDemandResponse('sendMessage');
+  });
+  const requests: Request[] = [];
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true,
+    physicalTransport: async (request) => {
+      requests.push(request);
+      return new URL(request.url).pathname === '/EXT/auth/tokenrefresh/v1'
+        ? await linejsRefreshResponse(jwt, 'rotated-refresh-token') : new Response();
+    } });
+  await adapter.installSecrets({ token: jwt, qrCert: null,
+    e2eeStorage: { refreshToken: 'saved-refresh-token', expire: 1 } });
+  try {
+    let failure: unknown;
+    try { await adapter.send({ chatType: 'direct', chatId: 'u-peer' }, 'hello', null, lease); }
+    catch (error) { failure = error; }
+    expect(sends).toBe(1);
+    expect(requests.filter((request) => new URL(request.url).pathname === '/enc')).toHaveLength(1);
+    expect(requests.filter((request) => new URL(request.url).pathname === '/EXT/auth/tokenrefresh/v1')).toHaveLength(0);
+    expect(failure).toMatchObject({ code: 'SIDE_EFFECT_DENIED' });
+  } finally { encrypt.mockRestore(); legy.mockRestore(); }
+});
+
+it('refreshes and retries a read when the server demands token refresh', async () => {
+  const { LegyEncryptedTransport } = await import(new URL('../../../node_modules/@evex/linejs/base/request/legy.js', import.meta.url).href) as {
+    LegyEncryptedTransport: { prototype: { fetch: (request: Request, fetcher: (request: Request) => Promise<Response>,
+      options: { endpoint?: string }) => Promise<Response> } };
+  };
+  let readAttempts = 0;
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async function(request, fetcher, options) {
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    return ++readAttempts === 1 ? await linejsRefreshDemandResponse('getProfile') : await linejsProfileResponse(`u${'a'.repeat(32)}`);
+  });
+  const requests: Request[] = [];
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => {
+      requests.push(request);
+      return new URL(request.url).pathname === '/EXT/auth/tokenrefresh/v1'
+        ? await linejsRefreshResponse(jwt, 'rotated-refresh-token') : new Response();
+    } });
+  const rotations: unknown[] = [];
+  adapter.on('credentials', (value) => rotations.push(value));
+  await adapter.installSecrets({ token: jwt, qrCert: null,
+    e2eeStorage: { refreshToken: 'saved-refresh-token', expire: Math.floor(Date.now() / 1000) + 3600 } });
+  try {
+    await expect(adapter.refreshOwnProfile()).resolves.toEqual({ ownMid: `u${'a'.repeat(32)}`, displayName: 'Agent' });
+    expect(requests.filter((request) => new URL(request.url).pathname === '/enc')).toHaveLength(2);
+    expect(requests.filter((request) => new URL(request.url).pathname === '/EXT/auth/tokenrefresh/v1')).toHaveLength(1);
+    expect(rotations).toEqual([{ token: jwt, e2eeStorage: {
+      refreshToken: 'rotated-refresh-token', expire: expect.any(Number),
+    } }]);
+  } finally { legy.mockRestore(); }
+});
+
+it('coalesces overlapping profile refreshes and resumes ordinary storage events afterward', async () => {
+  const { TalkService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/talk/mod.js', import.meta.url).href) as {
+    TalkService: { prototype: { getProfile: (...args: any[]) => Promise<unknown> } };
+  };
+  const refreshedToken = [Buffer.from('{"alg":"HS256"}').toString('base64url'),
+    Buffer.from('{"sub":"u-self","v":"refreshed"}').toString('base64url'), 'signature'].join('.');
+  let profileCalls = 0;
+  const profile = vi.spyOn(TalkService.prototype, 'getProfile').mockImplementation(async function(this: any) {
+    if (profileCalls++ === 0) await Promise.all([
+      this.client.auth.tryRefreshToken(), this.client.auth.tryRefreshToken(),
+    ]);
+    return { mid: 'u-self', displayName: 'Agent' };
+  });
+  const requests: Request[] = [];
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => { requests.push(request); return await linejsRefreshResponse(refreshedToken, 'rotated-refresh-token'); } });
+  const rotations: any[] = [];
+  const storageEvents: unknown[] = [];
+  adapter.on('credentials', (value) => rotations.push(value));
+  adapter.on('storage', (value) => storageEvents.push(value));
+  try {
+    await adapter.installSecrets({ token: jwt, qrCert: null,
+      e2eeStorage: { refreshToken: 'saved-refresh-token', expire: Math.floor(Date.now() / 1000) + 3600 } });
+    await adapter.loginToken(jwt);
+    expect(requests).toHaveLength(1);
+    expect(rotations).toEqual([{ token: refreshedToken, e2eeStorage: {
+      refreshToken: 'rotated-refresh-token', expire: expect.any(Number),
+    } }]);
+    expect(storageEvents).toEqual([]);
+
+    await adapter.loginToken(JSON.stringify({ accessToken: jwt, refreshToken: 'ordinary-refresh', expire: 4_000_000_000 }));
+    expect(storageEvents).toHaveLength(2);
   } finally { profile.mockRestore(); }
 });
 

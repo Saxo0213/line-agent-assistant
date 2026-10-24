@@ -3,9 +3,9 @@ import { ENGLISH_DESKTOP_COPY } from './desktop-copy.js';
 import { KOREAN_DESKTOP_COPY_PART9 } from './desktop-copy-ko-part9.js';
 
 describe('Korean desktop copy part 9', () => {
-  it('contains exactly the ten new English permission keys', () => {
-    const expected = ['permissionCurrentChat', 'permissionCurrentChatDescription', 'permissionAllChats', 'permissionAllChatsDescription', 'permissionFolderRead', 'permissionFolderReadDescription', 'permissionFolderWrite', 'permissionFolderWriteDescription', 'permissionLocalTools', 'permissionLocalToolsDescription'];
-    expect(expected).toHaveLength(10);
+  it('contains the rotation interval label, permission keys, and unsend keys', () => {
+    const expected = ['agentStatusRotationIntervalSeconds', 'externalMonitorAuthorityChanged', 'externalMonitorCheckpointChanged', 'externalMonitorSourceChanged', 'externalMonitorReaderStartupFailed', 'externalMonitorReaderFailed', 'externalMonitorDatabaseFailed', 'externalMonitorFailureUnknown', 'permissionCurrentChat', 'permissionCurrentChatDescription', 'permissionAllChats', 'permissionAllChatsDescription', 'permissionFolderRead', 'permissionFolderReadDescription', 'permissionFolderWrite', 'permissionFolderWriteDescription', 'permissionLocalTools', 'permissionLocalToolsDescription', 'unsendMessage', 'unsendConfirm', 'unsendTimeWindow', 'unsendOneHour', 'unsendSevenDays', 'unsendWindowSaved', 'unsendFailed', 'historyReadFailed', 'chatResourceReadFailed', 'profileRefreshFailed', 'messageSendFailed', 'messageUnsendFailed', 'messageReactionFailed', 'friendRelationCheckFailed', 'friendAddFailed', 'attachmentDownloadOperationFailed', 'credentialRestoreFailed', 'lineSyncFailed', 'mediaWasNotSentTryAgain', 'mediaSendingRequiresDirectOrGroupChat'];
+    expect(expected).toHaveLength(38);
     expect(Object.keys(KOREAN_DESKTOP_COPY_PART9).sort()).toEqual(expected.sort());
   });
 

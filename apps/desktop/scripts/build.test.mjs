@@ -34,6 +34,15 @@ test('the packaging config excludes source maps and sets the approved Electron f
   assert.match(fuses, /onlyLoadAppFromAsar: true/);
 });
 
+test('the chat resource test helper is built outside packaged dist inputs', async () => {
+  const root = path.join(import.meta.dirname, '..', '..', '..');
+  const builder = await readFile(path.join(root, 'electron-builder.yml'), 'utf8');
+  const script = await readFile(path.join(root, 'apps', 'desktop', 'scripts', 'build-chat-resource-archive.mjs'), 'utf8');
+  assert.match(builder, /^  - dist\/\*\*\/\*$/m);
+  assert.match(script, /resolve\(root, '\.\.', '\.\.', 'node_modules', '\.cache', 'chat-resource-archive', 'ChatResourceArchiveHost\.Test\.exe'\)/);
+  assert.match(script, /rmSync\(staleTestOutput, \{ force: true \}\)/);
+});
+
 test('the packaging config ships only the en, zh, ja and ko Electron locales', async () => {
   const config = await readFile(path.join(import.meta.dirname, '..', '..', '..', 'electron-builder.yml'), 'utf8');
   const block = config.match(/^electronLanguages:\r?\n((?: {2}- .+\r?\n?)+)/m);

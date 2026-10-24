@@ -12,6 +12,7 @@ import type { ExternalSourceProbeAdmission } from '../external-source-probe-admi
 import type { ProcessLiveness } from './stale-owner-marker-reconciliation.js';
 import type { ImportCursor } from './protocol.js';
 import type { OfficialBuildTrustPort } from '../official-build-trust.js';
+import { ExternalMonitorDiagnosticFailure } from '../external-monitor-diagnostics.js';
 
 const execFileAsync = promisify(execFile);
 const PROCESS_IDENTITY_TIMEOUT_MS = 5_000;
@@ -135,6 +136,7 @@ export async function createJsOfficialSnapshotImporter(input: Readonly<{
         ...(input.buildTrust ? { buildTrust: input.buildTrust } : {}),
         beforeCreate: async ({ signal }) => {
           if (signal.aborted) throw new Error('reader_cancelled');
+          request.onPhase?.('private_directory_preparation');
           await ensurePrivateDirectory(requestRoot);
           if (signal.aborted) throw new Error('reader_cancelled');
         },
@@ -142,6 +144,7 @@ export async function createJsOfficialSnapshotImporter(input: Readonly<{
         ...(request.onReady ? { onReady: request.onReady } : {}),
         ...(request.onDirectoryPage ? { onDirectoryPage: request.onDirectoryPage } : {}),
         onProgress: request.onProgress,
+        ...(request.onPhase ? { onPhase: request.onPhase } : {}),
         onPage: request.onPage,
       });
     },
@@ -203,6 +206,52 @@ async function inspectProcess(pid: number): Promise<OwnerProcessIdentity | null>
 }
 
 async function ensurePrivateDirectory(directory: string): Promise<void> {
+  try { await ensurePrivatePath(directory); }
+  catch (error) {
+    if (error instanceof ExternalMonitorDiagnosticFailure) throw error;
+    throw new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup', 'private_directory_path_validation', 'private_directory_preparation');
+  }
+  let result: { stdout: string };
+  try {
+    result = await setPrivateDirectoryAcl(directory);
+  } catch (error) {
+    const detail = classifyPrivateDirectoryAclResult(undefined, error)!;
+    throw new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup', detail, 'private_directory_preparation');
+  }
+  const outputFailure = classifyPrivateDirectoryAclResult(result);
+  if (outputFailure) {
+    throw new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup', outputFailure, 'private_directory_preparation');
+  }
+}
+
+/** Node's execFile timeout rejection is code=null, killed=true, signal=SIGTERM. */
+export function isExecFileTimeout(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const result = error as { code?: unknown; killed?: unknown; signal?: unknown };
+  return result.code === 'ETIMEDOUT'
+    || (result.code === null && result.killed === true && result.signal === 'SIGTERM');
+}
+
+export function classifyPrivateDirectoryAclResult(result: { stdout: string } | undefined, error?: unknown):
+  'private_directory_acl_command_timeout' | 'private_directory_acl_command_failed' | 'private_directory_acl_unexpected_output' | undefined {
+  if (error !== undefined) return isExecFileTimeout(error)
+    ? 'private_directory_acl_command_timeout' : 'private_directory_acl_command_failed';
+  return result?.stdout.trim() === 'restricted' ? undefined : 'private_directory_acl_unexpected_output';
+}
+
+/** Build the environment for the ACL command without changing the app's inherited environment. */
+export function createPrivateDirectoryAclEnvironment(
+  environment: NodeJS.ProcessEnv,
+  windowsDirectory: string | undefined,
+): NodeJS.ProcessEnv {
+  if (!windowsDirectory || !path.isAbsolute(windowsDirectory)) throw new Error('reader_windows_directory_invalid');
+  return {
+    ...environment,
+    PSModulePath: path.join(windowsDirectory, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'),
+  };
+}
+
+async function ensurePrivatePath(directory: string): Promise<void> {
   const resolved = path.resolve(directory);
   const root = path.parse(resolved).root;
   let current = root;
@@ -215,6 +264,10 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
       throw new Error('reader_owner_directory_invalid');
     }
   }
+}
+
+async function setPrivateDirectoryAcl(directory: string): Promise<{ stdout: string }> {
+  const resolved = path.resolve(directory);
   const escaped = resolved.replaceAll("'", "''");
   const script = `$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; ` +
     `$acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); ` +
@@ -225,6 +278,7 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
     `Set-Acl -LiteralPath '${escaped}' -AclObject $acl; 'restricted'`;
   const result = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
     windowsHide: true, timeout: PROCESS_IDENTITY_TIMEOUT_MS, maxBuffer: 1024,
+    env: createPrivateDirectoryAclEnvironment(process.env, process.env.SystemRoot ?? process.env.WINDIR),
   });
-  if (result.stdout.trim() !== 'restricted') throw new Error('reader_owner_directory_invalid');
+  return result;
 }

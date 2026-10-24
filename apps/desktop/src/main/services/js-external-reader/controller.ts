@@ -13,6 +13,7 @@ import { FRAME_LIMITS, FrameDecoder, encodeFrame, validateFrameEnvelope, type Di
 import { verifyJsExternalReaderResources } from './resources.js';
 import { BuildTrustSession, FAILURE_BUILD_KEYS, INVENTORY_BUILD_KEYS } from './build-trust-session.js';
 import type { OfficialBuildTrustPort } from '../official-build-trust.js';
+import type { ExternalMonitorFailurePhase } from '../external-monitor-diagnostics.js';
 import type { ExternalSourceProbeAdmission } from '../external-source-probe-admission.js';
 import {
   runOwnerReadySession,
@@ -648,7 +649,9 @@ export class JsExternalReaderController {
     onPage(page: DirectMonitorPage, signal?: AbortSignal): Promise<ImportCursor | null> | ImportCursor | null;
     signal?: AbortSignal; pollIntervalMs?: number;
     onReady?(access: NativeMonitorAccess, signal?: AbortSignal): Promise<void> | void;
+    onPhase?(phase: ExternalMonitorFailurePhase): void;
   }): Promise<void> {
+    input.onPhase?.('reader_resource_verification');
     if (this.#active) throw new Error('reader_already_active');
     if (!/^[a-f0-9]{32}$/.test(input.requestId) || !/^[0-9a-f]{64}$/.test(input.sourceIdentityDigest) ||
         !input.expectedMid || !Number.isSafeInteger(input.deadlineUnixMs) || input.deadlineUnixMs <= Date.now() ||
@@ -664,6 +667,7 @@ export class JsExternalReaderController {
     const bridgePath = await realpath(input.bridgePath);
     if (bridgePath !== resources.bridgePath) throw new Error('reader_resource_integrity_failed');
     this.#active = true;
+    input.onPhase?.('reader_request_resources');
     let frames: FrameStream | undefined;
     let closed: Promise<number | null> | undefined;
     let child: FixtureChild | undefined;
@@ -674,6 +678,7 @@ export class JsExternalReaderController {
         mainIdentity: input.mainIdentity, bridgeImagePath: bridgePath,
         bridgeImageSha256: resources.bridgeSha256,
         admission: this.#admission, markerStore: input.markerStore, inspectProcess: input.inspectProcess,
+        ...(input.onPhase ? { onPhase: input.onPhase } : {}),
         ...(input.beforeCreate ? { beforeCreate: input.beforeCreate } : {}),
         ...(input.signal ? { signal: input.signal } : {}),
         spawnChild: () => {
@@ -687,6 +692,7 @@ export class JsExternalReaderController {
           return {
             pid: running.pid, closedEvent: closed, isAlive: () => running.exitCode === null && running.signalCode === null,
             async prepareOwnerReady() {
+              input.onPhase?.('protocol_source_ready');
               const hello = await frames!.next(startupDeadline, input.signal);
               if (!validateFrameEnvelope(hello, { requestId: input.requestId, expectedSequence: 1,
                     allowedKeys: ['bridgeVersion', 'capability'] }) || hello.type !== 'hello' ||
@@ -707,6 +713,7 @@ export class JsExternalReaderController {
           };
         },
         runAfterReady: async ({ signal, trackSettlement }) => {
+          input.onPhase?.('protocol_source_ready');
           const stream = frames!;
           let outSeq = 2, inSeq = 2, pageNumber = 0;
           let cursor = input.cursor;
@@ -743,6 +750,7 @@ export class JsExternalReaderController {
               inventory.type !== 'inventory' || !validCandidateCount(inventory.candidateCount) ||
               typeof inventory.sourceIdentityDigest !== 'string') throw new Error('reader_inventory_shape_invalid');
           if (inventory.processCount !== 1) throw new Error('reader_process_count_invalid');
+          input.onPhase?.('protocol_source_ready');
           // The reader selects the active (newest) database. A different digest means official LINE is on another account
           // than the stored source (or its database was replaced): fail closed, never retarget or move the source.
           if (inventory.sourceIdentityDigest !== input.sourceIdentityDigest) throw new Error('reader_source_identity_changed');
@@ -850,6 +858,7 @@ export class JsExternalReaderController {
           // One directory pass per reader session, before the first message poll.
           let directoryPageNumber = 0;
           for (;;) {
+            input.onPhase?.('directory_callback_ack');
             if (signal.aborted) throw new Error('reader_cancelled');
             const expectedPageNumber = directoryPageNumber + 1;
             await writeFrame(child!, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'directory_next', pageNumber: expectedPageNumber });
@@ -870,6 +879,7 @@ export class JsExternalReaderController {
             if (!directoryPage.hasMore) break;
           }
           for (;;) {
+            input.onPhase?.('first_poll_callback_ack');
             if (signal.aborted) throw new Error('reader_cancelled');
             await processAuxiliary();
             await writeFrame(child!, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'poll',

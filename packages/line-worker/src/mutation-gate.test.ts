@@ -266,12 +266,10 @@ describe("trusted RequestClient boundary", () => {
     expect(transport).toHaveBeenCalledTimes(1);
   });
 
-  it("limits a manual grant to one native sendMessage RPC", async () => {
+  it("permits one native unsendMessage RPC through the manual mutation gate", async () => {
     const client = encryptedClient();
     const { gate, physicalTransport } = setup({ requestClient: client });
-    await gate.invokeRpc({ phase: "MANUAL_SEND", lease: LEASE }, { operation: "send", payload: { text: "hello" } });
-    await expect(gate.invokeRpc({ phase: "MANUAL_SEND", lease: LEASE }, { operation: "unsend" }))
-      .rejects.toMatchObject({ code: "SIDE_EFFECT_DENIED" });
+    await gate.invokeRpc({ phase: "MANUAL_SEND", lease: LEASE }, { operation: "unsend" });
     expect(physicalTransport).toHaveBeenCalledTimes(1);
   });
 
@@ -311,7 +309,7 @@ describe("trusted RequestClient boundary", () => {
 
     await expect(gate.invokeRpc(
       { phase: "CONTROL_SEND", lease: LEASE },
-      { operation: "unsend" },
+      { operation: "relation-add" },
     )).rejects.toMatchObject({ code: "SIDE_EFFECT_DENIED" });
     expect(physicalTransport).not.toHaveBeenCalled();
   });

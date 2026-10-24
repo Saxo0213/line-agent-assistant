@@ -59,9 +59,20 @@ describe('production main protocol registration', () => {
     expect(lock).toBeLessThan(ready);
     expect(source).toMatch(/if\s*\(!hasSingleInstanceLock\)\s*\{\s*if\s*\(firstRunSetupOnly\)\s*app\.exit\(0\);\s*else\s*app\.quit\(\)/);
     expect(source).toMatch(/app\.on\(['"]second-instance['"]/);
+    expect(source).toMatch(/second_instance_received/);
+    expect(source).toMatch(/routeSecondInstance\(commandLine\.slice\(1\)/);
+    expect(source).toMatch(/second_instance_\$\{classification\}/);
     expect(source).toMatch(/window\.isMinimized\(\)/);
     expect(source).toMatch(/window\.restore\(\)/);
     expect(source).toMatch(/window\.show\(\)/);
     expect(source).toMatch(/window\.focus\(\)/);
+  });
+
+  it('uses a certain post-drain process exit instead of Electron window close handlers', async () => {
+    const source = await readFile(fileURLToPath(new URL('./main.ts', import.meta.url)), 'utf8');
+    expect(source).toMatch(/exit:\s*\(\)\s*=>\s*\{\s*windowGeometryPersistence\?\.flush\(\);\s*tray\?\.destroy\(\);\s*fileTypeIcons\.disable\(\);\s*app\.exit\(0\);\s*\}/);
+    expect(source).toMatch(/closeServices:\s*\(\)\s*=>\s*shutdownServices\(/);
+    expect(source).toContain("from './desktop-lifecycle.js'");
+    expect(source).toMatch(/restartApplication:\s*\(\)\s*=>\s*setupSession\s*\?\s*setupSession\.succeeded\(\)\s*:\s*lifecycle\.request\('restart'\)/);
   });
 });

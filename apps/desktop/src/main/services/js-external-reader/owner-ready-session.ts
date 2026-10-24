@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { lstat, mkdir, open, opendir, readFile, rename, rmdir, unlink } from 'node:fs/promises';
 import type { ExternalSourceProbeAdmission, ExternalSourceProbeRelease } from '../external-source-probe-admission.js';
+import type { ExternalMonitorFailurePhase } from '../external-monitor-diagnostics.js';
 
 const OWNER_READY_MAX_MS = 45_000;
 
@@ -181,6 +182,7 @@ export async function runOwnerReadySession<T>(input: {
   beforeCreate?(context: { signal: AbortSignal; deadlineUnixMs: number; trackSettlement(settlement: Promise<unknown>): void }): Promise<void> | void;
   signal?: AbortSignal;
   closeTimeoutMs?: number;
+  onPhase?(phase: ExternalMonitorFailurePhase): void;
 }): Promise<T> {
   const requestId = input.requestId;
   const closeTimeoutMs = input.closeTimeoutMs ?? 2_000;
@@ -206,6 +208,7 @@ export async function runOwnerReadySession<T>(input: {
     Math.max(1, deadlineUnixMs - Date.now()));
   // The session deadline and caller signal also bound the wait for the shared slot.
   let releaseAdmission: ExternalSourceProbeRelease;
+  input.onPhase?.('owner_admission_marker');
   try {
     releaseAdmission = await input.admission.acquire(signal);
   } catch (error) {
@@ -240,12 +243,14 @@ export async function runOwnerReadySession<T>(input: {
     if (!ownerReady && Date.now() >= activeDeadlineUnixMs) throw new Error('reader_deadline_exceeded');
   };
   const sameIdentity = async (expected: OwnerProcessIdentity) => {
+    input.onPhase?.('child_identity');
     const actual = await bounded(input.inspectProcess(expected.pid), ownerReady ? Date.now() + 120_000 : activeDeadlineUnixMs, signal);
     return !!actual && identityMatches(expected, actual);
   };
 
   try {
     assertActive();
+    input.onPhase?.('reader_request_resources');
     if (input.beforeCreate) {
       preparationSettled = false;
       const preparation = Promise.resolve().then(() => input.beforeCreate!({ signal, deadlineUnixMs, trackSettlement: trackCallbackSettlement }));
@@ -264,6 +269,7 @@ export async function runOwnerReadySession<T>(input: {
       deadlineUnixMs: input.deadlineUnixMs,
     };
     markerCreated = true;
+    input.onPhase?.('owner_admission_marker');
     currentMarker = provisional;
     const createMarker = input.markerStore.create(provisional);
     const createSettlement = createMarker.then(() => { markerCreated = true; }, () => undefined);
@@ -276,11 +282,13 @@ export async function runOwnerReadySession<T>(input: {
 
     // Spawn is not cancellable until it returns its owned child handle. Do not
     // race it against the parent signal and lose a late-returned process.
+    input.onPhase?.('child_identity');
     child = input.spawnChild();
     if (!child || !Number.isSafeInteger(child.pid) || Number(child.pid) < 1 || !child.isAlive()) {
       throw new Error('reader_child_closed_before_ready');
     }
     assertActive();
+    input.onPhase?.('child_identity');
     const firstIdentity = await bounded(input.inspectProcess(child.pid!), deadlineUnixMs, signal);
     if (!firstIdentity || firstIdentity.pid !== child.pid || !identityMatchesExpectedBridge(firstIdentity, {
       pid: child.pid!, imagePath: input.bridgeImagePath, imageSha256: input.bridgeImageSha256,
@@ -294,9 +302,11 @@ export async function runOwnerReadySession<T>(input: {
       childStartedAt: firstIdentity.startedAt,
       childImagePath: normalizeImagePath(firstIdentity.imagePath),
     };
+    input.onPhase?.('owner_admission_marker');
     const beforePromotion = await bounded(input.markerStore.read(), deadlineUnixMs, signal);
     if (!sameMarker(beforePromotion, provisional)) throw new Error('reader_owner_marker_invalid');
     assertActive();
+    input.onPhase?.('owner_admission_marker');
     const promoteMarker = input.markerStore.promote(provisional, owned);
     const promoteSettlement = promoteMarker.then(() => { currentMarker = owned; }, () => undefined);
     markerMutationSettlement = promoteSettlement.then(() => { markerMutationPending = false; });
@@ -304,15 +314,22 @@ export async function runOwnerReadySession<T>(input: {
     await bounded(promoteMarker, deadlineUnixMs, signal);
     currentMarker = owned;
 
+    input.onPhase?.('owner_admission_marker');
     const promoted = await bounded(input.markerStore.read(), deadlineUnixMs, signal);
     if (!sameMarker(promoted, owned)) throw new Error('reader_owner_marker_invalid');
     assertActive();
+    input.onPhase?.('child_identity');
     if (!child.isAlive() || !(await sameIdentity(firstIdentity))) throw new Error('reader_child_identity_changed');
     assertActive();
-    if (child.prepareOwnerReady) await bounded(child.prepareOwnerReady(requestId), deadlineUnixMs, signal);
+    if (child.prepareOwnerReady) {
+      input.onPhase?.('protocol_source_ready');
+      await bounded(child.prepareOwnerReady(requestId), deadlineUnixMs, signal);
+    }
     assertActive();
+    input.onPhase?.('child_identity');
     if (!child.isAlive() || !(await sameIdentity(firstIdentity))) throw new Error('reader_child_identity_changed');
     assertActive();
+    input.onPhase?.('protocol_source_ready');
     await bounded(child.sendOwnerReady(requestId), deadlineUnixMs, signal);
     if (!child.isAlive()) throw new Error('reader_child_closed_before_ready');
     assertActive();
@@ -335,6 +352,7 @@ export async function runOwnerReadySession<T>(input: {
     requestFailed = true;
     throw error;
   } finally {
+    if (!requestFailed) input.onPhase?.('cleanup');
     clearTimeout(timeout);
     sessionAbort.abort();
     let childClosed = !child;
@@ -378,7 +396,7 @@ export async function runOwnerReadySession<T>(input: {
         }).catch(() => undefined);
       }
     }
-    if (ownerReady && (cleanupUncertain || !releaseSafe || markerMutationPending)) throw new Error('reader_owner_cleanup_uncertain');
+    if (!requestFailed && ownerReady && (cleanupUncertain || !releaseSafe || markerMutationPending)) throw new Error('reader_owner_cleanup_uncertain');
     if (!requestFailed && !cleanupUncertain && childCloseError !== undefined) throw childCloseError;
 
     function releaseAdmissionOnce() {

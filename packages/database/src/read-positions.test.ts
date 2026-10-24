@@ -38,6 +38,7 @@ database('read positions', () => {
     epoch = Number((await pool.query('SELECT control_epoch FROM account_control WHERE singleton=true')).rows[0].control_epoch);
     instance = `rp-worker-${randomUUID()}`;
     await accounts.bindWorker({ accountId: 'rp-A', workerInstanceId: instance, controlEpoch: epoch });
+    await accounts.applyWorkerLogin({ accountId: 'rp-A', workerInstanceId: instance, controlEpoch: epoch }, 'rp-own-mid', 'Read positions');
   });
   afterAll(async () => { await close?.(); });
 
@@ -47,7 +48,18 @@ database('read positions', () => {
       cursorAfter: { version: 1, revision: '2', globalRev: '2', individualRev: '2' },
       envelopes, ...(readReceipts ? { readReceipts } : {}) } as Batch;
   }
-  const ingest = (input: Batch) => repository.ingestBatchAndRoute(input, input.envelopes.map(() => ({ eligible: false as const })));
+  const ingest = async (input: Batch) => {
+    const prior = await pool.query(`SELECT b.batch_id FROM line_accounts a JOIN external_source_batches b
+      ON b.source_id=a.selected_source_id AND b.generation=a.selected_source_generation
+      WHERE a.account_id=$1 AND b.batch_id=$2`, [input.accountId, input.batchId]);
+    if (!prior.rowCount) {
+      const checkpoint = await pool.query<{ cursor: Batch['cursorAfter'] }>(`SELECT c.cursor FROM line_accounts a
+        JOIN external_source_checkpoints c ON c.source_id=a.selected_source_id AND c.generation=a.selected_source_generation
+        WHERE a.account_id=$1`, [input.accountId]);
+      input.cursorBefore = checkpoint.rows[0]?.cursor ?? { version: 1, revision: '0', globalRev: '0', individualRev: '0' };
+    }
+    return repository.ingestBatchAndRoute(input, input.envelopes.map(() => ({ eligible: false as const })));
+  };
   const key = (chatType: 'group' | 'room' | 'direct', chatId: string, accountId = 'rp-A') => ({ accountId, chatType, chatId });
 
   it('inserts, advances, and never regresses a read position', async () => {

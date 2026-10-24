@@ -3,6 +3,7 @@ import { mkdir, open, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { ConversationKey } from '@line-agent/contracts';
 import { NATIVE_PICTURE_ORIGINS } from '@line-agent/contracts';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 
 const LINE_ORIGINS = new Set<string>(NATIVE_PICTURE_ORIGINS);
 const STICKER_ORIGIN = 'https://stickershop.line-scdn.net';
@@ -19,6 +20,7 @@ type MediaSource = { type: 'remote'; url: string; asset?: ImmutableAsset } | { t
 type RemoteFlight = { promise: Promise<MediaBytes | null>; controller: AbortController; waiters: number };
 type MediaBytes = { bytes: Uint8Array; mimeType: string };
 type Options = {
+  onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void;
   fetch?: typeof fetch;
   loadAttachment?: (key: ConversationKey, attachmentId: string, signal: AbortSignal) => Promise<MediaBytes | null>;
   now?: () => number;
@@ -69,6 +71,7 @@ function imageMime(bytes: Buffer, _declaredMime: string | null): ImageMime | nul
 }
 
 export class LineMediaService {
+  readonly #onDiagnostic: Options['onDiagnostic'];
   readonly #fetch: typeof fetch;
   readonly #loadAttachment?: Options['loadAttachment'];
   readonly #now: () => number;
@@ -93,6 +96,7 @@ export class LineMediaService {
   readonly #shutdownController = new AbortController();
 
   constructor(options: Options = {}) {
+    this.#onDiagnostic = options.onDiagnostic;
     this.#fetch = options.fetch ?? fetch;
     this.#loadAttachment = options.loadAttachment;
     this.#now = options.now ?? Date.now;
@@ -110,6 +114,15 @@ export class LineMediaService {
 
   avatarSource(url: string): MediaSource | null {
     return isAllowedRemote(url) ? { type: 'remote', url } : null;
+  }
+
+  async invalidateAvatar(url: string): Promise<void> {
+    if (!isAllowedRemote(url)) return;
+    const key = createHash('sha256').update(new URL(url).href).digest('hex');
+    const flight = this.#remoteFlights.get(key);
+    if (flight) flight.controller.abort(new Error('LINE avatar was refreshed'));
+    await Promise.all([rm(path.join(this.#cacheRoot, `${key}.img`), { force: true }),
+      rm(path.join(this.#cacheRoot, `${key}.json`), { force: true })]);
   }
 
   stickerSource(stickerId: string, animated: boolean): MediaSource | null {
@@ -238,6 +251,7 @@ export class LineMediaService {
     }
     if (signal?.aborted || this.#shutdown) { release(); return cached?.media ?? null; }
     const requestController = new AbortController();
+    const correlationId = randomUUID();
     const relay = () => requestController.abort(signal?.reason ?? this.#shutdownController.signal.reason);
     signal?.addEventListener('abort', relay, { once: true });
     this.#shutdownController.signal.addEventListener('abort', relay, { once: true });
@@ -260,7 +274,10 @@ export class LineMediaService {
           if (!location || redirects === 2) return cached?.media ?? null;
           current = new URL(location, current).href; continue;
         }
-        if (!response.ok || !response.body) { await this.#awaitRemoteCleanup(response.body?.cancel().catch(() => undefined), deadlineAt); return cached?.media ?? null; }
+        if (!response.ok || !response.body) {
+          try { this.#onDiagnostic?.({ operation: 'attachment', stage: 'download', category: !response.ok ? 'transport_failed' : 'invalid_response', recovery: 'retry', outcome: 'failed', statusCode: response.status }, { correlationId }); } catch { /* observer only */ }
+          await this.#awaitRemoteCleanup(response.body?.cancel().catch(() => undefined), deadlineAt); return cached?.media ?? null;
+        }
         let cancelPromise: Promise<void> | undefined;
         const cancelBody = () => { cancelPromise = response.body?.cancel().then(() => undefined).catch(() => undefined); };
         requestController.signal.addEventListener('abort', cancelBody, { once: true });
@@ -286,7 +303,12 @@ export class LineMediaService {
         return { bytes, mimeType };
       }
       return cached?.media ?? null;
-    } catch { return cached?.media ?? null; }
+    } catch (error) {
+      if (!signal?.aborted && !this.#shutdown) {
+        try { this.#onDiagnostic?.(diagnosticFailure('attachment', 'download', error), { correlationId }); } catch { /* observer only */ }
+      }
+      return cached?.media ?? null;
+    }
     finally { clearTimeout(timer); signal?.removeEventListener('abort', relay); this.#shutdownController.signal.removeEventListener('abort', relay); if (temp) await rm(temp, { force: true }).catch(() => undefined); release(); }
   }
 

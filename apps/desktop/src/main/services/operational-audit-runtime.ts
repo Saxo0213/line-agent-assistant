@@ -24,11 +24,12 @@ export function createOperationalAuditRuntime(pool: Pool, directory: string) {
       const publish = () => {
         const values = [db, file].filter((value): value is NonNullable<typeof value> => value !== undefined);
         const merged = new Map<string, SafeAuditRecord>();
-        for (const source of values) for (const event of source.events) {
+        for (const source of [...values, { events: audit.sinkEvents() }]) for (const event of source.events) {
           merged.set(`${event.correlationId}:${event.action}:${event.phase}:${event.createdAt}`, event);
         }
         onUpdate?.({ events: [...merged.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, boundedLimit),
-          available: values.some((value) => !value.failed), partial: values.length < 2 || values.some((value) => value.failed) });
+          available: values.some((value) => !value.failed), partial: values.length < 2 || values.some((value) => value.failed)
+            || audit.health().databaseFailed || audit.health().fallbackFailed || audit.health().droppedCount > 0 });
       };
       const dbRead = database.list(boundedLimit).then((events) => { db = { events, failed: false }; publish(); }, () => { db = { events: [], failed: true }; publish(); });
       const controller = new AbortController();
@@ -39,12 +40,13 @@ export function createOperationalAuditRuntime(pool: Pool, directory: string) {
       try { await Promise.all([dbRead, fallbackRead]); }
       finally { if (timer) clearTimeout(timer); }
       const merged = new Map<string, SafeAuditRecord>();
-      for (const source of [db, file]) for (const event of source?.events ?? []) {
+      for (const source of [db, file, { events: audit.sinkEvents() }]) for (const event of source?.events ?? []) {
         merged.set(`${event.correlationId}:${event.action}:${event.phase}:${event.createdAt}`, event);
       }
       const available = Boolean(db && !db.failed || file && !file.failed);
       return { events: [...merged.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, boundedLimit),
-        available, partial: !db || !file || Boolean(db?.failed || file?.failed) };
+        available, partial: !db || !file || Boolean(db?.failed || file?.failed) || audit.health().databaseFailed
+          || audit.health().fallbackFailed || audit.health().droppedCount > 0 };
     },
   };
 }

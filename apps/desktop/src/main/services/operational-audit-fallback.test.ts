@@ -13,7 +13,8 @@ describe('operational audit JSONL fallback', () => {
     const folder = await mkdtemp(join(tmpdir(), 'operational-audit-')); folders.push(folder);
     const fallback = new OperationalAuditFallback(folder);
     const event: AuditEvent = { action: 'secret_clear', phase: 'succeeded', initiator: 'user', correlationId: 'request-1',
-      accountId: 'account-a', resultCode: 'secret_removed', createdAt: '2026-10-17T10:00:00.000Z' };
+      accountId: 'account-a', resultCode: 'secret_removed', createdAt: '2026-10-17T10:00:00.000Z',
+      diagnostic: { operation: 'secret_store', stage: 'write', category: 'persistence_failed', recovery: 'check_configuration' } };
     await fallback.append({ ...event, token: 'must-not-be-stored' } as never);
     await expect(fallback.list()).resolves.toEqual([event]);
     expect(JSON.parse((await readFile(join(folder, 'operational-current.jsonl'), 'utf8')).trim())).toEqual(event);

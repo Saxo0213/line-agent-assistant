@@ -1,9 +1,9 @@
-import { AgentStatusIconsSchema, DEFAULT_AGENT_STATUS_ICONS, type AgentProvider, type AgentStatusIcons, type ConversationKey } from '@line-agent/contracts';
+import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, AgentStatusIconsSchema, DEFAULT_AGENT_STATUS_ICONS, type AgentProvider, type AgentStatusIcons, type ConversationKey } from '@line-agent/contracts';
 import type { Pool } from 'pg';
 
-const appSettingKeys = new Set(['default_provider', 'workspace_path', 'attachment_root', 'attachment_auto_attempt_limit', 'show_agent_status_markers', 'agent_status_icons']);
+const appSettingKeys = new Set(['default_provider', 'workspace_path', 'attachment_root', 'attachment_auto_attempt_limit', 'show_agent_status_markers', 'agent_status_icons', 'agent_status_rotation_interval_seconds', 'manual_unsend_window']);
 
-export type ConversationSettings = { attachmentAutoAttemptLimit: number; showAgentStatusMarkers: boolean; agentStatusIcons: AgentStatusIcons };
+export type ConversationSettings = { attachmentAutoAttemptLimit: number; showAgentStatusMarkers: boolean; agentStatusIcons: AgentStatusIcons; agentStatusRotationIntervalSeconds: number };
 
 function validateConversationSettings(settings: ConversationSettings): void {
   if (!Number.isInteger(settings.attachmentAutoAttemptLimit) || settings.attachmentAutoAttemptLimit < 3 || settings.attachmentAutoAttemptLimit > 10) {
@@ -11,6 +11,11 @@ function validateConversationSettings(settings: ConversationSettings): void {
   }
   if (typeof settings.showAgentStatusMarkers !== 'boolean') throw new Error('Agent status marker preference must be a boolean');
   AgentStatusIconsSchema.parse(settings.agentStatusIcons);
+  if (!Number.isInteger(settings.agentStatusRotationIntervalSeconds)
+    || settings.agentStatusRotationIntervalSeconds < AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN
+    || settings.agentStatusRotationIntervalSeconds > AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX) {
+    throw new Error('Agent status icon rotation interval must be an integer from 5 to 86400 seconds');
+  }
 }
 
 export const OFFICIAL_LINE_BUILD_TRUST_KEY = 'official_line_build_trust';
@@ -34,13 +39,15 @@ export class SettingsRepository {
   async getConversationSettings(): Promise<ConversationSettings> {
     const result = await this.pool.query<{ key: string; value: unknown }>(
       "SELECT key, value FROM app_settings WHERE key = ANY($1::text[])",
-      [['attachment_auto_attempt_limit', 'show_agent_status_markers', 'agent_status_icons']],
+      [['attachment_auto_attempt_limit', 'show_agent_status_markers', 'agent_status_icons', 'agent_status_rotation_interval_seconds']],
     );
     const values = new Map(result.rows.map((row) => [row.key, row.value]));
     const limit = values.has('attachment_auto_attempt_limit') ? values.get('attachment_auto_attempt_limit') : 3;
     const markers = values.has('show_agent_status_markers') ? values.get('show_agent_status_markers') : true;
     const icons = values.has('agent_status_icons') ? values.get('agent_status_icons') : DEFAULT_AGENT_STATUS_ICONS;
-    const settings = { attachmentAutoAttemptLimit: limit, showAgentStatusMarkers: markers, agentStatusIcons: icons } as ConversationSettings;
+    const rotationInterval = values.has('agent_status_rotation_interval_seconds') ? values.get('agent_status_rotation_interval_seconds') : 10;
+    const settings = { attachmentAutoAttemptLimit: limit, showAgentStatusMarkers: markers, agentStatusIcons: icons,
+      agentStatusRotationIntervalSeconds: rotationInterval } as ConversationSettings;
     validateConversationSettings(settings);
     return settings;
   }
@@ -51,10 +58,11 @@ export class SettingsRepository {
     try {
       await client.query('BEGIN');
       await client.query(
-        'INSERT INTO app_settings (key, value) VALUES ($1, $2::jsonb), ($3, $4::jsonb), ($5, $6::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
+        'INSERT INTO app_settings (key, value) VALUES ($1, $2::jsonb), ($3, $4::jsonb), ($5, $6::jsonb), ($7, $8::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
         ['attachment_auto_attempt_limit', JSON.stringify(settings.attachmentAutoAttemptLimit),
           'show_agent_status_markers', JSON.stringify(settings.showAgentStatusMarkers),
-          'agent_status_icons', JSON.stringify(settings.agentStatusIcons)],
+          'agent_status_icons', JSON.stringify(settings.agentStatusIcons),
+          'agent_status_rotation_interval_seconds', JSON.stringify(settings.agentStatusRotationIntervalSeconds)],
       );
       await client.query('COMMIT');
     } catch (error) {

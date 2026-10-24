@@ -39,6 +39,90 @@ describe('operator palette and scaling', () => {
     } finally { style.remove(); delete document.documentElement.dataset.theme; }
   });
 
+  it('keeps direct and group read receipts on the same compact metadata line', () => {
+    const style = document.createElement('style');
+    style.textContent = `${readFileSync(stylePath, 'utf8')}\n${readFileSync(themePath, 'utf8')}\n${readFileSync(lineMediaPath, 'utf8')}`;
+    document.head.append(style);
+    const row = document.createElement('div'); row.className = 'message-row outbound';
+    row.style.fontSize = '14px'; row.style.lineHeight = '1.55';
+    const direct = document.createElement('span'); direct.className = 'message-read';
+    const groupRoot = document.createElement('span'); groupRoot.className = 'message-read-root';
+    const groupReceipt = document.createElement('button'); groupReceipt.className = 'message-read message-read-button';
+    const trailing = document.createElement('div'); trailing.className = 'message-trailing-meta';
+    const actions = document.createElement('div'); actions.className = 'message-actions';
+    const reply = document.createElement('span'); reply.className = 'reply-action';
+    const meta = document.createElement('div'); meta.className = 'message-meta';
+    const time = document.createElement('time'); time.className = 'message-time';
+    groupRoot.append(groupReceipt); actions.append(reply); meta.append(direct, groupRoot, time); trailing.append(actions, meta); row.append(trailing); document.body.append(row);
+    try {
+      const directStyle = getComputedStyle(direct);
+      const wrapperStyle = getComputedStyle(groupRoot);
+      const replyStyle = getComputedStyle(reply);
+      const timeStyle = getComputedStyle(time);
+      expect(wrapperStyle.display).toBe('flex');
+      expect(wrapperStyle.fontSize).toBe('11px');
+      expect(wrapperStyle.lineHeight).toBe('16px');
+      expect(wrapperStyle.fontSize).toBe(directStyle.fontSize);
+      expect(wrapperStyle.lineHeight).toBe(directStyle.lineHeight);
+      expect(replyStyle.lineHeight).toBe(timeStyle.lineHeight);
+      expect(replyStyle.marginTop).toBe('0px');
+      expect(getComputedStyle(actions).alignItems).toBe('flex-end');
+      // The shared rule is outside viewport media queries, so narrow layouts keep these metrics too.
+      expect(style.textContent).toMatch(/\.message-row \.message-trailing-meta :is\([^)]*\.message-read-root[^)]*\)\s*\{[^}]*font-size:\s*11px;[^}]*line-height:\s*16px/s);
+    } finally { row.remove(); style.remove(); }
+  });
+
+  it('gives every trailing metadata row one fixed pitch and clears inherited action spacing', () => {
+    const style = document.createElement('style');
+    style.textContent = `${readFileSync(stylePath, 'utf8')}\n${readFileSync(lineMediaPath, 'utf8')}`;
+    document.head.append(style);
+    const row = document.createElement('div'); row.className = 'message-row outbound';
+    const trailing = document.createElement('div'); trailing.className = 'message-trailing-meta';
+    const actions = document.createElement('div'); actions.className = 'message-actions';
+    const open = document.createElement('button'); open.className = 'reply-action'; open.textContent = 'Open';
+    const reply = document.createElement('button'); reply.className = 'reply-action'; reply.disabled = true; reply.textContent = 'Reply';
+    const readRoot = document.createElement('span'); readRoot.className = 'message-read-root';
+    const read = document.createElement('button'); read.className = 'message-read message-read-button'; read.textContent = 'Read';
+    const directRead = document.createElement('span'); directRead.className = 'message-read'; directRead.textContent = 'Read';
+    const time = document.createElement('time'); time.className = 'message-time'; time.textContent = '10:00';
+    const meta = document.createElement('div'); meta.className = 'message-meta';
+    readRoot.append(read); actions.append(open, reply); meta.append(directRead, readRoot, time); trailing.append(actions, meta); row.append(trailing); document.body.append(row);
+    try {
+      for (const item of [open, reply, directRead, readRoot, read, time]) {
+        const computed = getComputedStyle(item);
+        expect(computed.height).toBe('16px');
+        expect(computed.minHeight).toBe('16px');
+        expect(computed.marginTop).toBe('0px');
+        expect(computed.marginBottom).toBe('0px');
+        expect(computed.paddingTop).toBe('0px');
+        expect(computed.paddingBottom).toBe('0px');
+      }
+      expect(getComputedStyle(actions).alignItems).toBe('flex-end');
+      expect(style.textContent).toContain('.message-row .message-actions .reply-action::before');
+      expect(style.textContent).toContain('.message-read-button:focus-visible');
+      expect(getComputedStyle(trailing).gap).toBe('0');
+      // The row rule is not scoped to a wide viewport, so media rows retain the same pitch when narrow.
+      expect(style.textContent).toMatch(/\.message-row \.message-trailing-meta :is\([^)]*\.message-time[^)]*\)\s*\{[^}]*height:\s*16px/s);
+    } finally { row.remove(); style.remove(); }
+  });
+
+  it('aligns inbound timestamps with the action edge and keeps metadata stacks equal width', () => {
+    const style = document.createElement('style');
+    style.textContent = readFileSync(lineMediaPath, 'utf8');
+    document.head.append(style);
+    const row = document.createElement('div'); row.className = 'message-row inbound';
+    const actions = document.createElement('div'); actions.className = 'message-actions';
+    const meta = document.createElement('div'); meta.className = 'message-meta';
+    const time = document.createElement('time'); time.className = 'message-time';
+    meta.append(time); row.append(actions, meta); document.body.append(row);
+    try {
+      expect(getComputedStyle(time).alignSelf).toBe('flex-start');
+      expect(getComputedStyle(actions).width).toBe('100%');
+      expect(getComputedStyle(actions).alignItems).toBe('flex-start');
+      expect(getComputedStyle(meta).width).toBe('100%');
+    } finally { row.remove(); style.remove(); }
+  });
+
   it('keeps light and dark body, secondary and primary action text readable', () => {
     const base = readFileSync(stylePath, 'utf8');
     const theme = existsSync(themePath) ? readFileSync(themePath, 'utf8') : '';

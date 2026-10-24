@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { AgentAttachmentSummarySchema, AgentAttachmentUploadsSchema, AgentEventSchema, AgentProviderSchema } from './agent.js';
 import { AgentStatusIconsSchema } from './agent-status-icons.js';
+import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN } from './agent-status-rotation.js';
 import { AutoResponderRuleSchema, AutoResponderSettingsSchema, validateAutoresponderConfig } from './autoresponder.js';
 import { AccountModeSchema, ChatTypeSchema, ConversationKeySchema, WritableConversationKeySchema } from './account.js';
 import { MentionRangeSchema, MessageContentSchema, MessageKindSchema, SticonRangeSchema } from './line.js';
@@ -26,12 +27,23 @@ import {
   McpToolOutputUnionSchema,
   McpLocalClientKindSchema,
   McpLocalClientStatusSchema,
+  MAX_MCP_TOOL_SCOPES,
 } from './mcp.js';
 
 const IdSchema = z.string().min(1);
 const TimestampSchema = z.iso.datetime({ offset: true });
 const RequestIdSchema = z.strictObject({ requestId: IdSchema });
 const PageSchema = z.strictObject({ before: IdSchema.nullable(), limit: z.number().int().min(1).max(100) });
+const ChatResourceCursorSchema = z.string().max(2048).nullable();
+export const ChatResourceNoteSchema = z.strictObject({ postId: IdSchema.max(256), createdTime: z.number().nullable(), text: z.string().max(262144).nullable(),
+  content: z.record(z.string(), z.unknown()).optional() });
+export const ChatResourceAlbumSchema = z.strictObject({ albumId: IdSchema.max(256), chatId: IdSchema.max(256), title: z.string().max(20000).nullable(),
+  photoCount: z.number().int().min(0).max(100000).nullable(), createTime: z.number().nullable(), updateTime: z.number().nullable() });
+export const ChatResourcePhotoSchema = z.strictObject({ photoId: IdSchema.max(256), oid: IdSchema.max(256), prefix: z.string().max(512),
+  shotTime: z.number().nullable(), width: z.number().int().min(0).nullable(), height: z.number().int().min(0).nullable() });
+export type ChatResourceNote = z.infer<typeof ChatResourceNoteSchema>;
+export type ChatResourceAlbum = z.infer<typeof ChatResourceAlbumSchema>;
+export type ChatResourcePhoto = z.infer<typeof ChatResourcePhotoSchema>;
 export const AgentJobSearchCursorSchema = z.strictObject({ createdAt: TimestampSchema, jobId: IdSchema });
 export const AgentJobSearchQuerySchema = z.strictObject({
   keyword: z.string().max(500).optional(), searchPrompt: z.boolean(), searchReply: z.boolean(),
@@ -88,13 +100,15 @@ export type PendingAgentApproval = z.infer<typeof PendingAgentApprovalSchema>;
 
 export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('getSnapshot') }),
+  RequestIdSchema.extend({ type: z.literal('reportRendererFailure') }),
   RequestIdSchema.extend({ type: z.literal('searchAgentJobs'), query: AgentJobSearchQuerySchema }),
-  RequestIdSchema.extend({ type: z.literal('lineAddAccountQr'), confirmOfficialLogout: z.boolean().optional() }),
-  RequestIdSchema.extend({ type: z.literal('lineLoginQr'), accountId: IdSchema, confirmOfficialLogout: z.boolean().optional() }),
+  RequestIdSchema.extend({ type: z.literal('lineAddAccountQr') }),
+  RequestIdSchema.extend({ type: z.literal('lineLoginQr'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('lineLogout'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('refreshLineAvatar'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('lineSetAutoLogin'), accountId: IdSchema, enabled: z.boolean() }),
   RequestIdSchema.extend({ type: z.literal('lineBeginAdminPairing'), accountId: IdSchema }),
-  RequestIdSchema.extend({ type: z.literal('lineStart'), accountId: IdSchema, confirmOfficialLogout: z.boolean().optional() }),
+  RequestIdSchema.extend({ type: z.literal('lineStart'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('externalImportStart'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('externalImportStop'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('previewExternalAdminBinding') }),
@@ -112,8 +126,21 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('getAgentRoomJobEvents'), jobId: IdSchema }),
   RequestIdSchema.merge(ConversationKeySchema).merge(PageSchema).extend({ type: z.literal('listMessages') }),
   RequestIdSchema.merge(ConversationKeySchema).merge(PageSchema).extend({ type: z.literal('listAttachments') }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('listChatNotes'), cursor: ChatResourceCursorSchema }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('getChatNote'), postId: IdSchema.max(256) }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('listChatAlbums'), cursor: ChatResourceCursorSchema }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('listChatAlbumPhotos'), albumId: IdSchema.max(256), cursor: ChatResourceCursorSchema }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('downloadChatAlbumPhoto'), albumId: IdSchema.max(256), photoId: IdSchema.max(256),
+    oid: IdSchema.max(256), prefix: z.enum(['album/a', 'album/v']) }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('openChatAlbum'), albumId: IdSchema.max(256) }),
+  RequestIdSchema.extend({ type: z.literal('cancelChatResourceRequest'), targetRequestId: IdSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('sendText'), text: z.string().min(1) }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('replyText'), replyToMessageId: IdSchema, text: z.string().min(1) }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('sendManualMedia'),
+    files: AgentAttachmentUploadsSchema.min(1) }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('unsendMessage'), messageId: z.string().regex(/^(?:0|[1-9][0-9]*)$/) }),
+  RequestIdSchema.extend({ type: z.literal('getManualUnsendWindow') }),
+  RequestIdSchema.extend({ type: z.literal('setManualUnsendWindow'), window: z.enum(['1h', '7d']) }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('stopJob'), jobId: IdSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('retryJob'), jobId: IdSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('newSession'), provider: AgentProviderSchema }),
@@ -132,6 +159,7 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('getConversationSettings') }),
   RequestIdSchema.extend({ type: z.literal('setConversationSettings'), settings: z.strictObject({
     attachmentAutoAttemptLimit: z.number().int().min(3).max(10), showAgentStatusMarkers: z.boolean(), agentStatusIcons: AgentStatusIconsSchema,
+    agentStatusRotationIntervalSeconds: z.number().int().min(AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN).max(AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX),
   }) }),
   RequestIdSchema.extend({ type: z.literal('getAutoResponderSettings') }),
   z.strictObject({ type: z.literal('setAutoResponderSettings'), requestId: IdSchema,
@@ -153,7 +181,7 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
     deviceLabel: z.string().trim().min(1).max(120),
     principalId: z.string().trim().min(1).max(128).optional(),
     accountScopes: z.array(IdSchema).min(1).max(16),
-    toolScopes: z.array(McpToolNameSchema).min(1).max(3),
+    toolScopes: z.array(McpToolNameSchema).min(1).max(MAX_MCP_TOOL_SCOPES),
     expiration: McpTokenExpirationSchema,
   }),
   RequestIdSchema.extend({ type: z.literal('mcpRevokeToken'), tokenId: z.uuid() }),
@@ -218,7 +246,7 @@ export type LineAccountSummary = z.infer<typeof LineAccountSummarySchema>;
 
 /** Display-only metadata. Original preview text and persisted messages remain unchanged. */
 export const GeneratedPreviewSchema = z.strictObject({
-  kind: z.enum(['deleted', 'unsent', 'image', 'video', 'audio', 'file', 'sticker', 'contact', 'location', 'rich', 'unsupported', 'call', 'gift', 'post', 'chat_event', 'system', 'message']),
+  kind: z.enum(['deleted', 'unsent', 'image', 'video', 'audio', 'file', 'sticker', 'contact', 'location', 'rich', 'unsupported', 'call', 'gift', 'post', 'post_note', 'post_album', 'chat_event', 'system', 'message']),
   name: z.string().optional(),
   status: z.enum(['queued', 'downloading', 'ready', 'failed', 'expired']).optional(),
 });
@@ -297,6 +325,7 @@ export const IpcEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('messageStored'), key: ConversationKeySchema, messageId: IdSchema,
     conversation: ConversationSummarySchema }),
   z.strictObject({ type: z.literal('externalMonitorRoundComplete'), accountId: IdSchema }),
+  z.strictObject({ type: z.literal('lineAvatarRefreshed'), accountId: IdSchema, ownMid: IdSchema }),
   /** Reading phase of the official-LINE identity read behind the external-monitor dialog. */
   z.strictObject({ type: z.literal('externalAdminBindingProgress'), phase: z.enum(['locating', 'reading_identity']) }),
   z.strictObject({ type: z.literal('attachmentChanged'), attachmentId: IdSchema }),
@@ -341,6 +370,7 @@ export type StickerDescriptor = z.infer<typeof StickerDescriptorSchema>;
 export const MessageListResultSchema = MessageSearchResultSchema.extend({
   kind: MessageKindSchema,
   content: MessageContentSchema.nullable().optional(),
+  postNotificationType: z.enum(['note', 'album']).nullable().optional(),
   sticker: StickerDescriptorSchema.nullable(),
   mentionRanges: z.array(MentionRangeSchema).optional(),
   agentJobStatus: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']).nullable().optional(),
@@ -361,12 +391,16 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('getAutoResponderSettings'), requestId: IdSchema, ok: z.literal(true), settings: AutoResponderSettingsSchema }),
     z.strictObject({ type: z.literal('getConversationSettings'), requestId: IdSchema, ok: z.literal(true), settings: z.strictObject({
       attachmentAutoAttemptLimit: z.number().int().min(3).max(10), showAgentStatusMarkers: z.boolean(), agentStatusIcons: AgentStatusIconsSchema,
+      agentStatusRotationIntervalSeconds: z.number().int().min(AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN).max(AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX),
     }) }),
     z.strictObject({ type: z.literal('setConversationSettings'), requestId: IdSchema, ok: z.literal(true), settings: z.strictObject({
       attachmentAutoAttemptLimit: z.number().int().min(3).max(10), showAgentStatusMarkers: z.boolean(), agentStatusIcons: AgentStatusIconsSchema,
+      agentStatusRotationIntervalSeconds: z.number().int().min(AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN).max(AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX),
     }) }),
+    z.strictObject({ type: z.literal('getManualUnsendWindow'), requestId: IdSchema, ok: z.literal(true), window: z.enum(['1h', '7d']) }),
+    z.strictObject({ type: z.literal('setManualUnsendWindow'), requestId: IdSchema, ok: z.literal(true), window: z.enum(['1h', '7d']) }),
     z.strictObject({ type: z.literal('setAutoResponderSettings'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().positive() }),
-    z.strictObject({ type: z.literal('accepted'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('accepted'), requestId: IdSchema, ok: z.literal(true), ownMid: z.string().regex(/^u[0-9a-fA-F]{32}$/).optional() }),
     z.strictObject({ type: z.literal('lineAdminPairing'), requestId: IdSchema, ok: z.literal(true), token: z.string().regex(/^\d{6}$/), expiresAt: TimestampSchema }),
     z.strictObject({ type: z.literal('submitAgentRoomPrompt'), requestId: IdSchema, ok: z.literal(true), jobId: IdSchema }),
     z.strictObject({ type: z.literal('getAgentRoomJobEvents'), requestId: IdSchema, ok: z.literal(true), events: z.array(AgentEventSchema) }),
@@ -378,6 +412,16 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('searchMessages'), requestId: IdSchema, ok: z.literal(true), messages: z.array(MessageSearchResultSchema) }),
     z.strictObject({ type: z.literal('listMessages'), requestId: IdSchema, ok: z.literal(true), messages: z.array(MessageListResultSchema), nextCursor: IdSchema.nullable() }),
     z.strictObject({ type: z.literal('listAttachments'), requestId: IdSchema, ok: z.literal(true), attachments: z.array(AttachmentSummarySchema), nextCursor: IdSchema.nullable() }),
+    z.strictObject({ type: z.literal('listChatNotes'), requestId: IdSchema, ok: z.literal(true), notes: z.array(ChatResourceNoteSchema).max(50), nextCursor: ChatResourceCursorSchema }),
+    z.strictObject({ type: z.literal('getChatNote'), requestId: IdSchema, ok: z.literal(true), note: ChatResourceNoteSchema }),
+    z.strictObject({ type: z.literal('listChatAlbums'), requestId: IdSchema, ok: z.literal(true), albums: z.array(ChatResourceAlbumSchema).max(50), nextCursor: ChatResourceCursorSchema }),
+    z.strictObject({ type: z.literal('listChatAlbumPhotos'), requestId: IdSchema, ok: z.literal(true), photos: z.array(ChatResourcePhotoSchema).max(50), nextCursor: ChatResourceCursorSchema }),
+    z.strictObject({ type: z.literal('downloadChatAlbumPhoto'), requestId: IdSchema, albumId: IdSchema.max(256), photoId: IdSchema.max(256), ok: z.literal(true), sizeBytes: z.number().int().min(1).max(20971520) }),
+    z.strictObject({ type: z.literal('openChatAlbum'), requestId: IdSchema, ok: z.literal(true), albumId: IdSchema.max(256),
+      savedCount: z.number().int().min(0).max(500), failedCount: z.number().int().min(0).max(500), totalCount: z.number().int().min(0).max(500),
+      byteCount: z.number().int().min(0).max(268435456), complete: z.boolean(), failureCodes: z.array(z.string().regex(/^[A-Z][A-Z0-9_]{1,47}$/)).max(500),
+      errorCode: z.string().regex(/^[A-Z][A-Z0-9_]{1,47}$/).nullable() }),
+    z.strictObject({ type: z.literal('cancelChatResourceRequest'), requestId: IdSchema, ok: z.literal(true), cancelled: z.boolean() }),
     z.strictObject({ type: z.literal('getJobEvents'), requestId: IdSchema, ok: z.literal(true), events: z.array(AgentEventSchema) }),
     z.strictObject({ type: z.literal('openAttachment'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
     z.strictObject({ type: z.literal('openExternalUrl'), requestId: IdSchema, ok: z.literal(true) }),
@@ -408,6 +452,6 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('createChatFolder'), requestId: IdSchema, ok: z.literal(true), folder: ChatFolderSummarySchema }),
     z.strictObject({ type: z.literal('openChatFolder'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
   ]),
-  z.strictObject({ type: z.literal('error'), requestId: IdSchema, ok: z.literal(false), code: z.string().min(1), message: z.string().min(1), retryable: z.boolean(), detail: z.enum(['same_account', 'unknown']).optional() }),
+  z.strictObject({ type: z.literal('error'), requestId: IdSchema, ok: z.literal(false), code: z.string().min(1), message: z.string().min(1), retryable: z.boolean() }),
 ]);
 export type IpcResult = z.infer<typeof IpcResultSchema>;

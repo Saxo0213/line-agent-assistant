@@ -5,13 +5,22 @@ export const McpToolNameSchema = z.enum([
   'list_targets',
   'query_target_messages',
   'query_target_messages_by_time',
+  'list_chat_notes',
+  'get_chat_note',
+  'list_chat_albums',
+  'get_chat_album',
 ]);
 export const MCP_TOOL_NAMES = McpToolNameSchema.options;
+export const MAX_MCP_TOOL_SCOPES = 64;
 export type McpToolName = z.infer<typeof McpToolNameSchema>;
 export const MCP_TOOL_EFFECTS: Readonly<Record<McpToolName, 'read' | 'effect'>> = {
   list_targets: 'read',
   query_target_messages: 'read',
   query_target_messages_by_time: 'read',
+  list_chat_notes: 'read',
+  get_chat_note: 'read',
+  list_chat_albums: 'read',
+  get_chat_album: 'read',
 };
 
 export const McpTokenStateSchema = z.enum(['ACTIVE', 'REVOKED']);
@@ -30,7 +39,7 @@ export const McpTokenSummarySchema = z.strictObject({
   principalId: z.string().trim().min(1).max(128),
   deviceLabel: z.string().trim().min(1).max(120),
   accountScopes: z.array(z.string().min(1)).min(1).max(16),
-  toolScopes: z.array(McpToolNameSchema).min(1).max(3),
+  toolScopes: z.array(McpToolNameSchema).min(1).max(MAX_MCP_TOOL_SCOPES),
   grantVersion: z.number().int().positive(),
   state: McpTokenStateSchema,
   expiresAt: z.iso.datetime({ offset: true }).nullable(),
@@ -215,6 +224,12 @@ export const McpQueryTargetMessagesByTimeInputSchema = TargetSelectorBaseSchema.
 });
 export type McpQueryTargetMessagesByTimeInput = z.infer<typeof McpQueryTargetMessagesByTimeInputSchema>;
 
+const McpResourceChatTypeSchema = z.enum(['direct', 'group', 'room']);
+const ChatResourceSelectorSchema = z.strictObject({ accountId: z.string().trim().min(1).max(256), chatType: McpResourceChatTypeSchema, chatId: z.string().trim().min(1).max(256) });
+export const McpChatResourceListInputSchema = ChatResourceSelectorSchema.extend({ limit: z.number().int().min(1).max(50).optional(), cursor: z.string().max(512).optional() });
+export const McpChatResourceGetNoteInputSchema = ChatResourceSelectorSchema.extend({ noteId: z.string().trim().min(1).max(256) });
+export const McpChatResourceGetAlbumInputSchema = ChatResourceSelectorSchema.extend({ albumId: z.string().trim().min(1).max(256) });
+
 export const McpToolInputUnionSchema = z.discriminatedUnion('name', [
   z.strictObject({
     name: z.literal('list_targets'),
@@ -228,8 +243,22 @@ export const McpToolInputUnionSchema = z.discriminatedUnion('name', [
     name: z.literal('query_target_messages_by_time'),
     arguments: McpQueryTargetMessagesByTimeInputSchema,
   }),
+  z.strictObject({ name: z.literal('list_chat_notes'), arguments: McpChatResourceListInputSchema }),
+  z.strictObject({ name: z.literal('get_chat_note'), arguments: McpChatResourceGetNoteInputSchema }),
+  z.strictObject({ name: z.literal('list_chat_albums'), arguments: McpChatResourceListInputSchema }),
+  z.strictObject({ name: z.literal('get_chat_album'), arguments: McpChatResourceGetAlbumInputSchema }),
 ]);
 export type McpToolInputUnion = z.infer<typeof McpToolInputUnionSchema>;
+
+const McpSavedAtSchema = z.iso.datetime({ offset: true }).nullable();
+const McpArchivedNoteSummarySchema = z.strictObject({ noteId: z.string().min(1).max(256), savedAt: McpSavedAtSchema });
+const McpArchivedNoteSchema = McpArchivedNoteSummarySchema.extend({ markdown: z.string().max(384 * 1024) });
+const McpArchivedAlbumSchema = z.strictObject({
+  albumId: z.string().min(1).max(256), chatId: z.string().min(1).max(256), title: z.string().max(20_000).nullable(),
+  photoCount: z.number().int().min(0).max(100_000).nullable(), createTime: z.number().int().nonnegative().nullable(), updateTime: z.number().int().nonnegative().nullable(),
+});
+const McpArchivedAlbumPhotoSchema = z.strictObject({ photoId: z.string().min(1).max(256), shotTime: z.number().int().nonnegative().nullable(),
+  width: z.number().int().nonnegative().nullable(), height: z.number().int().nonnegative().nullable(), available: z.boolean() });
 
 export const McpToolOutputUnionSchema = z.discriminatedUnion('toolName', [
   z.strictObject({
@@ -246,6 +275,10 @@ export const McpToolOutputUnionSchema = z.discriminatedUnion('toolName', [
     from: z.iso.datetime({ offset: true }).nullable(),
     to: z.iso.datetime({ offset: true }).nullable(),
   }),
+  z.strictObject({ toolName: z.literal('list_chat_notes'), accountId: z.string(), chatType: McpResourceChatTypeSchema, chatId: z.string(), notes: z.array(McpArchivedNoteSummarySchema).max(50), nextCursor: z.string().max(512).nullable(), savedAt: McpSavedAtSchema }),
+  z.strictObject({ toolName: z.literal('get_chat_note'), accountId: z.string(), chatType: McpResourceChatTypeSchema, chatId: z.string(), note: McpArchivedNoteSchema.nullable(), savedAt: McpSavedAtSchema }),
+  z.strictObject({ toolName: z.literal('list_chat_albums'), accountId: z.string(), chatType: McpResourceChatTypeSchema, chatId: z.string(), albums: z.array(McpArchivedAlbumSchema).max(50), nextCursor: z.string().max(512).nullable(), savedAt: McpSavedAtSchema }),
+  z.strictObject({ toolName: z.literal('get_chat_album'), accountId: z.string(), chatType: McpResourceChatTypeSchema, chatId: z.string(), album: McpArchivedAlbumSchema.nullable(), photos: z.array(McpArchivedAlbumPhotoSchema).max(50), savedAt: McpSavedAtSchema }),
 ]);
 export type McpToolOutputUnion = z.infer<typeof McpToolOutputUnionSchema>;
 

@@ -22,6 +22,8 @@ export const JAPANESE_DESKTOP_COPY_PART3: Partial<Record<keyof typeof ENGLISH_DE
   call: '通話',
   gift: 'ギフト',
   postNotification: '投稿通知',
+  postNoteNotification: 'ノート通知',
+  postAlbumNotification: 'アルバム通知',
   chatEvent: 'チャットイベント',
   systemMessage: 'システムメッセージ',
   cancelledCall: 'キャンセルされた通話',

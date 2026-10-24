@@ -1,11 +1,13 @@
-import { randomUUID } from 'node:crypto';
-import { normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpMessageRecord, type McpTargetSummary, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
+import { createHash, randomUUID } from 'node:crypto';
+import { InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpMessageRecord, type McpTargetSummary, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { parseLineStickerDescriptor, type StickerDescriptor } from './sticker-descriptor.js';
 import { CONVERSATION_TITLE_SQL, MEMBER_NAME_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nameFragments, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, upsertLineContacts, type LineContactInput } from './name-resolution.js';
 import { NativeSourceEnvelopeSchema, type NativeSourceEnvelope } from '@line-agent/contracts';
-import { bridgeLiveMessage } from './content-bridge/index.js';
+import { bridgeLiveMessage, liveChatEventMids, postNotificationSubtypeFromRaw } from './content-bridge/index.js';
+import { loadChatEventNames } from './content-bridge/chat-event-names.js';
 import { nativeReactions, type MessageReaction } from './native-reactions.js';
+import { stageSystemLoginObservation, type ExternalObservation } from './external-monitor-repository.js';
 
 export type ReadPositionChange = Readonly<{ key: ConversationKey; messageId: string }>;
 const ReadReceiptsSchema = ReadReceiptSchema.array().max(500);
@@ -30,6 +32,18 @@ function liveProjectionValues(envelope: InboundEnvelope): [string | null, number
     bridged?.replyToMessageId ?? envelope.replyToMessageId];
 }
 
+function systemLoginObservation(envelope: InboundEnvelope, receipt?: { controlEpoch: number;
+  receiptMode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; sensitive: boolean }): ExternalObservation {
+  return { observationId: envelope.messageId, canonicalMessageId: envelope.messageId,
+    nativeConversationKind: envelope.chatType, nativeConversationId: envelope.chatId, nativeMessageId: envelope.messageId,
+    chatType: envelope.chatType, chatId: envelope.chatId, senderId: envelope.senderId,
+    livePayload: { raw: envelope.raw, eventId: envelope.eventId, ...(envelope.contact ? { contact: envelope.contact } : {}),
+      ...(receipt && envelope.ingestion.source === 'live' ? { recovery: { envelope, ...receipt } } : {}) },
+    mentionIds: envelope.mentionIds, mentionRanges: envelope.mentionRanges,
+    attachments: envelope.attachments.map((item) => ({ ...item, expiresAt: null })),
+    kind: envelope.kind, text: envelope.text, occurredAt: envelope.occurredAt };
+}
+
 export type RoutingDecision =
   | { eligible: false; action?: 'ignore' | 'stop' | 'new' | 'status'; primaryAdminSenderId?: string }
   | { eligible: false; workspaceFailure: { provider: AgentProvider; prompt: string; workspacePath: string | null;
@@ -39,10 +53,12 @@ export type RoutingDecision =
 
 export type PendingRouteAction = 'stop' | 'new' | 'status';
 export type PendingRoute = { key: ConversationKey; messageId: string };
+export type UnroutedLiveSourceMessage = Readonly<{ observationId: string; envelope: InboundEnvelope | null; receiptMode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; receiptControlEpoch: number; sensitive: boolean }>;
 
 export interface IngestResult {
   disposition: 'inserted' | 'duplicate';
   durableCursor: string | null;
+  messageChanged?: boolean;
   jobId?: string;
   jobStatus?: { accountId: string; chatType: ConversationKey['chatType']; chatId: string; sourceMessageId: string; jobId: string; status: 'queued' | 'failed'; revision: string };
 }
@@ -329,20 +345,66 @@ export class MessageRepository {
     return result.rows[0]?.cursor ? TalkCursorV1Schema.parse(JSON.parse(result.rows[0].cursor)) : null;
   }
 
-  async ingestBatchAndRoute(
-    batch: Extract<LineWorkerEvent, { type: 'batch' }>, decisions: readonly RoutingDecision[],
-  ): Promise<{ inserted: number; duplicate: number; insertedMessageIds: string[]; jobIds: string[]; jobMessageIds: string[]; primaryAdminActionMessageIds: string[]; jobStatuses: NonNullable<IngestResult['jobStatus']>[];
+  async prepareBatchConversations(batch: Extract<LineWorkerEvent, { type: 'batch' }>): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const control = await client.query<{ control_epoch: string }>('SELECT control_epoch FROM account_control WHERE singleton=true FOR SHARE');
+      const account = await client.query<{ mode: string; worker_instance_id: string | null; worker_binding_epoch: string | null;
+        connection_mode: string; own_mid: string | null; selected_source_id: string | null; selected_source_generation: string | null;
+        source_type: string | null; source_state: string | null; verified_account_mid: string | null }>(
+        `SELECT a.mode,a.worker_instance_id,a.worker_binding_epoch,a.connection_mode,a.own_mid,a.selected_source_id,
+          a.selected_source_generation,s.source_type,s.state AS source_state,s.verified_account_mid
+         FROM line_accounts a LEFT JOIN line_account_sources s ON s.account_id=a.account_id
+           AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
+         WHERE a.account_id=$1 FOR SHARE OF a`, [batch.accountId]);
+      const row = account.rows[0];
+      if (row?.connection_mode === 'EXTERNAL_MONITOR') throw new Error('External monitor is read-only');
+      if (!row || row.worker_instance_id !== batch.workerInstanceId || Number(row.worker_binding_epoch) !== batch.controlEpoch
+        || batch.controlEpoch > Number(control.rows[0]?.control_epoch)
+        || (row.mode === 'ACTIVE_CONTROL' && batch.controlEpoch !== Number(control.rows[0]?.control_epoch))) throw new Error('Stale batch control epoch');
+      if (row.connection_mode !== 'SYSTEM_LOGIN' || !row.selected_source_id || row.source_type !== 'SYSTEM_LOGIN'
+        || row.source_state !== 'ACTIVE' || row.own_mid !== row.verified_account_mid) throw new Error('Stale login batch authority');
+      for (const envelope of batch.envelopes) {
+        if (envelope.accountId !== batch.accountId) throw new Error('Batch envelope account mismatch');
+        await client.query(`INSERT INTO conversations(account_id,chat_type,chat_id) VALUES($1,$2,$3)
+          ON CONFLICT(account_id,chat_type,chat_id) DO NOTHING`, [batch.accountId,envelope.chatType,envelope.chatId]);
+      }
+      await client.query('COMMIT');
+    } catch (error) { await client.query('ROLLBACK'); throw error; }
+    finally { client.release(); }
+  }
+
+  /** Compatibility entry point for existing repository callers and test doubles. */
+  async ingestBatchAndRoute(batch: Extract<LineWorkerEvent, { type: 'batch' }>, decisions: readonly RoutingDecision[]) {
+    if (batch.envelopes.length !== decisions.length) throw new Error('One routing decision is required per envelope');
+    await this.prepareBatchConversations(batch);
+    const stored = await this.ingestBatchSource(batch);
+    const admitted = await this.admitLiveBatch(batch, decisions);
+    await this.recordBatchRoutes(batch, admitted.routeDecisions, new Set(admitted.jobStatuses.map((status) => status.sourceMessageId)));
+    return { ...stored, ...admitted };
+  }
+
+  async ingestBatchSource(
+    batch: Extract<LineWorkerEvent, { type: 'batch' }>,
+    sensitiveMessageIds: ReadonlySet<string> = new Set(),
+  ): Promise<{ inserted: number; duplicate: number; insertedMessageIds: string[]; changedMessageIds: string[]; jobIds: string[]; jobMessageIds: string[]; primaryAdminActionMessageIds: string[]; jobStatuses: NonNullable<IngestResult['jobStatus']>[];
     readPositionsChanged: number; readPositionChanges: ReadPositionChange[] }> {
     const readReceipts = ReadReceiptsSchema.parse(batch.readReceipts ?? []);
-    if (batch.envelopes.length !== decisions.length) throw new Error('One routing decision is required per envelope');
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       const control = await client.query<{ control_epoch: string }>(
         'SELECT control_epoch FROM account_control WHERE singleton = true FOR SHARE',
       );
-      const authority = await client.query<{ mode: string; worker_instance_id: string | null; worker_binding_epoch: string | null; connection_mode: string }>(
-        'SELECT mode, worker_instance_id, worker_binding_epoch,connection_mode FROM line_accounts WHERE account_id = $1 FOR SHARE', [batch.accountId],
+      const authority = await client.query<{ mode: string; worker_instance_id: string | null; worker_binding_epoch: string | null;
+        connection_mode: string; own_mid: string | null; selected_source_id: string | null; selected_source_generation: string | null;
+        source_type: string | null; source_state: string | null; verified_account_mid: string | null }>(
+        `SELECT a.mode,a.worker_instance_id,a.worker_binding_epoch,a.connection_mode,a.own_mid,a.selected_source_id,
+          a.selected_source_generation,s.source_type,s.state AS source_state,s.verified_account_mid
+         FROM line_accounts a LEFT JOIN line_account_sources s ON s.account_id=a.account_id
+           AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
+         WHERE a.account_id=$1 FOR SHARE OF a`, [batch.accountId],
       );
       const account = authority.rows[0];
       if (!account || account.worker_instance_id !== batch.workerInstanceId
@@ -354,116 +416,67 @@ export class MessageRepository {
       if (account.connection_mode === 'EXTERNAL_MONITOR') {
         throw new Error('External monitor is read-only');
       }
+      if (account.connection_mode !== 'SYSTEM_LOGIN' || !account.selected_source_id
+        || account.source_type !== 'SYSTEM_LOGIN' || account.source_state !== 'ACTIVE'
+        || account.own_mid !== account.verified_account_mid || !account.selected_source_generation) {
+        throw new Error('Logged-in source authority is stale');
+      }
+      const sourceId = account.selected_source_id;
+      const sourceGeneration = Number(account.selected_source_generation);
+      if (!['ACTIVE_CONTROL', 'MONITOR_ONLY', 'PAUSED'].includes(account.mode)) throw new Error('Invalid login receipt mode');
+      const receiptMode = account.mode as 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED';
+      const batchDigest = createHash('sha256').update(JSON.stringify({ cursorBefore: batch.cursorBefore,
+        cursorAfter: batch.cursorAfter, envelopes: batch.envelopes, readReceipts }), 'utf8').digest('hex');
+      const priorSourceBatch = await client.query<{ payload_digest: string }>(
+        'SELECT payload_digest FROM external_source_batches WHERE source_id=$1 AND generation=$2 AND batch_id=$3 FOR UPDATE',
+        [sourceId, sourceGeneration, batch.batchId]);
+      if (priorSourceBatch.rows[0] && priorSourceBatch.rows[0].payload_digest !== batchDigest) {
+        throw new Error('Login source batch replay digest mismatch');
+      }
+      const sourceBatchReplay = Boolean(priorSourceBatch.rows[0]);
+      if (!sourceBatchReplay) {
+        const checkpoint = await client.query<{ cursor: TalkCursorV1Dto }>(
+          'SELECT cursor FROM external_source_checkpoints WHERE source_id=$1 AND account_id=$2 AND generation=$3 FOR UPDATE',
+          [sourceId, batch.accountId, sourceGeneration]);
+        const currentCursor = checkpoint.rows[0]?.cursor;
+        if (!currentCursor || currentCursor.revision !== batch.cursorBefore.revision
+          || currentCursor.globalRev !== batch.cursorBefore.globalRev || currentCursor.individualRev !== batch.cursorBefore.individualRev) {
+          throw new Error('Login source predecessor checkpoint mismatch');
+        }
+        await client.query(`INSERT INTO external_source_batches(source_id,account_id,generation,batch_id,payload_digest,result)
+          VALUES ($1,$2,$3,$4,$5,'{}'::jsonb)`,
+        [sourceId, batch.accountId, sourceGeneration, batch.batchId, batchDigest]);
+      }
       let inserted = 0;
       let duplicate = 0;
       const insertedMessageIds: string[] = [];
+      const changedMessageIds: string[] = [];
       const jobIds: string[] = [];
       const jobMessageIds: string[] = [];
-      const primaryAdminActionMessageIds: string[] = [];
-      const jobStatuses: NonNullable<IngestResult['jobStatus']>[] = [];
       for (const [index, envelope] of batch.envelopes.entries()) {
         if (envelope.accountId !== batch.accountId) throw new Error('Batch envelope account mismatch');
-        const requestedDecision = decisions[index]!;
-        const primaryAdminSenderId = requestedDecision.primaryAdminSenderId;
-        const primaryAdminStillBound = primaryAdminSenderId === undefined || (await client.query<{ user_id: string }>(
-          `SELECT user_id FROM account_administrators WHERE account_id=$1 AND role='PRIMARY_ADMIN' AND user_id=$2 FOR SHARE`,
-          [envelope.accountId, primaryAdminSenderId],
-        )).rowCount === 1;
-        const requestedAuthorization = requestedDecision.eligible || 'workspaceFailure' in requestedDecision
-          ? requestedDecision.authorization : undefined;
-        const grantAuthorized = requestedAuthorization
-          ? await this.lockAndCheckAgentAuthorization(client, envelope.accountId, envelope.chatType, envelope.chatId,
-            envelope.senderId, requestedAuthorization)
-          : true;
-        const decision: RoutingDecision = !grantAuthorized || !primaryAdminStillBound
-          ? { eligible: false, action: 'ignore' } : requestedDecision;
-        await client.query(
-          'INSERT INTO conversations (account_id, chat_type, chat_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-          [envelope.accountId, envelope.chatType, envelope.chatId],
-        );
-        const message = await client.query<{ message_id: string }>(
-          `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, content,
-             content_rule_version, reply_to_message_id, mention_ids, mention_ranges, ingestion_source, occurred_at, raw)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::jsonb,$13::jsonb,$14,$15,$16::jsonb)
-           ON CONFLICT (account_id, message_id) DO NOTHING RETURNING message_id`,
-          [envelope.accountId, envelope.messageId, envelope.eventId, envelope.chatId, envelope.chatType,
-            envelope.senderId, envelope.kind, envelope.text, ...liveProjectionValues(envelope),
-            JSON.stringify(envelope.mentionIds), JSON.stringify(envelope.mentionRanges), envelope.ingestion.source,
-            envelope.occurredAt, JSON.stringify(envelope.raw)],
-        );
-        if (!message.rowCount) {
+        const staged = sourceBatchReplay ? { changed: false, conflict: false } : await stageSystemLoginObservation(client, {
+          accountId: batch.accountId, sourceId, generation: sourceGeneration, batchId: batch.batchId,
+          origin: envelope.ingestion.source === 'live' ? 'SYSTEM_LOGIN_LIVE' : 'SYSTEM_LOGIN_HISTORY',
+          captureCanonicalExistence: true,
+          observation: systemLoginObservation(envelope, { controlEpoch: batch.controlEpoch, receiptMode,
+            sensitive: sensitiveMessageIds.has(envelope.messageId) }),
+        });
+        if (staged.conflict) throw new Error('Login source observation ID was reused with changed identity');
+        const existed = sourceBatchReplay || staged.canonicalExisted === true;
+        if (existed) {
           duplicate++;
-          const existing = grantAuthorized ? await client.query<{ job_id: string }>(
-            `SELECT job_id FROM agent_jobs WHERE account_id = $1 AND source_type = 'line' AND source_message_id = $2 AND status = 'queued'`,
-            [envelope.accountId, envelope.messageId],
-          ) : { rows: [] };
-          if (existing.rows[0]) { jobIds.push(existing.rows[0].job_id); jobMessageIds.push(envelope.messageId); }
+          if (staged.changed) changedMessageIds.push(envelope.messageId);
           continue;
         }
         inserted++;
         insertedMessageIds.push(envelope.messageId);
+        if (staged.changed) changedMessageIds.push(envelope.messageId);
         if (envelope.ingestion.source === 'live' && envelope.kind !== 'event') await client.query(
           `UPDATE conversations c SET unread_count=unread_count+1, updated_at=now()
            WHERE c.account_id=$1 AND c.chat_type=$2 AND c.chat_id=$3 AND EXISTS
              (SELECT 1 FROM line_accounts la WHERE la.account_id=$1 AND la.own_mid IS DISTINCT FROM $4)`,
           [envelope.accountId, envelope.chatType, envelope.chatId, envelope.senderId]);
-        const canRoute = account.mode === 'ACTIVE_CONTROL' && envelope.ingestion.source === 'live';
-        const workspaceFailure = !decision.eligible && 'workspaceFailure' in decision ? decision.workspaceFailure : undefined;
-        const action = !canRoute ? 'ignore' : decision.eligible || workspaceFailure ? 'prompt'
-          : ('action' in decision ? decision.action : undefined) ?? 'ignore';
-        if (action !== 'ignore' && primaryAdminSenderId !== undefined) primaryAdminActionMessageIds.push(envelope.messageId);
-        await client.query(
-          `INSERT INTO message_routes (account_id, message_id, action, provider, creation_epoch) VALUES ($1,$2,$3,$4,$5)`,
-          [envelope.accountId, envelope.messageId, action, action === 'prompt'
-            ? decision.eligible ? decision.provider : workspaceFailure?.provider ?? null : null,
-            action === 'ignore' ? null : batch.controlEpoch],
-        );
-        for (const attachment of envelope.attachments) {
-          await client.query(
-            `INSERT INTO attachments (external_attachment_id, account_id, chat_type, chat_id, message_id, kind, name, mime_type, size_bytes)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-             ON CONFLICT (account_id, chat_type, chat_id, message_id, external_attachment_id) DO NOTHING`,
-            [attachment.id, envelope.accountId, envelope.chatType, envelope.chatId, envelope.messageId,
-              attachment.kind, attachment.name, attachment.mimeType, attachment.sizeBytes],
-          );
-        }
-        if (!canRoute || (!decision.eligible && !workspaceFailure)) continue;
-        const provider = decision.eligible ? decision.provider : workspaceFailure!.provider;
-        const prompt = decision.eligible ? decision.prompt : workspaceFailure!.prompt;
-        const workspacePath = decision.eligible ? decision.workspacePath : workspaceFailure!.workspacePath ?? '';
-        await client.query(
-          `INSERT INTO agent_sessions (account_id, chat_type, chat_id, provider, source_type) VALUES ($1,$2,$3,$4,'line') ON CONFLICT DO NOTHING`,
-          [envelope.accountId, envelope.chatType, envelope.chatId, provider],
-        );
-        const session = await client.query<{ generation: number }>(
-          `SELECT generation FROM agent_sessions WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 AND provider = $4 AND source_type = 'line' FOR UPDATE`,
-          [envelope.accountId, envelope.chatType, envelope.chatId, provider],
-        );
-        const jobId = randomUUID();
-        const insertedJob = await client.query<{ job_id: string; status: 'queued' | 'failed'; revision: string }>(
-          `INSERT INTO agent_jobs (job_id, account_id, chat_type, chat_id, provider, source_type, source_message_id,
-             prompt, workspace_path, generation, creation_epoch, status, completed_at, direct_friend_grant_id,
-             direct_friend_grant_version, room_agent_grant_id, room_agent_grant_version)
-           VALUES ($1,$2,$3,$4,$5,'line',$6,$7,$8,$9,$10,$11,CASE WHEN $11='failed' THEN now() ELSE NULL END,$12,$13,$14,$15)
-           RETURNING job_id,status,((extract(epoch FROM updated_at) * 1000000)::numeric(20,0))::text AS revision`,
-          [jobId, envelope.accountId, envelope.chatType, envelope.chatId, provider, envelope.messageId,
-            prompt, workspacePath, session.rows[0]!.generation, batch.controlEpoch, workspaceFailure ? 'failed' : 'queued',
-            grantAuthorized ? requestedAuthorization?.directGrantId ?? null : null,
-            grantAuthorized ? requestedAuthorization?.directGrantVersion ?? null : null,
-            grantAuthorized ? requestedAuthorization?.roomGrantId ?? null : null,
-            grantAuthorized ? requestedAuthorization?.roomGrantVersion ?? null : null],
-        );
-        jobIds.push(jobId);
-        const committedJob = insertedJob.rows[0];
-        if (!committedJob) throw new Error('Inserted Agent job projection missing');
-        jobStatuses.push({ accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId,
-          sourceMessageId: envelope.messageId, jobId: committedJob.job_id, status: committedJob.status, revision: committedJob.revision });
-        if (workspaceFailure) {
-          await client.query('INSERT INTO agent_events (job_id, event) VALUES ($1, $2::jsonb)',
-            [jobId, JSON.stringify({ type: 'failed', code: workspaceFailure.code, message: workspaceFailure.reason, retryable: false })]);
-        } else {
-          jobMessageIds.push(envelope.messageId);
-        }
       }
       const { readPositionsChanged, readPositionChanges } = await this.upsertReadPositions(client, batch.accountId, readReceipts);
       const source = 'live';
@@ -483,8 +496,16 @@ export class MessageRepository {
          ON CONFLICT (account_id, source) DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()`,
         [batch.accountId, source, JSON.stringify(cursorAfter)],
       );
+      if (!sourceBatchReplay) {
+        await client.query(`UPDATE external_source_checkpoints SET cursor=$4::jsonb,updated_at=now()
+          WHERE source_id=$1 AND account_id=$2 AND generation=$3`,
+        [sourceId, batch.accountId, sourceGeneration, JSON.stringify(cursorAfter)]);
+        await client.query(`UPDATE external_source_batches SET result=$4::jsonb
+          WHERE source_id=$1 AND generation=$2 AND batch_id=$3`,
+        [sourceId, sourceGeneration, batch.batchId, JSON.stringify({ inserted, duplicate })]);
+      }
       await client.query('COMMIT');
-      return { inserted, duplicate, insertedMessageIds, jobIds, jobMessageIds, primaryAdminActionMessageIds, jobStatuses,
+      return { inserted, duplicate, insertedMessageIds, changedMessageIds: [...new Set(changedMessageIds)], jobIds: [], jobMessageIds: [], primaryAdminActionMessageIds: [], jobStatuses: [],
         readPositionsChanged, readPositionChanges };
     } catch (error) {
       await client.query('ROLLBACK');
@@ -492,6 +513,172 @@ export class MessageRepository {
     } finally {
       client.release();
     }
+  }
+
+  async admitLiveBatch(batch: Extract<LineWorkerEvent, { type: 'batch' }>, decisions: readonly RoutingDecision[]): Promise<{
+    jobIds: string[]; jobMessageIds: string[]; jobStatuses: NonNullable<IngestResult['jobStatus']>[]; primaryAdminActionMessageIds: string[];
+    routeDecisions: RoutingDecision[];
+  }> {
+    if (batch.envelopes.length !== decisions.length) throw new Error('One routing decision is required per envelope');
+    const client = await this.pool.connect();
+    const jobIds: string[] = [], jobMessageIds: string[] = [], jobStatuses: NonNullable<IngestResult['jobStatus']>[] = [], primaryAdminActionMessageIds: string[] = [];
+    const routeDecisions = [...decisions];
+    try {
+      await client.query('BEGIN');
+      const control = await client.query<{ control_epoch: string }>('SELECT control_epoch FROM account_control WHERE singleton=true FOR SHARE');
+      const authority = await client.query<{ mode: string; worker_instance_id: string | null; worker_binding_epoch: string | null;
+        connection_mode: string; own_mid: string | null; selected_source_id: string | null; selected_source_generation: string | null;
+        source_type: string | null; source_state: string | null; verified_account_mid: string | null }>(
+        `SELECT a.mode,a.worker_instance_id,a.worker_binding_epoch,a.connection_mode,a.own_mid,a.selected_source_id,
+          a.selected_source_generation,s.source_type,s.state AS source_state,s.verified_account_mid
+         FROM line_accounts a LEFT JOIN line_account_sources s ON s.account_id=a.account_id
+           AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
+         WHERE a.account_id=$1 FOR SHARE OF a`, [batch.accountId]);
+      const account = authority.rows[0];
+      if (!account || account.worker_instance_id !== batch.workerInstanceId
+        || Number(account.worker_binding_epoch) !== batch.controlEpoch || batch.controlEpoch > Number(control.rows[0]?.control_epoch)
+        || (account.mode === 'ACTIVE_CONTROL' && batch.controlEpoch !== Number(control.rows[0]?.control_epoch))
+        || account.connection_mode !== 'SYSTEM_LOGIN' || !account.selected_source_id || account.source_type !== 'SYSTEM_LOGIN'
+        || account.source_state !== 'ACTIVE' || account.own_mid !== account.verified_account_mid) throw new Error('Stale login admission authority');
+      if (account.mode !== 'ACTIVE_CONTROL') {
+        routeDecisions.fill({ eligible: false, action: 'ignore' });
+        await client.query('COMMIT');
+        return { jobIds, jobMessageIds, jobStatuses, primaryAdminActionMessageIds, routeDecisions };
+      }
+      for (const [index, envelope] of batch.envelopes.entries()) {
+        if (envelope.ingestion.source !== 'live' || envelope.accountId !== batch.accountId) continue;
+        const priorRoute = await client.query<{ action: string }>(
+          'SELECT action FROM message_routes WHERE account_id=$1 AND message_id=$2 FOR SHARE',
+          [batch.accountId, envelope.messageId]);
+        if (priorRoute.rows[0]?.action === 'prompt') {
+          const existing = await client.query<{ job_id: string; status: 'queued' | 'failed'; revision: string }>(
+            `SELECT job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision
+             FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2`,
+            [batch.accountId, envelope.messageId]);
+          const job = existing.rows[0];
+          if (job) {
+            jobIds.push(job.job_id);
+            jobStatuses.push({ accountId: batch.accountId, chatType: envelope.chatType, chatId: envelope.chatId,
+              sourceMessageId: envelope.messageId, jobId: job.job_id, status: job.status, revision: job.revision });
+            if (job.status === 'queued') jobMessageIds.push(envelope.messageId);
+          }
+          continue;
+        }
+        if (priorRoute.rowCount) continue;
+        const requested = decisions[index]!;
+        const primaryAdminStillBound = requested.primaryAdminSenderId === undefined || (await client.query(
+          `SELECT 1 FROM account_administrators WHERE account_id=$1 AND role='PRIMARY_ADMIN' AND user_id=$2 FOR SHARE`,
+          [batch.accountId, requested.primaryAdminSenderId])).rowCount === 1;
+        const requestedAuthorization = requested.eligible || 'workspaceFailure' in requested ? requested.authorization : undefined;
+        const grantAuthorized = requestedAuthorization ? await this.lockAndCheckAgentAuthorization(client, batch.accountId,
+          envelope.chatType, envelope.chatId, envelope.senderId, requestedAuthorization) : true;
+        const decision: RoutingDecision = !grantAuthorized || !primaryAdminStillBound ? { eligible: false, action: 'ignore' } : requested;
+        routeDecisions[index] = decision;
+        if ('primaryAdminSenderId' in decision && decision.primaryAdminSenderId
+          && (decision.eligible || 'workspaceFailure' in decision || ('action' in decision && decision.action !== 'ignore'))) {
+          primaryAdminActionMessageIds.push(envelope.messageId);
+        }
+        const failure = !decision.eligible && 'workspaceFailure' in decision ? decision.workspaceFailure : undefined;
+        if (!decision.eligible && !failure) continue;
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,2))', [`${batch.accountId}:${envelope.messageId}`]);
+        const existing = await client.query<{ job_id: string; status: 'queued' | 'failed'; revision: string }>(
+          `SELECT job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision
+           FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2`, [batch.accountId,envelope.messageId]);
+        let job = existing.rows[0];
+        if (!job) {
+          const provider = decision.eligible ? decision.provider : failure!.provider;
+          const prompt = decision.eligible ? decision.prompt : failure!.prompt;
+          const workspacePath = decision.eligible ? decision.workspacePath : failure!.workspacePath ?? '';
+          await client.query(`INSERT INTO agent_sessions(account_id,chat_type,chat_id,provider,source_type) VALUES($1,$2,$3,$4,'line')
+            ON CONFLICT DO NOTHING`, [batch.accountId,envelope.chatType,envelope.chatId,provider]);
+          const session = await client.query<{ generation: number }>(`SELECT generation FROM agent_sessions WHERE account_id=$1
+            AND chat_type=$2 AND chat_id=$3 AND provider=$4 AND source_type='line' FOR UPDATE`,
+            [batch.accountId,envelope.chatType,envelope.chatId,provider]);
+          const jobId = randomUUID();
+          const inserted = await client.query<{ job_id: string; status: 'queued'|'failed'; revision: string }>(
+            `INSERT INTO agent_jobs(job_id,account_id,chat_type,chat_id,provider,source_type,source_message_id,source_sender_id,prompt,workspace_path,
+               generation,creation_epoch,status,completed_at,direct_friend_grant_id,direct_friend_grant_version,room_agent_grant_id,room_agent_grant_version)
+             VALUES($1,$2,$3,$4,$5,'line',$6,$7,$8,$9,$10,$11,$12,CASE WHEN $12='failed' THEN now() ELSE NULL END,$13,$14,$15,$16)
+             ON CONFLICT(account_id,source_message_id) WHERE source_type='line' DO NOTHING
+             RETURNING job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision`,
+            [jobId,batch.accountId,envelope.chatType,envelope.chatId,provider,envelope.messageId,envelope.senderId,prompt,workspacePath,session.rows[0]!.generation,
+              batch.controlEpoch,failure?'failed':'queued',requestedAuthorization?.directGrantId??null,requestedAuthorization?.directGrantVersion??null,
+              requestedAuthorization?.roomGrantId??null,requestedAuthorization?.roomGrantVersion??null]);
+          job = inserted.rows[0] ?? (await client.query<{ job_id: string; status: 'queued'|'failed'; revision: string }>(
+            `SELECT job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision
+             FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2`, [batch.accountId,envelope.messageId])).rows[0];
+          if (!job) throw new Error('Agent job insert did not produce or find a job');
+          if (failure && inserted.rowCount) await client.query('INSERT INTO agent_events(job_id,event) VALUES($1,$2::jsonb)',
+            [job.job_id,JSON.stringify({type:'failed',code:failure.code,message:failure.reason,retryable:false})]);
+        }
+        jobIds.push(job.job_id);
+        jobStatuses.push({ accountId:batch.accountId,chatType:envelope.chatType,chatId:envelope.chatId,
+          sourceMessageId:envelope.messageId,jobId:job.job_id,status:job.status,revision:job.revision });
+        if (job.status === 'queued') jobMessageIds.push(envelope.messageId);
+      }
+      await client.query('COMMIT');
+      return { jobIds, jobMessageIds, jobStatuses, primaryAdminActionMessageIds, routeDecisions };
+    } catch (error) { await client.query('ROLLBACK'); throw error; }
+    finally { client.release(); }
+  }
+
+  async recordBatchRoutes(batch: Extract<LineWorkerEvent, { type: 'batch' }>, decisions: readonly RoutingDecision[], completedPrompts: ReadonlySet<string>): Promise<void> {
+    if (batch.envelopes.length !== decisions.length) throw new Error('One routing decision is required per envelope');
+    for (const [index, envelope] of batch.envelopes.entries()) {
+      if (envelope.ingestion.source !== 'live') continue;
+      const decision = decisions[index]!;
+      const failure = !decision.eligible && 'workspaceFailure' in decision ? decision.workspaceFailure : undefined;
+      if ((decision.eligible || failure) && !completedPrompts.has(envelope.messageId)) continue;
+      const action = decision.eligible || failure ? 'prompt' : ('action' in decision ? decision.action : undefined) ?? 'ignore';
+      await this.pool.query(`INSERT INTO message_routes(account_id,message_id,action,provider,creation_epoch)
+        SELECT $1,$2,$3,$4,$5 WHERE EXISTS(SELECT 1 FROM messages WHERE account_id=$1 AND message_id=$2)
+        ON CONFLICT(account_id,message_id) DO NOTHING`, [envelope.accountId,envelope.messageId,action,
+          action === 'prompt' ? decision.eligible ? decision.provider : failure?.provider ?? null : null,
+          action === 'ignore' ? null : batch.controlEpoch]);
+    }
+  }
+
+  async existingLiveRoutes(batch: Extract<LineWorkerEvent, { type: 'batch' }>): Promise<Set<string>> {
+    const messageIds = batch.envelopes.filter((envelope) => envelope.ingestion.source === 'live'
+      && envelope.accountId === batch.accountId).map((envelope) => envelope.messageId);
+    if (!messageIds.length) return new Set();
+    const result = await this.pool.query<{ message_id: string }>(
+      'SELECT message_id FROM message_routes WHERE account_id=$1 AND message_id=ANY($2::text[])',
+      [batch.accountId, messageIds]);
+    return new Set(result.rows.map((row) => row.message_id));
+  }
+
+  async listUnroutedLiveSourceMessages(input: { accountId: string; workerInstanceId: string; controlEpoch: number;
+    afterObservationId?: string; limit?: number }): Promise<UnroutedLiveSourceMessage[]> {
+    const limit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? 100)));
+    const result = await this.pool.query<{ observation_id: string; recovery: Record<string, unknown> | null }>(
+      `SELECT o.observation_id,o.normalized_payload->'livePayload'->'recovery' AS recovery
+       FROM line_accounts a
+       JOIN line_account_sources s ON s.account_id=a.account_id AND s.source_id=a.selected_source_id
+         AND s.generation=a.selected_source_generation AND s.source_type='SYSTEM_LOGIN' AND s.state='ACTIVE'
+       JOIN message_source_provenance p ON p.account_id=a.account_id AND p.source_id=s.source_id
+         AND p.generation=s.generation AND p.origin='SYSTEM_LOGIN_LIVE'
+       JOIN external_source_observations o ON o.source_id=p.source_id AND o.generation=p.generation
+         AND o.observation_id=p.observation_id AND o.canonical_message_id=p.message_id
+       JOIN account_control ac ON ac.singleton=true
+       LEFT JOIN message_routes r ON r.account_id=p.account_id AND r.message_id=p.message_id
+       WHERE a.account_id=$1 AND a.connection_mode='SYSTEM_LOGIN' AND a.mode='ACTIVE_CONTROL'
+         AND a.worker_instance_id=$2 AND a.worker_binding_epoch=$3 AND ac.control_epoch=$3
+         AND a.own_mid=s.verified_account_mid AND r.message_id IS NULL
+         AND o.normalized_payload->'livePayload'->'recovery'->'envelope' IS NOT NULL
+         AND o.observation_id > $4
+       ORDER BY o.observation_id ASC LIMIT $5`,
+      [input.accountId, input.workerInstanceId, input.controlEpoch, input.afterObservationId ?? '', limit]);
+    return result.rows.map((row) => {
+      const recovery = row.recovery ?? {};
+      const parsed = InboundEnvelopeSchema.safeParse(recovery.envelope);
+      const receiptMode = recovery.receiptMode === 'ACTIVE_CONTROL' || recovery.receiptMode === 'MONITOR_ONLY' || recovery.receiptMode === 'PAUSED'
+        ? recovery.receiptMode : 'PAUSED';
+      const receiptControlEpoch = Number.isSafeInteger(recovery.controlEpoch) && Number(recovery.controlEpoch) >= 0
+        ? Number(recovery.controlEpoch) : -1;
+      return { observationId: row.observation_id, envelope: parsed.success ? parsed.data : null,
+        receiptMode, receiptControlEpoch, sensitive: recovery.sensitive === true };
+    });
   }
 
   /** Forward-only read-position upsert, one statement per batch. Receipts for unknown conversations are dropped. */
@@ -626,28 +813,126 @@ export class MessageRepository {
     );
   }
 
+  /** Record a confirmed LINE unsend through the selected system-login source copy and its canonical projector. */
+  async recordManualUnsend(key: ConversationKey, messageId: string, ownMid: string): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const authority = await client.query<{ own_mid: string | null; connection_mode: string; source_id: string | null;
+        generation: string | null; source_type: string | null; source_state: string | null; verified_account_mid: string | null }>(
+        `SELECT a.own_mid,a.connection_mode,a.selected_source_id AS source_id,a.selected_source_generation AS generation,
+          s.source_type,s.state AS source_state,s.verified_account_mid
+         FROM line_accounts a LEFT JOIN line_account_sources s ON s.account_id=a.account_id
+           AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
+         WHERE a.account_id=$1 FOR SHARE OF a`, [key.accountId]);
+      const account = authority.rows[0];
+      if (!account || account.connection_mode !== 'SYSTEM_LOGIN' || account.own_mid !== ownMid
+        || account.verified_account_mid !== ownMid || account.source_type !== 'SYSTEM_LOGIN' || account.source_state !== 'ACTIVE'
+        || !account.source_id || !account.generation) throw new Error('Logged-in source authority is stale');
+
+      const message = await client.query<{ chat_type: string; chat_id: string; sender_id: string; content: MessageContent | null }>(
+        'SELECT chat_type,chat_id,sender_id,content FROM messages WHERE account_id=$1 AND message_id=$2', [key.accountId, messageId]);
+      const current = message.rows[0];
+      if (!current || current.chat_type !== key.chatType || current.chat_id !== key.chatId || current.sender_id !== ownMid) {
+        throw new Error('Message is not an owned message in the selected conversation');
+      }
+      if (current.content?.type === 'unsent') { await client.query('COMMIT'); return false; }
+
+      const source = await client.query<{ normalized_payload: ExternalObservation }>(
+        `SELECT normalized_payload FROM external_source_observations
+         WHERE source_id=$1 AND account_id=$2 AND generation=$3 AND canonical_message_id=$4 AND status='PROJECTED'
+         ORDER BY observation_id LIMIT 1`, [account.source_id, key.accountId, Number(account.generation), messageId]);
+      const prior = source.rows[0]?.normalized_payload;
+      if (!prior?.livePayload) throw new Error('Message source copy is unavailable for unsend reconciliation');
+      const raw = prior.livePayload.raw;
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Message source copy is unavailable for unsend reconciliation');
+      const rawRecord = raw as Record<string, JsonValue>;
+      const nativeMessage = rawRecord.message;
+      if (nativeMessage === null || typeof nativeMessage !== 'object' || Array.isArray(nativeMessage)) {
+        throw new Error('Message source copy is unavailable for unsend reconciliation');
+      }
+      const nativeRecord = nativeMessage as Record<string, JsonValue>;
+      const metadata = nativeRecord.contentMetadata;
+      const metadataRecord = metadata !== null && typeof metadata === 'object' && !Array.isArray(metadata)
+        ? metadata as Record<string, JsonValue> : {};
+      const observation: ExternalObservation = { ...prior, text: null, livePayload: { ...prior.livePayload,
+        raw: { ...rawRecord, message: { ...nativeRecord, text: '', contentMetadata: { ...metadataRecord, UNSENT: true } } } } };
+      const batchId = `manual-unsend:${randomUUID()}`;
+      const payloadDigest = createHash('sha256').update(JSON.stringify(observation), 'utf8').digest('hex');
+      await client.query(`INSERT INTO external_source_batches(source_id,account_id,generation,batch_id,payload_digest,result)
+        VALUES ($1,$2,$3,$4,$5,'{}'::jsonb)`,
+      [account.source_id, key.accountId, Number(account.generation), batchId, payloadDigest]);
+      const staged = await stageSystemLoginObservation(client, { accountId: key.accountId, sourceId: account.source_id,
+        generation: Number(account.generation), batchId, origin: 'SYSTEM_LOGIN_LIVE', observation });
+      if (staged.conflict) throw new Error('Message source copy changed while reconciling unsend');
+      await client.query('COMMIT');
+      return staged.changed;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally { client.release(); }
+  }
+
   async ingestAndRoute(envelope: InboundEnvelope, routingDecision: RoutingDecision): Promise<IngestResult> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       const control = await client.query<{ control_epoch: string }>('SELECT control_epoch FROM account_control WHERE singleton = true FOR SHARE');
       await client.query('INSERT INTO line_accounts (account_id) VALUES ($1) ON CONFLICT (account_id) DO NOTHING', [envelope.accountId]);
-      const source = await client.query<{ connection_mode: string }>(
-        'SELECT connection_mode FROM line_accounts WHERE account_id=$1 FOR SHARE', [envelope.accountId]);
+      const source = await client.query<{ connection_mode: string; own_mid: string | null; source_id: string | null;
+        generation: string | null; source_type: string | null; source_state: string | null; verified_account_mid: string | null }>(
+        `SELECT a.connection_mode,a.own_mid,a.selected_source_id AS source_id,a.selected_source_generation AS generation,
+          s.source_type,s.state AS source_state,s.verified_account_mid FROM line_accounts a LEFT JOIN line_account_sources s
+            ON s.account_id=a.account_id AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
+         WHERE a.account_id=$1 FOR SHARE OF a`, [envelope.accountId]);
       if (source.rows[0]?.connection_mode === 'EXTERNAL_MONITOR') throw new Error('External monitor is read-only');
+      const loginSource = source.rows[0]?.connection_mode === 'SYSTEM_LOGIN' && source.rows[0]?.source_type === 'SYSTEM_LOGIN'
+        && source.rows[0]?.source_state === 'ACTIVE' && source.rows[0]?.own_mid === source.rows[0]?.verified_account_mid
+        ? { sourceId: source.rows[0]!.source_id!, generation: Number(source.rows[0]!.generation) } : null;
+      if (envelope.ingestion.source === 'history' && source.rows[0]?.connection_mode === 'SYSTEM_LOGIN'
+        && source.rows[0]?.own_mid !== null && !loginSource) throw new Error('Logged-in history source authority is stale');
       await client.query(
         'INSERT INTO conversations (account_id, chat_id, chat_type) VALUES ($1, $2, $3) ON CONFLICT (account_id, chat_type, chat_id) DO NOTHING',
         [envelope.accountId, envelope.chatId, envelope.chatType],
       );
-      const inserted = await client.query(
-        `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, content, content_rule_version, reply_to_message_id, mention_ids, mention_ranges, ingestion_source, occurred_at, raw)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb, $14, $15, $16::jsonb)
-         ON CONFLICT (account_id, message_id) DO NOTHING RETURNING message_id`,
-        [envelope.accountId, envelope.messageId, envelope.eventId, envelope.chatId, envelope.chatType, envelope.senderId, envelope.kind, envelope.text, ...liveProjectionValues(envelope), JSON.stringify(envelope.mentionIds), JSON.stringify(envelope.mentionRanges), envelope.ingestion.source, envelope.occurredAt, JSON.stringify(envelope.raw)],
-      );
+      let inserted = true;
+      let messageChanged = false;
+      if (loginSource) {
+        const observation = systemLoginObservation(envelope);
+        const observationDigest = createHash('sha256').update(JSON.stringify(observation), 'utf8').digest('hex');
+        const batchId = `history:${observationDigest}`;
+        const priorBatch = await client.query<{ payload_digest: string }>(
+          'SELECT payload_digest FROM external_source_batches WHERE source_id=$1 AND generation=$2 AND batch_id=$3 FOR UPDATE',
+          [loginSource.sourceId, loginSource.generation, batchId]);
+        if (priorBatch.rows[0] && priorBatch.rows[0].payload_digest !== observationDigest) throw new Error('Login history replay digest mismatch');
+        if (!priorBatch.rows[0]) {
+          await client.query(`INSERT INTO external_source_batches(source_id,account_id,generation,batch_id,payload_digest,result)
+            VALUES ($1,$2,$3,$4,$5,'{}'::jsonb)`,
+          [loginSource.sourceId, envelope.accountId, loginSource.generation, batchId, observationDigest]);
+          const staged = await stageSystemLoginObservation(client, { accountId: envelope.accountId, sourceId: loginSource.sourceId,
+            generation: loginSource.generation, batchId, origin: envelope.ingestion.source === 'live' ? 'SYSTEM_LOGIN_LIVE' : 'SYSTEM_LOGIN_HISTORY',
+            observation, captureCanonicalExistence: true });
+          if (staged.conflict) throw new Error('Login source observation ID was reused with changed identity');
+          messageChanged = staged.changed;
+          inserted = staged.canonicalExisted === false;
+        } else {
+          inserted = false;
+        }
+      } else {
+        const priorMessage = await client.query('SELECT 1 FROM messages WHERE account_id=$1 AND message_id=$2 FOR UPDATE',
+          [envelope.accountId, envelope.messageId]);
+        inserted = !priorMessage.rowCount;
+        const directInsert = await client.query(
+          `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, content, content_rule_version, reply_to_message_id, mention_ids, mention_ranges, ingestion_source, occurred_at, raw)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb, $14, $15, $16::jsonb)
+           ON CONFLICT (account_id, message_id) DO NOTHING RETURNING message_id`,
+          [envelope.accountId, envelope.messageId, envelope.eventId, envelope.chatId, envelope.chatType, envelope.senderId, envelope.kind, envelope.text, ...liveProjectionValues(envelope), JSON.stringify(envelope.mentionIds), JSON.stringify(envelope.mentionRanges), envelope.ingestion.source, envelope.occurredAt, JSON.stringify(envelope.raw)],
+        );
+        inserted = Boolean(directInsert.rowCount);
+      }
       let jobId: string | undefined;
       let jobStatus: NonNullable<IngestResult['jobStatus']> | undefined;
-      if (inserted.rowCount) {
+      if (inserted) {
         if (envelope.ingestion.source === 'live' && envelope.kind !== 'event') await client.query(
           `UPDATE conversations c SET unread_count=unread_count+1, updated_at=now()
            WHERE c.account_id=$1 AND c.chat_type=$2 AND c.chat_id=$3 AND EXISTS
@@ -707,9 +992,10 @@ export class MessageRepository {
         [envelope.accountId, envelope.ingestion.source],
       );
       await client.query('COMMIT');
-      const result: IngestResult = { disposition: inserted.rowCount ? 'inserted' : 'duplicate', durableCursor: cursor.rows[0]?.cursor ?? null };
+      const result: IngestResult = { disposition: inserted ? 'inserted' : 'duplicate', durableCursor: cursor.rows[0]?.cursor ?? null };
       if (jobId) result.jobId = jobId;
       if (jobStatus) result.jobStatus = jobStatus;
+      if (messageChanged) result.messageChanged = true;
       return result;
     } catch (error) {
       await client.query('ROLLBACK');
@@ -766,7 +1052,7 @@ export class MessageRepository {
       conversationTitle: row.conversation_title, text: row.text_content, occurredAt: row.occurred_at.toISOString() }));
   }
 
-  async listMessages(key: ConversationKey, before: string | null, limit: number): Promise<{ messages: TimelineMessageRecord[]; nextCursor: string | null }> {
+  async listMessages(key: ConversationKey, before: string | null, limit: number, exactMessageId?: string): Promise<{ messages: TimelineMessageRecord[]; nextCursor: string | null }> {
     const result = await this.pool.query<{
       account_id: string; chat_type: ConversationKey['chatType']; chat_id: string; message_id: string;
       sender_id: string; text_content: string | null; content: MessageContent | null; occurred_at: Date; kind: InboundEnvelope['kind']; raw: unknown; mention_ranges?: unknown;
@@ -781,14 +1067,18 @@ export class MessageRepository {
          CASE WHEN octet_length((m.raw->'recall'->'original')::text) <= ${RECALL_ORIGINAL_MAX_BYTES} THEN m.raw->'recall'->'original' END AS recall_original
        FROM messages m LEFT JOIN line_accounts la ON la.account_id = m.account_id
        WHERE m.account_id = $1 AND m.chat_type = $2 AND m.chat_id = $3 AND (m.kind <> 'event' OR m.content IS NOT NULL)
+         AND ($6::text IS NULL OR m.message_id=$6)
          AND ($4::text IS NULL OR (m.occurred_at, m.message_id) < (
            SELECT occurred_at, message_id FROM messages
            WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 AND message_id = $4))
        ORDER BY m.occurred_at DESC, m.message_id DESC LIMIT $5`,
-      [key.accountId, key.chatType, key.chatId, before, limit + 1],
+      [key.accountId, key.chatType, key.chatId, before, limit + 1, exactMessageId ?? null],
     );
     const page = result.rows.slice(0, limit);
     const nextCursor = result.rows.length > limit ? page.at(-1)!.message_id : null;
+    const eventMids = [...new Set(page.flatMap((row) => liveChatEventMids(row.raw)).slice(0, 10_500))];
+    const chatEventNames = eventMids.length > 0
+      ? await loadChatEventNames(this.pool, key.accountId, key.chatType, key.chatId, eventMids) : undefined;
     const reactionsByMessage = new Map(page.map((row) => [row.message_id, nativeReactions(row.raw)] as const).filter(([, list]) => list.length > 0));
     const reactorIds = [...new Set([...reactionsByMessage.values()].flatMap((list) => list.flatMap((group) => group.reactorIds)))];
     const reactorNames = new Map<string, string>();
@@ -806,7 +1096,12 @@ export class MessageRepository {
     return { messages: [...page].reverse().map((row) => ({ accountId: row.account_id, chatType: row.chat_type,
       chatId: row.chat_id, messageId: row.message_id, senderId: row.sender_id, text: row.text_content,
       occurredAt: row.occurred_at.toISOString(), kind: row.kind,
-      content: row.content,
+      content: (() => {
+        if (!chatEventNames || liveChatEventMids(row.raw).length === 0) return row.content;
+        const projected = bridgeLiveMessage({ raw: row.raw, names: chatEventNames });
+        return projected?.content ?? row.content;
+      })(),
+      postNotificationType: postNotificationSubtypeFromRaw(row.raw),
       sticker: row.kind === 'sticker' ? parseLineStickerDescriptor(row.raw) : null,
       mentionRanges: normalizeMentionRanges(row.text_content, row.mention_ranges),
       sourceDeleted: row.source_deleted === true,
@@ -814,6 +1109,11 @@ export class MessageRepository {
       ...(reactionsByMessage.has(row.message_id)
         ? { reactions: reactionsByMessage.get(row.message_id)!.map((group) => ({ ...group, reactorNames: group.reactorIds.map(nameOf) })) } : {}),
       recallOriginal: parseRecallOriginal(row.recall_original) })), nextCursor };
+  }
+
+  async getMessage(key: ConversationKey, messageId: string): Promise<TimelineMessageRecord | null> {
+    const page = await this.listMessages(key, null, 1, messageId);
+    return page.messages[0] ?? null;
   }
 
   /** Readers of one own message (position >= messageId), newest read first. Empty for non-own or unsupported chats. */

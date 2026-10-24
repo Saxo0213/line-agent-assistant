@@ -1,7 +1,69 @@
 import { describe, expect, it } from 'vitest';
-import { createOperationalAudit, type AuditEvent } from './operational-audit.js';
+import { createOperationalAudit, parseOperationalAuditEvent, type AuditEvent } from './operational-audit.js';
 
 describe('operational audit', () => {
+  it('never coalesces unidentified independent operations and retains identified repeats once', async () => {
+    const stored: AuditEvent[] = [];
+    const audit = createOperationalAudit({ append: async (event) => { stored.push(event); }, appendFallback: async () => {}, logSinkState() {} });
+    const diagnostic = { operation: 'delivery', stage: 'execute', category: 'unknown', recovery: 'retry' } as const;
+    audit.failure(diagnostic); audit.failure(diagnostic);
+    for (let index = 0; index < 100; index++) audit.failure(diagnostic, { requestId: 'request-a', jobId: 'job-a', background: true });
+    audit.failure(diagnostic, { requestId: 'request-b', jobId: 'job-b' });
+    await audit.flush();
+    expect(stored).toHaveLength(4);
+    expect(new Set(stored.map((event) => event.correlationId)).size).toBe(4);
+    expect(stored.slice(2)).toMatchObject([{ requestId: 'request-a', jobId: 'job-a' }, { requestId: 'request-b', jobId: 'job-b' }]);
+  });
+  it('keeps independent requests, jobs and providers distinct while coalescing background repeats', async () => {
+    const stored: AuditEvent[] = [];
+    const audit = createOperationalAudit({ append: async (event) => { stored.push(event); }, appendFallback: async () => {}, logSinkState() {} });
+    const diagnostic = { operation: 'agent', stage: 'execute', category: 'unknown', recovery: 'retry' } as const;
+    audit.failure(diagnostic, { jobId: 'job-a' }); audit.failure(diagnostic, { jobId: 'job-b' });
+    audit.failure(diagnostic, { requestId: 'request-a' }); audit.failure(diagnostic, { requestId: 'request-b' });
+    audit.failure({ ...diagnostic, provider: 'codex' }, { background: true }); audit.failure({ ...diagnostic, provider: 'claude' }, { background: true });
+    const correlated = audit.failure({ ...diagnostic, provider: 'claude' }, { background: true });
+    await audit.flush(); expect(stored).toHaveLength(6);
+    expect(correlated).toBe(stored[5]?.correlationId);
+  });
+
+  it('coalesces an idle/burst failure stream within fixed memory and drains without creating timers', async () => {
+    const stored: AuditEvent[] = [];
+    const audit = createOperationalAudit({ append: async (event) => { stored.push(event); }, appendFallback: async () => {}, logSinkState() {} });
+    for (let index = 0; index < 10_000; index++) {
+      audit.failure({ operation: 'poll', stage: 'execute', category: 'timeout', recovery: 'retry' }, { background: true });
+    }
+    audit.failure({ operation: 'history', stage: 'read', category: 'cancelled', recovery: 'none' });
+    await audit.flush();
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).not.toHaveProperty('background');
+    expect(audit.health()).toEqual({ databaseFailed: false, fallbackFailed: false, droppedCount: 0, queuedCount: 0, failureKeys: 1 });
+    expect(audit.pendingActionCount).toBe(0);
+  });
+
+  it('bounds retained background failure scopes through repeated burst and idle drains', async () => {
+    const audit = createOperationalAudit({ append: async () => {}, appendFallback: async () => {}, logSinkState() {} });
+    for (let burst = 0; burst < 5; burst++) {
+      for (let scope = 0; scope < 200; scope++) audit.failure({ operation: 'poll', stage: 'execute', category: 'timeout', recovery: 'retry' },
+        { accountId: `account-${burst}-${scope}`, background: true });
+      await audit.flush();
+      expect(audit.health()).toMatchObject({ queuedCount: 0, failureKeys: 128, droppedCount: 0 });
+      expect(audit.pendingActionCount).toBe(0);
+    }
+  });
+
+  it('round trips fixed diagnostic fields and discards arbitrary exception content', async () => {
+    const stored: AuditEvent[] = [];
+    const audit = createOperationalAudit({ append: async (event) => { stored.push(event); }, appendFallback: async () => {}, logSinkState() {} });
+    audit.observed('worker_operation_error', { initiator: 'worker', requestId: 'request-a', errorCode: 'HISTORY_READ_FAILED',
+      diagnostic: { operation: 'history', stage: 'read', category: 'timeout', recovery: 'retry', statusCode: 504,
+        message: 'secret-sentinel', cause: new Error('secret-sentinel') } as never });
+    await audit.flush();
+    expect(parseOperationalAuditEvent(JSON.parse(JSON.stringify(stored[0])))).toMatchObject({ requestId: 'request-a',
+      diagnostic: { operation: 'history', stage: 'read', category: 'timeout', recovery: 'retry', statusCode: 504 } });
+    expect(JSON.stringify(stored)).not.toContain('secret-sentinel');
+    expect(parseOperationalAuditEvent({ ...stored[0], diagnostic: { operation: 'secret-sentinel' } })).toBeNull();
+  });
+
   it('records requested and terminal events with one correlation id and only allowlisted fields', async () => {
     const stored: AuditEvent[] = [];
     const audit = createOperationalAudit({
@@ -46,7 +108,8 @@ describe('operational audit', () => {
     await audit.flush();
 
     expect(workerContinued).toBe(true);
-    expect(fallback.map((event) => event.phase)).toEqual(['requested', 'failed']);
+    expect(fallback.filter((event) => event.action === 'worker_stop').map((event) => event.phase)).toEqual(['requested', 'failed']);
+    expect(audit.sinkEvents()).toContainEqual(expect.objectContaining({ action: 'audit_sink_failed', errorCode: 'DATABASE_WRITE_FAILED' }));
     expect(databaseAttempts).toBe(6);
     expect(JSON.stringify(fallback)).not.toContain('sensitive payload');
     expect(sinkChanges.map(({ state }) => state)).toEqual(['failed']);
@@ -55,7 +118,7 @@ describe('operational audit', () => {
     await audit.flush();
     expect(sinkChanges).toEqual([{ state: 'failed', droppedCount: 0 }, { state: 'recovered', droppedCount: 0 }]);
     expect(fallback).toHaveLength(2);
-    expect(database.map((event) => event.action)).toEqual(['worker_exited']);
+    expect(database.map((event) => event.action)).toEqual(['worker_exited', 'audit_sink_failed', 'audit_sink_recovered']);
   });
 
   it('drops the oldest queued audit events when its bounded queue is full', async () => {

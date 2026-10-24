@@ -11,7 +11,7 @@ import { Search } from './pages/Search.js';
 import { Jobs } from './pages/Jobs.js';
 import { Settings } from './pages/Settings.js';
 import { SetupWizard } from './pages/SetupWizard.js';
-import { LineMediaImage } from './LineMediaImage.js';
+import { accountAvatarRefreshed, LineMediaImage } from './LineMediaImage.js';
 import type { DatabaseSetupStatus } from '../setup-protocol.js';
 import { readStoredSettingsTab, storeSettingsTab, type SettingsTabId } from './settings-tab-storage.js';
 import { LocaleProvider, type LocaleState } from './locale-context.js';
@@ -191,6 +191,7 @@ export function App({ api = window.lineAgent }: { api?: DesktopApi }) {
   useEffect(() => {
     const remove = api.onEvent((event) => {
       if (event.type === 'snapshotChanged') setSnapshot(event.snapshot);
+      if (event.type === 'lineAvatarRefreshed') accountAvatarRefreshed(event.accountId, event.ownMid);
       if (event.type === 'controlChanged') setSnapshot((current) => ({ ...current, control: event.control }));
       if (event.type === 'messageStored') {
         setSnapshot((current) => {

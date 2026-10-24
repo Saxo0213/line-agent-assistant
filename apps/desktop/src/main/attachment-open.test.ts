@@ -34,6 +34,32 @@ describe('Windows attachment open', () => {
     return { base, root, target, record, calls, service, setRecord: (value: PreviewRecord | null) => { current = value; } };
   }
 
+  it('reports a fixed shell failure with attachment identity while success and shutdown remain quiet', async () => {
+    const f = await fixture();
+    const reports: unknown[] = [];
+    let result = 'private-native-error C:\\secret\\invoice.pdf';
+    const service = new AttachmentOpenService({ root: f.root, authority: { lookup: async () => f.record },
+      openPath: async () => result, onDiagnostic: (...args) => { reports.push(args); } });
+    expect(await service.open(ID, { senderId: 9 })).toBe(false);
+    expect(reports).toMatchObject([[{ operation: 'attachment', stage: 'execute', category: 'unavailable', outcome: 'failed' }, { requestId: ID }]]);
+    expect(JSON.stringify(reports)).not.toMatch(/private-native-error|secret|invoice/);
+    reports.length = 0; result = '';
+    expect(await service.open(ID, { senderId: 9 })).toBe(true);
+    await service.shutdown();
+    expect(await service.open(ID, { senderId: 9 })).toBe(false);
+    expect(reports).toEqual([]);
+    const launched = deferred<void>(), shellResult = deferred<string>();
+    const cancelled = new AttachmentOpenService({ root: f.root, authority: { lookup: async () => f.record },
+      openPath: async () => { launched.resolve(); return shellResult.promise; }, onDiagnostic: (...args) => { reports.push(args); } });
+    const pending = cancelled.open(ID, { senderId: 9 });
+    await launched.promise; await cancelled.shutdown();
+    expect(await pending).toBe(false);
+    shellResult.resolve('private-late-shell-error');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(reports).toEqual([]);
+    await f.service.shutdown();
+  });
+
   it('passes the exact original .blob path once and never changes the source', async () => {
     const f = await fixture(), before = await lstat(f.target), bytes = await readFile(f.target);
     expect(await f.service.open(ID, { senderId: 9 })).toBe(true);

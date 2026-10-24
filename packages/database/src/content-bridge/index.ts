@@ -1,4 +1,4 @@
-import { LINE_CONTENT_KIND_BY_TYPE, LINE_CONTENT_TYPE_NUMBER_BY_NAME, parseSticonRanges, redactMessageContent, redactSensitiveText, STICON_REPLACE_MAX_BYTES, type ContactDescriptor, type MessageContent, type MessageKind, type NativeSourceEnvelope, type SticonRange } from '@line-agent/contracts';
+import { LINE_CONTENT_KIND_BY_TYPE, LINE_CONTENT_TYPE_NUMBER_BY_NAME, NativeSourceEnvelopeSchema, parseSticonRanges, redactMessageContent, redactSensitiveText, STICON_REPLACE_MAX_BYTES, type ContactDescriptor, type MessageContent, type MessageKind, type NativeSourceEnvelope, type SticonRange } from '@line-agent/contracts';
 
 /**
  * Layer 2 of the two-layer message storage (docs/architecture/content-bridge-two-layer-2026-10-20.md).
@@ -125,6 +125,20 @@ export function nativeChatEventMids(envelope: NativeSourceEnvelope | null | unde
     return args ? [args.actor, ...args.targets.slice(0, MAX_EVENT_TARGETS)] : [];
   } catch { return []; }
 }
+/** MIDs needed to format a live type-18 event; malformed or unrelated envelopes return no identifiers. */
+export function liveChatEventMids(rawValue: unknown): string[] {
+  try {
+    if (!isRecord(rawValue) || rawValue.contentState !== undefined || !isRecord(rawValue.message)) return [];
+    const message = rawValue.message;
+    const type = typeof message.contentType === 'number' ? message.contentType
+      : typeof message.contentType === 'string' ? TYPE_NUMBER_BY_NAME[message.contentType] ?? Number(message.contentType) : null;
+    const metadata = message.contentMetadata;
+    if (type !== 18 || !isRecord(metadata) || typeof metadata.LOC_KEY !== 'string'
+      || !Object.hasOwn(CHAT_EVENT_HAS_TARGETS, metadata.LOC_KEY)) return [];
+    const args = parseChatEventArgs(metadata);
+    return args ? [args.actor, ...args.targets.slice(0, MAX_EVENT_TARGETS)] : [];
+  } catch { return []; }
+}
 /** Native type 0 with `_eventInfo.type` 15: LINE's community member-removal system line; every other type-0 row has no projection. */
 const convertNativeText = (f: BridgeFields): MessageContent | null => {
   const info = f.eventInfo;
@@ -186,7 +200,7 @@ function relationReply(relationType: unknown, relatedId: unknown): string | null
 }
 
 /** Live worker `messages.raw` (the sanitized operation) plus the envelope contact descriptor. */
-export function bridgeLiveMessage(input: Readonly<{ raw: unknown; contact?: ContactDescriptor | null | undefined }>,
+export function bridgeLiveMessage(input: Readonly<{ raw: unknown; contact?: ContactDescriptor | null | undefined; names?: ReadonlyMap<string, string> }>,
   rules: readonly BridgeRule[] = CONTENT_BRIDGE_RULES): BridgeResult | null {
   const raw = isRecord(input.raw) ? input.raw : {};
   if (raw.contentState !== undefined) return null; // decrypt_failed / contact_rejected: nothing to project
@@ -202,7 +216,51 @@ export function bridgeLiveMessage(input: Readonly<{ raw: unknown; contact?: Cont
       latitude: finiteWithin(m.location.latitude, 90), longitude: finiteWithin(m.location.longitude, 180) } : null;
   const contact = input.contact ? { mid: input.contact.mid, displayName: input.contact.displayName } : null;
   return applyRules('live', { contentType: input.contact ? 13 : contentType, text: typeof m.text === 'string' ? m.text : null,
-    metadata, location, contact, eventInfo: null }, relationReply(m.messageRelationType, m.relatedMessageId), rules);
+    metadata, location, contact, eventInfo: null, ...(input.names ? { names: input.names } : {}) }, relationReply(m.messageRelationType, m.relatedMessageId), rules);
+}
+
+/** Narrow, read-time subtype projection from an already stored raw message. No raw fields leave this module. */
+export function postNotificationSubtypeFromRaw(rawValue: unknown): 'note' | 'album' | null {
+  if (!isRecord(rawValue) || rawValue.sourceDeleted === true) return null;
+  if (rawValue.contentState !== undefined) return null;
+  // Native history stores a sanitized `message` projection beside the authoritative
+  // plain native row. Once native is present, never fall back to projection fields.
+  if (rawValue.native !== undefined) return postNotificationSubtypeFromNative(rawValue.native);
+  const message = isRecord(rawValue.message) ? rawValue.message : null;
+  if (message !== null) {
+    const rawType = message.contentType;
+    const contentType = typeof rawType === 'number' ? rawType : typeof rawType === 'string'
+      ? TYPE_NUMBER_BY_NAME[rawType] ?? (/^\d{1,4}$/.test(rawType) ? Number(rawType) : null) : null;
+    if (contentType !== 16) return null;
+    const metadata = message.contentMetadata;
+    if (!isRecord(metadata)) return null;
+    return metadata.serviceType === 'GB' ? 'note' : metadata.serviceType === 'AB' ? 'album' : null;
+  }
+  return null;
+}
+
+function postNotificationSubtypeFromNative(native: unknown): 'note' | 'album' | null {
+  // Read only the two native cells needed for classification. This deliberately does
+  // not validate or convert the complete native envelope on the snapshot path.
+  if (!isRecord(native) || native.format !== 2 || native.encoding !== 'plain' || native.table !== '_message' || !isRecord(native.row)
+    || !Array.isArray(native.row.columns) || !Array.isArray(native.row.cells) || native.row.columns.length !== native.row.cells.length) return null;
+  const columns = native.row.columns;
+  const cells = native.row.cells;
+  const typeIndex = columns.indexOf('_contentType');
+  const metadataIndex = columns.indexOf('_contentMetadata');
+  if (typeIndex < 0 || metadataIndex < 0 || typeIndex >= cells.length || metadataIndex >= cells.length) return null;
+  const typeCell = cells[typeIndex];
+  const typeText = typeof typeCell === 'number' ? String(typeCell) : isRecord(typeCell) && typeCell.sqliteType === 'integer' && typeof typeCell.value === 'string'
+    ? typeCell.value : typeof typeCell === 'string' ? typeCell : null;
+  if (typeText !== '16') return null;
+  const metadataText = cellText(cellMap(native as unknown as Extract<NativeSourceEnvelope, { format: 2 }>), '_contentMetadata');
+  if (metadataText === null) return null;
+  if (Buffer.byteLength(metadataText, 'utf8') > MAX_METADATA_BYTES) return null;
+  try {
+    const metadata: unknown = JSON.parse(metadataText);
+    if (!isRecord(metadata)) return null;
+    return metadata.serviceType === 'GB' ? 'note' : metadata.serviceType === 'AB' ? 'album' : null;
+  } catch { return null; }
 }
 
 type Cells = ReadonlyMap<string, unknown>;

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { LineWorkerCommand, LineWorkerEvent, WorkerBinding } from '@line-agent/contracts';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AgentJob, ClaimedLineDelivery, DeliverySegment } from '@line-agent/database';
 
 const DEFAULT_LIMIT = 4900;
@@ -76,7 +77,12 @@ export class DeliveryService {
   private deferredRecoveryInFlight = false;
   private stopping = false;
   constructor(private readonly repository: DeliveryRepository, private readonly worker: DeliveryWorker,
-    private readonly canWriteLine: (accountId: string) => Promise<boolean> = async () => true) {}
+    private readonly canWriteLine: (accountId: string) => Promise<boolean> = async () => true,
+    private readonly onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void) {}
+
+  private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown, outcome: 'failed' | 'unknown' = 'failed', identity?: import('@line-agent/contracts').DiagnosticIdentity): void {
+    try { this.onDiagnostic?.(diagnosticFailure('delivery', stage, error, outcome), identity); } catch { /* Preserve durable delivery behavior. */ }
+  }
 
   recoverPending(accountId?: string): Promise<void> {
     if (this.stopping || !this.repository.listPendingLineDeliveryJobs) return Promise.resolve();
@@ -146,7 +152,7 @@ export class DeliveryService {
     if (nextAccount) {
       this.deferredAccounts.delete(nextAccount);
       this.deferredRecoveryInFlight = true;
-      void this.recoverPending(nextAccount).catch(() => undefined).finally(() => {
+      void this.recoverPending(nextAccount).catch((error: unknown) => this.reportFailure('recover', error, 'failed', { accountId: nextAccount, background: true })).finally(() => {
         this.deferredRecoveryInFlight = false;
         this.drainDeferredAccounts();
       });
@@ -154,7 +160,7 @@ export class DeliveryService {
     }
     if (this.globalRecoveryNeeded) {
       this.globalRecoveryNeeded = false;
-      void this.recoverPending().catch(() => undefined);
+      void this.recoverPending().catch((error: unknown) => this.reportFailure('recover', error, 'failed', { background: true }));
     }
   }
 
@@ -162,7 +168,10 @@ export class DeliveryService {
     if (this.stopping) return Promise.resolve();
     const active = this.activeJobs.get(jobId);
     if (active) return active;
-    const operation = this.deliverJob(jobId);
+    const operation = this.deliverJob(jobId).catch((error: unknown) => {
+      if (!this.stopping) this.reportFailure('execute', error, 'failed', { jobId });
+      throw error;
+    });
     this.activeJobs.set(jobId, operation);
     void operation.finally(() => { if (this.activeJobs.get(jobId) === operation) this.activeJobs.delete(jobId); }).catch(() => undefined);
     return operation;
@@ -204,9 +213,11 @@ export class DeliveryService {
             && result.status === 'sent' && result.messageId) {
             await this.repository.markDeliverySent(jobId, segment.partIndex, result.messageId);
           } else {
+            this.reportFailure('response', undefined, 'unknown', { jobId, accountId: claimed.accountId, requestId, workerInstanceId: fresh.workerInstanceId });
             await this.repository.markDeliveryUnknown(jobId, segment.partIndex);
           }
-        } catch {
+        } catch (error) {
+          this.reportFailure('execute', error, 'unknown', { jobId, accountId: claimed.accountId, requestId, workerInstanceId: fresh.workerInstanceId });
           await this.repository.markDeliveryUnknown(jobId, segment.partIndex);
         }
       }

@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { normalizeNativePicturePath } from '@line-agent/contracts';
+import { ContactDescriptorSchema, InboundEnvelopeSchema, JsonValueSchema, normalizeNativePicturePath, type ContactDescriptor, type InboundEnvelope, type JsonValue } from '@line-agent/contracts';
 import { Buffer } from 'node:buffer';
 import type { Pool, PoolClient } from 'pg';
 import { upsertLineContacts } from './name-resolution.js';
-import { bridgeNativeEnvelope, isRecalledNativeEnvelope, nativeChatEventMids } from './content-bridge/index.js';
+import { bridgeLiveMessage, bridgeNativeEnvelope, isRecalledNativeEnvelope, nativeChatEventMids } from './content-bridge/index.js';
 import { loadChatEventNames } from './content-bridge/chat-event-names.js';
 import { ChatTypeSchema, NativeCatalogRecordSchema, NativeSourceEnvelopeSchema, NativeStickerMetadataSchema,
   NativeAttachmentDescriptorSchema, NativeConversationMetadataSchema, NativeDirectoryRowSchema, normalizeMentionRanges, redactSensitiveString, redactSensitiveText, storedTextForKind, type ChatType, type MentionRange, type NativeAttachmentDescriptor, type NativeCatalogRecord,
@@ -34,8 +34,12 @@ export interface ExternalObservation {
   senderId: string;
   senderName?: string;
   senderPicturePath?: string | null;
+  mentionIds?: string[];
   mentionRanges?: unknown;
   nativePayload?: NativeSourceEnvelope;
+  livePayload?: { raw: JsonValue; eventId?: string; contact?: ContactDescriptor; recovery?: {
+    envelope: InboundEnvelope; controlEpoch: number; receiptMode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; sensitive: boolean;
+  } };
   nativeStickerMetadata?: NativeStickerMetadata;
   attachments?: NativeAttachmentDescriptor[];
   kind: string;
@@ -75,6 +79,96 @@ export interface ExternalChangedMessage {
   chatType: ChatType;
   chatId: string;
   messageId: string;
+}
+
+/** Projects a staged copy with the canonical source conversion. Caller owns the transaction and authority check. */
+export async function projectStagedSourceObservation(client: PoolClient, input: {
+  accountId: string; sourceId: string; generation: number; observation: ExternalObservation;
+  origin: 'SYSTEM_LOGIN_LIVE' | 'SYSTEM_LOGIN_HISTORY' | 'EXTERNAL_MONITOR';
+}): Promise<boolean> {
+  const observation = input.observation;
+  if (!observation.canonicalMessageId) return false;
+  const changed = await upsertCanonicalLineMessage(client, input.accountId, input.sourceId, observation,
+    input.origin === 'SYSTEM_LOGIN_LIVE' ? 'live' : 'history');
+  await client.query(`INSERT INTO message_source_provenance(account_id,message_id,source_id,generation,observation_id,origin,redacted)
+    VALUES ($1,$2,$3,$4,$5,$6,true) ON CONFLICT(source_id,generation,observation_id)
+    DO UPDATE SET origin=CASE WHEN message_source_provenance.origin='SYSTEM_LOGIN_LIVE'
+      AND EXCLUDED.origin='SYSTEM_LOGIN_HISTORY' THEN message_source_provenance.origin ELSE EXCLUDED.origin END`,
+  [input.accountId, observation.canonicalMessageId, input.sourceId, input.generation, observation.observationId, input.origin]);
+  await client.query(`UPDATE external_source_observations SET status='PROJECTED'
+    WHERE source_id=$1 AND generation=$2 AND observation_id=$3`, [input.sourceId, input.generation, observation.observationId]);
+  return changed;
+}
+
+/** Login observations use the same source-copy table and canonical projector as monitor imports. */
+export async function stageSystemLoginObservation(client: PoolClient, input: {
+  accountId: string; sourceId: string; generation: number; batchId: string;
+  origin: 'SYSTEM_LOGIN_LIVE' | 'SYSTEM_LOGIN_HISTORY'; observation: ExternalObservation; captureCanonicalExistence?: boolean;
+}): Promise<{ changed: boolean; conflict: boolean; canonicalExisted?: boolean }> {
+  let observation = normalizeObservation(input.observation);
+  if (!observation.canonicalMessageId) return { changed: false, conflict: false };
+  if (observation.livePayload?.recovery && observation.livePayload.recovery.envelope.accountId !== input.accountId) {
+    throw new Error('Mismatched login recovery account');
+  }
+  let normalizedJson = stableJson(observation);
+  let normalizedDigest = canonicalDigest(observation);
+  const captureCanonicalExistence = async () => input.captureCanonicalExistence === true
+    ? Boolean((await client.query('SELECT 1 FROM messages WHERE account_id=$1 AND message_id=$2',
+      [input.accountId, observation.canonicalMessageId])).rowCount)
+    : undefined;
+  const inserted = await client.query(`INSERT INTO external_source_observations(source_id,account_id,generation,observation_id,batch_id,
+      canonical_message_id,normalized_digest,normalized_payload,status)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'STAGED') ON CONFLICT(source_id,generation,observation_id) DO NOTHING RETURNING observation_id`,
+  [input.sourceId, input.accountId, input.generation, observation.observationId, input.batchId,
+    observation.canonicalMessageId, normalizedDigest, normalizedJson]);
+  if (!inserted.rowCount) {
+    const prior = await client.query<{ normalized_digest: string; status: string; canonical_message_id: string | null;
+      normalized_payload: ExternalObservation }>(
+      `SELECT normalized_digest,status,canonical_message_id,normalized_payload FROM external_source_observations
+       WHERE source_id=$1 AND generation=$2 AND observation_id=$3 FOR UPDATE`,
+    [input.sourceId, input.generation, observation.observationId]);
+    const stored = prior.rows[0];
+    if (!stored || stored.canonical_message_id !== observation.canonicalMessageId) return { changed: false, conflict: true };
+    const firstRecovery = stored.normalized_payload.livePayload?.recovery;
+    if (firstRecovery) {
+      observation = normalizeObservation({ ...observation, livePayload: {
+        ...(observation.livePayload ?? { raw: {} }), recovery: firstRecovery,
+      } });
+      normalizedJson = stableJson(observation);
+      normalizedDigest = canonicalDigest(observation);
+    }
+    if (stored.normalized_digest !== normalizedDigest) {
+      const previous = stored.normalized_payload;
+      const stableLoginIdentity = stored.status === 'PROJECTED'
+        && previous.nativeConversationKind === observation.nativeConversationKind
+        && previous.nativeConversationId === observation.nativeConversationId
+        && previous.nativeMessageId === observation.nativeMessageId
+        && previous.chatType === observation.chatType && previous.chatId === observation.chatId
+        && previous.senderId === observation.senderId && previous.occurredAt === observation.occurredAt;
+      if (!stableLoginIdentity) return { changed: false, conflict: true };
+      if (isLoginRecallObservation(previous) && !isLoginRecallObservation(observation)) {
+        const canonicalExisted = await captureCanonicalExistence();
+        return { changed: false, conflict: false,
+          ...(input.captureCanonicalExistence === true ? { canonicalExisted: canonicalExisted === true } : {}) };
+      }
+      await client.query(`UPDATE external_source_observations SET batch_id=$4,canonical_message_id=$5,
+        normalized_digest=$6,normalized_payload=$7::jsonb,conflict_reason=NULL
+        WHERE source_id=$1 AND generation=$2 AND observation_id=$3`,
+      [input.sourceId, input.generation, observation.observationId, input.batchId, observation.canonicalMessageId,
+        normalizedDigest, normalizedJson]);
+    } else if (stored.status === 'CONFLICT') return { changed: false, conflict: true };
+    else if (stableJson({ mentionIds: stored.normalized_payload.mentionIds, mentionRanges: stored.normalized_payload.mentionRanges })
+      !== stableJson({ mentionIds: observation.mentionIds, mentionRanges: observation.mentionRanges })) {
+      await client.query(`UPDATE external_source_observations SET normalized_payload=$4::jsonb
+        WHERE source_id=$1 AND generation=$2 AND observation_id=$3`,
+      [input.sourceId, input.generation, observation.observationId, normalizedJson]);
+    }
+  }
+  // The source observation row is locked above. Callers that need inserted/duplicate
+  // accounting capture canonical existence here, before the shared projector locks it.
+  const canonicalExisted = await captureCanonicalExistence();
+  return { changed: await projectStagedSourceObservation(client, { ...input, observation }), conflict: false,
+    ...(input.captureCanonicalExistence === true ? { canonicalExisted: canonicalExisted === true } : {}) };
 }
 
 export interface ExternalDirectPollInput {
@@ -187,6 +281,30 @@ function normalizeObservation(value: ExternalObservation): ExternalObservation {
   const nativeMetadata = value.nativeMetadata === undefined ? undefined : NativeConversationMetadataSchema.parse(value.nativeMetadata);
   const nativePayload = value.nativePayload === undefined ? undefined : NativeSourceEnvelopeSchema.parse(value.nativePayload);
   if (nativePayload && nativePayload.table !== '_message') throw new Error('Invalid external native message payload table');
+  const livePayload = value.livePayload === undefined ? undefined : (() => {
+    if (!value.livePayload || typeof value.livePayload !== 'object' || Array.isArray(value.livePayload)) throw new Error('Invalid login live payload');
+    const raw = JsonValueSchema.parse(value.livePayload.raw);
+    const serializedBytes = Buffer.byteLength(JSON.stringify(raw), 'utf8');
+    if (serializedBytes > 256 * 1024) throw new Error('Login live payload exceeds size limit');
+    const contact = value.livePayload.contact === undefined ? undefined : ContactDescriptorSchema.parse(value.livePayload.contact);
+    const eventId = value.livePayload.eventId === undefined ? undefined : requiredText(value.livePayload.eventId, 'login event ID', 512);
+    const recovery = value.livePayload.recovery === undefined ? undefined : (() => {
+      const candidate = value.livePayload!.recovery;
+      if (!candidate || !Number.isSafeInteger(candidate.controlEpoch) || candidate.controlEpoch < 0
+        || !['ACTIVE_CONTROL', 'MONITOR_ONLY', 'PAUSED'].includes(candidate.receiptMode) || typeof candidate.sensitive !== 'boolean') {
+        throw new Error('Invalid login recovery receipt');
+      }
+      const envelope = InboundEnvelopeSchema.parse(candidate.envelope);
+      if (envelope.ingestion.source !== 'live' || envelope.messageId !== (nativeMessageId ?? legacyMessageId)
+        || envelope.chatType !== value.chatType || envelope.chatId !== value.chatId || envelope.senderId !== value.senderId) {
+        throw new Error('Mismatched login recovery envelope');
+      }
+      if (Buffer.byteLength(JSON.stringify(envelope), 'utf8') > 256 * 1024) throw new Error('Login recovery envelope exceeds size limit');
+      return { envelope, controlEpoch: candidate.controlEpoch, receiptMode: candidate.receiptMode, sensitive: candidate.sensitive };
+    })();
+    return { raw, ...(eventId === undefined ? {} : { eventId }), ...(contact === undefined ? {} : { contact }),
+      ...(recovery === undefined ? {} : { recovery }) };
+  })();
   const nativeStickerMetadata = value.nativeStickerMetadata === undefined ? undefined
     : NativeStickerMetadataSchema.safeParse(value.nativeStickerMetadata).success
       ? NativeStickerMetadataSchema.parse(value.nativeStickerMetadata) : undefined;
@@ -216,13 +334,22 @@ function normalizeObservation(value: ExternalObservation): ExternalObservation {
   const text = storedTextForKind(kind, redaction?.text ?? null);
   const mentionRanges = sourceRanges === undefined ? undefined
     : text === null ? [] : normalizeMentionRanges(text, redaction!.mentionRanges);
+  const mentionIds = value.mentionIds === undefined ? undefined : (() => {
+    if (!Array.isArray(value.mentionIds) || value.mentionIds.length > 128
+      || value.mentionIds.some((id) => typeof id !== 'string' || !id || id.length > 512)) {
+      throw new Error('Invalid external observation mention IDs');
+    }
+    return [...new Set(value.mentionIds)];
+  })();
   return { observationId, canonicalMessageId: nativeMessageId ?? (legacyMessageId
     ? externalArchiveKey(nativeConversationKind, nativeConversationId, legacyMessageId) : null),
     nativeConversationKind, nativeConversationId, nativeMessageId: nativeMessageId ?? legacyMessageId,
     chatType: value.chatType, chatId, conversationTitle, ...(nativeMetadata === undefined ? {} : { nativeMetadata }),
     nativeContentType: value.nativeContentType ?? null, senderId, ...(senderName === undefined ? {} : { senderName }),
     ...(senderPicturePath === null ? {} : { senderPicturePath }),
+    ...(mentionIds === undefined ? {} : { mentionIds }),
     ...(mentionRanges === undefined ? {} : { mentionRanges }), ...(nativePayload === undefined ? {} : { nativePayload }),
+    ...(livePayload === undefined ? {} : { livePayload }),
     ...(nativeStickerMetadata === undefined ? {} : { nativeStickerMetadata }), ...(attachments === undefined ? {} : { attachments }),
     kind, text, occurredAt: date.toISOString() };
 }
@@ -250,9 +377,16 @@ function canonicalDigest(observation: ExternalObservation): string {
     conversationTitle: observation.conversationTitle, nativeMetadata: observation.nativeMetadata,
     nativeContentType: observation.nativeContentType, senderId: observation.senderId, kind: observation.kind,
     ...(observation.nativePayload === undefined ? {} : { nativeSourceDigest: observation.nativePayload.sourceDigest }),
+    ...(observation.livePayload === undefined ? {} : { livePayload: observation.livePayload }),
     ...(observation.nativeStickerMetadata === undefined ? {} : { nativeStickerMetadata: observation.nativeStickerMetadata }),
     ...(observation.attachments === undefined ? {} : { attachments: observation.attachments }),
     text: observation.text, occurredAt: observation.occurredAt }));
+}
+
+function isLoginRecallObservation(observation: ExternalObservation): boolean {
+  if (observation.nativePayload && isRecalledNativeEnvelope(observation.nativePayload)) return true;
+  if (!observation.livePayload) return false;
+  return bridgeLiveMessage({ raw: observation.livePayload.raw, contact: observation.livePayload.contact })?.content?.type === 'unsent';
 }
 
 /**
@@ -789,13 +923,9 @@ export class ExternalMonitorRepository {
         }
         if (!observation.canonicalMessageId) continue;
         nameCandidates.push(observation);
-        const changed = await upsertCanonicalLineMessage(client, input.accountId, input.sourceId, observation);
+        const changed = await projectStagedSourceObservation(client, { accountId: input.accountId, sourceId: input.sourceId,
+          generation: input.generation, observation, origin: 'EXTERNAL_MONITOR' });
         if (changed && observation.canonicalMessageId) changedMessages.push({ chatType: observation.chatType, chatId: observation.chatId, messageId: observation.canonicalMessageId });
-        await client.query(`INSERT INTO message_source_provenance(account_id,message_id,source_id,generation,observation_id,origin,redacted)
-          VALUES ($1,$2,$3,$4,$5,'EXTERNAL_MONITOR',true) ON CONFLICT DO NOTHING`,
-        [input.accountId, observation.canonicalMessageId, input.sourceId, input.generation, observation.observationId]);
-        await client.query(`UPDATE external_source_observations SET status='PROJECTED'
-          WHERE source_id=$1 AND generation=$2 AND observation_id=$3`, [input.sourceId, input.generation, observation.observationId]);
         projected++;
         newlyProjected++;
       }
@@ -1311,6 +1441,10 @@ function bridgeProjection(observation: ExternalObservation, prior: StoredProject
   names?: ReadonlyMap<string, string>): BridgeProjection {
   const bridged = bridgeNativeEnvelope(observation.nativePayload, undefined, names);
   if (bridged) return { kind: bridged.kind, content: bridged.content, version: bridged.version, replyToMessageId: bridged.replyToMessageId };
+  if (observation.livePayload) {
+    const live = bridgeLiveMessage({ raw: observation.livePayload.raw, contact: observation.livePayload.contact });
+    if (live) return { kind: live.kind, content: live.content, version: live.version, replyToMessageId: live.replyToMessageId };
+  }
   return { kind: observation.kind, content: prior?.content ?? null, version: prior?.content_rule_version ?? 0,
     replyToMessageId: prior?.reply_to_message_id ?? null };
 }
@@ -1320,6 +1454,10 @@ function projectionMatches(prior: StoredProjection, projection: BridgeProjection
 }
 
 function buildExternalMessageRaw(existing: Record<string, unknown>, observation: ExternalObservation): Record<string, unknown> {
+  if (observation.livePayload) {
+    const liveRaw = isPlainRecord(observation.livePayload.raw) ? observation.livePayload.raw : { workerRaw: observation.livePayload.raw };
+    return { ...existing, ...liveRaw, ...(observation.livePayload.contact ? { loginContact: observation.livePayload.contact } : {}) };
+  }
   const previousMessage = isPlainRecord(existing.message) ? existing.message : {};
   const previousMetadata = isPlainRecord(previousMessage.contentMetadata) ? previousMessage.contentMetadata : {};
   const retainedStickerMetadata = NativeStickerMetadataSchema.safeParse({
@@ -1664,11 +1802,11 @@ async function updateExternalMentionRanges(client: PoolClient, accountId: string
   const updates = new Map<string, { chat_type: string; chat_id: string; message_id: string;
     mention_ranges: MentionRange[]; mention_ids: string[] }>();
   for (const observation of observations) {
-    if (!observation.canonicalMessageId || !Array.isArray(observation.mentionRanges)) continue;
-    const mentionRanges = observation.mentionRanges as MentionRange[];
+    if (!observation.canonicalMessageId || (!Array.isArray(observation.mentionRanges) && observation.mentionIds === undefined)) continue;
+    const mentionRanges = Array.isArray(observation.mentionRanges) ? observation.mentionRanges as MentionRange[] : [];
     const key = stableJson([observation.chatType, observation.chatId, observation.canonicalMessageId]);
     updates.set(key, { chat_type: observation.chatType, chat_id: observation.chatId, message_id: observation.canonicalMessageId,
-      mention_ranges: mentionRanges, mention_ids: [...new Set(mentionRanges.map((range) => range.userId))] });
+      mention_ranges: mentionRanges, mention_ids: observation.mentionIds ?? [...new Set(mentionRanges.map((range) => range.userId))] });
   }
   if (updates.size === 0) return [];
   const changed = await client.query<{ chat_type: ChatType; chat_id: string; message_id: string }>(`UPDATE messages AS message SET
@@ -1692,7 +1830,7 @@ function addUniqueChangedMessages(target: ExternalChangedMessage[], additions: E
 }
 
 async function upsertCanonicalLineMessage(client: PoolClient, accountId: string, sourceId: string,
-  observation: ExternalObservation): Promise<boolean> {
+  observation: ExternalObservation, ingestionSource: 'live' | 'history' = 'history'): Promise<boolean> {
   if (!observation.canonicalMessageId) throw new Error('External observation has no canonical message ID');
   const conversation = await client.query(`INSERT INTO conversations(account_id,chat_type,chat_id,title,native_metadata)
     VALUES ($1,$2,$3,COALESCE($4,''),COALESCE($5::jsonb,'{"midType":null,"parentChatId":null,"communityId":null}'::jsonb))
@@ -1709,7 +1847,8 @@ async function upsertCanonicalLineMessage(client: PoolClient, accountId: string,
   const conversationChanged = (conversation.rowCount ?? 0) > 0;
   if (await canonicalLineMessageMatches(client, accountId, observation)) {
     await upsertExternalAttachments(client, accountId, [observation]);
-    return conversationChanged;
+    const mentionChanged = await updateExternalMentionRanges(client, accountId, [observation]);
+    return conversationChanged || mentionChanged.length > 0;
   }
   const existingRaw = await client.query<{ raw: Record<string, unknown> | null; content: MessageContent | null;
     content_rule_version: number; reply_to_message_id: string | null }>(
@@ -1719,16 +1858,17 @@ async function upsertCanonicalLineMessage(client: PoolClient, accountId: string,
   const projection = bridgeProjection(observation, existingRaw.rows[0], await chatEventNames(client, accountId, observation));
   await client.query(`INSERT INTO messages(account_id,message_id,event_id,chat_type,chat_id,sender_id,kind,text_content,content,content_rule_version,
     reply_to_message_id,mention_ids,mention_ranges,ingestion_source,occurred_at,raw)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,'[]'::jsonb,'[]'::jsonb,'history',$12::timestamptz,$13::jsonb)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,'[]'::jsonb,'[]'::jsonb,$14,$12::timestamptz,$13::jsonb)
     ON CONFLICT (account_id,message_id) DO UPDATE SET chat_type=EXCLUDED.chat_type,chat_id=EXCLUDED.chat_id,
       sender_id=EXCLUDED.sender_id,kind=EXCLUDED.kind,
       text_content=CASE WHEN EXCLUDED.content->>'type'='unsent' THEN messages.text_content ELSE EXCLUDED.text_content END,content=EXCLUDED.content,
       content_rule_version=EXCLUDED.content_rule_version,reply_to_message_id=EXCLUDED.reply_to_message_id,
       occurred_at=EXCLUDED.occurred_at,raw=EXCLUDED.raw`,
-  [accountId, observation.canonicalMessageId, `external:${sourceId}:${observation.observationId}`,
+  [accountId, observation.canonicalMessageId, observation.livePayload?.eventId ?? `external:${sourceId}:${observation.observationId}`,
     observation.chatType, observation.chatId, observation.senderId, projection.kind, observation.text,
     projection.content === null ? null : JSON.stringify(projection.content), projection.version, projection.replyToMessageId,
-    observation.occurredAt, JSON.stringify(raw)]);
+    observation.occurredAt, JSON.stringify(raw), ingestionSource]);
   await upsertExternalAttachments(client, accountId, [observation]);
+  await updateExternalMentionRanges(client, accountId, [observation]);
   return true;
 }

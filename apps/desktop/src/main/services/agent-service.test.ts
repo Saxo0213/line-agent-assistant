@@ -361,6 +361,46 @@ describe('LINE execution reactions', () => {
       vi.useRealTimers();
     }
   });
+
+  it('retimes running LINE reactions from the update time on the shared scheduler', async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const job = { jobId: 'reaction-retime', accountId: 'a', chatType: 'direct' as const, chatId: 'retime', provider: 'codex' as const,
+      prompt: 'work', workspacePath: 'C:\\trusted', generation: 0, status: 'running' as const,
+      sourceType: 'line' as const, sourceMessageId: 'source-retime', sourceRequestId: null, creationEpoch: 1 };
+    let claimed = false;
+    const repository = {
+      async claimNext() { if (claimed) return null; claimed = true; return job; },
+      async getJob() { return job; }, async lookupSession() { return null; }, async appendEvent() {}, async bindSession() { return true; },
+      async failJob() { return { ...job, status: 'failed' as const, revision: '2' }; },
+    };
+    const reactions: string[] = [];
+    const service = newAgentService(repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' }, {
+      async *run() { await gate; yield { type: 'completed' as const, finalText: 'done' }; }, async cancel() {},
+    }, undefined, undefined, 1, 60_000, 5000, 1,
+    async (_jobId, _key, _messageId, reaction) => { reactions.push(reaction); });
+
+    try {
+      service.kick(key('retime'));
+      for (let attempt = 0; attempt < 12 && reactions.length === 0; attempt++) await Promise.resolve();
+      expect(reactions).toEqual(['NICE']);
+      expect(() => service.setStatusRotationIntervalSeconds(86_401)).toThrow();
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(4_000);
+      service.setStatusRotationIntervalSeconds(5);
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(reactions).toEqual(['NICE']);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(reactions).toEqual(['NICE', 'AMAZING']);
+      expect(vi.getTimerCount()).toBe(1);
+    } finally {
+      release();
+      await service.idle();
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('six-state LINE reactions', () => {

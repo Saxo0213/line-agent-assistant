@@ -75,6 +75,12 @@
 .agent-level-options small { color: var(--secondary); font-size: 11px; }
 .agent-level-status { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 31; max-width: 280px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--secondary); font-size: 12px; }
 .agent-composer.dragging-attachment { outline: 2px dashed var(--primary); outline-offset: -4px; background: var(--subtle); }
+.composer-drop-active { outline: 2px dashed var(--primary); outline-offset: -3px; background: var(--subtle); }
+.manual-media-chips { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.manual-media-chips li { display: flex; align-items: center; gap: 7px; max-width: min(360px, 100%); padding: 4px 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--subtle); }
+.manual-media-chips li > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.manual-media-chips small { color: var(--secondary); white-space: nowrap; }
+.manual-media-chips button { min-height: 26px; padding: 0 6px; line-height: 1; }
 .attachment-chips { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 .attachment-chips.readonly { margin: 8px 0 0; }
 .attachment-chip { display: flex; align-items: center; gap: 8px; max-width: 260px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--subtle); }

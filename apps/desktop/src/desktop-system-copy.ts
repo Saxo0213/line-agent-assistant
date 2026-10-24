@@ -1,5 +1,6 @@
 /** Legacy display enums are wire values, never persisted translations or user content. */
 export const SYSTEM_DISPLAY_COPY = {
+  '系統操作失敗': 'System operation failed',
   '系統啟動': 'System startup', '系統關閉': 'System shutdown', '服務啟動': 'Service started', '服務停止': 'Service stopped',
   '工作程序啟動': 'Worker started', '工作程序停止': 'Worker stopped', '工作程序重新啟動': 'Worker restarted',
   '工作程序隔離': 'Worker isolated', '工作程序結束': 'Worker exited', 'LINE 登入開始': 'LINE login started',
@@ -14,6 +15,7 @@ export const SYSTEM_DISPLAY_COPY = {
   '新增使用者（好友授權）': 'Add user (friend authorization)', '新增使用者：確認 LINE 好友關係': 'Add user: verify LINE friendship',
   '新增使用者：加入 LINE 好友': 'Add user: add LINE friend', '新增使用者：重新確認好友': 'Add user: recheck friendship',
   '新增使用者：授權預檢': 'Add user: authorization preflight', '新增使用者：寫入白名單': 'Add user: save allowlist',
+  '相簿照片下載': 'Album photo download',
   '已提出': 'Requested', '已完成': 'Completed', '失敗': 'Failed', '已記錄': 'Recorded',
   '等待下載': 'Waiting to download', '下載中': 'Downloading', '已過期': 'Expired', '重試中': 'Retrying', '下載失敗': 'Download failed',
 } as const;
@@ -52,6 +54,7 @@ export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> 
 };
 
 const JAPANESE_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
+  '系統操作失敗': 'システム操作失敗',
   '系統啟動': 'システム起動', '系統關閉': 'システム終了', '服務啟動': 'サービス起動', '服務停止': 'サービス停止', '工作程序啟動': 'ワーカー起動', '工作程序停止': 'ワーカー停止', '工作程序重新啟動': 'ワーカー再起動',
   '工作程序隔離': 'ワーカー隔離', '工作程序結束': 'ワーカー終了', 'LINE 登入開始': 'LINE ログイン開始', 'LINE QR Code 已準備': 'LINE QR コードの準備完了', 'LINE PIN 已準備': 'LINE PIN の準備完了',
   'LINE 登入完成': 'LINE ログイン完了', 'LINE 登入失敗': 'LINE ログイン失敗', 'LINE 登入失效': 'LINE ログイン無効', '登入資訊已更新': 'ログイン情報を更新', '清除登入資訊': 'ログイン情報を消去',
@@ -60,9 +63,11 @@ const JAPANESE_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> =
   '系統作業': 'システム操作', '圖片下載': '画像をダウンロード', '影片下載': '動画をダウンロード', '語音下載': '音声をダウンロード', '檔案下載': 'ファイルをダウンロード', '附件下載': '添付ファイルをダウンロード',
   'LINE 操作失敗': 'LINE 操作失敗', 'LINE 聯絡人／群組清單更新': 'LINE 連絡先／グループ一覧を更新', '新增使用者（好友授權）': 'ユーザー追加（友だち認証）', '新增使用者：確認 LINE 好友關係': 'ユーザー追加：LINE の友だち関係を確認',
   '新增使用者：加入 LINE 好友': 'ユーザー追加：LINE の友だちに追加', '新增使用者：重新確認好友': 'ユーザー追加：友だち関係を再確認', '新增使用者：授權預檢': 'ユーザー追加：認証を事前確認', '新增使用者：寫入白名單': 'ユーザー追加：許可リストに保存',
+  '相簿照片下載': 'アルバム写真をダウンロード',
   '已提出': 'リクエスト済み', '已完成': '完了', '失敗': '失敗', '已記錄': '記録済み', '等待下載': 'ダウンロード待ち', '下載中': 'ダウンロード中', '已過期': '期限切れ', '重試中': '再試行中', '下載失敗': 'ダウンロード失敗',
 };
 const KOREAN_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
+  '系統操作失敗': '시스템 작업 실패',
   '系統啟動': '시스템 시작', '系統關閉': '시스템 종료', '服務啟動': '서비스 시작', '服務停止': '서비스 중지', '工作程序啟動': '작업자 시작', '工作程序停止': '작업자 중지', '工作程序重新啟動': '작업자 재시작',
   '工作程序隔離': '작업자 격리', '工作程序結束': '작업자 종료', 'LINE 登入開始': 'LINE 로그인 시작', 'LINE QR Code 已準備': 'LINE QR 코드 준비 완료', 'LINE PIN 已準備': 'LINE PIN 준비 완료',
   'LINE 登入完成': 'LINE 로그인 완료', 'LINE 登入失敗': 'LINE 로그인 실패', 'LINE 登入失效': 'LINE 로그인 무효화', '登入資訊已更新': '로그인 정보 업데이트', '清除登入資訊': '로그인 정보 삭제',
@@ -71,6 +76,7 @@ const KOREAN_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
   '系統作業': '시스템 작업', '圖片下載': '이미지 다운로드', '影片下載': '동영상 다운로드', '語音下載': '음성 다운로드', '檔案下載': '파일 다운로드', '附件下載': '첨부 파일 다운로드',
   'LINE 操作失敗': 'LINE 작업 실패', 'LINE 聯絡人／群組清單更新': 'LINE 연락처／그룹 목록 업데이트', '新增使用者（好友授權）': '사용자 추가(친구 인증)', '新增使用者：確認 LINE 好友關係': '사용자 추가: LINE 친구 관계 확인',
   '新增使用者：加入 LINE 好友': '사용자 추가: LINE 친구 추가', '新增使用者：重新確認好友': '사용자 추가: 친구 관계 재확인', '新增使用者：授權預檢': '사용자 추가: 인증 사전 확인', '新增使用者：寫入白名單': '사용자 추가: 허용 목록 저장',
+  '相簿照片下載': '앨범 사진 다운로드',
   '已提出': '요청됨', '已完成': '완료', '失敗': '실패', '已記錄': '기록됨', '等待下載': '다운로드 대기', '下載中': '다운로드 중', '已過期': '만료됨', '重試中': '재시도 중', '下載失敗': '다운로드 실패',
 };
 

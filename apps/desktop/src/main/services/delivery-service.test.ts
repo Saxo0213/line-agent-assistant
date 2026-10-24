@@ -1,8 +1,33 @@
 import { describe, expect, it } from 'vitest';
 import type { ClaimedLineDelivery } from '../../../../../packages/database/src/agent-repository.js';
 import { DeliveryService, splitDeliveryText } from './delivery-service.js';
+import { createOperationalAudit, type AuditEvent } from './operational-audit.js';
 
 describe('delivery composition', () => {
+  it('persists separate failures for distinct jobs with their worker request identities', async () => {
+    const stored: AuditEvent[] = [];
+    const audit = createOperationalAudit({ append: async (event) => { stored.push(event); }, appendFallback: async () => {}, logSinkState() {} });
+    const service = new DeliveryService({
+      async getJob(jobId) { return { jobId, accountId: 'account', chatType: 'group', chatId: 'chat', provider: 'codex', prompt: 'private-prompt',
+        workspacePath: 'C:\\private-path', generation: 0, status: 'completed', sourceType: 'line', sourceMessageId: 'm', sourceRequestId: null, creationEpoch: 4 }; },
+      async listDeliveries(jobId) { return [{ deliveryId: 'd', jobId, partIndex: 0, text: 'private-message', idempotencyKey: jobId,
+        status: 'pending', lineMessageId: null }]; },
+      async claimLineDelivery(jobId) { return { deliveryId: 'd', jobId, partIndex: 0, text: 'private-message', idempotencyKey: jobId,
+        status: 'sending', lineMessageId: null, accountId: 'account', chatType: 'group', chatId: 'chat', controlEpoch: 4 }; },
+      async markDeliveryUnknown() { return true; }, async markDeliverySent() { return true; },
+    }, {
+      async binding() { return { accountId: 'account', workerInstanceId: 'worker', controlEpoch: 4, mode: 'ACTIVE_CONTROL' }; },
+      async send() { throw new Error('private-exception'); },
+    }, async () => true, (diagnostic, identity) => { audit.failure(diagnostic, identity); });
+    await service.deliverCompletedJob('job-a'); await service.deliverCompletedJob('job-b');
+    await audit.flush();
+    expect(stored).toHaveLength(2);
+    expect(stored).toMatchObject([{ jobId: 'job-a', accountId: 'account', workerInstanceId: 'worker', requestId: expect.any(String) },
+      { jobId: 'job-b', accountId: 'account', workerInstanceId: 'worker', requestId: expect.any(String) }]);
+    expect(stored[0]?.correlationId).not.toBe(stored[1]?.correlationId);
+    expect(JSON.stringify(stored)).not.toMatch(/private-prompt|private-path|private-message|private-exception/);
+    await service.shutdown();
+  });
   it('splits long output deterministically and balances code fences', () => {
     const source = '```ts\n' + 'x'.repeat(120) + '\n```';
     const parts = splitDeliveryText(source, 60);

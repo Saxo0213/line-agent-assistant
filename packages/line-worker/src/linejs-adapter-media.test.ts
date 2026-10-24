@@ -65,6 +65,13 @@ it('uploads a file once without a preview or media content info', async () => {
     contentMetadata: { SID: 'emf', OID: 'OID_F', FILE_SIZE: String(3 + 32), e2eeVersion: '2' } }));
 });
 
+it('allows an explicitly manual media send through a monitor only binding', async () => {
+  const monitor = await fixture({ mode: 'MONITOR_ONLY', objIds: ['OID_F'] });
+  await monitor.adapter.sendMedia({ chatType: 'direct', chatId: peer }, { kind: 'file', bytes: Buffer.from('doc'), fileName: 'report.pdf' }, lease, true);
+  expect(monitor.order).toEqual([expect.stringMatching(/^POST \/r\/talk\/emf\/reqid-/), 'encryptE2EEMessage', 'sendMessage']);
+  expect(monitor.send).toHaveBeenCalledOnce();
+});
+
 it('fails the upload when the preview object id does not match, without sending', async () => {
   const { adapter, send } = await fixture({ objIds: ['OID_1', 'OID_2'] });
   await expect(adapter.sendMedia({ chatType: 'direct', chatId: peer }, { kind: 'image', bytes: Buffer.from('x'), fileName: 'a.png' }, lease))

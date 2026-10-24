@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { AGENT_ROOM_KEY, AgentProviderSchema, type AgentAttachmentUpload, type AgentEvent, type AgentProvider, type AgentRunRequest, type WritableConversationKey } from '@line-agent/contracts';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+import { AGENT_ROOM_KEY, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, AgentProviderSchema, type AgentAttachmentUpload, type AgentEvent, type AgentProvider, type AgentRunRequest, type WritableConversationKey } from '@line-agent/contracts';
 import { AgentAttachmentError, DEFAULT_ATTACHMENT_PROMPT, attachmentPromptSection, removeJobAttachments, resolveStoredAttachments, storeAttachments, validateUploads, type ResolvedAttachment } from './agent-attachments.js';
 import type { AgentRepository, AgentJobStatusProjection, AgentQueueKey } from '@line-agent/database';
 import type { WorkspaceAuthority } from './workspace-authority.js';
@@ -89,6 +90,7 @@ export class AgentService {
   private readonly activeJobs = new Map<string, string>();
   private readonly executions = new Map<string, ActiveExecution>();
   private schedulerTimer: ReturnType<typeof setTimeout> | undefined;
+  private statusRotationIntervalMs = HEARTBEAT_INTERVAL_MS;
   private readonly activeAccountSlots = new Map<string, number>();
   private readonly reservedAccountSlots = new Map<string, number>();
   private reservedProviderSlots = 0;
@@ -122,7 +124,12 @@ export class AgentService {
     private readonly mcpLauncher: InternalMcpLauncher | undefined,
     /** Required: where a job runs and which provider tools it gets. There is no default, so nothing fails open. */
     private readonly environment: AgentJobEnvironment,
+    private readonly onDiagnostic?: (diagnostic: SafeDiagnostic, jobId?: string) => void,
   ) {}
+
+  private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown, jobId?: string): void {
+    try { this.onDiagnostic?.(diagnosticFailure('agent', stage, error), jobId); } catch { /* Observation cannot change durable job state. */ }
+  }
 
   private releaseMcp(jobId: string): void {
     try { this.mcpLauncher?.release(jobId); } catch { /* Release is best effort; durable job state still fences requests. */ }
@@ -149,6 +156,22 @@ export class AgentService {
   }
 
   publishCommittedStatus(projection: AgentJobStatusProjection): void { this.publishLifecycle(projection); }
+
+  /** Retimes the existing scheduler's running-reaction deadline after settings are saved. */
+  setStatusRotationIntervalSeconds(seconds: number): void {
+    if (!Number.isInteger(seconds) || seconds < AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN
+      || seconds > AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX) {
+      throw new Error('Status icon rotation interval must be an integer from 5 to 86400 seconds');
+    }
+    this.statusRotationIntervalMs = seconds * 1000;
+    const nextAt = Date.now() + this.statusRotationIntervalMs;
+    for (const execution of this.executions.values()) {
+      if (!execution.terminal && !execution.terminalPending && !execution.deadlineExceeded && execution.messageId && this.onReaction) {
+        execution.nextHeartbeatAt = nextAt;
+      }
+    }
+    this.scheduleScheduler();
+  }
 
   /**
    * Called after LINE ingest durably committed new jobs. A freshly queued LINE job gets one AMAZING reaction.
@@ -484,13 +507,14 @@ export class AgentService {
             });
             if (enriched) effectivePrompt = enriched.enrichedPrompt;
           } catch (contextError) {
+            this.reportFailure('prepare', contextError, job.jobId);
             const failEvent: AgentEvent = {
               type: 'failed',
               code: 'MCP_ACCESS_DENIED',
-              message: contextError instanceof Error ? contextError.message : 'MCP internal query failed.',
+              message: 'MCP internal query failed.',
               retryable: false,
             };
-            await this.agents.appendEvent(job.jobId, failEvent).catch(() => undefined);
+            await this.agents.appendEvent(job.jobId, failEvent).catch((error: unknown) => this.reportFailure('persist', error, job.jobId));
             const projection = await this.agents.failJob(job.jobId);
             if (projection) {
               execution.terminal = true;
@@ -504,10 +528,10 @@ export class AgentService {
         // Workspace and provider tools are decided here from the job row and handed to the runner as data.
         let prepared: AgentJobPlan;
         try { prepared = await this.environment.prepare(job.jobId, job.workspacePath); }
-        catch { prepared = { ok: false, code: 'WORKSPACE_UNAVAILABLE', message: 'The Agent workspace is unavailable.' }; }
+        catch (error) { this.reportFailure('prepare', error, job.jobId); prepared = { ok: false, code: 'WORKSPACE_UNAVAILABLE', message: 'The Agent workspace is unavailable.' }; }
         if (!prepared.ok) {
           const failEvent: AgentEvent = { type: 'failed', code: prepared.code, message: prepared.message, retryable: false };
-          await this.agents.appendEvent(job.jobId, failEvent).catch(() => undefined);
+          await this.agents.appendEvent(job.jobId, failEvent).catch((error: unknown) => this.reportFailure('persist', error, job.jobId));
           const projection = await this.agents.failJob(job.jobId);
           if (projection) {
             execution.terminal = true;
@@ -523,9 +547,10 @@ export class AgentService {
         if (job.sourceType === 'ui' && job.attachments?.length) {
           try { attachmentFiles = await resolveStoredAttachments(plan.workspacePath, job.jobId, job.attachments); }
           catch (attachmentError) {
+            this.reportFailure('prepare', attachmentError, job.jobId);
             const failEvent: AgentEvent = { type: 'failed', code: 'ATTACHMENT_MISSING',
               message: attachmentError instanceof AgentAttachmentError ? attachmentError.message : '附件檔案已遺失，無法執行這項工作。', retryable: false };
-            await this.agents.appendEvent(job.jobId, failEvent).catch(() => undefined);
+            await this.agents.appendEvent(job.jobId, failEvent).catch((error: unknown) => this.reportFailure('persist', error, job.jobId));
             const projection = await this.agents.failJob(job.jobId);
             if (projection) {
               execution.terminal = true;
@@ -569,7 +594,7 @@ export class AgentService {
               const userText = historyEligible ? withAgentRoomHistoryHint(request.prompt) : request.prompt;
               runRequest = { ...request, prompt: withMcpSkill(skill, withOutputChannel(userText, job.sourceType)), mcp: launch };
             }
-          } catch { launch = null; }
+          } catch (error) { this.reportFailure('prepare', error, job.jobId); launch = null; }
           const initial: AgentEvent = launch
             ? { type: 'mcp_status', status: 'configured', message: MCP_STATUS_MESSAGES.configured }
             : { type: 'mcp_status', status: 'not_loaded', message: MCP_STATUS_MESSAGES.not_loaded };
@@ -577,7 +602,7 @@ export class AgentService {
             execution.mcpPhase = 'configured';
             execution.mcpObserveAt = Date.now() + MCP_OBSERVATION_TIMEOUT_MS;
           }
-          await this.agents.appendEvent(job.jobId, initial).catch(() => undefined);
+          await this.agents.appendEvent(job.jobId, initial).catch((error: unknown) => this.reportFailure('persist', error, job.jobId));
           await this.onEvent?.(job.jobId, initial);
         }
         if (attachmentFiles.length > 0) {
@@ -587,7 +612,7 @@ export class AgentService {
             ...(imagePaths.length > 0 ? { imagePaths } : {}) };
         }
         execution.deadlineAt = Date.now() + this.maxExecutionMs;
-        execution.nextHeartbeatAt = Date.now() + HEARTBEAT_INTERVAL_MS;
+        execution.nextHeartbeatAt = Date.now() + this.statusRotationIntervalMs;
         this.executions.set(job.jobId, execution);
         this.startScheduler();
         this.sendReaction(execution, 'NICE', 'running');
@@ -646,7 +671,8 @@ export class AgentService {
             this.sendReaction(execution, 'SAD', 'failed');
           }
         }
-      } catch {
+      } catch (error) {
+        this.reportFailure('execute', error, job.jobId);
         if (execution.deadlineExceeded && !timeoutPersisted) {
           const timeoutEvent: AgentEvent = { type: 'failed', code: 'TIMEOUT', message: 'Agent execution timed out.', retryable: false };
           timeoutPersisted = await this.appendTimeoutWithRetry(job.jobId, timeoutEvent, this.shutdownAbortController.signal);
@@ -746,7 +772,7 @@ export class AgentService {
         this.emitMcpStatus(execution, 'not_loaded');
       }
       if (execution.messageId && this.onReaction && now >= execution.nextHeartbeatAt) {
-        execution.nextHeartbeatAt = now + HEARTBEAT_INTERVAL_MS;
+        execution.nextHeartbeatAt = now + this.statusRotationIntervalMs;
         if (!execution.reactionInFlight) {
           execution.heartbeatPhase = (execution.heartbeatPhase + 1) % HEARTBEAT_REACTIONS.length;
           this.sendReaction(execution, HEARTBEAT_REACTIONS[execution.heartbeatPhase]!, 'running');
@@ -785,7 +811,7 @@ export class AgentService {
     for (let attempt = 0; attempt < 3; attempt++) {
       if (signal.aborted) return false;
       try { await this.agents.appendEvent(jobId, event); return true; }
-      catch { if (attempt < 2 && !await this.waitForRetry(10 * (attempt + 1), signal)) return false; }
+      catch (error) { this.reportFailure('persist', error, jobId); if (attempt < 2 && !await this.waitForRetry(10 * (attempt + 1), signal)) return false; }
     }
     return false;
   }
@@ -796,7 +822,7 @@ export class AgentService {
       try {
         const projection = await this.agents.failJob(jobId); if (projection) { this.publishLifecycle(projection); return true; }
         if ((await this.agents.getJob(jobId))?.status !== 'running') return true;
-      } catch { /* Retry until the durable job is terminal; a live running row blocks this chat after restart. */ }
+      } catch (error) { this.reportFailure('persist', error, jobId); /* Retry until the durable job is terminal. */ }
       if (!await this.waitForRetry(Math.min(1000, 25 * 2 ** Math.min(attempt++, 5)), signal)) return false;
     }
     return false;
@@ -820,7 +846,7 @@ export class AgentService {
   private refillQueued(): void {
     if (this.shuttingDown || !this.agents.listQueuedConversations) return;
     if (this.refillPromise) { this.refillPending = true; return; }
-    this.refillPromise = this.recoverQueued().catch(() => undefined).finally(() => {
+    this.refillPromise = this.recoverQueued().catch((error: unknown) => this.reportFailure('recover', error)).finally(() => {
       this.refillPromise = undefined;
       if (this.refillPending && !this.shuttingDown) {
         this.refillPending = false;

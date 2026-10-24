@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { isLocalAgentRoom, LineWorkerCommandSchema, LineWorkerEventSchema, WORKER_PROTOCOL_VERSION, type ComponentHealth, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto, type WorkerBinding } from '@line-agent/contracts';
 import type { IntegratedWorkerGateway, SendMediaRequest } from './connected-facade.js';
+import { ManualSendNotStartedError } from './services/manual-send-errors.js';
 
 type Bound = WorkerBinding & { mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; purpose?: 'DOWNLOAD_ONLY'; expectedMid?: string; application?: string };
 type AccountAuthority = Readonly<{ intentGeneration: number; controlEpoch: number; mode: Bound['mode'];
@@ -10,6 +12,19 @@ type Child = { postMessage(value: unknown): void; kill(): void; on(event: 'messa
 type Pending<T> = { resolve(value: T): void; reject(error: Error): void; timer?: ReturnType<typeof setTimeout>; cleanup?: () => void;
   command?: unknown; started?: boolean;
   cancelling?: boolean; value?: T; attachmentId?: string; cancelReason?: string; done?: Promise<void>; finishDone?(): void };
+export type ChatResourceGatewayDiagnostic = { stage: 'gateway_admission' | 'pending_request' | 'worker_response';
+  reason: 'missing_worker' | 'not_ready_worker' | 'stale_binding' | 'pending_stopped' | 'worker_response_error' | 'unknown';
+  currentBindingMatch?: boolean; currentEpochMatch?: boolean; workerReady?: boolean };
+export class ChatResourceGatewayError extends Error {
+  constructor(message: string, readonly diagnostic: ChatResourceGatewayDiagnostic) { super(message); this.name = 'ChatResourceGatewayError'; }
+}
+function chatResourceGatewayError(message: string, stage: ChatResourceGatewayDiagnostic['stage'], reason: ChatResourceGatewayDiagnostic['reason'],
+  currentBindingMatch?: boolean, currentEpochMatch?: boolean, workerReady?: boolean): ChatResourceGatewayError {
+  return new ChatResourceGatewayError(message, { stage, reason,
+    ...(currentBindingMatch !== undefined ? { currentBindingMatch } : {}),
+    ...(currentEpochMatch !== undefined ? { currentEpochMatch } : {}),
+    ...(workerReady !== undefined ? { workerReady } : {}) });
+}
 type State = { binding: Bound; child: Child; poll: ReturnType<typeof setInterval> | undefined; stopping: boolean;
   generation: number; bindingComplete: boolean;
   bindingCompletePromise: Promise<void>; resolveBindingComplete(): void;
@@ -25,10 +40,13 @@ type State = { binding: Bound; child: Child; poll: ReturnType<typeof setInterval
   downloadReady: boolean;
   downloadAuthRequests: Map<string, Pending<Extract<LineWorkerEvent, { type: 'downloadAuthResult' }>>>;
   sends: Map<string, Pending<Extract<LineWorkerEvent, { type: 'sendResult' }>>>;
+  unsends: Map<string, Pending<Extract<LineWorkerEvent, { type: 'unsendResult' }>>>;
   sendQueue: string[]; activeSendId: string | undefined;
   uncertainSends: Map<string, { operationId: string; attemptId: string; writeGrantVersion: number }>;
   downloads: Map<string, Pending<Extract<LineWorkerEvent, { type: 'attachmentResult' }>>>;
   relations: Map<string, Pending<Extract<LineWorkerEvent, { type: 'friendRelationResult' | 'addFriendResult' }>>>;
+  chatResources: Map<string, Pending<Extract<LineWorkerEvent, { type: 'chatResourceResult' }>>>;
+  ownProfiles: Map<string, Pending<Extract<LineWorkerEvent, { type: 'ownProfileResult' }>>>;
   usedRelationRequests: Map<string, { type: 'check' | 'add'; targetMid: string }>;
   modeWaiters: Map<string, Set<(value: boolean) => void>>;
   rawModeWaiters: Map<string, Set<(value: boolean) => void>>; exited: Promise<void>; resolveExited(): void };
@@ -54,6 +72,7 @@ type AccountRuntime = { generation: number; transportGeneration: number; authori
 export const MAX_UTILITY_WORKERS = 4;
 
 export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Child;
+  onDiagnostic?: (diagnostic: SafeDiagnostic, accountId?: string) => void;
   durableCursor?(accountId: string, signal: AbortSignal): Promise<TalkCursorV1Dto | null>;
   pollIntervalMs?: number; responseTimeoutMs?: number; restartDelayMs?: number; maxRestarts?: number; stopTimeoutMs?: number;
   lifecycleTimeoutMs?: number; maxWorkers?: number; maxSendsGlobal?: number;
@@ -122,7 +141,19 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       }
       else pending.reject(new Error(reason));
     }
+    for (const [requestId, pending] of state.unsends) {
+      if (pending.timer) clearTimeout(pending.timer);
+      const command = pending.command as Extract<LineWorkerCommand, { type: 'unsendMessage' }>;
+      if (pending.started && (reason === 'Worker exited' || reason === 'Worker stopped')) pending.resolve({
+        ...workerBindingFields(state.binding), type: 'unsendResult', chatType: command.chatType, chatId: command.chatId,
+        requestId, messageId: command.messageId, status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' });
+      else pending.reject(new Error(reason));
+    }
+    state.unsends.clear();
     for (const pending of state.downloads.values()) { pending.cleanup?.(); clearTimeout(pending.timer); pending.reject(new Error(reason)); pending.finishDone?.(); }
+    for (const pending of state.chatResources.values()) { pending.cleanup?.(); if (pending.timer) clearTimeout(pending.timer);
+      pending.reject(chatResourceGatewayError(reason, 'pending_request', 'pending_stopped')); }
+    for (const pending of state.ownProfiles.values()) { if (pending.timer) clearTimeout(pending.timer); pending.reject(new Error(reason)); }
     for (const pending of state.downloadAuthRequests.values()) { pending.cleanup?.(); if (pending.timer) clearTimeout(pending.timer); pending.reject(new Error(reason)); }
     for (const pending of state.relations.values()) {
       if (pending.timer) clearTimeout(pending.timer);
@@ -137,7 +168,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     }
     state.sends.clear(); state.sendQueue.length = 0; state.activeSendId = undefined;
     cancelPacing(state.binding.accountId);
-    state.uncertainSends.clear(); state.downloads.clear(); state.downloadAuthRequests.clear(); state.downloadReady = false; state.relations.clear();
+    state.uncertainSends.clear(); state.downloads.clear(); state.chatResources.clear(); state.ownProfiles.clear(); state.downloadAuthRequests.clear(); state.downloadReady = false; state.relations.clear();
     for (const waiters of state.modeWaiters.values()) for (const resolve of waiters) resolve(false);
     state.modeWaiters.clear();
     for (const waiters of state.rawModeWaiters.values()) for (const resolve of waiters) resolve(false);
@@ -273,7 +304,8 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       if (!pending || pending.cancelling) continue;
       const command = pending.command as ManualSendCommand;
       if (state.acknowledgedMode !== 'ACTIVE_CONTROL'
-        && !(command.type === 'manualSendText' && state.acknowledgedMode === 'MONITOR_ONLY')) {
+        && !(command.type === 'manualSendText' && state.acknowledgedMode === 'MONITOR_ONLY')
+        && !(command.type === 'sendMedia' && command.manualSend === true && state.acknowledgedMode === 'MONITOR_ONLY')) {
         state.sends.delete(requestId);
         pending.cleanup?.();
         pending.resolve({ ...workerBindingFields(state.binding), type: 'sendResult', requestId,
@@ -296,7 +328,9 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       catch (error) {
         if (pending.timer) clearTimeout(pending.timer);
         pending.cleanup?.(); state.sends.delete(requestId); state.activeSendId = undefined;
-        pending.reject(error instanceof Error ? error : new Error('Worker send failed'));
+        pending.reject(command.type === 'sendMedia'
+          ? new ManualSendNotStartedError(error instanceof Error ? error.message : 'Worker media send was not admitted.')
+          : error instanceof Error ? error : new Error('Worker send failed'));
         continue;
       }
       return;
@@ -358,7 +392,8 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
         if (!isCurrentEventState(state, accountId, state.child, event)) continue;
         try {
           await listener?.(event.workerInstanceId, event);
-        } catch {
+        } catch (error) {
+          try { options.onDiagnostic?.(diagnosticFailure('catalog_refresh', 'persist', error), accountId); } catch { /* observer only */ }
           // Catalog persistence and snapshot publication are a separate health
           // domain; never retire a healthy transport for their failures.
           if (event.type === 'conversationCatalog' || event.state === 'ready') {
@@ -386,7 +421,8 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
         if (!isCurrentEventState(state, accountId, state.child, event)) continue;
         await listener?.(event.workerInstanceId, event);
       }
-    } catch {
+    } catch (error) {
+      try { options.onDiagnostic?.(diagnosticFailure('line_ingest', 'persist', error), accountId); } catch { /* observer only */ }
       failEventProcessing(accountId, state);
     } finally {
       state.processingDomainEvents = false;
@@ -394,9 +430,13 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     }
   };
   async function consume(accountId: string, source: Child, raw: unknown) {
-    const parsed = LineWorkerEventSchema.safeParse(unwrap(raw)); if (!parsed.success) return;
+    const parsed = LineWorkerEventSchema.safeParse(unwrap(raw));
+    if (!parsed.success) {
+      try { options.onDiagnostic?.(diagnosticFailure('unknown', 'parse'), accountId); } catch { /* observer only */ }
+      return;
+    }
     const event = parsed.data; const state = stateFor(accountId);
-    const cancellationEvent = event.type === 'attachmentResult' || event.type === 'attachmentCancelAck';
+    const cancellationEvent = event.type === 'attachmentResult' || event.type === 'attachmentCancelAck' || event.type === 'chatResourceResult';
     if (!state || state.child !== source || event.accountId !== accountId || event.workerInstanceId !== state.binding.workerInstanceId
       || ('controlEpoch' in event && event.controlEpoch !== state.binding.controlEpoch)
       || event.transportOwnerId !== state.binding.transportOwnerId
@@ -408,8 +448,9 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       void drainCatalogEvents(accountId, state);
       return;
     }
-    if (event.type !== 'sendResult' && event.type !== 'attachmentResult' && event.type !== 'attachmentCancelAck'
+    if (event.type !== 'sendResult' && event.type !== 'unsendResult' && event.type !== 'attachmentResult' && event.type !== 'attachmentCancelAck'
       && event.type !== 'friendRelationResult' && event.type !== 'addFriendResult'
+      && event.type !== 'chatResourceResult' && event.type !== 'ownProfileResult'
       && event.type !== 'downloadAuthResult' && event.type !== 'downloadReady' && event.type !== 'downloadAuthInvalidated'
       && event.type !== 'modeAck' && event.type !== 'workerProtocolAck') {
       if (state.domainEvents.length + Number(state.processingDomainEvents) >= maxQueuedDomainEvents) throw new Error('Worker domain event queue limit exceeded');
@@ -430,6 +471,13 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       }
       if (stateFor(accountId) === state) refreshPhase(lifecycleFor(accountId));
     }
+    else if (event.type === 'unsendResult') {
+      const pending = state.unsends.get(event.requestId);
+      const command = pending?.command as Extract<LineWorkerCommand, { type: 'unsendMessage' }> | undefined;
+      if (!pending || !command || event.messageId !== command.messageId || event.chatId !== command.chatId || event.chatType !== command.chatType
+        || !sameWorkerBinding(state.binding, command) || !sameWorkerBinding(state.binding, event)) return;
+      state.unsends.delete(event.requestId); if (pending.timer) clearTimeout(pending.timer); pending.cleanup?.(); pending.resolve(event);
+    }
     else if (event.type === 'friendRelationResult' || event.type === 'addFriendResult') {
       const pending = state.relations.get(event.requestId);
       const command = pending?.command as Extract<LineWorkerCommand, { type: 'checkFriendRelation' | 'addFriendByMid' }> | undefined;
@@ -439,6 +487,19 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       if (!relationControlCurrent(state)) { failPendingRelations(state, 'RELATION_BINDING_REVOKED'); return; }
       state.relations.delete(event.requestId);
       if (pending.timer) clearTimeout(pending.timer);
+      pending.resolve(event);
+    }
+    else if (event.type === 'chatResourceResult') {
+      const pending = state.chatResources.get(event.requestId);
+      const command = pending?.command as Extract<LineWorkerCommand, { type: 'chatResourceRead' }> | undefined;
+      if (!pending || !command || event.action !== command.action || event.chatId !== command.chatId ||
+        event.chatType !== command.chatType || !sameWorkerBinding(state.binding, command) || !sameWorkerBinding(state.binding, event)) return;
+      pending.resolve(event);
+    }
+    else if (event.type === 'ownProfileResult') {
+      const pending = state.ownProfiles.get(event.requestId);
+      const command = pending?.command as Extract<LineWorkerCommand, { type: 'refreshOwnProfile' }> | undefined;
+      if (!pending || !command || !sameWorkerBinding(state.binding, command) || !sameWorkerBinding(state.binding, event)) return;
       pending.resolve(event);
     }
     else if (event.type === 'attachmentResult') {
@@ -681,7 +742,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
             if (state!.protocolVerified || state!.stopping || stateFor(effective.accountId) !== state) return;
             state!.stopping = true; lifecycle.phase = 'retiring'; child.kill();
           }, responseTimeoutMs),
-          sends: new Map(), sendQueue: [], activeSendId: undefined, uncertainSends: new Map(), downloads: new Map(), relations: new Map(), usedRelationRequests: new Map(), modeWaiters: new Map(), rawModeWaiters: new Map(), exited, resolveExited,
+          sends: new Map(), unsends: new Map(), sendQueue: [], activeSendId: undefined, uncertainSends: new Map(), downloads: new Map(), relations: new Map(), chatResources: new Map(), ownProfiles: new Map(), usedRelationRequests: new Map(), modeWaiters: new Map(), rawModeWaiters: new Map(), exited, resolveExited,
           poll: effective.purpose === 'DOWNLOAD_ONLY' ? undefined : setInterval(() => { if (stateFor(effective.accountId) === state) child.postMessage({ type: 'poll', ...ownerFields(effective), accountId: effective.accountId,
             workerInstanceId: state!.binding.workerInstanceId, controlEpoch: state!.binding.controlEpoch }); }, options.pollIntervalMs ?? 1500) };
         lifecycle.child = state;
@@ -690,7 +751,9 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
         });
         child.on('exit', () => {
           resolveExited(); state!.exitConfirmed = true; state!.retired = true; state!.domainEvents.length = 0; state!.catalogEvents.clear();
-          try { workerExitListener?.(state!.binding); } catch { /* Observability must not affect worker lifecycle. */ }
+          try { workerExitListener?.(state!.binding); } catch (error) {
+            try { options.onDiagnostic?.(diagnosticFailure('stop', 'publish', error), effective.accountId); } catch { /* observer only */ }
+          }
           if (lifecycle.child !== state) return;
           lifecycle.child = undefined; if (state!.poll) clearInterval(state!.poll); clearPending(state!, 'Worker exited');
           const cleanup = lifecycle.cleanup;
@@ -711,6 +774,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
         return effective;
       } catch (error) {
         if (state && lifecycle.child === state && !state.stopping) {
+          try { options.onDiagnostic?.(diagnosticFailure('init', 'spawn', error), effective.accountId); } catch { /* observer only */ }
           state.stopping = true; state.retired = true; state.domainEvents.length = 0; state.catalogEvents.clear(); lifecycle.phase = 'retiring';
           try { await cleanupChild(lifecycle, state); } catch { /* preserve the launch failure and keep the child owned */ }
         }
@@ -784,14 +848,14 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
   };
   const acquireMedia = (signal?: AbortSignal): Promise<void> => {
     if (closing) return Promise.reject(new Error('Worker gateway is closing'));
-    if (signal?.aborted) return Promise.reject(new Error('Worker send cancelled'));
+    if (signal?.aborted) return Promise.reject(new ManualSendNotStartedError('Worker send cancelled before media admission.'));
     if (!mediaActive) { mediaActive = true; return Promise.resolve(); }
     if (mediaWaiters.length >= MAX_MEDIA_WAITERS) return Promise.reject(new Error('Worker media queue is full (QUEUE_FULL)'));
     return new Promise<void>((resolve, reject) => {
       const onAbort = () => {
         const index = mediaWaiters.indexOf(waiter);
         if (index >= 0) mediaWaiters.splice(index, 1);
-        reject(new Error('Worker send cancelled'));
+        reject(new ManualSendNotStartedError('Worker send cancelled before media admission.'));
       };
       const waiter = { resolve: () => { signal?.removeEventListener('abort', onAbort); resolve(); },
         reject: (error: Error) => { signal?.removeEventListener('abort', onAbort); reject(error); } };
@@ -804,22 +868,33 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     if (next) next.resolve(); else mediaActive = false;
   };
   const enqueueSendMedia = async (command: SendMediaRequest, signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'sendResult' }>> => {
-    if (isLocalAgentRoom(command)) throw new Error('Local-only route cannot be sent to LINE');
-    await acquireMedia(signal);
+    if (isLocalAgentRoom(command)) throw new ManualSendNotStartedError('Local-only route cannot be sent to LINE');
+    let acquired = false;
+    let queued = false;
     try {
+      await acquireMedia(signal);
+      acquired = true;
       const state = currentFor(command);
-      if (!relationControlCurrent(state)) throw new Error('Worker mode not acknowledged for LINE send (protocol handshake required)');
+      const manual = command.manualSend === true;
+      if (manual ? !manualSendCurrent(state) : !relationControlCurrent(state)) throw new Error(manual
+        ? 'Worker manual-send capability is not current' : 'Worker mode not acknowledged for LINE send (protocol handshake required)');
       if (state.sends.has(command.requestId) || state.uncertainSends.has(command.requestId)) throw new Error('Duplicate worker request ID');
       if (sendCount(state) >= maxSendsPerAccount || globalSendCount() >= maxSendsGlobal) throw new Error('Worker send queue is full (QUEUE_FULL)');
       const wireCommand = LineWorkerCommandSchema.parse({
         type: 'sendMedia', accountId: command.accountId, workerInstanceId: command.workerInstanceId,
         controlEpoch: command.controlEpoch, chatType: command.chatType, chatId: command.chatId, requestId: command.requestId,
         kind: command.kind, filePath: command.filePath, fileName: command.fileName, sizeBytes: command.sizeBytes,
-        sha256: command.sha256, timeoutMs: MEDIA_SEND_TIMEOUT_MS,
+        sha256: command.sha256, timeoutMs: MEDIA_SEND_TIMEOUT_MS, ...(manual ? { manualSend: true } : {}),
         ...ownerFields(state.binding), operationId: command.requestId, attemptId: randomUUID(), effectPermit: randomUUID(),
       }) as ManualSendCommand;
-      return await queueWire(state, command.requestId, wireCommand, signal);
-    } finally { releaseMedia(); }
+      const pending = queueWire(state, command.requestId, wireCommand, signal);
+      queued = true;
+      return await pending;
+    } catch (error) {
+      if (!queued) throw error instanceof ManualSendNotStartedError ? error
+        : new ManualSendNotStartedError(error instanceof Error ? error.message : 'Media send was not admitted to the worker.');
+      throw error;
+    } finally { if (acquired) releaseMedia(); }
   };
   const queueWire = (state: State, requestId: string, wireCommand: ManualSendCommand,
     signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'sendResult' }>> => {
@@ -834,10 +909,16 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
           const index = state.sendQueue.indexOf(command.requestId);
           if (index >= 0) state.sendQueue.splice(index, 1);
         }
-        pending.reject(new Error('Worker send cancelled'));
+        pending.reject(pending.started ? new Error('Worker send cancelled after worker admission')
+          : wireCommand.type === 'sendMedia' ? new ManualSendNotStartedError('Worker send cancelled before worker admission.')
+            : new Error('Worker send cancelled before worker admission'));
       };
       if (signal) pending.cleanup = () => signal.removeEventListener('abort', abort);
-      if (signal?.aborted) { reject(new Error('Worker send cancelled')); return; }
+      if (signal?.aborted) {
+        reject(wireCommand.type === 'sendMedia' ? new ManualSendNotStartedError('Worker send cancelled before worker admission.')
+          : new Error('Worker send cancelled before worker admission'));
+        return;
+      }
       state.sends.set(command.requestId, pending);
       state.sendQueue.push(command.requestId);
       signal?.addEventListener('abort', abort, { once: true });
@@ -961,6 +1042,29 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       return { type: 'sendResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
         requestId: 'requestId' in command ? command.requestId : 'control', status: 'unknown', messageId: null, error: null };
     },
+    async unsend(command, signal) {
+      const state = currentFor(command);
+      if (!sameWorkerBinding(state.binding, command) || !manualSendCurrent(state)) throw new Error('Worker manual-unsend capability is not current');
+      if (state.unsends.size >= 8) throw new Error('Worker unsend queue is full (QUEUE_FULL)');
+      if (state.unsends.has(command.requestId)) throw new Error('Duplicate worker unsend request ID');
+      return new Promise((resolve, reject) => {
+        const wire = LineWorkerCommandSchema.parse({ ...workerBindingFields(state.binding), type: 'unsendMessage',
+          requestId: command.requestId, chatType: command.chatType, chatId: command.chatId, messageId: command.messageId });
+        const pending: Pending<Extract<LineWorkerEvent, { type: 'unsendResult' }>> = { command: wire, resolve, reject };
+        const abort = () => { if (!pending.started && state.unsends.delete(command.requestId)) { if (pending.timer) clearTimeout(pending.timer); reject(new Error('Worker unsend cancelled')); } };
+        if (signal?.aborted) { reject(new Error('Worker unsend cancelled')); return; }
+        if (signal) pending.cleanup = () => signal.removeEventListener('abort', abort);
+        pending.timer = setTimeout(() => {
+          if (state.unsends.get(command.requestId) !== pending) return;
+          state.unsends.delete(command.requestId); pending.cleanup?.();
+          resolve({ ...workerBindingFields(state.binding), type: 'unsendResult', chatType: command.chatType, chatId: command.chatId,
+            requestId: command.requestId, messageId: command.messageId, status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' });
+        }, responseTimeoutMs);
+        state.unsends.set(command.requestId, pending); signal?.addEventListener('abort', abort, { once: true });
+        try { pending.started = true; state.child.postMessage(wire); }
+        catch (error) { state.unsends.delete(command.requestId); if (pending.timer) clearTimeout(pending.timer); pending.cleanup?.(); reject(error instanceof Error ? error : new Error('Worker unsend failed')); }
+      });
+    },
     async sendManual(command, signal) { return enqueueSend(command, true, signal); },
     async sendMedia(command, signal) { return enqueueSendMedia(command, signal); },
     async checkFriendRelation(command) {
@@ -1043,6 +1147,76 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
         catch (error) { pending.reject(error instanceof Error ? error : new Error('Worker download failed')); }
       });
     },
+    async readChatResource(command, signal) {
+      let state: State;
+      try { state = currentFor(command); }
+      catch (error) {
+        const current = stateFor(command.accountId);
+        if (!current) throw chatResourceGatewayError('Worker is unavailable', 'gateway_admission', 'missing_worker');
+        if (error instanceof Error && error.message === 'Worker is stopping') throw chatResourceGatewayError(error.message, 'gateway_admission', 'not_ready_worker', true, true, false);
+        throw chatResourceGatewayError(error instanceof Error ? error.message : 'Stale worker binding', 'gateway_admission', 'stale_binding', false,
+          current.binding.controlEpoch === command.controlEpoch, current.bindingReady);
+      }
+      if (!state.protocolVerified || !state.bindingReady || state.stopping || state.acknowledgedMode === 'PAUSED') {
+        throw chatResourceGatewayError('Worker protocol/mode not acknowledged for chat resource read', 'gateway_admission', 'not_ready_worker', true, true, false);
+      }
+      if (!sameWorkerBinding(state.binding, command)) throw chatResourceGatewayError('Incomplete or stale worker binding for chat resource read', 'gateway_admission', 'stale_binding', false,
+        state.binding.controlEpoch === command.controlEpoch, state.bindingReady);
+      if (signal?.aborted) throw new Error('Chat resource read cancelled');
+      const totalPending = [...runtimes.values()].reduce((sum, lifecycle) => sum + (lifecycle.child?.chatResources.size ?? 0), 0);
+      if (state.chatResources.size >= 4 || totalPending >= 16) throw new Error('Worker chat resource queue is full (QUEUE_FULL)');
+      if (state.chatResources.has(command.requestId)) throw new Error('Duplicate chat resource request ID');
+      return await new Promise((resolve, reject) => {
+        const finish = (settle: () => void) => {
+          if (state.chatResources.get(command.requestId) !== pending) return;
+          state.chatResources.delete(command.requestId); if (pending.timer) clearTimeout(pending.timer); pending.cleanup?.(); settle();
+        };
+        const cancel = (reason: string) => {
+          try { state.child.postMessage({ type: 'cancelChatResourceRead', ...ownerFields(state.binding), accountId: state.binding.accountId,
+            workerInstanceId: state.binding.workerInstanceId, controlEpoch: state.binding.controlEpoch,
+            chatType: command.chatType, chatId: command.chatId, requestId: command.requestId }); }
+          catch { /* Worker exit cleanup will reject the request. */ }
+          const current = stateFor(command.accountId) === state && !state.stopping && !state.retired;
+          finish(() => reject(chatResourceGatewayError(reason, 'pending_request', reason.includes('cancel') ? 'pending_stopped' : 'unknown',
+            ...(current ? [sameWorkerBinding(state.binding, command), state.binding.controlEpoch === command.controlEpoch,
+              state.protocolVerified && state.bindingReady && state.acknowledgedMode !== 'PAUSED'] as const : []))));
+        };
+        const pending: Pending<Extract<LineWorkerEvent, { type: 'chatResourceResult' }>> = {
+          command, resolve: (value) => finish(() => resolve(value)), reject: (error) => finish(() => reject(error)),
+        };
+        pending.timer = setTimeout(() => cancel('Chat resource response timed out'), command.timeoutMs);
+        state.chatResources.set(command.requestId, pending);
+        if (signal) {
+          const abort = () => cancel('Chat resource read cancelled');
+          signal.addEventListener('abort', abort, { once: true });
+          pending.cleanup = () => signal.removeEventListener('abort', abort);
+          if (signal.aborted) abort();
+        }
+        if (state.chatResources.get(command.requestId) !== pending) return;
+        try { state.child.postMessage({ ...command, ...ownerFields(state.binding) }); }
+        catch (error) { pending.reject(error instanceof Error ? error : new Error('Chat resource read failed')); }
+      });
+    },
+    async refreshOwnProfile(command) {
+      const state = currentFor(command);
+      if (!state.protocolVerified || !state.bindingReady || state.stopping || state.acknowledgedMode === 'PAUSED') throw new Error('Worker protocol/mode not acknowledged for profile read');
+      if (!sameWorkerBinding(state.binding, command)) throw new Error('Incomplete or stale worker binding for profile read');
+      if (state.ownProfiles.size >= 1) throw new Error('Worker profile request is already in progress (QUEUE_FULL)');
+      if (state.ownProfiles.has(command.requestId)) throw new Error('Duplicate worker profile request ID');
+      return await new Promise((resolve, reject) => {
+        const finish = (settle: () => void) => {
+          if (state.ownProfiles.get(command.requestId) !== pending) return;
+          state.ownProfiles.delete(command.requestId); if (pending.timer) clearTimeout(pending.timer); settle();
+        };
+        const pending: Pending<Extract<LineWorkerEvent, { type: 'ownProfileResult' }>> = {
+          command, resolve: (value) => finish(() => resolve(value)), reject: (error) => finish(() => reject(error)),
+        };
+        pending.timer = setTimeout(() => pending.reject(new Error('LINE profile response timed out')), command.timeoutMs);
+        state.ownProfiles.set(command.requestId, pending);
+        try { state.child.postMessage({ ...command, ...ownerFields(state.binding) }); }
+        catch (error) { pending.reject(error instanceof Error ? error : new Error('LINE profile read failed')); }
+      });
+    },
     async waitModeAck(accountId, mode, waitMs) {
       const state = stateFor(accountId); if (!state) return false;
       if (state.acknowledgedMode === mode && state.modeAckReady && state.bindingReady) return true;
@@ -1108,11 +1282,14 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       const values = [...runtimes.values()];
       const live = values.flatMap((lifecycle) => lifecycle.child ? [lifecycle.child] : []);
       const pendingTasks = live.reduce((sum, state) => sum + state.domainEvents.length + Number(state.processingDomainEvents)
-        + state.sends.size + state.downloads.size + state.relations.size + Number(!!state.modeTask) + Number(!!state.restartTask), 0)
+        + state.sends.size + state.unsends.size + state.downloads.size + state.relations.size + state.chatResources.size
+        + Number(!!state.modeTask) + Number(!!state.restartTask), 0)
         + values.reduce((sum, lifecycle) => sum + Number(!!lifecycle.launch) + Number(!!lifecycle.cleanup)
           + Number(!!lifecycle.external) + Number(!!lifecycle.quarantine), 0);
       const ownedTimers = values.reduce((sum, lifecycle) => sum + Number(!!lifecycle.restart)
         + (lifecycle.child ? Number(!lifecycle.child.protocolVerified) + 1 + lifecycle.child.sends.size + lifecycle.child.downloads.size + lifecycle.child.relations.size
+          + lifecycle.child.unsends.size
+          + lifecycle.child.chatResources.size
           + [...lifecycle.child.modeWaiters.values(), ...lifecycle.child.rawModeWaiters.values()].reduce((waiterSum, waiters) => waiterSum + waiters.size, 0) : 0), 0);
       const ownedListeners = live.reduce((sum, state) => sum + (state.child.listenerCount
         ? state.child.listenerCount('message') + state.child.listenerCount('exit') : 2), 0);

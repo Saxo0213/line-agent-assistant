@@ -198,6 +198,18 @@ describe('renderer IPC', () => {
     expect(IpcResultSchema.safeParse({ type: 'searchAgentJobs', requestId: 'jobs', ok: true, jobs: [], nextCursor: null }).success).toBe(true);
   });
 
+  it('allows a verified own MID on a successful avatar refresh response', () => {
+    expect(IpcResultSchema.safeParse({ type: 'accepted', requestId: 'avatar-refresh', ok: true,
+      ownMid: `u${'a'.repeat(32)}` }).success).toBe(true);
+    expect(IpcResultSchema.safeParse({ type: 'accepted', requestId: 'avatar-refresh', ok: true,
+      ownMid: 'not-a-line-mid' }).success).toBe(false);
+  });
+
+  it('accepts a scoped own-avatar refresh projection event', () => {
+    expect(IpcEventSchema.safeParse({ type: 'lineAvatarRefreshed', accountId: 'account-1', ownMid: `u${'a'.repeat(32)}` }).success).toBe(true);
+    expect(IpcEventSchema.safeParse({ type: 'lineAvatarRefreshed', accountId: 'account-1', ownMid: '' }).success).toBe(false);
+  });
+
   it('requires exact conversation scope for manual attachment downloads', () => {
     expect(IpcRequestSchema.safeParse({ type: 'downloadAttachment', requestId: 'download-1',
       attachmentId: '2a653934-7064-4d90-a9f0-e6e24cf4f93d' }).success).toBe(false);
@@ -205,6 +217,9 @@ describe('renderer IPC', () => {
       attachmentId: '2a653934-7064-4d90-a9f0-e6e24cf4f93d', accountId: 'a', chatType: 'group', chatId: 'g' }).success).toBe(true);
     expect(IpcRequestSchema.safeParse({ type: 'listMessages', requestId: 'list-community', accountId: 'a', chatType: 'community', chatId: 'c', before: null, limit: 20 }).success).toBe(true);
     expect(IpcRequestSchema.safeParse({ type: 'sendText', requestId: 'send-community', accountId: 'a', chatType: 'community', chatId: 'c', text: 'blocked' }).success).toBe(false);
+    expect(IpcRequestSchema.safeParse({ type: 'sendManualMedia', requestId: 'media-1', accountId: 'a', chatType: 'direct', chatId: 'u-peer', files: [{ name: 'a.txt', bytes: new Uint8Array([1]) }] }).success).toBe(true);
+    expect(IpcRequestSchema.safeParse({ type: 'sendManualMedia', requestId: 'media-2', accountId: 'a', chatType: 'room', chatId: 'r-room', text: '', files: [] }).success).toBe(false);
+    expect(IpcRequestSchema.safeParse({ type: 'sendManualMedia', requestId: 'media-3', accountId: 'a', chatType: 'group', chatId: 'c-peer', files: [] }).success).toBe(false);
     // The Agent room is account-less: the LINE-chat submitPrompt is gone and the room call refuses any chat key.
     expect(IpcRequestSchema.safeParse({ type: 'submitPrompt', requestId: 'agent-community', accountId: 'a', chatType: 'thread', chatId: 't', provider: 'codex', prompt: 'blocked' }).success).toBe(false);
     expect(IpcRequestSchema.safeParse({ type: 'submitAgentRoomPrompt', requestId: 'room-1', provider: 'codex', prompt: 'hi' }).success).toBe(true);
@@ -261,9 +276,12 @@ describe('renderer IPC', () => {
   });
 
   it('bounds the conversation settings IPC payload and validates scoped Agent status events', () => {
-    const settings = { attachmentAutoAttemptLimit: 10, showAgentStatusMarkers: false, agentStatusIcons: DEFAULT_AGENT_STATUS_ICONS };
+    const settings = { attachmentAutoAttemptLimit: 10, showAgentStatusMarkers: false, agentStatusIcons: DEFAULT_AGENT_STATUS_ICONS,
+      agentStatusRotationIntervalSeconds: 5 };
     expect(IpcRequestSchema.safeParse({ type: 'setConversationSettings', requestId: 'settings-1', settings }).success).toBe(true);
+    expect(IpcRequestSchema.safeParse({ type: 'setConversationSettings', requestId: 'settings-max-rotation', settings: { ...settings, agentStatusRotationIntervalSeconds: 86_400 } }).success).toBe(true);
     for (const value of [2, 11, 3.5, '7']) expect(IpcRequestSchema.safeParse({ type: 'setConversationSettings', requestId: 'settings-invalid', settings: { ...settings, attachmentAutoAttemptLimit: value } }).success).toBe(false);
+    for (const value of [4, 5.5, '7', 86_401]) expect(IpcRequestSchema.safeParse({ type: 'setConversationSettings', requestId: 'settings-invalid-rotation', settings: { ...settings, agentStatusRotationIntervalSeconds: value } }).success).toBe(false);
     for (const symbol of ['', '   ', '\n', 'x'.repeat(17)]) {
       expect(AgentStatusIconsSchema.safeParse({ ...DEFAULT_AGENT_STATUS_ICONS, running: symbol }).success).toBe(false);
     }

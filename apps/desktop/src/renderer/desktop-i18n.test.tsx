@@ -58,6 +58,9 @@ describe('English desktop source', () => {
     expect(systemLabelFor('ja', '系統啟動')).toBe('システム起動');
     expect(systemLabelFor('ko', '系統啟動')).toBe('시스템 시작');
     expect(systemLabelFor('zh-TW', '系統啟動')).toBe('系統啟動');
+    expect(systemLabelFor('en', '相簿照片下載')).toBe('Album photo download');
+    expect(systemLabelFor('ja', '相簿照片下載')).toBe('アルバム写真をダウンロード');
+    expect(systemLabelFor('ko', '相簿照片下載')).toBe('앨범 사진 다운로드');
   });
   it('has a complete English source and matching interpolation slots in the retained catalog', () => {
     expect(desktopTextFor('en', 'chats')).toBe('Chats');

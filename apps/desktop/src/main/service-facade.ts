@@ -1,6 +1,8 @@
-import type { IpcRequest, IpcResult, ConversationKey, WritableConversationKey, AppSnapshot, MessageContent, LineMediaTarget } from '@line-agent/contracts';
+import type { IpcRequest, IpcResult, ConversationKey, WritableConversationKey, AppSnapshot, MessageContent, LineMediaTarget,
+  ChatResourceNote, ChatResourceAlbum, ChatResourcePhoto } from '@line-agent/contracts';
 import type { SystemActivityResult, SystemErrorsResult } from '../desktop-protocol.js';
 import type { SticonRange } from '@line-agent/contracts';
+import type { AlbumOpenResult } from './services/chat-resources.js';
 
 export type TimelineMessage = {
   accountId: string; chatType: ConversationKey['chatType']; chatId: string; messageId: string; senderId: string;
@@ -9,6 +11,7 @@ export type TimelineMessage = {
   sticonRanges?: SticonRange[] | undefined;
   kind: 'text' | 'image' | 'video' | 'audio' | 'file' | 'sticker' | 'contact' | 'event' | 'location' | 'rich';
   content?: MessageContent | null | undefined;
+  postNotificationType?: 'note' | 'album' | null | undefined;
   sticker: { stickerId: string; animated: boolean; altText: string | null } | null;
   agentJobStatus?: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | null | undefined;
   agentJobId?: string | null | undefined;
@@ -36,11 +39,17 @@ export type FriendRow = { mid: string; name: string; avatarAvailable: boolean; h
 export type MessageReader = { mid: string; name: string; readAt: string };
 export type WorkRecord = { id: string; title: string; status: 'todo' | 'doing' | 'waiting' | 'done'; key: ConversationKey; messageIds: string[]; attachmentIds: string[]; updatedAt: string };
 export type DesktopServiceFacade = {
-  dispatch(request: IpcRequest): Promise<IpcResult>;
+  dispatch(request: IpcRequest, signal?: AbortSignal): Promise<IpcResult>;
   openAttachment(attachmentId: string, senderId?: number): Promise<boolean>;
   downloadAttachment(key: WritableConversationKey, attachmentId: string): Promise<boolean>;
   handleLineMedia?(target: LineMediaTarget, signal?: AbortSignal): Promise<Response>;
-  listMessages(key: ConversationKey, cursor: string | null, limit: number): Promise<MessagePage>;
+  listMessages(key: ConversationKey, cursor: string | null, limit: number, exactMessageId?: string): Promise<MessagePage>;
+  listChatNotes(key: ConversationKey, cursor: string | null): Promise<{ notes: ChatResourceNote[]; nextCursor: string | null }>;
+  getChatNote(key: ConversationKey, postId: string): Promise<ChatResourceNote>;
+  listChatAlbums(key: ConversationKey, cursor: string | null): Promise<{ albums: ChatResourceAlbum[]; nextCursor: string | null }>;
+  listChatAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null): Promise<{ photos: ChatResourcePhoto[]; nextCursor: string | null }>;
+  downloadChatAlbumPhoto(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: string): Promise<{ albumId: string; photoId: string; sizeBytes: number }>;
+  openChatAlbum(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<AlbumOpenResult>;
   listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[]): Promise<AttachmentState[]>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: NonNullable<TimelineMessage['agentJobStatus']>; revision: string }>>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: NonNullable<TimelineMessage['agentJobStatus']>; revision: string }>>;
@@ -72,6 +81,12 @@ export function createDisconnectedFacade(reason = '服務尚未接入；請完�
       return { type: 'error', requestId: request.requestId, ok: false, code: 'NOT_CONNECTED', message: reason, retryable: false };
     },
     async listMessages() { return { messages: [], olderCursor: null }; },
+    async listChatNotes() { return { notes: [], nextCursor: null }; },
+    async getChatNote() { throw new Error(reason); },
+    async listChatAlbums() { return { albums: [], nextCursor: null }; },
+    async listChatAlbumPhotos() { return { photos: [], nextCursor: null }; },
+    async downloadChatAlbumPhoto() { throw new Error(reason); },
+    async openChatAlbum() { throw new Error(reason); },
     async listAttachmentStates() { return []; },
     async listAgentStatuses() { return []; },
     async openAttachment() { return false; },

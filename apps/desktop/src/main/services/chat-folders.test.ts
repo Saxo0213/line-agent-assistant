@@ -25,6 +25,9 @@ function store(): ChatFolderStore {
       if (!rows.has(key)) rows.set(key, { folderId: crypto.randomUUID(), accountId, chatType: chatType as ChatFolderRow['chatType'], chatId, title: 'Friendly Title' });
       return rows.get(key)!;
     },
+    async getChatFolderForConversation(accountId, chatType, chatId) {
+      return rows.get(JSON.stringify([accountId, chatType, chatId])) ?? null;
+    },
   };
 }
 
@@ -60,6 +63,17 @@ describe('chat folder layers under the configured workspace', () => {
     const moved = await service.resolve('acc', 'group', 'g', 'test');
     expect(moved.path).toBe(join(second, 'groups', first.folder.folderId));
     expect((await readdir(first.path)).length).toBe(1);
+  });
+
+  it('resolves an existing archive folder without creating rows, directories, or metadata', async () => {
+    const rows = store();
+    const service = new ChatFolderService(rows, { current: async () => workspace });
+    expect(await service.resolveExisting('acc', 'group', 'g')).toBeNull();
+    await expect(readdir(join(workspace, 'groups'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const { folder, path } = await service.resolve('acc', 'group', 'g', 'test');
+    await rm(join(path, '_chat.json'));
+    await expect(service.resolveExisting('acc', 'group', 'g')).resolves.toEqual({ folder, path });
+    expect(await readdir(path)).toEqual([]);
   });
 
   it('fails closed when the layer or the folder is a junction escaping the workspace (row 8 / 15)', async () => {

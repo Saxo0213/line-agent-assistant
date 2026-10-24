@@ -94,6 +94,14 @@ export async function findPrimaryAdminUser(queryable: Queryable, accountId: stri
   return result.rows[0]?.user_id ?? null;
 }
 
+async function findPrimaryAdminSender(queryable: Queryable, accountId: string, senderMid: string): Promise<string | null> {
+  const result = await queryable.query<{ user_id: string }>(
+    `SELECT user_id FROM account_administrators WHERE account_id=$1 AND user_id=$2 AND role='PRIMARY_ADMIN'`,
+    [accountId, senderMid],
+  );
+  return result.rows[0]?.user_id ?? null;
+}
+
 export const MAX_FOLDER_LINKS = 32;
 export interface LinkedChat { folderId: string; chatType: 'group' | 'room'; chatId: string }
 
@@ -124,8 +132,8 @@ export interface JobPolicy {
 /** Job-start resolution used by agent-service; unresolvable state is all-DENY, never ALLOW. */
 export async function resolveJobPolicy(queryable: Queryable, jobId: string): Promise<JobPolicy | null> {
   const job = (await queryable.query<{ account_id: string | null; chat_type: ConversationKey['chatType'] | null; chat_id: string | null; source_type: string;
-    source_message_id: string | null }>(
-    'SELECT account_id, chat_type, chat_id, source_type, source_message_id FROM agent_jobs WHERE job_id = $1', [jobId])).rows[0];
+    source_message_id: string | null; source_sender_id: string | null }>(
+    'SELECT account_id, chat_type, chat_id, source_type, source_message_id, source_sender_id FROM agent_jobs WHERE job_id = $1', [jobId])).rows[0];
   if (!job) return null;
   // The shared Agent room is the operator's own: account-less, full permissions, no chat folders.
   if (job.source_type === 'ui') {
@@ -133,7 +141,11 @@ export async function resolveJobPolicy(queryable: Queryable, jobId: string): Pro
   }
   if (job.account_id === null || job.chat_type === null || job.chat_id === null) return null;
   let principal: JobPrincipal = { kind: 'unresolved' };
-  if (job.source_type === 'line' && job.source_message_id) {
+  if (job.source_type === 'line' && job.source_sender_id) {
+    const admin = await findPrimaryAdminSender(queryable, job.account_id, job.source_sender_id);
+    if (admin) principal = { kind: 'admin', userId: admin };
+    else principal = { kind: 'user', senderMid: job.source_sender_id };
+  } else if (job.source_type === 'line' && job.source_message_id) {
     const admin = await findPrimaryAdminUser(queryable, job.account_id, job.source_message_id);
     if (admin) principal = { kind: 'admin', userId: admin };
     else {
@@ -536,6 +548,17 @@ export class AgentPermissionRepository {
        WHERE f.account_id = $1 AND f.chat_type = $2 AND f.chat_id = $3`, [accountId, chatType, chatId])).rows[0];
     if (!row) throw new AgentPermissionError('INVALID_CHAT', 'The chat does not exist.');
     return { folderId: row.folder_id, accountId, chatType, chatId, title: row.title };
+  }
+
+  /** Read-only lookup; archive queries must not create a folder row as a side effect. */
+  async getChatFolderForConversation(accountId: string, chatType: string, chatId: string): Promise<ChatFolderRow | null> {
+    if (chatType !== 'direct' && chatType !== 'group' && chatType !== 'room') return null;
+    const row = (await this.pool.query<{ folder_id: string; title: string }>(
+      `SELECT f.folder_id, ${CHAT_TITLE_SQL} AS title FROM chat_folders f
+       JOIN conversations c ON c.account_id = f.account_id AND c.chat_type = f.chat_type AND c.chat_id = f.chat_id
+       ${CHAT_CONTACT_JOIN}
+       WHERE f.account_id = $1 AND f.chat_type = $2 AND f.chat_id = $3`, [accountId, chatType, chatId])).rows[0];
+    return row ? { folderId: row.folder_id, accountId, chatType, chatId, title: row.title } : null;
   }
 
   async getChatFolder(folderId: string): Promise<ChatFolderRow | null> {

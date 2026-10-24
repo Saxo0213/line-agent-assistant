@@ -84,6 +84,10 @@ export const MCP_TOOL_PERMISSIONS: Readonly<Record<McpToolName, readonly AgentPe
   list_targets: ['records.query_current_chat', 'records.query_all_chats'],
   query_target_messages: ['records.query_current_chat', 'records.query_all_chats'],
   query_target_messages_by_time: ['records.query_current_chat', 'records.query_all_chats'],
+  list_chat_notes: ['records.query_current_chat', 'records.query_all_chats'],
+  get_chat_note: ['records.query_current_chat', 'records.query_all_chats'],
+  list_chat_albums: ['records.query_current_chat', 'records.query_all_chats'],
+  get_chat_album: ['records.query_current_chat', 'records.query_all_chats'],
 };
 
 /** Provider built-in tool decision, passed to the runner as data and never inferred by it. */

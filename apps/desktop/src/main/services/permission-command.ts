@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AgentExecutionLevel, LineWorkerCommand, LineWorkerEvent } from '@line-agent/contracts';
 import { AgentPermissionError, type AgentPermissionRepository } from '@line-agent/database';
 import type { RoomAutomationTransport } from './room-automation.js';
@@ -23,6 +24,7 @@ export type PermissionTicket =
   | { kind: 'reply'; pendingId: number }
   | { kind: 'clear'; pendingId: number };
 export type PermissionCommandOptions = {
+  onDiagnostic?: (diagnostic: SafeDiagnostic) => void;
   now?: () => number;
   onPolicyChanged?: () => void;
   locale?: Locale | string;
@@ -66,6 +68,7 @@ export class PermissionCommandService {
   private readonly now: () => number;
   private readonly onPolicyChanged: (() => void) | undefined;
   private readonly locale: Locale | string;
+  private readonly onDiagnostic: PermissionCommandOptions['onDiagnostic'];
   private queued = 0;
   private nextId = 1;
 
@@ -74,6 +77,7 @@ export class PermissionCommandService {
     this.now = options.now ?? Date.now;
     this.onPolicyChanged = options.onPolicyChanged;
     this.locale = options.locale ?? 'en';
+    this.onDiagnostic = options.onDiagnostic;
   }
 
   private label(level: AgentExecutionLevel): string { return linePrompt(this.locale, promptKeys[level]); }
@@ -238,6 +242,7 @@ export class PermissionCommandService {
       }
     } catch (error) {
       if (this.closed) return;
+      try { this.onDiagnostic?.(diagnosticFailure('database', 'persist', error)); } catch { /* Reply behavior remains authoritative. */ }
       await this.reply(envelope, linePrompt(this.locale, error instanceof AgentPermissionError && error.code === 'PERMISSION_VERSION_CONFLICT'
         ? 'permissionConflict' : 'permissionFailure'));
     }

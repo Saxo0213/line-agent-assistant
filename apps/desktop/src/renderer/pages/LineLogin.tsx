@@ -9,7 +9,7 @@ import { ProgressOverlay } from '../components/ProgressOverlay.js';
 export type LineLoginView = { accountId: string; loginAttemptId: string | null; state: 'connecting' | 'connected' | 'disconnected' | 'degraded' | 'reauth_required'; message: string | null; imageDataUrl?: string; pin?: string };
 type PendingAction = 'add' | 'restart' | 'login';
 type PendingTarget = string;
-type PendingLogin = { target: PendingTarget; action: PendingAction; phase: 'checking' | 'starting' };
+type PendingLogin = { target: PendingTarget; action: PendingAction };
 const adminBindingErrorKeys = {
   AGENT_ACCOUNT_REQUIRED: 'logInToTheAgentAccountFirst', PRIMARY_ADMIN_ALREADY_BOUND: 'aPrimaryAdministratorIsAlreadyConfigured',
   EXTERNAL_IMPORT_BUSY: 'lineIsBeingReadTryAgainShortly', OFFICIAL_IDENTITY_UNAVAILABLE: 'unableToReadTheCurrentLineAccountOpenLine',
@@ -21,6 +21,13 @@ export const OFFICIAL_DATABASES_BUSY = desktopTextFor('en', 'multipleLineDatabas
 export const LINE_WINDOW_AMBIGUOUS = desktopTextFor('en', 'multipleLineWindowsAreOpenCloseTheOtherWindows');
 export const EXTERNAL_MONITOR_INTERRUPTED = desktopTextFor('en', 'externalMonitoringStoppedUnexpectedlyRestartExternalMonitoring');
 const knownImportKeys = {
+  external_monitor_authority_stale: 'externalMonitorAuthorityChanged',
+  external_monitor_checkpoint_changed: 'externalMonitorCheckpointChanged',
+  external_monitor_source_changed: 'externalMonitorSourceChanged',
+  external_monitor_reader_startup_failed: 'externalMonitorReaderStartupFailed',
+  external_monitor_reader_failed: 'externalMonitorReaderFailed',
+  external_monitor_database_failed: 'externalMonitorDatabaseFailed',
+  external_monitor_unknown: 'externalMonitorFailureUnknown',
   official_account_not_active: 'theCurrentLineAccountIsNotThePrimaryAdministrator',
   reader_source_identity_changed: 'theCurrentLineAccountIsNotThePrimaryAdministrator',
   process_missing: 'openLineAndLogInToThePrimaryAdministrator', key_unavailable: 'openLineAndLogInToThePrimaryAdministrator',
@@ -55,7 +62,6 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   const extraText = useExtraText();
   const safeErrorText = useSafeErrorText();
   const locale = useDesktopLocale();
-  const pendingText = { checking: desktopText('checkingLineLoginStatus'), starting: desktopText('startingLineLogin') } as const;
   const adminBindingErrors = Object.fromEntries(Object.entries(adminBindingErrorKeys).map(([code, key]) => [code, desktopText(key)])) as Record<keyof typeof adminBindingErrorKeys, string>;
   const readingPhaseText = { locating: desktopText('findingLine'), reading_identity: desktopText('readingUserProfile') } as const;
   const importStageText = { checking_source: stageText(locale, 'checking_source'), closing_line_window: stageText(locale, 'closing_line_window'), copying_snapshot: stageText(locale, 'copying_snapshot'), counting_rows: stageText(locale, 'counting_rows') };
@@ -65,6 +71,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   const [startingExternalImport, setStartingExternalImport] = useState<string | null>(null);
   const [bindingAdmin, setBindingAdmin] = useState(false);
   const [loggingOut, setLoggingOut] = useState<string | null>(null);
+  const [refreshingAvatar, setRefreshingAvatar] = useState<string | null>(null);
   const [approvingSigner, setApprovingSigner] = useState(false);
   const [progress, setProgress] = useState<{ title: string; step: string; error?: string; errorCode?: string | null; confirmation?: string; accountId?: string;
     /** After 確定: follow the Primary Admin account's first-import progress from the snapshot. */ following?: boolean; followWarning?: string | null } | null>(null);
@@ -110,40 +117,23 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       setProgress((current) => current?.title === desktopText('startExternalMonitoring') ? null : current);
     }
   }, [accounts]);
-  /** Main decides whether the official LINE app may be signed out; the user confirms and the same request is resent. null = user cancelled. */
-  async function withOfficialLogoutConfirm(target: PendingTarget, action: PendingAction, run: (options?: { confirmOfficialLogout: true }) => Promise<IpcResult>): Promise<IpcResult | null> {
-    setPending({ target, action, phase: 'checking' });
-    try {
-      const first = await run();
-      if (first.ok || first.type !== 'error' || first.code !== 'OFFICIAL_LINE_SESSION_ACTIVE') return first;
-      const question = first.detail === 'same_account'
-        ? desktopText('lineIsLoggedInToThisAccountContinuingWill')
-        : desktopText('lineIsRunningButItsAccountCouldNotBe');
-      setPending(null); // not held while the confirm dialog is open
-      if (!window.confirm(question)) return null;
-      setPending({ target, action, phase: 'starting' });
-      return await run({ confirmOfficialLogout: true });
-    } catch (cause) {
-      throw cause;
-    } finally {
-      setPending(null);
-    }
-  }
   async function addAccount(slot: 'add:agent' | 'add:admin') {
     flushSync(() => setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: desktopText('startingLogin') }));
-    let result: IpcResult | null;
-    try { result = await withOfficialLogoutConfirm(slot, 'add', (options) => options ? api.lineAddAccountQr(options) : api.lineAddAccountQr()); }
+    setPending({ target: slot, action: 'add' });
+    let result: IpcResult;
+    try { result = await api.lineAddAccountQr(); }
     catch (cause) { setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(cause, desktopText('unableToStartLineLogin')) }); return; }
-    if (!result) { setProgress(null); return; }
+    finally { setPending(null); }
     if (result.ok) { setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: live?.pin ? desktopText('enterThePinOnYourPhone') : live?.imageDataUrl ? desktopText('scanTheQrCodeWithLineOnYourPhone') : desktopText('loggingIn') }); notify(desktopText('aNewLineAccountLoginHasStarted')); }
     else setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(result) });
   }
   async function restart(accountId: string) {
     flushSync(() => setProgress({ get title() { return desktopText('restartLine'); }, get step() { return desktopText('startingLine'); }, accountId }));
-    let result: IpcResult | null;
-    try { result = await withOfficialLogoutConfirm(accountId, 'restart', (options) => options ? api.lineStart(accountId, options) : api.lineStart(accountId)); }
+    setPending({ target: accountId, action: 'restart' });
+    let result: IpcResult;
+    try { result = await api.lineStart(accountId); }
     catch (cause) { setProgress({ get title() { return desktopText('restartLine'); }, step: '', error: safeErrorText(cause, desktopText('unableToRestartLine')) }); return; }
-    if (!result) { setProgress(null); return; }
+    finally { setPending(null); }
     if (result.ok) {
       setProgress(live?.state === 'connecting' ? { get title() { return desktopText('logInToLineAccount'); }, accountId, step: live.pin ? desktopText('enterThePinOnYourPhone') : live.imageDataUrl ? desktopText('scanTheQrCodeWithLineOnYourPhone') : desktopText('loggingIn') } : null);
       notify(desktopText('syncRestartRequested'));
@@ -153,10 +143,11 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   async function relogin(accountId: string) {
     flushSync(() => setProgress({ get title() { return desktopText('logInToLineAccount'); }, get step() { return desktopText('startingLogin'); }, accountId }));
     const monitoring = accounts.find((account) => account.accountId === accountId)?.externalImportProgress?.stage === 'monitoring';
-    let result: IpcResult | null;
-    try { result = await withOfficialLogoutConfirm(accountId, 'login', (options) => options ? api.lineLoginQr(accountId, options) : api.lineLoginQr(accountId)); }
+    setPending({ target: accountId, action: 'login' });
+    let result: IpcResult;
+    try { result = await api.lineLoginQr(accountId); }
     catch (cause) { setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(cause, desktopText('unableToStartLineLogin')) }); return; }
-    if (!result) { setProgress(null); return; }
+    finally { setPending(null); }
     if (!result.ok) { setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(result) }); return; }
     setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: desktopText('scanTheQrCodeWithLineOnYourPhone') });
     const outcome = desktopText('qrLoginStarted');
@@ -170,6 +161,15 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       notify(result.ok ? desktopText('arg0LoggedOutHistoryRetained', { arg0: account.displayName }) : safeErrorText(result));
     } catch (cause) { notify(safeErrorText(cause, desktopText('unableToLogOutOfLine'))); }
     finally { setLoggingOut(null); }
+  }
+  async function refreshAvatar(account: LineAccountSummary) {
+    if (refreshingAvatar) return;
+    setRefreshingAvatar(account.accountId);
+    try {
+      const result = await api.refreshLineAvatar(account.accountId);
+      notify(result.ok ? desktopText('avatarRefreshed') : safeErrorText(result));
+    } catch (error) { notify(safeErrorText(error, desktopText('unableToRefreshAvatar'))); }
+    finally { setRefreshingAvatar(null); }
   }
   async function cancelLogin() {
     if (!live?.accountId) { setProgress(null); return; }
@@ -341,7 +341,6 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   };
   const accountCard = (account: LineAccountSummary) => {
     const busy = pending !== null && pending.target === account.accountId;
-    const checkingAs = (action: PendingAction) => busy && pending.action === action && pending.phase === 'checking';
     const stage = account.externalImportProgress?.stage;
     const monitoring = stage === 'monitoring' || stage === 'syncing';
     const stopping = stoppingExternalImport === account.accountId;
@@ -381,19 +380,20 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
         onChange={(event) => void setAutoLogin(account, event.target.checked)} /> {desktopText('logInAutomaticallyAtStartup')}</label>
       {monitoring && <span id={`auto-login-disabled-${account.accountId}`} className="sr-only">{desktopText('unavailableDuringExternalMonitoring')}</span>}
       <div className="button-row account-actions">
+        {account.status === 'connected' && !monitoring && <button disabled={refreshingAvatar !== null || busy}
+          onClick={() => void refreshAvatar(account)}>{refreshingAvatar === account.accountId ? desktopText('refreshingAvatar') : desktopText('refreshAvatar')}</button>}
         {account.productRole === 'AGENT' && account.hasPrimaryAdmin !== true && <button className="primary" onClick={() => void beginAdminPairing(account)}>{desktopText('addAdministrator')}</button>}
-        <button disabled={account.status === 'disconnected' || busy} onClick={() => void restart(account.accountId)}>{checkingAs('restart') ? desktopText('checking') : desktopText('restart')}</button>
-        <button aria-label={`${account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')} ${account.displayName}`} disabled={busy} onClick={() => void relogin(account.accountId)}>{checkingAs('login') ? desktopText('checking') : account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')}</button>
+        <button disabled={account.status === 'disconnected' || busy} onClick={() => void restart(account.accountId)}>{desktopText('restart')}</button>
+        <button aria-label={`${account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')} ${account.displayName}`} disabled={busy} onClick={() => void relogin(account.accountId)}>{account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')}</button>
         <button aria-label={desktopText('logOutArg0', { arg0: account.displayName })} disabled={account.status === 'disconnected' || busy || loggingOut === account.accountId} onClick={() => void logout(account)}>{loggingOut === account.accountId ? desktopText('loggingOut') : desktopText('logOut')}</button>
-        {busy && <InlineBusy>{pendingText[pending.phase]}</InlineBusy>}
+        {busy && <InlineBusy>{desktopText('startingLineLogin')}</InlineBusy>}
         {loggingOut === account.accountId && <InlineBusy>{desktopText('loggingOut')}</InlineBusy>}
         {!embedded && account.productRole === 'PRIMARY_ADMIN' && account.hasVerifiedLineIdentity === true && externalMonitorAction(account)}
       </div>
     </article>;
   };
   const addPending = pending !== null && pending.action === 'add';
-  const vacantChecking = (slot: PendingTarget) => pending?.target === slot && pending.phase === 'checking';
-  const vacantPending = (slot: PendingTarget) => pending?.target === slot ? pendingText[pending.phase] : null;
+  const vacantPending = (slot: PendingTarget) => pending?.target === slot ? desktopText('startingLineLogin') : null;
   const progressAccount = progress?.accountId ? accounts.find((account) => account.accountId === progress.accountId) : undefined;
   const progressImport = progressAccount?.externalImportProgress;
   const followImport = progress?.following ? admin?.externalImportProgress : undefined;
@@ -435,8 +435,8 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     <section className={embedded ? 'panel combined-account-card' : undefined} aria-label={embedded ? desktopText('lineAccountSettings') : undefined}>
     {embedded && <h2 className="combined-account-title">{desktopText('account')}</h2>}
     <div className="account-role-slots">
-      <section className="account-role-slot" aria-label={extraText('agentAccountSlot')}><div className="account-role-heading"><h2>Agent</h2><p>{agent?.displayName ?? desktopText('notLoggedIn182')}</p></div>{agent ? accountCard(agent) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}>{admin ? <p>{desktopText('primaryAdministratorConfiguredANewAgentAccountWillBe')}</p> : null}<div className="action-with-status"><button className="primary" disabled={loginActive || addPending} onClick={() => void addAccount('add:agent')}>{vacantChecking('add:agent') ? desktopText('checking') : desktopText('logInToAgentLineAccount')}</button>{vacantPending('add:agent') && <InlineBusy>{vacantPending('add:agent')!}</InlineBusy>}</div></article>}</section>
-      <section className="account-role-slot" aria-label={extraText('primaryAdminAccountSlot')}><div className="account-role-heading"><h2>Primary Admin</h2><p>{admin?.displayName ?? desktopText('notLoggedIn182')}</p></div>{admin ? accountCard(admin) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}><div className="action-with-status"><button className="primary" disabled={loginActive || addPending || agent?.hasPrimaryAdmin !== true} onClick={() => void addAccount('add:admin')}>{vacantChecking('add:admin') ? desktopText('checking') : desktopText('logInToPrimaryAdminLineAccount')}</button>{vacantPending('add:admin') && <InlineBusy>{vacantPending('add:admin')!}</InlineBusy>}</div>
+      <section className="account-role-slot" aria-label={extraText('agentAccountSlot')}><div className="account-role-heading"><h2>Agent</h2><p>{agent?.displayName ?? desktopText('notLoggedIn182')}</p></div>{agent ? accountCard(agent) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}>{admin ? <p>{desktopText('primaryAdministratorConfiguredANewAgentAccountWillBe')}</p> : null}<div className="action-with-status"><button className="primary" disabled={loginActive || addPending} onClick={() => void addAccount('add:agent')}>{desktopText('logInToAgentLineAccount')}</button>{vacantPending('add:agent') && <InlineBusy>{vacantPending('add:agent')!}</InlineBusy>}</div></article>}</section>
+      <section className="account-role-slot" aria-label={extraText('primaryAdminAccountSlot')}><div className="account-role-heading"><h2>Primary Admin</h2><p>{admin?.displayName ?? desktopText('notLoggedIn182')}</p></div>{admin ? accountCard(admin) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}><div className="action-with-status"><button className="primary" disabled={loginActive || addPending || agent?.hasPrimaryAdmin !== true} onClick={() => void addAccount('add:admin')}>{desktopText('logInToPrimaryAdminLineAccount')}</button>{vacantPending('add:admin') && <InlineBusy>{vacantPending('add:admin')!}</InlineBusy>}</div>
         {embedded && canBindAdminFromSettings && <div className="action-with-status"><button className="primary" disabled={bindingAdmin || addPending} onClick={() => void bindAdminFromOfficialLine()}>{desktopText('setAdministratorFromLineAndStartExternalMonitoring')}</button>{bindingAdmin && <InlineBusy>{desktopText('settingPrimaryAdministrator')}</InlineBusy>}</div>}
         {!embedded && (!agent || agent.hasPrimaryAdmin !== true) && <div className="action-with-status"><button className="primary" disabled={bindingAdmin || addPending} onClick={() => void bindAdminFromOfficialLine()}>{desktopText('setAdministratorFromLineAndStartExternalMonitoring')}</button></div>}</article>}</section>
     </div>

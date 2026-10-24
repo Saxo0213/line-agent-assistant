@@ -5,10 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { BaseClient, InternalError } from '@evex/linejs/base';
 import { MemoryStorage } from '@evex/linejs/storage';
 import { Protocols } from '@evex/linejs/thrift';
-import { normalizeNativePicturePath, type AccountMode, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue, type NativeAttachmentDownloadInput, type TalkCursorV1Dto } from '@line-agent/contracts';
+import { normalizeNativePicturePath, type AccountMode, type ChatResourceReadCommand, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue, type NativeAttachmentDownloadInput, type TalkCursorV1Dto } from '@line-agent/contracts';
 import {
-  createMutationGate, EffectDeniedError,
+  createMutationGate, EffectDeniedError, isReadOnlyRpc,
   type ControlLease, type ControlLeasePhase, type DirectFetchEffect, type MediaUploadScope, type RpcCallContext, type RpcTransportState,
+  type ChatResourceFetchEffect,
   type TrustedInvocationDispatch, type TrustedRequestClient,
 } from './mutation-gate.js';
 import { MediaUploadFailedError } from './worker-loop.js';
@@ -18,6 +19,7 @@ import { safeRaw } from './normalizer.js';
 import { verifyLinejsPackage } from './version.js';
 import { SafeAttachmentError } from './attachment-error.js';
 import { parseEncryptedAccessToken, validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
+import { boundedChatResourceResponseCode, ChatResourceFailure } from './chat-resource-error.js';
 
 type OpaqueCall = () => Promise<unknown>;
 type SourceCall = Readonly<{
@@ -224,6 +226,11 @@ export function limitDownloadResponse(response: Response, maxBytes: number): Res
   return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 }
 
+export function limitChatResourceBootstrapResponse(response: Response, maxBytes: number): Response {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new TypeError('Invalid channel-token bootstrap byte limit');
+  return limitDownloadResponse(response, Math.min(maxBytes, 64 * 1024));
+}
+
 function restoreBinaryJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(restoreBinaryJson);
   if (value instanceof Uint8Array) return value;
@@ -234,6 +241,25 @@ function restoreBinaryJson(value: unknown): unknown {
     return new Uint8Array(Buffer.from(item.data, 'base64'));
   }
   return Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, restoreBinaryJson(entry)]));
+}
+
+function finiteNonnegative(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function finitePositive(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+function normalizeChatNote(value: unknown): { postId: string; createdTime: number | null; text: string | null; content?: Record<string, JsonValue> } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('LINE_NOTE_SHAPE_INVALID');
+  const post = value as Record<string, unknown>;
+  const postId = post.postId ?? post.id;
+  const contents = post.contents && typeof post.contents === 'object' && !Array.isArray(post.contents)
+    ? post.contents as Record<string, unknown> : {};
+  if (typeof postId !== 'string' && typeof postId !== 'number') throw new Error('LINE_NOTE_ID_INVALID');
+  const content = safeRaw(contents);
+  return { postId: String(postId), createdTime: finiteNonnegative(post.createdTime ?? post.updateTime),
+    text: typeof contents.text === 'string' ? contents.text : typeof post.text === 'string' ? post.text : null,
+    ...(content && typeof content === 'object' && !Array.isArray(content) ? { content: content as Record<string, JsonValue> } : {}) };
 }
 
 async function* fileChunks(file: File): AsyncIterable<Uint8Array> {
@@ -496,7 +522,14 @@ export function linejsEncryptedTextMessageOptions(to: string, chunks: Buffer[], 
 class RotatingMemoryStorage extends MemoryStorage {
   #emit?: (snapshot: JsonValue) => void;
   #loading = false;
+  #suppressEvents = false;
   setListener(listener: (snapshot: JsonValue) => void): void { this.#emit = listener; }
+  async suppressEvents<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#suppressEvents;
+    this.#suppressEvents = true;
+    try { return await operation(); }
+    finally { this.#suppressEvents = previous; }
+  }
   async load(snapshot: JsonValue | null, qrCert: string | null): Promise<void> {
     this.#loading = true;
     try {
@@ -509,15 +542,15 @@ class RotatingMemoryStorage extends MemoryStorage {
   }
   override async set(key: string, value: Parameters<MemoryStorage['set']>[1]): Promise<void> {
     await super.set(key, value);
-    if (!this.#loading) this.#emit?.(safeRaw(this.getAll()));
+    if (!this.#loading && !this.#suppressEvents) this.#emit?.(safeRaw(this.getAll()));
   }
   override async delete(key: string): Promise<void> {
     await super.delete(key);
-    if (!this.#loading) this.#emit?.(safeRaw(this.getAll()));
+    if (!this.#loading && !this.#suppressEvents) this.#emit?.(safeRaw(this.getAll()));
   }
   override async clear(): Promise<void> {
     await super.clear();
-    if (!this.#loading) this.#emit?.(safeRaw(this.getAll()));
+    if (!this.#loading && !this.#suppressEvents) this.#emit?.(safeRaw(this.getAll()));
   }
 }
 
@@ -526,12 +559,15 @@ export class LinejsAdapter implements LineTransport {
   readonly #storage: RotatingMemoryStorage;
   readonly #options: LinejsAdapterOptions;
   readonly #gate: ReturnType<typeof createMutationGate<OpaqueCall, unknown, Response>>;
-  readonly #listeners: Partial<Record<'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'authInvalidated', (value?: any) => void>> = {};
+  readonly #listeners: Partial<Record<'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated', (value?: any) => void>> = {};
   readonly #directFetchContext = new AsyncLocalStorage<DirectFetchEffect>();
+  readonly #chatResourceFetchContext = new AsyncLocalStorage<ChatResourceFetchEffect>();
   readonly #attachmentDownloadContext = new AsyncLocalStorage<AttachmentDownloadContext>();
   readonly #mediaUploadContext = new AsyncLocalStorage<MediaUploadScope>();
   readonly #requestFailures = new WeakSet<object>();
   #revoked = false;
+  #refreshingCredentials = false;
+  #refreshInFlight: Promise<void> | undefined;
   #downloadAuthAdopted = false;
   #adoptedObsToken: string | null = null;
   #activeRelationAdd: RelationAddContext | undefined;
@@ -567,6 +603,12 @@ export class LinejsAdapter implements LineTransport {
             return response;
           }
           const direct = this.#directFetchContext.getStore();
+          const resource = this.#chatResourceFetchContext.getStore();
+          if (resource) {
+            const bounded = new Request(request, { signal: resource.signal, redirect: 'error' });
+            const response = await this.#gate.runChatResourceFetch(resource, bounded);
+            return limitDownloadResponse(response, resource.maxBytes);
+          }
           if (direct) {
             const download = this.#attachmentDownloadContext.getStore();
             const boundedRequest = download ? new Request(request, { signal: download.signal }) : request;
@@ -596,15 +638,41 @@ export class LinejsAdapter implements LineTransport {
             body: new Uint8Array(base.thrift.writeThrift(source.value, source.methodName, Protocols[source.protocolType ?? 3])) })
           : request;
         const download = this.#attachmentDownloadContext.getStore();
+        const resource = this.#chatResourceFetchContext.getStore();
+        const resourceBootstrap = resource && source.path === '/CH4' ? resource : undefined;
         const dispatchedRequest = download ? new Request(request, { signal: download.signal }) : request;
         return await dispatch({ actualMethodName: source.methodName, actualPath: source.path,
-          transport, logicalRequest, execute: async (customFetch) => {
+          actualValue: source.value, transport, logicalRequest, execute: async (customFetch) => {
             const response = await customFetch(dispatchedRequest);
-            return download ? limitDownloadResponse(response, download.maxBytes) : response;
+            if (download) return limitDownloadResponse(response, download.maxBytes);
+            return resourceBootstrap ? limitChatResourceBootstrapResponse(response, resourceBootstrap.maxBytes) : response;
           } }) as Response;
       },
     });
     this.#base = base;
+    const nativeRefresh = base.auth.tryRefreshToken.bind(base.auth);
+    base.auth.tryRefreshToken = async () => {
+      const source = sourceContext.getStore();
+      if (source && !isReadOnlyRpc(source.path, source.methodName)) {
+        throw new EffectDeniedError('native token refresh is denied for a non-read RPC to prevent mutation replay');
+      }
+      let inFlight = this.#refreshInFlight;
+      if (!inFlight) {
+        inFlight = (async () => {
+          this.#refreshingCredentials = true;
+          try {
+            await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' },
+              () => this.#storage.suppressEvents(nativeRefresh));
+            const token = this.#base.authToken;
+            if (!token) throw new Error('LINEJS refresh returned no access token');
+            this.#listeners.credentials?.({ token, e2eeStorage: safeRaw(this.#storage.getAll()) });
+          } finally { this.#refreshingCredentials = false; }
+        })();
+        this.#refreshInFlight = inFlight;
+      }
+      try { await inFlight; }
+      finally { if (this.#refreshInFlight === inFlight) this.#refreshInFlight = undefined; }
+    };
     if (options.application) base.request.systemType = options.application;
     const original = base.request.request.bind(base.request);
     base.request.request = (async (...args: Parameters<typeof original>) => {
@@ -621,7 +689,7 @@ export class LinejsAdapter implements LineTransport {
         }
       });
     }) as typeof base.request.request;
-    this.#gate = createMutationGate({ accountId: options.accountId, workerInstanceId: options.workerInstanceId,
+    this.#gate = createMutationGate({ accountId: options.accountId, workerInstanceId: options.workerInstanceId, controlEpoch: options.controlEpoch,
       requestClient, physicalTransport: async (request) => {
         const source = sourceContext.getStore();
         if (source?.path === '/RE4' && source.methodName === 'addFriendByMid' && this.#activeRelationAdd) {
@@ -655,7 +723,11 @@ export class LinejsAdapter implements LineTransport {
     });
     base.on('qrcall', (code) => this.#listeners.qr?.(code));
     base.on('pincall', (pin) => this.#listeners.pin?.(pin));
-    base.on('update:authtoken', (token) => { base.authToken = token; this.#listeners.token?.(token); });
+    base.on('update:authtoken', (token) => {
+      base.authToken = token;
+      this.#clearChatResourceTokens();
+      if (!this.#refreshingCredentials) this.#listeners.token?.(token);
+    });
     base.on('update:qrcert', (qrCert) => this.#listeners.qrCert?.(qrCert));
     this.#storage.setListener((snapshot) => this.#listeners.storage?.(snapshot));
   }
@@ -666,12 +738,13 @@ export class LinejsAdapter implements LineTransport {
     if (verified.status !== 'verified') throw new ProtocolUnverifiedError(verified.reason);
     return new LinejsAdapter(options);
   }
-  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'authInvalidated', listener: (value?: any) => void): void {
+  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated', listener: (value?: any) => void): void {
     this.#listeners[event] = listener;
   }
   async installSecrets(secrets: { token: string | null; qrCert: string | null; e2eeStorage: JsonValue | null }): Promise<void> {
     this.#downloadAuthAdopted = false;
     this.#adoptedObsToken = null;
+    this.#clearChatResourceTokens();
     await this.#storage.load(secrets.e2eeStorage, secrets.qrCert);
     if (secrets.token === null) delete this.#base.authToken;
     else this.#base.authToken = secrets.token;
@@ -685,7 +758,17 @@ export class LinejsAdapter implements LineTransport {
   async loginToken(token: string): Promise<TransportIdentity> {
     this.#downloadAuthAdopted = false;
     this.#adoptedObsToken = null;
-    await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ authToken: token }));
+    const expire = await this.#storage.get('expire');
+    const refreshToken = await this.#storage.get('refreshToken');
+    let tokenToUse = token;
+    if (typeof expire === 'number' && Number.isFinite(expire) && expire <= Math.floor(Date.now() / 1000)
+      && typeof refreshToken === 'string') {
+      await this.#base.auth.tryRefreshToken();
+      const refreshedToken = this.#base.authToken;
+      if (!refreshedToken) throw new Error('LINEJS refresh returned no access token');
+      tokenToUse = refreshedToken;
+    }
+    await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ authToken: tokenToUse }));
     return this.#profile();
   }
   async adoptDownloadAuth(token: string, application: string,
@@ -783,6 +866,17 @@ export class LinejsAdapter implements LineTransport {
       getChats: (options) => this.#base.talk.getChats(options),
       getContactsV2: (options) => this.#base.talk.getContactsV2(options),
     }, async (call) => await this.#gate.invokeRpc(context, call) as Awaited<ReturnType<typeof call>>);
+  }
+  async refreshOwnProfile(): Promise<TransportIdentity> {
+    if (this.#downloadAuthAdopted || this.#revoked || !this.#base.authToken) throw new Error('LINE profile read is unavailable');
+    const profile = await this.#gate.invokeRpc(this.#readContext(), () => this.#base.talk.getProfile()) as {
+      mid?: unknown; displayName?: unknown; picturePath?: unknown;
+    };
+    if (!profile || typeof profile.mid !== 'string' || !/^u[0-9a-f]{32}$/i.test(profile.mid)) throw new Error('LINE profile response is invalid');
+    const picturePath = normalizeLinePicturePath(profile.picturePath, Object.hasOwn(profile, 'picturePath'));
+    const displayName = typeof profile.displayName === 'string' && profile.displayName.length <= 256 ? profile.displayName : null;
+    return { ownMid: profile.mid.toLowerCase(), displayName,
+      ...(picturePath === undefined ? {} : { picturePath }) };
   }
   #profile(): TransportIdentity {
     const profile = this.#base.profile;
@@ -901,6 +995,101 @@ export class LinejsAdapter implements LineTransport {
       })) as readonly unknown[];
     return decryptLinejsHistoryMessages(messages, async (message) => await this.#gate.invokeRpc(context,
       () => this.#base.e2ee.decryptE2EEMessage(message as Parameters<BaseClient['e2ee']['decryptE2EEMessage']>[0])));
+  }
+  async readChatResource(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>): Promise<{
+    nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[];
+    photos?: readonly unknown[]; bytes?: Uint8Array;
+  }> {
+    if (!this.#base.authToken || !this.#base.profile?.mid) throw new EffectDeniedError('chat resources require a logged-in account');
+    if (options.signal.aborted) throw options.signal.reason;
+    const context = this.#readContext();
+    const rest = { accountId: this.#options.accountId, workerInstanceId: this.#options.workerInstanceId,
+      controlEpoch: this.#options.controlEpoch, signal: options.signal,
+      maxBytes: command.action === 'downloadAlbumPhoto' ? command.maxBytes! : 2 * 1024 * 1024,
+      chatId: command.chatId, ownMid: this.#base.profile.mid, action: command.action,
+      ...(command.cursor === undefined ? {} : { cursor: command.cursor }),
+      ...(command.postId === undefined ? {} : { postId: command.postId }),
+      ...(command.albumId === undefined ? {} : { albumId: command.albumId }),
+      ...(command.oid === undefined ? {} : { oid: command.oid }), ...(command.prefix === undefined ? {} : { prefix: command.prefix }),
+      ...(context.phase === 'CONTROL_READ' ? { lease: context.lease } : {}) };
+    const withFetch = <T>(fn: () => Promise<T>) => this.#chatResourceFetchContext.run(rest, fn);
+    const stage = async <T>(category: 'bootstrap_failure' | 'list_get_transport_failure' | 'normalization_failure', operation: () => Promise<T> | T): Promise<T> => {
+      try { return await operation(); } catch (error) {
+        if (options.signal.aborted) throw error;
+        throw new ChatResourceFailure(category);
+      }
+    };
+    const listGet = async <T>(operation: () => Promise<T>): Promise<T> => {
+      try { return await operation(); } catch (error) {
+        if (options.signal.aborted) throw error;
+        if (error instanceof InternalError && error.type === 'MoaError') {
+          const data = error.data as Record<string, unknown> | undefined;
+          if (data && Object.hasOwn(data, 'code')) throw new ChatResourceFailure('response_code_invalid');
+          if (data && !Object.hasOwn(data, 'status')) throw new ChatResourceFailure('response_shape_invalid');
+          if (error.message === 'Moa returned invalid JSON' || error.message === 'Moa returned an invalid response object') {
+            throw new ChatResourceFailure('response_shape_invalid');
+          }
+        }
+        throw new ChatResourceFailure('list_get_transport_failure');
+      }
+    };
+    if (command.action === 'listNotes' || command.action === 'getNote') {
+      // LINEJS lazily obtains this channel token. Keep its sole Thrift bootstrap inside the exact RPC gate.
+      await stage('bootstrap_failure', () => withFetch(() => this.#gate.invokeRpc({ phase: 'CHAT_RESOURCE_BOOTSTRAP', chatResourceBootstrap: {
+        accountId: rest.accountId, workerInstanceId: rest.workerInstanceId, controlEpoch: rest.controlEpoch,
+        channelId: '1341209850', signal: options.signal, maxBytes: 64 * 1024,
+      } }, () => this.#base.timeline.initTimeline())));
+      const response = await stage('list_get_transport_failure', () => withFetch(() => command.action === 'listNotes'
+        ? this.#base.timeline.listPost({ homeId: command.chatId, ...(command.cursor ? { postId: command.cursor } : {}) })
+        : this.#base.timeline.getPost({ homeId: command.chatId, postId: command.postId! })));
+      if (!response || typeof response !== 'object' || Array.isArray(response)) throw new ChatResourceFailure('response_shape_invalid');
+      const raw = response as Record<string, unknown>;
+      if (raw.code !== 0) throw new ChatResourceFailure('response_code_invalid', boundedChatResourceResponseCode(raw.code, Object.hasOwn(raw, 'code')));
+      if (!raw.result || typeof raw.result !== 'object' || Array.isArray(raw.result)) throw new ChatResourceFailure('response_shape_invalid');
+      const data = raw.result as Record<string, unknown>;
+      const posts = Array.isArray(data.posts) ? data.posts : command.action === 'getNote' ? [data.post ?? data] : [];
+      const notes = await stage('normalization_failure', () => posts.slice(0, command.limit ?? 50).map((post) => normalizeChatNote(post)));
+      const next = data.nextCursor ?? data.nextPostId ?? data.cursor;
+      return command.action === 'getNote' ? { note: notes[0] } : {
+        notes, nextCursor: typeof next === 'string' && next.length <= 2048 ? next : null,
+      };
+    }
+    // Moa's token bootstrap is likewise an exact /CH4 RPC; its service caches the token per account session.
+    await stage('bootstrap_failure', () => withFetch(() => this.#gate.invokeRpc({ phase: 'CHAT_RESOURCE_BOOTSTRAP', chatResourceBootstrap: {
+      accountId: rest.accountId, workerInstanceId: rest.workerInstanceId, controlEpoch: rest.controlEpoch,
+      channelId: '1375220249', signal: options.signal, maxBytes: 64 * 1024,
+    } }, () => this.#base.moa.getAlbumChannelToken())));
+    if (command.action === 'listAlbums') {
+      const response = await listGet(() => withFetch(() => this.#base.moa.getAlbums({ ...(command.cursor === undefined || command.cursor === null ? {} : { cursor: command.cursor }) })));
+      if (!response || typeof response !== 'object' || Array.isArray(response)) throw new ChatResourceFailure('response_shape_invalid');
+      const albumResult = response.result;
+      const albums = albumResult?.albums;
+      if (!albumResult || !Array.isArray(albums)) throw new ChatResourceFailure('response_shape_invalid');
+      return await stage('normalization_failure', () => ({ albums: albums.filter((album) => album.chatId === command.chatId).slice(0, command.limit ?? 50).map((album) => ({
+        albumId: String(album.albumId), chatId: String(album.chatId), title: typeof album.title === 'string' ? album.title : null,
+        photoCount: finiteNonnegative(album.photoCount), createTime: finiteNonnegative(album.createTime), updateTime: finiteNonnegative(album.updateTime),
+      })), nextCursor: typeof albumResult.nextCursor === 'string' ? albumResult.nextCursor : albumResult.hasMore ? albumResult.cursor ?? null : null }));
+    }
+    if (command.action === 'listAlbumPhotos') {
+      const response = await listGet(() => withFetch(() => this.#base.moa.getPhotos({ chatId: command.chatId, albumId: command.albumId!,
+        ...(command.cursor === undefined || command.cursor === null ? {} : { cursor: command.cursor }), pageSize: command.limit ?? 50 })));
+      if (!response || typeof response !== 'object' || Array.isArray(response)) throw new ChatResourceFailure('response_shape_invalid');
+      const photoResult = response.result;
+      const photos = photoResult?.photos;
+      if (!photoResult || !Array.isArray(photos)) throw new ChatResourceFailure('response_shape_invalid');
+      return await stage('normalization_failure', () => ({ photos: photos.slice(0, command.limit ?? 50).flatMap((photo) => {
+        const oid = photo.oid ?? photo.obsResourceId?.oid;
+        const photoId = photo.photoId ?? photo.id ?? oid;
+        if (oid === undefined || photoId === undefined) return [];
+        return [{ photoId: String(photoId), oid: String(oid), prefix: photo.obsResourceId?.sid === 'v' || photo.resourceType === 'VIDEO' ? 'album/v' as const : 'album/a' as const,
+          shotTime: finiteNonnegative(photo.shotTime), width: finitePositive(photo.width), height: finitePositive(photo.height) }];
+      }), nextCursor: typeof photoResult.nextCursor === 'string' ? photoResult.nextCursor : null }));
+    }
+    const bytes = await listGet(() => withFetch(() => this.#base.moa.downloadPhoto({ chatId: command.chatId, albumId: command.albumId!,
+      oid: command.oid!, prefix: command.prefix! })));
+    if (bytes.byteLength > command.maxBytes!) throw new ChatResourceFailure('response_validation');
+    if (options.signal.aborted) throw options.signal.reason;
+    return { bytes };
   }
   async download(_kind: 'image' | 'video' | 'audio' | 'file', _messageId: string,
     _externalAttachmentId: string, lineMessage: JsonValue,
@@ -1024,13 +1213,13 @@ export class LinejsAdapter implements LineTransport {
   }
   /** Mirrors linejs `obs.uploadMediaByE2EE`, with every POST and RPC passing the mutation gate. */
   async sendMedia(conversation: { chatType: 'direct' | 'group'; chatId: string },
-    media: Readonly<{ kind: 'image' | 'file'; bytes: Buffer; fileName: string }>, lease: ControlLease): Promise<{ messageId: string }> {
-    if (this.#options.mode !== 'ACTIVE_CONTROL' || this.#revoked) throw new EffectDeniedError('worker mode is read-only');
+    media: Readonly<{ kind: 'image' | 'file'; bytes: Buffer; fileName: string }>, lease: ControlLease, manual = false): Promise<{ messageId: string }> {
+    if ((this.#options.mode !== 'ACTIVE_CONTROL' && !(manual && this.#options.mode === 'MONITOR_ONLY')) || this.#revoked) throw new EffectDeniedError('worker mode is read-only');
     const prefix = conversation.chatType === 'direct' ? 'u' : conversation.chatType === 'group' ? 'c' : undefined;
     if (prefix === undefined || !conversation.chatId.startsWith(prefix)) throw new EffectDeniedError('conversation type/MID mismatch');
     if (media.kind !== 'image' && media.kind !== 'file') throw new EffectDeniedError('unsupported media kind');
     const [namespace, contentType] = media.kind === 'image' ? ['emi', 1] as const : ['emf', 14] as const;
-    const scope = this.#gate.openMediaUploadScope(lease, media.kind);
+    const scope = this.#gate.openMediaUploadScope(lease, media.kind, manual);
     try {
       let prepared: { objId: string; size: number; chunks: Buffer[] };
       try {
@@ -1049,7 +1238,7 @@ export class LinejsAdapter implements LineTransport {
           }
           return first.objId;
         });
-        const chunks = await this.#gate.invokeRpc({ phase: 'CONTROL_READ', lease }, () =>
+      const chunks = await this.#gate.invokeRpc({ phase: manual ? 'MONITOR_READ' : 'CONTROL_READ', lease }, () =>
           this.#base.e2ee.encryptE2EEMessage(conversation.chatId, { keyMaterial, fileName: media.fileName },
             contentType as never)) as Buffer[];
         prepared = { objId, size: encrypted.size, chunks };
@@ -1058,7 +1247,7 @@ export class LinejsAdapter implements LineTransport {
         throw new MediaUploadFailedError();
       }
       const extension = media.fileName.split('.').at(-1);
-      const result = await this.#gate.invokeRpc({ phase: 'CONTROL_SEND', lease }, () => this.#base.talk.sendMessage({
+      const result = await this.#gate.invokeRpc({ phase: manual ? 'MANUAL_SEND' : 'CONTROL_SEND', lease }, () => this.#base.talk.sendMessage({
         to: conversation.chatId, chunks: prepared.chunks, contentType: contentType as never, e2ee: true,
         contentMetadata: {
           SID: namespace, OID: prepared.objId, FILE_SIZE: prepared.size.toString(), e2eeVersion: '2',
@@ -1085,6 +1274,18 @@ export class LinejsAdapter implements LineTransport {
       }
       return await this.#base.talk.react({ id: BigInt(messageId), reaction });
     });
+  }
+  async unsend(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string }, messageId: string,
+    lease: ControlLease): Promise<void> {
+    if ((this.#options.mode !== 'ACTIVE_CONTROL' && this.#options.mode !== 'MONITOR_ONLY') || this.#revoked) {
+      throw new EffectDeniedError('worker mode is read-only');
+    }
+    const prefix = { direct: 'u', group: 'c', room: 'r' }[conversation.chatType];
+    if (!conversation.chatId.startsWith(prefix)) throw new EffectDeniedError('conversation type/MID mismatch');
+    if (!/^(?:0|[1-9][0-9]*)$/.test(messageId) || BigInt(messageId) > 9223372036854775807n) {
+      throw new EffectDeniedError('message ID is not a LINE int64');
+    }
+    await this.#gate.invokeRpc({ phase: 'MANUAL_SEND', lease }, () => this.#base.talk.unsendMessage({ messageId }));
   }
   async checkFriendRelation(targetMid: string, lease: ControlLease, signal: RelationCancellation = { aborted: false }): Promise<FriendRelation> {
     return (await this.checkFriendRelationDiagnostic(targetMid, lease, signal)).status;
@@ -1170,6 +1371,12 @@ export class LinejsAdapter implements LineTransport {
     } finally { this.#activeRelationAdd = undefined; }
   }
   revoke(): void { this.#revoked = true; this.#adoptedObsToken = null; }
+  #clearChatResourceTokens(): void {
+    const timeline = this.#base.timeline as unknown as { timelineToken?: string; timelineHeaders: Record<string, string | undefined> };
+    delete timeline.timelineToken;
+    timeline.timelineHeaders = {};
+    this.#base.moa.clearAlbumChannelToken();
+  }
   #readContext(): { phase: 'CONTROL_READ'; lease: ControlLease } | { phase: 'MONITOR_READ' } {
     return this.#options.mode === 'ACTIVE_CONTROL' && !this.#revoked
       ? { phase: 'CONTROL_READ', lease: this.#lease() } : { phase: 'MONITOR_READ' };

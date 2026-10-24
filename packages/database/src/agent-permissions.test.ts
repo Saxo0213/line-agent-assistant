@@ -308,6 +308,24 @@ database('Agent permissions, chat folders and folder links', () => {
     await clearRules();
   });
 
+  it('resolves login job permissions from the captured sender before the source message exists', async () => {
+    await clearRules();
+    await set({ kind: 'USER', mid: 'user-a' }, 'chat_folder.read', 'ALLOW', 0);
+    const jobId = randomUUID();
+    const sourceMessageId = `not-yet-stored-${randomUUID()}`;
+    await pool.query(`INSERT INTO agent_jobs (job_id,account_id,chat_type,chat_id,provider,source_type,source_message_id,
+      source_sender_id,prompt,workspace_path,generation,creation_epoch,status,direct_friend_grant_id,direct_friend_grant_version)
+      VALUES ($1,$2,'group','g1','codex','line',$3,'user-a','direct envelope prompt','C:\\workspace',1,1,'queued',$4,$5)`,
+    [jobId, ACCOUNT, sourceMessageId, grants.get('user-a')!.grantId, grants.get('user-a')!.version]);
+    const policy = await resolveJobPolicy(pool, jobId);
+    expect(policy?.principal).toEqual({ kind: 'user', senderMid: 'user-a' });
+    expect(policy?.permissions['chat_folder.read']).toBe('ALLOW');
+    expect((await pool.query('SELECT 1 FROM messages WHERE account_id=$1 AND message_id=$2', [ACCOUNT, sourceMessageId])).rowCount).toBe(0);
+    await set({ kind: 'USER', mid: 'user-a' }, 'chat_folder.read', 'DENY', await current('user-a', 'chat_folder.read'));
+    expect((await resolveJobPolicy(pool, jobId))?.permissions['chat_folder.read']).toBe('DENY');
+    await clearRules();
+  });
+
   it('stores execution policy defaults, applies optimistic versioning, and accepts only valid tool allowlist values', async () => {
     expect(await repo.getExecutionPolicy()).toMatchObject({ level: 'full', approvalTimeoutSeconds: 180, timeoutAction: 'DENY', version: 1 });
     await pool.query('INSERT INTO agent_execution_policy (singleton) VALUES (true) ON CONFLICT (singleton) DO NOTHING');

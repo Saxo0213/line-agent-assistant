@@ -9,9 +9,42 @@ import { LocaleProvider, type LocaleState } from '../locale-context.js';
 import { readFileSync } from 'node:fs';
 import { URL as NodeURL } from 'node:url';
 import { LineLogin } from './LineLogin.js';
+import { accountAvatarRefreshed, LineMediaImage } from '../LineMediaImage.js';
 import { extraTextFor } from '../desktop-i18n.js';
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+
+it('reloads the connected account avatar after a successful explicit refresh', async () => {
+  const account = { ...buildAdmin(), status: 'connected' as const };
+  const ownMid = `u${'e'.repeat(32)}`;
+  const listeners: ((event: IpcEvent) => void)[] = [];
+  const refreshLineAvatar = vi.fn(async () => ({ ...accepted, ownMid }));
+  const api = { refreshLineAvatar, onEvent: vi.fn((listener: (event: IpcEvent) => void) => {
+    listeners.push(listener);
+    return () => { listeners.splice(listeners.indexOf(listener), 1); };
+  }) } as unknown as DesktopApi;
+  function AvatarEventHost() {
+    React.useEffect(() => api.onEvent((event) => {
+      if (event.type === 'lineAvatarRefreshed') accountAvatarRefreshed(event.accountId, event.ownMid);
+    }), []);
+    return null;
+  }
+  const view = render(<><LineMediaImage enabled target={{ type: 'account', accountId: account.accountId }} fallbackKind="person" className="avatar" alt="account" />
+    <LineMediaImage enabled target={{ type: 'conversation', accountId: account.accountId, chatType: 'direct', chatId: ownMid }} fallbackKind="person" className="avatar" alt="own direct chat" />
+    <LineMediaImage enabled target={{ type: 'conversation', accountId: account.accountId, chatType: 'direct', chatId: 'u-peer' }} fallbackKind="person" className="avatar" alt="peer direct chat" />
+    <LineLogin api={api} accounts={[account]} headingRef={React.createRef()} /><AvatarEventHost /></>);
+  const beforeAccount = screen.getByAltText('account');
+  const beforeOwn = screen.getByAltText('own direct chat');
+  const beforePeer = screen.getByAltText('peer direct chat');
+  fireEvent.click(screen.getByRole('button', { name: '更新頭像' }));
+  await waitFor(() => expect(refreshLineAvatar).toHaveBeenCalledWith(account.accountId));
+  act(() => listeners.forEach((listener) => listener({ type: 'lineAvatarRefreshed', accountId: account.accountId, ownMid })));
+  await waitFor(() => expect(screen.getByAltText('account')).not.toBe(beforeAccount));
+  expect(screen.getByAltText('account').getAttribute('src')).toBe(beforeAccount.getAttribute('src'));
+  await waitFor(() => expect(screen.getByAltText('own direct chat')).not.toBe(beforeOwn));
+  expect(screen.getByAltText('own direct chat').getAttribute('src')).toBe(beforeOwn.getAttribute('src'));
+  expect(screen.getByAltText('peer direct chat')).toBe(beforePeer);
+});
 
 function render(ui: React.ReactElement, locale: LocaleState['effectiveLocale'] = 'zh-TW') {
   const state: LocaleState = { status: 'loaded', effectiveLocale: locale, preference: locale, busy: false, error: null,
@@ -297,18 +330,14 @@ describe('inline account action status', () => {
 
 
 const accepted: IpcResult = { type: 'accepted', requestId: 'x', ok: true };
-const blocked = (detail: 'same_account' | 'unknown'): IpcResult => ({ type: 'error', requestId: 'x', ok: false,
-  code: 'OFFICIAL_LINE_SESSION_ACTIVE', message: 'blocked', retryable: false, detail });
-const SAME = 'LINE 目前正以此帳號登入，繼續將使 LINE 被登出。要繼續嗎？';
-const UNKNOWN = 'LINE 正在執行，無法確認登入的帳號。若為同一帳號，繼續將使 LINE 被登出。要繼續嗎？';
 
 const agent = { accountId: 'account-A', displayName: '工作', status: 'disconnected', lastSyncedAt: null, mode: 'ACTIVE_CONTROL',
   productRole: 'AGENT', canSendManually: true } as unknown as LineAccountSummary;
 
-function setup(first: IpcResult) {
-  const lineLoginQr = vi.fn(async (_id: string, options?: { confirmOfficialLogout?: boolean }) => options?.confirmOfficialLogout ? accepted : first);
-  const lineStart = vi.fn(async (_id: string, options?: { confirmOfficialLogout?: boolean }) => options?.confirmOfficialLogout ? accepted : first);
-  const lineAddAccountQr = vi.fn(async (options?: { confirmOfficialLogout?: boolean }) => options?.confirmOfficialLogout ? accepted : first);
+function setup() {
+  const lineLoginQr = vi.fn(async () => accepted);
+  const lineStart = vi.fn(async () => accepted);
+  const lineAddAccountQr = vi.fn(async () => accepted);
   const notices: string[] = [];
   const api = { lineLoginQr, lineStart, lineAddAccountQr } as unknown as DesktopApi;
   const view = (accounts: LineAccountSummary[]) => render(<LineLogin api={api} accounts={accounts}
@@ -316,124 +345,28 @@ function setup(first: IpcResult) {
   return { lineLoginQr, lineStart, lineAddAccountQr, notices, view };
 }
 
-describe('LineLogin official LINE confirmation', () => {
-  for (const [detail, text] of [['same_account', SAME], ['unknown', UNKNOWN]] as const) {
-    it(`asks with the ${detail} text and resends the login with the flag on confirm`, async () => {
-      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
-      const { lineLoginQr, view } = setup(blocked(detail));
-      view([agent]);
-      fireEvent.click(screen.getByRole('button', { name: '登入 工作' }));
-      await waitFor(() => expect(lineLoginQr).toHaveBeenCalledTimes(2));
-      expect(confirm).toHaveBeenCalledWith(text);
-      expect(lineLoginQr).toHaveBeenNthCalledWith(1, 'account-A');
-      expect(lineLoginQr).toHaveBeenNthCalledWith(2, 'account-A', { confirmOfficialLogout: true });
-    });
-  }
-
-  it('sends nothing more when the user cancels', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false);
-    const { lineLoginQr, notices, view } = setup(blocked('same_account'));
-    view([agent]);
-    fireEvent.click(screen.getByRole('button', { name: '登入 工作' }));
-    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
-    await Promise.resolve();
-    expect(lineLoginQr).toHaveBeenCalledTimes(1);
-    expect(notices).toEqual([]);
-  });
-
-  it('does not prompt when the login is accepted', async () => {
+describe('LineLogin does not inspect or confirm the official LINE process', () => {
+  it('starts add, restart, and QR login directly with one request each', async () => {
     const confirm = vi.spyOn(window, 'confirm');
-    const { lineLoginQr, notices, view } = setup(accepted);
-    view([agent]);
-    fireEvent.click(screen.getByRole('button', { name: '登入 工作' }));
-    await waitFor(() => expect(notices).toEqual(['QR 重新登入流程已啟動。']));
+    const { lineLoginQr, lineStart, lineAddAccountQr, notices, view } = setup();
+    view([{ ...agent, status: 'connected' } as LineAccountSummary]);
+    fireEvent.click(screen.getByRole('button', { name: '重新登入 工作' }));
+    await waitFor(() => expect(lineLoginQr).toHaveBeenCalledOnce());
+    expect(lineLoginQr).toHaveBeenCalledWith('account-A');
     expect(confirm).not.toHaveBeenCalled();
-    expect(lineLoginQr).toHaveBeenCalledTimes(1);
-  });
-
-  describe('pending feedback', () => {
-    const CHECKING = '正在檢查 LINE 登入狀態…';
-    const STARTING = '正在啟動 LINE 登入…';
-    const deferred = () => { let resolve!: (value: IpcResult) => void; const promise = new Promise<IpcResult>((r) => { resolve = r; }); return { promise, resolve }; };
-    const renderWith = (lineLoginQr: DesktopApi['lineLoginQr']) => {
-      const notices: string[] = [];
-      render(<LineLogin api={{ lineLoginQr } as unknown as DesktopApi} accounts={[{ ...agent, status: 'connected' } as LineAccountSummary]}
-        headingRef={{ current: null }} onNotice={(message) => notices.push(message)} />);
-      return notices;
-    };
-
-    it('shows the checking status and disables the account buttons until the first call settles', async () => {
-      const first = deferred();
-      renderWith(vi.fn(() => first.promise) as unknown as DesktopApi['lineLoginQr']);
-      fireEvent.click(screen.getByRole('button', { name: '重新登入 工作' }));
-      expect(await screen.findByText(CHECKING)).toBeTruthy();
-      expect(screen.getAllByRole('status').some((element) => element.textContent === CHECKING)).toBe(true);
-      for (const name of ['重新登入 工作', '登出 工作']) expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(true);
-      expect((screen.getByRole('button', { name: '重新啟動' }) as HTMLButtonElement).disabled).toBe(true);
-      expect(screen.getByRole('button', { name: '重新登入 工作' }).textContent).toBe('檢查中…');
-      first.resolve(accepted);
-      await waitFor(() => expect(screen.queryByText(CHECKING)).toBeNull());
-      for (const name of ['重新登入 工作', '登出 工作']) expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(false);
-      expect(screen.getByRole('button', { name: '重新登入 工作' }).textContent).toBe('重新登入');
-    });
-
-    it('shows the starting status while the confirmed second call is pending', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
-      const second = deferred();
-      const lineLoginQr = vi.fn(async (_id: string, options?: { confirmOfficialLogout?: boolean }) => options?.confirmOfficialLogout ? await second.promise : blocked('same_account'));
-      renderWith(lineLoginQr as unknown as DesktopApi['lineLoginQr']);
-      fireEvent.click(screen.getByRole('button', { name: '重新登入 工作' }));
-      expect(await screen.findByText(STARTING)).toBeTruthy();
-      expect(screen.queryByText(CHECKING)).toBeNull();
-      expect((screen.getByRole('button', { name: '重新登入 工作' }) as HTMLButtonElement).disabled).toBe(true);
-      expect(screen.getByRole('button', { name: '重新登入 工作' }).textContent).toBe('重新登入');
-      second.resolve(accepted);
-      await waitFor(() => expect(screen.queryByText(STARTING)).toBeNull());
-    });
-
-    it('clears the pending state when the user cancels the confirm', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(false);
-      renderWith(vi.fn(async () => blocked('unknown')) as unknown as DesktopApi['lineLoginQr']);
-      fireEvent.click(screen.getByRole('button', { name: '重新登入 工作' }));
-      await waitFor(() => expect(window.confirm).toHaveBeenCalled());
-      await waitFor(() => expect(screen.queryByText(CHECKING)).toBeNull());
-      expect((screen.getByRole('button', { name: '重新登入 工作' }) as HTMLButtonElement).disabled).toBe(false);
-    });
-
-    it('keeps the login error in the overlay when the call rejects', async () => {
-      const notices = renderWith(vi.fn(async () => { throw new Error('boom'); }) as unknown as DesktopApi['lineLoginQr']);
-      fireEvent.click(screen.getByRole('button', { name: '重新登入 工作' }));
-      expect((await screen.findByRole('alert')).textContent).toContain('無法啟動 LINE 登入。');
-      expect(notices).toEqual([]);
-      expect(screen.queryByText(CHECKING)).toBeNull();
-      fireEvent.click(screen.getByRole('button', { name: '關閉' }));
-    });
-
-    it('shows the status in the vacant slot panel and disables its login buttons', async () => {
-      const first = deferred();
-      const lineAddAccountQr = vi.fn(() => first.promise);
-      render(<LineLogin api={{ lineAddAccountQr } as unknown as DesktopApi} accounts={[]} headingRef={{ current: null }} onNotice={() => undefined} />);
-      fireEvent.click(screen.getByRole('button', { name: '登入 Agent LINE 帳號' }));
-      expect(await screen.findByText(CHECKING)).toBeTruthy();
-      expect(screen.getByLabelText('Agent 帳號欄位').textContent).toContain(CHECKING);
-      expect((screen.getByRole('button', { name: '登入 Primary Admin LINE 帳號' }) as HTMLButtonElement).disabled).toBe(true);
-      first.resolve(accepted);
-      await waitFor(() => expect(screen.queryByText(CHECKING)).toBeNull());
-      expect((screen.getByRole('button', { name: '登入 Agent LINE 帳號' }) as HTMLButtonElement).disabled).toBe(false);
-    });
-  });
-
-  it('guards restart and add-account the same way', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    const restart = setup(blocked('unknown'));
-    restart.view([{ ...agent, status: 'connected' } as LineAccountSummary]);
-    fireEvent.click(screen.getByRole('button', { name: '重新啟動' }));
-    await waitFor(() => expect(restart.lineStart).toHaveBeenCalledWith('account-A', { confirmOfficialLogout: true }));
     cleanup();
-    const add = setup(blocked('unknown'));
-    add.view([]);
+    view([{ ...agent, status: 'connected' } as LineAccountSummary]);
+    fireEvent.click(screen.getByRole('button', { name: '重新啟動' }));
+    await waitFor(() => expect(lineStart).toHaveBeenCalledOnce());
+    expect(lineStart).toHaveBeenCalledWith('account-A');
+    expect(confirm).not.toHaveBeenCalled();
+    cleanup();
+    view([]);
     fireEvent.click(screen.getByRole('button', { name: '登入 Agent LINE 帳號' }));
-    await waitFor(() => expect(add.lineAddAccountQr).toHaveBeenCalledWith({ confirmOfficialLogout: true }));
+    await waitFor(() => expect(lineAddAccountQr).toHaveBeenCalledOnce());
+    expect(lineAddAccountQr).toHaveBeenCalledWith();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(notices.length).toBeGreaterThan(0);
   });
 });
 

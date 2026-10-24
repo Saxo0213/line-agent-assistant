@@ -1,6 +1,7 @@
 import { DatabaseSetupRequestSchema, DatabaseSetupResultSchema, type DatabaseSetupResult, type EmbeddedConnectionInfo } from '../setup-protocol.js';
 import type { DatabaseSetupService } from './services/database-setup.js';
 import { EMBEDDED_PG_MESSAGES, isEmbeddedPgError } from './services/embedded-postgres/errors.js';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 
 /** Main-side owner of the embedded PostgreSQL wizard flow; progress events are pushed by its implementation. */
 export type EmbeddedSetupPort = { start(): Promise<void>; cancel(): void; connectionInfo(): Promise<EmbeddedConnectionInfo>;
@@ -33,19 +34,8 @@ export function createSetupCutover(options: { isConnected(): boolean; fence(): v
   };
 }
 
-export async function restartAfterShutdown(shutdown: () => Promise<void>, relaunch: () => void,
-  exit: (code: number) => void, timeoutMs = 30_000): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([shutdown(), new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new Error('Application shutdown timed out')), timeoutMs);
-    })]);
-  } finally { if (timer) clearTimeout(timer); }
-  relaunch();
-  exit(0);
-}
-
 export function createSetupAdapter(options: { webContentsId: number; rendererUrl: string; setup: DatabaseSetupService;
+  onDiagnostic?: (diagnostic: SafeDiagnostic) => void;
   chooseAttachmentRoot(): Promise<string | null>; chooseAgentWorkspace(): Promise<string | null>; restartApplication(): Promise<void> | void;
   runSetupSave?: (save: () => Promise<void>) => Promise<void>; attachmentRootChange?: AttachmentRootChange; embedded?: EmbeddedSetupPort }) {
   return async (sender: Sender, payload: unknown): Promise<DatabaseSetupResult> => {
@@ -99,17 +89,17 @@ export function createSetupAdapter(options: { webContentsId: number; rendererUrl
       }
       return DatabaseSetupResultSchema.parse(result);
     } catch (cause) {
+      try { options.onDiagnostic?.(diagnosticFailure('database', 'prepare', cause)); } catch { /* Setup result remains authoritative. */ }
       if (isEmbeddedPgError(cause)) return { type: 'error', requestId, ok: false, message: EMBEDDED_PG_MESSAGES[cause.code], errorCode: cause.code };
       const code = typeof cause === 'object' && cause !== null && 'code' in cause ? String(cause.code) : '';
-      if (code === 'INVALID_WORKSPACE' && cause instanceof Error) return error(cause.message);
-      if (cause instanceof Error && /Attachment|attachment/.test(cause.message)) return error(cause.message, request.type === 'moveAttachmentRoot');
+      if (code === 'INVALID_WORKSPACE') return error('Select an existing absolute workspace directory in Settings → Agent.');
       if (code === '28P01') return error('PostgreSQL 帳號或密碼錯誤。');
       if (code === '3D000') return error('指定的資料庫不存在。');
       if (code === '42P04') return error('同名資料庫已存在，請重新讀取清單。');
       if (code === 'ECONNREFUSED') return error('無法連線 PostgreSQL，請確認主機、Port 與服務狀態。');
       if (cause instanceof Error && cause.message === 'Invalid database name') return error('資料庫名稱格式無效。');
       if (cause instanceof Error && cause.message === 'Managed folders must be absolute paths') return error('附件與 Agent 工作目錄必須是絕對路徑。');
-      return error(cause instanceof Error && /Attachment|attachment/.test(cause.message) ? cause.message : '資料庫操作失敗，請檢查連線設定與伺服器權限。', request.type === 'moveAttachmentRoot');
+      return error('資料庫操作失敗，請檢查連線設定與伺服器權限。', request.type === 'moveAttachmentRoot');
     }
   };
 }

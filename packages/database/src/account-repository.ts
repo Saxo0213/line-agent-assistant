@@ -1,5 +1,5 @@
-import { LOCAL_AGENT_ROOM_CHAT_ID, LOCAL_AGENT_ROOM_TITLE, type AccountMode, type WorkerBinding } from '@line-agent/contracts';
-import { randomUUID } from 'node:crypto';
+import { LOCAL_AGENT_ROOM_CHAT_ID, LOCAL_AGENT_ROOM_TITLE, TalkCursorV1Schema, type AccountMode, type WorkerBinding } from '@line-agent/contracts';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { normalizeNativePicturePath } from '@line-agent/contracts';
 import { transitionAgentJobStatus, type AgentJobStatusProjection } from './agent-repository.js';
@@ -276,6 +276,43 @@ export class AccountRepository {
       if (role.rows[0]!.product_role === 'AGENT' && !await this.bindPendingSlotAdmin(client, binding.accountId, ownMid, slot)) {
         await client.query('ROLLBACK'); return false;
       }
+      const sourceMode = await client.query<{ connection_mode: string; source_id: string | null;
+        generation: string | null; source_type: string | null; source_state: string | null }>(
+        `SELECT a.connection_mode,a.selected_source_id AS source_id,a.selected_source_generation AS generation,
+          s.source_type,s.state AS source_state FROM line_accounts a LEFT JOIN line_account_sources s
+            ON s.account_id=a.account_id AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
+         WHERE a.account_id=$1 FOR UPDATE OF a`, [binding.accountId]);
+      const selected = sourceMode.rows[0];
+      if (!selected || selected.connection_mode !== 'SYSTEM_LOGIN'
+        || (selected.source_id !== null && (selected.source_type !== 'SYSTEM_LOGIN' || selected.source_state !== 'ACTIVE'))) {
+        await client.query('ROLLBACK'); return false;
+      }
+      if (selected.source_id === null) {
+        const generation = await client.query<{ generation: string }>(
+          `SELECT COALESCE(max(generation),0)+1 AS generation FROM line_account_sources
+           WHERE account_id=$1 AND source_type='SYSTEM_LOGIN'`, [binding.accountId]);
+        const sourceId = randomUUID();
+        const identityDigest = createHash('sha256').update(`${binding.accountId}\0${ownMid}`, 'utf8').digest('hex');
+        await client.query(`INSERT INTO line_account_sources(source_id,account_id,source_type,generation,identity_digest,
+            verified_account_mid,state,read_capability,write_capability)
+          VALUES ($1,$2,'SYSTEM_LOGIN',$3,$4,$5,'ACTIVE',true,true)`,
+        [sourceId, binding.accountId, generation.rows[0]!.generation, identityDigest, ownMid]);
+        const checkpoint = await client.query<{ cursor: unknown }>(
+          "SELECT cursor FROM sync_cursors WHERE account_id=$1 AND source='live'", [binding.accountId]);
+        const previousCursor = checkpoint.rows[0]?.cursor;
+        let cursor = { version: 1 as const, revision: '0', globalRev: '0', individualRev: '0' };
+        if (previousCursor) {
+          try {
+            const parsed = TalkCursorV1Schema.safeParse(typeof previousCursor === 'string' ? JSON.parse(previousCursor) : previousCursor);
+            if (parsed.success) cursor = parsed.data;
+          } catch { /* legacy per-message cursors are opaque and start a fresh source checkpoint */ }
+        }
+        await client.query(`INSERT INTO external_source_checkpoints(source_id,account_id,generation,cursor)
+          VALUES ($1,$2,$3,$4::jsonb)`, [sourceId, binding.accountId, generation.rows[0]!.generation, JSON.stringify(cursor)]);
+        await client.query(`UPDATE line_accounts SET selected_source_id=$2,selected_source_generation=$3
+          WHERE account_id=$1 AND connection_mode='SYSTEM_LOGIN' AND selected_source_id IS NULL`,
+        [binding.accountId, sourceId, generation.rows[0]!.generation]);
+      }
       if (await commitCredentials?.() === false) { await client.query('ROLLBACK'); return false; }
       await client.query('COMMIT');
       return true;
@@ -289,6 +326,35 @@ export class AccountRepository {
        last_synced_at=CASE WHEN $3='connected' THEN now() ELSE last_synced_at END, updated_at=now()
        WHERE account_id=$1 AND worker_instance_id=$2 AND worker_binding_epoch=$4 AND mode <> 'PAUSED'`,
       [binding.accountId, binding.workerInstanceId, status, binding.controlEpoch],
+    );
+    return result.rowCount === 1;
+  }
+
+  async refreshWorkerAvatar(binding: WorkerBinding, ownMid: string, displayName: string | null, picturePath?: string | null): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE line_accounts a SET display_name=COALESCE($4,a.display_name),
+         picture_path=CASE WHEN $5::boolean THEN $6 ELSE a.picture_path END, updated_at=now()
+       WHERE a.account_id=$1 AND a.worker_instance_id=$2 AND a.worker_binding_epoch=$3
+         AND a.own_mid=$7 AND a.status='connected' AND a.mode <> 'PAUSED'
+         AND (a.selected_source_id IS NULL OR EXISTS (
+           SELECT 1 FROM line_account_sources s WHERE s.account_id=a.account_id
+             AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
+             AND s.source_type='SYSTEM_LOGIN' AND s.state='ACTIVE'))`,
+      [binding.accountId, binding.workerInstanceId, binding.controlEpoch, displayName,
+        picturePath !== undefined, picturePath ?? null, ownMid],
+    );
+    return result.rowCount === 1;
+  }
+
+  async canRefreshWorkerAvatar(binding: WorkerBinding, ownMid: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1 FROM line_accounts a WHERE a.account_id=$1 AND a.worker_instance_id=$2 AND a.worker_binding_epoch=$3
+         AND a.own_mid=$4 AND a.status='connected' AND a.mode <> 'PAUSED'
+         AND (a.selected_source_id IS NULL OR EXISTS (
+           SELECT 1 FROM line_account_sources s WHERE s.account_id=a.account_id
+             AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
+             AND s.source_type='SYSTEM_LOGIN' AND s.state='ACTIVE'))`,
+      [binding.accountId, binding.workerInstanceId, binding.controlEpoch, ownMid],
     );
     return result.rowCount === 1;
   }

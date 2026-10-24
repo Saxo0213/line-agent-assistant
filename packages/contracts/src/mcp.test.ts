@@ -32,12 +32,24 @@ describe('MCP contracts and IPC schemas', () => {
       'list_targets',
       'query_target_messages',
       'query_target_messages_by_time',
+      'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album',
     ]);
     expect(McpToolNameSchema.safeParse('send_text').success).toBe(false);
   });
   it('classifies every MCP tool as read or effect', () => {
     expect(Object.keys(MCP_TOOL_EFFECTS).sort()).toEqual([...MCP_TOOL_NAMES].sort());
     for (const tool of MCP_TOOL_NAMES) expect(MCP_TOOL_EFFECTS[tool]).toBe('read');
+  });
+
+  it('requires explicit account and stable conversation selectors for archived Note and Album tools', () => {
+    for (const name of ['list_chat_notes', 'list_chat_albums'] as const) {
+      expect(McpToolInputUnionSchema.safeParse({ name, arguments: { accountId: 'acc', chatType: 'group', chatId: 'chat', limit: 50 } }).success).toBe(true);
+      expect(McpToolInputUnionSchema.safeParse({ name, arguments: { chatType: 'group', chatId: 'chat' } }).success).toBe(false);
+      expect(McpToolInputUnionSchema.safeParse({ name, arguments: { accountId: 'acc', chatType: 'group', chatId: 'chat', limit: 51 } }).success).toBe(false);
+    }
+    expect(McpToolInputUnionSchema.safeParse({ name: 'get_chat_note', arguments: { accountId: 'acc', chatType: 'group', chatId: 'chat', noteId: 'post-1' } }).success).toBe(true);
+    expect(McpToolInputUnionSchema.safeParse({ name: 'get_chat_album', arguments: { accountId: 'acc', chatType: 'group', chatId: 'chat', albumId: 'album-1' } }).success).toBe(true);
+    expect(McpToolInputUnionSchema.safeParse({ name: 'list_chat_albums', arguments: { accountId: 'acc', chatType: 'community', chatId: 'chat' } }).success).toBe(false);
   });
 
   it('validates non-secret MCP token summary and server status schemas', () => {

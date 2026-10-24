@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { LINE_CONTENT_TYPE_NUMBER_BY_NAME, lineContentKind, redactSensitiveText } from '@line-agent/contracts';
-import { CONTENT_BRIDGE_RULES, bridgeKindFor, bridgeLiveMessage, bridgeNativeEnvelope, bridgeRuleFor, nativeChatEventMids, contentTypeAliases, remapSticonRangesForDisplay, sticonRangesFromNativeEnvelope, MAX_METADATA_BYTES } from './index.js';
+import { CONTENT_BRIDGE_RULES, bridgeKindFor, bridgeLiveMessage, bridgeNativeEnvelope, bridgeRuleFor, liveChatEventMids, nativeChatEventMids, contentTypeAliases, postNotificationSubtypeFromRaw, remapSticonRangesForDisplay, sticonRangesFromNativeEnvelope, MAX_METADATA_BYTES } from './index.js';
 import { dpapiEnvelope, plainEnvelope } from './test-support.js';
 
 const metadata = (value: Record<string, unknown>) => JSON.stringify(value);
@@ -9,6 +9,38 @@ const live = (message: Record<string, unknown>, contact?: { mid: string; display
   bridgeLiveMessage({ raw: { revision: 1, message: { id: 'm1', ...message } }, ...(contact ? { contact } : {}) });
 
 describe('content bridge rules', () => {
+  it('classifies only stored type-16 live and plain native service tokens', () => {
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: { serviceType: 'GB' } } })).toBe('note');
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: { serviceType: 'AB' } } })).toBe('album');
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: { serviceType: 'gb' } } })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 1, contentMetadata: { serviceType: 'GB' } } })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: { serviceType: 'OTHER' } } })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 'POSTNOTIFICATION', contentMetadata: { serviceType: 'GB' } }, unrelated: 'x'.repeat(1_000_000) })).toBe('note');
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: '{"serviceType":"GB"}' } })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ sourceDeleted: true, message: { contentType: 16, contentMetadata: { serviceType: 'GB' } } })).toBeNull();
+    const nativeEnvelope = plainEnvelope({ _id: 'post', _contentType: 16, _contentMetadata: '{"serviceType":"AB"}' });
+    expect(postNotificationSubtypeFromRaw({ native: nativeEnvelope })).toBe('album');
+    expect(postNotificationSubtypeFromRaw({ native: plainEnvelope({ _id: 'post-note', _contentType: 16, _contentMetadata: '{"serviceType":"GB"}' }),
+      unrelated: 'x'.repeat(1_000_000) })).toBe('note');
+    expect(postNotificationSubtypeFromRaw({ native: plainEnvelope({ _id: 'bad-meta', _contentType: 16, _contentMetadata: '{bad' }) })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ native: { ...nativeEnvelope, encoding: 'dpapi' } })).toBeNull();
+  });
+  it('uses native history subtype when sanitized raw also has a metadata-free message projection', () => {
+    for (const [serviceType, expected] of [['AB', 'album'], ['GB', 'note']] as const) {
+      const row = { message: { id: 'sanitized-id', contentType: 16 },
+        native: plainEnvelope({ _id: 'native-id', _contentType: 16, _contentMetadata: JSON.stringify({ serviceType }) }) };
+      expect(postNotificationSubtypeFromRaw(row)).toBe(expected);
+    }
+  });
+  it('keeps native history subtype within source, state, type, and metadata boundaries', () => {
+    const native = plainEnvelope({ _id: 'native-id', _contentType: 16, _contentMetadata: '{"serviceType":"GB"}' });
+    expect(postNotificationSubtypeFromRaw({ sourceDeleted: true, message: { contentType: 16 }, native })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ contentState: 'decrypt_failed', message: { contentType: 16 }, native })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16, contentMetadata: { serviceType: 'GB' } },
+      native: plainEnvelope({ _id: 'tampered-type', _contentType: 1, _contentMetadata: '{"serviceType":"GB"}' }) })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16 }, native: plainEnvelope({ _id: 'bad', _contentType: 16, _contentMetadata: '{bad' }) })).toBeNull();
+    expect(postNotificationSubtypeFromRaw({ message: { contentType: 16 }, native: plainEnvelope({ _id: 'large', _contentType: 16, _contentMetadata: ' '.repeat(MAX_METADATA_BYTES + 1) }) })).toBeNull();
+  });
   it('remaps sticons with redaction and drops overlapping ranges for native and live sources', () => {
     const rawText = 'LW-ABCDEFGH (pray) @Ada https://x.test (wave) RA-token';
     const ranges = [{ start: 12, end: 18, productId: 'p', sticonId: 's', animated: false },
@@ -146,6 +178,12 @@ describe('content bridge rules', () => {
       expect(nativeChatEventMids(envelope('C_MJ', A))).toEqual([A]);
       expect(nativeChatEventMids(envelope('UNKNOWN', A))).toEqual([]);
       expect(nativeChatEventMids(envelope('C_MI', 'bad'))).toEqual([]);
+    });
+    it('extracts live type-18 actor and target MIDs safely', () => {
+      const live = (locArgs: unknown) => ({ message: { contentType: 18, contentMetadata: { LOC_KEY: 'C_MI', LOC_ARGS: locArgs } } });
+      expect(liveChatEventMids(live(`${A}\u001e${B}`))).toEqual([A, B]);
+      expect(liveChatEventMids(live(`${A}\u001ebad`))).toEqual([]);
+      expect(liveChatEventMids({ message: { contentType: 18, contentMetadata: {} } })).toEqual([]);
     });
   });
 

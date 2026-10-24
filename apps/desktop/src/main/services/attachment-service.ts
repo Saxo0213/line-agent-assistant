@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { isWritableChatType, type AttachmentResult, type LineWorkerCommand, type NativeAttachmentDownloadInput, type WorkerBinding } from '@line-agent/contracts';
@@ -45,7 +46,7 @@ export class AttachmentService {
   constructor(private readonly messages: MessageRepository, private readonly worker: AttachmentWorker,
     private readonly root?: string, maxConcurrent = 4,
     private readonly onChanged?: (attachmentId: string) => void | Promise<void>,
-    private readonly onDispatcherError?: (error: unknown) => void,
+    private readonly onDispatcherError?: (error: unknown, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void,
     private readonly resolveNativeAttachment?: (attachment: Attachment, signal: AbortSignal) => Promise<NativeAttachmentDownloadInput | null>,
     private readonly isAccountConnected?: (accountId: string) => Promise<boolean>,
     private readonly random: () => number = Math.random) {
@@ -56,6 +57,10 @@ export class AttachmentService {
     if (!Number.isInteger(limit) || limit < 3 || limit > 10) throw new Error('Invalid automatic attachment attempt limit');
     this.automaticAttemptLimit = limit;
     void this.recover();
+  }
+
+  private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown, identity?: import('@line-agent/contracts').DiagnosticIdentity): void {
+    try { this.onDispatcherError?.(diagnosticFailure('attachment', stage, error), identity); } catch { /* Diagnostics never change attachment state. */ }
   }
 
   private notifyChanged(attachmentId: string): void {
@@ -150,7 +155,9 @@ export class AttachmentService {
       return false;
     }
     this.notifyChanged(attachmentId);
+    const identity = { requestId: attachmentId, accountId: attachment.accountId, workerInstanceId: binding.workerInstanceId, correlationId: randomUUID() };
     let dispatched = false;
+    let stage: SafeDiagnostic['stage'] = 'prepare';
     try {
       const { mode: _mode, ...lease } = binding;
       let nativeAttachment: NativeAttachmentDownloadInput | null | undefined;
@@ -160,7 +167,7 @@ export class AttachmentService {
           return false;
         }
         try { nativeAttachment = await this.resolveNativeAttachment?.(attachment, signal) ?? null; }
-        catch { nativeAttachment = null; }
+        catch (error) { this.reportFailure('prepare', error, identity); nativeAttachment = null; }
       }
       if (this.externalSourceExpired(attachment)) {
         await this.messages.cancelAttachmentDownloadBeforeDispatch(attempt, attachment).catch(() => false);
@@ -181,11 +188,14 @@ export class AttachmentService {
         return false;
       }
       dispatched = true;
+      stage = 'download';
       const result: AttachmentResult = await this.worker.download(command, signal);
+      stage = 'persist';
       if (this.closed) return false;
       if (result.attachmentId !== attachmentId || result.attemptToken !== attemptToken || result.workerInstanceId !== binding.workerInstanceId
         || result.accountId !== attachment.accountId || result.chatType !== attachment.chatType
         || result.chatId !== attachment.chatId) {
+        this.reportFailure('response', undefined, identity);
         await this.messages.markAttachmentFailed(attempt, 'Mismatched worker attachment result', this.automaticAttemptLimit);
         this.notifyChanged(attachmentId); return false;
       }
@@ -199,9 +209,11 @@ export class AttachmentService {
       }
       if (result.status === 'expired') await this.messages.markAttachmentExpired(attempt, result.error);
       else await this.messages.markAttachmentFailed(attempt, result.error, this.automaticAttemptLimit);
+      this.reportFailure('download', undefined, identity);
       this.notifyChanged(attachmentId);
       return false;
-    } catch {
+    } catch (error) {
+      if (!signal.aborted && !this.closed) this.reportFailure(stage, error, identity);
       if (this.closed) return false;
       if (!dispatched) await this.messages.cancelAttachmentDownloadBeforeDispatch(attempt, attachment).catch(() => false);
       else if (signal.aborted) await this.messages.cancelAttachmentDownload(attempt, this.automaticAttemptLimit).catch(() => false);

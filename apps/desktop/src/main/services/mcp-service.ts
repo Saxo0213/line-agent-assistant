@@ -5,11 +5,13 @@ import {
   ChatTypeSchema,
   McpAgentRoomHistoryOutputSchema,
   MCP_TOOL_PERMISSIONS,
+  McpToolOutputUnionSchema,
   McpToolInputUnionSchema,
   type EffectivePermissions,
   McpToolNameSchema,
   normalizeMcpTimeBound,
   type ConversationKey,
+  type WorkerBinding,
   type McpMessageRecord,
   type McpServerStatus,
   type McpTokenSummary,
@@ -35,11 +37,14 @@ import {
 } from './internal-mcp-capabilities.js';
 import type { AgentApprovalBroker } from './agent-approval-broker.js';
 import type { AgentLineSendHandler } from './agent-line-send-service.js';
+import type { McpChatResourceReader } from './mcp-chat-resource-reader.js';
+import type { SafeDiagnostic } from '@line-agent/contracts';
 
 export const MAX_CONCURRENT_MCP_REQUESTS = 8;
 export const DEFAULT_MCP_RATE_LIMIT_PER_MINUTE = 60;
 const MAX_TRACKED_TOKEN_BUCKETS = 256;
 const RATE_LIMIT_WINDOW_MS = 60_000;
+const MAX_CHAT_RESOURCE_RESPONSE_BYTES = 512 * 1024;
 
 export function redactMcpSensitiveText(value: string | null): string | null {
   if (value === null) return null;
@@ -127,6 +132,22 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         limit: { type: 'integer', minimum: 1, maximum: 200, default: 50 },
       },
     },
+  },
+  {
+    name: 'list_chat_notes', description: 'List saved Note archives for an explicitly selected conversation.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, cursor: { type: 'string', maxLength: 512 } }, required: ['accountId', 'chatType', 'chatId'] },
+  },
+  {
+    name: 'get_chat_note', description: 'Read one saved Note archive by its stable post ID.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, noteId: { type: 'string' } }, required: ['accountId', 'chatType', 'chatId', 'noteId'] },
+  },
+  {
+    name: 'list_chat_albums', description: 'List saved Album archives for an explicitly selected conversation.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, cursor: { type: 'string', maxLength: 512 } }, required: ['accountId', 'chatType', 'chatId'] },
+  },
+  {
+    name: 'get_chat_album', description: 'Read one saved Album archive by its stable album ID, with bounded photo metadata and image availability. Image bytes are not returned.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, albumId: { type: 'string' } }, required: ['accountId', 'chatType', 'chatId', 'albumId'] },
   },
 ];
 
@@ -218,6 +239,7 @@ export function numberMcpTargets<T extends {
 }
 
 export interface McpServiceOptions {
+  onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void;
   pool: Pool;
   tokens: McpTokenRepository;
   messages: MessageRepository;
@@ -231,6 +253,9 @@ export interface McpServiceOptions {
   approvalBroker?: Pick<AgentApprovalBroker, 'request'>;
   /** Agent LINE send behind list_send_targets / send_to_target; absent means the tools are never offered. */
   lineSend?: AgentLineSendHandler;
+  chatResources?: McpChatResourceReader;
+  /** Returns the current authenticated LOGIN binding; archive queries fail closed when absent. */
+  getLiveLoginBinding?: (accountId: string) => Promise<WorkerBinding | null>;
 }
 
 /**
@@ -257,6 +282,30 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> => {
   const prototype = Object.getPrototypeOf(value) as unknown;
   return prototype === Object.prototype || prototype === null;
 };
+function safeArchiveTimestamp(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value)) || value.length > 64) throw new Error('Archived resource timestamp is malformed.');
+  return value;
+}
+function safeArchiveCursor(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string' || value.length > 512) throw new Error('Archived resource cursor is malformed.');
+  return value;
+}
+function safeAlbumMetadata(value: unknown, chatId: string): Record<string, unknown> {
+  if (!isPlainObject(value) || typeof value.albumId !== 'string' || value.albumId.length > 256 || value.chatId !== chatId
+    || (value.title !== null && (typeof value.title !== 'string' || Buffer.byteLength(value.title, 'utf8') > 20_000))
+    || (value.photoCount !== null && (!Number.isInteger(value.photoCount) || Number(value.photoCount) < 0 || Number(value.photoCount) > 100_000))) {
+    throw new Error('Archived Album is malformed.');
+  }
+  return { albumId: value.albumId, chatId, title: value.title, photoCount: value.photoCount,
+    createTime: safeArchiveNumber(value.createTime), updateTime: safeArchiveNumber(value.updateTime) };
+}
+function safeArchiveNumber(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error('Archived resource metadata is malformed.');
+  return value;
+}
 
 const SUPPORTED_MCP_PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'] as const;
 export function negotiateMcpProtocol(requested: unknown): string {
@@ -367,6 +416,7 @@ export class McpService {
     conversationScope?: ConversationKey,
     ownLineNamesOnly = false,
     extraConversationScopes: ReadonlyArray<Pick<ConversationKey, 'chatType' | 'chatId'>> = [],
+    signal?: AbortSignal,
   ): Promise<{ output: McpToolOutputUnion; resultCount: number }> {
     const scopeFilter = {
       ...(conversationScope ? { conversationScope } : {}),
@@ -412,6 +462,77 @@ export class McpService {
         output: { toolName: 'query_target_messages', messages },
         resultCount: messages.length,
       };
+    }
+
+    if (tool.name === 'list_chat_notes' || tool.name === 'list_chat_albums' || tool.name === 'get_chat_note' || tool.name === 'get_chat_album') {
+      const args = tool.arguments as { accountId: string; chatType: ConversationKey['chatType']; chatId: string; limit?: number; cursor?: string; noteId?: string; albumId?: string };
+      const key: ConversationKey = { accountId: args.accountId, chatType: args.chatType, chatId: args.chatId };
+      if (!authorizedAccountIds.includes(key.accountId)) throw new McpDomainError('SCOPE_DENIED', 'The requested conversation is unavailable.');
+      const visible = !conversationScope || (conversationScope.chatType === key.chatType && conversationScope.chatId === key.chatId)
+        || extraConversationScopes.some((scope) => scope.chatType === key.chatType && scope.chatId === key.chatId);
+      if (!visible) throw new McpDomainError('SCOPE_DENIED', 'The requested conversation is unavailable.');
+      if (!this.options.getLiveLoginBinding) throw new McpDomainError('SCOPE_DENIED', 'The requested conversation is unavailable.');
+      const initialBinding = await this.options.getLiveLoginBinding(key.accountId);
+      if (!initialBinding || initialBinding.accountId !== key.accountId) throw new McpDomainError('SCOPE_DENIED', 'The requested conversation is unavailable.');
+      const exists = await client.query('SELECT 1 FROM conversations WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 LIMIT 1', [key.accountId, key.chatType, key.chatId]);
+      if (exists.rowCount !== 1) throw new McpDomainError('SCOPE_DENIED', 'The requested conversation is unavailable.');
+      if (!this.options.chatResources) throw new McpDomainError('RATE_LIMITED', 'Archived chat resources are unavailable.');
+      const readArchive = async <T>(operation: Promise<T>): Promise<T> => {
+        try { return await operation; }
+        catch (error) {
+          if (signal?.aborted) throw signal.reason ?? error;
+          throw new McpDomainError('INVALID_INPUT', 'Saved chat resources are unavailable or malformed.');
+        }
+      };
+      let output: McpToolOutputUnion;
+      if (tool.name === 'list_chat_notes') {
+        const result = await readArchive(this.options.chatResources.listNotes(key, (tool.arguments as Extract<McpToolInputUnion, { name: 'list_chat_notes' }>['arguments']).limit ?? 20,
+          (tool.arguments as Extract<McpToolInputUnion, { name: 'list_chat_notes' }>['arguments']).cursor, signal));
+        if (!Array.isArray(result.notes) || result.notes.length > 50 || result.notes.some((row) => !isPlainObject(row) || typeof row.noteId !== 'string' || row.noteId.length > 256)) throw new Error('Archived Note list is malformed.');
+        output = McpToolOutputUnionSchema.parse({ toolName: tool.name, ...key, notes: result.notes.map((row) => ({ noteId: (row as Record<string, unknown>).noteId as string,
+          savedAt: safeArchiveTimestamp((row as Record<string, unknown>).savedAt) })), nextCursor: safeArchiveCursor(result.nextCursor), savedAt: safeArchiveTimestamp(result.savedAt) });
+      } else if (tool.name === 'get_chat_note') {
+        const result = await readArchive(this.options.chatResources.getNote(key, (tool.arguments as Extract<McpToolInputUnion, { name: 'get_chat_note' }>['arguments']).noteId, signal));
+        const note = result.note;
+        if (note !== null && (!isPlainObject(note) || note.noteId !== args.noteId || typeof note.markdown !== 'string' || Buffer.byteLength(note.markdown, 'utf8') > 384 * 1024)) throw new Error('Archived Note is malformed or oversized.');
+        const noteRecord = note as Record<string, unknown> | null;
+        output = McpToolOutputUnionSchema.parse({ toolName: tool.name, ...key, note: noteRecord === null ? null : { noteId: args.noteId, markdown: noteRecord.markdown,
+          savedAt: safeArchiveTimestamp(noteRecord.savedAt) }, savedAt: safeArchiveTimestamp(result.savedAt) });
+      } else if (tool.name === 'list_chat_albums') {
+        const result = await readArchive(this.options.chatResources.listAlbums(key, (tool.arguments as Extract<McpToolInputUnion, { name: 'list_chat_albums' }>['arguments']).limit ?? 20,
+          (tool.arguments as Extract<McpToolInputUnion, { name: 'list_chat_albums' }>['arguments']).cursor, signal));
+        if (!Array.isArray(result.albums) || result.albums.length > 50) throw new Error('Archived Album list is malformed.');
+        output = McpToolOutputUnionSchema.parse({ toolName: tool.name, ...key, albums: result.albums.map((row) => safeAlbumMetadata(row, key.chatId)), nextCursor: safeArchiveCursor(result.nextCursor), savedAt: safeArchiveTimestamp(result.savedAt) });
+      } else {
+        const result = await readArchive(this.options.chatResources.getAlbum(key, (tool.arguments as Extract<McpToolInputUnion, { name: 'get_chat_album' }>['arguments']).albumId, signal));
+        const album = result.album === null ? null : safeAlbumMetadata(result.album, key.chatId);
+        if (album && album.albumId !== (tool.arguments as Extract<McpToolInputUnion, { name: 'get_chat_album' }>['arguments']).albumId) throw new Error('Archived Album ID does not match.');
+        if (!Array.isArray(result.photos) || result.photos.length > 50) throw new Error('Archived photo metadata is malformed.');
+        const photos = result.photos.map((photo) => {
+          if (!isPlainObject(photo) || typeof photo.photoId !== 'string' || photo.photoId.length > 256 || typeof photo.available !== 'boolean') throw new Error('Archived photo metadata is malformed.');
+          const optionalInteger = (value: unknown): number | null => {
+            if (value === null || value === undefined) return null;
+            if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error('Archived photo metadata is malformed.');
+            return value;
+          };
+          return { photoId: photo.photoId, shotTime: optionalInteger(photo.shotTime), width: optionalInteger(photo.width), height: optionalInteger(photo.height), available: photo.available };
+        });
+        output = McpToolOutputUnionSchema.parse({ toolName: tool.name, ...key, album, photos, savedAt: safeArchiveTimestamp(result.savedAt) });
+      }
+      if (signal?.aborted) throw signal.reason ?? new Error('MCP request cancelled.');
+      if (Buffer.byteLength(JSON.stringify(output), 'utf8') > MAX_CHAT_RESOURCE_RESPONSE_BYTES) throw new Error('Archived resource response exceeds the bounded size.');
+      const currentBinding = await this.options.getLiveLoginBinding(key.accountId);
+      if (!currentBinding || currentBinding.accountId !== initialBinding.accountId
+        || currentBinding.workerInstanceId !== initialBinding.workerInstanceId || currentBinding.controlEpoch !== initialBinding.controlEpoch
+        || currentBinding.transportOwnerId !== initialBinding.transportOwnerId || currentBinding.transportGeneration !== initialBinding.transportGeneration
+        || currentBinding.writeGrantVersion !== initialBinding.writeGrantVersion) {
+        throw new McpDomainError('SCOPE_DENIED', 'The requested conversation is unavailable.');
+      }
+      const resultCount = output.toolName === 'list_chat_notes' ? output.notes.length
+        : output.toolName === 'list_chat_albums' ? output.albums.length
+          : output.toolName === 'get_chat_album' ? output.photos.length
+            : output.toolName === 'get_chat_note' ? (output.note ? 1 : 0) : 0;
+      return { output, resultCount };
     }
 
     const normalizedFrom = tool.arguments.from ? normalizeMcpTimeBound(tool.arguments.from, 'from') : null;
@@ -470,7 +591,7 @@ export class McpService {
           ...('chatId' in tool.arguments && tool.arguments.chatId ? { chatId: tool.arguments.chatId } : {}),
         },
         execute: async ({ client, authorizedAccountIds, conversationScope, ownLineNamesOnly, extraConversationScopes }) => {
-          const { output, resultCount } = await this.executeParsedTool(client, authorizedAccountIds, tool, conversationScope, ownLineNamesOnly, extraConversationScopes);
+          const { output, resultCount } = await this.executeParsedTool(client, authorizedAccountIds, tool, conversationScope, ownLineNamesOnly, extraConversationScopes, signal);
           return { data: output, resultCount };
         },
       });
@@ -635,6 +756,7 @@ export class McpService {
     rawPayload: unknown,
     parentSignal?: AbortSignal,
   ): Promise<{ httpStatus: number; body: Record<string, unknown> | null }> {
+    const diagnosticIdentity = { correlationId: crypto.randomUUID() };
     return this.track(async (signal) => {
       if (!rawPayload || typeof rawPayload !== 'object' || Array.isArray(rawPayload)) {
         return {
@@ -724,7 +846,8 @@ export class McpService {
             signal,
             rateLimiter: (tokenId) => this.checkTokenRateLimit(tokenId),
             execute: async ({ toolScopes }) => ({
-              data: MCP_TOOL_DEFINITIONS.filter((def) => toolScopes.includes(def.name)),
+              data: MCP_TOOL_DEFINITIONS.filter((def) => toolScopes.includes(def.name)
+                && (this.options.chatResources || !def.name.startsWith('list_chat_') && !def.name.startsWith('get_chat_'))),
             }),
           });
           return {
@@ -789,6 +912,10 @@ export class McpService {
                 client,
                 authorizedAccountIds,
                 parsedInput.data,
+                undefined,
+                false,
+                [],
+                signal,
               );
               return { data: toolOutput, resultCount };
             },
@@ -817,14 +944,15 @@ export class McpService {
           },
         };
       } catch (error) {
-        return this.mapErrorToJsonRpc(id, error);
+        return this.mapErrorToJsonRpc(id, error, diagnosticIdentity);
       }
-    }, parentSignal).catch((error) => this.mapErrorToJsonRpc(null, error));
+    }, parentSignal).catch((error) => this.mapErrorToJsonRpc(null, error, diagnosticIdentity));
   }
 
   private mapErrorToJsonRpc(
     id: string | number | null,
     error: unknown,
+    identity?: import('@line-agent/contracts').DiagnosticIdentity,
   ): { httpStatus: number; body: Record<string, unknown> } {
     if (error instanceof McpDomainError) {
       if (error.code === 'AUTH_INVALID' || error.code === 'REVOKED' || error.code === 'EXPIRED') {
@@ -878,6 +1006,8 @@ export class McpService {
         };
       }
     }
+    try { this.options.onDiagnostic?.({ operation: 'mcp', stage: 'execute', category: 'unknown', recovery: 'retry', outcome: 'failed' }, identity); }
+    catch { /* Diagnostics cannot affect the response or disclose the exception. */ }
     return {
       httpStatus: 500,
       body: {
@@ -885,7 +1015,7 @@ export class McpService {
         id,
         error: {
           code: -32603,
-          message: error instanceof Error ? error.message : 'Internal MCP server error.',
+          message: 'Internal MCP server error.',
         },
       },
     };
@@ -918,7 +1048,8 @@ export class McpService {
     const context = { sourceType: 'job' as const, jobId: capability.jobId, generation: capability.generation, accountId: capability.accountId };
     const verify = () => this.track(() => this.options.tokens.verifyInternalAgentAccess({ context, signal }), signal);
     const allowedTools = (permissions: EffectivePermissions) => MCP_TOOL_DEFINITIONS.filter(
-      (definition) => MCP_TOOL_PERMISSIONS[definition.name].some((permission) => permissions[permission] === 'ALLOW'));
+      (definition) => MCP_TOOL_PERMISSIONS[definition.name].some((permission) => permissions[permission] === 'ALLOW')
+        && (this.options.chatResources || !definition.name.startsWith('list_chat_') && !definition.name.startsWith('get_chat_')));
     const finalCheck = async (toolName: McpInternalToolName | null): Promise<void> => {
       if (this.internalCapabilities.isLive(capability) && !signal.aborted) return;
       await this.options.tokens.recordAudit({
@@ -1032,7 +1163,7 @@ export class McpService {
       }
       return { httpStatus: 404, body: { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${rpc.method}` } } };
     } catch (error) {
-      return this.mapErrorToJsonRpc(id, error);
+      return this.mapErrorToJsonRpc(id, error, { correlationId: crypto.randomUUID(), ...(capability.accountId ? { accountId: capability.accountId } : {}), jobId: capability.jobId });
     }
   }
 

@@ -74,7 +74,7 @@ export class EmbeddedPostgresServer {
     await this.deps.mkdir(dirname(this.options.logFile));
     const result = await this.pgCtl(['-l', this.options.logFile, '-w', '-t', '60', 'start'], 75_000);
     if (result.code !== 0 || result.timedOut) {
-      this.deps.log(`pg_start_failed: ${result.stderr.slice(0, 500)}`);
+      this.deps.log('pg_start_failed');
       throw new EmbeddedPgError(nonAscii(this.options.dataDirectory) || nonAscii(this.options.binDirectory) ? 'pg_path_unsupported' : 'pg_start_failed',
         result.stderr.slice(0, 500));
     }

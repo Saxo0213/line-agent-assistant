@@ -22,6 +22,7 @@ type ConversationRow = {
   latest_source_deleted?: boolean | null;
   latest_content?: MessageContent | null;
   latest_kind?: string | null;
+  latest_notification_projection?: unknown;
   latest_occurred_at: Date | null;
   latest_attachment_name: string | null;
   latest_attachment_kind: 'image' | 'video' | 'audio' | 'file' | null;
@@ -33,11 +34,36 @@ const attachmentKindLabel = { image: '圖片', video: '影片', audio: '語音',
 const attachmentStatusLabel = { queued: '等待下載', downloading: '下載中', ready: '', failed: '下載失敗', expired: '已過期' } as const;
 
 const systemEventLabel: Readonly<Record<number, string>> = { 6: '通話', 9: '禮物', 16: '貼文通知', 18: '聊天事件' };
+export const boundedNotificationProjectionSql = `CASE WHEN m.kind='event' AND m.content->>'type'='event' AND m.content->>'nativeContentType'='16'
+      AND jsonb_typeof(m.raw->'message')='object'
+      AND m.raw#>>'{message,contentType}' IN ('16','POSTNOTIFICATION')
+      AND m.raw->'contentState' IS NULL
+      AND NOT (m.raw ? 'sourceDeleted')
+      AND m.raw#>>'{message,contentMetadata,serviceType}' IN ('GB','AB')
+      THEN jsonb_build_object('serviceType', m.raw#>>'{message,contentMetadata,serviceType}')
+      WHEN m.kind='event' AND m.content->>'type'='event' AND m.content->>'nativeContentType'='16'
+        AND m.raw#>>'{native,encoding}'='plain' AND m.raw#>>'{native,table}'='_message'
+        AND NOT (m.raw ? 'sourceDeleted') AND native_fields.content_type IS NOT NULL AND native_fields.metadata IS NOT NULL
+        AND (native_fields.content_type=to_jsonb(16) OR native_fields.content_type=to_jsonb('16'::text)
+          OR (native_fields.content_type->>'sqliteType'='integer' AND native_fields.content_type->>'value'='16'))
+        AND ((jsonb_typeof(native_fields.metadata)='string' AND octet_length(native_fields.metadata #>> '{}')<=16384)
+          OR (jsonb_typeof(native_fields.metadata)='object' AND native_fields.metadata->>'sqliteType' IN ('text','blob')
+            AND native_fields.metadata->>'encoding'='base64' AND jsonb_typeof(native_fields.metadata->'data')='string'
+            AND octet_length(native_fields.metadata->>'data')<=21848
+            AND native_fields.metadata->>'data' ~ '^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$'
+            AND ((length(native_fields.metadata->>'data') / 4) * 3
+              - CASE WHEN right(native_fields.metadata->>'data',2)='==' THEN 2
+                WHEN right(native_fields.metadata->>'data',1)='=' THEN 1 ELSE 0 END)<=16384))
+      THEN jsonb_build_object('contentType', 16, 'metadataText', CASE WHEN jsonb_typeof(native_fields.metadata)='string'
+        THEN native_fields.metadata #>> '{}' ELSE 'base64:' || (native_fields.metadata->>'data') END)
+      ELSE NULL END`;
 /** Conversation-list label for a projected content type that has no text body. */
-function contentPreview(content: MessageContent | null | undefined): string | null {
+function contentPreview(content: MessageContent | null | undefined, postNotificationType?: 'note' | 'album' | null): string | null {
   switch (content?.type) {
     case undefined: return null;
-    case 'event': return (content.nativeContentType === 18 ? content.text?.trim() || undefined : undefined)
+    case 'event': return (content.nativeContentType === 16 && postNotificationType === 'note' ? '記事本通知' : undefined)
+      ?? (content.nativeContentType === 16 && postNotificationType === 'album' ? '相簿通知' : undefined)
+      ?? (content.nativeContentType === 18 ? content.text?.trim() || undefined : undefined)
       ?? (content.nativeContentType === null ? undefined : systemEventLabel[content.nativeContentType])
       ?? (content.nativeContentType === 0 ? content.text?.trim() || null : null) ?? '系統訊息';
     case 'unsent': return '已收回訊息';
@@ -67,16 +93,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function postNotificationSubtypeFromProjection(value: unknown): 'note' | 'album' | null {
+  if (!isRecord(value)) return null;
+  let metadata: unknown;
+  if (Object.keys(value).length === 1 && (value.serviceType === 'GB' || value.serviceType === 'AB')) {
+    metadata = value;
+  } else if (Object.keys(value).length === 2 && value.contentType === 16 && typeof value.metadataText === 'string') {
+    let metadataText = value.metadataText;
+    if (metadataText.startsWith('base64:')) {
+      const encoded = metadataText.slice('base64:'.length);
+      if (encoded.length > 21_848 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) return null;
+      const decoded = Buffer.from(encoded, 'base64');
+      if (decoded.byteLength > 16_384) return null;
+      try { metadataText = new TextDecoder('utf-8', { fatal: true }).decode(decoded); } catch { return null; }
+    } else if (Buffer.byteLength(metadataText, 'utf8') > 16_384) return null;
+    try { metadata = JSON.parse(metadataText); } catch { return null; }
+  } else return null;
+  if (!isRecord(metadata)) return null;
+  return metadata.serviceType === 'GB' ? 'note' : metadata.serviceType === 'AB' ? 'album' : null;
+}
+
 export function mapConversation(row: ConversationRow): ConversationSummary {
+  const postNotificationType = row.latest_content?.type === 'event' && row.latest_content.nativeContentType === 16
+    && !row.latest_source_deleted
+    ? postNotificationSubtypeFromProjection(row.latest_notification_projection) : null;
   // Same projection as the timeline; sticon characters become placeholders and other private-use code points are dropped.
   const projected = row.latest_text ? projectSticons(isRecord(row.latest_sticon_raw) ? row.latest_sticon_raw : {}, row.latest_text) : [];
   const previewed = row.latest_text ? previewWithSticons(row.latest_text, projected) : { text: '', ranges: [] };
-  const text = previewed.text;
+  const postPlaceholder = row.latest_content?.type === 'event' && row.latest_content.nativeContentType === 16
+    && row.latest_text?.trim().toUpperCase() === 'POSTNOTIFICATION';
+  const text = postPlaceholder ? '' : previewed.text;
   const attachment = row.latest_attachment_kind
     ? row.latest_attachment_kind === 'image' ? attachmentKindLabel.image : row.latest_attachment_name?.trim() || attachmentKindLabel[row.latest_attachment_kind]
     : null;
   const status = row.latest_attachment_kind !== 'image' && row.latest_attachment_status ? attachmentStatusLabel[row.latest_attachment_status] : '';
-  const preview = row.latest_source_deleted ? '已刪除訊息' : row.latest_content?.type === 'unsent' ? '已收回訊息' : text || (attachment ? `${attachment}${status ? `（${status}）` : ''}` : null) || contentPreview(row.latest_content) || kindPreview(row.latest_kind);
+  const preview = row.latest_source_deleted ? '已刪除訊息' : row.latest_content?.type === 'unsent' ? '已收回訊息' : text || (attachment ? `${attachment}${status ? `（${status}）` : ''}` : null) || contentPreview(row.latest_content, postNotificationType) || kindPreview(row.latest_kind);
   let display: GeneratedPreview | undefined;
   if (row.latest_source_deleted) display = { kind: 'deleted' };
   else if (row.latest_content?.type === 'unsent') display = { kind: 'unsent' };
@@ -89,7 +140,8 @@ export function mapConversation(row: ConversationRow): ConversationSummary {
       // Native event prose is historical content; only generated fallback labels are localized.
       if (!((content.nativeContentType === 18 || content.nativeContentType === 0) && content.text?.trim())) {
         const kinds: Record<number, GeneratedPreview['kind']> = { 6: 'call', 9: 'gift', 16: 'post', 18: 'chat_event' };
-        display = { kind: kinds[content.nativeContentType ?? -1] ?? 'system' };
+        display = { kind: content.nativeContentType === 16 && postNotificationType === 'note' ? 'post_note'
+          : content.nativeContentType === 16 && postNotificationType === 'album' ? 'post_album' : kinds[content.nativeContentType ?? -1] ?? 'system' };
       }
     } else {
       const kind = content && content.type !== 'media' ? content.type : row.latest_kind;
@@ -110,7 +162,7 @@ latestMessageAt: row.latest_occurred_at?.toISOString() ?? null,
 const conversationSelect = `SELECT c.account_id, c.chat_type, c.chat_id, COALESCE(${CONVERSATION_TITLE_SQL}, '') AS title,
     CASE WHEN c.chat_type IN ('group','room') THEN COALESCE(room_policy.state = 'ENABLED', false) ELSE c.agent_enabled END AS agent_enabled,
     c.default_provider,
-    c.unread_count, ${CONVERSATION_PICTURE_SQL} picture_path, latest.message_id latest_message_id, latest.sticon_raw latest_sticon_raw, latest.text_content latest_text, latest.content latest_content, latest.source_deleted latest_source_deleted, latest.kind latest_kind, latest.occurred_at latest_occurred_at,
+    c.unread_count, ${CONVERSATION_PICTURE_SQL} picture_path, latest.message_id latest_message_id, latest.sticon_raw latest_sticon_raw, latest.text_content latest_text, latest.content latest_content, latest.source_deleted latest_source_deleted, latest.kind latest_kind, latest.notification_projection latest_notification_projection, latest.occurred_at latest_occurred_at,
     latest.attachment_name latest_attachment_name, latest.attachment_kind latest_attachment_kind,
     latest.attachment_status latest_attachment_status
   FROM conversations c
@@ -119,7 +171,9 @@ const conversationSelect = `SELECT c.account_id, c.chat_type, c.chat_id, COALESC
   LEFT JOIN room_agent_policies room_policy ON room_policy.account_id=c.account_id
     AND room_policy.chat_type=c.chat_type AND room_policy.chat_id=c.chat_id
   LEFT JOIN LATERAL (
-    SELECT m.message_id, m.text_content, ${boundedSticonRawSql('m.raw')} AS sticon_raw, m.content, (m.raw ? 'sourceDeleted') AS source_deleted, m.kind, m.occurred_at, attachment.name attachment_name,
+    SELECT m.message_id, m.text_content, ${boundedSticonRawSql('m.raw')} AS sticon_raw, m.content, (m.raw ? 'sourceDeleted') AS source_deleted, m.kind,
+      ${boundedNotificationProjectionSql} AS notification_projection,
+      m.occurred_at, attachment.name attachment_name,
       attachment.kind attachment_kind, attachment.status attachment_status
     FROM messages m
     LEFT JOIN LATERAL (
@@ -127,6 +181,15 @@ const conversationSelect = `SELECT c.account_id, c.chat_type, c.chat_id, COALESC
       WHERE a.account_id=m.account_id AND a.chat_type=m.chat_type AND a.chat_id=m.chat_id AND a.message_id=m.message_id
       ORDER BY a.created_at, a.attachment_id LIMIT 1
     ) attachment ON true
+    LEFT JOIN LATERAL (
+      SELECT
+        (SELECT (m.raw#>'{native,row,cells}') -> (column_cell.ordinality - 1)::int
+          FROM jsonb_array_elements_text(m.raw#>'{native,row,columns}') WITH ORDINALITY column_cell(value, ordinality)
+          WHERE column_cell.value='_contentType' LIMIT 1) AS content_type,
+        (SELECT (m.raw#>'{native,row,cells}') -> (column_cell.ordinality - 1)::int
+          FROM jsonb_array_elements_text(m.raw#>'{native,row,columns}') WITH ORDINALITY column_cell(value, ordinality)
+          WHERE column_cell.value='_contentMetadata' LIMIT 1) AS metadata
+    ) native_fields ON true
     WHERE m.account_id=c.account_id AND m.chat_type=c.chat_type AND m.chat_id=c.chat_id AND (m.kind <> 'event' OR m.content IS NOT NULL)
     ORDER BY m.occurred_at DESC, m.message_id DESC LIMIT 1
   ) latest ON true`;

@@ -120,7 +120,7 @@ export function jobStatusLabel(status: string): string { return jobStatusLabelFo
 const PREVIEW_KEYS: Record<GeneratedPreview['kind'], PlainCopyKey> = {
   deleted: 'deleted', unsent: 'thisMessageWasUnsent', image: 'image', video: 'video', audio: 'voice', file: 'file730',
   sticker: 'sticker', contact: 'lineContact', location: 'location', rich: 'richMessage', unsupported: 'messageContent',
-  call: 'call', gift: 'gift', post: 'postNotification', chat_event: 'chatEvent', system: 'systemMessage', message: 'messageContent',
+  call: 'call', gift: 'gift', post: 'postNotification', post_note: 'postNoteNotification', post_album: 'postAlbumNotification', chat_event: 'chatEvent', system: 'systemMessage', message: 'messageContent',
 };
 export function generatedPreviewFor(locale: Locale, display: GeneratedPreview | undefined, original: string | null | undefined): string {
   if (!display) return original ?? '';

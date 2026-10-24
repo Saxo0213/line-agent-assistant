@@ -2,6 +2,16 @@ import { describe, expect, it } from 'vitest';
 import { createDesktopApi } from './api.js';
 
 describe('sandbox preload API', () => {
+  it('reports a renderer failure with no exception, DOM or state payload', async () => {
+    const calls: unknown[] = [];
+    const api = createDesktopApi({ async invoke(channel, payload) {
+      calls.push({ channel, payload });
+      return { type: 'accepted', requestId: (payload as { requestId: string }).requestId, ok: true };
+    }, on() {}, removeListener() {} });
+    await api.reportRendererFailure?.();
+    expect(calls).toEqual([{ channel: 'line-agent:request', payload: { type: 'reportRendererFailure', requestId: expect.any(String) } }]);
+  });
+
   it('uses the typed locale channel and validates the returned locale snapshot', async () => {
     const calls: unknown[] = [];
     const api = createDesktopApi({ async invoke(channel, payload) {
@@ -279,10 +289,40 @@ describe('sandbox preload API', () => {
       .resolves.toMatchObject({ ok: false, code: 'LINE_SEND_OUTCOME_UNKNOWN' });
   });
 
+  it('forwards manual media bytes and the captured writable chat through IPC', async () => {
+    let sent: unknown;
+    const api = createDesktopApi({ async invoke(_channel, payload) {
+      sent = payload;
+      return { type: 'accepted', requestId: (payload as { requestId: string }).requestId, ok: true };
+    }, on() {}, removeListener() {} });
+    const files = [{ name: 'note.txt', bytes: new Uint8Array([1, 2, 3]) }];
+    await api.sendManualMedia!({ accountId: 'a', chatType: 'group', chatId: 'c' }, files);
+    expect(sent).toMatchObject({ type: 'sendManualMedia', accountId: 'a', chatType: 'group', chatId: 'c', files });
+    expect((sent as { files: Array<{ bytes: Uint8Array }> }).files[0]?.bytes).toEqual(files[0]!.bytes);
+  });
+
   it('rejects malformed send responses and correlation mismatches for conservative renderer handling', async () => {
     const malformed = createDesktopApi({ async invoke() { return { type: 'accepted', ok: true }; }, on() {}, removeListener() {} });
     await expect(malformed.sendText({ accountId: 'a', chatType: 'group', chatId: 'c' }, 'hello')).rejects.toThrow();
     const mismatched = createDesktopApi({ async invoke() { return { type: 'accepted', requestId: 'wrong', ok: true }; }, on() {}, removeListener() {} });
     await expect(mismatched.sendText({ accountId: 'a', chatType: 'group', chatId: 'c' }, 'hello')).rejects.toThrow('IPC correlation mismatch');
+  });
+
+  it('passes only a request ID across the preload bridge and exposes typed cancellation', async () => {
+    const calls: unknown[] = [];
+    const api = createDesktopApi({ async invoke(_channel, payload) {
+      const bridgedPayload = structuredClone(payload);
+      calls.push(bridgedPayload);
+      const request = bridgedPayload as { type: string; requestId: string };
+      if (request.type === 'cancelChatResourceRequest') return { type: request.type, requestId: request.requestId, ok: true, cancelled: true };
+      return { type: 'listChatNotes', requestId: request.requestId, ok: true, notes: [], nextCursor: null };
+    }, on() {}, removeListener() {} });
+    const targetRequestId = 'renderer-resource-1';
+    await expect(api.listChatNotes({ accountId: 'a', chatType: 'group', chatId: 'c' }, null, targetRequestId)).resolves.toEqual({ notes: [], nextCursor: null });
+    await expect(api.cancelChatResourceRequest(targetRequestId)).resolves.toBe(true);
+    expect(calls[0]).toMatchObject({ type: 'listChatNotes', requestId: targetRequestId });
+    expect(calls[1]).toMatchObject({ type: 'cancelChatResourceRequest', targetRequestId, requestId: expect.any(String) });
+    expect(JSON.stringify(calls)).not.toContain('signal');
+    expect(calls.some((value) => value instanceof AbortSignal)).toBe(false);
   });
 });

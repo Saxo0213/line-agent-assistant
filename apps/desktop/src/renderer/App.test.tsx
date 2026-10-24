@@ -7,7 +7,7 @@ import { act, cleanup, fireEvent, render as renderBase, screen, waitFor, within 
 import { App, firstDisplayedConversation } from './App.js';
 import { LocaleProvider, type LocaleState } from './locale-context.js';
 import { LineLogin } from './pages/LineLogin.js';
-import { accountComposerStatus, formatLatestMessageTime, formatVisibleMessageDate } from './pages/Conversations.js';
+import { accountComposerStatus, accountHeaderStatusFor, formatLatestMessageTime, formatVisibleMessageDate } from './pages/Conversations.js';
 import type { DesktopApi } from '../preload/api.js';
 import type { TimelineMessage } from '../main/service-facade.js';
 import { DEFAULT_AGENT_STATUS_ICONS, lineMediaUrl, type AppSnapshot, type ConversationSummary, type IpcEvent } from '@line-agent/contracts';
@@ -186,6 +186,13 @@ function fakeApi(): DesktopApi {
     setLocale: vi.fn(async (preference: 'automatic' | 'en' | 'zh-TW' | 'ja' | 'ko') => ({ preference, effectiveLocale: preference === 'automatic' ? 'en' : preference })),
     getSnapshot: vi.fn(async () => snapshot),
     listMessages: vi.fn(async () => ({ messages: [], olderCursor: null })),
+    listChatNotes: vi.fn(async () => ({ notes: [], nextCursor: null })),
+    getChatNote: vi.fn(async () => ({ postId: 'post-1', createdTime: null, text: null })),
+    listChatAlbums: vi.fn(async () => ({ albums: [], nextCursor: null })),
+    listChatAlbumPhotos: vi.fn(async () => ({ photos: [], nextCursor: null })),
+    downloadChatAlbumPhoto: vi.fn(async (key, albumId, photoId) => ({ albumId, photoId, sizeBytes: 1 })),
+    openChatAlbum: vi.fn(async (_key, albumId) => ({ albumId, savedCount: 0, failedCount: 0, totalCount: 0, byteCount: 0, complete: true, failureCodes: [], errorCode: null })),
+    cancelChatResourceRequest: vi.fn(async () => true),
     listAttachmentStates: vi.fn(async () => []),
     listAgentStatuses: vi.fn(async () => []),
     listWorkRecords: vi.fn(async () => []),
@@ -202,6 +209,9 @@ function fakeApi(): DesktopApi {
     searchMessages: vi.fn(async () => []),
     sendText: vi.fn(async () => accepted),
     replyText: vi.fn(async () => accepted),
+    unsendMessage: vi.fn(async () => accepted),
+    getManualUnsendWindow: vi.fn(async () => '1h' as const),
+    setManualUnsendWindow: vi.fn(async (window) => window),
     submitAgentRoomPrompt: vi.fn(async () => ({ type: 'submitAgentRoomPrompt', requestId: 'x', ok: true, jobId: 'job-1' } as const)),
     openAttachment: vi.fn(async () => false),
     openExternalUrl: vi.fn(async () => ({ type: 'openExternalUrl', requestId: 'x', ok: true } as const)),
@@ -210,6 +220,7 @@ function fakeApi(): DesktopApi {
     lineAddAccountQr: vi.fn(async () => accepted),
     lineLoginQr: vi.fn(async () => accepted),
     lineLogout: vi.fn(async () => accepted),
+    refreshLineAvatar: vi.fn(async () => accepted),
     lineSetAutoLogin: vi.fn(async () => accepted),
     lineBeginAdminPairing: vi.fn(async () => ({ token: '123456', expiresAt: '2026-10-16T06:00:00.000Z' })),
     lineStart: vi.fn(async () => accepted),
@@ -227,7 +238,7 @@ function fakeApi(): DesktopApi {
     retryJob: vi.fn(async () => accepted),
     setWorkspace: vi.fn(async () => accepted),
     setDefaultAgent: vi.fn(async () => accepted),
-    getConversationSettings: vi.fn(async () => ({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS } })),
+    getConversationSettings: vi.fn(async () => ({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS }, agentStatusRotationIntervalSeconds: 10 })),
     setConversationSettings: vi.fn(async (settings) => settings),
     getAutoResponderSettings: vi.fn(async () => ({ version: 0, displayName: 'Agent', fallback: '我不知道你在說甚麼', rules: [] })),
     setAutoResponderSettings: vi.fn(async () => ({ type: 'setAutoResponderSettings', requestId: 'x', ok: true, version: 1 } as const)),
@@ -276,6 +287,75 @@ async function openSystemTab() {
   fireEvent.click(await screen.findByRole('button', { name: '設定' }));
   fireEvent.click(await screen.findByRole('tab', { name: '系統' }));
 }
+
+it('reloads only the refreshed account avatars for periodic and manual App events', async () => {
+  const ownMid = `u${'e'.repeat(32)}`;
+  const peerMid = `u${'f'.repeat(32)}`;
+  const api = fakeApi();
+  const listeners: Parameters<DesktopApi['onEvent']>[0][] = [];
+  api.onEvent = vi.fn((listener) => { listeners.push(listener); return () => undefined; });
+  api.getSnapshot = vi.fn(async () => ({
+    ...snapshot,
+    accounts: snapshot.accounts.map((item) => ({ ...item, avatarAvailable: item.accountId === 'account-A' })),
+    conversations: [
+      { ...snapshot.conversations[0]!, avatarAvailable: true },
+      { ...snapshot.conversations[0]!, chatType: 'direct' as const, chatId: ownMid, title: '我的聊天室', avatarAvailable: true },
+      { ...snapshot.conversations[0]!, chatType: 'direct' as const, chatId: peerMid, title: 'Peer 聊天', avatarAvailable: true },
+    ],
+  }));
+  api.listMessages = vi.fn(async () => ({ messages: [
+    { ...message('account-A', 'own-message'), senderId: ownMid, senderName: 'Me', senderAvatarAvailable: true },
+    { ...message('account-A', 'peer-message'), senderId: peerMid, senderName: 'Peer', senderAvatarAvailable: true },
+  ], olderCursor: null }));
+  const target = {
+    account: { type: 'account' as const, accountId: 'account-A' },
+    ownChat: { type: 'conversation' as const, accountId: 'account-A', chatType: 'direct' as const, chatId: ownMid },
+    ownMember: { type: 'member' as const, accountId: 'account-A', chatType: 'group' as const, chatId: 'same-chat', memberId: ownMid },
+    peerChat: { type: 'conversation' as const, accountId: 'account-A', chatType: 'direct' as const, chatId: peerMid },
+    peerMember: { type: 'member' as const, accountId: 'account-A', chatType: 'group' as const, chatId: 'same-chat', memberId: peerMid },
+  };
+  const imagesFor = (value: typeof target.account | typeof target.ownChat | typeof target.ownMember) =>
+    [...document.querySelectorAll<HTMLImageElement>(`img[src="${lineMediaUrl(value)}"]`)];
+  const mounted = async () => {
+    await waitFor(() => expect(imagesFor(target.account).length).toBeGreaterThan(0));
+    await waitFor(() => expect(imagesFor(target.ownChat).length).toBeGreaterThan(0));
+    await waitFor(() => expect(imagesFor(target.ownMember).length).toBeGreaterThan(0));
+    await waitFor(() => expect(imagesFor(target.peerChat).length).toBeGreaterThan(0));
+    await waitFor(() => expect(imagesFor(target.peerMember).length).toBeGreaterThan(0));
+  };
+  const capture = () => ({
+    account: imagesFor(target.account), ownChat: imagesFor(target.ownChat), ownMember: imagesFor(target.ownMember),
+    peerChat: imagesFor(target.peerChat), peerMember: imagesFor(target.peerMember),
+  });
+  const expectOwnReloaded = (before: ReturnType<typeof capture>) => {
+    for (const key of ['account', 'ownChat', 'ownMember'] as const) {
+      const after = capture()[key];
+      expect(after).toHaveLength(before[key].length);
+      after.forEach((image, index) => {
+        expect(image).not.toBe(before[key][index]);
+        expect(image.getAttribute('src')).toBe(before[key][index]!.getAttribute('src'));
+      });
+    }
+    expect(capture().peerChat).toEqual(before.peerChat);
+    expect(capture().peerMember).toEqual(before.peerMember);
+  };
+
+  await renderLineApp(api);
+  await mounted();
+  const beforePeriodic = capture();
+  act(() => listeners.forEach((listener) => listener({ type: 'lineAvatarRefreshed', accountId: 'account-A', ownMid })));
+  await waitFor(() => expectOwnReloaded(beforePeriodic));
+
+  await openSystemTab();
+  const beforeManual = imagesFor(target.account)[0]!;
+  fireEvent.click(within(document.querySelector('.account-record[data-account-id="account-A"]')!).getByRole('button', { name: '更新頭像' }));
+  await waitFor(() => expect(api.refreshLineAvatar).toHaveBeenCalledWith('account-A'));
+  act(() => listeners.forEach((listener) => listener({ type: 'lineAvatarRefreshed', accountId: 'account-A', ownMid })));
+  await waitFor(() => {
+    expect(imagesFor(target.account)[0]).not.toBe(beforeManual);
+    expect(imagesFor(target.account)[0]?.getAttribute('src')).toBe(beforeManual.getAttribute('src'));
+  });
+});
 
 describe('locale restart choice focus', () => {
   async function beginLocaleSave() {
@@ -502,7 +582,7 @@ describe('operator console', () => {
     for (const id of ['incoming', 'outgoing']) {
       const card = container.querySelector(`#message-${id}`)!;
       const row = card.closest('.message-row')!;
-      expect(row.querySelector('.sender-avatar') !== null).toBe(chatType !== 'direct' && id === 'incoming');
+      expect(row.querySelector('.sender-avatar') !== null).toBe(id === 'incoming');
       expect(row.querySelector('.message-identity > span:not(.sender-avatar)') !== null).toBe(chatType !== 'direct' && id === 'incoming');
       expect(card.parentElement?.querySelector('.message-time')?.textContent).toBeTruthy();
       expect(card.querySelector('.message-text')?.textContent).toBe(id);
@@ -548,10 +628,10 @@ describe('operator console', () => {
     expect(rows[1]?.querySelector('.inbound-avatar-spacer')).toBeTruthy();
   });
 
-  it('renders direct inbound bubbles without an avatar or spacer column', async () => {
+  it('renders the peer avatar for the first direct inbound bubble and reserves its column afterward', async () => {
     const api = fakeApi();
     api.getSnapshot = vi.fn(async () => ({ ...snapshot,
-      conversations: [{ ...snapshot.conversations[0]!, chatType: 'direct' as const }],
+      conversations: [{ ...snapshot.conversations[0]!, chatType: 'direct' as const, avatarAvailable: true }],
     }));
     api.listMessages = vi.fn(async () => ({ messages: [
       { ...message('account-A', 'direct-first'), chatType: 'direct' as const },
@@ -561,16 +641,19 @@ describe('operator console', () => {
     await screen.findByText('direct-second');
     const rows = container.querySelectorAll('.message-row.inbound.direct');
     expect(rows).toHaveLength(2);
-    expect(rows[0]?.querySelector('.sender-avatar, .inbound-avatar-spacer')).toBeNull();
-    expect(rows[1]?.querySelector('.sender-avatar, .inbound-avatar-spacer')).toBeNull();
+    const firstAvatar = rows[0]?.querySelector('img.sender-avatar');
+    expect(firstAvatar?.getAttribute('src')).toBe(lineMediaUrl({ type: 'conversation', accountId: 'account-A', chatType: 'direct', chatId: 'same-chat' }));
+    expect(rows[1]?.querySelector('.sender-avatar')).toBeNull();
+    expect(rows[1]?.querySelector('.inbound-avatar-spacer')).toBeTruthy();
     expect(rows[0]?.querySelector('.message')).toBeTruthy();
     expect(rows[0]?.querySelector('.message-sender-name')).toBeNull();
     expect(rows[1]?.querySelector('.message')).toBeTruthy();
+    expect(rows[1]?.querySelector('.message-sender-name')).toBeNull();
   });
 
   describe('read receipts', () => {
     const own = (id: string, readCount?: number) => ({ ...message('account-A', id), direction: 'outbound' as const,
-      ...(readCount ? { readCount } : {}) });
+      ...(readCount !== undefined ? { readCount } : {}) });
     const readers = [{ mid: 'u1', name: '小明', readAt: new Date().toISOString() }, { mid: 'u2', name: '小華', readAt: '2026-01-02T08:05:00.000Z' }];
 
     it('shows plain 已讀 for a direct chat', async () => {
@@ -589,6 +672,14 @@ describe('operator console', () => {
       await renderLineApp(api);
       await screen.findByText('unread-own');
       expect(document.body.textContent).not.toContain('已讀');
+    });
+
+    it('does not render a zero read count as text', async () => {
+      const api = fakeApi();
+      api.listMessages = vi.fn(async () => ({ messages: [own('zero-read-own', 0)], olderCursor: null }));
+      const { container } = await renderLineApp(api);
+      await screen.findByText('zero-read-own');
+      expect(container.querySelector('#message-zero-read-own')?.textContent).not.toContain('0');
     });
 
     it('opens the reader list, closes on Esc with focus restored, and keeps one panel open', async () => {
@@ -652,6 +743,124 @@ describe('operator console', () => {
     expect(row.querySelector('.message-time')?.textContent).toBeTruthy();
   });
 
+  it('requires confirmation, then refreshes an unsent message from the exact DB row', async () => {
+    const api = fakeApi();
+    const own = { ...message('account-A', 'recent-own'), senderId: 'own-account-A', text: 'own message', direction: 'outbound' as const,
+      occurredAt: new Date(Date.now() - 20 * 60 * 1000).toISOString() };
+    const other = { ...message('account-A', 'recent-inbound'), text: 'other message', occurredAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() };
+    const recalled = { ...own, text: null, deleted: true, content: { format: 1 as const, type: 'unsent' as const } };
+    const listMessages = vi.fn(async (...args: Parameters<DesktopApi['listMessages']>) => args[3] === own.messageId
+      ? { messages: [recalled], olderCursor: null }
+      : { messages: [own, other], olderCursor: null });
+    api.listMessages = listMessages;
+    const { container } = await renderLineApp(api);
+    await screen.findByText('own message');
+    const ownRow = container.querySelector('#message-recent-own')!.closest('.message-row')!;
+    const otherRow = container.querySelector('#message-recent-inbound')!.closest('.message-row')!;
+    fireEvent.contextMenu(otherRow);
+    expect(screen.queryByRole('menuitem', { name: desktopTextFor('zh-TW', 'unsendMessage') })).toBeNull();
+
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    fireEvent.contextMenu(ownRow);
+    fireEvent.click(await screen.findByRole('menuitem', { name: desktopTextFor('zh-TW', 'unsendMessage') }));
+    expect(confirm).toHaveBeenCalled();
+    expect(api.unsendMessage).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    fireEvent.contextMenu(ownRow);
+    fireEvent.click(await screen.findByRole('menuitem', { name: desktopTextFor('zh-TW', 'unsendMessage') }));
+    await waitFor(() => expect(api.unsendMessage).toHaveBeenCalledWith(expect.objectContaining({ accountId: 'account-A', chatId: 'same-chat' }), own.messageId));
+    await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith(expect.objectContaining({ accountId: 'account-A', chatId: 'same-chat' }), null, 1, own.messageId));
+    await waitFor(() => expect(ownRow.querySelector('.message-recalled-label')?.textContent).toContain('已收回'));
+  });
+
+  it('shows the context action for older own messages only with the seven day window', async () => {
+    const oldOwn = { ...message('account-A', 'old-own'), senderId: 'own-account-A', direction: 'outbound' as const,
+      occurredAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString() };
+    const api = fakeApi();
+    api.listMessages = vi.fn(async () => ({ messages: [oldOwn], olderCursor: null }));
+    api.getManualUnsendWindow = vi.fn(async () => '1h' as const);
+    const oneHour = await renderLineApp(api);
+    await screen.findByText('old-own');
+    const row = oneHour.container.querySelector('#message-old-own')!.closest('.message-row')!;
+    fireEvent.contextMenu(row);
+    expect(screen.queryByRole('menuitem', { name: desktopTextFor('zh-TW', 'unsendMessage') })).toBeNull();
+    oneHour.unmount();
+
+    const sevenDayApi = fakeApi();
+    sevenDayApi.listMessages = vi.fn(async () => ({ messages: [oldOwn], olderCursor: null }));
+    sevenDayApi.getManualUnsendWindow = vi.fn(async () => '7d' as const);
+    const sevenDays = await renderLineApp(sevenDayApi);
+    await screen.findByText('old-own');
+    const sevenDayRow = sevenDays.container.querySelector('#message-old-own')!.closest('.message-row')!;
+    fireEvent.contextMenu(sevenDayRow);
+    expect(await screen.findByRole('menuitem', { name: desktopTextFor('zh-TW', 'unsendMessage') })).toBeTruthy();
+  });
+
+  it('suppresses the message context menu for an external-monitor-only account', async () => {
+    const own = { ...message('account-B', 'monitor-own'), senderId: 'own-account-B', direction: 'outbound' as const,
+      text: 'monitor own message', occurredAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() };
+    const api = fakeApi();
+    api.getSnapshot = vi.fn(async () => ({ ...snapshot, accounts: snapshot.accounts.map((item) => item.accountId === 'account-B'
+      ? { ...item, canSendManually: false } : item) }));
+    api.listMessages = vi.fn(async () => ({ messages: [own], olderCursor: null }));
+    const view = await renderLineApp(api);
+    fireEvent.click(view.container.querySelector<HTMLButtonElement>('[data-account-id="account-B"]')!);
+    await screen.findByText('monitor own message');
+    const row = view.container.querySelector('#message-monitor-own')!.closest('.message-row')!;
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    fireEvent(row, event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(api.unsendMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh an unsent row after switching accounts while the request is pending', async () => {
+    const pending = deferred<Awaited<ReturnType<DesktopApi['unsendMessage']>>>();
+    const own = { ...message('account-A', 'switch-own'), senderId: 'own-account-A', direction: 'outbound' as const,
+      occurredAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() };
+    const other = { ...message('account-B', 'switch-other'), text: 'other account message' };
+    const api = fakeApi();
+    api.listMessages = vi.fn(async (key, _cursor, _limit, exactMessageId) => ({
+      messages: exactMessageId === own.messageId ? [{ ...own, text: null, deleted: true,
+        content: { format: 1 as const, type: 'unsent' as const } }] : [key.accountId === 'account-A' ? own : other],
+      olderCursor: null,
+    }));
+    api.unsendMessage = vi.fn(() => pending.promise);
+    const view = await renderLineApp(api);
+    const row = view.container.querySelector('#message-switch-own')!.closest('.message-row')!;
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    fireEvent.contextMenu(row);
+    fireEvent.click(await screen.findByRole('menuitem', { name: desktopTextFor('zh-TW', 'unsendMessage') }));
+    await waitFor(() => expect(api.unsendMessage).toHaveBeenCalledTimes(1));
+    fireEvent.click(view.container.querySelector<HTMLButtonElement>('[data-account-id="account-B"]')!);
+    await screen.findByText('other account message');
+    await act(async () => pending.resolve({ type: 'accepted', requestId: 'accepted', ok: true }));
+    const calls = (api.listMessages as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls.some((call: unknown[]) => call[0] && (call[0] as { accountId?: string }).accountId === 'account-A'
+      && call[3] === own.messageId)).toBe(false);
+  });
+
+  it('does not fetch a projected row after the conversation unmounts during unsend', async () => {
+    const pending = deferred<Awaited<ReturnType<DesktopApi['unsendMessage']>>>();
+    const api = fakeApi();
+    const own = { ...message('account-A', 'unmount-own'), senderId: 'own-account-A', direction: 'outbound' as const,
+      occurredAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() };
+    api.listMessages = vi.fn(async () => ({ messages: [own], olderCursor: null }));
+    api.unsendMessage = vi.fn(() => pending.promise);
+    const view = await renderLineApp(api);
+    const row = view.container.querySelector('#message-unmount-own')!.closest('.message-row')!;
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    fireEvent.contextMenu(row);
+    fireEvent.click(await screen.findByRole('menuitem', { name: desktopTextFor('zh-TW', 'unsendMessage') }));
+    await waitFor(() => expect(api.unsendMessage).toHaveBeenCalledTimes(1));
+    const listMessages = api.listMessages as ReturnType<typeof vi.fn>;
+    expect(listMessages.mock.calls.map((call: unknown[]) => call[3])).not.toContain(own.messageId);
+    view.unmount();
+    await act(async () => pending.resolve({ type: 'accepted', requestId: 'accepted', ok: true }));
+    expect(api.listMessages).not.toHaveBeenCalledWith(expect.anything(), null, 1, own.messageId);
+  });
+
   it('formats message time as a 12-hour time with a space after the period label', async () => {
     vi.stubEnv('TZ', 'Asia/Taipei');
     const api = fakeApi();
@@ -697,12 +906,14 @@ describe('operator console', () => {
     const { container } = await renderLineApp(api);
     await screen.findByText('meta-out-2');
     const inbound = container.querySelector('#message-meta-in')!;
-    expect(inbound.nextElementSibling?.classList.contains('message-time')).toBe(true);
-    expect(inbound.querySelector('time')).toBeNull();
+    expect(inbound.nextElementSibling?.classList.contains('message-trailing-meta')).toBe(true);
+    expect(inbound.nextElementSibling?.querySelector('.message-meta .message-time')).not.toBeNull();
     const outbound = [...container.querySelectorAll('.message-row.outbound')];
     for (const row of outbound) {
       const bubble = row.querySelector('.message')!;
-      expect(bubble.previousElementSibling?.classList.contains('message-time')).toBe(true);
+      const trailingMeta = row.querySelector('.message-trailing-meta')!;
+      expect(trailingMeta.querySelector('.message-meta .message-time')).not.toBeNull();
+      expect(trailingMeta.parentElement).toBe(row);
       expect(row.querySelector('.sender-avatar, .message-identity, .message-sender-name')).toBeNull();
     }
     expect(outbound[0]!.querySelector('.message.bubble-tail')).not.toBeNull();
@@ -819,11 +1030,12 @@ describe('operator console', () => {
     const noneMarker = noneRow.querySelector('.message-recalled-label')!;
     expect(noneMarker.textContent).toBe('已收回（無資料）');
     expect(noneMarker.nextElementSibling).toBe(noneRow.querySelector('.message-time'));
-    expect(before(noneMarker, none.querySelector('.reply-reference')!)).toBe(true);
+    expect(noneMarker.closest('.message-meta')?.parentElement?.classList.contains('message-trailing-meta')).toBe(true);
     const kept = container.querySelector('#message-rq-kept')!;
-    const keptMarker = kept.closest('.message-row')!.querySelector('.message-recalled-label')!;
+    const keptRow = kept.closest('.message-row')!;
+    const keptMarker = keptRow.querySelector('.message-recalled-label')!;
     expect(keptMarker.nextElementSibling).toBe(kept.closest('.message-row')!.querySelector('.message-time'));
-    expect(before(keptMarker, kept.querySelector('.reply-reference')!)).toBe(true);
+    expect(keptMarker.closest('.message-meta')?.parentElement?.classList.contains('message-trailing-meta')).toBe(true);
     expect(before(kept.querySelector('.reply-reference')!, kept.querySelector('.message-text')!)).toBe(true);
     expect(kept.querySelector('.message-recalled-label, .message-recalled-divider')).toBeNull();
     expect(keptMarker.textContent).toBe('已收回');
@@ -831,7 +1043,7 @@ describe('operator console', () => {
     const srcMarker = src.closest('.message-row')!.querySelector('.message-recalled-label')!;
     expect(srcMarker.textContent).toBe('已刪除（無資料）');
     expect(srcMarker.nextElementSibling).toBe(src.closest('.message-row')!.querySelector('.message-time'));
-    expect(before(srcMarker, src.querySelector('.reply-reference')!)).toBe(true);
+    expect(srcMarker.closest('.message-meta')?.parentElement?.classList.contains('message-trailing-meta')).toBe(true);
   });
 
   it('presents source-deleted messages like recalled ones with the 已刪除 label and recalled stickers below 已收回', async () => {
@@ -915,6 +1127,10 @@ describe('operator console', () => {
         content: { format: 1 as const, type: 'event' as const, nativeContentType: 9, text: '已送出貼圖' } },
       { ...message('account-A', 'content-post'), text: null, kind: 'event' as const,
         content: { format: 1 as const, type: 'event' as const, nativeContentType: 16, text: null } },
+      { ...message('account-A', 'content-post-note'), text: null, kind: 'event' as const, postNotificationType: 'note' as const,
+        content: { format: 1 as const, type: 'event' as const, nativeContentType: 16, text: 'POSTNOTIFICATION' } },
+      { ...message('account-A', 'content-post-album'), text: null, kind: 'event' as const, postNotificationType: 'album' as const,
+        content: { format: 1 as const, type: 'event' as const, nativeContentType: 16, text: 'POSTNOTIFICATION' } },
       { ...message('account-A', 'content-post-enum'), text: null, kind: 'event' as const,
         content: { format: 1 as const, type: 'event' as const, nativeContentType: 16, text: ' postnotification ' } },
       { ...message('account-A', 'content-post-text'), text: null, kind: 'event' as const,
@@ -939,6 +1155,8 @@ describe('operator console', () => {
     expect(screen.getByText('通話')).toBeTruthy();
     expect(screen.getByText('禮物 已送出貼圖')).toBeTruthy();
     expect(screen.getAllByText('貼文通知')).toHaveLength(2);
+    expect(screen.getByText('記事本通知')).toBeTruthy();
+    expect(screen.getByText('相簿通知')).toBeTruthy();
     expect(screen.queryByText('貼文通知 POSTNOTIFICATION')).toBeNull();
     expect(screen.getByText('貼文通知 有人在貼文中提及你')).toBeTruthy();
     expect(screen.getByText('聊天事件')).toBeTruthy();
@@ -946,6 +1164,25 @@ describe('operator console', () => {
     expect(screen.getByText('系統訊息')).toBeTruthy();
     expect(screen.getByText('此訊息類型尚未支援（類型 42）')).toBeTruthy();
     expect(container.querySelector('#message-content-media')?.textContent).toContain('0:12');
+  });
+
+  it('renders note and album notifications as sender bubbles while group events stay centered', async () => {
+    const api = fakeApi();
+    api.listMessages = vi.fn(async () => ({ messages: [
+      { ...message('account-A', 'note-in'), senderName: '小明', senderAvatarAvailable: true, postNotificationType: 'note' as const,
+        content: { format: 1 as const, type: 'event' as const, nativeContentType: 16, text: 'POSTNOTIFICATION' } },
+      { ...message('account-A', 'album-out'), direction: 'outbound' as const, postNotificationType: 'album' as const,
+        content: { format: 1 as const, type: 'event' as const, nativeContentType: 16, text: 'POSTNOTIFICATION' } },
+      { ...message('account-A', 'membership'), content: { format: 1 as const, type: 'event' as const, nativeContentType: 18, text: '小明已加入群組。' } },
+    ], olderCursor: null }));
+    const { container } = await renderLineApp(api);
+    expect(await screen.findByText('記事本通知')).toBeTruthy();
+    expect(screen.getByText('相簿通知')).toBeTruthy();
+    expect(screen.getByText('小明')).toBeTruthy();
+    expect(container.querySelector('#message-note-in.message.inbound')).toBeTruthy();
+    expect(container.querySelector('#message-note-in .message-system-event')).toBeNull();
+    expect(container.querySelector('#message-album-out.message.outbound')).toBeTruthy();
+    expect(container.querySelector('#message-membership .message-system-event')).toBeTruthy();
   });
 
   it('hides the core warning while waiting for LINE login', async () => {
@@ -988,6 +1225,54 @@ describe('operator console', () => {
     expect(screen.getAllByText('核心功能需檢查')).toHaveLength(1);
     expect(container.querySelector('.app-header')).toBeNull();
     expect(container.querySelector('.app-warning')).toBeNull();
+  });
+
+  it('accepts picked and dropped files in the LINE composer and sends text before media', async () => {
+    const api = fakeApi();
+    const order: string[] = [];
+    api.sendText = vi.fn(async () => { order.push('text'); return { type: 'accepted', requestId: 'text-1', ok: true } as const; });
+    api.sendManualMedia = vi.fn(async (_key, files) => { order.push(`media:${files[0]?.name}`); return { type: 'accepted', requestId: 'media-1', ok: true } as const; });
+    const { container } = await renderLineApp(api);
+    const picker = screen.getByTestId('line-media-file-input') as HTMLInputElement;
+    const attachButton = container.querySelector('.composer-actions .attach-button')!;
+    expect(attachButton.classList.contains('attach-button')).toBe(true);
+    expect(attachButton.querySelector('svg')?.getAttribute('width')).toBe('18');
+    expect(attachButton.querySelector('svg path')?.getAttribute('d')).toBe('M21.4 11.6l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5');
+    const picked = new File([new Uint8Array([1, 2])], 'picked.txt', { type: 'text/plain' });
+    const dropped = new File([new Uint8Array([3, 4])], 'dropped.txt', { type: 'text/plain' });
+    fireEvent.change(picker, { target: { files: [picked] } });
+    fireEvent.drop(screen.getByRole('textbox', { name: 'LINE 訊息' }), { dataTransfer: { files: [dropped] } });
+    fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'hello first' } });
+    expect(screen.getByText('picked.txt')).toBeTruthy();
+    expect(screen.getByText('dropped.txt')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
+    await waitFor(() => expect(order).toEqual(['text', 'media:picked.txt', 'media:dropped.txt']));
+  });
+
+  it('keeps the uncertain attachment and stops the remaining media batch', async () => {
+    const api = fakeApi();
+    api.sendManualMedia = vi.fn(async () => ({ type: 'error', requestId: 'media-unknown', ok: false,
+      code: 'LINE_SEND_OUTCOME_UNKNOWN', message: 'unknown', retryable: false } as const));
+    await renderLineApp(api);
+    const picker = screen.getByTestId('line-media-file-input') as HTMLInputElement;
+    const files = [new File([new Uint8Array([1])], 'first.txt'), new File([new Uint8Array([2])], 'second.txt')];
+    fireEvent.change(picker, { target: { files } });
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
+    await waitFor(() => expect(api.sendManualMedia).toHaveBeenCalledTimes(1));
+    expect(screen.getByText('first.txt')).toBeTruthy();
+    expect(screen.getByText('second.txt')).toBeTruthy();
+  });
+
+  it('reports account readiness rejection as definitely not sent', async () => {
+    const api = fakeApi();
+    api.sendManualMedia = vi.fn(async () => ({ type: 'error', requestId: 'media-not-ready', ok: false,
+      code: 'ACCOUNT_NOT_READY', message: 'not ready', retryable: false } as const));
+    await renderLineApp(api);
+    fireEvent.change(screen.getByTestId('line-media-file-input'), { target: { files: [new File([new Uint8Array([1])], 'wait.txt')] } });
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
+    expect(await screen.findByText('附件未傳送，可以重試。')).toBeTruthy();
+    expect(screen.queryByText('無法確認訊息是否已送出，請到 LINE 確認。')).toBeNull();
+    expect(screen.getByText('wait.txt')).toBeTruthy();
   });
 
   it('shows scoped account, conversation, sender, and ready-image media with text fallback', async () => {
@@ -1050,20 +1335,35 @@ describe('operator console', () => {
     expect(screen.getByRole('button', { name: '查看觀察' }).getAttribute('aria-pressed')).toBe('true');
   });
 
-  it('shows conversation Agent trigger state and provider separately from LINE reception', async () => {
+  it('shows only the selected conversation Agent trigger state beside chat resources', async () => {
     await renderLineApp(fakeApi());
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
-    expect(screen.getByText('Agent 觸發：未啟用 · Claude')).toBeTruthy();
-    expect(screen.getByText('收訊監控與 Agent 觸發分開設定')).toBeTruthy();
+    expect(screen.getByText('Agent 觸發：未啟用')).toBeTruthy();
+    expect(screen.queryByText('Agent 觸發：未啟用 · Claude')).toBeNull();
+    expect(screen.queryByText('收訊監控與 Agent 觸發分開設定')).toBeNull();
+    const statusArea = document.querySelector('.chat-header-meta');
+    expect(statusArea?.firstElementChild?.classList.contains('agent-trigger-status')).toBe(true);
+    expect(statusArea?.firstElementChild?.nextElementSibling?.classList.contains('chat-resources-actions')).toBe(true);
+    expect(screen.queryByText('已連線')).toBeNull();
   });
 
-  it('shows the enabled conversation Agent provider', async () => {
+  it('localizes the external monitoring status and preserves connected and paused labels', () => {
+    const monitored = snapshot.accounts.find((account) => account.accountId === 'account-B')!;
+    expect(accountHeaderStatusFor(monitored, 'en')).toBe('Monitoring');
+    expect(accountHeaderStatusFor(monitored, 'zh-TW')).toBe('監控中');
+    expect(accountHeaderStatusFor(monitored, 'ja')).toBe('監視中');
+    expect(accountHeaderStatusFor(monitored, 'ko')).toBe('모니터링 중');
+    expect(accountHeaderStatusFor(snapshot.accounts[0]!, 'zh-TW')).toBe('已連線');
+    expect(accountHeaderStatusFor({ ...snapshot.accounts[0]!, mode: 'PAUSED' }, 'zh-TW')).toBe('已暫停');
+  });
+
+  it('shows the enabled state for the selected conversation Agent trigger', async () => {
     const api = fakeApi();
     api.getSnapshot = vi.fn(async () => ({ ...snapshot, conversations: [{
       ...snapshot.conversations[0]!, agentEnabled: true, defaultProvider: 'codex' as const,
     }] }));
     await renderLineApp(api);
-    await screen.findByText('Agent 觸發：已啟用 · Codex');
+    await screen.findByText('Agent 觸發：已啟用');
   });
 
   it('renders committed job state delivered by the coalesced domain snapshot publisher', async () => {
@@ -1537,7 +1837,7 @@ describe('operator console', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
     fireEvent.change(await screen.findByRole('combobox', { name: 'Language' }), { target: { value: 'automatic' } });
     expect(api.setLocale).not.toHaveBeenCalled();
-    expect(screen.queryByRole('group')).toBeNull();
+    expect(screen.queryByRole('alertdialog', { name: 'Restart the application now to apply the saved language?' })).toBeNull();
   });
 
   it('coalesces rapid language changes while a save is in flight', async () => {
@@ -1873,11 +2173,12 @@ describe('operator console', () => {
     await waitFor(() => expect(api.resolveFileTypeIcon).toHaveBeenCalledWith('pdf'));
   });
 
-  it('renders Agent lifecycle status (fixed reaction-mapped glyph, stored custom icon ignored) below and outside the source message bubble', async () => {
+  it('renders Agent lifecycle status (neutral glyph, stored custom icon ignored) below and outside the source message bubble', async () => {
     const api = fakeApi();
     api.getConversationSettings = vi.fn(async () => ({
       attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true,
       agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS, running: '★' },
+      agentStatusRotationIntervalSeconds: 10,
     }));
     api.listMessages = vi.fn(async () => ({ messages: [{ ...message('account-A', 'agent-source'), agentJobId: 'job-source', agentJobStatus: 'running' as const }], olderCursor: null }));
     await renderLineApp(api);
@@ -1886,7 +2187,7 @@ describe('operator console', () => {
     expect(marker.querySelector('[aria-hidden="true"]')?.textContent).toBe(LINE_REACTION_GLYPHS.NICE);
     expect(marker.getAttribute('aria-label')).toBe('Agent 執行中');
     expect(marker.getAttribute('title')).toBe('Agent 執行中');
-    expect(marker.querySelector('.agent-status-glyph')?.getAttribute('aria-hidden')).toBe('true');
+    expect(marker.textContent).toBe(LINE_REACTION_GLYPHS.NICE);
     const row = marker.closest('.message-row')!;
     const bubble = row.querySelector('.message')!;
     expect(bubble.contains(marker)).toBe(false);
@@ -1894,7 +2195,7 @@ describe('operator console', () => {
     expect(bubble.compareDocumentPosition(marker) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it('shows the reaction-mapped glyph for running, completed and failed chat markers', async () => {
+  it('shows neutral reaction glyphs for running, completed and failed chat markers', async () => {
     const api = fakeApi();
     api.listMessages = vi.fn(async () => ({ messages: [
       { ...message('account-A', 'agent-r'), agentJobId: 'job-r', agentJobStatus: 'running' as const },
@@ -1911,7 +2212,7 @@ describe('operator console', () => {
 
   it('always renders the Agent marker even when the stored toggle is false', async () => {
     const api = fakeApi();
-    api.getConversationSettings = vi.fn(async () => ({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: false, agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS } }));
+    api.getConversationSettings = vi.fn(async () => ({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: false, agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS }, agentStatusRotationIntervalSeconds: 10 }));
     api.listMessages = vi.fn(async () => ({ messages: [{ ...message('account-A', 'agent-hidden'), agentJobId: 'job-hidden', agentJobStatus: 'running' as const }], olderCursor: null }));
     await renderLineApp(api);
     await waitFor(() => expect(document.querySelector('.agent-status-marker.running[role="status"]')).toBeTruthy());
@@ -2471,7 +2772,7 @@ describe('operator console', () => {
     Object.defineProperty(list, 'scrollTop', { configurable: true, get: () => top, set: (value: number) => { top = value; } });
     fireEvent.scroll(list);
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'hello' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     await waitFor(() => expect(api.sendText).toHaveBeenCalled());
     expect(top).toBe(1000);
   });
@@ -2484,7 +2785,7 @@ describe('operator console', () => {
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     expect(screen.getByTestId('composer-status').textContent).toBe('');
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'hello' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     const slotAlert = await waitFor(() => {
       const found = within(screen.getByTestId('composer-status')).getByRole('alert');
       return found;
@@ -2492,7 +2793,7 @@ describe('operator console', () => {
     expect(slotAlert.textContent).toContain('訊息未送出');
     expect(slotAlert.closest('.error-banner')).toBeNull();
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'hello again' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     await waitFor(() => expect(api.sendText).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(within(screen.getByTestId('composer-status')).queryByRole('alert')).toBeNull());
     expect(screen.getByTestId('composer-status')).toBeTruthy();
@@ -2567,8 +2868,8 @@ describe('operator console', () => {
     const row = replyButton.closest('.message-row');
     expect(actions).toBeTruthy();
     expect(row?.contains(bubble)).toBe(true);
-    expect(bubble?.nextElementSibling).toBe(bubble?.parentElement?.querySelector('.message-time'));
-    expect(actions?.parentElement).toBe(row);
+    expect(bubble?.nextElementSibling?.classList.contains('message-trailing-meta')).toBe(true);
+    expect(actions?.parentElement?.classList.contains('message-trailing-meta')).toBe(true);
     expect(bubble?.contains(actions!)).toBe(false);
     fireEvent.click(replyButton);
 
@@ -2735,7 +3036,7 @@ describe('operator console', () => {
     await screen.findByText('待回覆訊息');
     fireEvent.click(screen.getByRole('button', { name: '回覆' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: '收到' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
 
     await waitFor(() => expect(api.replyText).toHaveBeenCalledOnce());
     await waitFor(() => expect(document.querySelector('.reply-preview')).toBeNull());
@@ -2753,9 +3054,9 @@ describe('operator console', () => {
     await renderLineApp(api);
     expect(await screen.findAllByRole('button', { name: /同名群組.*群組/ })).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
-    expect(screen.getByTestId('address-plate').textContent).toContain('觀察');
     expect(screen.getByTestId('address-plate').textContent).toContain('群組');
-    expect(screen.getByTestId('address-plate').textContent).toContain('僅監控');
+    expect(screen.getByTestId('address-plate').textContent).toContain('Agent 觸發：未啟用');
+    expect(screen.getByTestId('address-plate').textContent).not.toContain('觀察');
     expect(screen.getByTestId('address-plate').textContent).not.toContain('account-B');
     expect(screen.getByTestId('address-plate').textContent).not.toContain('same-chat');
     expect(screen.queryByText('正在切換主操作帳號…')).toBeNull();
@@ -2769,12 +3070,12 @@ describe('operator console', () => {
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'LINE draft' } });
     expect(screen.queryByRole('textbox', { name: 'Agent 訊息' })).toBeNull();
-    expect(screen.getByRole('button', { name: '傳送到 LINE' }).hasAttribute('disabled')).toBe(false);
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    expect(screen.getByRole('button', { name: '傳送' }).hasAttribute('disabled')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     await waitFor(() => expect(api.sendText).toHaveBeenCalledWith({ accountId: 'account-B', chatType: 'group', chatId: 'same-chat' }, 'LINE draft'));
     fireEvent.click(await screen.findByRole('button', { name: '回覆' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'LINE reply' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     await waitFor(() => expect(api.replyText).toHaveBeenCalledWith({ accountId: 'account-B', chatType: 'group', chatId: 'same-chat' }, 'admin-source', 'LINE reply'));
     expect(api.submitAgentRoomPrompt).not.toHaveBeenCalled();
   });
@@ -2789,9 +3090,9 @@ describe('operator console', () => {
     await screen.findByText('monitor-message');
 
     expect(await screen.findByText('僅監控，無法傳送')).toBeTruthy();
-    expect(screen.queryByText('監控中')).toBeNull();
+    expect(within(screen.getByTestId('address-plate')).getByText('Agent 觸發：未啟用')).toBeTruthy();
     expect(screen.queryByRole('textbox', { name: 'LINE 訊息' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '傳送到 LINE' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '傳送' })).toBeNull();
     expect(screen.queryByRole('button', { name: '回覆' })).toBeNull();
     expect(document.getElementById('composer')).toBeNull();
   });
@@ -2821,7 +3122,6 @@ describe('operator console', () => {
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
     await screen.findByText('offline-message');
     expect(within(screen.getByTestId('composer-status')).getByText('未登入')).toBeTruthy();
-    expect(screen.queryByText('監控中')).toBeNull();
   });
 
   it('shows the database-empty copy for an empty timeline of a disconnected account', async () => {
@@ -2858,9 +3158,8 @@ describe('operator console', () => {
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
 
     expect(await screen.findByText('僅監控，無法傳送')).toBeTruthy();
-    expect(screen.queryByText('監控中')).toBeNull();
     expect(screen.queryByRole('textbox', { name: 'LINE 訊息' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '傳送到 LINE' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '傳送' })).toBeNull();
   });
 
   it('shows a new-message indicator without scrolling a reader away from older messages', async () => {
@@ -2939,7 +3238,7 @@ describe('operator console', () => {
     await renderLineApp(api);
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'reply A' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
     await act(async () => { send.resolve({ type: 'accepted', requestId: 'x', ok: true }); await send.promise; });
     expect(screen.queryByText('LINE 動作已交付；請留意送達狀態。')).toBeNull();
@@ -2951,7 +3250,7 @@ describe('operator console', () => {
     await renderLineApp(api);
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'hello' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
 
     expect(await screen.findByText('LINE 傳送結果不確定；請先確認對話內容。')).toBeTruthy();
     expect(screen.queryByRole('button', { name: /重新傳送/ })).toBeNull();
@@ -2967,7 +3266,7 @@ describe('operator console', () => {
     await renderLineApp(api);
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'hello' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     const retry = await screen.findByRole('button', { name: '重新傳送訊息' });
     expect(retry.closest('.message-row')?.textContent).toContain('hello');
     fireEvent.click(retry);
@@ -2984,7 +3283,7 @@ describe('operator console', () => {
     await renderLineApp(api);
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'offline page' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     fireEvent.click(screen.getByRole('button', { name: '搜尋' }));
     await act(async () => { send.resolve({ type: 'error', requestId: 'x', ok: false, code: 'LINE_SEND_NOT_STARTED', message: 'denied', retryable: false }); await send.promise; });
     fireEvent.click(screen.getByRole('button', { name: '聊天' }));
@@ -2999,7 +3298,7 @@ describe('operator console', () => {
     await renderLineApp(api);
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'route A payload' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
     expect(screen.queryByText('route A payload')).toBeNull();
     await act(async () => { send.resolve({ type: 'error', requestId: 'x', ok: false, code: 'LINE_SEND_NOT_STARTED', message: 'denied', retryable: false }); await send.promise; });
@@ -3020,7 +3319,7 @@ describe('operator console', () => {
     await screen.findByText('target-one');
     fireEvent.click(screen.getAllByRole('button', { name: '回覆' })[0]!);
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'old reply' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     await waitFor(() => expect(api.replyText).toHaveBeenCalledOnce());
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
     fireEvent.click(screen.getByRole('button', { name: '查看工作' }));
@@ -3031,7 +3330,7 @@ describe('operator console', () => {
     await act(async () => { reply.resolve({ type: 'accepted', requestId: 'old', ok: true }); await reply.promise; });
     expect(input.value).toBe('new reply');
     expect(document.querySelector('.reply-quote')?.textContent).toBe('target-two');
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     await waitFor(() => expect(api.replyText).toHaveBeenCalledTimes(2));
     expect(api.replyText).toHaveBeenLastCalledWith({ accountId: 'account-A', chatType: 'group', chatId: 'same-chat' }, 'target-two', 'new reply');
   });
@@ -3044,7 +3343,7 @@ describe('operator console', () => {
     await renderLineApp(api);
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'hello' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     const retry = await screen.findByRole('button', { name: '重新傳送訊息' });
     publish({ ...snapshot, accounts: snapshot.accounts.map((item) => item.accountId === 'account-A' ? { ...item, canSendManually: false } : item) });
     await waitFor(() => expect(retry.hasAttribute('disabled')).toBe(true));
@@ -3061,7 +3360,7 @@ describe('operator console', () => {
     await screen.findByText('reply-target');
     fireEvent.click(screen.getByRole('button', { name: '回覆' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'reply body' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     const retry = await screen.findByRole('button', { name: '重新傳送訊息' });
     fireEvent.click(retry);
     await waitFor(() => expect(api.replyText).toHaveBeenCalledTimes(2));
@@ -3077,7 +3376,7 @@ describe('operator console', () => {
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     const input = () => screen.getByRole('textbox', { name: 'LINE 訊息' }) as HTMLTextAreaElement;
     fireEvent.change(input(), { target: { value: 'first draft' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
     fireEvent.click(screen.getByRole('button', { name: '查看工作' }));
     fireEvent.change(input(), { target: { value: 'new draft' } });
@@ -3093,7 +3392,7 @@ describe('operator console', () => {
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     const input = screen.getByRole('textbox', { name: 'LINE 訊息' }) as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'submitted' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     fireEvent.change(input, { target: { value: 'new draft' } });
     await act(async () => { send.resolve({ type: 'accepted', requestId: 'old', ok: true }); await send.promise; });
     expect(input.value).toBe('new draft');
@@ -3107,7 +3406,7 @@ describe('operator console', () => {
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
     const input = screen.getByRole('textbox', { name: 'LINE 訊息' }) as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'submitted' } });
-    fireEvent.click(screen.getByRole('button', { name: '傳送到 LINE' }));
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     fireEvent.change(input, { target: { value: 'temporary edit' } });
     fireEvent.change(input, { target: { value: 'submitted' } });
     await act(async () => { send.resolve({ type: 'accepted', requestId: 'old', ok: true }); await send.promise; });

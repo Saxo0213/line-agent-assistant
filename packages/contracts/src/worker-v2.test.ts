@@ -4,6 +4,29 @@ import { LineWorkerCommandSchema, LineWorkerEventSchema } from './worker-v2.js';
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const cursor = { version: 1, revision: '1', globalRev: '2', individualRev: '3' };
 
+it('bounds chat resource reads and image result payloads', () => {
+  const command = { type: 'chatResourceRead', ...binding, chatType: 'group', chatId: `c${'a'.repeat(32)}`,
+    requestId: 'resource-1', action: 'downloadAlbumPhoto', albumId: 'album-1', photoId: 'photo-1', oid: 'oid-1',
+    prefix: 'album/a', maxBytes: 1024, timeoutMs: 10_000 };
+  expect(LineWorkerCommandSchema.safeParse(command).success).toBe(true);
+  expect(LineWorkerCommandSchema.safeParse({ ...command, maxBytes: 20 * 1024 * 1024 + 1 }).success).toBe(false);
+  expect(LineWorkerCommandSchema.safeParse({ ...command, albumId: undefined }).success).toBe(false);
+  const event = { type: 'chatResourceResult', ...binding, chatType: 'group', chatId: command.chatId,
+    requestId: command.requestId, action: command.action, ok: true, error: null, bytes: new Uint8Array([1, 2]) };
+  expect(LineWorkerEventSchema.safeParse(event).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ ...event, bytes: new Uint8Array(20 * 1024 * 1024 + 1) }).success).toBe(false);
+  const { bytes: _bytes, ...eventBase } = event;
+  const failed = { ...eventBase, action: 'listNotes', ok: false, error: 'response_code_invalid' };
+  for (const responseCode of [-1_000_000_000, 1_000_000_000, 'missing', 'non_numeric']) {
+    expect(LineWorkerEventSchema.safeParse({ ...failed, responseCode }).success).toBe(true);
+  }
+  expect(LineWorkerEventSchema.safeParse({ ...event, responseCode: 403 }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...failed, action: 'listAlbums', responseCode: 403 }).success).toBe(false);
+  for (const responseCode of [-1_000_000_001, 1_000_000_001, 'private response']) {
+    expect(LineWorkerEventSchema.safeParse({ ...failed, responseCode }).success).toBe(false);
+  }
+});
+
 it('carries optional nullable picture paths through login identity and scoped catalog entries', () => {
   const login = LineWorkerEventSchema.parse({ type: 'login', ...binding, loginAttemptId: 'attempt-1',
     ownMid: 'u-self', displayName: 'Agent', picturePath: 'https://profile.line-scdn.net/avatar.png' });
@@ -40,6 +63,13 @@ it('accepts only fixed, attempt-correlated terminal login failure diagnostics', 
   expect(LineWorkerEventSchema.safeParse({ ...failure, code: 'NOT_AUTHORIZED_DEVICE' }).success).toBe(false);
   expect(LineWorkerEventSchema.safeParse({ ...failure, message: 'token:secret' }).success).toBe(false);
   expect(LineWorkerEventSchema.safeParse({ ...failure, rawError: 'response body' }).success).toBe(false);
+});
+
+it('accepts only enumerated worker command failure codes', () => {
+  const failure = { type: 'error', ...binding, code: 'HISTORY_READ_FAILED',
+    message: 'LINE chat history could not be read.', retryable: false };
+  expect(LineWorkerEventSchema.safeParse(failure).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ ...failure, code: 'private exception text' }).success).toBe(false);
 });
 
 it('requires the owner-bound worker protocol version on init and acknowledges only the same version', () => {

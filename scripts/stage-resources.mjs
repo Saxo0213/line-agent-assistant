@@ -196,6 +196,7 @@ export async function stageResources({ repositoryRoot = thisRepositoryRoot, outp
   await pruneRuntimeDependencies(path.join(workerRoot, 'node_modules'));
 
   await copyRequired(path.join(repositoryRoot, 'packages', 'agent-bridge', 'dist', 'native', 'JobHost.exe'), path.join(outputRoot, 'native', 'JobHost.exe'));
+  if (process.platform === 'win32') await copyRequired(path.join(repositoryRoot, 'apps', 'desktop', 'dist', 'native', 'ChatResourceArchiveHost.exe'), path.join(outputRoot, 'native', 'ChatResourceArchiveHost.exe'));
   await copyRequired(path.join(repositoryRoot, 'packages', 'database', 'migrations'), path.join(outputRoot, 'database', 'migrations'));
   await copyRequired(path.join(repositoryRoot, 'skills', 'linejs-mcp'), path.join(outputRoot, 'skills', 'linejs-mcp'));
 

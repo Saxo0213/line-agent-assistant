@@ -4,18 +4,22 @@ import { allPermissions, McpDomainError, type McpTokenRepository, type MessageRe
 import { AGENT_PERMISSION_IDS, MCP_TOOL_NAMES, type AgentPermissionId, type EffectivePermissions } from '@line-agent/contracts';
 import { AGENT_ROOM_HISTORY_TOOL_DEFINITION, MCP_TOOL_DEFINITIONS, McpService } from './mcp-service.js';
 import { AgentApprovalBroker, type AgentApprovalEvent } from './agent-approval-broker.js';
+import { createOperationalAudit, type AuditEvent } from './operational-audit.js';
 
 const withEffects = (overrides: Partial<Record<AgentPermissionId, 'ALLOW' | 'DENY'>>): EffectivePermissions =>
   ({ ...allPermissions('DENY'), ...overrides });
 
-function harness(permissions: EffectivePermissions, onCall?: () => never, roomHistory = false) {
+function harness(permissions: EffectivePermissions, onCall?: () => never, roomHistory = false, onDiagnostic?: ConstructorParameters<typeof McpService>[0]['onDiagnostic']) {
   const tokens = {
     verifyInternalAgent: async () => permissions,
     verifyInternalAgentAccess: async () => ({ permissions, roomHistory }),
     executeForInternalAgent: async () => { if (onCall) onCall(); return { toolName: 'list_targets', targets: [] }; },
     recordAudit: async () => undefined,
   } as unknown as McpTokenRepository;
-  const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository });
+  const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository,
+    ...(onDiagnostic ? { onDiagnostic } : {}),
+    chatResources: { listNotes: async () => ({ notes: [], nextCursor: null, savedAt: null }), getNote: async () => ({ note: null, savedAt: null }),
+      listAlbums: async () => ({ albums: [], nextCursor: null, savedAt: null }), getAlbum: async () => ({ album: null, photos: [], savedAt: null }) } });
   const { token } = service.internalCapabilities.mint({ jobId: 'job-1', generation: 1, accountId: 'a', endpointInstance: 'instance' });
   const rpc = (method: string, params?: unknown) => service.handleInternalJsonRpc(token, 'instance',
     { jsonrpc: '2.0', id: 1, method, ...(params === undefined ? {} : { params }) });
@@ -23,11 +27,44 @@ function harness(permissions: EffectivePermissions, onCall?: () => never, roomHi
 }
 
 describe('internal MCP tools/list and tools/call follow the effective permissions', () => {
+  it('contains unexpected internal exception text at the JSON-RPC boundary', async () => {
+    const sentinel = 'private-token-path-prompt-sentinel';
+    const reports = vi.fn();
+    const { rpc, service } = harness(allPermissions('ALLOW'), () => { throw new Error(sentinel); }, false, reports);
+    try {
+      const response = await rpc('tools/call', { name: 'list_targets', arguments: {} });
+      expect(response.httpStatus).toBe(500);
+      expect(response.body).toMatchObject({ error: { code: -32603, message: 'Internal MCP server error.' } });
+      expect(JSON.stringify(response)).not.toContain(sentinel);
+      expect(reports).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mcp' }), { jobId: 'job-1', accountId: 'a', correlationId: expect.any(String) });
+    } finally { await service.shutdown(); }
+  });
+
+  it('contains unexpected external exception text at the JSON-RPC boundary', async () => {
+    const sentinel = 'private-token-path-prompt-sentinel';
+    const tokens = { executeWithVerifiedToken: async () => { throw new Error(sentinel); } } as unknown as McpTokenRepository;
+    const stored: AuditEvent[] = [];
+    const audit = createOperationalAudit({ append: async (event) => { stored.push(event); }, appendFallback: async () => {}, logSinkState() {} });
+    const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository,
+      onDiagnostic: (diagnostic, identity) => { audit.failure(diagnostic, identity); } });
+    try {
+      const response = await service.handleExternalJsonRpc('not-a-real-token', { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      expect(response.httpStatus).toBe(500);
+      expect(response.body).toMatchObject({ error: { code: -32603, message: 'Internal MCP server error.' } });
+      expect(JSON.stringify(response)).not.toContain(sentinel);
+      await service.handleExternalJsonRpc('not-a-real-token', { jsonrpc: '2.0', id: 'private-external-id-sentinel', method: 'tools/list' });
+      await audit.flush();
+      expect(stored).toHaveLength(2);
+      expect(stored[0]?.correlationId).not.toBe(stored[1]?.correlationId);
+      expect(JSON.stringify(stored)).not.toMatch(/private-external-id-sentinel|private-token-path-prompt-sentinel|not-a-real-token/);
+    } finally { await service.shutdown(); }
+  });
+
   it('lists the record tools when either records permission resolves ALLOW', async () => {
     for (const permission of ['records.query_current_chat', 'records.query_all_chats'] as const) {
       const { rpc, service } = harness(withEffects({ [permission]: 'ALLOW' }));
       const names = ((await rpc('tools/list')).body as { result: { tools: Array<{ name: string }> } }).result.tools.map((tool) => tool.name);
-      expect(names).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time']);
+      expect(names).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album']);
       await service.shutdown();
     }
   });
@@ -37,7 +74,7 @@ describe('internal MCP tools/list and tools/call follow the effective permission
     expect(((await denied.rpc('tools/list')).body as { result: { tools: unknown[] } }).result.tools).toEqual([]);
     await denied.service.shutdown();
     const admin = harness(allPermissions('ALLOW'));
-    expect(((await admin.rpc('tools/list')).body as { result: { tools: unknown[] } }).result.tools).toHaveLength(3);
+    expect(((await admin.rpc('tools/list')).body as { result: { tools: unknown[] } }).result.tools).toHaveLength(7);
     await admin.service.shutdown();
     expect(AGENT_PERMISSION_IDS).toHaveLength(5);
   });
@@ -57,10 +94,10 @@ describe('Agent room history tool visibility', () => {
 
   it('lists the history tool only when the repository says the Agent room (or its shared chat) may use it', async () => {
     const allowed = harness(allPermissions('ALLOW'), undefined, true);
-    expect(await names(allowed.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'query_agent_room_history']);
+    expect(await names(allowed.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album', 'query_agent_room_history']);
     await allowed.service.shutdown();
     const denied = harness(allPermissions('ALLOW'), undefined, false);
-    expect(await names(denied.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time']);
+    expect(await names(denied.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album']);
     await denied.service.shutdown();
   });
 

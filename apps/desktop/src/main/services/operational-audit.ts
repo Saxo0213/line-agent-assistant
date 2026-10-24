@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
 
 export const AUDIT_ACTIONS = [
   'app_start', 'app_stop', 'service_start', 'service_stop', 'worker_start', 'worker_stop', 'worker_restart',
@@ -9,7 +10,8 @@ export const AUDIT_ACTIONS = [
   'audit_sink_failed', 'audit_sink_recovered',
   'friend_enrollment', 'friend_relation_initial', 'friend_add_attempt', 'friend_relation_recheck',
   'friend_authorization_precheck', 'friend_grant_commit',
-  'worker_operation_error', 'line_catalog_refresh',
+  'worker_operation_error', 'line_catalog_refresh', 'runtime_error',
+  'album_photo_download',
 ] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
 export const AUDIT_INITIATORS = ['user', 'system', 'worker'] as const;
@@ -29,7 +31,10 @@ export const AUDIT_ERROR_CODES = [
   'RELATION_OUTCOME_UNKNOWN', 'ENROLLMENT_BINDING_CHANGED', 'SIDE_EFFECT_DENIED', 'NOT_STARTED',
   'TRANSPORT_OUTCOME_UNKNOWN', 'ENROLLMENT_PRECHECK_FAILED', 'ENROLLMENT_GRANT_FAILED',
   'ENROLLMENT_REPLY_FAILED', 'ENROLLMENT_REPLY_UNKNOWN', 'INVALID_COMMAND', 'QUEUE_FULL',
-  'CATALOG_REFRESH_FAILED', 'WORKER_OPERATION_FAILED',
+  'CATALOG_REFRESH_FAILED', 'WORKER_OPERATION_FAILED', 'HISTORY_READ_FAILED', 'CHAT_RESOURCE_READ_FAILED',
+  'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED', 'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED',
+  'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED', 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED',
+  'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED',
 ] as const;
 export type AuditErrorCode = typeof AUDIT_ERROR_CODES[number];
 export const AUDIT_RESULT_CODES = ['worker_stopped', 'secret_removed', 'agent_auth_action_completed', 'audit_sink_recovered',
@@ -40,6 +45,7 @@ export const AUDIT_RESULT_CODES = ['worker_stopped', 'secret_removed', 'agent_au
 export type AuditResultCode = typeof AUDIT_RESULT_CODES[number];
 
 export interface AuditEvent {
+  diagnostic?: SafeDiagnostic;
   action: AuditAction;
   phase: AuditPhase;
   initiator: AuditInitiator;
@@ -57,7 +63,7 @@ export interface AuditEvent {
 }
 
 export type AuditFields = Pick<AuditEvent, 'initiator'> & Partial<Pick<AuditEvent,
-  'accountId' | 'workerInstanceId' | 'loginAttemptId' | 'requestId' | 'jobId' | 'reasonCode'>>;
+  'accountId' | 'workerInstanceId' | 'loginAttemptId' | 'requestId' | 'jobId' | 'reasonCode' | 'diagnostic'>>;
 export interface OperationalAuditDependencies {
   append(event: AuditEvent): Promise<void>;
   appendFallback(event: AuditEvent): Promise<void>;
@@ -88,6 +94,11 @@ export function parseOperationalAuditEvent(value: unknown): AuditEvent | null {
     || typeof input.createdAt !== 'string' || !Number.isFinite(Date.parse(input.createdAt))) return null;
   const event: AuditEvent = { action: input.action as AuditAction, phase: input.phase as AuditPhase,
     initiator: input.initiator as AuditInitiator, correlationId: input.correlationId, createdAt: input.createdAt };
+  if (input.diagnostic !== undefined) {
+    const diagnostic = parseSafeDiagnostic(input.diagnostic);
+    if (!diagnostic) return null;
+    event.diagnostic = diagnostic;
+  }
   for (const key of ['accountId', 'workerInstanceId', 'loginAttemptId', 'requestId', 'jobId'] as const) {
     const field = input[key];
     if (field !== undefined) {
@@ -118,9 +129,14 @@ export function createOperationalAudit(dependencies: OperationalAuditDependencie
   const capacity = Math.max(1, dependencies.capacity ?? 2048);
   const queue: AuditEvent[] = [];
   const pendingActions = new Map<string, { action: AuditAction; fields: AuditFields }>();
+  // One bounded coalescer for background failures; no per-operation timers or retained errors.
+  const recentFailures = new Map<string, { at: number; correlationId: string }>();
   let droppedCount = 0;
   let draining: Promise<void> | undefined;
   let dbFailed = false;
+  let fallbackFailed = false;
+  const sinkReports = new Set<string>();
+  let sinkFailureEvent: AuditEvent | undefined;
   let shutdownAbandoned = false;
   const sinkTimeoutMs = Math.max(1, dependencies.sinkTimeoutMs ?? 2000);
   const fallbackTimeoutMs = Math.max(1, dependencies.fallbackTimeoutMs ?? 2000);
@@ -133,7 +149,18 @@ export function createOperationalAudit(dependencies: OperationalAuditDependencie
     finally { if (timer) clearTimeout(timer); }
   };
   const reportSink = (state: 'failed' | 'recovered', errorCode: AuditErrorCode) => {
+    const key = `${state}:${errorCode}`;
+    if (sinkReports.has(key)) return;
+    sinkReports.add(key);
+    sinkReports.delete(`${state === 'failed' ? 'recovered' : 'failed'}:${errorCode}`);
     try { dependencies.logSinkState(state, errorCode, droppedCount); } catch { /* Logging must not escape into lifecycle work. */ }
+    const event = makeEvent(state === 'failed' ? 'audit_sink_failed' : 'audit_sink_recovered', 'observed', {
+      initiator: 'system', correlationId: randomUUID(), ...(state === 'failed' ? { errorCode } : { resultCode: 'audit_sink_recovered' }),
+      diagnostic: { operation: 'audit_sink', stage: 'write', category: 'persistence_failed',
+        recovery: state === 'failed' ? 'check_configuration' : 'none', outcome: state === 'failed' ? 'failed' : 'recovered' }, droppedCount });
+    // Do not feed a failure into its failed sink. Retain one fixed event and persist it with recovery.
+    if (state === 'failed') sinkFailureEvent = event;
+    else { if (sinkFailureEvent) enqueue(sinkFailureEvent); sinkFailureEvent = undefined; enqueue(event); }
   };
 
   const enqueue = (event: AuditEvent): void => {
@@ -163,14 +190,17 @@ export function createOperationalAudit(dependencies: OperationalAuditDependencie
         const wasOnline = !dbFailed;
         dbFailed = true;
         if (wasOnline) reportSink('failed', 'DATABASE_WRITE_FAILED');
-        await withTimeout(() => dependencies.appendFallback(event), fallbackTimeoutMs, 'AUDIT_FALLBACK_TIMEOUT').catch(() => {
+        await withTimeout(() => dependencies.appendFallback(event), fallbackTimeoutMs, 'AUDIT_FALLBACK_TIMEOUT').then(() => {
+          if (fallbackFailed) { fallbackFailed = false; reportSink('recovered', 'FALLBACK_WRITE_FAILED'); }
+        }, () => {
+          fallbackFailed = true;
+          droppedCount += 1;
           reportSink('failed', 'FALLBACK_WRITE_FAILED');
         });
       } else {
         if (dbFailed) {
           dbFailed = false;
           reportSink('recovered', 'DATABASE_WRITE_FAILED');
-          droppedCount = 0;
         }
       }
     }
@@ -193,11 +223,32 @@ export function createOperationalAudit(dependencies: OperationalAuditDependencie
     if (fields.reasonCode) event.reasonCode = fields.reasonCode;
     if (fields.resultCode) event.resultCode = fields.resultCode;
     if (fields.errorCode) event.errorCode = fields.errorCode;
+    const diagnostic = parseSafeDiagnostic(fields.diagnostic);
+    if (diagnostic) event.diagnostic = diagnostic;
     if (fields.droppedCount !== undefined) event.droppedCount = Math.max(0, Math.trunc(fields.droppedCount));
     return event;
   };
 
   return {
+    failure(diagnostic: SafeDiagnostic, fields: Partial<AuditFields> & { correlationId?: string; background?: boolean } = {}, errorCode: AuditErrorCode = 'UNKNOWN', action: AuditAction = 'runtime_error'): string | undefined {
+      const safe = parseSafeDiagnostic(diagnostic);
+      if (!safe || safe.category === 'cancelled') return;
+      const now = Date.now();
+      const key = JSON.stringify([action, errorCode, safe.operation, safe.stage, safe.category, safe.reason, safe.provider, safe.statusCode, safe.outcome,
+        boundedId(fields.accountId), boundedId(fields.workerInstanceId), boundedId(fields.requestId), boundedId(fields.jobId), boundedId(fields.loginAttemptId)]);
+      // Foreground attempts remain separate even when they reuse a job/attachment ID.
+      // Only an owner may explicitly declare a repeating background failure.
+      const coalesce = fields.background === true;
+      const scopedKey = `${key}:${boundedId(fields.correlationId) ?? ''}`;
+      const recent = coalesce ? recentFailures.get(scopedKey) : undefined;
+      if (recent && now - recent.at < 30_000) return recent.correlationId;
+      if (coalesce && recentFailures.size >= 128) recentFailures.delete(recentFailures.keys().next().value!);
+      const correlationId = boundedId(fields.correlationId) ?? boundedId(fields.requestId) ?? randomUUID();
+      if (coalesce) recentFailures.set(scopedKey, { at: now, correlationId });
+      enqueue(makeEvent(action, 'observed', { ...fields, initiator: fields.initiator ?? 'system',
+        correlationId, errorCode, diagnostic: safe }));
+      return correlationId;
+    },
     request(action: AuditAction, fields: AuditFields): string {
       const correlationId = boundedId(fields.requestId) ?? randomUUID();
       if (pendingActions.size >= capacity) {
@@ -217,6 +268,11 @@ export function createOperationalAudit(dependencies: OperationalAuditDependencie
     observed(action: AuditAction, fields: AuditFields & { correlationId?: string; resultCode?: AuditResultCode; errorCode?: AuditErrorCode; droppedCount?: number }): void {
       enqueue(makeEvent(action, 'observed', { ...fields, correlationId: fields.correlationId ?? randomUUID() }));
     },
+    outcome(action: AuditAction, phase: 'succeeded' | 'failed', fields: AuditFields & {
+      correlationId?: string; resultCode?: AuditResultCode; errorCode?: AuditErrorCode;
+    }): void {
+      enqueue(makeEvent(action, phase, { ...fields, correlationId: fields.correlationId ?? randomUUID() }));
+    },
     async flush(): Promise<void> {
       if (!draining || shutdownAbandoned) return;
       const activeDrain = draining;
@@ -233,6 +289,8 @@ export function createOperationalAudit(dependencies: OperationalAuditDependencie
       }
     },
     get droppedCount(): number { return droppedCount; },
+    health() { return { databaseFailed: dbFailed, fallbackFailed, droppedCount, queuedCount: queue.length, failureKeys: recentFailures.size }; },
+    sinkEvents(): AuditEvent[] { return sinkFailureEvent ? [sinkFailureEvent] : []; },
     get pendingActionCount(): number { return pendingActions.size; },
   };
 }

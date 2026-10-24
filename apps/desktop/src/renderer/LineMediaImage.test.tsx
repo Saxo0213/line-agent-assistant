@@ -4,9 +4,32 @@ import React from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import { lineMediaUrl } from '@line-agent/contracts';
-import { LineMediaImage } from './LineMediaImage.js';
+import { accountAvatarRefreshed, LineMediaImage } from './LineMediaImage.js';
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+it('reloads only account and own direct-chat avatar projections when their path is unchanged', () => {
+  const accountId = 'account-refresh-test';
+  const ownMid = `u${'d'.repeat(32)}`;
+  const view = render(<>
+    <LineMediaImage enabled target={{ type: 'account', accountId }} fallbackKind="person" className="avatar" alt="account" />
+    <LineMediaImage enabled target={{ type: 'conversation', accountId, chatType: 'direct', chatId: ownMid }} fallbackKind="person" className="avatar" alt="own conversation" />
+    <LineMediaImage enabled target={{ type: 'member', accountId, chatType: 'group', chatId: 'group-1', memberId: ownMid }} fallbackKind="person" className="avatar" alt="own member" />
+    <LineMediaImage enabled target={{ type: 'conversation', accountId, chatType: 'direct', chatId: 'u-peer' }} fallbackKind="person" className="avatar" alt="peer conversation" />
+    <LineMediaImage enabled target={{ type: 'member', accountId, chatType: 'group', chatId: 'group-1', memberId: 'u-peer' }} fallbackKind="person" className="avatar" alt="peer member" />
+  </>);
+  const before = Object.fromEntries(['account', 'own conversation', 'own member', 'peer conversation', 'peer member']
+    .map((alt) => [alt, screen.getByAltText(alt)]));
+
+  act(() => accountAvatarRefreshed(accountId, ownMid));
+
+  for (const alt of ['account', 'own conversation', 'own member']) {
+    const after = screen.getByAltText(alt);
+    expect(after).not.toBe(before[alt]);
+    expect(after.getAttribute('src')).toBe(before[alt]?.getAttribute('src'));
+  }
+  for (const alt of ['peer conversation', 'peer member']) expect(screen.getByAltText(alt)).toBe(before[alt]);
+});
 
 it('renders a fixed media URL directly and uses the existing fallback on error', async () => {
   render(<LineMediaImage enabled target={{ type: 'conversation', accountId: 'account A', chatType: 'group', chatId: 'chat/A' }}

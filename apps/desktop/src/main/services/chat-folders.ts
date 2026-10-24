@@ -15,6 +15,7 @@ export class ChatFolderError extends Error {
 
 export interface ChatFolderStore {
   ensureChatFolder(accountId: string, chatType: string, chatId: string, createdBy: string): Promise<ChatFolderRow>;
+  getChatFolderForConversation?(accountId: string, chatType: string, chatId: string): Promise<ChatFolderRow | null>;
 }
 
 /** `child` is strictly inside `parent` (never equal), compared on canonical paths. */
@@ -65,6 +66,27 @@ export class ChatFolderService {
     }
     await this.writeMetadata(folderReal, folder).catch(() => undefined);
     return { folder, path: folderReal };
+  }
+
+  /** Resolves an existing folder without creating a database row, directory, or metadata file. */
+  async resolveExisting(accountId: string, chatType: string, chatId: string): Promise<{ folder: ChatFolderRow; path: string } | null> {
+    if (!this.store.getChatFolderForConversation) return null;
+    const folder = await this.store.getChatFolderForConversation(accountId, chatType, chatId);
+    if (!folder) return null;
+    try {
+      const root = await realpath(await this.workspace.current());
+      const layerReal = await realpath(join(root, chatLayerDirectory(chatType)));
+      if (!isStrictlyInside(root, layerReal)) throw new ChatFolderError('The chat folder layer escapes the workspace.');
+      const expected = join(layerReal, folder.folderId);
+      const folderReal = await realpath(expected);
+      if (!isStrictlyInside(layerReal, folderReal) || folderReal !== expected || !(await lstat(folderReal)).isDirectory()) {
+        throw new ChatFolderError('The chat folder escapes its layer.');
+      }
+      return { folder, path: folderReal };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error instanceof ChatFolderError ? error : new ChatFolderError('The existing chat folder could not be resolved.');
+    }
   }
 
   /** Read-only lookup for Settings: the validated path and usage, or nulls when the folder does not exist (yet). */

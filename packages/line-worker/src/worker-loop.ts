@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   isLocalAgentRoom, MEDIA_FILE_MAX_BYTES, MEDIA_IMAGE_MAX_BYTES, LineWorkerCommandSchema, LineWorkerEventSchema,
   WORKER_PROTOCOL_VERSION, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue as ContractJsonValue, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto,
+  type ChatResourceReadCommand,
 } from '@line-agent/contracts';
 import { DurableCursorSession, decodeHistoryCursor, encodeHistoryCursor,
   type HistoryCursorV1, type JsonValue } from './cursor.js';
@@ -11,6 +12,7 @@ import { mkdir, open, statfs } from 'node:fs/promises';
 import { sanitizeAttachmentFilename, storeAttachment, type AttachmentStoreRuntime } from './attachment-store.js';
 import { SafeAttachmentError } from './attachment-error.js';
 import { validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
+import { isChatResourceFailure } from './chat-resource-error.js';
 
 export type TransportIdentity = Readonly<{ ownMid: string; displayName: string | null; picturePath?: string | null }>;
 export type SyncItem = unknown | Readonly<{
@@ -23,7 +25,7 @@ export type FriendRelationDiagnostic = Readonly<{ status: FriendRelation; error:
 export type FriendAddResult = Readonly<{ status: 'added' | 'failed' | 'unknown'; error: string | null }>;
 export type RelationCancellation = Readonly<{ aborted: boolean }>;
 export interface LineTransport {
-  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'authInvalidated', listener: (value?: any) => void): void;
+  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated', listener: (value?: any) => void): void;
   installSecrets(secrets: { token: string | null; qrCert: string | null; e2eeStorage: ContractJsonValue | null }): Promise<void>;
   adoptDownloadAuth?(token: string, application: string,
     options?: Readonly<{ expectedMid?: string; probe?: DownloadAuthProbe; signal?: AbortSignal }>): Promise<TransportIdentity>;
@@ -31,9 +33,14 @@ export interface LineTransport {
   loginQr(): Promise<TransportIdentity>;
   loginToken(token: string): Promise<TransportIdentity>;
   listConversations(): Promise<readonly ConversationCatalogItem[]>;
+  refreshOwnProfile?(): Promise<TransportIdentity>;
   sync(cursor: TalkCursorV1Dto): Promise<SyncResult>;
   history(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string },
     cursor: HistoryCursorV1 | null, limit: number): Promise<readonly unknown[]>;
+  readChatResource?(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>): Promise<Readonly<{
+    nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[];
+    photos?: readonly unknown[]; bytes?: Uint8Array;
+  }>>;
   download(kind: 'image' | 'video' | 'audio' | 'file', messageId: string,
     externalAttachmentId: string, lineMessage: ContractJsonValue,
     options: Readonly<{ signal: AbortSignal; maxBytes: number; identity: AttachmentDownloadIdentity;
@@ -44,9 +51,10 @@ export interface LineTransport {
     replyToMessageId: string | null, lease: ControlLease, manual?: boolean): Promise<{ messageId: string }>;
   /** Optional: transports without media support leave it undefined and the loop denies the command. */
   sendMedia?(conversation: { chatType: 'direct' | 'group'; chatId: string },
-    media: Readonly<{ kind: 'image' | 'file'; bytes: Buffer; fileName: string }>, lease: ControlLease): Promise<{ messageId: string }>;
+    media: Readonly<{ kind: 'image' | 'file'; bytes: Buffer; fileName: string }>, lease: ControlLease, manual?: boolean): Promise<{ messageId: string }>;
   react(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string }, messageId: string,
     reaction: Extract<LineWorkerCommand, { type: 'reactMessage' }>['reaction'], lease: ControlLease): Promise<void>;
+  unsend?(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string }, messageId: string, lease: ControlLease): Promise<void>;
   checkFriendRelation(targetMid: string, lease: ControlLease, signal?: RelationCancellation): Promise<FriendRelation>;
   checkFriendRelationDiagnostic?(targetMid: string, lease: ControlLease, signal?: RelationCancellation): Promise<FriendRelationDiagnostic>;
   addFriendByMid(targetMid: string, lease: ControlLease, onPhysicalStart: () => void, signal?: RelationCancellation): Promise<FriendAddResult>;
@@ -171,6 +179,7 @@ export class LineWorkerLoop {
   #pendingEvents = 0;
   #activeDownloads = 0;
   #activeTransportCalls = 0;
+  #profileReadInFlight = false;
   #credentialSwapPending = false;
   #transportQuarantined = false;
   #authInvalidated = false;
@@ -185,6 +194,7 @@ export class LineWorkerLoop {
   #catalogRefreshComplete = false;
   readonly #transportDrainWaiters: Array<() => void> = [];
   readonly #activeAttachments = new Map<string, { attachmentId: string; controller: AbortController; finished: Promise<void>; finish(): void }>();
+  readonly #activeChatResourceReads = new Map<string, AbortController>();
   readonly #downloadWaiters: Array<Readonly<{
     resolve(): void; reject(error: Error): void; signal: AbortSignal; onAbort(): void;
   }>> = [];
@@ -229,6 +239,11 @@ export class LineWorkerLoop {
       this.#secrets = { ...this.#secrets, e2eeStorage };
       this.#emitSecretRotation();
     });
+    this.#transport.on('credentials', (credentials: { token: string; e2eeStorage: ContractJsonValue }) => {
+      if (this.#stopped || this.#binding?.purpose === 'DOWNLOAD_ONLY') return;
+      this.#secrets = { ...this.#secrets, token: credentials.token, e2eeStorage: credentials.e2eeStorage };
+      this.#emitSecretRotation();
+    });
   }
 
   get durableCursor(): TalkCursorV1Dto {
@@ -251,11 +266,12 @@ export class LineWorkerLoop {
       command.controlEpoch === bound.controlEpoch) {
       this.#revoked = true;
       if (command.type === 'stop') this.#stopped = true;
+      for (const controller of this.#activeChatResourceReads.values()) controller.abort(new Error('Worker authority changed'));
       this.#transport.revoke?.();
       this.#catalogRefreshGeneration += 1;
       if (command.type === 'stop') this.#receiveGeneration += 1;
     }
-    if (this.#eventFailure && ['setSecretState', 'loginQr', 'loginToken', 'poll', 'history', 'sendText', 'manualSendText', 'sendMedia', 'downloadAttachment', 'checkFriendRelation', 'addFriendByMid'].includes(command.type)) {
+    if (this.#eventFailure && ['setSecretState', 'loginQr', 'loginToken', 'poll', 'history', 'chatResourceRead', 'sendText', 'manualSendText', 'sendMedia', 'downloadAttachment', 'checkFriendRelation', 'addFriendByMid', 'unsendMessage'].includes(command.type)) {
       throw this.#eventFailure;
     }
     if (command.type === 'init') {
@@ -280,7 +296,7 @@ export class LineWorkerLoop {
       if (command.type === 'poll') return;
       throw new Error('LINE authentication is invalidated');
     }
-    if (binding.mode === 'PAUSED' && ['loginQr', 'loginToken', 'poll', 'history', 'downloadAttachment'].includes(command.type)) {
+    if (binding.mode === 'PAUSED' && ['loginQr', 'loginToken', 'poll', 'history', 'downloadAttachment', 'refreshOwnProfile'].includes(command.type)) {
       throw new Error('paused worker cannot access LINE');
     }
     switch (command.type) {
@@ -372,6 +388,31 @@ export class LineWorkerLoop {
       case 'history':
         await this.#withTransportCall(() => this.#history(command));
         return;
+      case 'chatResourceRead':
+        await this.#withTransportCall(() => this.#chatResourceRead(command));
+        return;
+      case 'refreshOwnProfile': {
+        const identity = this.#identity();
+        if (this.#profileReadInFlight) {
+          await this.#emit({ type: 'ownProfileResult', ...identity, requestId: command.requestId, ok: false, error: 'PROFILE_READ_BUSY' });
+          return;
+        }
+        this.#profileReadInFlight = true;
+        try {
+          if (!this.#ownMid || !this.#transport.refreshOwnProfile) throw new Error('PROFILE_READ_UNAVAILABLE');
+          const profile = await this.#withTransportCall(() => this.#transport.refreshOwnProfile!());
+          if (this.#stopped || this.#revoked || profile.ownMid !== this.#ownMid) throw new Error('PROFILE_MISMATCH');
+          await this.#emit({ type: 'ownProfileResult', ...identity, requestId: command.requestId, ok: true, error: null,
+            ownMid: profile.ownMid, displayName: profile.displayName, ...(profile.picturePath === undefined ? {} : { picturePath: profile.picturePath }) });
+        } catch (error) {
+          await this.#emit({ type: 'ownProfileResult', ...this.#identity(), requestId: command.requestId, ok: false,
+            error: error instanceof Error && ['PROFILE_READ_UNAVAILABLE', 'PROFILE_MISMATCH'].includes(error.message) ? error.message : 'PROFILE_READ_FAILED' });
+        } finally { this.#profileReadInFlight = false; }
+        return;
+      }
+      case 'cancelChatResourceRead':
+        this.#activeChatResourceReads.get(command.requestId)?.abort(new Error('Chat resource request cancelled'));
+        return;
       case 'downloadAttachment':
         await this.#withTransportCall(() => this.#download(command));
         return;
@@ -401,6 +442,9 @@ export class LineWorkerLoop {
       case 'reactMessage':
         await this.#reactMessage(command);
         return;
+      case 'unsendMessage':
+        await this.#unsendMessage(command);
+        return;
       case 'checkFriendRelation':
         await this.#checkFriendRelation(command);
         return;
@@ -416,8 +460,9 @@ export class LineWorkerLoop {
         await this.#emit({ type: 'status', ...this.#identity(), state: 'stopped', message: null });
         return;
       default:
-        await this.#emit({ type: 'error', ...this.#identity(), code: 'UNSUPPORTED_COMMAND',
-          message: 'worker command is not implemented', retryable: false });
+        await this.#emit({ type: 'error', ...this.#identity(), code: 'WORKER_OPERATION_FAILED',
+          message: 'worker command is not implemented', retryable: false,
+          diagnostic: { operation: 'unknown', stage: 'dispatch', category: 'unsupported', recovery: 'check_configuration', outcome: 'not_started' } });
     }
   }
 
@@ -550,7 +595,7 @@ export class LineWorkerLoop {
   #queueEvent(value: unknown): void {
     if (this.#eventFailure) throw this.#eventFailure;
     if (this.#pendingEvents >= 64) {
-      this.#eventFailure = new Error('worker event queue is full');
+      this.#eventFailure = Object.assign(new Error('worker event queue is full'), { code: 'WORKER_EVENT_QUEUE_FULL' });
       throw this.#eventFailure;
     }
     const event = LineWorkerEventSchema.parse(value);
@@ -558,7 +603,7 @@ export class LineWorkerLoop {
     this.#eventTail = this.#eventTail.then(async () => {
       if (!this.#eventFailure) await this.#emitEvent(event);
     }).catch((error: unknown) => {
-      this.#eventFailure = error instanceof Error ? error : new Error('private event sink failed');
+      this.#eventFailure = Object.assign(new Error('private event sink failed'), { code: 'WORKER_EVENT_SINK_FAILED' });
     }).finally(() => { this.#pendingEvents -= 1; });
   }
   async #emit(value: unknown): Promise<void> {
@@ -637,6 +682,54 @@ export class LineWorkerLoop {
     });
     await this.#emit({ type: 'historyResult', ...this.#identity(), chatType: command.chatType,
       chatId: command.chatId, requestId: command.requestId, nextCursor, envelopes });
+  }
+  async #chatResourceRead(command: Extract<LineWorkerCommand, { type: 'chatResourceRead' }>): Promise<void> {
+    const identity = this.#identity();
+    const base = { type: 'chatResourceResult' as const, ...identity, chatType: command.chatType, chatId: command.chatId,
+      requestId: command.requestId, action: command.action };
+    const fail = async (error: string, responseCode?: number | 'missing' | 'non_numeric') => this.#emit({ ...base, ok: false, error,
+      ...(typeof responseCode === 'number' && Number.isFinite(responseCode) && Math.abs(responseCode) <= 1_000_000_000
+        || responseCode === 'missing' || responseCode === 'non_numeric' ? { responseCode } : {}) });
+    if (this.#stopped || this.#revoked || this.#authInvalidated || this.#binding?.mode === 'PAUSED') {
+      await fail('WORKER_NOT_ACTIVE'); return;
+    }
+    if (!this.#ownMid) { await fail('NOT_LOGGED_IN'); return; }
+    if (!this.#transport.readChatResource) { await fail('UNSUPPORTED'); return; }
+    if (this.#activeChatResourceReads.size >= 4 || this.#activeChatResourceReads.has(command.requestId)) { await fail('QUEUE_FULL'); return; }
+    const controller = new AbortController();
+    this.#activeChatResourceReads.set(command.requestId, controller);
+    const timeout = setTimeout(() => controller.abort(Object.assign(new Error('Chat resource request timed out'), { code: 'TIMEOUT' })), command.timeoutMs);
+    try {
+      const value = await this.#transport.readChatResource(command, { signal: controller.signal });
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (command.action === 'listAlbums') {
+        const albums = (value.albums ?? []).filter((album) => typeof album === 'object' && album !== null &&
+          (album as { chatId?: unknown }).chatId === command.chatId).slice(0, command.limit ?? 50);
+        let result: ReturnType<typeof LineWorkerEventSchema.parse>;
+        try { result = LineWorkerEventSchema.parse({ ...base, ok: true, error: null, albums, nextCursor: value.nextCursor ?? null }); }
+        catch { await fail('response_validation'); return; }
+        await this.#emit(result);
+      } else {
+        const payload = { ...base, ok: true, error: null, ...value };
+        let result: ReturnType<typeof LineWorkerEventSchema.parse>;
+        try { result = LineWorkerEventSchema.parse(payload); }
+        catch { await fail('response_validation'); return; }
+        if (('notes' in result && (result.notes?.length ?? 0) > (command.limit ?? 50)) ||
+          ('albums' in result && (result.albums?.length ?? 0) > (command.limit ?? 50)) ||
+          ('photos' in result && (result.photos?.length ?? 0) > (command.limit ?? 50))) { await fail('response_validation'); return; }
+        await this.#emit(result);
+      }
+    } catch (error) {
+      const reason = controller.signal.aborted ? controller.signal.reason as { code?: unknown } | undefined : undefined;
+      if (reason?.code === 'TIMEOUT') await fail('TIMEOUT');
+      else if (controller.signal.aborted) await fail('CANCELLED');
+      else if (isChatResourceFailure(error)) await fail(error.category,
+        error.category === 'response_code_invalid' ? error.responseCode : undefined);
+      else await fail('unknown');
+    } finally {
+      clearTimeout(timeout);
+      if (this.#activeChatResourceReads.get(command.requestId) === controller) this.#activeChatResourceReads.delete(command.requestId);
+    }
   }
   async #download(command: Extract<LineWorkerCommand, { type: 'downloadAttachment' }>): Promise<void> {
     const identity = this.#identity();
@@ -759,8 +852,7 @@ export class LineWorkerLoop {
     const manual = command.type === 'manualSendText';
     const permittedMode = this.#binding!.mode === 'ACTIVE_CONTROL' || (manual && this.#binding!.mode === 'MONITOR_ONLY');
     if (!validEffectPermit || !permittedMode || this.#revoked || this.#sending ||
-      this.#credentialSwapPending || this.#transportQuarantined ||
-      !await this.#validateLease(identity)) {
+      this.#credentialSwapPending || this.#transportQuarantined) {
       await this.#emit({ type: 'sendResult', ...identity, requestId: command.requestId,
         operationId: command.operationId, attemptId: command.attemptId,
         status: 'failed', messageId: null, error: 'SIDE_EFFECT_DENIED' });
@@ -768,6 +860,14 @@ export class LineWorkerLoop {
     }
     this.#sending = true;
     try {
+      const initialLeaseValid = await this.#validateLease(identity);
+      if (this.#revoked || !permittedMode || !initialLeaseValid ||
+        this.#credentialSwapPending || this.#transportQuarantined) {
+        await this.#emit({ type: 'sendResult', ...identity, requestId: command.requestId,
+          operationId: command.operationId, attemptId: command.attemptId,
+          status: 'failed', messageId: null, error: 'SIDE_EFFECT_DENIED' });
+        return;
+      }
       const leaseValid = await this.#validateLease(identity);
       if (this.#revoked || !permittedMode || !leaseValid ||
         this.#credentialSwapPending || this.#transportQuarantined) {
@@ -835,13 +935,21 @@ export class LineWorkerLoop {
       return;
     }
     const sendMedia = this.#transport.sendMedia?.bind(this.#transport);
-    if (!sendMedia || !validEffectPermit || this.#binding!.mode !== 'ACTIVE_CONTROL' || this.#revoked || this.#sending ||
-      this.#credentialSwapPending || this.#transportQuarantined || !await this.#validateLease(identity)) {
+    const manual = command.manualSend === true;
+    const permittedMode = this.#binding!.mode === 'ACTIVE_CONTROL' || (manual && this.#binding!.mode === 'MONITOR_ONLY');
+    if (!sendMedia || !validEffectPermit || !permittedMode || this.#revoked || this.#sending ||
+      this.#credentialSwapPending || this.#transportQuarantined) {
       await result('failed', null, 'SIDE_EFFECT_DENIED');
       return;
     }
     this.#sending = true;
     try {
+      const initialLeaseValid = await this.#validateLease(identity);
+      if (this.#revoked || !permittedMode || !initialLeaseValid ||
+        this.#credentialSwapPending || this.#transportQuarantined) {
+        await result('failed', null, 'SIDE_EFFECT_DENIED');
+        return;
+      }
       let bytes: Buffer;
       try { bytes = await this.#readMediaFile(command); }
       catch (error) {
@@ -849,7 +957,7 @@ export class LineWorkerLoop {
         return;
       }
       const leaseValid = await this.#validateLease(identity);
-      if (this.#revoked || this.#binding!.mode !== 'ACTIVE_CONTROL' || !leaseValid ||
+      if (this.#revoked || !permittedMode || !leaseValid ||
         this.#credentialSwapPending || this.#transportQuarantined) {
         await result('failed', null, 'SIDE_EFFECT_DENIED');
         return;
@@ -857,7 +965,7 @@ export class LineWorkerLoop {
       if (owned) this.#usedEffectPermits.add(permit);
       let timer: ReturnType<typeof setTimeout> | undefined;
       const operation = this.#withTransportCall(() => sendMedia({ chatType: command.chatType, chatId: command.chatId },
-        { kind: command.kind, bytes, fileName: command.fileName }, identity));
+        { kind: command.kind, bytes, fileName: command.fileName }, identity, manual));
       // The slot stays held until the real operation settles, even after a timeout result.
       const settled = operation.then(() => undefined, () => undefined);
       try {
@@ -885,6 +993,35 @@ export class LineWorkerLoop {
     if (!command.chatId.startsWith(prefix)) return;
     await this.#withTransportCall(() => this.#transport.react({ chatType: command.chatType, chatId: command.chatId },
       command.messageId, command.reaction, identity));
+  }
+
+  async #unsendMessage(command: Extract<LineWorkerCommand, { type: 'unsendMessage' }>): Promise<void> {
+    const identity = this.#identity();
+    const failed = async (status: 'failed' | 'unknown', error: string) => this.#emit({
+      type: 'unsendResult', ...identity, chatType: command.chatType, chatId: command.chatId,
+      requestId: command.requestId, messageId: command.messageId, status, error,
+    });
+    const binding = this.#binding!;
+    if (!this.#transport.unsend || !this.#ownMid || (binding.mode !== 'ACTIVE_CONTROL' && binding.mode !== 'MONITOR_ONLY')
+      || this.#revoked || this.#authInvalidated || this.#credentialSwapPending || this.#transportQuarantined || this.#sending) {
+      await failed('failed', 'SIDE_EFFECT_DENIED'); return;
+    }
+    const prefix = { direct: 'u', group: 'c', room: 'r' }[command.chatType];
+    if (!command.chatId.startsWith(prefix)) { await failed('failed', 'SIDE_EFFECT_DENIED'); return; }
+    this.#sending = true;
+    try {
+      const leaseValid = await this.#validateLease(identity);
+      if (this.#revoked || this.#authInvalidated || (binding.mode !== 'ACTIVE_CONTROL' && binding.mode !== 'MONITOR_ONLY')
+        || !leaseValid || this.#credentialSwapPending || this.#transportQuarantined) {
+        await failed('failed', 'SIDE_EFFECT_DENIED'); return;
+      }
+      await this.#withTransportCall(() => this.#transport.unsend!({ chatType: command.chatType, chatId: command.chatId }, command.messageId, identity));
+      await this.#emit({ type: 'unsendResult', ...identity, chatType: command.chatType, chatId: command.chatId,
+        requestId: command.requestId, messageId: command.messageId, status: 'unsent', error: null });
+    } catch (error) {
+      const denied = error instanceof EffectDeniedError;
+      await failed(denied ? 'failed' : 'unknown', denied ? 'SIDE_EFFECT_DENIED' : 'TRANSPORT_OUTCOME_UNKNOWN');
+    } finally { this.#sending = false; }
   }
 
   async #relationAuthorized(): Promise<boolean> {

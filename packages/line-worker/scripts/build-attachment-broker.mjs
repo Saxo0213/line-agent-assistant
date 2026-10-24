@@ -37,3 +37,10 @@ const crashingOutput = resolve(root, "dist", "test-fixtures", "CrashingAttachmen
 const crashFixture = spawnSync(framework, ["/nologo", "/target:exe", "/platform:x64", `/out:${crashingOutput}`, crashingSource], { stdio: "inherit", shell: false });
 if (crashFixture.error) throw crashFixture.error;
 if (crashFixture.status !== 0) process.exit(crashFixture.status ?? 1);
+
+const identitySource = resolve(root, "src", "fixtures", "chat-resource-archive", "IdentityProbe.cs");
+const identityOutput = resolve(root, "dist", "test-fixtures", "ChatResourceIdentityProbe.exe");
+mkdirSync(dirname(identityOutput), { recursive: true });
+const identityFixture = spawnSync(framework, ["/nologo", "/target:exe", "/platform:x64", `/out:${identityOutput}`, identitySource], { stdio: "inherit", shell: false });
+if (identityFixture.error) throw identityFixture.error;
+if (identityFixture.status !== 0) process.exit(identityFixture.status ?? 1);

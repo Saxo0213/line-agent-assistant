@@ -1,6 +1,7 @@
 import type { SafeAuditRecord } from '@line-agent/database';
 import type { AttachmentActivityRecord, TerminalAttachmentErrorRecord } from '@line-agent/database';
 import type { SystemActivity, SystemErrorRow } from '../../desktop-protocol.js';
+import { parseSafeDiagnostic } from '@line-agent/contracts';
 import { AUDIT_ACTIONS, AUDIT_ERROR_CODES, AUDIT_REASON_CODES, type AuditAction, type AuditErrorCode, type AuditReasonCode } from './operational-audit.js';
 
 export type SystemActivityRow = SystemActivity;
@@ -9,6 +10,7 @@ type AttachmentStatusLabel = Extract<SystemActivity, { kind: 'attachment' }>['st
 type ReadProjection<T> = { available: boolean; partial: boolean; value: readonly T[] };
 
 const actionLabels: Record<AuditAction, SystemActionLabel> = {
+  runtime_error: '系統操作失敗',
   app_start: '系統啟動', app_stop: '系統關閉', service_start: '服務啟動', service_stop: '服務停止',
   worker_start: '工作程序啟動', worker_stop: '工作程序停止', worker_restart: '工作程序重新啟動',
   worker_quarantine: '工作程序隔離', worker_exited: '工作程序結束', line_login_started: 'LINE 登入開始',
@@ -22,6 +24,7 @@ const actionLabels: Record<AuditAction, SystemActionLabel> = {
   friend_enrollment: '新增使用者（好友授權）', friend_relation_initial: '新增使用者：確認 LINE 好友關係',
   friend_add_attempt: '新增使用者：加入 LINE 好友', friend_relation_recheck: '新增使用者：重新確認好友',
   friend_authorization_precheck: '新增使用者：授權預檢', friend_grant_commit: '新增使用者：寫入白名單',
+  album_photo_download: '相簿照片下載',
 };
 const phaseLabels: Record<SafeAuditRecord['phase'], Extract<SystemActivity, { kind: 'audit' }>['phase']> = {
   requested: '已提出', succeeded: '已完成', failed: '失敗', observed: '已記錄',
@@ -90,7 +93,9 @@ export function projectSystemErrors(events: readonly SafeAuditRecord[], attachme
     if (event.phase !== 'failed' && !(typeof event.errorCode === 'string' && event.errorCode.length > 0)) continue;
     const createdAt = normalizedTime(event.createdAt);
     if (!createdAt || !event.phase) continue;
-    rows.push({ createdAt, action: actionLabel(event.action), code: errorCode(event) });
+    const diagnostic = parseSafeDiagnostic(event.diagnostic);
+    rows.push({ createdAt, action: actionLabel(event.action), code: errorCode(event),
+      ...(diagnostic ? { diagnostic, ...(/^[A-Za-z0-9_-]{1,128}$/.test(event.correlationId) ? { correlationId: event.correlationId } : {}) } : {}) });
   }
   for (const attachment of attachments) {
     if (attachment.status === 'failed' && attachment.retryCount < 3) continue;

@@ -29,4 +29,26 @@ database('AccountRepository', () => {
       blocker.release();
     }
   });
+
+  it('refreshes only the connected account profile under its current worker and identity binding', async () => {
+    const accountId = 'avatar-refresh-binding';
+    const ownMid = `u${'a'.repeat(32)}`;
+    const binding = { accountId, workerInstanceId: 'avatar-worker-current', controlEpoch: 1 };
+    const accounts = new AccountRepository(pool);
+    await accounts.ensureAccount(accountId, 'Before refresh');
+    await pool.query(`UPDATE line_accounts SET own_mid=$2,product_role='AGENT',worker_instance_id=$3,
+      worker_binding_epoch=$4,status='connected',mode='MONITOR_ONLY' WHERE account_id=$1`,
+    [accountId, ownMid, binding.workerInstanceId, binding.controlEpoch]);
+
+    expect(await accounts.canRefreshWorkerAvatar(binding, ownMid)).toBe(true);
+    expect(await accounts.refreshWorkerAvatar(binding, ownMid, 'After refresh', 'https://profile.line-scdn.net/new.png')).toBe(true);
+    expect(await accounts.getAccount(accountId)).toMatchObject({ accountId, ownMid });
+    expect((await pool.query('SELECT display_name,picture_path FROM line_accounts WHERE account_id=$1', [accountId])).rows[0])
+      .toEqual({ display_name: 'After refresh', picture_path: 'https://profile.line-scdn.net/new.png' });
+
+    expect(await accounts.canRefreshWorkerAvatar({ ...binding, workerInstanceId: 'stale-worker' }, ownMid)).toBe(false);
+    expect(await accounts.refreshWorkerAvatar(binding, `u${'b'.repeat(32)}`, 'Wrong identity', null)).toBe(false);
+    await pool.query("UPDATE line_accounts SET mode='PAUSED' WHERE account_id=$1", [accountId]);
+    expect(await accounts.canRefreshWorkerAvatar(binding, ownMid)).toBe(false);
+  });
 });

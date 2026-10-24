@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { lineMediaUrl, type ConversationKey, type LineMediaTarget } from '@line-agent/contracts';
 import type { DesktopApi } from '../preload/api.js';
 
@@ -27,6 +27,29 @@ export function AvatarPlaceholder({ kind, className }: { kind: 'person' | 'group
 
 const visibleAttachments = new Map<Element, (visible: boolean) => void>();
 let attachmentObserver: IntersectionObserver | null = null;
+const refreshedAccountAvatars = new Map<string, { version: number; ownMid: string }>();
+const accountAvatarListeners = new Set<() => void>();
+
+export function accountAvatarRefreshed(accountId: string, ownMid: string): void {
+  const previous = refreshedAccountAvatars.get(accountId);
+  refreshedAccountAvatars.set(accountId, { version: (previous?.version ?? 0) + 1, ownMid });
+  for (const listener of accountAvatarListeners) listener();
+}
+
+function avatarRefreshVersion(target: LineMediaTarget | undefined): number {
+  if (!target) return 0;
+  const refreshed = refreshedAccountAvatars.get(target.accountId);
+  if (!refreshed) return 0;
+  if (target.type === 'account') return refreshed.version;
+  if (target.type === 'conversation' && target.chatType === 'direct' && target.chatId === refreshed.ownMid) return refreshed.version;
+  if (target.type === 'member' && target.memberId === refreshed.ownMid) return refreshed.version;
+  return 0;
+}
+
+function subscribeToAccountAvatarRefresh(listener: () => void): () => void {
+  accountAvatarListeners.add(listener);
+  return () => accountAvatarListeners.delete(listener);
+}
 
 function observeAttachment(element: Element, update: (visible: boolean) => void): () => void {
   visibleAttachments.set(element, update);
@@ -46,7 +69,10 @@ export function LineMediaImage(props: Props) {
   const target = props.target ?? (props.attachment ? { type: 'attachment' as const,
     ...props.attachment.key, attachmentId: props.attachment.attachmentId } : undefined);
   const scope = JSON.stringify(target ?? null);
-  return <LineMediaImageRequest key={JSON.stringify([scope, props.enabled])} {...props} target={target} />;
+  const refreshedAt = useSyncExternalStore(subscribeToAccountAvatarRefresh,
+    () => avatarRefreshVersion(target),
+    () => 0);
+  return <LineMediaImageRequest key={JSON.stringify([scope, props.enabled, refreshedAt])} {...props} target={target} />;
 }
 
 function LineMediaImageRequest({ enabled, target, fallback, fallbackKind, accessibleFallback, className, alt = '', title }: Props) {

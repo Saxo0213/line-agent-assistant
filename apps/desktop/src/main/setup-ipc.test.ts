@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createSetupAdapter, createSetupCutover, restartAfterShutdown } from './setup-ipc.js';
+import { createSetupAdapter, createSetupCutover } from './setup-ipc.js';
 import { EmbeddedPgError } from './services/embedded-postgres/errors.js';
 
 describe('database setup IPC boundary', () => {
@@ -130,20 +130,6 @@ describe('database setup IPC boundary', () => {
     finishRestart();
     await expect(request).resolves.toMatchObject({ type: 'restartApplication', ok: true });
     expect(order).toEqual(['shutdown-start', 'relaunch-exit']);
-  });
-
-  it('relaunches only after bounded shutdown succeeds and does not relaunch on timeout', async () => {
-    const order: string[] = [];
-    await restartAfterShutdown(async () => { order.push('shutdown'); },
-      () => order.push('relaunch'), (code) => order.push(`exit-${code}`), 50);
-    expect(order).toEqual(['shutdown', 'relaunch', 'exit-0']);
-
-    let release!: () => void;
-    const hung = new Promise<void>((resolve) => { release = resolve; });
-    await expect(restartAfterShutdown(() => hung, () => order.push('bad-relaunch'),
-      (code) => order.push(`bad-exit-${code}`), 5)).rejects.toThrow('Application shutdown timed out');
-    release();
-    expect(order).toEqual(['shutdown', 'relaunch', 'exit-0']);
   });
 
   it('rejects untrusted renderers and delegates validated setup requests', async () => {

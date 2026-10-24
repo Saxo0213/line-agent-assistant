@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
-import { McpListTargetsInputSchema, McpQueryTargetMessagesByTimeInputSchema, McpQueryTargetMessagesInputSchema, type AgentEvent, type AgentRunRequest } from '@line-agent/contracts';
+import { McpListTargetsInputSchema, McpQueryTargetMessagesByTimeInputSchema, McpQueryTargetMessagesInputSchema, MCP_TOOL_NAMES, type AgentEvent, type AgentRunRequest } from '@line-agent/contracts';
 import { AccountRepository, AdminRepository, FriendWhitelistRepository, McpTokenRepository, MessageRepository } from '@line-agent/database';
 import { createTestDatabase } from '../../../../../packages/database/src/test-database.js';
 import { MCP_TOOL_DEFINITIONS, McpService, numberMcpTargets } from './mcp-service.js';
@@ -499,6 +499,7 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
       expect(localConnect.type).toBe('mcpLocalClientConnect');
       if (localConnect.type !== 'mcpLocalClientConnect') throw new Error('Expected local MCP client connection');
       expect(localConnect).not.toHaveProperty('plaintextToken');
+      expect((await tokens.listTokens()).find((token) => token.tokenId === localConnect.status.tokenId)?.toolScopes).toEqual([...MCP_TOOL_NAMES]);
       const localConfigPath = join(attachmentRoot, 'client-config', 'claude_desktop_config.json');
       expect(JSON.parse(await readFile(localConfigPath, 'utf8')).mcpServers.linejs.env.LINEJS_MCP_TOKEN).toMatch(/^la_mcp_/);
       const localRevoke = await facade.dispatch({ type: 'mcpRevokeToken', requestId: 'local-revoke', tokenId: localConnect.status.tokenId! });

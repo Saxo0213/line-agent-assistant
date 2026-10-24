@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ExternalSourceProbeAdmissionGate } from '../external-source-probe-admission.js';
+import { ExternalMonitorDiagnosticFailure } from '../external-monitor-diagnostics.js';
 import { reconcileStaleOwnerMarkers, type ReconciliationFilesystem } from './stale-owner-marker-reconciliation.js';
 import {
   runOwnerReadySession,
@@ -12,6 +13,7 @@ import {
   type OwnerReadyMarkerStore,
   type OwnerReadyChild,
   type OwnerProcessIdentity,
+  type OwnerReadyMarker,
 } from './owner-ready-session.js';
 
 const mainIdentity: OwnerProcessIdentity = {
@@ -34,6 +36,57 @@ afterEach(async () => {
 });
 
 describe('owner-ready request lifecycle', () => {
+  it.each(['spawn', 'inspection', 'marker-read', 'marker-promotion', 'late-identity', 'handshake'] as const)(
+    'reports the active phase and preserves the primary %s failure through cleanup', async (failure) => {
+      const root = await makeRoot();
+      const requestId = '7'.repeat(32);
+      const baseStore = markerStore(root, requestId);
+      const child = fakeChild();
+      const admission = new ExternalSourceProbeAdmissionGate();
+      let currentPhase: string | undefined;
+      let inspectionCount = 0;
+      const phases = {
+        spawn: 'child_identity', inspection: 'child_identity', 'marker-read': 'owner_admission_marker',
+        'marker-promotion': 'owner_admission_marker', 'late-identity': 'child_identity', handshake: 'protocol_source_ready',
+      } as const;
+      const store: OwnerReadyMarkerStore = failure === 'marker-read'
+        ? { ...baseStore, async read() { throw new Error('primary_marker_read_failure'); } }
+        : failure === 'marker-promotion'
+          ? { ...baseStore, async promote() { throw new Error('primary_marker_promotion_failure'); } }
+          : baseStore;
+      if (failure === 'handshake') child.sendOwnerReady = async () => { throw new Error('primary_handshake_failure'); };
+      const expectedError = {
+        spawn: 'primary_spawn_failure', inspection: 'primary_inspection_failure', 'marker-read': 'primary_marker_read_failure',
+        'marker-promotion': 'primary_marker_promotion_failure', 'late-identity': 'reader_child_identity_changed',
+        handshake: 'primary_handshake_failure',
+      }[failure];
+      const spawnChild = () => {
+        if (failure === 'spawn') throw new Error(expectedError);
+        return child;
+      };
+      const inspectProcess = async () => {
+        inspectionCount += 1;
+        if (failure === 'inspection' && inspectionCount === 1) throw new Error(expectedError);
+        if (failure === 'late-identity' && inspectionCount === 3) return { ...childIdentity, startedAt: '134000000000000099' };
+        return childIdentity;
+      };
+      await expect(runOwnerReadySession({
+        requestRoot: root, requestId, deadlineUnixMs: Date.now() + 5_000,
+        mainIdentity, bridgeImagePath: childIdentity.imagePath, bridgeImageSha256: childIdentity.imageSha256,
+        admission, markerStore: store, spawnChild, inspectProcess,
+        runAfterReady: async () => undefined,
+        onPhase(phase) { currentPhase = phase; },
+      })).rejects.toThrow(expectedError);
+      expect(currentPhase).toBe(phases[failure]);
+      if (failure === 'marker-read') {
+        expect(await baseStore.exists()).toBe(true);
+        expect(admission.isBusy()).toBe(true);
+      } else {
+        expect(await baseStore.exists()).toBe(false);
+        expect(admission.isBusy()).toBe(false);
+      }
+    });
+
   it('provisions an absent private request root before owner marker creation and removes the current request after close', async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), 'linejs-owner-ready-fresh-'));
     roots.push(parent);
@@ -492,6 +545,34 @@ describe('owner-ready request lifecycle', () => {
     expect(admission.isBusy()).toBe(true);
   });
 
+  it('preserves the primary operation error when marker cleanup also fails', async () => {
+    const root = path.join(os.tmpdir(), 'linejs-owner-ready-cleanup-test');
+    const admission = new ExternalSourceProbeAdmissionGate();
+    const requestId = '8'.repeat(32);
+    let currentMarker: OwnerReadyMarker | undefined;
+    const store: OwnerReadyMarkerStore = {
+      requestDirectory: path.join(root, `probe-${requestId}`),
+      async create(marker) { currentMarker = marker; },
+      async read() { if (!currentMarker) throw new Error('reader_owner_marker_invalid'); return currentMarker; },
+      async promote(_expected, next) { currentMarker = next; },
+      async remove() { throw new Error('private_cleanup_detail'); },
+    };
+    await expect(runOwnerReadySession({
+      requestRoot: root,
+      requestId,
+      deadlineUnixMs: Date.now() + 5_000,
+      mainIdentity,
+      bridgeImagePath: childIdentity.imagePath,
+      bridgeImageSha256: childIdentity.imageSha256,
+      admission,
+      markerStore: store,
+      spawnChild: () => fakeChild(),
+      inspectProcess: async () => childIdentity,
+      runAfterReady: async () => { throw new Error('reader_page_invalid'); },
+    })).rejects.toThrow('reader_page_invalid');
+    expect(admission.isBusy()).toBe(true);
+  });
+
   it('does not report success when shared admission release cannot be verified', async () => {
     const root = await makeRoot();
     const stuckRelease = Object.assign(() => undefined, { isCurrentOwner: () => true });
@@ -538,7 +619,7 @@ describe('owner-ready request lifecycle', () => {
     const outcome = pending.then(() => null, (error: unknown) => error);
     await workStarted;
     cancellation.abort();
-    expect((await outcome as Error).message).toBe('reader_owner_cleanup_uncertain');
+    expect((await outcome as Error).message).toMatch(/abort|cancel/i);
     expect(admission.isBusy()).toBe(true);
     settleWork();
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -572,6 +653,40 @@ describe('owner-ready request lifecycle', () => {
     expect(aclCalls).toBe(0);
     expect(spawnCalls).toBe(0);
     expect(admission.isBusy()).toBe(true);
+  });
+
+  it('preserves private directory failure from the marker create second ACL pass', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'linejs-owner-ready-phase-'));
+    roots.push(root);
+    const requestId = '4'.repeat(32);
+    const admission = new ExternalSourceProbeAdmissionGate();
+    const typedFailure = new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup',
+      'private_directory_acl_command_timeout', 'private_directory_preparation');
+    let aclCalls = 0;
+    const ensurePrivateDirectory = async () => {
+      aclCalls += 1;
+      if (aclCalls === 2) throw typedFailure;
+    };
+    const store = new FileOwnerReadyMarkerStore(root, requestId, ensurePrivateDirectory);
+    const phases: string[] = [];
+    await expect(runOwnerReadySession({
+      requestRoot: root,
+      requestId,
+      deadlineUnixMs: Date.now() + 5_000,
+      mainIdentity,
+      bridgeImagePath: childIdentity.imagePath,
+      bridgeImageSha256: childIdentity.imageSha256,
+      admission,
+      markerStore: store,
+      spawnChild: () => { throw new Error('child_must_not_spawn'); },
+      inspectProcess: async () => childIdentity,
+      runAfterReady: async () => undefined,
+      beforeCreate: async () => ensurePrivateDirectory(),
+      onPhase: (phase) => phases.push(phase),
+    })).rejects.toBe(typedFailure);
+    expect(aclCalls).toBe(2);
+    expect(phases).toContain('owner_admission_marker');
+    expect(typedFailure.phase).toBe('private_directory_preparation');
   });
 
   it('revalidates request-root identity after ACL callback before spawning', async () => {

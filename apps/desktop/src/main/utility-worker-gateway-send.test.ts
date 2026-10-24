@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createUtilityWorkerGateway } from './utility-worker-gateway.js';
+import { LineWorkerCommandSchema, LineWorkerEventSchema } from '@line-agent/contracts';
 
 class FakeChild {
   readonly posted: any[] = [];
+  lastMessage: unknown;
   private message?: (value: unknown) => void;
   private exit?: () => void;
   private owner: Record<string, unknown> = {};
@@ -19,9 +21,10 @@ class FakeChild {
   }
   emitRaw(value: unknown) {
     const requestId = (value as { requestId?: string }).requestId;
-    const sent = requestId && [...this.posted].reverse().find((item) => item.requestId === requestId);
-    this.message?.({ data: { ...this.owner, ...(sent ? { operationId: sent.operationId, attemptId: sent.attemptId } : {}),
-      ...(value as object) }, ports: [] });
+    const sent = requestId && [...this.posted].reverse().find((item) => item.requestId === requestId
+      && ['sendText', 'manualSendText', 'sendMedia'].includes(item.type));
+    this.lastMessage = { ...this.owner, ...(sent ? { operationId: sent.operationId, attemptId: sent.attemptId } : {}), ...(value as object) };
+    this.message?.({ data: this.lastMessage, ports: [] });
   }
   ack(current: Record<string, unknown>) {
     const { accountId, workerInstanceId, controlEpoch } = current as { accountId: string; workerInstanceId: string; controlEpoch: number };
@@ -58,8 +61,13 @@ async function harness(extra: Parameters<typeof createUtilityWorkerGateway>[0] e
   const text = (accountId: string, requestId: string, body = 'hi') => gateway.send({ type: 'sendText', ...accounts.get(accountId)!,
     requestId, chatType: 'direct', chatId: 'u-peer', text: body, replyToMessageId: null } as never);
   const media = (accountId: string, requestId: string, signal?: AbortSignal) => gateway.sendMedia!({ ...(accounts.get(accountId) as object),
-    requestId, chatType: 'direct', chatId: 'u-peer', kind: 'file', filePath: 'C:\\work\\a.bin', fileName: 'a.bin', sizeBytes: 3, sha256 } as never, signal);
-  return { gateway, children, accounts, add, text, media };
+    requestId, chatType: 'direct', chatId: 'u-peer', kind: 'file', filePath: 'C:\\work\\a.bin', fileName: 'a.bin', sizeBytes: 3, sha256,
+  } as never, signal);
+  const resource = (accountId: string, requestId: string, signal?: AbortSignal) => gateway.readChatResource!({
+    ...(accounts.get(accountId) as object), type: 'chatResourceRead', requestId, chatType: 'group', chatId: `c${'a'.repeat(32)}`,
+    action: 'listNotes', timeoutMs: 10_000,
+  } as never, signal);
+  return { gateway, children, accounts, add, text, media, resource };
 }
 
 describe('media send gateway', () => {
@@ -116,6 +124,79 @@ describe('media send gateway', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(vi.getTimerCount()).toBe(0);
     expect(h.gateway.inventory!()).toMatchObject({ ownedTimers: 0, ownedListeners: 0, pendingTasks: 0 });
+  });
+});
+
+describe('chat resource read gateway', () => {
+  it('sends a bound request and accepts only its matching result', async () => {
+    const h = await harness();
+    const binding = await h.add('resource-account');
+    const child = h.children.get('resource-account')!;
+    const pending = h.resource('resource-account', 'notes-1');
+    await vi.waitFor(() => expect(child.posted.some((value) => value.type === 'chatResourceRead')).toBe(true));
+    const command = child.posted.find((value) => value.type === 'chatResourceRead')!;
+    expect(command).toMatchObject({ requestId: 'notes-1', workerInstanceId: binding.workerInstanceId,
+      transportOwnerId: binding.transportOwnerId, transportGeneration: binding.transportGeneration });
+    const result = { type: 'chatResourceResult', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+      controlEpoch: binding.controlEpoch, chatType: 'group', chatId: command.chatId, requestId: 'notes-1', action: 'listNotes',
+      ok: true, error: null, notes: [{ postId: 'post-1', createdTime: 1, text: 'Note' }], nextCursor: null };
+    expect(LineWorkerEventSchema.safeParse(result).success).toBe(true);
+    child.emitRaw(result);
+    await vi.waitFor(() => expect(child.lastMessage).toBeDefined());
+    expect(LineWorkerEventSchema.safeParse(child.lastMessage).success).toBe(true);
+    expect(child.lastMessage).toMatchObject({ transportOwnerId: binding.transportOwnerId,
+      transportGeneration: binding.transportGeneration, writeGrantVersion: binding.writeGrantVersion });
+    expect(child.lastMessage).toMatchObject({ accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+      controlEpoch: binding.controlEpoch, chatType: command.chatType, chatId: command.chatId, requestId: command.requestId,
+      action: command.action });
+    await expect(pending).resolves.toMatchObject({ ok: true, notes: [{ postId: 'post-1' }] });
+  });
+
+  it('does not claim current worker readiness when an accepted read is followed by worker exit', async () => {
+    vi.useFakeTimers();
+    const h = await harness({ maxRestarts: 0 });
+    const binding = await h.add('resource-exit');
+    const child = h.children.get('resource-exit')!;
+    const first = h.resource('resource-exit', 'notes-accepted');
+    await vi.waitFor(() => expect(child.posted.some((value) => value.type === 'chatResourceRead')).toBe(true));
+    const firstCommand = child.posted.find((value) => value.requestId === 'notes-accepted')!;
+    child.emitRaw({ type: 'chatResourceResult', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+      controlEpoch: binding.controlEpoch, chatType: 'group', chatId: firstCommand.chatId, requestId: firstCommand.requestId,
+      action: 'listNotes', ok: true, error: null, notes: [], nextCursor: null });
+    await expect(first).resolves.toMatchObject({ ok: true });
+
+    const controller = new AbortController();
+    const pending = h.resource('resource-exit', 'notes-pending', controller.signal);
+    await vi.waitFor(() => expect(child.posted.some((value) => value.requestId === 'notes-pending')).toBe(true));
+    const rejected = expect(pending).rejects.toMatchObject({ diagnostic: {
+      stage: 'pending_request', reason: 'pending_stopped' } });
+    child.kill();
+    await rejected;
+    const failure = await pending.catch((error) => error);
+    expect(failure.diagnostic).not.toHaveProperty('currentBindingMatch');
+    expect(failure.diagnostic).not.toHaveProperty('currentEpochMatch');
+    expect(failure.diagnostic).not.toHaveProperty('workerReady');
+    await vi.waitFor(() => expect(h.gateway.inventory!()).toMatchObject({ activeWorkers: 0, pendingTasks: 0, ownedTimers: 0, ownedListeners: 0 }));
+    await h.gateway.shutdown();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.gateway.inventory!()).toMatchObject({ pendingTasks: 0, ownedTimers: 0, ownedListeners: 0 });
+  });
+
+  it('cancels the in-flight worker request and rejects stale bindings', async () => {
+    const h = await harness();
+    const binding = await h.add('resource-cancel');
+    const child = h.children.get('resource-cancel')!;
+    const controller = new AbortController();
+    const pending = h.resource('resource-cancel', 'notes-cancel', controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toThrow('cancelled');
+    const cancel = child.posted.find((item) => item.type === 'cancelChatResourceRead');
+    expect(cancel).toMatchObject({ requestId: 'notes-cancel', chatType: 'group', chatId: `c${'a'.repeat(32)}` });
+    expect(LineWorkerCommandSchema.safeParse(cancel).success).toBe(true);
+    await expect(h.gateway.readChatResource!({ ...binding, controlEpoch: Number(binding.controlEpoch) + 1, type: 'chatResourceRead',
+      requestId: 'stale', chatType: 'group', chatId: `c${'a'.repeat(32)}`, action: 'listNotes', timeoutMs: 10_000 } as never))
+      .rejects.toMatchObject({ message: 'Stale worker binding', diagnostic: { stage: 'gateway_admission', reason: 'stale_binding',
+        currentBindingMatch: false, currentEpochMatch: false, workerReady: true } });
   });
 });
 

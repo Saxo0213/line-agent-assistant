@@ -15,6 +15,7 @@ export const MCP_SHUTDOWN_TIMEOUT_MS = 2_000;
 export const MCP_APPROVAL_REQUEST_TIMEOUT_MS = 905_000;
 
 export interface McpHttpServerOptions {
+  onDiagnostic?: () => void;
   port?: number;
   maxBodyBytes?: number;
   requestTimeoutMs?: number;
@@ -258,6 +259,7 @@ export class McpHttpServer {
       this.sendJson(res, response.httpStatus, response.body);
     } catch {
       if (!res.writableEnded) {
+        try { this.options.onDiagnostic?.(); } catch { /* Transport results cannot depend on observation. */ }
         this.sendJson(res, 500, {
           jsonrpc: '2.0',
           id: null,

@@ -8,15 +8,13 @@ describe('Task 5 IPC authority contract', () => {
     expect(AppSnapshotSchema.safeParse(base).success).toBe(true);
     expect(AppSnapshotSchema.safeParse({ ...base, control: undefined }).success).toBe(false);
   });
-  it('accepts the optional official-logout confirmation on login requests and the typed blocked result', () => {
+  it('does not expose official LINE process-guard confirmation on login requests', () => {
     for (const request of [{ type: 'lineLoginQr', accountId: 'a' }, { type: 'lineStart', accountId: 'a' }, { type: 'lineAddAccountQr' }]) {
       expect(IpcRequestSchema.safeParse({ requestId: 'r', ...request }).success).toBe(true);
-      expect(IpcRequestSchema.safeParse({ requestId: 'r', ...request, confirmOfficialLogout: true }).success).toBe(true);
-      expect(IpcRequestSchema.safeParse({ requestId: 'r', ...request, confirmOfficialLogout: 'yes' }).success).toBe(false);
+      expect(IpcRequestSchema.safeParse({ requestId: 'r', ...request, confirmOfficialLogout: true }).success).toBe(false);
     }
     const blocked = { type: 'error', requestId: 'r', ok: false, code: 'OFFICIAL_LINE_SESSION_ACTIVE', message: 'm', retryable: false };
-    expect(IpcResultSchema.safeParse({ ...blocked, detail: 'same_account' }).success).toBe(true);
-    expect(IpcResultSchema.safeParse({ ...blocked, detail: 'other' }).success).toBe(false);
+    expect(IpcResultSchema.safeParse({ ...blocked, detail: 'same_account' }).success).toBe(false);
   });
   it('rejects public control switching and renderer workspace paths', () => {
     expect(IpcRequestSchema.safeParse({ type: 'switchControl', requestId: 'r', accountId: 'b', expectedEpoch: 7 }).success).toBe(false);

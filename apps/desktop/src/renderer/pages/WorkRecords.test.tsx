@@ -20,6 +20,20 @@ afterEach(() => {
 });
 
 describe('WorkRecords system tabs', () => {
+  it('shows fixed diagnostic detail, recovery and local reference without inventing legacy detail', async () => {
+    const api = { listSystemActivity: vi.fn(async () => ({ activity: [], partial: false })), listSystemErrors: vi.fn(async () => ({ partial: false, errors: [
+      { createdAt: '2026-10-24T10:00:00.000Z', action: 'LINE 操作失敗', code: 'HISTORY_READ_FAILED', correlationId: 'local-reference',
+        diagnostic: { operation: 'history', stage: 'read', category: 'timeout', recovery: 'retry' } },
+      { createdAt: '2026-10-24T09:00:00.000Z', action: 'LINE 操作失敗', code: 'WORKER_OPERATION_FAILED' },
+    ] })) } as unknown as DesktopApi;
+    renderAtLocale(<WorkRecords api={api} onOpen={vi.fn()} headingRef={React.createRef()} />, 'en');
+    fireEvent.click(screen.getByRole('tab', { name: 'System errors' }));
+    expect(await screen.findByText('history')).toBeTruthy();
+    expect(screen.getByText('Retry this action.')).toBeTruthy();
+    expect(screen.getByText('local-reference')).toBeTruthy();
+    expect(screen.getByText('Diagnostic detail was not recorded.')).toBeTruthy();
+  });
+
   it('uses bottom-underline tabs and keeps keyboard selection behavior', async () => {
     const api = { listSystemActivity: vi.fn(async () => ({ activity: [], partial: false })),
       listSystemErrors: vi.fn(async () => ({ errors: [], partial: false })) } as unknown as DesktopApi;
@@ -63,6 +77,7 @@ describe('WorkRecords system tabs', () => {
       listSystemActivity: vi.fn(async () => ({ partial: false, activity: [] })),
       listSystemErrors: vi.fn(async () => ({ partial: false, errors: [
         { createdAt: '2026-10-17T10:02:00.000Z', action: 'LINE 操作失敗', code: 'INVALID_COMMAND' },
+        { createdAt: '2026-10-17T10:01:00.000Z', action: 'LINE 操作失敗', code: 'HISTORY_READ_FAILED' },
       ] })),
     } as unknown as DesktopApi;
     render(<WorkRecords api={api} onOpen={vi.fn()} headingRef={React.createRef()} />);
@@ -74,6 +89,8 @@ describe('WorkRecords system tabs', () => {
     expect(errorRow?.querySelector('p')?.textContent).toBe('LINE 工作程序執行指令時發生錯誤');
     expect(errorRow?.querySelector('code')?.textContent).toBe('INVALID_COMMAND');
     expect(errorRow?.querySelector('.work-record-row-action')).toBeTruthy();
+    expect(screen.getByText('HISTORY_READ_FAILED')).toBeTruthy();
+    expect(screen.getByText('無法讀取 LINE 聊天記錄。')).toBeTruthy();
   });
 
   it('shows attachment activity and terminal errors only in their selected tabs', async () => {

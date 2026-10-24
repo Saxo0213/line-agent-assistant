@@ -14,6 +14,9 @@ import {
   type AgentToolAllowlistEntry,
   type SetAgentExecutionPolicyInput,
   AppSnapshotSchema,
+  ChatResourceNoteSchema,
+  ChatResourceAlbumSchema,
+  ChatResourcePhotoSchema,
   AutoResponderSettingsSchema,
   IpcEventSchema,
   IpcResultSchema,
@@ -44,6 +47,9 @@ import {
   type McpToolName,
   type McpToolOutputUnion,
   type MessageSearchResult,
+  type ChatResourceNote,
+  type ChatResourceAlbum,
+  type ChatResourcePhoto,
 } from '@line-agent/contracts';
 import { FriendListSchema, MessageReadersSchema, AttachmentStateListSchema, ControlStateSchema, DesktopReadResultSchema, MessagePageSchema, SystemActivityResultSchema, SystemErrorsResultSchema, WorkRecordSchema } from '../desktop-protocol.js';
 import { DatabaseSetupResultSchema, SETUP_PROGRESS_CHANNEL, SetupProgressEventSchema, type DatabaseConnectionInput, type DatabaseSetupStatus,
@@ -52,10 +58,19 @@ import type { FriendRow, MessagePage, MessageReader, WorkRecord } from '../main/
 import { LocaleSnapshotSchema, type LocalePreference, type LocaleSnapshot } from '../locale.js';
 
 export type DesktopApi = {
+  reportRendererFailure?(): Promise<IpcResult>;
   getLocale(): Promise<LocaleSnapshot>;
   setLocale(preference: LocalePreference): Promise<LocaleSnapshot>;
   getSnapshot(): Promise<AppSnapshot>;
-  listMessages(key: ConversationKey, cursor: string | null, limit?: number): Promise<MessagePage>;
+  listMessages(key: ConversationKey, cursor: string | null, limit?: number, messageId?: string): Promise<MessagePage>;
+  listChatNotes(key: ConversationKey, cursor: string | null, requestId?: string): Promise<{ notes: ChatResourceNote[]; nextCursor: string | null }>;
+  getChatNote(key: ConversationKey, postId: string, requestId?: string): Promise<ChatResourceNote>;
+  listChatAlbums(key: ConversationKey, cursor: string | null, requestId?: string): Promise<{ albums: ChatResourceAlbum[]; nextCursor: string | null }>;
+  listChatAlbumPhotos(key: ConversationKey, albumId: string, cursor: string | null, requestId?: string): Promise<{ photos: ChatResourcePhoto[]; nextCursor: string | null }>;
+  downloadChatAlbumPhoto(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: 'album/a' | 'album/v', requestId?: string): Promise<{ albumId: string; photoId: string; sizeBytes: number }>;
+  openChatAlbum(key: ConversationKey, albumId: string, requestId?: string): Promise<{ albumId: string; savedCount: number; failedCount: number; totalCount: number;
+    byteCount: number; complete: boolean; failureCodes: string[]; errorCode: string | null }>;
+  cancelChatResourceRequest(targetRequestId: string): Promise<boolean>;
   listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[]): Promise<ReturnType<typeof AttachmentStateListSchema.parse>>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'; revision: string }>>;
   listWorkRecords(): Promise<WorkRecord[]>;
@@ -69,6 +84,10 @@ export type DesktopApi = {
   searchAgentJobs(query: AgentJobSearchQuery): Promise<{ jobs: AgentJobSummary[]; nextCursor: NonNullable<AgentJobSearchQuery['cursor']> | null }>;
   sendText(key: WritableConversationKey, text: string): Promise<IpcResult>;
   replyText(key: WritableConversationKey, replyToMessageId: string, text: string): Promise<IpcResult>;
+  sendManualMedia?(key: WritableConversationKey, files: AgentAttachmentUpload[]): Promise<IpcResult>;
+  unsendMessage(key: ConversationKey, messageId: string): Promise<IpcResult>;
+  getManualUnsendWindow(): Promise<'1h' | '7d'>;
+  setManualUnsendWindow(window: '1h' | '7d'): Promise<'1h' | '7d'>;
   /** The shared Agent room: operator-owned, independent of every LINE account. */
   submitAgentRoomPrompt(input: { provider: AgentProvider; prompt: string; attachments?: AgentAttachmentUpload[] }): Promise<IpcResult>;
   getAgentRoomJobEvents(jobId: string): Promise<AgentEvent[]>;
@@ -78,12 +97,13 @@ export type DesktopApi = {
   openExternalUrl(url: string): Promise<IpcResult>;
   downloadAttachment(key: WritableConversationKey, attachmentId: string): Promise<IpcResult>;
   resolveFileTypeIcon(extension: string): Promise<string | null>;
-  lineAddAccountQr(options?: { confirmOfficialLogout?: boolean }): Promise<IpcResult>;
-  lineLoginQr(accountId: string, options?: { confirmOfficialLogout?: boolean }): Promise<IpcResult>;
+  lineAddAccountQr(): Promise<IpcResult>;
+  lineLoginQr(accountId: string): Promise<IpcResult>;
   lineLogout(accountId: string): Promise<IpcResult>;
+  refreshLineAvatar(accountId: string): Promise<IpcResult>;
   lineSetAutoLogin(accountId: string, enabled: boolean): Promise<IpcResult>;
   lineBeginAdminPairing(accountId: string): Promise<{ token: string; expiresAt: string }>;
-  lineStart(accountId: string, options?: { confirmOfficialLogout?: boolean }): Promise<IpcResult>;
+  lineStart(accountId: string): Promise<IpcResult>;
   externalImportStart(accountId: string): Promise<IpcResult>;
   externalImportStop(accountId: string): Promise<IpcResult>;
   /** Operator-only: reads the official LINE identity for the admin-binding confirmation dialog. */
@@ -174,8 +194,7 @@ function throwIpcErrorOrUnexpected(result: IpcResult, message: string): never {
 }
 
 export function createDesktopApi(transport: Transport): DesktopApi {
-  const request = async (body: RequestBody): Promise<IpcResult> => {
-    const requestId = crypto.randomUUID();
+  const request = async (body: RequestBody, requestId: string = crypto.randomUUID()): Promise<IpcResult> => {
     const result = IpcResultSchema.parse(await transport.invoke('line-agent:request', { ...body, requestId }));
     if (result.requestId !== requestId) throw new Error('IPC correlation mismatch');
     return result;
@@ -195,8 +214,17 @@ export function createDesktopApi(transport: Transport): DesktopApi {
   return Object.freeze({
     async getLocale() { return LocaleSnapshotSchema.parse(await transport.invoke('line-agent:locale', { type: 'getLocale' })); },
     async setLocale(preference) { return LocaleSnapshotSchema.parse(await transport.invoke('line-agent:locale', { type: 'setLocale', preference })); },
+    reportRendererFailure: () => request({ type: 'reportRendererFailure' }),
     async getSnapshot() { const result = await request({ type: 'getSnapshot' }); if (result.type !== 'getSnapshot') throw new Error(result.type === 'error' ? result.message : 'Unexpected snapshot response'); return AppSnapshotSchema.parse(result.snapshot); },
-    async listMessages(key, cursor, limit = 75) { const result = await read({ type: 'listMessages', key, cursor, limit }); return MessagePageSchema.parse(result.page); },
+    async listMessages(key, cursor, limit = 75, messageId) { const result = await read({ type: 'listMessages', key, cursor, limit, ...(messageId ? { messageId } : {}) }); return MessagePageSchema.parse(result.page); },
+    async listChatNotes(key, cursor, requestId) { const result = await request({ type: 'listChatNotes', ...key, cursor }, requestId); if (result.type !== 'listChatNotes') throwIpcErrorOrUnexpected(result, 'Unexpected Note response'); return { notes: ChatResourceNoteSchema.array().max(50).parse(result.notes), nextCursor: result.nextCursor }; },
+    async getChatNote(key, postId, requestId) { const result = await request({ type: 'getChatNote', ...key, postId }, requestId); if (result.type !== 'getChatNote') throwIpcErrorOrUnexpected(result, 'Unexpected Note response'); return ChatResourceNoteSchema.parse(result.note); },
+    async listChatAlbums(key, cursor, requestId) { const result = await request({ type: 'listChatAlbums', ...key, cursor }, requestId); if (result.type !== 'listChatAlbums') throwIpcErrorOrUnexpected(result, 'Unexpected Album response'); return { albums: ChatResourceAlbumSchema.array().max(50).parse(result.albums), nextCursor: result.nextCursor }; },
+    async listChatAlbumPhotos(key, albumId, cursor, requestId) { const result = await request({ type: 'listChatAlbumPhotos', ...key, albumId, cursor }, requestId); if (result.type !== 'listChatAlbumPhotos') throwIpcErrorOrUnexpected(result, 'Unexpected Album photo response'); return { photos: ChatResourcePhotoSchema.array().max(50).parse(result.photos), nextCursor: result.nextCursor }; },
+    async downloadChatAlbumPhoto(key, albumId, photoId, oid, prefix, requestId) { const result = await request({ type: 'downloadChatAlbumPhoto', ...key, albumId, photoId, oid, prefix }, requestId); if (result.type !== 'downloadChatAlbumPhoto') throwIpcErrorOrUnexpected(result, 'Unexpected Album photo download response'); return { albumId: result.albumId, photoId: result.photoId, sizeBytes: result.sizeBytes }; },
+    async openChatAlbum(key, albumId, requestId) { const result = await request({ type: 'openChatAlbum', ...key, albumId }, requestId); if (result.type !== 'openChatAlbum') throwIpcErrorOrUnexpected(result, 'Unexpected Album archive response'); return { albumId: result.albumId, savedCount: result.savedCount, failedCount: result.failedCount, totalCount: result.totalCount,
+      byteCount: result.byteCount, complete: result.complete, failureCodes: result.failureCodes, errorCode: result.errorCode }; },
+    async cancelChatResourceRequest(targetRequestId) { const result = await request({ type: 'cancelChatResourceRequest', targetRequestId }); return result.type === 'cancelChatResourceRequest' && result.cancelled; },
     async listAttachmentStates(key, attachmentIds) { if (attachmentIds.length > 225) throw new Error('Attachment state lookup exceeds 225 IDs'); if (attachmentIds.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) throw new Error('Invalid attachment ID'); const result = await read({ type: 'listAttachmentStates', key, attachmentIds: [...new Set(attachmentIds)] }); return AttachmentStateListSchema.parse(result.attachments); },
     async listAgentStatuses(key, messageIds) { if (messageIds.length > 225) throw new Error('Agent status lookup exceeds 225 IDs'); const result = await read({ type: 'listAgentStatuses', key, messageIds: [...new Set(messageIds)] }); return result.statuses; },
     async listWorkRecords() { const result = await read({ type: 'listWorkRecords' }); return WorkRecordSchema.array().parse(result.records); },
@@ -210,6 +238,10 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async searchAgentJobs(query) { const result = await request({ type: 'searchAgentJobs', query }); if (result.type !== 'searchAgentJobs') throw new Error(result.type === 'error' ? result.message : 'Unexpected task search response'); return { jobs: result.jobs, nextCursor: result.nextCursor }; },
     sendText: (key, text) => request({ type: 'sendText', ...key, text }),
     replyText: (key, replyToMessageId, text) => request({ type: 'replyText', ...key, replyToMessageId, text }),
+    sendManualMedia: (key, files) => request({ type: 'sendManualMedia', ...key, files }),
+    unsendMessage: (key, messageId) => request({ type: 'unsendMessage', ...key, messageId }),
+    async getManualUnsendWindow() { const result = await request({ type: 'getManualUnsendWindow' }); if (result.type !== 'getManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },
+    async setManualUnsendWindow(window) { const result = await request({ type: 'setManualUnsendWindow', window }); if (result.type !== 'setManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },
     submitAgentRoomPrompt: (input) => request({ type: 'submitAgentRoomPrompt', provider: input.provider, prompt: input.prompt,
       ...(input.attachments?.length ? { attachments: input.attachments } : {}) }),
     async getAgentRoomJobEvents(jobId) { const result = await request({ type: 'getAgentRoomJobEvents', jobId }); if (result.type !== 'getAgentRoomJobEvents') throw new Error(result.type === 'error' ? result.message : 'Unexpected job events response'); return result.events; },
@@ -219,12 +251,13 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     openExternalUrl: (url) => request({ type: 'openExternalUrl', url }),
     async downloadAttachment(key, attachmentId) { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)) throw new Error('Invalid attachment ID'); return await request({ type: 'downloadAttachment', ...key, attachmentId }); },
     async resolveFileTypeIcon(extension) { if (!/^[a-z0-9]{1,12}$/.test(extension)) return null; const result = await request({ type: 'resolveFileTypeIcon', extension }); return result.type === 'resolveFileTypeIcon' ? result.dataUrl : null; },
-    lineAddAccountQr: (options) => request({ type: 'lineAddAccountQr', ...(options?.confirmOfficialLogout === true ? { confirmOfficialLogout: true } : {}) }),
-    lineLoginQr: (accountId, options) => request({ type: 'lineLoginQr', accountId, ...(options?.confirmOfficialLogout === true ? { confirmOfficialLogout: true } : {}) }),
+    lineAddAccountQr: () => request({ type: 'lineAddAccountQr' }),
+    lineLoginQr: (accountId) => request({ type: 'lineLoginQr', accountId }),
     lineLogout: (accountId) => request({ type: 'lineLogout', accountId }),
+    refreshLineAvatar: (accountId) => request({ type: 'refreshLineAvatar', accountId }),
     lineSetAutoLogin: (accountId, enabled) => request({ type: 'lineSetAutoLogin', accountId, enabled }),
     async lineBeginAdminPairing(accountId) { const result = await request({ type: 'lineBeginAdminPairing', accountId }); if (result.type !== 'lineAdminPairing') throw new Error(result.type === 'error' ? result.message : 'Unexpected pairing response'); return { token: result.token, expiresAt: result.expiresAt }; },
-    lineStart: (accountId, options) => request({ type: 'lineStart', accountId, ...(options?.confirmOfficialLogout === true ? { confirmOfficialLogout: true } : {}) }),
+    lineStart: (accountId) => request({ type: 'lineStart', accountId }),
     externalImportStart: (accountId) => request({ type: 'externalImportStart', accountId }),
     externalImportStop: (accountId) => request({ type: 'externalImportStop', accountId }),
     previewExternalAdminBinding: () => request({ type: 'previewExternalAdminBinding' }),

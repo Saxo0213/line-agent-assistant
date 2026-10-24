@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { LineWorkerCommand } from '@line-agent/contracts';
 import { LineWorkerCommandSchema, WORKER_PROTOCOL_VERSION } from '@line-agent/contracts';
 import { createUtilityWorkerGateway } from './utility-worker-gateway.js';
+import { ManualSendNotStartedError } from './services/manual-send-errors.js';
+import { createHash } from 'node:crypto';
+import { ChatResourceArchiveService, type ChatResourceBinding, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
+import { ChatResourceAccountAdmission } from './services/chat-resource-admission.js';
 
 class FakeChild {
   readonly posted: unknown[] = [];
@@ -33,7 +37,7 @@ class FakeChild {
   emitRaw(value: unknown) {
     const event = value as { requestId?: string };
     const sent = event.requestId && [...this.posted].reverse().find((item) =>
-      ['sendText', 'manualSendText'].includes((item as { type?: string; requestId?: string }).type ?? '')
+      ['sendText', 'manualSendText', 'sendMedia'].includes((item as { type?: string; requestId?: string }).type ?? '')
       && (item as { requestId?: string }).requestId === event.requestId) as Record<string, unknown> | undefined;
     this.message?.({ data: { ...this.owner, ...(sent ? { operationId: sent.operationId, attemptId: sent.attemptId } : {}),
       ...(value as object) }, ports: [] });
@@ -68,6 +72,216 @@ function trackedAbortSignal() {
 }
 
 describe('utility worker gateway', () => {
+  it('matches unsend results to the exact pending request and cleans up on timeout', async () => {
+    const child = new FakeChild();
+    const gateway = createUtilityWorkerGateway({ spawn: () => child, pollIntervalMs: 60_000, responseTimeoutMs: 5 });
+    try {
+      const current = await gateway.start('unsend-gateway', { accountId: 'unsend-gateway', workerInstanceId: 'unsend-worker', controlEpoch: 3, mode: 'MONITOR_ONLY' });
+      child.emit({ type: 'modeAck', ...current, mode: 'MONITOR_ONLY', drained: true });
+      const baseline = gateway.inventory?.();
+      const unsend = gateway.unsend!;
+      const request = { type: 'unsendMessage' as const, ...current, requestId: 'unsend-gateway-1', chatType: 'group' as const, chatId: 'c-chat', messageId: '99' };
+      const completed = unsend(request);
+      const command = child.posted.at(-1) as typeof request;
+      expect(LineWorkerCommandSchema.parse(command)).toMatchObject({ type: 'unsendMessage', requestId: request.requestId, messageId: '99' });
+      const { mode: _mode, ...wireBinding } = current;
+      child.emit({ type: 'unsendResult', ...wireBinding, requestId: request.requestId, chatType: 'group', chatId: 'c-chat', messageId: '99', status: 'unsent', error: null });
+      await expect(completed).resolves.toMatchObject({ status: 'unsent', requestId: request.requestId });
+      expect(gateway.inventory?.()?.pendingTasks).toBe(baseline?.pendingTasks);
+
+      const timedOut = unsend({ ...request, requestId: 'unsend-gateway-timeout', messageId: '100' });
+      await expect(timedOut).resolves.toMatchObject({ status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' });
+      expect(gateway.inventory?.()?.pendingTasks).toBe(baseline?.pendingTasks);
+    } finally { await gateway.shutdown(); }
+  });
+
+  it.each([
+    { ok: true as const, error: null, ownMid: 'u12345678901234567890123456789012', displayName: 'Own account', picturePath: '/avatar.jpg' },
+    { ok: false as const, error: 'PROFILE_READ_FAILED' },
+  ])('settles an explicit own profile request when the worker returns $ok', async (result) => {
+    const child = new FakeChild();
+    const gateway = createUtilityWorkerGateway({ spawn: () => child, pollIntervalMs: 60_000 });
+    try {
+      const current = await gateway.start('profile-result', {
+        accountId: 'profile-result', workerInstanceId: 'profile-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL',
+      });
+      child.emit({ type: 'modeAck', ...current, drained: true });
+      const { mode: _mode, ...binding } = current;
+      const command = { type: 'refreshOwnProfile' as const, ...binding,
+        requestId: `profile-${result.ok}`, timeoutMs: 5_000 };
+      const outcome = gateway.refreshOwnProfile!(command);
+      expect(child.posted.find((item) => (item as { type?: string }).type === 'refreshOwnProfile')).toMatchObject(command);
+
+      child.emit({ type: 'ownProfileResult', ...binding, requestId: command.requestId, ...result });
+
+      await expect(outcome).resolves.toMatchObject({
+        type: 'ownProfileResult', requestId: command.requestId, ...result,
+      });
+    } finally {
+      await gateway.shutdown();
+    }
+  });
+
+  it('reopens archive admission only after the gateway mode acknowledgement and fresh authentication', async () => {
+    const children: FakeChild[] = [];
+    const gateway = createUtilityWorkerGateway({ spawn: () => { const child = new FakeChild(); children.push(child); return child; }, pollIntervalMs: 60_000 });
+    let activeBinding: Awaited<ReturnType<typeof gateway.binding>> = null;
+    let authenticated = false;
+    let reads = 0;
+    const publications: number[] = [];
+    const store: ChatResourceStore = {
+      async publish(input) {
+        input.guard();
+        const hash = createHash('sha256').update(input.content).digest('hex');
+        publications.push(publications.length + 1);
+        return { revision: publications.length, savedAt: new Date().toISOString(), contentHash: hash, byteLength: input.content.byteLength };
+      },
+      async read() { return null; }, async list() { return { items: [], nextCursor: null }; }, async close() {}, forceClose() {},
+    };
+    const archive = new ChatResourceArchiveService({
+      async readChatResource(command) {
+        reads++;
+        return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true,
+          accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+          chatType: command.chatType, chatId: command.chatId, note: { postId: 'note-a', createdTime: 1, text: 'saved' } } as ChatResourceReadResult;
+      }, store, async isWritableAccount() { return true; },
+      async getBinding(accountId) {
+        const binding = activeBinding;
+        if (!binding || binding.accountId !== accountId || typeof binding.transportOwnerId !== 'string'
+          || typeof binding.transportGeneration !== 'number' || typeof binding.writeGrantVersion !== 'number') return null;
+        return { ...binding, transportOwnerId: binding.transportOwnerId, transportGeneration: binding.transportGeneration,
+          writeGrantVersion: binding.writeGrantVersion };
+      },
+      isCurrentBinding(binding) { return authenticated && gateway.isCurrentActiveControlBinding(binding); },
+      async conversationExists() { return true; },
+    });
+    const admission = new ChatResourceAccountAdmission(archive, (binding) => authenticated
+      && gateway.isCurrentActiveControlBinding(binding));
+    const postAckTasks: Promise<void>[] = [];
+    const callbackReadiness: boolean[] = [];
+    gateway.onBinding!((binding) => {
+      authenticated = false; activeBinding = binding;
+      admission.close(binding.accountId, 'new worker binding'); admission.observeBinding(binding);
+    });
+    gateway.onEvent(async (instance, event) => {
+      if (event.type !== 'login' && event.type !== 'status') return;
+      const current = await gateway.binding(event.accountId);
+      if (!current || current.workerInstanceId !== instance || current.workerInstanceId !== event.workerInstanceId) return;
+      if (event.type === 'login') { authenticated = true; admission.authenticated(current); }
+      else if (event.state === 'ready') admission.ready(current);
+    });
+    gateway.onModeChange!((binding) => {
+      callbackReadiness.push(gateway.isCurrentActiveControlBinding(binding));
+      admission.close(binding.accountId, 'mode acknowledgement pending', true);
+      const mode = binding.mode;
+      postAckTasks.push((async () => {
+        if (mode === 'PAUSED' || !await gateway.waitModeAck(binding.accountId, mode, 1000)) return;
+        const current = await gateway.binding(binding.accountId);
+        if (!current || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch || current.mode !== mode) return;
+        admission.ready(current);
+        admission.modeReady(current);
+      })());
+    });
+
+    async function sendLoginAndReady(child: FakeChild, binding: NonNullable<typeof activeBinding>) {
+      const { mode: _mode, ...wireBinding } = binding;
+      child.emit({ type: 'login', ...wireBinding, loginAttemptId: `login-${binding.controlEpoch}`, ownMid: 'self', displayName: 'Agent' });
+      child.emit({ type: 'status', ...wireBinding, state: 'ready', message: null });
+      await vi.waitFor(() => expect(authenticated).toBe(true), { timeout: 1000 });
+    }
+    async function acknowledge(child: FakeChild, binding: NonNullable<typeof activeBinding>) {
+      child.emit({ type: 'modeAck', ...binding, mode: binding.mode, drained: true });
+      await vi.waitFor(() => expect(gateway.isCurrentActiveControlBinding(binding)).toBe(true), { timeout: 1000 });
+      await Promise.all(postAckTasks.splice(0));
+    }
+
+    try {
+      const first = await gateway.start('archive-gateway', { accountId: 'archive-gateway', workerInstanceId: 'archive-worker-1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+      await sendLoginAndReady(children[0]!, first);
+      await expect(archive.getNote({ accountId: first.accountId, chatType: 'group', chatId: 'chat-a' }, 'note-a')).rejects.toThrow('archive is closed');
+      await acknowledge(children[0]!, first);
+      await expect(archive.getNote({ accountId: first.accountId, chatType: 'group', chatId: 'chat-a' }, 'note-a')).resolves.toMatchObject({ text: 'saved' });
+      expect(callbackReadiness).toEqual([false]);
+      expect(reads).toBe(1);
+      expect(publications).toHaveLength(1);
+
+      admission.close(first.accountId, 'logout'); authenticated = false;
+      admission.authenticated(first);
+      await expect(archive.getNote({ accountId: first.accountId, chatType: 'group', chatId: 'chat-a' }, 'note-a')).rejects.toThrow('archive is closed');
+      expect(reads).toBe(1);
+
+      const next = await gateway.start(first.accountId, { accountId: first.accountId, workerInstanceId: 'archive-worker-2', controlEpoch: 2, mode: 'ACTIVE_CONTROL' });
+      await sendLoginAndReady(children[1]!, next);
+      await acknowledge(children[1]!, next);
+      await expect(archive.getNote({ accountId: next.accountId, chatType: 'group', chatId: 'chat-a' }, 'note-a')).resolves.toMatchObject({ text: 'saved' });
+      expect(callbackReadiness).toEqual([false, false]);
+      expect(reads).toBe(2);
+      expect(publications).toHaveLength(2);
+    } finally {
+      for (const child of children) child.crash();
+      await archive.shutdown();
+      await gateway.shutdown();
+    }
+  });
+
+  it('routes archive note and album reads through the current fake worker binding', async () => {
+    const child = new FakeChild();
+    const gateway = createUtilityWorkerGateway({ spawn: () => child, pollIntervalMs: 60_000 });
+    const started = await gateway.start('resource-owner-binding', {
+      accountId: 'resource-owner-binding', workerInstanceId: 'resource-worker', controlEpoch: 4, mode: 'ACTIVE_CONTROL',
+    });
+    const current: ChatResourceBinding = { ...started, transportOwnerId: started.transportOwnerId!,
+      transportGeneration: started.transportGeneration!, writeGrantVersion: started.writeGrantVersion! };
+    const archived: string[] = [];
+    const store: ChatResourceStore = {
+      async publish(input) {
+        input.guard(); archived.push(input.kind);
+        const hash = createHash('sha256').update(input.content).digest('hex');
+        return { revision: 1, savedAt: new Date().toISOString(), contentHash: hash, byteLength: input.content.byteLength };
+      },
+      async read() { return null; }, async list() { return { items: [], nextCursor: null }; }, async close() {}, forceClose() {},
+    };
+    const archive = new ChatResourceArchiveService({
+      readChatResource: (command, signal) => gateway.readChatResource!(command, signal), store,
+      async isWritableAccount() { return true; },
+      async getBinding(accountId) { return accountId === current.accountId ? current : null; },
+      isCurrentBinding(binding) { return gateway.isCurrentActiveControlBinding!(binding); },
+      async conversationExists() { return true; },
+    });
+    const key = { accountId: current.accountId, chatType: 'group' as const, chatId: 'group-a' };
+    try {
+      child.emit({ type: 'modeAck', ...current, drained: true });
+      const readAndRespond = async (action: 'listNotes' | 'listAlbums') => {
+        const result = action === 'listNotes' ? archive.listNotes(key, null) : archive.listAlbums(key, null);
+        void result.catch(() => undefined);
+        await vi.waitFor(() => expect(child.posted.at(-1)).toMatchObject({ type: 'chatResourceRead', action,
+          transportOwnerId: current.transportOwnerId, transportGeneration: current.transportGeneration,
+          writeGrantVersion: current.writeGrantVersion }));
+        const command = child.posted.at(-1) as { requestId: string; chatType: 'group'; chatId: string };
+        child.emitRaw({ type: 'chatResourceResult', accountId: current.accountId, workerInstanceId: current.workerInstanceId,
+          controlEpoch: current.controlEpoch, transportOwnerId: current.transportOwnerId, transportGeneration: current.transportGeneration,
+          writeGrantVersion: current.writeGrantVersion, requestId: command.requestId, action, ok: true, error: null,
+          chatType: command.chatType, chatId: command.chatId,
+          ...(action === 'listNotes' ? { notes: [{ postId: 'note-a', createdTime: 1, text: 'note' }], nextCursor: null }
+            : { albums: [{ albumId: 'album-a', chatId: command.chatId, title: 'album', photoCount: 0, createTime: 1, updateTime: 1 }], nextCursor: null }) });
+        return result;
+      };
+
+      await expect(readAndRespond('listNotes')).resolves.toMatchObject({ notes: [{ postId: 'note-a' }] });
+      await expect(readAndRespond('listAlbums')).resolves.toMatchObject({ albums: [{ albumId: 'album-a' }] });
+      const currentRequest = child.posted.filter((item) => (item as { type?: string }).type === 'chatResourceRead').at(-1) as Record<string, unknown>;
+      const postedCount = child.posted.length;
+      await expect(gateway.readChatResource!({ ...currentRequest, requestId: 'stale-owner', transportOwnerId: 'stale-owner' } as never))
+        .rejects.toThrow(/stale|binding/i);
+      expect(child.posted).toHaveLength(postedCount);
+      expect(archived).toEqual(['note', 'album']);
+      expect(child.posted.filter((item) => (item as { type?: string }).type === 'chatResourceRead')).toHaveLength(2);
+    } finally {
+      await archive.shutdown();
+      await gateway.shutdown();
+    }
+  });
+
   it('keeps a replacement download worker unready until restart adoption completes after auth events', async () => {
     vi.useFakeTimers();
     const children: FakeChild[] = [];
@@ -190,6 +404,29 @@ describe('utility worker gateway', () => {
       transportGeneration: current.transportGeneration, writeGrantVersion: current.writeGrantVersion,
       requestId: command.requestId, status: 'sent', messageId: 'sent-1', error: null });
     await expect(send).resolves.toMatchObject({ status: 'sent', messageId: 'sent-1' });
+    const media = gateway.sendMedia!({ ...current, requestId: 'admin-manual-media-1', chatType: 'direct', chatId: 'u-peer',
+      kind: 'file', filePath: 'C:\\work\\note.txt', fileName: 'note.txt', sizeBytes: 4, sha256: 'a'.repeat(64), manualSend: true } as never);
+    await vi.waitFor(() => expect(child.posted.find((item) => (item as { requestId?: string }).requestId === 'admin-manual-media-1')).toBeTruthy(), { timeout: 3_000 });
+    expect(child.posted.at(-1)).toMatchObject({ type: 'sendMedia', manualSend: true, accountId: binding.accountId });
+    const mediaCommand = child.posted.at(-1) as { requestId: string };
+    child.emit({ type: 'sendResult', accountId: current.accountId, workerInstanceId: current.workerInstanceId,
+      controlEpoch: current.controlEpoch, transportOwnerId: current.transportOwnerId,
+      transportGeneration: current.transportGeneration, writeGrantVersion: current.writeGrantVersion,
+      requestId: mediaCommand.requestId, status: 'sent', messageId: 'media-sent-1', error: null });
+    await expect(media).resolves.toMatchObject({ status: 'sent', messageId: 'media-sent-1' });
+    await gateway.shutdown();
+  });
+
+  it('marks a stale manual media binding as definitively not started', async () => {
+    const child = new FakeChild();
+    const gateway = createUtilityWorkerGateway({ spawn: () => child, pollIntervalMs: 60_000 });
+    const current = await gateway.start('stale-manual-media', { accountId: 'stale-manual-media',
+      workerInstanceId: 'stale-manual-media-worker', controlEpoch: 3, mode: 'MONITOR_ONLY' });
+    child.emit({ type: 'modeAck', ...current, mode: 'MONITOR_ONLY', drained: true });
+    await expect(gateway.sendMedia!({ ...current, controlEpoch: current.controlEpoch + 1, requestId: 'stale-media',
+      chatType: 'direct', chatId: 'peer', kind: 'file', filePath: 'C:\\work\\note.txt', fileName: 'note.txt',
+      sizeBytes: 4, sha256: 'a'.repeat(64), manualSend: true } as never)).rejects.toBeInstanceOf(ManualSendNotStartedError);
+    expect(child.posted.some((item) => (item as { type?: string }).type === 'sendMedia')).toBe(false);
     await gateway.shutdown();
   });
 

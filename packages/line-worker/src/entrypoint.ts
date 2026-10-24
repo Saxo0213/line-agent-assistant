@@ -1,10 +1,32 @@
 import { LineWorkerCommandSchema, LineWorkerEventSchema, LOGIN_FAILURES,
-  type LineWorkerCommand, type LineWorkerEvent } from '@line-agent/contracts';
+  type LineWorkerCommand, type LineWorkerEvent, type WorkerErrorCode } from '@line-agent/contracts';
 import { createLinejsAdapter } from './linejs-adapter.js';
 import { LineWorkerLoop, type LineTransport, type LineWorkerOptions } from './worker-loop.js';
 import { createWindowsAttachmentBroker } from './windows-attachment-broker.js';
+import { diagnosticFailure } from '@line-agent/contracts';
 
 type Init = Extract<LineWorkerCommand, { type: 'init' }>;
+
+const operationErrors: Partial<Record<LineWorkerCommand['type'], Readonly<{ code: WorkerErrorCode; message: string }>>> = {
+  history: { code: 'HISTORY_READ_FAILED', message: 'LINE chat history could not be read.' },
+  chatResourceRead: { code: 'CHAT_RESOURCE_READ_FAILED', message: 'LINE chat resources could not be read.' },
+  refreshOwnProfile: { code: 'PROFILE_REFRESH_FAILED', message: 'The LINE profile could not be refreshed.' },
+  sendText: { code: 'MESSAGE_SEND_FAILED', message: 'The LINE message could not be sent.' },
+  manualSendText: { code: 'MESSAGE_SEND_FAILED', message: 'The LINE message could not be sent.' },
+  sendMedia: { code: 'MESSAGE_SEND_FAILED', message: 'The LINE attachment could not be sent.' },
+  unsendMessage: { code: 'MESSAGE_UNSEND_FAILED', message: 'The LINE message could not be unsent.' },
+  reactMessage: { code: 'MESSAGE_REACTION_FAILED', message: 'The LINE reaction could not be applied.' },
+  checkFriendRelation: { code: 'FRIEND_RELATION_CHECK_FAILED', message: 'The LINE friend relationship could not be checked.' },
+  addFriendByMid: { code: 'FRIEND_ADD_FAILED', message: 'The LINE friend could not be added.' },
+  downloadAttachment: { code: 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', message: 'The LINE attachment could not be downloaded.' },
+  setSecretState: { code: 'CREDENTIAL_RESTORE_FAILED', message: 'LINE credentials could not be restored.' },
+  poll: { code: 'LINE_SYNC_FAILED', message: 'LINE updates could not be synchronized.' },
+};
+
+function operationError(command: LineWorkerCommand | undefined): Readonly<{ code: WorkerErrorCode; message: string }> {
+  return command ? operationErrors[command.type] ?? { code: 'WORKER_OPERATION_FAILED', message: 'The LINE worker operation failed.' }
+    : { code: 'INVALID_COMMAND', message: 'Worker command rejected' };
+}
 
 export interface WorkerPort {
   onMessage(handler: (value: unknown) => void): void;
@@ -105,12 +127,14 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
     ...(binding.writeGrantVersion === undefined ? {} : { writeGrantVersion: binding.writeGrantVersion }) }) : undefined;
   const capabilityKey = (command: LineWorkerCommand) => command.type === 'history'
     ? `history:${command.accountId}:${command.workerInstanceId}`
+    : command.type === 'chatResourceRead' ? `chat-resource:${command.accountId}:${command.workerInstanceId}`
     : command.type === 'downloadAttachment' ? `attachment:${command.accountId}:${command.workerInstanceId}`
       : command.type === 'cancelAttachmentDownload' ? `cancel:${command.accountId}:${command.workerInstanceId}`
         : `control:${command.accountId}:${command.workerInstanceId}`;
   const emit = (event: LineWorkerEvent) => port.postMessage(LineWorkerEventSchema.parse(event));
   const execute = async (input: unknown, supplied?: LineWorkerCommand): Promise<void> => {
     let command: LineWorkerCommand | undefined;
+    let commandExecutionStarted = false;
     try {
       command = supplied ?? LineWorkerCommandSchema.parse(input);
       if (!binding) {
@@ -141,6 +165,7 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
           error: 'SIDE_EFFECT_DENIED' });
         return;
       }
+      commandExecutionStarted = true;
       await loop.handle(command);
     } catch (error) {
       if (!binding) return; // There is no trusted account/instance to address.
@@ -158,8 +183,12 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
       } else if (error instanceof Error && 'code' in error && error.code === 'PROTOCOL_UNVERIFIED') {
         await emit({ type: 'status', ...identity, state: 'PROTOCOL_UNVERIFIED', message: null });
       } else {
-        await emit({ type: 'error', ...identity, code: 'INVALID_COMMAND',
-          message: 'Worker command rejected', retryable: false });
+        const diagnostic = commandExecutionStarted ? operationError(command)
+          : { code: 'INVALID_COMMAND' as const, message: 'Worker command rejected' };
+        await emit({ type: 'error', ...identity, ...diagnostic, retryable: false,
+          diagnostic: diagnosticFailure(command?.type ?? 'unknown', commandExecutionStarted ? 'execute'
+            : command?.type === 'init' && initializing ? 'bootstrap' : 'admission', error),
+          ...(command && 'requestId' in command ? { requestId: command.requestId } : {}) });
       }
     }
   };
@@ -179,15 +208,16 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
       initializationReady = new Promise<void>((resolve) => { resolveInitialization = resolve; });
     }
     const expectedBinding = binding ?? reservedBinding;
-    if (parsed.success && (parsed.data.type === 'revokeControl' || parsed.data.type === 'stop' || parsed.data.type === 'cancelAttachmentDownload') && expectedBinding &&
+    if (parsed.success && (parsed.data.type === 'revokeControl' || parsed.data.type === 'stop' || parsed.data.type === 'cancelAttachmentDownload' || parsed.data.type === 'cancelChatResourceRead') && expectedBinding &&
       parsed.data.accountId === expectedBinding.accountId && parsed.data.workerInstanceId === expectedBinding.workerInstanceId &&
       parsed.data.controlEpoch === expectedBinding.controlEpoch &&
       parsed.data.transportOwnerId === expectedBinding.transportOwnerId &&
       parsed.data.transportGeneration === expectedBinding.transportGeneration &&
       parsed.data.writeGrantVersion === expectedBinding.writeGrantVersion) {
-      if (parsed.data.type !== 'cancelAttachmentDownload') urgentFence = true;
+      if (parsed.data.type === 'revokeControl' || parsed.data.type === 'stop') urgentFence = true;
       const taskKey = parsed.data.type === 'cancelAttachmentDownload'
-        ? `cancel:${parsed.data.attemptToken}` : parsed.data.type;
+        ? `cancel:${parsed.data.attemptToken}` : parsed.data.type === 'cancelChatResourceRead'
+          ? `cancel-chat-resource:${parsed.data.requestId}` : parsed.data.type;
       if (!urgentTasks.has(taskKey)) {
         const ready = loop ? Promise.resolve() : initializationReady ?? Promise.resolve();
         const type = taskKey;

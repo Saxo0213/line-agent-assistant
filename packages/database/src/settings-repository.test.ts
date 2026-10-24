@@ -17,12 +17,15 @@ database('conversation settings repository', () => {
   afterAll(async () => { await close?.(); });
 
   it('uses defaults when keys are absent and commits both validated values together', async () => {
-    expect(await repository.getConversationSettings()).toEqual({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: DEFAULT_AGENT_STATUS_ICONS });
+    expect(await repository.getConversationSettings()).toEqual({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true,
+      agentStatusIcons: DEFAULT_AGENT_STATUS_ICONS, agentStatusRotationIntervalSeconds: 10 });
     const customIcons = { ...DEFAULT_AGENT_STATUS_ICONS, running: '🤖', completed: '🏁' };
-    await repository.setConversationSettings({ attachmentAutoAttemptLimit: 7, showAgentStatusMarkers: false, agentStatusIcons: customIcons });
-    expect(await repository.getConversationSettings()).toEqual({ attachmentAutoAttemptLimit: 7, showAgentStatusMarkers: false, agentStatusIcons: customIcons });
+    await repository.setConversationSettings({ attachmentAutoAttemptLimit: 7, showAgentStatusMarkers: false, agentStatusIcons: customIcons,
+      agentStatusRotationIntervalSeconds: 5 });
+    expect(await repository.getConversationSettings()).toEqual({ attachmentAutoAttemptLimit: 7, showAgentStatusMarkers: false,
+      agentStatusIcons: customIcons, agentStatusRotationIntervalSeconds: 5 });
     expect((await pool.query('SELECT key FROM app_settings ORDER BY key')).rows).toEqual([
-      { key: 'agent_status_icons' }, { key: 'attachment_auto_attempt_limit' }, { key: 'show_agent_status_markers' },
+      { key: 'agent_status_icons' }, { key: 'agent_status_rotation_interval_seconds' }, { key: 'attachment_auto_attempt_limit' }, { key: 'show_agent_status_markers' },
     ]);
   });
 
@@ -42,6 +45,12 @@ database('conversation settings repository', () => {
       agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS, failed: '\n' },
     })).rejects.toThrow();
     expect(await repository.getConversationSettings()).toEqual(before);
+  });
+
+  it.each([4, 5.5, '6', null, 86_401])('rejects an invalid status icon rotation interval: %s', async (seconds) => {
+    await expect(repository.setConversationSettings({
+      ...(await repository.getConversationSettings()), agentStatusRotationIntervalSeconds: seconds as number,
+    })).rejects.toThrow();
   });
 
   it('stores the official LINE build trust document under its single app_settings key', async () => {

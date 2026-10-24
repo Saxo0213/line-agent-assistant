@@ -4,6 +4,28 @@ import { createIpcAdapter, createReadAdapter } from './ipc.js';
 const snapshot = { control: { epoch: 0, activeAccountId: null, phase: 'idle' as const, targetAccountId: null }, defaultProvider: 'claude' as const, components: [], queueDepth: 0, accounts: [], conversations: [], jobs: [], providers: [] };
 
 describe('renderer IPC boundary', () => {
+  it('records a no-payload renderer fault even before a connected service exists', async () => {
+    const onDiagnostic = vi.fn();
+    const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', onDiagnostic });
+    expect(await adapter({ senderId: 7, url: 'file:///app/index.html' }, { type: 'reportRendererFailure', requestId: 'render-1' }))
+      .toMatchObject({ type: 'accepted', ok: true });
+    expect(onDiagnostic).toHaveBeenCalledWith({ operation: 'renderer', stage: 'execute', category: 'unknown', recovery: 'reopen_app' }, { requestId: 'render-1' });
+    expect(await adapter({ senderId: 7, url: 'file:///app/index.html' }, { type: 'reportRendererFailure', requestId: 'render-2', error: 'private-sentinel' }))
+      .toMatchObject({ ok: false, code: 'INVALID_REQUEST' });
+  });
+
+  it('records a safe read failure and contains arbitrary service exception text', async () => {
+    const onDiagnostic = vi.fn();
+    const adapter = createReadAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', onDiagnostic,
+      service: { listWorkRecords: async () => { throw new Error('private-token-path-sentinel'); } } as never });
+    await expect(adapter({ senderId: 7, url: 'file:///app/index.html' }, { type: 'listWorkRecords' }))
+      .rejects.toThrow('Service read failed. See System Errors for diagnostic details.');
+    expect(onDiagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'ipc', stage: 'read', category: 'unknown' }), { correlationId: expect.any(String) });
+    await expect(adapter({ senderId: 7, url: 'file:///app/index.html' }, { type: 'listWorkRecords' })).rejects.toThrow('Service read failed.');
+    expect(onDiagnostic.mock.calls[0]?.[1].correlationId).not.toBe(onDiagnostic.mock.calls[1]?.[1].correlationId);
+    expect(JSON.stringify(onDiagnostic.mock.calls)).not.toContain('private-token-path-sentinel');
+  });
+
   it('rejects generic issuance for reserved local-client principals', async () => {
     const dispatch = vi.fn(async () => ({ type: 'error' as const, requestId: 'local', ok: false as const, code: 'unexpected', message: 'unexpected', retryable: false }));
     const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', service: { dispatch } });
@@ -101,6 +123,45 @@ describe('renderer IPC boundary', () => {
     })).resolves.toMatchObject({ type: 'error', requestId: 'link-fail', ok: false });
   });
 
+  it('records unexpected chat resource failures while returning a service error', async () => {
+    const onDiagnostic = vi.fn();
+    let cancellingStarted!: () => void;
+    const started = new Promise<void>((resolve) => { cancellingStarted = resolve; });
+    const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', onDiagnostic,
+      service: { dispatch: async (request, signal) => {
+        if (request.requestId === 'album-cancelled') return await new Promise<never>((_resolve, reject) => {
+          cancellingStarted();
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+        if (request.requestId === 'album-failure-after-cancel') return await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('independent worker failure')), { once: true });
+        });
+        throw new Error('unexpected resource failure');
+      } } });
+    const sender = { senderId: 7, url: 'file:///app/index.html' };
+    const cancelled = adapter(sender, { type: 'openChatAlbum', requestId: 'album-cancelled', accountId: 'account-a',
+      chatType: 'group', chatId: 'chat-a', albumId: 'album-a' });
+    await started;
+    await expect(adapter(sender, { type: 'cancelChatResourceRequest', requestId: 'album-cancel', targetRequestId: 'album-cancelled' }))
+      .resolves.toMatchObject({ ok: true, cancelled: true });
+    await expect(cancelled).resolves.toMatchObject({ type: 'error', code: 'CANCELLED' });
+    expect(onDiagnostic).not.toHaveBeenCalled();
+
+    const failedAfterCancel = adapter(sender, { type: 'openChatAlbum', requestId: 'album-failure-after-cancel', accountId: 'account-a',
+      chatType: 'group', chatId: 'chat-a', albumId: 'album-a' });
+    await expect(adapter(sender, { type: 'cancelChatResourceRequest', requestId: 'album-cancel-2', targetRequestId: 'album-failure-after-cancel' }))
+      .resolves.toMatchObject({ ok: true, cancelled: true });
+    await expect(failedAfterCancel).resolves.toMatchObject({ type: 'error', code: 'SERVICE_UNAVAILABLE' });
+    expect(onDiagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'ipc', stage: 'execute', category: 'unknown' }),
+      { requestId: 'album-failure-after-cancel', accountId: 'account-a' });
+
+    await expect(adapter({ senderId: 7, url: 'file:///app/index.html' }, { type: 'openChatAlbum', requestId: 'album-failure',
+      accountId: 'account-a', chatType: 'group', chatId: 'chat-a', albumId: 'album-a' }))
+      .resolves.toMatchObject({ type: 'error', code: 'SERVICE_UNAVAILABLE' });
+    expect(onDiagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'ipc', stage: 'execute', category: 'unknown' }),
+      { requestId: 'album-failure', accountId: 'account-a' });
+  });
+
   it('delegates manual attachment downloads with the complete conversation scope', async () => {
     const seen: unknown[] = [];
     const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', service: {
@@ -144,6 +205,31 @@ describe('renderer IPC boundary', () => {
     await adapter(sender, { type: 'getSnapshot', requestId: 'after' });
     expect(firstCalls).toBe(1);
     expect(secondCalls).toBe(1);
+  });
+
+  it('cancels only an active resource request from the same renderer sender and forgets it after settlement', async () => {
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let activeSignal: AbortSignal | undefined;
+    const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', service: {
+      dispatch: async (request, signal) => {
+        activeSignal = signal; entered();
+        await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+        return { type: 'error', requestId: request.requestId, ok: false, code: 'CANCELLED', message: 'cancelled', retryable: false };
+      },
+    } });
+    const sender = { senderId: 7, url: 'file:///app/index.html' };
+    const pending = adapter(sender, { type: 'listChatNotes', requestId: 'read-1', accountId: 'a', chatType: 'group', chatId: 'c', cursor: null });
+    await started;
+    expect(activeSignal?.aborted).toBe(false);
+    await expect(adapter(sender, { type: 'cancelChatResourceRequest', requestId: 'cancel-1', targetRequestId: 'read-1' }))
+      .resolves.toMatchObject({ type: 'cancelChatResourceRequest', cancelled: true });
+    expect(activeSignal?.aborted).toBe(true);
+    await expect(pending).resolves.toMatchObject({ type: 'error', requestId: 'read-1' });
+    await expect(adapter(sender, { type: 'cancelChatResourceRequest', requestId: 'cancel-2', targetRequestId: 'read-1' }))
+      .resolves.toMatchObject({ type: 'cancelChatResourceRequest', cancelled: false });
+    await expect(adapter({ ...sender, senderId: 8 }, { type: 'cancelChatResourceRequest', requestId: 'cancel-3', targetRequestId: 'read-1' }))
+      .resolves.toMatchObject({ type: 'error', code: 'UNTRUSTED_SENDER' });
   });
 });
 

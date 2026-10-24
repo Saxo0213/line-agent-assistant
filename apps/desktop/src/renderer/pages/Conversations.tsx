@@ -3,7 +3,7 @@ import type { Locale } from '../../locale.js';
 import { AgentStatusMarker } from '../AgentStatusMarker.js';
 import { MessageReactions } from './MessageReactions.js';
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { type AppSnapshot, type ConversationSummary, type LineAccountSummary, type ConversationKey } from '@line-agent/contracts';
+import { AGENT_ATTACHMENT_LIMITS, type AgentAttachmentUpload, type AppSnapshot, type ConversationSummary, type LineAccountSummary, type ConversationKey } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import type { TimelineMessage } from '../../main/service-facade.js';
 import { ComposerStatus, useComposerStatus, type ComposerMessage } from './ComposerStatus.js';
@@ -38,6 +38,7 @@ import { FileAttachmentCard } from '../FileAttachmentCard.js';
 import { ConversationSortMenu, DEFAULT_SORT, type SortState } from './ConversationSortMenu.js';
 import { useFriends } from '../useFriends.js';
 import { MessageReadReceipt } from './MessageReadReceipt.js';
+import { ChatResources, type ChatResourceApi } from './ChatResources.js';
 
 const nameCompare = (left: string, right: string, locale: Locale) => left.localeCompare(right, locale, { sensitivity: 'base', numeric: true });
 
@@ -58,12 +59,28 @@ const AUTO_LOAD_EDGE_PX = 200;
 const LATEST_BUTTON_DISTANCE_PX = 300;
 const keyFor = (item: ConversationSummary): ConversationKey => ({ accountId: item.accountId, chatType: item.chatType, chatId: item.chatId });
 const hasRecalledOriginal = (message: TimelineMessage) => Boolean(message.text?.trim()) || (message.deletedAtSource === true && (message.kind === 'sticker' || (message.content != null && message.content.type !== 'unsent'))) || message.recalledContent != null || message.recalledKind === 'sticker' || message.attachments.some((attachment) => attachment.status === 'ready');
+function readManualFile(file: File): Promise<Uint8Array> {
+  if (typeof file.arrayBuffer === 'function') return file.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+    reader.onerror = () => reject(reader.error ?? new Error('Unable to read attachment'));
+    reader.readAsArrayBuffer(file);
+  });
+}
 // The marker sits in the message metadata immediately above its timestamp; only the label differs.
 const recalledMarkerLabel = (message: TimelineMessage, locale: Locale) => desktopTextFor(locale, message.deletedAtSource ? 'deleted' : 'unsent');
 const scopedMessages = (messages: TimelineMessage[], key: ConversationKey) => messages.filter((item) => item.accountId === key.accountId && item.chatType === key.chatType && item.chatId === key.chatId);
 const chronological = (messages: TimelineMessage[]) => [...messages].sort((left, right) => left.occurredAt.localeCompare(right.occurredAt));
 const compareRevision = (left: string, right: string) => left.length === right.length ? left.localeCompare(right) : left.length - right.length;
-const modeLabel = (locale: Locale): Record<LineAccountSummary['mode'], string> => ({ ACTIVE_CONTROL: desktopTextFor(locale, 'activeControl'), MONITOR_ONLY: desktopTextFor(locale, 'monitorOnly'), PAUSED: desktopTextFor(locale, 'paused') });
+export function accountHeaderStatusFor(account: LineAccountSummary, locale: Locale): string {
+  if (account.mode === 'MONITOR_ONLY') return desktopTextFor(locale, 'monitoring');
+  if (account.mode === 'PAUSED') return desktopTextFor(locale, 'paused');
+  if (account.status === 'connected') return desktopTextFor(locale, 'connected');
+  if (account.status === 'disconnected') return desktopTextFor(locale, 'notLoggedIn182');
+  if (account.status === 'reauth_required') return desktopTextFor(locale, 'lineLoginRequiredAgain');
+  return desktopTextFor(locale, 'connectionError');
+}
 export function formatLatestMessageTime(timestamp: string | null | undefined, now = new Date(), locale: Locale = 'en'): string | null {
   if (!timestamp) return null;
   const date = new Date(timestamp);
@@ -233,11 +250,13 @@ const BARE_CONTENT_TYPES: ReadonlySet<string> = new Set(['event', 'contact', 'lo
 function PinIcon() {
   return <svg className="location-pin-icon" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z" /></svg>;
 }
-function systemEventLabel(locale: Locale, nativeContentType: number | null, text: string | null): string {
+function systemEventLabel(locale: Locale, nativeContentType: number | null, text: string | null, postNotificationType?: 'note' | 'album' | null): string {
   // A chat event with LINE's own rendered line shows only that line; without it the generic label remains.
   if (nativeContentType === 18 && text?.trim()) return text.trim();
   const renderedText = nativeContentType === 16 && text?.trim().toUpperCase() === 'POSTNOTIFICATION' ? null : text;
   const label = nativeContentType === 6 ? desktopTextFor(locale, 'call') : nativeContentType === 9 ? desktopTextFor(locale, 'gift')
+    : nativeContentType === 16 && postNotificationType === 'note' ? desktopTextFor(locale, 'postNoteNotification')
+      : nativeContentType === 16 && postNotificationType === 'album' ? desktopTextFor(locale, 'postAlbumNotification')
     : nativeContentType === 16 ? desktopTextFor(locale, 'postNotification') : nativeContentType === 18 ? desktopTextFor(locale, 'chatEvent') : undefined;
   return [label, renderedText?.trim() || undefined].filter(Boolean).join(' ') || desktopTextFor(locale, 'systemMessage');
 }
@@ -277,7 +296,6 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   const chatTypeLabel = (chatType: string) => chatTypeLabelFor(locale, chatType);
   const conversationFallbackTitle = (chatType: string) => conversationFallbackTitleFor(locale, chatType);
   const formatMessageTime = (timestamp: string) => formatMessageTimeFor(timestamp, locale);
-  const modeLabels = modeLabel(locale);
   const nameCompareLocale = (left: string, right: string) => nameCompare(left, right, locale);
   const [filter, setFilter] = useState('');
   const [sort, setSort] = useState<SortState>(DEFAULT_SORT);
@@ -289,6 +307,10 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   const [listHeight, setListHeight] = useState(720);
   const [focusedRow, setFocusedRow] = useState<string | null>(null);
   const [lineDrafts, setLineDrafts] = useState<Record<string, string>>({});
+  const [manualFiles, setManualFiles] = useState<Record<string, Array<{ id: string; file: File }>>>({});
+  const manualFileInput = useRef<HTMLInputElement>(null);
+  const [fileDragActive, setFileDragActive] = useState(false);
+  const fileCounter = useRef(0);
   const [messages, setMessages] = useState<TimelineMessage[]>([]);
   const messagesRef = useRef<TimelineMessage[]>(messages);
   messagesRef.current = messages;
@@ -337,7 +359,12 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   const scrollFrame = useRef<number | null>(null);
   const autoLoad = useRef<() => void>(() => undefined);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [unsendMenu, setUnsendMenu] = useState<{ messageId: string; x: number; y: number; routeKey: string } | null>(null);
+  const [unsendBusy, setUnsendBusy] = useState(false);
+  const [manualUnsendWindow, setManualUnsendWindow] = useState<'1h' | '7d'>('1h');
+  useEffect(() => { if (typeof api.getManualUnsendWindow !== 'function') return; let live = true; void api.getManualUnsendWindow().then((window) => { if (live) setManualUnsendWindow(window); }).catch(() => undefined); return () => { live = false; }; }, [api]);
   const requestGeneration = useRef(0);
+  useEffect(() => () => { requestGeneration.current += 1; }, []);
   const draftRevisions = useRef<Record<string, number>>({});
   const replyRevision = useRef(0);
   const currentRoute = useRef('');
@@ -397,8 +424,61 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   const lineRevisionKey = `line:${routeKey}`;
   currentRoute.current = routeKey;
   currentRouteValue.current = route;
+  useEffect(() => { setUnsendMenu(null); }, [routeKey]);
   const lineDraft = lineDrafts[routeKey] ?? '';
+  const routeFiles = manualFiles[routeKey] ?? [];
+  const canAttachMedia = !!writableRoute && route?.chatType !== 'room';
   const canSendLine = !!writableRoute && !!account && account.canSendManually === true && account.status === 'connected' && coreReady;
+  function addManualFiles(incoming: File[]) {
+    if (sending || incoming.length === 0 || !canAttachMedia) return;
+    let total = routeFiles.reduce((sum, item) => sum + item.file.size, 0);
+    let count = routeFiles.length;
+    let problem: string | null = null;
+    const accepted: Array<{ id: string; file: File }> = [];
+    for (const file of incoming) {
+      if (count >= AGENT_ATTACHMENT_LIMITS.maxFiles) { problem = desktopText('upToArg0Files', { arg0: AGENT_ATTACHMENT_LIMITS.maxFiles }); continue; }
+      if (file.size < 1 || file.size > AGENT_ATTACHMENT_LIMITS.maxFileBytes) { problem = desktopText('maximumArg0MbPerFile', { arg0: 20 }); continue; }
+      if (total + file.size > AGENT_ATTACHMENT_LIMITS.maxTotalBytes) { problem = desktopText('maximumArg0MbInAttachments', { arg0: 50 }); continue; }
+      fileCounter.current += 1;
+      accepted.push({ id: `line-file-${fileCounter.current}`, file });
+      count += 1;
+      total += file.size;
+    }
+    if (accepted.length) setManualFiles((current) => ({ ...current, [routeKey]: [...(current[routeKey] ?? []), ...accepted] }));
+    if (problem) notify(problem);
+  }
+  function removeManualFile(id: string) {
+    setManualFiles((current) => ({ ...current, [routeKey]: (current[routeKey] ?? []).filter((item) => item.id !== id) }));
+  }
+  function canShowUnsend(message: TimelineMessage): boolean {
+    const age = Date.now() - Date.parse(message.occurredAt);
+    return canSendLine && message.direction === 'outbound' && !message.deleted && message.content?.type !== 'unsent'
+      && Number.isFinite(age) && age >= 0 && age <= (manualUnsendWindow === '7d' ? 7 * 24 * 60 * 60 * 1000 : 60 * 60 * 1000);
+  }
+  async function runUnsend() {
+    const selectedMessage = unsendMenu;
+    setUnsendMenu(null);
+    if (!selectedMessage || !route || !canSendLine || selectedMessage.routeKey !== routeKey || unsendBusy) return;
+    const message = messagesRef.current.find((item) => item.messageId === selectedMessage.messageId);
+    if (!message || !canShowUnsend(message)) return;
+    if (!window.confirm(desktopText('unsendConfirm'))) return;
+    const generation = requestGeneration.current;
+    const capturedRouteKey = routeKey;
+    const capturedRoute = route;
+    setUnsendBusy(true);
+    try {
+      const result = await api.unsendMessage(capturedRoute, message.messageId);
+      if (result.type !== 'accepted') throw new Error(safeErrorTextFor(locale, result, desktopText('unsendFailed')));
+      if (generation !== requestGeneration.current || currentRoute.current !== capturedRouteKey || capturedRouteKey !== routeKey) return;
+      const projected = await api.listMessages(capturedRoute, null, 1, message.messageId);
+      if (generation !== requestGeneration.current || currentRoute.current !== capturedRouteKey || capturedRouteKey !== routeKey) return;
+      const updated = projected.messages.find((item) => item.messageId === message.messageId);
+      if (!updated) throw new Error(desktopText('unsendFailed'));
+      setMessages((current) => current.map((item) => item.messageId === updated.messageId ? updated : item));
+    } catch (error) {
+      if (generation === requestGeneration.current && currentRoute.current === capturedRouteKey) notify(safeErrorTextFor(locale, error, desktopText('unsendFailed')));
+    } finally { setUnsendBusy(false); }
+  }
   function chooseReply(target: TimelineMessage | null) { replyRevision.current += 1; setReply(target); }
   function visibleMessageIds(items = messagesRef.current, start = windowStart): string[] {
     const first = Math.min(start, Math.max(0, items.length - RENDER_WINDOW));
@@ -884,41 +964,62 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     const revisionKey = lineRevisionKey;
     const submittedRevision = draftRevisions.current[revisionKey] ?? 0;
     const text = lineDraft.trim();
-    if (!text) return;
+    const submittedFiles = [...routeFiles];
+    if (!text && submittedFiles.length === 0) return;
     if (!canSendLine) return;
     const capturedRoute = writableRoute;
     const capturedReplyId = reply?.messageId ?? null;
     const submittedReplyRevision = replyRevision.current;
-    const id = crypto.randomUUID();
-    const currentEntries = sendFeedbackRef.current;
-    if (currentEntries.length >= MANUAL_SEND_FEEDBACK_LIMIT && currentEntries.every((entry) => entry.status === 'pending')) {
-      setComposerError(desktopText('sendFeedbackIsFullTrySendingAgainLater')); return;
+    const id = text ? crypto.randomUUID() : null;
+    if (text) {
+      const currentEntries = sendFeedbackRef.current;
+      if (currentEntries.length >= MANUAL_SEND_FEEDBACK_LIMIT && currentEntries.every((entry) => entry.status === 'pending')) {
+        setComposerError(desktopText('sendFeedbackIsFullTrySendingAgainLater')); return;
+      }
+      const pendingEntry: ManualSendFeedback = { id: id!, key: capturedRoute, routeKey, text, replyToMessageId: capturedReplyId,
+        createdAt: new Date().toISOString(), status: 'pending' };
+      const nextEntries = addManualSendFeedback(currentEntries, pendingEntry);
+      if (!nextEntries) { setComposerError(desktopText('sendFeedbackIsFullTrySendingAgainLater')); return; }
+      sendFeedbackRef.current = nextEntries;
+      setSendFeedback(nextEntries);
+      scrollOnSend.current = true; jumpToBottom.current = true; setWindowStart(Number.MAX_SAFE_INTEGER);
     }
-    const pendingEntry: ManualSendFeedback = { id, key: capturedRoute, routeKey, text, replyToMessageId: capturedReplyId,
-      createdAt: new Date().toISOString(), status: 'pending' };
-    const nextEntries = addManualSendFeedback(currentEntries, pendingEntry);
-    if (!nextEntries) { setComposerError(desktopText('sendFeedbackIsFullTrySendingAgainLater')); return; }
     pendingSubmitRoutes.current.add(routeKey);
-    sendFeedbackRef.current = nextEntries;
-    setSendFeedback(nextEntries);
-    scrollOnSend.current = true; jumpToBottom.current = true; setWindowStart(Number.MAX_SAFE_INTEGER);
     setSending(true); clearComposerStatus();
     try {
-      const result = capturedReplyId ? await api.replyText(capturedRoute, capturedReplyId, text) : await api.sendText(capturedRoute, text);
-      if (result.ok) {
-        settleFeedback(id, 'remove');
-        if (currentRoute.current === routeKey) setComposerNotice(desktopText('sentToLine'));
-      } else {
-        const notStarted = result.type === 'error' && result.code === 'LINE_SEND_NOT_STARTED';
-        settleFeedback(id, notStarted ? 'failed' : 'unknown');
-        if (currentRoute.current === routeKey) setComposerError(notStarted ? desktopText('messageWasNotSentTryAgain') : desktopText('deliveryCouldNotBeConfirmedCheckLineBeforeRetrying'));
+      if (text && id) {
+        const result = capturedReplyId ? await api.replyText(capturedRoute, capturedReplyId, text) : await api.sendText(capturedRoute, text);
+        if (result.ok) {
+          settleFeedback(id, 'remove');
+          if (currentRoute.current === routeKey) setComposerNotice(desktopText('sentToLine'));
+        } else {
+          const notStarted = result.type === 'error' && result.code === 'LINE_SEND_NOT_STARTED';
+          settleFeedback(id, notStarted ? 'failed' : 'unknown');
+          if (currentRoute.current === routeKey) setComposerError(notStarted ? desktopText('messageWasNotSentTryAgain') : desktopText('deliveryCouldNotBeConfirmedCheckLineBeforeRetrying'));
+          setLineDrafts((drafts) => draftRevisions.current[revisionKey] === submittedRevision && drafts[routeKey] === lineDraft ? { ...drafts, [routeKey]: '' } : drafts);
+          return;
+        }
+        setLineDrafts((drafts) => draftRevisions.current[revisionKey] === submittedRevision && drafts[routeKey] === lineDraft ? { ...drafts, [routeKey]: '' } : drafts);
+        if (capturedReplyId && currentRoute.current === routeKey && replyRevision.current === submittedReplyRevision) chooseReply(null);
       }
-      setLineDrafts((drafts) => draftRevisions.current[revisionKey] === submittedRevision && drafts[routeKey] === lineDraft ? { ...drafts, [routeKey]: '' } : drafts);
-      if (capturedReplyId && currentRoute.current === routeKey && replyRevision.current === submittedReplyRevision) chooseReply(null);
+      for (const item of submittedFiles) {
+        const upload: AgentAttachmentUpload = { name: item.file.name, bytes: await readManualFile(item.file) };
+        if (!api.sendManualMedia) throw new Error('Manual media sending is unavailable');
+        const result = await api.sendManualMedia(capturedRoute, [upload]);
+        if (!result.ok) {
+          const notStarted = result.type === 'error' && ['LINE_SEND_NOT_STARTED', 'LINE_MEDIA_BUSY', 'LINE_MEDIA_UNAVAILABLE',
+            'LINE_MEDIA_UNSUPPORTED_CHAT', 'ACCOUNT_NOT_READY', 'ACCOUNT_NOT_ACTIVE', 'EXTERNAL_MONITOR_READ_ONLY',
+            'MANUAL_MEDIA_INVALID', 'MANUAL_MEDIA_LIMIT', 'MANUAL_MEDIA_STAGE_FAILED', 'SERVICE_CLOSING'].includes(result.code);
+          if (currentRoute.current === routeKey) setComposerError(notStarted ? desktopText('mediaWasNotSentTryAgain') : desktopText('deliveryCouldNotBeConfirmedCheckLineBeforeRetrying'));
+          return;
+        }
+        setManualFiles((current) => ({ ...current, [routeKey]: (current[routeKey] ?? []).filter((candidate) => candidate.id !== item.id) }));
+      }
+      if (submittedFiles.length > 0 && currentRoute.current === routeKey) setComposerNotice(desktopText('sentToLine'));
     } catch {
-      settleFeedback(id, 'unknown');
+      if (id) settleFeedback(id, 'unknown');
       if (currentRoute.current === routeKey) setComposerError(desktopText('deliveryCouldNotBeConfirmedCheckLineBeforeRetrying'));
-      setLineDrafts((drafts) => draftRevisions.current[revisionKey] === submittedRevision && drafts[routeKey] === lineDraft ? { ...drafts, [routeKey]: '' } : drafts);
+      if (text) setLineDrafts((drafts) => draftRevisions.current[revisionKey] === submittedRevision && drafts[routeKey] === lineDraft ? { ...drafts, [routeKey]: '' } : drafts);
     }
     finally {
       pendingSubmitRoutes.current.delete(routeKey);
@@ -1009,7 +1110,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     </section>
     <section className="chat-panel" id="active-chat-panel"><button className="mobile-list-toggle" onClick={() => setListOpen(!listOpen)}>{desktopText('chatList')}</button>
       {route && account ? <>
-        <header className={`chat-header line-chat-header route-${account.mode}`} data-testid="address-plate"><div className="chat-title-wrap"><AvatarWithTypeBadge chatType={route.chatType}><LineMediaImage api={api} enabled={conversation!.avatarAvailable === true} target={{ type: 'conversation', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId }} fallbackKind={route.chatType === 'direct' ? 'person' : 'group'} className="chat-conversation-avatar" /></AvatarWithTypeBadge><h2>{conversation!.title || conversationFallbackTitle(route.chatType)}</h2></div><div className="chat-header-meta"><div className="identity-row"><span>{account.displayName}</span><span className="mode-chip">{modeLabels[account.mode]}</span></div><div className={`agent-trigger-status ${conversation!.agentEnabled ? 'enabled' : 'disabled'}`} role="status"><span>{desktopText('agentTrigger')}{conversation!.agentEnabled ? desktopText('enabled') : desktopText('disabled')} · {conversation!.defaultProvider === 'codex' ? 'Codex' : 'Claude'}</span><small>{desktopText('receiveMonitoringAndAgentTriggersAreConfiguredSeparately')}</small></div></div></header>
+        <header className={`chat-header line-chat-header route-${account.mode}`} data-testid="address-plate"><div className="chat-title-wrap"><AvatarWithTypeBadge chatType={route.chatType}><LineMediaImage api={api} enabled={conversation!.avatarAvailable === true} target={{ type: 'conversation', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId }} fallbackKind={route.chatType === 'direct' ? 'person' : 'group'} className="chat-conversation-avatar" /></AvatarWithTypeBadge><h2>{conversation!.title || conversationFallbackTitle(route.chatType)}</h2></div><div className="chat-header-meta"><div className={`agent-trigger-status ${conversation!.agentEnabled ? 'enabled' : 'disabled'}`} role="status">{desktopText('agentTrigger')}{conversation!.agentEnabled ? desktopText('enabled') : desktopText('disabled')}</div><ChatResources key={`${routeKey}:${account.mode}:${account.status}`} api={api as DesktopApi & ChatResourceApi} route={route} accountStatus={account.status} accountMode={account.mode} /></div></header>
         <div className="timeline-frame">
         <div className="timeline" id="timeline" tabIndex={-1} ref={timeline} onScroll={(event) => {
           const own = pinTop.current !== null && Math.abs(event.currentTarget.scrollTop - pinTop.current) < 1;
@@ -1025,7 +1126,9 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
             const recalledOriginal = message.deleted && hasRecalledOriginal(message);
             // A recalled row keeps `unsent` as its content; show the preserved original through the normal renderers.
             const shown = recalledOriginal && message.content?.type === 'unsent' ? { ...message, content: message.recalledContent ?? null, kind: message.recalledKind ?? message.kind } : message;
-            const systemLike = message.content?.type === 'event';
+            const senderNotification = message.content?.type === 'event' && message.content.nativeContentType === 16
+              && (message.postNotificationType === 'note' || message.postNotificationType === 'album');
+            const systemLike = message.content?.type === 'event' && !senderNotification;
             const quotedSenderName = quoted && quoted.senderName === quoted.senderId
               ? quoted.direction === 'outbound' ? desktopText('me') : desktopText('otherPerson') : quoted?.senderName;
             const dateChanged = !previous || previous.occurredAt.slice(0, 10) !== message.occurredAt.slice(0, 10);
@@ -1039,7 +1142,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
             // Media, stickers, cards and system events sit on the pane without a coloured bubble.
             const sticons = message.text === null ? [] : validSticonRanges(message.text, message.sticonRanges);
             const bareSticons = (!shown.content || recalledOriginal) && message.text !== null && sticonOnly(message.text, sticons);
-            const bare = (bareSticons || shown.kind === 'sticker' || (shown.content !== undefined && shown.content !== null && BARE_CONTENT_TYPES.has(shown.content.type))
+            const bare = (bareSticons || shown.kind === 'sticker' || (!senderNotification && shown.content !== undefined && shown.content !== null && BARE_CONTENT_TYPES.has(shown.content.type))
               || (message.attachments.length > 0 && !message.text?.trim() && (!message.content || message.content.type === 'media')));
             const bubbleTail = runStart && !bare;
             const recalledMarker = message.deleted
@@ -1047,13 +1150,18 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
               : null;
             return <React.Fragment key={`${message.accountId}/${message.messageId}`}>
             {dateChanged && <div className="date-separator">{new Date(message.occurredAt).toLocaleDateString(locale)}</div>}
-            <div className={`message-row ${message.direction} ${route.chatType}${showIdentity ? ' has-inbound-identity' : ''}${showSenderName ? ' has-sender-name' : ''}${runStart ? ' run-start' : ' run-cont'}${message.reactions?.length ? ' has-reactions' : ''}`} data-message-date={message.occurredAt}>
-              {message.direction === 'inbound' && !isEvent && route.chatType !== 'direct' && (showIdentity ? <div className="message-identity"><LineMediaImage api={api} enabled={message.senderAvatarAvailable === true} target={{ type: 'member', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId, memberId: message.senderId }} fallbackKind="person" className="sender-avatar" /><span className="message-sender-name">{message.senderName === message.senderId ? desktopText('otherPerson') : message.senderName}</span></div> : <div className="inbound-avatar-spacer" aria-hidden="true" />)}
-              {message.direction === 'outbound' && (message.readCount && message.readCount > 0 && !isEvent || message.deleted
-                ? <div className="message-meta">{message.readCount && message.readCount > 0 && !isEvent && <MessageReadReceipt api={api} route={route} messageId={message.messageId} count={message.readCount} />}
-                  {recalledMarker}<time className="message-time" dateTime={message.occurredAt}>{formatMessageTime(message.occurredAt)}</time></div>
-                : <time className="message-time" dateTime={message.occurredAt}>{formatMessageTime(message.occurredAt)}</time>)}
-              {message.direction === 'inbound' && message.deleted && <div className="message-meta">{recalledMarker}<time className="message-time" dateTime={message.occurredAt}>{formatMessageTime(message.occurredAt)}</time></div>}
+            <div className={`message-row ${message.direction} ${route.chatType}${showIdentity ? ' has-inbound-identity' : ''}${showSenderName ? ' has-sender-name' : ''}${runStart ? ' run-start' : ' run-cont'}${message.reactions?.length ? ' has-reactions' : ''}`} data-message-date={message.occurredAt}
+              onContextMenu={(event) => {
+                if (account?.canSendManually !== true) { event.preventDefault(); setUnsendMenu(null); return; }
+                if (!canShowUnsend(message)) return;
+                event.preventDefault(); setUnsendMenu({ messageId: message.messageId, x: event.clientX, y: event.clientY, routeKey });
+              }}>
+              {message.direction === 'inbound' && !isEvent && (showIdentity
+                ? <div className="message-identity"><LineMediaImage api={api} enabled={route.chatType === 'direct' ? conversation!.avatarAvailable === true : message.senderAvatarAvailable === true}
+                  target={route.chatType === 'direct' ? { type: 'conversation', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId }
+                    : { type: 'member', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId, memberId: message.senderId }}
+                  fallbackKind="person" className="sender-avatar" />{route.chatType !== 'direct' && <span className="message-sender-name">{message.senderName === message.senderId ? desktopText('otherPerson') : message.senderName}</span>}</div>
+                : <div className="inbound-avatar-spacer" aria-hidden="true" />)}
               <article className={`message ${message.direction}${message.kind === 'sticker' ? ' sticker-message' : ''}${systemLike ? ' system-event-message' : ''}${bare ? ' bubble-bare' : ''}${bubbleTail ? ' bubble-tail' : ''}`} tabIndex={0} id={`message-${message.messageId}`}>
                 {message.replyToMessageId && <button className="reply-reference" title={generatedPreviewFor(locale, quoted?.display, quoted?.preview) || desktopText('quotedMessage')}
                   aria-label={quoted ? desktopText('replyToArg0Arg1', { arg0: quotedSenderName, arg1: generatedPreviewFor(locale, quoted.display, quoted.preview) }) : desktopText('quotedMessage')}
@@ -1074,9 +1182,9 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
                     {shown.content?.type === 'contact' && <div className="message-content-card contact-content-card"><AvatarPlaceholder kind="person" className="content-contact-avatar" /><strong>{shown.content.displayName ?? desktopText('sharedLineContact')}</strong>{shown.content.displayName !== null && <span>{desktopText('lineContact')}</span>}</div>}
                     {shown.content?.type === 'location' && <div className="message-content-card location-content-card"><PinIcon /><strong>{shown.content.title || message.text || desktopText('location')}</strong>{shown.content.address && <span>{shown.content.address}</span>}</div>}
                     {shown.content?.type === 'rich' && <div className="message-content-card rich-content-card">{shown.content.altText || desktopText('richMessage')}</div>}
-                    {shown.content?.type === 'event' && <div className="message-system-event">{shown.content.nativeContentType === 6 && shown.content.call
+                {shown.content?.type === 'event' && (senderNotification ? <div className="message-text">{systemEventLabel(locale, shown.content.nativeContentType, shown.content.text, shown.postNotificationType)}</div> : <div className="message-system-event">{shown.content.nativeContentType === 6 && shown.content.call
                       ? formatCallLabelFor(locale, shown.content.call, message.direction, shown.content.nativeContentType, shown.content.text)
-                      : systemEventLabel(locale, shown.content.nativeContentType, shown.content.text)}</div>}
+                  : systemEventLabel(locale, shown.content.nativeContentType, shown.content.text, shown.postNotificationType)}</div>)}
                     {shown.content?.type === 'unsupported' && <div className="message-content-card unsupported-content-card">{shown.content.fallbackText || desktopText('unsupportedMessageTypeArg0', { arg0: shown.content.nativeContentType ?? '?' })}</div>}
                     {!shown.content && shown.kind === 'contact' && !message.text?.trim() && <div className="message-text contact-placeholder">{desktopText('sharedLineContact')}</div>}
                     {shown.kind === 'sticker' && (!message.deleted || recalledOriginal) && <div className="message-sticker">
@@ -1095,13 +1203,19 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
                       onDownload={() => void downloadAttachment(attachment.id)} onOpen={() => void openAttachment(attachment.id)} showOpenAction={false} />}
                 </div>)}
               </article>
-              {message.direction === 'inbound' && !message.deleted && <time className="message-time" dateTime={message.occurredAt}>{formatMessageTime(message.occurredAt)}</time>}
+              <div className="message-trailing-meta">
+                {(message.attachments.some((attachment) => attachment.status === 'ready') || canSendLine) && <div className="message-actions">
+                  {message.attachments.filter((attachment) => attachment.status === 'ready').map((attachment) => <button key={attachment.id} className="reply-action" onClick={() => void openAttachment(attachment.id)}>{desktopText('open')}</button>)}
+                  {canSendLine && <button className="reply-action" disabled={message.direction === 'outbound'} onClick={() => chooseReply(message)}>{desktopText('reply')}</button>}
+                </div>}
+                <div className="message-meta">
+                  {message.direction === 'outbound' && message.readCount !== undefined && message.readCount > 0 && !isEvent
+                    ? <MessageReadReceipt api={api} route={route} messageId={message.messageId} count={message.readCount} /> : null}
+                  {recalledMarker}<time className="message-time" dateTime={message.occurredAt}>{formatMessageTime(message.occurredAt)}</time>
+                </div>
+              </div>
               {message.reactions && message.reactions.length > 0 && <MessageReactions api={api} message={message} />}
               {message.agentJobStatus && <AgentStatusMarker status={message.agentJobStatus} />}
-              {(message.attachments.some((attachment) => attachment.status === 'ready') || canSendLine) && <div className="message-actions">
-                {message.attachments.filter((attachment) => attachment.status === 'ready').map((attachment) => <button key={attachment.id} className="reply-action" onClick={() => void openAttachment(attachment.id)}>{desktopText('open')}</button>)}
-                {canSendLine && <button className="reply-action" disabled={message.direction === 'outbound'} onClick={() => chooseReply(message)}>{desktopText('reply')}</button>}
-              </div>}
             </div>
           </React.Fragment>;
           })}
@@ -1117,11 +1231,17 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
           </div>
         </div>
         {visibleMessageDate && messages.length > 0 && <div className="visible-message-date" aria-hidden="true">{formatVisibleMessageDate(visibleMessageDate, new Date(), locale)}</div>}
+        {unsendMenu?.routeKey === routeKey && <div role="menu" className="message-context-menu" style={{ position: 'fixed', left: unsendMenu.x, top: unsendMenu.y, zIndex: 60 }} onContextMenu={(event) => event.preventDefault()}>
+          <button type="button" role="menuitem" disabled={unsendBusy} onClick={() => void runUnsend()}>{unsendBusy ? desktopText('processing160') : desktopText('unsendMessage')}</button>
+          <button type="button" role="menuitem" onClick={() => setUnsendMenu(null)}>{desktopText('cancel')}</button>
+        </div>}
         {(farFromBottom || hasNewerLoaded || newCount > 0) && <button className="latest-button" aria-label={newCount > 0 ? desktopText('jumpToLatestMessageArg0NewMessages', { arg0: newCount }) : desktopText('jumpToLatestMessage')} onClick={jumpToLatest}><span aria-hidden="true">↓</span> {newCount > 0 ? desktopText('arg0NewMessages', { arg0: newCount }) : desktopText('latestMessage')}</button>}
         </div>
         {canSendLine ? <div className={`composer route-${account.mode}`} id="composer" tabIndex={-1}>
           {reply && <div className="reply-preview"><LineMediaImage api={api} enabled={reply.senderAvatarAvailable === true} target={reply.direction === 'outbound' ? { type: 'account', accountId: reply.accountId } : { type: 'member', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId, memberId: reply.senderId }} fallbackKind="person" className="reply-avatar" /><span className="reply-copy"><strong className="reply-name">{replyName}</strong><span className="reply-quote">{renderMessageText(replyContent, openMessageUrl, replyMentionRanges)}</span></span><button className="reply-cancel" aria-label={desktopText('cancelReply')} onClick={() => chooseReply(null)}><span aria-hidden="true">×</span></button></div>}
-          <label className="sr-only" htmlFor="line-draft">{desktopText('lineMessage')}</label><textarea id="line-draft" aria-label={desktopText('lineMessage')} value={lineDraft} onChange={(event) => { draftRevisions.current[lineRevisionKey] = (draftRevisions.current[lineRevisionKey] ?? 0) + 1; setLineDrafts((drafts) => ({ ...drafts, [routeKey]: event.target.value })); }} onKeyDown={(event) => { if (event.ctrlKey && event.key === 'Enter') { event.preventDefault(); void submit(); } }} placeholder={desktopText('enterAMessageToSendToLine')} /><div className="composer-actions"><span className="composer-actions-hint">{desktopText('ctrlEnterToSendEnterForANewLine')}</span><ComposerStatus message={composerStatus ?? accountComposerStatus(account, coreReady, locale)} onDismiss={clearComposerStatus} />{showCoreWarning && <span className="health bad" role="status">{desktopText('coreFeaturesNeedAttention')}</span>}<button className="primary" disabled={!canSendLine || !lineDraft.trim() || sending} onClick={() => void submit()}>{sending ? desktopText('sending') : desktopText('sendToLine')}</button></div>
+          <label className="sr-only" htmlFor="line-draft">{desktopText('lineMessage')}</label><textarea id="line-draft" className={fileDragActive ? 'composer-drop-active' : undefined} aria-label={desktopText('lineMessage')} value={lineDraft} onChange={(event) => { draftRevisions.current[lineRevisionKey] = (draftRevisions.current[lineRevisionKey] ?? 0) + 1; setLineDrafts((drafts) => ({ ...drafts, [routeKey]: event.target.value })); }} onKeyDown={(event) => { if (event.ctrlKey && event.key === 'Enter') { event.preventDefault(); void submit(); } }} onDragOver={(event) => { if (!canAttachMedia || !Array.from(event.dataTransfer.types).includes('Files')) return; event.preventDefault(); setFileDragActive(true); }} onDragLeave={() => setFileDragActive(false)} onDrop={(event) => { if (!canAttachMedia) return; event.preventDefault(); setFileDragActive(false); addManualFiles(Array.from(event.dataTransfer.files)); }} placeholder={desktopText('enterAMessageToSendToLine')} />
+          {routeFiles.length > 0 && <ul className="manual-media-chips" aria-label={desktopText('pendingAttachments')}>{routeFiles.map(({ id: fileId, file }) => <li key={fileId}><span aria-hidden="true">{file.type.startsWith('image/') ? '▧' : '▤'}</span><span title={file.name}>{file.name}</span><small>{new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(file.size / (1024 * 1024))} MB</small><button type="button" aria-label={desktopText('removeArg0', { arg0: file.name })} disabled={sending} onClick={() => removeManualFile(fileId)}>×</button></li>)}</ul>}
+          <div className="composer-actions"><span className="composer-actions-hint">{desktopText('ctrlEnterToSendEnterForANewLine')}</span><ComposerStatus message={composerStatus ?? accountComposerStatus(account, coreReady, locale)} onDismiss={clearComposerStatus} />{showCoreWarning && <span className="health bad" role="status">{desktopText('coreFeaturesNeedAttention')}</span>}{route?.chatType === 'room' && <span className="muted" role="status">{desktopText('mediaSendingRequiresDirectOrGroupChat')}</span>}<input ref={manualFileInput} className="sr-only" type="file" multiple data-testid="line-media-file-input" aria-label={desktopText('attachFiles')} onChange={(event) => { addManualFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ''; }} /><button type="button" className="attach-button" aria-label={desktopText('attachFiles')} title={canAttachMedia ? desktopText('attachFiles') : desktopText('mediaSendingRequiresDirectOrGroupChat')} disabled={!canSendLine || !canAttachMedia || sending} onClick={() => manualFileInput.current?.click()}><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21.4 11.6l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5" /></svg></button><button className="primary" disabled={!canSendLine || (!lineDraft.trim() && routeFiles.length === 0) || sending} onClick={() => void submit()}>{sending ? desktopText('sending') : desktopText('sendToLine')}</button></div>
         </div> : <div className={`composer route-${account.mode}`}><div className="composer-actions"><ComposerStatus message={composerStatus ?? accountComposerStatus(account, coreReady, locale)} onDismiss={clearComposerStatus} />{showCoreWarning && <span className="health bad" role="status">{desktopText('coreFeaturesNeedAttention')}</span>}</div></div>}
       </> : <div className="empty-screen"><h2>{desktopText('selectAChat')}</h2><p>{desktopText('messagesAppearHereAfterAnAccountLogsIn')}</p></div>}
     </section>

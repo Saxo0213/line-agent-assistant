@@ -120,4 +120,11 @@ describe('worker sendMedia', () => {
     expect(revoked.events.at(-1)).toMatchObject({ status: 'failed', error: 'SIDE_EFFECT_DENIED' });
     expect(stale.transport.sendMediaCalls.length + revoked.transport.sendMediaCalls.length).toBe(0);
   });
+
+  it('allows only explicit manual media for a current monitor binding', async () => {
+    const monitor = await setup('MONITOR_ONLY');
+    await monitor.worker.handle({ ...monitor.command, manualSend: true });
+    expect(monitor.transport.sendMediaCalls).toHaveLength(1);
+    expect(monitor.events.at(-1)).toMatchObject({ requestId: 'media-1', status: 'sent' });
+  });
 });

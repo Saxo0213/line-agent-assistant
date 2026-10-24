@@ -11,7 +11,7 @@ import { KOREAN_DESKTOP_COPY_PART8 } from './desktop-copy-ko-part8.js';
 import { KOREAN_DESKTOP_COPY_PART9 } from './desktop-copy-ko-part9.js';
 
 describe('Korean desktop copy coverage', () => {
-  it('covers all 746 English keys exactly once across parts 1 through 9', () => {
+  it('covers all 766 English keys exactly once across parts 1 through 9', () => {
     const parts = [
       KOREAN_DESKTOP_COPY_PART1,
       KOREAN_DESKTOP_COPY_PART2,
@@ -24,8 +24,8 @@ describe('Korean desktop copy coverage', () => {
       KOREAN_DESKTOP_COPY_PART9,
     ];
     const keys = parts.flatMap((part) => Object.keys(part));
-    expect(Object.keys(ENGLISH_DESKTOP_COPY)).toHaveLength(746);
-    expect(keys).toHaveLength(746);
+    expect(Object.keys(ENGLISH_DESKTOP_COPY)).toHaveLength(766);
+    expect(keys).toHaveLength(766);
     expect(new Set(keys).size).toBe(keys.length);
     expect([...keys].sort()).toEqual(Object.keys(ENGLISH_DESKTOP_COPY).sort());
   });

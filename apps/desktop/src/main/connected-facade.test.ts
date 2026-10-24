@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { realpath, readFile } from 'node:fs/promises';
+import { realpath, readFile, writeFile } from 'node:fs/promises';
+import { access } from 'node:fs/promises';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -8,12 +9,13 @@ import { createServer } from 'node:net';
 import { once } from 'node:events';
 import { request as httpRequest } from 'node:http';
 import { IpcResultSchema, lineMediaUrl, parseLineMediaUrl,type AgentExecutionLevel, type AgentRunRequest, type InboundEnvelope, type IpcEvent, type LineWorkerCommand, type LineWorkerEvent, type LineMediaTarget } from '@line-agent/contracts';
-import { AccountRepository, AdminRepository, AgentPermissionRepository, AgentRepository, ExternalMonitorRepository, MessageRepository } from '@line-agent/database';
+import { AccountRepository, AdminRepository, AgentPermissionRepository, AgentRepository, ExternalMonitorRepository, MessageRepository, SettingsRepository } from '@line-agent/database';
 import { createTestDatabase } from '../../../../packages/database/src/test-database.js';
 import { plainEnvelope } from '../../../../packages/database/src/content-bridge/test-support.js';
 import { createLinejsAdapter } from '../../../../packages/line-worker/src/linejs-adapter.js';
 import { FRIEND_LIST_LIMIT, FriendListSchema, MessagePageSchema, MessageReadersSchema } from '../desktop-protocol.js';
 import { createConnectedFacade, createPermissionCommandService, resolveMcpLocalClientBridgePath, sameJsonValue, toExternalObservation, type ConnectedFacadeOptions, type IntegratedAgent, type IntegratedWorkerGateway } from './connected-facade.js';
+import { isNativeNotePostNotification, type ChatResourceReadResult, type ChatResourceRequest, type ChatResourceStore } from './services/chat-resources.js';
 import type { PermissionCommandTransport } from './services/permission-command.js';
 import { SecretStore } from './services/secret-store.js';
 import { OfficialBuildTrustService, type OfficialBuildTrustState } from './services/official-build-trust.js';
@@ -21,6 +23,8 @@ import { createOperationalAudit, type AuditEvent } from './services/operational-
 import { AttachmentPreviewService } from './attachment-preview.js';
 import { LineMediaService } from './line-media.js';
 import { createDisconnectedFacade } from './service-facade.js';
+import { createIpcAdapter } from './ipc.js';
+import { ExternalMonitorDiagnosticFailure } from './services/external-monitor-diagnostics.js';
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 const MEDIA_PNG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
@@ -46,6 +50,7 @@ describe('JSONB structural equality', () => {
     expect(sameJsonValue({ createdTime: '7', id: 'a' }, { createdTime: '7', id: 'b' })).toBe(false);
   });
 });
+
 
 describe('disconnected task search', () => {
   it('reports database unavailability through the standard request error', async () => {
@@ -210,11 +215,15 @@ database('connected facade account login semantics', () => {
   let qrError: Error | null;
   let failedLoginTokenAccount: string | null;
   let manualSendFailure: string | null;
+  let manualUnsendFailure: string | null;
+  let manualUnsendFenced = false;
   let welcomeSendOutcome: 'sent' | 'failed' | 'unknown' | 'throw';
+  let refreshedOwnProfile: { ownMid: string; displayName: string; picturePath: string } | null;
   let monitorAckFailures = new Set<string>();
   let failDownloadOnlyStart = false;
   let workerEventHandler: ((workerInstanceId: string, event: LineWorkerEvent) => Promise<void>) | undefined;
   let workerBindingHandler: ((binding: TestBinding, signal: AbortSignal) => Promise<void> | void) | undefined;
+  let workerRestartBindingHandler: ((binding: TestBinding, signal: AbortSignal) => Promise<void> | void) | undefined;
   let published: IpcEvent[];
   let agent: IntegratedAgent;
   let workers: IntegratedWorkerGateway;
@@ -223,12 +232,30 @@ database('connected facade account login semantics', () => {
   let pendingProtect: { started(): void; wait: Promise<void> } | null;
   let pendingWelcomeSend: { started(): void; wait: Promise<void>; release?: () => void } | null;
   let pendingWelcomeBinding: { accountId: string; started(): void; wait: Promise<void> } | null;
+  let pendingOwnProfileRead: { started(): void; wait: Promise<void>; release?: () => void } | null;
   let pendingWorkerStop: { started(): void; wait: Promise<void> } | null;
+  let pendingManualMedia: { started(): void; wait: Promise<void>; release(): void } | null;
   let auditEvents: AuditEvent[];
   let audit: ReturnType<typeof createOperationalAudit>;
   let mediaFetches: string[];
+  let archiveStore: ChatResourceStore;
+  let archivePublishGate: { entered(): void; wait: Promise<void> } | null;
+  let archiveCommits: number;
+  let archiveReads: number;
 
   beforeEach(async () => {
+    archivePublishGate = null;
+    archiveCommits = 0;
+    archiveReads = 0;
+    archiveStore = {
+      async publish(input) {
+        const gate = archivePublishGate;
+        if (gate) { gate.entered(); await gate.wait; }
+        input.guard(); archiveCommits++;
+        return { revision: archiveCommits, savedAt: new Date().toISOString(), contentHash: (await import('node:crypto')).createHash('sha256').update(input.content).digest('hex'), byteLength: input.content.byteLength };
+      },
+      async read() { return null; }, async list() { return { items: [], nextCursor: null }; }, async close() {}, forceClose() {},
+    };
     mediaFetches = [];
     mediaSources = {
       sticonSource: vi.spyOn(LineMediaService.prototype, 'sticonSource'),
@@ -245,7 +272,9 @@ database('connected facade account login semantics', () => {
     pendingProtect = null;
     pendingWelcomeSend = null;
     pendingWelcomeBinding = null;
+    pendingOwnProfileRead = null;
     pendingWorkerStop = null;
+    pendingManualMedia = null;
     auditEvents = [];
     audit = createOperationalAudit({ async append(event) { auditEvents.push(event); }, async appendFallback() {}, logSinkState() {} });
     secretStore = new SecretStore(secretRoot, { async protect(value) {
@@ -264,8 +293,12 @@ database('connected facade account login semantics', () => {
     markDownloadReadyOnAccept = true;
     qrError = null;
     failedLoginTokenAccount = null;
+    workerRestartBindingHandler = undefined;
     manualSendFailure = null;
+    manualUnsendFailure = null;
+    manualUnsendFenced = false;
     welcomeSendOutcome = 'sent';
+    refreshedOwnProfile = null;
     monitorAckFailures = new Set();
     failDownloadOnlyStart = false;
     published = [];
@@ -281,6 +314,11 @@ database('connected facade account login semantics', () => {
         onBinding = listener;
         workerBindingHandler = listener;
         return () => { if (workerBindingHandler === listener) workerBindingHandler = previousHandler; };
+      },
+      onRestartBinding(listener) {
+        const previousHandler = workerRestartBindingHandler;
+        workerRestartBindingHandler = listener;
+        return () => { if (workerRestartBindingHandler === listener) workerRestartBindingHandler = previousHandler; };
       },
       async start(accountId, binding) {
         starts.push({ accountId, mode: binding.mode, controlEpoch: binding.controlEpoch });
@@ -317,7 +355,7 @@ database('connected facade account login semantics', () => {
       },
       isCurrentManualSendBinding(binding) {
         const current = bindings.get(binding.accountId);
-        return !!current && current.mode !== 'PAUSED' && current.accountId === binding.accountId
+        return !manualUnsendFenced && !!current && current.mode !== 'PAUSED' && current.accountId === binding.accountId
           && current.workerInstanceId === binding.workerInstanceId && current.controlEpoch === binding.controlEpoch
           && current.transportOwnerId === binding.transportOwnerId && current.transportGeneration === binding.transportGeneration
           && current.writeGrantVersion === binding.writeGrantVersion;
@@ -341,6 +379,14 @@ database('connected facade account login semantics', () => {
           status: command.type === 'sendText' && command.text === '歡迎你成為本系統管理員' ? welcomeStatus : 'sent',
           messageId: null, error: welcomeSendOutcome === 'failed' ? 'SIMULATED_FAILURE' : null };
       },
+      async refreshOwnProfile(command) {
+        commands.push(command);
+        const gate = pendingOwnProfileRead;
+        if (gate) { pendingOwnProfileRead = null; gate.started(); await gate.wait; }
+        if (!refreshedOwnProfile) throw new Error('No fake profile configured');
+        const { type: _type, timeoutMs: _timeoutMs, ...binding } = command;
+        return { ...binding, type: 'ownProfileResult', ok: true, error: null, ...refreshedOwnProfile };
+      },
       async sendManual(command) {
         const manual = { ...command, type: 'manualSendText' } as LineWorkerCommand;
         commands.push(manual);
@@ -348,13 +394,44 @@ database('connected facade account login semantics', () => {
           requestId: command.requestId, status: manualSendFailure === '__UNKNOWN__' ? 'unknown' : manualSendFailure ? 'failed' : 'sent',
           messageId: manualSendFailure ? null : 'manual-sent', error: manualSendFailure === '__UNKNOWN__' ? null : manualSendFailure };
       },
+      async sendMedia(command, signal) {
+        const media = { type: 'sendMedia', ...command } as LineWorkerCommand;
+        commands.push(media);
+        const gate = pendingManualMedia;
+        if (gate) {
+          pendingManualMedia = null;
+          gate.started();
+          await Promise.race([gate.wait, new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }))]);
+          if (signal?.aborted) throw new Error('Worker send cancelled after worker admission');
+        }
+        return { type: 'sendResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+          requestId: command.requestId, operationId: command.requestId, attemptId: command.requestId, status: 'sent', messageId: 'media-sent', error: null };
+      },
+      async unsend(command) {
+        commands.push(command);
+        return { type: 'unsendResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+          transportOwnerId: command.transportOwnerId, transportGeneration: command.transportGeneration, writeGrantVersion: command.writeGrantVersion,
+          requestId: command.requestId, chatType: command.chatType, chatId: command.chatId, messageId: command.messageId,
+          status: manualUnsendFailure === '__UNKNOWN__' ? 'unknown' : manualUnsendFailure ? 'failed' : 'unsent',
+          error: manualUnsendFailure === '__UNKNOWN__' ? 'TRANSPORT_OUTCOME_UNKNOWN' : manualUnsendFailure };
+      },
       async checkFriendRelation(command) { friendRemoteCalls++; return { ...command, type: 'friendRelationResult', status: 'unknown', error: 'RELATION_OUTCOME_UNKNOWN' }; },
       async addFriendByMid(command) { friendRemoteCalls++; return { ...command, type: 'addFriendResult', status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' }; },
       async download() { throw new Error('No attachment download expected'); },
+      async readChatResource(command: ChatResourceRequest): Promise<ChatResourceReadResult> {
+        archiveReads++;
+        return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true,
+          accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+          chatType: command.chatType, chatId: command.chatId, note: { postId: command.postId ?? 'note-a', createdTime: 1, text: 'archive test' } };
+      },
       async waitModeAck(accountId, mode) {
         return mode !== 'MONITOR_ONLY' || !monitorAckFailures.has(bindings.get(accountId)?.workerInstanceId ?? '');
       },
-      async stop(accountId) { stops.push(accountId); bindings.delete(accountId); },
+      async stop(accountId) {
+        const gate = pendingWorkerStop;
+        if (gate) { pendingWorkerStop = null; gate.started(); await gate.wait; }
+        stops.push(accountId); bindings.delete(accountId);
+      },
       async stopBinding(binding) {
         const gate = pendingWorkerStop;
         if (gate) { pendingWorkerStop = null; gate.started(); await gate.wait; }
@@ -375,6 +452,7 @@ database('connected facade account login semantics', () => {
     await pool.query("INSERT INTO app_settings(key,value) VALUES ('workspace_path',$1::jsonb)", [JSON.stringify('Z:\\missing-workspace-recovery')]);
     facade = await createConnectedFacade({ pool, workers, agent, attachmentRoot: 'C:\\attachments', mediaCacheRoot: join(secretRoot, 'line-media-cache'),
       previewPresenter: { async present() { return false; }, closeAll() {} }, secretStore, audit, runMigrations: false,
+      chatResourceStore: archiveStore,
       publish(event) { published.push(event); } });
   });
 
@@ -385,6 +463,17 @@ database('connected facade account login semantics', () => {
     if (secretRoot) await rm(secretRoot, { recursive: true, force: true });
     for (const spy of Object.values(mediaSources)) spy.mockRestore();
     vi.unstubAllGlobals();
+  });
+
+  it('uses the default manual unsend window and persists the selected value', async () => {
+    expect(await facade.dispatch({ type: 'getManualUnsendWindow', requestId: 'unsend-window-default' }))
+      .toMatchObject({ type: 'getManualUnsendWindow', ok: true, window: '1h' });
+    expect(await facade.dispatch({ type: 'setManualUnsendWindow', requestId: 'unsend-window-set', window: '7d' }))
+      .toMatchObject({ type: 'setManualUnsendWindow', ok: true, window: '7d' });
+    expect(await facade.dispatch({ type: 'getManualUnsendWindow', requestId: 'unsend-window-read' }))
+      .toMatchObject({ type: 'getManualUnsendWindow', ok: true, window: '7d' });
+    await expect(new SettingsRepository(pool).getAppSetting('not_a_supported_setting'))
+      .rejects.toThrow('App setting not allowed');
   });
 
   it('mints the MCP capability for queued jobs recovered at startup because the listener is bound first', async () => {
@@ -503,10 +592,13 @@ database('connected facade account login semantics', () => {
   }
 
   async function restartFacadeWithImporter(importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']>,
-    publish?: (event: IpcEvent) => void, externalImportProgressPath?: string, externalDownloadTokenLookup = false) {
+    publish?: (event: IpcEvent) => void, externalImportProgressPath?: string, externalDownloadTokenLookup = false,
+    externalMonitorDiagnosticPath?: string) {
     await facade.shutdown();
     facade = await createConnectedFacade({ pool, workers, agent, attachmentRoot: 'C:\\attachments', secretStore, audit,
-      runMigrations: false, officialSnapshotImporter: importer, externalDownloadTokenLookup, ...(externalImportProgressPath ? { externalImportProgressPath } : {}),
+      runMigrations: false, officialSnapshotImporter: importer, externalDownloadTokenLookup,
+      ...(externalImportProgressPath ? { externalImportProgressPath } : {}),
+      ...(externalMonitorDiagnosticPath ? { externalMonitorDiagnosticPath } : {}),
       publish(event) { published.push(event); publish?.(event); } });
   }
 
@@ -1282,6 +1374,31 @@ database('connected facade account login semantics', () => {
       expect(commands.some((command) => command.type === 'loginToken' && command.accountId === 'auto-on-agent')).toBe(true);
     });
 
+    it('makes one opted-in startup restore attempt and preserves the secret after failure', async () => {
+      await addStoredAccounts('auto-fail-agent');
+      await storeToken('auto-fail-agent');
+      await new AccountRepository(pool).setAutoLoginOnStartup('auto-fail-agent', true);
+      failedLoginTokenAccount = 'auto-fail-agent';
+      await restartFacade();
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      expect(commands.filter((command) => command.type === 'loginToken' && command.accountId === 'auto-fail-agent')).toHaveLength(1);
+      expect((await secretStore.load('auto-fail-agent'))?.token).toBe('token-auto-fail-agent');
+      expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='auto-fail-agent'")).rows[0]).toEqual({ status: 'degraded' });
+    });
+
+    it('rebinds a replacement worker without automatically logging the LINE account in again', async () => {
+      await addStoredAccounts('worker-restart-agent');
+      await storeToken('worker-restart-agent');
+      expect((await facade.dispatch({ type: 'lineStart', requestId: 'worker-restart-start', accountId: 'worker-restart-agent' })).ok).toBe(true);
+      const original = bindings.get('worker-restart-agent');
+      expect(original).toBeDefined();
+      const replacement = { ...original!, workerInstanceId: 'worker-restart-replacement' };
+      bindings.set(replacement.accountId, replacement);
+      commands.length = 0;
+      await workerRestartBindingHandler?.(replacement, new AbortController().signal);
+      expect(commands.some((command) => command.type === 'loginToken' || command.type === 'loginQr')).toBe(false);
+    });
+
     it('persists the lineSetAutoLogin toggle, exposes it in the snapshot, and rejects unknown accounts', async () => {
       await addStoredAccounts('toggle-agent');
       const read = async () => {
@@ -1303,92 +1420,14 @@ database('connected facade account login semantics', () => {
     });
   });
 
-  describe('official LINE login guard', () => {
-    type Verdict = 'not_running' | 'other_account' | 'same_account' | 'unknown';
-    function fakeGuard(verdict: Verdict) {
-      const checks: Array<{ accountId: string; ownMid: string | null }> = [];
-      return { checks, guard: { async check(input: { accountId: string; ownMid: string | null }) { checks.push(input); return verdict; }, shutdown() {} } };
-    }
-    async function facadeWithGuard(verdict: Verdict) {
-      const fake = fakeGuard(verdict);
-      await facade.shutdown();
-      starts.length = 0; commands.length = 0; bindings.clear();
-      facade = await createConnectedFacade({ pool, workers, agent, attachmentRoot: 'C:\attachments', secretStore, audit,
-        runMigrations: false, officialLineSessionGuard: fake.guard, publish(event) { published.push(event); } });
-      return fake;
-    }
-    async function storeToken(accountId: string) {
-      secretStore.beginLogin(accountId, 'seed-instance', 'seed-attempt');
-      expect(await secretStore.saveRotation(accountId, 'seed-instance', 'seed-attempt',
-        { token: `token-${accountId}`, qrCert: null, e2eeStorage: null })).toBe(true);
-    }
-    const noWork = () => {
-      expect(starts).toEqual([]);
-      expect(commands.some((command) => command.type === 'loginToken' || command.type === 'loginQr')).toBe(false);
-    };
-
-    for (const verdict of ['same_account', 'unknown'] as const) {
-      it(`blocks lineStart, lineLoginQr and lineAddAccountQr on ${verdict} until confirmed`, async () => {
-        await addStoredAccounts('guard-agent');
-        const fake = await facadeWithGuard(verdict);
-        for (const request of [
-          { type: 'lineStart', requestId: 'g-start', accountId: 'guard-agent' },
-          { type: 'lineLoginQr', requestId: 'g-qr', accountId: 'guard-agent' },
-        ] as const) {
-          const blocked = await facade.dispatch(request);
-          expect(blocked).toMatchObject({ ok: false, code: 'OFFICIAL_LINE_SESSION_ACTIVE', detail: verdict, message: verdict === 'same_account'
-            ? 'LINE 目前正以此帳號登入，繼續將使 LINE 被登出。'
-            : 'LINE 正在執行，無法確認登入的帳號。若為同一帳號，繼續將使 LINE 被登出。' });
-        }
-        const slotsBefore = (await pool.query('SELECT count(*) FROM line_accounts')).rows[0].count;
-        expect(await facade.dispatch({ type: 'lineAddAccountQr', requestId: 'g-add' }))
-          .toMatchObject({ ok: false, code: 'OFFICIAL_LINE_SESSION_ACTIVE', detail: verdict });
-        expect((await pool.query('SELECT count(*) FROM line_accounts')).rows[0].count).toBe(slotsBefore);
-        expect(fake.checks.find((check) => check.accountId === '')?.ownMid).toBeNull();
-        noWork();
-        expect(await facade.dispatch({ type: 'lineStart', requestId: 'g-start-ok', accountId: 'guard-agent', confirmOfficialLogout: true }))
-          .toMatchObject({ ok: true });
-        expect(starts.some((item) => item.accountId === 'guard-agent')).toBe(true);
-        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'g-qr-ok', accountId: 'guard-agent', confirmOfficialLogout: true }))
-          .toMatchObject({ ok: true });
-        expect(commands.some((command) => command.type === 'loginQr' && command.accountId === 'guard-agent')).toBe(true);
-      });
-    }
-
-    for (const verdict of ['not_running', 'other_account'] as const) {
-      it(`proceeds without a prompt on ${verdict}`, async () => {
-        await addStoredAccounts('guard-ok-agent');
-        await facadeWithGuard(verdict);
-        expect(await facade.dispatch({ type: 'lineStart', requestId: 'ok-start', accountId: 'guard-ok-agent' })).toMatchObject({ ok: true });
-        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'ok-qr', accountId: 'guard-ok-agent' })).toMatchObject({ ok: true });
-        expect(await facade.dispatch({ type: 'lineAddAccountQr', requestId: 'ok-add' }).then((result) => result.ok
-          || (result.type === 'error' && result.code !== 'OFFICIAL_LINE_SESSION_ACTIVE'))).toBe(true);
-      });
-    }
-
-    for (const verdict of ['same_account', 'unknown'] as const) {
-      it(`startup auto-login skips an opted-in account on ${verdict} and keeps its secret`, async () => {
-        await addStoredAccounts('guard-auto-agent');
-        await storeToken('guard-auto-agent');
-        await new AccountRepository(pool).setAutoLoginOnStartup('guard-auto-agent', true);
-        await pool.query("UPDATE line_accounts SET status='connected' WHERE account_id='guard-auto-agent'");
-        await facadeWithGuard(verdict);
-        noWork();
-        expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='guard-auto-agent'")).rows[0]).toEqual({ status: 'disconnected' });
-        expect((await secretStore.load('guard-auto-agent'))?.token).toBe('token-guard-auto-agent');
-      });
-    }
-
-    for (const verdict of ['not_running', 'other_account'] as const) {
-      it(`startup auto-login still logs in on ${verdict}`, async () => {
-        await addStoredAccounts('guard-auto-ok-agent');
-        await storeToken('guard-auto-ok-agent');
-        await new AccountRepository(pool).setAutoLoginOnStartup('guard-auto-ok-agent', true);
-        await facadeWithGuard(verdict);
-        expect(starts.some((item) => item.accountId === 'guard-auto-ok-agent')).toBe(true);
-        expect(commands.some((command) => command.type === 'loginToken' && command.accountId === 'guard-auto-ok-agent')).toBe(true);
-      });
-    }
+  it('starts manual LINE login directly without an official-process lookup or confirmation field', async () => {
+    await addStoredAccounts('direct-login-agent');
+    expect(await facade.dispatch({ type: 'lineStart', requestId: 'direct-start', accountId: 'direct-login-agent' }))
+      .toMatchObject({ ok: true });
+    expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'direct-qr', accountId: 'direct-login-agent' }))
+      .toMatchObject({ ok: true });
+    expect(starts.some((item) => item.accountId === 'direct-login-agent')).toBe(true);
+    expect(commands.some((command) => command.type === 'loginQr' && command.accountId === 'direct-login-agent')).toBe(true);
   });
 
   it('drains a startup-resumed monitor before the Primary Admin QR login worker starts', async () => {
@@ -1598,6 +1637,173 @@ database('connected facade account login semantics', () => {
     }
   });
 
+  it('projects and safely records startup authority-read failures', async () => {
+    const accountId = 'monitor-startup-diagnostic-admin';
+    await addStoredAccounts('monitor-startup-diagnostic-agent', accountId);
+    const repository = new ExternalMonitorRepository(pool);
+    const source = await repository.bindVerifiedExternalSource({ accountId, ownMid: `own-${accountId}`,
+      sourceIdentity: 'monitor-startup-diagnostic-source', initialImport: { snapshotDigest: 'a'.repeat(64),
+        schemaVersion: 'line-schema-v1', highWater: null, eligibleCount: '0' } });
+    await repository.completeInitialImport({ accountId, sourceId: source.sourceId, generation: source.generation,
+      expectedModeRevision: source.modeRevision, expectedCheckpoint: {}, finalCursor: {}, highWater: null });
+    const failure = 'private postgres path C:\\secret\ncredential=hidden';
+    const getState = vi.spyOn(ExternalMonitorRepository.prototype, 'getInitialImportState').mockRejectedValue(new Error(failure));
+    const diagnosticPath = join(secretRoot, 'startup-monitor-diagnostic.json');
+    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
+      async readOfficialSnapshot() { throw new Error('completed source must skip snapshot import'); },
+      async readOfficialMonitor() { throw new Error('must not reach reader before state verification'); },
+    };
+    try {
+      await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+      await waitForState(async () => {
+        const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'monitor-startup-diagnostic-state' });
+        expect(snapshot.type === 'getSnapshot' && snapshot.ok
+          ? snapshot.snapshot.accounts.find((item) => item.accountId === accountId)?.externalImportProgress
+          : null).toMatchObject({ stage: 'failed', committedRows: '0', message: 'external_monitor_database_failed' });
+      });
+      const record = JSON.parse(await readFile(diagnosticPath, 'utf8')) as Record<string, unknown>;
+      expect(record).toMatchObject({ stage: 'startup', code: 'external_monitor_database_failed', producer: 'startup_resume' });
+      expect(JSON.stringify(record)).not.toContain(failure);
+    } finally {
+      getState.mockRestore();
+    }
+  });
+
+  it('classifies stale authority at a completed-import restart fence', async () => {
+    const accountId = 'monitor-restart-diagnostic-admin';
+    await addStoredAccounts('monitor-restart-diagnostic-agent', accountId);
+    const diagnosticPath = join(secretRoot, 'restart-monitor-diagnostic.json');
+    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
+      async readOfficialSnapshot() { throw new Error('completed source must skip snapshot import'); },
+      async readOfficialMonitor() { throw new Error('monitor reader must not start after failed fence'); },
+    };
+    await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+    const repository = new ExternalMonitorRepository(pool);
+    const source = await repository.bindVerifiedExternalSource({ accountId, ownMid: `own-${accountId}`,
+      sourceIdentity: 'monitor-restart-diagnostic-source', initialImport: { snapshotDigest: 'b'.repeat(64),
+        schemaVersion: 'line-schema-v1', highWater: null, eligibleCount: '0' } });
+    await repository.completeInitialImport({ accountId, sourceId: source.sourceId, generation: source.generation,
+      expectedModeRevision: source.modeRevision, expectedCheckpoint: {}, finalCursor: {}, highWater: null });
+    const failure = 'External source authority is stale';
+    const readFence = vi.spyOn(ExternalMonitorRepository.prototype, 'readBatchFence').mockRejectedValue(new Error(failure));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(await facade.dispatch({ type: 'externalImportStart', requestId: 'monitor-restart-diagnostic-start', accountId }))
+        .toMatchObject({ ok: true });
+      await waitForState(async () => {
+        const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'monitor-restart-diagnostic-state' });
+        expect(snapshot.type === 'getSnapshot' && snapshot.ok
+          ? snapshot.snapshot.accounts.find((item) => item.accountId === accountId)?.externalImportProgress
+          : null).toMatchObject({ stage: 'failed', committedRows: '0', message: 'external_monitor_authority_stale' });
+      });
+      const record = JSON.parse(await readFile(diagnosticPath, 'utf8')) as Record<string, unknown>;
+      expect(record).toMatchObject({ stage: 'startup', code: 'external_monitor_authority_stale', producer: 'manual_start' });
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(failure);
+      expect(JSON.stringify(record)).not.toContain(failure);
+    } finally {
+      readFence.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
+  it('persists the facade fence phase when the admitted monitor state changes before reader launch', async () => {
+    const accountId = 'monitor-second-state-diagnostic-admin';
+    await addStoredAccounts('monitor-second-state-diagnostic-agent', accountId);
+    const diagnosticPath = join(secretRoot, 'second-state-monitor-diagnostic.json');
+    const repository = new ExternalMonitorRepository(pool);
+    const source = await repository.bindVerifiedExternalSource({ accountId, ownMid: `own-${accountId}`,
+      sourceIdentity: 'monitor-second-state-diagnostic-source', initialImport: { snapshotDigest: 'd'.repeat(64),
+        schemaVersion: 'line-schema-v1', highWater: null, eligibleCount: '0' } });
+    await repository.completeInitialImport({ accountId, sourceId: source.sourceId, generation: source.generation,
+      expectedModeRevision: source.modeRevision, expectedCheckpoint: {}, finalCursor: {}, highWater: null });
+    const admittedState = await repository.getInitialImportState({ accountId, sourceId: source.sourceId, generation: source.generation });
+    expect(admittedState?.initialImportComplete).toBe(true);
+    let stateReads = 0;
+    const getState = vi.spyOn(ExternalMonitorRepository.prototype, 'getInitialImportState').mockImplementation(async () => {
+      stateReads += 1;
+      return stateReads === 1 ? admittedState : { ...admittedState!, initialImportComplete: false };
+    });
+    let readerLaunches = 0;
+    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
+      async readOfficialSnapshot() { throw new Error('completed source must skip snapshot import'); },
+      async readOfficialMonitor() { readerLaunches += 1; throw new Error('reader must not start after state fence fails'); },
+    };
+    try {
+      await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+      await waitForState(async () => {
+        const record = JSON.parse(await readFile(diagnosticPath, 'utf8')) as Record<string, unknown>;
+        expect(record).toMatchObject({ stage: 'startup', code: 'external_monitor_checkpoint_changed',
+          phase: 'facade_checkpoint_fence' });
+      });
+      expect(stateReads).toBe(2);
+      expect(readerLaunches).toBe(0);
+    } finally {
+      getState.mockRestore();
+    }
+  });
+
+  it('preserves typed private directory phase from marker creation under owner admission', async () => {
+    const accountId = 'monitor-private-directory-phase-admin';
+    await addStoredAccounts('monitor-private-directory-phase-agent', accountId);
+    const diagnosticPath = join(secretRoot, 'private-directory-phase-monitor-diagnostic.json');
+    const repository = new ExternalMonitorRepository(pool);
+    const source = await repository.bindVerifiedExternalSource({ accountId, ownMid: `own-${accountId}`,
+      sourceIdentity: 'monitor-private-directory-phase-source', initialImport: { snapshotDigest: 'e'.repeat(64),
+        schemaVersion: 'line-schema-v1', highWater: null, eligibleCount: '0' } });
+    await repository.completeInitialImport({ accountId, sourceId: source.sourceId, generation: source.generation,
+      expectedModeRevision: source.modeRevision, expectedCheckpoint: {}, finalCursor: {}, highWater: null });
+    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
+      async readOfficialSnapshot() { throw new Error('completed source must skip snapshot import'); },
+      async readOfficialMonitor(input) {
+        input.onPhase?.('owner_admission_marker');
+        throw new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup',
+          'private_directory_acl_command_timeout', 'private_directory_preparation');
+      },
+    };
+    await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+    await waitForState(async () => {
+      const record = JSON.parse(await readFile(diagnosticPath, 'utf8')) as Record<string, unknown>;
+      expect(record).toMatchObject({ stage: 'startup', code: 'external_monitor_reader_startup_failed',
+        detail: 'private_directory_acl_command_timeout', phase: 'private_directory_preparation', producer: 'startup_resume' });
+    });
+  });
+
+  it('records reader failures with the runtime phase after readiness and hides injected text', async () => {
+    const accountId = 'monitor-runtime-diagnostic-admin';
+    await addStoredAccounts('monitor-runtime-diagnostic-agent', accountId);
+    const diagnosticPath = join(secretRoot, 'runtime-monitor-diagnostic.json');
+    const repository = new ExternalMonitorRepository(pool);
+    const source = await repository.bindVerifiedExternalSource({ accountId, ownMid: `own-${accountId}`,
+      sourceIdentity: 'monitor-runtime-diagnostic-source', initialImport: { snapshotDigest: 'c'.repeat(64),
+        schemaVersion: 'line-schema-v1', highWater: null, eligibleCount: '0' } });
+    await repository.completeInitialImport({ accountId, sourceId: source.sourceId, generation: source.generation,
+      expectedModeRevision: source.modeRevision, expectedCheckpoint: {}, finalCursor: {}, highWater: null });
+    const failure = 'native exception C:\\private mid=u-secret credential=hidden';
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
+      async readOfficialSnapshot() { throw new Error('completed source must skip snapshot import'); },
+      async readOfficialMonitor(input) {
+        input.onReady?.({ sourceId: 'fake-source', generation: 1 } as never);
+        throw new Error(failure);
+      },
+    };
+    try {
+      await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+      await waitForState(async () => {
+        const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'monitor-runtime-diagnostic-state' });
+        expect(snapshot.type === 'getSnapshot' && snapshot.ok
+          ? snapshot.snapshot.accounts.find((item) => item.accountId === accountId)?.externalImportProgress
+          : null).toMatchObject({ stage: 'failed', committedRows: '0', message: 'external_monitor_unknown' });
+      });
+      const record = JSON.parse(await readFile(diagnosticPath, 'utf8')) as Record<string, unknown>;
+      expect(record).toMatchObject({ stage: 'runtime', code: 'external_monitor_unknown', producer: 'startup_resume' });
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(failure);
+      expect(JSON.stringify(record)).not.toContain(failure);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
   it('stops only the matching completed external monitor and keeps its checkpoint', async () => {
     const accountId = 'explicit-stop-admin';
     await addStoredAccounts('explicit-stop-agent', accountId);
@@ -1607,6 +1813,9 @@ database('connected facade account login semantics', () => {
         schemaVersion: 'line-schema-v1', highWater: null, eligibleCount: '0' } });
     await repository.completeInitialImport({ accountId, sourceId: source.sourceId, generation: source.generation,
       expectedModeRevision: source.modeRevision, expectedCheckpoint: {}, finalCursor: {}, highWater: null });
+    const diagnosticPath = join(secretRoot, 'explicit-stop-monitor-diagnostic.json');
+    await writeFile(diagnosticPath, JSON.stringify({ version: 1, createdAt: new Date().toISOString(),
+      stage: 'startup', code: 'external_monitor_unknown' }));
     let monitorStarted!: () => void;
     const started = new Promise<void>((resolve) => { monitorStarted = resolve; });
     let restartedMonitorStarted!: () => void;
@@ -1616,6 +1825,7 @@ database('connected facade account login semantics', () => {
     const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
       async readOfficialSnapshot() { throw new Error('completed source must skip initial import'); },
       async readOfficialMonitor(input) {
+        await input.onReady?.({ sourceId: 'fake-source', generation: 1 } as never);
         observedSignal = input.signal;
         monitorRuns++;
         if (monitorRuns === 1) monitorStarted();
@@ -1626,8 +1836,9 @@ database('connected facade account login semantics', () => {
         });
       },
     };
-    await restartFacadeWithImporter(importer);
+    await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
     await started;
+    await vi.waitFor(async () => expect(readFile(diagnosticPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' }));
 
     const otherAccountRequest = await facade.dispatch({ type: 'externalImportStop', requestId: 'explicit-stop-other', accountId: 'explicit-stop-agent' });
     expect(otherAccountRequest).toMatchObject({ ok: false, code: 'EXTERNAL_MONITOR_NOT_ACTIVE' });
@@ -1645,6 +1856,7 @@ database('connected facade account login semantics', () => {
     }, { timeout: 5_000, interval: 100 });
     await expect(repository.getInitialImportState({ accountId, sourceId: source.sourceId, generation: source.generation }))
       .resolves.toMatchObject({ initialImportComplete: true, committedCount: '0', cursor: {} });
+    await expect(readFile(diagnosticPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await facade.dispatch({ type: 'externalImportStart', requestId: 'explicit-stop-restart', accountId })).toMatchObject({ ok: true });
     await restarted;
     expect(await facade.dispatch({ type: 'externalImportStop', requestId: 'explicit-stop-second', accountId })).toMatchObject({ type: 'accepted', ok: true });
@@ -1829,7 +2041,140 @@ database('connected facade account login semantics', () => {
     expect(result.ok, JSON.stringify(result)).toBe(true);
   }
 
+  async function loginReady(accountId: string, ownMid = `own-${accountId}`) {
+    await activate(accountId);
+    expect((await facade.dispatch({ type: 'lineLoginQr', requestId: `qr-${accountId}`, accountId })).ok).toBe(true);
+    const binding = bindings.get(accountId)!;
+    const attempt = latestLoginAttempt(accountId);
+    await workerEventHandler?.(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: attempt, ownMid, displayName: 'Agent' });
+    await workerEventHandler?.(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
+    return binding;
+  }
+
+  async function seedManualUnsendMessage(binding: TestBinding, messageId: string, senderId: string, occurredAt: string) {
+    const raw = { message: { id: messageId, from: senderId, to: 'unsend-chat', toType: 1, contentType: 0,
+      text: `source ${messageId}`, createdTime: Date.parse(occurredAt), contentMetadata: {} } };
+    const checkpoint = await pool.query<{ cursor: { version: 1; revision: string; globalRev: string; individualRev: string } }>(
+      "SELECT cursor FROM external_source_checkpoints WHERE account_id=$1 AND source_id=(SELECT selected_source_id FROM line_accounts WHERE account_id=$1)",
+      [binding.accountId]);
+    const cursorBefore = checkpoint.rows[0]!.cursor;
+    const cursorAfter = { version: 1 as const, revision: (BigInt(cursorBefore.revision) + 1n).toString(),
+      globalRev: (BigInt(cursorBefore.globalRev) + 1n).toString(), individualRev: cursorBefore.individualRev };
+    await workerEventHandler?.(binding.workerInstanceId, { type: 'batch', ...binding, batchId: `batch-${messageId}`,
+      cursorBefore, cursorAfter, envelopes: [{
+        eventId: `event-${messageId}`, messageId, accountId: binding.accountId, chatType: 'direct', chatId: 'unsend-chat',
+        senderId, kind: 'text', text: `source ${messageId}`, mentionIds: [], mentionRanges: [], replyToMessageId: null,
+        ingestion: { source: 'live', cursor: null }, occurredAt, attachments: [], raw,
+      }] });
+  }
+
   async function control() { return facade.controlState(); }
+
+  it('refreshes the connected account avatar through its current worker and publishes the updated snapshot', async () => {
+    const accountId = 'avatar-refresh-flow';
+    const ownMid = `u${'c'.repeat(32)}`;
+    const picturePath = 'https://profile.line-scdn.net/avatar-refresh.png';
+    await addStoredAccounts(accountId);
+    const binding: TestBinding = { accountId, workerInstanceId: 'avatar-refresh-worker', controlEpoch: 0, mode: 'MONITOR_ONLY' };
+    await workers.start(accountId, binding);
+    await pool.query(`UPDATE line_accounts SET own_mid=$2,status='connected',mode='MONITOR_ONLY',connection_mode='SYSTEM_LOGIN',
+      worker_instance_id=$3,worker_binding_epoch=$4 WHERE account_id=$1`,
+    [accountId, ownMid, binding.workerInstanceId, binding.controlEpoch]);
+    refreshedOwnProfile = { ownMid, displayName: 'Refreshed account', picturePath };
+
+    const result = await facade.dispatch({ type: 'refreshLineAvatar', requestId: 'avatar-refresh-flow-request', accountId });
+
+    expect(result).toMatchObject({ type: 'accepted', ok: true, requestId: 'avatar-refresh-flow-request' });
+    expect(commands.at(-1)).toMatchObject({ type: 'refreshOwnProfile', accountId, workerInstanceId: binding.workerInstanceId });
+    expect(await pool.query('SELECT display_name,picture_path FROM line_accounts WHERE account_id=$1', [accountId])).toMatchObject({
+      rows: [{ display_name: 'Refreshed account', picture_path: picturePath }],
+    });
+    expect(published.some((event) => event.type === 'snapshotChanged')).toBe(true);
+    expect(published.filter((event) => event.type === 'lineAvatarRefreshed')).toEqual([{ type: 'lineAvatarRefreshed', accountId, ownMid }]);
+  });
+
+  it('coalesces overlapping avatar refreshes for the same signed-in account', async () => {
+    const accountId = 'avatar-refresh-overlap';
+    const ownMid = `u${'b'.repeat(32)}`;
+    await addStoredAccounts(accountId);
+    const binding: TestBinding = { accountId, workerInstanceId: 'avatar-refresh-overlap-worker', controlEpoch: 0, mode: 'MONITOR_ONLY' };
+    await workers.start(accountId, binding);
+    await pool.query(`UPDATE line_accounts SET own_mid=$2,status='connected',mode='MONITOR_ONLY',connection_mode='SYSTEM_LOGIN',
+      worker_instance_id=$3,worker_binding_epoch=$4 WHERE account_id=$1`,
+    [accountId, ownMid, binding.workerInstanceId, binding.controlEpoch]);
+    refreshedOwnProfile = { ownMid, displayName: 'Overlapping account', picturePath: 'https://profile.line-scdn.net/overlap.png' };
+    let begin!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { begin = resolve; });
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    pendingOwnProfileRead = { started: begin, wait: pending, release };
+
+    const first = facade.dispatch({ type: 'refreshLineAvatar', requestId: 'avatar-overlap-first', accountId });
+    await started;
+    const second = facade.dispatch({ type: 'refreshLineAvatar', requestId: 'avatar-overlap-second', accountId });
+    await Promise.resolve();
+    expect(commands.filter((command) => command.type === 'refreshOwnProfile')).toHaveLength(1);
+    release();
+
+    expect(await first).toMatchObject({ type: 'accepted', requestId: 'avatar-overlap-first', ok: true });
+    expect(await second).toMatchObject({ type: 'accepted', requestId: 'avatar-overlap-second', ok: true });
+    expect(published.filter((event) => event.type === 'lineAvatarRefreshed')).toHaveLength(1);
+  });
+
+  it.each([
+    ['paused account', { accountMode: 'PAUSED' as const }],
+    ['disconnected account', { status: 'disconnected' as const }],
+    ['external monitor source', { connectionMode: 'EXTERNAL_MONITOR' as const }],
+    ['download-only binding', { purpose: 'DOWNLOAD_ONLY' as const }],
+  ] as [string, { accountMode?: 'PAUSED'; status?: 'disconnected'; connectionMode?: 'EXTERNAL_MONITOR'; purpose?: 'DOWNLOAD_ONLY' }][])('does not issue a profile read for a %s', async (_label, excluded) => {
+    const accountId = `avatar-refresh-skip-${String(_label).replaceAll(' ', '-')}`;
+    const ownMid = `u${'e'.repeat(32)}`;
+    await addStoredAccounts(accountId);
+    const binding: TestBinding = { accountId, workerInstanceId: `${accountId}-worker`, controlEpoch: 0, mode: 'MONITOR_ONLY',
+      ...(excluded.purpose ? { purpose: excluded.purpose } : {}) };
+    await workers.start(accountId, binding);
+    await pool.query(`UPDATE line_accounts SET own_mid=$2,status=$3,mode=$4,connection_mode=$5,
+      worker_instance_id=$6,worker_binding_epoch=$7 WHERE account_id=$1`,
+    [accountId, ownMid, excluded.status ?? 'connected', excluded.accountMode ?? 'MONITOR_ONLY', excluded.connectionMode ?? 'SYSTEM_LOGIN',
+      binding.workerInstanceId, binding.controlEpoch]);
+
+    const result = await facade.dispatch({ type: 'refreshLineAvatar', requestId: `${accountId}-request`, accountId });
+
+    expect(result).toMatchObject({ type: 'error', ok: false, code: 'LINE_PROFILE_REFRESH_UNAVAILABLE' });
+    expect(commands.some((command) => command.type === 'refreshOwnProfile' && command.accountId === accountId)).toBe(false);
+  });
+
+  it.each(['logout', 'rebind'] as const)('discards a profile response after %s during the read', async (change) => {
+    const accountId = `avatar-refresh-stale-${change}`;
+    const ownMid = `u${'f'.repeat(32)}`;
+    const oldPicture = 'https://profile.line-scdn.net/avatar-before-stale-read.png';
+    await addStoredAccounts(accountId);
+    const binding: TestBinding = { accountId, workerInstanceId: `${accountId}-worker`, controlEpoch: 0, mode: 'MONITOR_ONLY' };
+    await workers.start(accountId, binding);
+    await pool.query(`UPDATE line_accounts SET own_mid=$2,status='connected',mode='MONITOR_ONLY',connection_mode='SYSTEM_LOGIN',
+      picture_path=$3,worker_instance_id=$4,worker_binding_epoch=$5 WHERE account_id=$1`,
+    [accountId, ownMid, oldPicture, binding.workerInstanceId, binding.controlEpoch]);
+    refreshedOwnProfile = { ownMid, displayName: 'Stale response', picturePath: 'https://profile.line-scdn.net/avatar-stale.png' };
+    let begin!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { begin = resolve; });
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    pendingOwnProfileRead = { started: begin, wait: pending };
+    const request = facade.dispatch({ type: 'refreshLineAvatar', requestId: `${accountId}-request`, accountId });
+    await started;
+    if (change === 'logout') {
+      await pool.query("UPDATE line_accounts SET status='disconnected' WHERE account_id=$1", [accountId]);
+    } else {
+      const replacement: TestBinding = { ...binding, workerInstanceId: `${accountId}-replacement` };
+      bindings.set(accountId, replacement);
+      await pool.query('UPDATE line_accounts SET worker_instance_id=$2 WHERE account_id=$1', [accountId, replacement.workerInstanceId]);
+    }
+    release();
+
+    expect(await request).toMatchObject({ type: 'error', ok: false, code: 'LINE_PROFILE_REFRESH_STALE' });
+    expect((await pool.query('SELECT picture_path FROM line_accounts WHERE account_id=$1', [accountId])).rows[0]?.picture_path).toBe(oldPicture);
+    expect(published.some((event) => event.type === 'lineAvatarRefreshed' && event.accountId === accountId)).toBe(false);
+  });
 
   function latestLoginAttempt(accountId: string): string {
     const state = [...published].reverse().find((event) => event.type === 'lineLoginState'
@@ -1928,6 +2273,7 @@ database('connected facade account login semantics', () => {
         { token: `token-${accountId}`, qrCert: null, e2eeStorage: null });
     }
     stops.length = 0;
+    const commandsBeforeInvalidation = commands.length;
     const { RequestClient } = await import(new URL('./request/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
       RequestClient: { prototype: { request: (...args: any[]) => Promise<unknown> } };
     };
@@ -1959,6 +2305,129 @@ database('connected facade account login semantics', () => {
     expect(await facade.dispatch({ type: 'sendText', requestId: 'after-auth-invalidation', accountId: 'account-a',
       chatType: 'direct', chatId: 'chat-a', text: 'must be blocked' })).toMatchObject({ ok: false });
     expect(commands.some((command) => command.type === 'manualSendText' && command.requestId === 'after-auth-invalidation')).toBe(false);
+    expect(commands.slice(commandsBeforeInvalidation).some((command) => command.type === 'loginToken' || command.type === 'loginQr')).toBe(false);
+  });
+
+  it.each(['auth invalidation', 'logout'] as const)('fences a suspended archive publication synchronously on %s', async (transition) => {
+    await addStoredAccounts('account-a');
+    await activate('account-a');
+    await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES ('account-a','group','archive-chat','Archive test') ON CONFLICT DO NOTHING");
+    await facade.dispatch({ type: 'lineLoginQr', requestId: `archive-initial-qr-${transition}`, accountId: 'account-a' });
+    const binding = bindings.get('account-a')!;
+    const initialAttempt = latestLoginAttempt('account-a');
+    await workerEventHandler!(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: initialAttempt,
+      ownMid: 'own-account-a', displayName: 'Agent' });
+    await workerEventHandler!(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
+    let release!: () => void;
+    let publicationStarted = false;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    archivePublishGate = { entered: () => { publicationStarted = true; }, wait };
+    const noteRead = facade.dispatch({ type: 'getChatNote', requestId: `archive-note-${transition}`, accountId: 'account-a',
+      chatType: 'group', chatId: 'archive-chat', postId: 'note-a' });
+    await vi.waitFor(() => expect(publicationStarted).toBe(true), { timeout: 1500 });
+
+    let lifecycleRelease!: () => void;
+    let lifecycleStarted = false;
+    const lifecycleGate = new Promise<void>((resolve) => { lifecycleRelease = resolve; });
+    const lifecycleEntered = () => { lifecycleStarted = true; };
+    if (transition === 'auth invalidation') {
+      pendingWorkerStop = { started: lifecycleEntered, wait: lifecycleGate };
+      const invalidation = workerEventHandler!(binding.workerInstanceId, { type: 'authInvalidated', ...binding });
+      await vi.waitFor(() => expect(lifecycleStarted).toBe(true), { timeout: 1500 });
+      const during = facade.dispatch({ type: 'getChatNote', requestId: 'archive-note-during-invalidation', accountId: 'account-a',
+        chatType: 'group', chatId: 'archive-chat', postId: 'note-a' });
+      await expect(during).resolves.toMatchObject({ ok: false, message: expect.stringContaining('archive is closed') });
+      expect(archiveReads).toBe(1);
+      await expect(noteRead).resolves.toMatchObject({ ok: false, message: expect.stringContaining('invalidated') });
+      release();
+      await vi.waitFor(() => expect(archiveCommits).toBe(0));
+      lifecycleRelease();
+      await invalidation;
+    } else {
+      pendingWorkerStop = { started: lifecycleEntered, wait: lifecycleGate };
+      const logout = facade.dispatch({ type: 'lineLogout', requestId: 'archive-logout', accountId: 'account-a' });
+      await vi.waitFor(() => expect(lifecycleStarted).toBe(true), { timeout: 1500 });
+      const during = facade.dispatch({ type: 'getChatNote', requestId: 'archive-note-during-logout', accountId: 'account-a',
+        chatType: 'group', chatId: 'archive-chat', postId: 'note-a' });
+      await expect(during).resolves.toMatchObject({ ok: false, message: expect.stringContaining('archive is closed') });
+      expect(archiveReads).toBe(1);
+      await expect(noteRead).resolves.toMatchObject({ ok: false, message: expect.stringContaining('logout') });
+      release();
+      await vi.waitFor(() => expect(archiveCommits).toBe(0));
+      lifecycleRelease();
+      await logout;
+    }
+    expect(archiveCommits).toBe(0);
+    await activate('account-a');
+    expect((await facade.dispatch({ type: 'lineLoginQr', requestId: `archive-recover-qr-${transition}`, accountId: 'account-a' })).ok).toBe(true);
+    const recoveredBinding = bindings.get('account-a')!;
+    const recoveredAttempt = latestLoginAttempt('account-a');
+    await workerEventHandler!(recoveredBinding.workerInstanceId, { type: 'login', ...recoveredBinding,
+      loginAttemptId: recoveredAttempt, ownMid: 'own-account-a', displayName: 'Agent' });
+    await workerEventHandler!(recoveredBinding.workerInstanceId, { type: 'status', ...recoveredBinding, state: 'ready', message: null });
+    await expect(facade.dispatch({ type: 'getChatNote', requestId: `archive-after-recovery-${transition}`, accountId: 'account-a',
+      chatType: 'group', chatId: 'archive-chat', postId: 'note-a' })).resolves.toMatchObject({ ok: true });
+    expect(archiveReads).toBe(2);
+    expect(archiveCommits).toBe(1);
+  });
+
+  it('cancels a pending album open without diagnostics or late publication, then accepts the next request', async () => {
+    await addStoredAccounts('account-a');
+    await loginReady('account-a');
+    await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES ('account-a','group','archive-chat','Archive test') ON CONFLICT DO NOTHING");
+    Object.assign(bindings.get('account-a')!, { transportOwnerId: 'archive-owner', transportGeneration: 1, writeGrantVersion: 1 });
+    archiveStore.ensureAlbumFolder = async () => undefined;
+    archiveStore.publishAlbumPhoto = async () => { archiveCommits++; };
+
+    let readStarted!: () => void;
+    const started = new Promise<void>((resolve) => { readStarted = resolve; });
+    let resolveRead!: (result: ChatResourceReadResult) => void;
+    workers.readChatResource = async (command) => {
+      archiveReads++;
+      readStarted();
+      return await new Promise<ChatResourceReadResult>((resolve) => { resolveRead = resolve; });
+    };
+
+    const onDiagnostic = vi.fn();
+    const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', onDiagnostic,
+      service: { dispatch: (request, signal) => facade.dispatch(request, signal) } });
+    const sender = { senderId: 7, url: 'file:///app/index.html' };
+    const openRequest = (requestId: string) => ({ type: 'openChatAlbum', requestId, accountId: 'account-a',
+      chatType: 'group', chatId: 'archive-chat', albumId: 'album-a' });
+    const auditEventsBeforeCancel = auditEvents.length;
+    const pendingOpen = adapter(sender, openRequest('album-cancelled'));
+    const enteredRead = await Promise.race([started.then(() => true), pendingOpen.then((result) => result)]);
+    if (enteredRead !== true) throw new Error(`Album request returned before worker read: ${JSON.stringify(enteredRead)}`);
+    await expect(adapter(sender, { type: 'cancelChatResourceRequest', requestId: 'album-cancel', targetRequestId: 'album-cancelled' }))
+      .resolves.toMatchObject({ type: 'cancelChatResourceRequest', ok: true, cancelled: true });
+    await expect(pendingOpen).resolves.toMatchObject({ type: 'error', code: 'CANCELLED' });
+    const readsAfterCancel = archiveReads;
+    await audit.flush();
+    expect(onDiagnostic).not.toHaveBeenCalled();
+    expect(auditEvents.slice(auditEventsBeforeCancel).some((event) => event.requestId === 'album-cancelled')).toBe(false);
+
+    resolveRead({ type: 'chatResourceResult', requestId: 'late-album-read', action: 'listAlbumPhotos', ok: true,
+      accountId: 'account-a', workerInstanceId: bindings.get('account-a')!.workerInstanceId, controlEpoch: bindings.get('account-a')!.controlEpoch,
+      chatType: 'group', chatId: 'archive-chat', photos: [], nextCursor: null });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(archiveCommits).toBe(0);
+    expect(archiveReads).toBe(readsAfterCancel);
+
+    workers.readChatResource = async (command) => {
+      archiveReads++;
+      return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true,
+        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+        chatType: command.chatType, chatId: command.chatId, photos: [], nextCursor: null };
+    };
+    await expect(adapter(sender, openRequest('album-after-cancel'))).resolves.toMatchObject({ type: 'openChatAlbum', ok: true,
+      albumId: 'album-a', savedCount: 0, failedCount: 0, totalCount: 0, complete: true, errorCode: null });
+    expect(archiveReads).toBe(readsAfterCancel + 1);
+
+    archiveStore.ensureAlbumFolder = async () => { throw new Error('unexpected archive failure'); };
+    await expect(adapter(sender, openRequest('album-unexpected'))).resolves.toMatchObject({ type: 'error', code: 'SERVICE_ERROR' });
+    await audit.flush();
+    expect(auditEvents).toContainEqual(expect.objectContaining({ action: 'runtime_error', requestId: 'album-unexpected',
+      diagnostic: expect.objectContaining({ category: 'unknown' }) }));
   });
 
   it('ignores an invalidation whose database binding has already been replaced', async () => {
@@ -2275,6 +2744,34 @@ database('connected facade account login semantics', () => {
     expect(bindings.get('account-b')?.mode).toBe('MONITOR_ONLY');
     expect(await control()).toMatchObject({ activeAccountId: 'account-a' });
     expect(commands.some((command) => command.type === 'manualSendText' && command.requestId === 'admin-manual-send')).toBe(true);
+    const media = await facade.dispatch({ type: 'sendManualMedia', requestId: 'admin-manual-media', accountId: 'account-b',
+      chatType: 'direct', chatId: 'admin-chat-account-b', files: [{ name: 'note.txt', bytes: new Uint8Array([1, 2]) }] });
+    expect(media).toMatchObject({ ok: true });
+    expect(commands.some((command) => command.type === 'sendMedia' && command.manualSend === true && command.fileName === 'note.txt')).toBe(true);
+  });
+
+  it('bounds same-account media bursts and cancels an admitted send with staged-file cleanup', async () => {
+    await addStoredAccounts('account-a');
+    await loginReady('account-a');
+    let started!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    pendingManualMedia = { started: () => started(), wait, release: () => release() };
+    const controller = new AbortController();
+    const request = { type: 'sendManualMedia' as const, requestId: 'bounded-manual-media', accountId: 'account-a',
+      chatType: 'direct' as const, chatId: 'media-chat', files: [{ name: 'note.txt', bytes: new Uint8Array([1, 2]) }] };
+    const active = facade.dispatch(request, controller.signal);
+    await entered;
+    const filePath = commands.find((command) => command.type === 'sendMedia')?.filePath;
+    expect(filePath).toBeDefined();
+    expect(await facade.dispatch({ ...request, requestId: 'burst-manual-media' })).toMatchObject({ ok: false, code: 'LINE_MEDIA_BUSY' });
+    expect(commands.filter((command) => command.type === 'sendMedia')).toHaveLength(1);
+
+    controller.abort();
+    expect(await active).toMatchObject({ ok: false, code: 'LINE_SEND_OUTCOME_UNKNOWN' });
+    await expect(access(filePath!)).rejects.toThrow();
+    expect(await facade.dispatch({ ...request, requestId: 'after-cancel-manual-media' })).toMatchObject({ ok: true });
   });
 
   it('keeps a rejected Primary Admin MID unable to send manually', async () => {
@@ -2331,6 +2828,48 @@ database('connected facade account login semantics', () => {
       chatType: 'direct', chatId: 'chat-a', text: 'send once' });
     expect(result).toMatchObject({ ok: false, code: 'LINE_SEND_NOT_STARTED', message: 'SIDE_EFFECT_DENIED' });
     expect(commands.filter((command) => command.type === 'manualSendText' && command.requestId === 'single-failed-manual-send')).toHaveLength(1);
+  });
+
+  it('reconciles a confirmed unsend into the exact older timeline row and refuses other senders', async () => {
+    await addStoredAccounts('unsend-facade-account');
+    const binding = await loginReady('unsend-facade-account');
+    const olderAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    await seedManualUnsendMessage(binding, 'unsend-owned-older', `own-${binding.accountId}`, olderAt);
+    await seedManualUnsendMessage(binding, 'unsend-other-older', 'other-person', olderAt);
+    const key = { accountId: binding.accountId, chatType: 'direct' as const, chatId: 'unsend-chat' };
+
+    const rejected = await facade.dispatch({ type: 'unsendMessage', requestId: 'unsend-other', ...key, messageId: 'unsend-other-older' });
+    expect(rejected).toMatchObject({ ok: false, code: 'MESSAGE_NOT_ELIGIBLE' });
+    expect(commands.some((command) => command.type === 'unsendMessage' && command.requestId === 'unsend-other')).toBe(false);
+
+    const acceptedResult = await facade.dispatch({ type: 'unsendMessage', requestId: 'unsend-owned', ...key, messageId: 'unsend-owned-older' });
+    expect(acceptedResult, JSON.stringify(acceptedResult)).toMatchObject({ ok: true });
+    expect(commands.filter((command) => command.type === 'unsendMessage' && command.requestId === 'unsend-owned')).toHaveLength(1);
+    const projected = await facade.listMessages(key, null, 1, 'unsend-owned-older');
+    expect(projected.messages).toHaveLength(1);
+    expect(projected.messages[0]).toMatchObject({ messageId: 'unsend-owned-older', content: { type: 'unsent' }, text: 'source unsend-owned-older' });
+  });
+
+  it('does not write DB unsend state after a failed or unknown worker result, and denies a fenced binding', async () => {
+    await addStoredAccounts('unsend-failure-account');
+    const binding = await loginReady('unsend-failure-account');
+    const occurredAt = new Date().toISOString();
+    await seedManualUnsendMessage(binding, 'unsend-failure-row', `own-${binding.accountId}`, occurredAt);
+    const request = { type: 'unsendMessage' as const, requestId: 'unsend-failure', accountId: binding.accountId,
+      chatType: 'direct' as const, chatId: 'unsend-chat', messageId: 'unsend-failure-row' };
+    const before = await facade.listMessages(request, null, 1, request.messageId);
+
+    manualUnsendFailure = 'SIDE_EFFECT_DENIED';
+    expect(await facade.dispatch(request)).toMatchObject({ ok: false, code: 'LINE_UNSEND_NOT_STARTED' });
+    expect(await facade.listMessages(request, null, 1, request.messageId)).toEqual(before);
+    manualUnsendFailure = '__UNKNOWN__';
+    expect(await facade.dispatch({ ...request, requestId: 'unsend-unknown' })).toMatchObject({ ok: false, code: 'LINE_UNSEND_OUTCOME_UNKNOWN' });
+    expect(await facade.listMessages(request, null, 1, request.messageId)).toEqual(before);
+
+    manualUnsendFenced = true;
+    expect(await facade.dispatch({ ...request, requestId: 'unsend-fenced' })).toMatchObject({ ok: false, code: 'ACCOUNT_NOT_ACTIVE' });
+    expect(commands.some((command) => command.type === 'unsendMessage' && command.requestId === 'unsend-fenced')).toBe(false);
+    expect(await facade.listMessages(request, null, 1, request.messageId)).toEqual(before);
   });
 
   it('preserves an unknown worker send outcome as uncertain without retrying', async () => {
@@ -2714,8 +3253,39 @@ database('connected facade account login semantics', () => {
       }] });
     const rows = await pool.query<{ text_content: string | null }>("SELECT text_content FROM messages WHERE account_id='account-b' AND message_id='monitor-message'");
     expect(rows.rows).toEqual([{ text_content: 'saved while monitoring' }]);
+    const key = { accountId: binding.accountId, chatType: 'direct' as const, chatId: 'contact-mid' };
+    const beforeUnsend = await facade.listMessages(key, null, 1, 'monitor-message');
+    const unsend = await facade.dispatch({ type: 'unsendMessage', requestId: 'monitor-unsend', ...key, messageId: 'monitor-message' });
+    expect(unsend).toMatchObject({ ok: false, code: 'EXTERNAL_MONITOR_READ_ONLY' });
+    expect(commands.some((command) => command.type === 'unsendMessage' && command.requestId === 'monitor-unsend')).toBe(false);
+    expect(await facade.listMessages(key, null, 1, 'monitor-message')).toEqual(beforeUnsend);
     expect(commands.some((command) => command.type === 'ackBatch' && command.batchId === 'monitor-batch')).toBe(true);
     expect(await control()).toMatchObject({ activeAccountId: null });
+  });
+
+  it('denies unsend from an external-monitor-only account before worker RPC or database mutation', async () => {
+    await addStoredAccounts('external-unsend-agent');
+    const monitor = await new AccountRepository(pool).bindPrimaryAdminFromExternalMonitor({
+      mid: 'u11111111111111111111111111111111', correlationId: 'external-unsend-test' });
+    expect(monitor.ok).toBe(true);
+    if (!monitor.ok) throw new Error('External monitor account was not created');
+    const accountId = monitor.accountId;
+    const chatId = 'external-unsend-chat';
+    await pool.query('INSERT INTO conversations(account_id,chat_id,chat_type) VALUES($1,$2,\'direct\')', [accountId, chatId]);
+    await pool.query(`INSERT INTO messages(account_id,message_id,event_id,chat_id,chat_type,sender_id,kind,text_content,content,
+      ingestion_source,occurred_at,raw) VALUES($1,$2,$3,$4,'direct',$5,'text','keep this row',
+      '{"format":1,"type":"text"}'::jsonb,'live',now(),'{}'::jsonb)`,
+    [accountId, 'external-unsend-message', 'external-unsend-event', chatId, 'u11111111111111111111111111111111']);
+    const before = await pool.query('SELECT text_content,content,raw FROM messages WHERE account_id=$1 AND message_id=$2',
+      [accountId, 'external-unsend-message']);
+
+    const result = await facade.dispatch({ type: 'unsendMessage', requestId: 'external-monitor-unsend', accountId,
+      chatType: 'direct', chatId, messageId: 'external-unsend-message' });
+
+    expect(result).toMatchObject({ ok: false, code: 'EXTERNAL_MONITOR_READ_ONLY' });
+    expect(commands.some((command) => command.type === 'unsendMessage' && command.requestId === 'external-monitor-unsend')).toBe(false);
+    expect(await pool.query('SELECT text_content,content,raw FROM messages WHERE account_id=$1 AND message_id=$2',
+      [accountId, 'external-unsend-message'])).toEqual(before);
   });
 
   /*
@@ -3164,15 +3734,15 @@ database('connected facade account login semantics', () => {
     expect(await facade.listMessageReaders!(key, '200')).toEqual({ readers: [] });
   });
 
-  it('projects synthetic reaction samples through repository, facade mapping and the strict MessagePageSchema, and serves only present paid icons', async () => {
+  it('projects real reaction samples through repository, facade mapping and the strict MessagePageSchema, and serves only present paid icons', async () => {
     const samples = [
-      '{"reactionList":[{"PaidType":{},"PredefinedType":2,"createdAt":1700000000000,"reactor":"u00000000000000000000000000000001","type":1,"updatedAt":1700000000000,"cancel":false}],"totalCount":0,"countByType":{}}',
-      '{"reactionList":[{"reactor":"u00000000000000000000000000000002","type":1,"createdAt":1700000001000,"updatedAt":1700000001000,"PredefinedType":4,"PaidType":{}}],"totalCount":0,"countByType":{}}',
-      '{"reactionList":[{"reactor":"u00000000000000000000000000000003","type":2,"createdAt":1700000002000,"updatedAt":1700000002000,"PredefinedType":0,"PaidType":{"emojiId":"004","productId":"60ebfdc03cc24041bb139cf5","resourceType":1,"version":2}}],"totalCount":0,"countByType":{}}',
+      '{"reactionList":[{"PaidType":{},"PredefinedType":2,"createdAt":1792277695027,"reactor":"ub6f5a192eaf1fc1acc3c61508b4fd6da","type":1,"updatedAt":1792277695027,"cancel":false}],"totalCount":0,"countByType":{}}',
+      '{"reactionList":[{"reactor":"ufaeaefdf10160b3aa1f38d2f57e68736","type":1,"createdAt":1792635926799,"updatedAt":1792635926799,"PredefinedType":4,"PaidType":{}}],"totalCount":0,"countByType":{}}',
+      '{"reactionList":[{"reactor":"ub254b3c8c4fc001b1862a8eef68f4f00","type":2,"createdAt":1792638565546,"updatedAt":1792638565546,"PredefinedType":0,"PaidType":{"emojiId":"004","productId":"60ebfdc03cc24041bb139cf5","resourceType":1,"version":2}}],"totalCount":0,"countByType":{}}',
     ];
     await pool.query("INSERT INTO line_accounts(account_id,display_name,own_mid) VALUES ('rx-a','rx-a','own-rx-a')");
     await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id) VALUES ('rx-a','group','rx-group')");
-    await pool.query("INSERT INTO line_contacts(account_id,mid,display_name) VALUES ('rx-a','u00000000000000000000000000000001','Nice Person')");
+    await pool.query("INSERT INTO line_contacts(account_id,mid,display_name) VALUES ('rx-a','ub6f5a192eaf1fc1acc3c61508b4fd6da','Nice Person')");
     const insert = (id: string, minute: number, raw: unknown) => pool.query(
       `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, ingestion_source, occurred_at, raw)
        VALUES ('rx-a',$1,$2,'rx-group','group','rx-other','text','t','live','2026-10-22T00:00:00Z'::timestamptz + ($3 || ' minutes')::interval,$4::jsonb)`,
@@ -3484,7 +4054,9 @@ database('connected facade account login semantics', () => {
     await workerEventHandler?.(binding.workerInstanceId, { type: 'error', ...binding,
       code: 'QUEUE_FULL', message: 'Worker capability is busy', retryable: true });
     await workerEventHandler?.(binding.workerInstanceId, { type: 'error', ...binding,
-      code: 'SENSITIVE_UNRECOGNIZED_CODE', message: 'private provider payload', retryable: false });
+      code: 'HISTORY_READ_FAILED', message: 'The LINE chat history could not be read.', retryable: false });
+    await workerEventHandler?.(binding.workerInstanceId, ({ type: 'error', ...binding,
+      code: 'SENSITIVE_UNRECOGNIZED_CODE', message: 'private provider payload', retryable: false } as unknown as LineWorkerEvent));
     await workerEventHandler?.(binding.workerInstanceId, { type: 'catalogRefreshStatus', ...binding,
       state: 'degraded', code: 'CATALOG_REFRESH_FAILED' });
     await workerEventHandler?.(binding.workerInstanceId, { type: 'catalogRefreshStatus', ...binding,
@@ -3496,7 +4068,7 @@ database('connected facade account login semantics', () => {
       "SELECT status FROM line_accounts WHERE account_id='account-a'")).rows[0].status).toBe('connected'));
     expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='account-a'")).rows[0].status).toBe('connected');
     expect(auditEvents.filter((event) => event.action === 'worker_operation_error').map((event) => event.errorCode))
-      .toEqual(['INVALID_COMMAND', 'QUEUE_FULL', 'WORKER_OPERATION_FAILED']);
+      .toEqual(['INVALID_COMMAND', 'QUEUE_FULL', 'HISTORY_READ_FAILED', 'WORKER_OPERATION_FAILED']);
     expect(auditEvents.filter((event) => event.action === 'line_catalog_refresh').map((event) => [event.errorCode, event.resultCode]))
       .toEqual([['CATALOG_REFRESH_FAILED', undefined], [undefined, 'catalog_refresh_recovered']]);
     expect(JSON.stringify(auditEvents)).not.toContain('private provider payload');
@@ -3855,7 +4427,7 @@ database('connected facade account login semantics', () => {
     await vi.waitFor(async () => {
       const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'mismatch-snapshot' });
       const account = snapshot.ok && snapshot.type === 'getSnapshot' ? snapshot.snapshot.accounts.find((item) => item.accountId === 'mismatch-admin') : undefined;
-      expect(account?.externalImportProgress).toMatchObject({ stage: 'failed', message: 'reader_source_identity_changed' });
+      expect(account?.externalImportProgress).toMatchObject({ stage: 'failed', message: 'external_monitor_source_changed' });
     }, { timeout: 8000 });
     expect(calls).toEqual(['monitor']); // no retry against another candidate, no new snapshot import
     expect(await state()).toEqual(before);

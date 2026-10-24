@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Pool } from 'pg';
 import { randomBytes } from 'node:crypto';
 import { LineWorkerCommandSchema } from '@line-agent/contracts';
@@ -659,16 +659,29 @@ it('does not send an existing job reaction after EXTERNAL_MONITOR is selected', 
 database('LineService transaction and worker identity', () => {
   let pool: Pool; let close: () => Promise<void>; let accounts: AccountRepository; let messages: MessageRepository;
   let settings: SettingsRepository; let admins: AdminRepository; let whitelist: FriendWhitelistRepository;
+  let loginSourceId: string;
   beforeAll(async () => { ({ pool, close } = await createTestDatabase()); accounts = new AccountRepository(pool);
     messages = new MessageRepository(pool); settings = new SettingsRepository(pool); admins = new AdminRepository(pool);
     whitelist = new FriendWhitelistRepository(pool);
     await accounts.ensureAccount('a');
     await pool.query("UPDATE line_accounts SET product_role='AGENT' WHERE account_id='a'");
     await accounts.activateControl('a', 1); await accounts.setOwnMid('a', 'agent-mid');
+    await accounts.bindWorker({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1 });
+    await accounts.applyWorkerLogin({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1 }, 'agent-mid', 'Agent');
+    loginSourceId = (await pool.query("SELECT selected_source_id FROM line_accounts WHERE account_id='a'")).rows[0]!.selected_source_id;
     await messages.ingestAndRoute({ ...batch().envelopes[0]!, messageId: 'seed', eventId: 'seed' }, { eligible: false });
     await settings.setAppSetting('workspace_path', 'C:\\trusted');
     await settings.setConversationAgent({ accountId: 'a', chatType: 'direct', chatId: 'c', enabled: true, provider: 'codex' });
     await admins.bindPrimary('a', 'c', 'user'); });
+  beforeEach(async () => {
+    await pool.query('DELETE FROM message_source_provenance WHERE source_id=$1', [loginSourceId]);
+    await pool.query('DELETE FROM external_source_conflicts WHERE source_id=$1', [loginSourceId]);
+    await pool.query('DELETE FROM external_source_observations WHERE source_id=$1', [loginSourceId]);
+    await pool.query('DELETE FROM external_source_batches WHERE source_id=$1', [loginSourceId]);
+    await pool.query("DELETE FROM sync_cursors WHERE account_id='a' AND source='live'");
+    await pool.query('UPDATE external_source_checkpoints SET cursor=$2::jsonb WHERE source_id=$1',
+      [loginSourceId, JSON.stringify(cursor('0'))]);
+  });
   afterAll(async () => { await close?.(); });
 
   it('keeps an unavailable prompt terminal when its directory is restored before ingest, with replay acknowledged once per batch', async () => {
@@ -677,8 +690,8 @@ database('LineService transaction and worker identity', () => {
     await authority.configure(directory);
     await rm(directory, { recursive: true });
     const commands: LineWorkerCommand[] = []; const kicked: string[] = [];
-    const original = messages.ingestBatchAndRoute.bind(messages);
-    const ingest = vi.spyOn(messages, 'ingestBatchAndRoute').mockImplementation(async (...args) => {
+    const original = messages.ingestBatchSource.bind(messages);
+    const ingest = vi.spyOn(messages, 'ingestBatchSource').mockImplementation(async (...args) => {
       await mkdir(directory, { recursive: true });
       return original(...args);
     });
@@ -715,7 +728,7 @@ database('LineService transaction and worker identity', () => {
     await service.handleWorkerEvent('readiness-worker', { type: 'status', ...eventBinding, state: 'ready', message: null });
     expect(service.isAttachmentReady(binding)).toBe(true);
     await service.handleWorkerEvent('readiness-worker', { type: 'error', accountId: 'a', workerInstanceId: 'readiness-worker',
-      controlEpoch: 1, code: 'TEMPORARY', message: 'temporary worker error', retryable: true });
+      controlEpoch: 1, code: 'WORKER_OPERATION_FAILED', message: 'temporary worker error', retryable: true });
     expect(service.isAuthenticatedReady(binding)).toBe(true);
     expect(service.isAttachmentReady(binding)).toBe(true);
     await service.handleWorkerEvent('readiness-worker', { type: 'status', ...eventBinding, state: 'ready', message: null });
@@ -892,14 +905,15 @@ database('LineService transaction and worker identity', () => {
       { name: 'new', text: '@Agent /new', mode: 'available', change: 'replace' },
       { name: 'status', text: '@Agent /status', mode: 'available', change: 'revoke' },
     ] as const;
+    let cursorBefore = '0';
     for (const testCase of cases) {
       const messageId = `admin-race-${testCase.name}`;
       const commands: LineWorkerCommand[] = [];
       const effects: string[] = [];
       const replies: string[] = [];
       const workerId = `admin-race-worker-${testCase.name}`;
-      const original = messages.ingestBatchAndRoute.bind(messages);
-      const ingest = vi.spyOn(messages, 'ingestBatchAndRoute').mockImplementation(async (...args) => {
+      const original = messages.admitLiveBatch.bind(messages);
+      const ingest = vi.spyOn(messages, 'admitLiveBatch').mockImplementation(async (...args) => {
         if (testCase.change === 'revoke') {
           await pool.query("DELETE FROM account_administrators WHERE account_id='a' AND role='PRIMARY_ADMIN'");
         } else {
@@ -922,7 +936,8 @@ database('LineService transaction and worker identity', () => {
           chatType: 'group' as const, chatId: 'admin-race-room', senderId: 'user', text: testCase.text,
           mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] };
         await service.handleWorkerEvent(workerId, { ...batch(), workerInstanceId: workerId,
-          batchId: `${messageId}-batch`, cursorAfter: cursor('970'), envelopes: [source] });
+          batchId: `${messageId}-batch`, cursorBefore: cursor(cursorBefore), cursorAfter: cursor('970'), envelopes: [source] });
+        cursorBefore = '970';
       } finally {
         ingest.mockRestore();
         const restored = await pool.query("UPDATE account_administrators SET user_id='user' WHERE account_id='a' AND role='PRIMARY_ADMIN'");
@@ -952,9 +967,12 @@ database('LineService transaction and worker identity', () => {
     const source = (name: string) => ({ ...batch().envelopes[0]!, eventId: `${name}-event`, messageId: `admin-control-${name}`,
       chatType: 'group' as const, chatId: 'admin-control-room', senderId: 'user', text: `@Agent /${name}`,
       mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] });
+    let cursorBefore = '0';
     for (const [index, name] of ['stop', 'new', 'status'].entries()) {
+      const cursorAfter = String(980 + index);
       await service.handleWorkerEvent('admin-control-worker', { ...batch(), workerInstanceId: 'admin-control-worker',
-        batchId: `admin-control-${name}-batch`, cursorAfter: cursor(String(980 + index)), envelopes: [source(name)] });
+        batchId: `admin-control-${name}-batch`, cursorBefore: cursor(cursorBefore), cursorAfter: cursor(cursorAfter), envelopes: [source(name)] });
+      cursorBefore = cursorAfter;
     }
     expect(effects).toEqual(['stop', 'new', 'status']);
     expect(replies).toEqual([]);
@@ -985,7 +1003,7 @@ database('LineService transaction and worker identity', () => {
 
     await whitelist.revoke('a', 'direct-member', 'user');
     await service.handleWorkerEvent('whitelist-direct-worker', { ...batch(), workerInstanceId: 'whitelist-direct-worker', batchId: 'whitelist-direct-revoked',
-      cursorAfter: cursor('961'), envelopes: [envelope('direct-revoked', 'direct-member')] });
+      cursorBefore: cursor('960'), cursorAfter: cursor('961'), envelopes: [envelope('direct-revoked', 'direct-member')] });
     expect((await pool.query("SELECT count(*) FROM agent_jobs WHERE source_message_id='direct-revoked'")).rows[0]?.count).toBe('0');
   });
 
@@ -993,8 +1011,8 @@ database('LineService transaction and worker identity', () => {
     const targetMid = `racing-member-${Date.now()}`;
     await whitelist.activate('a', targetMid, 'user');
     await settings.setConversationAgent({ accountId: 'a', chatType: 'direct', chatId: 'c', enabled: true, provider: 'codex' });
-    const original = messages.ingestBatchAndRoute.bind(messages);
-    vi.spyOn(messages, 'ingestBatchAndRoute').mockImplementation(async (...args) => {
+    const original = messages.admitLiveBatch.bind(messages);
+    vi.spyOn(messages, 'admitLiveBatch').mockImplementation(async (...args) => {
       await whitelist.revoke('a', targetMid, 'user');
       return original(...args);
     });
@@ -1058,8 +1076,8 @@ database('LineService transaction and worker identity', () => {
       adminChatId: 'c', adminUserId: 'user', adminVersion: Number(adminVersion.rows[0]!.version), targetMid,
       scope: { kind: 'CHAT', chatType: 'group', chatId },
     });
-    const originalIngest = messages.ingestBatchAndRoute.bind(messages);
-    const ingestSpy = vi.spyOn(messages, 'ingestBatchAndRoute').mockImplementation(async (...args) => {
+    const originalIngest = messages.prepareBatchConversations.bind(messages);
+    const ingestSpy = vi.spyOn(messages, 'prepareBatchConversations').mockImplementation(async (...args) => {
       signalIngestStart();
       return originalIngest(...args);
     });
@@ -1143,7 +1161,7 @@ database('LineService transaction and worker identity', () => {
     expect((await pool.query("SELECT direct_friend_grant_id, room_agent_grant_id, room_agent_grant_version FROM agent_jobs WHERE source_message_id='account-member-group-allowed'")).rows[0])
       .toMatchObject({ direct_friend_grant_id: expect.any(String), room_agent_grant_id: expect.any(String), room_agent_grant_version: '2' });
     await service.handleWorkerEvent('whitelist-room-worker', { ...batch(), workerInstanceId: 'whitelist-room-worker', batchId: 'chat-only-no-room-policy',
-      cursorAfter: cursor('9621'), envelopes: [envelope('chat-only-with-account-grant', 'account-member', 'chat-only-room')] });
+      cursorBefore: cursor('962'), cursorAfter: cursor('9621'), envelopes: [envelope('chat-only-with-account-grant', 'account-member', 'chat-only-room')] });
     expect((await pool.query("SELECT direct_friend_grant_id, room_agent_grant_id FROM agent_jobs WHERE source_message_id='chat-only-with-account-grant'")).rows[0])
       .toEqual({ direct_friend_grant_id: chatAndAccountGrant.grantId, room_agent_grant_id: null });
     expect(replies).toEqual([]);
@@ -1154,7 +1172,7 @@ database('LineService transaction and worker identity', () => {
       { async handle() {}, async isEnabled() { return false; }, async respond(_envelope: InboundEnvelope, body: string) { failedWorkspaceReplies.push(body); } } as never, whitelist);
     failedWorkspace.bind({ accountId: 'a', workerInstanceId: 'whitelist-room-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await failedWorkspace.handleWorkerEvent('whitelist-room-worker', { ...batch(), workerInstanceId: 'whitelist-room-worker', batchId: 'chat-only-workspace-failure',
-      cursorAfter: cursor('9622'), envelopes: [envelope('chat-only-workspace-failure-message', 'account-member', 'chat-only-room')] });
+      cursorBefore: cursor('9621'), cursorAfter: cursor('9622'), envelopes: [envelope('chat-only-workspace-failure-message', 'account-member', 'chat-only-room')] });
     expect((await pool.query("SELECT status FROM agent_jobs WHERE source_message_id='chat-only-workspace-failure-message'")).rows)
       .toEqual([{ status: 'failed' }]);
     expect(failedWorkspaceReplies).toEqual([]);
@@ -1162,26 +1180,26 @@ database('LineService transaction and worker identity', () => {
       .toEqual({ direct_friend_grant_id: null, room_agent_grant_id: null });
 
     await service.handleWorkerEvent('whitelist-room-worker', { ...batch(), workerInstanceId: 'whitelist-room-worker', batchId: 'chat-only-direct-denied',
-      cursorAfter: cursor('963'), envelopes: [{ ...batch().envelopes[0]!, eventId: 'chat-only-direct-event', messageId: 'chat-only-direct-denied',
+      cursorBefore: cursor('9622'), cursorAfter: cursor('9623'), envelopes: [{ ...batch().envelopes[0]!, eventId: 'chat-only-direct-event', messageId: 'chat-only-direct-denied',
         chatType: 'direct', chatId: 'c', senderId: 'room-member', text: 'hello' }] });
     expect((await pool.query("SELECT count(*) FROM agent_jobs WHERE source_message_id='chat-only-direct-denied'")).rows[0]?.count).toBe('0');
 
-    const original = messages.ingestBatchAndRoute.bind(messages);
-    vi.spyOn(messages, 'ingestBatchAndRoute').mockImplementation(async (...args) => {
+    const original = messages.admitLiveBatch.bind(messages);
+    vi.spyOn(messages, 'admitLiveBatch').mockImplementation(async (...args) => {
       await rooms.revokeRoom(scope, 'admin-revoke');
       return original(...args);
     });
     try {
       await service.handleWorkerEvent('whitelist-room-worker', { ...batch(), workerInstanceId: 'whitelist-room-worker', batchId: 'whitelist-room-revoked',
-        cursorAfter: cursor('964'), envelopes: [envelope('room-member-revoked-during-admission', 'account-member')] });
+        cursorBefore: cursor('9623'), cursorAfter: cursor('9624'), envelopes: [envelope('room-member-revoked-during-admission', 'account-member')] });
     } finally {
       vi.restoreAllMocks();
     }
     expect((await pool.query("SELECT count(*) FROM agent_jobs WHERE source_message_id='room-member-revoked-during-admission'")).rows[0]?.count).toBe('0');
 
-    const beforeWhitelistRevoke = messages.ingestBatchAndRoute.bind(messages);
+    const beforeWhitelistRevoke = messages.admitLiveBatch.bind(messages);
     let requestedFriendRaceDecision: unknown;
-    vi.spyOn(messages, 'ingestBatchAndRoute').mockImplementation(async (...args) => {
+    vi.spyOn(messages, 'admitLiveBatch').mockImplementation(async (...args) => {
       await whitelist.revoke('a', 'room-member', 'admin-revoke',
         { kind: 'CHAT', chatType: 'group', chatId: 'friend-race-room' });
       requestedFriendRaceDecision = args[1][0];
@@ -1189,7 +1207,7 @@ database('LineService transaction and worker identity', () => {
     });
     try {
       await service.handleWorkerEvent('whitelist-room-worker', { ...batch(), workerInstanceId: 'whitelist-room-worker', batchId: 'chat-grant-revoked',
-        cursorAfter: cursor('965'), envelopes: [envelope('room-member-friend-revoked-during-admission', 'room-member', 'friend-race-room')] });
+        cursorBefore: cursor('9624'), cursorAfter: cursor('9625'), envelopes: [envelope('room-member-friend-revoked-during-admission', 'room-member', 'friend-race-room')] });
     } finally {
       vi.restoreAllMocks();
     }
@@ -1239,7 +1257,7 @@ database('LineService transaction and worker identity', () => {
       ownMid: 'agent-mid', displayName: null });
     await service.handleWorkerEvent(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
     await service.handleWorkerEvent(binding.workerInstanceId, { ...batch(), ...binding, batchId: 'room-ready',
-      cursorAfter: cursor('955'), envelopes: [memberMention('room-ready-message')] });
+      cursorBefore: cursor('954'), cursorAfter: cursor('955'), envelopes: [memberMention('room-ready-message')] });
 
     expect(kicked).toEqual([]);
     expect((await pool.query("SELECT count(*) FROM agent_jobs WHERE source_message_id IN ('room-not-ready-message','room-ready-message')")).rows[0].count).toBe('0');
@@ -1349,11 +1367,11 @@ database('LineService transaction and worker identity', () => {
     const service = new LineService(accounts, messages, settings, { async send(command) { commands.push(command); } },
       { kick() {}, async stopChat() {}, async resetChat() {} });
     service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
-    const before = await pool.query("SELECT cursor FROM sync_cursors WHERE account_id = 'a' AND source = 'live'");
+    const before = await pool.query('SELECT cursor FROM external_source_checkpoints WHERE source_id=$1', [loginSourceId]);
     await service.handleWorkerEvent('stale-instance', { ...batch(), batchId: 'b2', cursorAfter: cursor('2') });
     expect(commands).toHaveLength(0);
-    const row = await pool.query("SELECT cursor FROM sync_cursors WHERE account_id = 'a' AND source = 'live'");
-    expect(row.rows[0].cursor).toBe(before.rows[0].cursor);
+    const row = await pool.query('SELECT cursor FROM external_source_checkpoints WHERE source_id=$1', [loginSourceId]);
+    expect(row.rows[0].cursor).toEqual(before.rows[0].cursor);
   });
   it('keeps the newest same-epoch worker binding when an older registration is delayed', async () => {
     let releaseOld!: () => void;
@@ -1419,9 +1437,88 @@ database('LineService transaction and worker identity', () => {
       { ...batch().envelopes[0]!, eventId: 'reset-failed-new-event', messageId: 'reset-failed-new-message', text: '/new' },
     ] };
     await expect(service.handleWorkerEvent('w1', input)).rejects.toThrow('reset interrupted');
+    expect(acknowledgements).toBe(1);
+    expect((await pool.query("SELECT effect_applied_at FROM message_routes WHERE account_id='a' AND message_id='reset-failed-new-message'")).rows[0]?.effect_applied_at).toBeNull();
     await service.handleWorkerEvent('w1', input);
     expect(resets).toBe(2);
-    expect(acknowledgements).toBe(1);
+    expect(acknowledgements).toBe(2);
+    expect((await pool.query("SELECT effect_applied_at FROM message_routes WHERE account_id='a' AND message_id='reset-failed-new-message'")).rows[0]?.effect_applied_at).not.toBeNull();
+  });
+  it('recovers an unmatched live prompt after restart without worker replay and admits it once', async () => {
+    const commands: LineWorkerCommand[] = [];
+    const first = new LineService(accounts, messages, settings, { async send(command) { commands.push(command); } },
+      { kick() {}, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined, admins);
+    const failOnce = vi.spyOn(messages, 'admitLiveBatch').mockRejectedValueOnce(new Error('forced admission failure'));
+    await first.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    const input = { ...batch(), batchId: 'recover-after-ack', cursorAfter: cursor('100'), envelopes: [
+      { ...batch().envelopes[0]!, eventId: 'recover-after-ack-event', messageId: 'recover-after-ack-message', text: 'do this' },
+    ] };
+    await first.handleWorkerEvent('w1', input);
+    failOnce.mockRestore();
+    expect(commands).toContainEqual(expect.objectContaining({ type: 'ackBatch', batchId: input.batchId }));
+    expect((await pool.query("SELECT count(*)::int count FROM messages WHERE account_id='a' AND message_id='recover-after-ack-message'"))
+      .rows[0]?.count).toBe(1);
+    expect((await pool.query("SELECT count(*)::int count FROM agent_jobs WHERE account_id='a' AND source_message_id='recover-after-ack-message'"))
+      .rows[0]?.count).toBe(0);
+    expect(await messages.listUnroutedLiveSourceMessages({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1 }))
+      .toMatchObject([{ envelope: { messageId: 'recover-after-ack-message', text: 'do this' },
+        receiptMode: 'ACTIVE_CONTROL', receiptControlEpoch: 1, sensitive: false }]);
+
+    const kicked: string[] = [];
+    const restarted = new LineService(accounts, messages, settings, { async send() {} },
+      { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined, admins);
+    const recoveredAdmit = vi.spyOn(messages, 'admitLiveBatch');
+    await restarted.bind({ accountId: 'a', workerInstanceId: 'restart-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    expect(await messages.listUnroutedLiveSourceMessages({ accountId: 'a', workerInstanceId: 'restart-worker', controlEpoch: 1 }))
+      .toMatchObject([{ envelope: { messageId: 'recover-after-ack-message', ingestion: { source: 'live' } } }]);
+    await restarted.handleWorkerEvent('restart-worker', { type: 'status', accountId: 'a', workerInstanceId: 'restart-worker',
+      controlEpoch: 1, state: 'ready', message: null });
+    expect(kicked).toEqual(['c']);
+    expect(recoveredAdmit).toHaveBeenCalled();
+    expect((await pool.query("SELECT count(*)::int count FROM agent_jobs WHERE account_id='a' AND source_message_id='recover-after-ack-message'"))
+      .rows[0]?.count).toBe(1);
+    expect((await pool.query("SELECT action FROM message_routes WHERE account_id='a' AND message_id='recover-after-ack-message'"))
+      .rows[0]?.action).toBe('prompt');
+  });
+  it.each([
+    ['monitor-only receipt', 'MONITOR_ONLY', 1],
+    ['old control epoch receipt', 'ACTIVE_CONTROL', 0],
+  ] as const)('does not replay a group mention automation for %s', async (_label, receiptMode, receiptEpoch) => {
+    const chatId = `recovery-mention-${receiptMode}-${receiptEpoch}`;
+    const grant = await whitelist.activate('a', 'recovery-member', 'user', { kind: 'CHAT', chatType: 'group', chatId });
+    await messages.upsertConversationCatalog('a', [{ chatType: 'group', chatId, title: chatId, members: [] }]);
+    await settings.setConversationAgent({ accountId: 'a', chatType: 'group', chatId, enabled: true, provider: 'codex' });
+    const envelope = { ...batch().envelopes[0]!, eventId: `event-${chatId}`, messageId: `message-${chatId}`,
+      chatType: 'group' as const, chatId, senderId: 'recovery-member', text: '@Agent do this', mentionIds: ['agent-mid'],
+      mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] };
+    const makeService = (commands: LineWorkerCommand[], responses: string[]) => new LineService(
+      accounts, messages, settings, { async send(command) { commands.push(command); } },
+      { kick() {}, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined, admins,
+      { async handle() {}, async getActiveAuthorization() { return { grantId: grant.grantId, version: grant.version }; },
+        async respond(_envelope, body) { responses.push(body); } }, whitelist);
+    const firstCommands: LineWorkerCommand[] = [];
+    const first = makeService(firstCommands, []);
+    const failOnce = vi.spyOn(messages, 'admitLiveBatch').mockRejectedValueOnce(new Error('forced admission failure'));
+    await first.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await first.handleWorkerEvent('w1', { ...batch(), batchId: `batch-${chatId}`, envelopes: [envelope] });
+    failOnce.mockRestore();
+    await pool.query(`UPDATE external_source_observations SET normalized_payload=jsonb_set(jsonb_set(normalized_payload,
+      '{livePayload,recovery,receiptMode}', to_jsonb($2::text), true),
+      '{livePayload,recovery,controlEpoch}',to_jsonb($3::int),true)
+      WHERE source_id=$1 AND observation_id=$4`, [loginSourceId, receiptMode, receiptEpoch, envelope.messageId]);
+
+    const commands: LineWorkerCommand[] = [];
+    const responses: string[] = [];
+    const restarted = makeService(commands, responses);
+    await restarted.bind({ accountId: 'a', workerInstanceId: 'recovery-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await restarted.handleWorkerEvent('recovery-worker', { type: 'status', accountId: 'a', workerInstanceId: 'recovery-worker',
+      controlEpoch: 1, state: 'ready', message: null });
+    expect(responses).toEqual([]);
+    expect(commands.filter((command) => command.type === 'sendText')).toEqual([]);
+    expect((await pool.query('SELECT count(*)::int count FROM agent_jobs WHERE account_id=$1 AND source_message_id=$2',
+      ['a', envelope.messageId])).rows[0]?.count).toBe(0);
+    expect((await pool.query('SELECT action FROM message_routes WHERE account_id=$1 AND message_id=$2',
+      ['a', envelope.messageId])).rows[0]?.action).toBe('ignore');
   });
   it('correlates QR login rotation and restores secrets to a fresh worker', async () => {
     const folder = await mkdtemp(join(tmpdir(), 'line-rotation-'));
@@ -1497,18 +1594,23 @@ database('LineService transaction and worker identity', () => {
     ['en', null, 'Agent idle'], ['zh-TW', null, 'Agent 閒置'], ['ja', null, 'Agent 待機中'], ['ko', null, 'Agent 대기 중'],
   ] as const)('answers /status in %s using current chat state without enqueuing an Agent job', async (locale, jobId, expected) => {
     const commands: LineWorkerCommand[] = [];
+    const messageId = `status-message-${locale}-${jobId ?? 'idle'}`;
     const service = new LineService(accounts, messages, settings, { async send(command) { commands.push(command); } },
       { kick() {}, async stopChat() {}, async resetChat() {}, async getChatStatus() { return { runningJobId: jobId }; } },
       undefined, undefined, undefined, admins, undefined, undefined, locale);
     service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
-    await service.handleWorkerEvent('w1', { ...batch(), batchId: 'status-batch', cursorAfter: cursor('3'),
-      envelopes: [{ ...batch().envelopes[0]!, eventId: 'status-event', messageId: 'status-message', text: '/status' }] });
-    expect(commands).toMatchObject([{ type: 'sendText', chatId: 'c', text: expected, replyToMessageId: 'status-message' }, { type: 'ackBatch' }]);
-    if (jobId) expect(commands[0]?.type === 'sendText' ? commands[0].text : '').toContain(jobId);
+    await service.handleWorkerEvent('w1', { ...batch(), batchId: `status-batch-${locale}-${jobId ?? 'idle'}`, cursorAfter: cursor('3'),
+      envelopes: [{ ...batch().envelopes[0]!, eventId: `${messageId}-event`, messageId, text: '/status' }] });
+    expect(commands).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'sendText', chatId: 'c', text: expected, replyToMessageId: messageId }),
+      expect.objectContaining({ type: 'ackBatch' }),
+    ]));
+    if (jobId) expect(commands.find((command) => command.type === 'sendText')?.type === 'sendText'
+      ? commands.find((command) => command.type === 'sendText')?.text : '').toContain(jobId);
   });
 
   describe('/權限 command', () => {
-    const permissionService = (workerInstanceId: string, now: () => number = Date.now) => {
+    const permissionService = (workerInstanceId: string, now: () => number = Date.now, startRevision = '0') => {
       const commands: LineWorkerCommand[] = []; const kicked: string[] = [];
       /** Result status the mocked shared LINE reply transport reports for each sendText. */
       const reply = { status: 'sent' as 'sent' | 'failed' | 'unknown' };
@@ -1524,21 +1626,30 @@ database('LineService transaction and worker identity', () => {
             messageId: reply.status === 'sent' ? `sent-${command.requestId}` : null, error: reply.status === 'sent' ? null : 'not sent' };
         },
       };
-      const permissionCommands = new PermissionCommandService(new AgentPermissionRepository(pool), transport, { now });
+      const permissionCommands = new PermissionCommandService(new AgentPermissionRepository(pool), transport, { now, locale: 'zh-TW' });
       service = new BaseLineService(accounts, messages, settings, { async send(command) { commands.push(command); } },
         { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {} },
         undefined, undefined, undefined, admins,
         { async inspect() { return { status: 'available', version: 0, path: 'C:\\trusted' }; } }, undefined, whitelist,
-        undefined, undefined, permissionCommands);
+        undefined, undefined, permissionCommands, undefined, 'zh-TW');
       const binding = { accountId: 'a', workerInstanceId, controlEpoch: 1, mode: 'ACTIVE_CONTROL' as const };
-      const deliver = (name: string, revision: string, overrides: Partial<InboundEnvelope> = {}) => service.handleWorkerEvent(workerInstanceId,
-        { ...batch(), workerInstanceId, batchId: `${name}-batch`, cursorAfter: cursor(revision),
-          envelopes: [{ ...batch().envelopes[0]!, eventId: `${name}-event`, messageId: name, text: '/權限', ...overrides }] });
+      let priorRevision = startRevision;
+      const batchCursors = new Map<string, { before: string; after: string }>();
+      const deliverBatch = async (batchId: string, revision: string, envelopes: InboundEnvelope[]) => {
+        const recorded = batchCursors.get(batchId);
+        const before = recorded?.before ?? priorRevision;
+        const after = recorded?.after ?? revision;
+        const result = await service.handleWorkerEvent(workerInstanceId, { ...batch(), workerInstanceId, batchId,
+          cursorBefore: cursor(before), cursorAfter: cursor(after), envelopes });
+        if (!recorded) { batchCursors.set(batchId, { before, after }); priorRevision = after; }
+        return result;
+      };
+      const deliver = (name: string, revision: string, overrides: Partial<InboundEnvelope> = {}) => deliverBatch(`${name}-batch`, revision,
+        [{ ...batch().envelopes[0]!, eventId: `${name}-event`, messageId: name, text: '/權限', ...overrides }]);
       const sent = () => commands.filter((command) => command.type === 'sendText');
       /** Delivers one batch; repeating a messageId in `items` or a whole call replays it as a duplicate. */
-      const deliverMany = (batchId: string, revision: string, items: Array<{ id: string; text: string }>) => service.handleWorkerEvent(
-        workerInstanceId, { ...batch(), workerInstanceId, batchId, cursorAfter: cursor(revision),
-          envelopes: items.map(({ id, text }) => ({ ...batch().envelopes[0]!, eventId: `${id}-event`, messageId: id, text })) });
+      const deliverMany = (batchId: string, revision: string, items: Array<{ id: string; text: string }>) => deliverBatch(batchId, revision,
+        items.map(({ id, text }) => ({ ...batch().envelopes[0]!, eventId: `${id}-event`, messageId: id, text })));
       const texts = () => sent().map((command) => command.type === 'sendText' ? command.text : '');
       return { service, binding, commands, kicked, deliver, deliverMany, sent, texts, reply, permissionCommands };
     };
@@ -1560,7 +1671,7 @@ database('LineService transaction and worker identity', () => {
     };
     const listOf = (current: string) => expect.stringContaining(`目前 Agent 執行權限：${current}\n`);
     const routeOf = async (messageId: string) => (await pool.query(
-      "SELECT r.action, (SELECT count(*)::int FROM agent_jobs j WHERE j.source_message_id=r.message_id) jobs FROM message_routes r WHERE r.account_id='a' AND r.message_id=$1",
+      "SELECT r.action, (SELECT count(*)::int FROM agent_jobs j WHERE j.account_id=r.account_id AND j.source_message_id=r.message_id) jobs FROM message_routes r WHERE r.account_id='a' AND r.message_id=$1",
       [messageId])).rows[0];
 
     it('answers the primary admin direct /權限 once without routing an Agent job', async () => {
@@ -1683,7 +1794,7 @@ database('LineService transaction and worker identity', () => {
 
     it('applies exactly one effect when a failed ingestion is retried', async () => {
       const policy = await withPolicy('trust');
-      const ingest = vi.spyOn(messages, 'ingestBatchAndRoute');
+      const ingest = vi.spyOn(messages, 'ingestBatchSource');
       try {
         const { service, binding, kicked, deliverMany, texts } = permissionService('permission-ingest-retry-worker');
         await service.bind(binding);
@@ -1749,7 +1860,8 @@ database('LineService transaction and worker identity', () => {
         try {
           const prefix = `permission-unsent-${status}`;
           const revision = (base: number) => String(1730 + index * 10 + base);
-          const { service, binding, commands, kicked, deliverMany, texts, reply, permissionCommands } = permissionService(`${prefix}-worker`);
+          const { service, binding, commands, kicked, deliverMany, texts, reply, permissionCommands } =
+            permissionService(`${prefix}-worker`, Date.now, index === 0 ? '0' : '1734');
           await service.bind(binding);
           const acks = () => commands.filter((command) => command.type === 'ackBatch').length;
 

@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import type { ConversationKey } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import type { SystemErrorCode } from '../../desktop-protocol.js';
+import { diagnosticLabels, diagnosticRecovery } from '../diagnostic-copy.js';
 
 type Tab = 'activity' | 'errors';
 const errorExplanationText: Record<SystemErrorCode, (text: ReturnType<typeof useDesktopText>) => string> = {
@@ -23,6 +24,12 @@ const errorExplanationText: Record<SystemErrorCode, (text: ReturnType<typeof use
   ENROLLMENT_REPLY_UNKNOWN: (text) => text('unableToConfirmFriendAuthorizationNotification'), INVALID_COMMAND: (text) => text('lineWorkerCommandFailed'),
   QUEUE_FULL: (text) => text('lineWorkerQueueFull'), CATALOG_REFRESH_FAILED: (text) => text('unableToUpdateLineContactsGroups'),
   WORKER_OPERATION_FAILED: (text) => text('lineWorkerActionFailed'), UNKNOWN_ERROR: (text) => text('unknownError'),
+  HISTORY_READ_FAILED: (text) => text('historyReadFailed'), CHAT_RESOURCE_READ_FAILED: (text) => text('chatResourceReadFailed'),
+  PROFILE_REFRESH_FAILED: (text) => text('profileRefreshFailed'), MESSAGE_SEND_FAILED: (text) => text('messageSendFailed'),
+  MESSAGE_UNSEND_FAILED: (text) => text('messageUnsendFailed'), MESSAGE_REACTION_FAILED: (text) => text('messageReactionFailed'),
+  FRIEND_RELATION_CHECK_FAILED: (text) => text('friendRelationCheckFailed'), FRIEND_ADD_FAILED: (text) => text('friendAddFailed'),
+  ATTACHMENT_DOWNLOAD_OPERATION_FAILED: (text) => text('attachmentDownloadOperationFailed'),
+  CREDENTIAL_RESTORE_FAILED: (text) => text('credentialRestoreFailed'), LINE_SYNC_FAILED: (text) => text('lineSyncFailed'),
 };
 
 export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOpen: (key: ConversationKey) => void; headingRef: React.RefObject<HTMLHeadingElement | null> }) {
@@ -94,7 +101,15 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
       {errors?.partial && <p className="monitor-note">{desktopText('someRecordsAreTemporarilyUnavailable')}</p>}
       <div className="work-record-list"><div className="work-record-column-header work-record-grid" aria-hidden="true"><span>{desktopText('time')}</span><span>{desktopText('records')}</span><span>{desktopText('action')}</span><span>{desktopText('status')}</span></div>{errors?.errors.map((row, index) => <article className="work-record-row work-record-grid" key={`${row.createdAt}:${row.code}:${index}`}>
         <div className="work-record-row-meta"><time>{localTime(row.createdAt)}</time></div>
-        <div className="work-record-row-content"><h2>{systemLabel(row.action)}</h2><p>{errorExplanationText[row.code](desktopText)}</p><code>{row.code}</code></div>
+        <div className="work-record-row-content"><h2>{systemLabel(row.action)}</h2><p>{errorExplanationText[row.code](desktopText)}</p><code>{row.code}</code>
+          {row.diagnostic ? <dl>
+            <dt>{diagnosticLabels[locale].operation}</dt><dd><code>{row.diagnostic.operation}</code></dd>
+            <dt>{diagnosticLabels[locale].stage}</dt><dd><code>{row.diagnostic.stage}</code></dd>
+            <dt>{diagnosticLabels[locale].reason}</dt><dd><code>{row.diagnostic.reason ?? row.diagnostic.category}</code>{row.diagnostic.statusCode !== undefined ? ` (${row.diagnostic.statusCode})` : ''}</dd>
+            <dt>{diagnosticLabels[locale].recovery}</dt><dd>{diagnosticRecovery(locale, row.diagnostic)}</dd>
+            {row.correlationId && <><dt>{diagnosticLabels[locale].reference}</dt><dd><code>{row.correlationId}</code></dd></>}
+          </dl> : <p>{diagnosticLabels[locale].legacy}</p>}
+        </div>
         <div className="work-record-row-action"></div><span className="badge">{desktopText('error')}</span>
       </article>)}</div>
     </section>}

@@ -11,6 +11,7 @@
 
 .chat-title-wrap {
   display: flex;
+  flex: 1 1 auto;
   min-width: 0;
   align-items: center;
   gap: 0.65rem;
@@ -27,8 +28,8 @@
 
 /* ------------------------------------------------------------------
    LINE desktop chat layout
-   row (grid) -> avatar column | bubble | time | actions
-   Inbound columns:  avatar, bubble, time, actions.  Outbound: actions, time, bubble.
+   row (grid) -> avatar column | bubble | time and actions
+   Inbound columns:  avatar, bubble, time and actions.  Outbound: time and actions, bubble.
    --bubble-row is 2 when a sender name sits above the first bubble of a run.
    ------------------------------------------------------------------ */
 .timeline {
@@ -68,7 +69,6 @@
   grid-template-columns: 36px fit-content(var(--bubble-max)) auto minmax(0, 1fr);
   justify-content: start;
 }
-.message-row.inbound.direct { grid-template-columns: fit-content(var(--bubble-max)) auto minmax(0, 1fr); }
 .message-row.outbound {
   grid-template-columns: minmax(0, 1fr) auto fit-content(var(--bubble-max));
   justify-content: end;
@@ -103,7 +103,6 @@
 /* Meta (time) sits outside the bubble, bottom aligned, never wrapping. */
 .message-time {
   align-self: end;
-  padding-bottom: 1px;
   color: var(--secondary);
   font-size: 11px;
   line-height: 1.2;
@@ -112,14 +111,48 @@
 .message-row.inbound .message-time { grid-column: 3; grid-row: var(--bubble-row); }
 .message-row.outbound .message-time { grid-column: 2; grid-row: 1; }
 
+.message-row .message-trailing-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  align-self: end;
+  width: max-content;
+  min-width: max-content;
+  grid-row: var(--bubble-row);
+}
+.message-row.inbound .message-trailing-meta { grid-column: 3; }
+.message-row.outbound .message-trailing-meta { grid-column: 2; grid-row: 1; }
+
+/* The trailing metadata column owns one fixed pitch for every visible row. */
+.message-row .message-trailing-meta :is(.reply-action, .message-read, .message-read-root, .message-time, .message-recalled-label) {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  height: 16px;
+  min-height: 16px;
+  margin: 0;
+  padding: 0;
+  font-size: 11px;
+  line-height: 16px;
+}
+.message-row .message-trailing-meta .reply-action,
+.message-row .message-trailing-meta .message-read-button { border: 0; }
+.message-row .message-trailing-meta .message-time { white-space: nowrap; }
+.message-row .message-actions .reply-action::before { content: ""; position: absolute; inset: 0 -4px; }
+
 /* Message metadata stacks markers directly above the time. */
-.message-row.inbound .message-meta { grid-column: 3; grid-row: var(--bubble-row); align-self: end; display: flex; flex-direction: column; align-items: flex-start; }
-.message-row.inbound.direct .message-meta { grid-column: 2; }
-.message-row.outbound .message-meta { grid-column: 2; grid-row: 1; align-self: end; display: flex; flex-direction: column; align-items: flex-end; }
+.message-row .message-actions,
+.message-row .message-meta { display: flex; flex-direction: column; align-items: flex-start; width: 100%; gap: 0; }
+.message-row.inbound .message-meta { grid-column: 3; grid-row: var(--bubble-row); align-self: end; }
+.message-row.inbound .message-meta .message-time { align-self: flex-start; }
+.message-row.outbound .message-actions,
+.message-row.outbound .message-meta { align-items: flex-end; }
+.message-row.outbound .message-meta { grid-column: 2; grid-row: 1; align-self: end; }
 .message-meta .message-time { grid-column: auto; grid-row: auto; }
-.message-read-root { display: block; }
-.message-read { color: var(--secondary); font-size: 11px; line-height: 1.2; white-space: nowrap; }
-.message-read-button { min-height: 0; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.message-read-root { display: flex; font-size: 11px; line-height: 16px; }
+.message-read { color: var(--secondary); font-size: 11px; line-height: 16px; white-space: nowrap; }
+.message-read-button { min-height: 16px; padding: 0; border: 0; background: transparent; cursor: pointer; }
 .message-read-button:hover { text-decoration: underline; }
 .message-read-button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 3px; }
 .read-readers-panel { position: fixed; z-index: 60; display: flex; flex-direction: column; box-sizing: border-box; padding: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 20px #17232633; overflow: hidden; }
@@ -154,9 +187,6 @@
   background: var(--bubble-in-bg);
   color: var(--bubble-in-text);
 }
-.message-row.inbound.direct .message { grid-column: 1; }
-.message-row.inbound.direct .message-time { grid-column: 2; }
-.message-row.inbound.direct .message-actions { grid-column: 3; }
 .message-row.inbound.direct .agent-status-marker { grid-column: 1 / -1; }
 .message-row.outbound .message {
   grid-column: 3;
@@ -222,17 +252,10 @@
 .reply-reference-preview { display: -webkit-box; overflow: hidden; color: var(--bubble-quote-text); line-height: 1.35; text-overflow: ellipsis; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .reply-reference-placeholder { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* Row actions (reply / open) appear on hover or keyboard focus. */
-.message-row .message-actions {
-  grid-row: var(--bubble-row);
-  align-self: end;
-  opacity: 0;
-  transition: opacity 0.15s ease-out;
-}
-.message-row:hover .message-actions,
-.message-row:focus-within .message-actions { opacity: 1; }
-.message-row.inbound .message-actions { grid-column: 4; align-items: flex-start; }
-.message-row.outbound .message-actions { grid-column: 1; grid-row: 1; justify-self: end; order: 0; align-items: flex-end; }
+/* Row actions (reply / open) stay visible above their message time. */
+.message-row .message-actions { display: flex; flex-direction: column; }
+.message-row.inbound .message-actions .reply-action { align-self: flex-start; }
+.message-row.outbound .message-actions .reply-action { align-self: flex-end; }
 
 .message-row .agent-status-marker {
   margin: 2px 0 0;
@@ -250,7 +273,7 @@
 .message-reaction { display: inline-flex; align-items: center; gap: 3px; min-height: 22px; padding: 2px 7px; border: 1px solid var(--border);
   border-radius: 11px; background: var(--surface); color: var(--secondary); font-size: 11px; line-height: 1; }
 .message-reaction-icon { display: block; flex: none; width: 16px; height: 16px; max-width: none; max-height: none; object-fit: contain; }
-.message-reaction span.message-reaction-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; font-size: 13px; line-height: 1; white-space: nowrap; }
+.message-reaction span.message-reaction-icon { width: auto; height: auto; font-size: 11px; line-height: 1; white-space: nowrap; }
 .message-reaction-count,.message-reaction-fallback { font-size: 11px; line-height: 1; white-space: nowrap; }
 
 /* System events: centered small pill without avatar or time. */

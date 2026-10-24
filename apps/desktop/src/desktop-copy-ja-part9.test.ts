@@ -3,6 +3,9 @@ import { ENGLISH_DESKTOP_COPY } from './desktop-copy.js';
 import { JAPANESE_DESKTOP_COPY_PART9 } from './desktop-copy-ja-part9.js';
 
 const expectedKeys = [
+  'agentStatusRotationIntervalSeconds',
+  'externalMonitorAuthorityChanged', 'externalMonitorCheckpointChanged', 'externalMonitorSourceChanged',
+  'externalMonitorReaderStartupFailed', 'externalMonitorReaderFailed', 'externalMonitorDatabaseFailed', 'externalMonitorFailureUnknown',
   'permissionCurrentChat',
   'permissionCurrentChatDescription',
   'permissionAllChats',
@@ -13,11 +16,16 @@ const expectedKeys = [
   'permissionFolderWriteDescription',
   'permissionLocalTools',
   'permissionLocalToolsDescription',
+  'unsendMessage', 'unsendConfirm', 'unsendTimeWindow', 'unsendOneHour', 'unsendSevenDays', 'unsendWindowSaved', 'unsendFailed',
+  'historyReadFailed', 'chatResourceReadFailed', 'profileRefreshFailed', 'messageSendFailed', 'messageUnsendFailed',
+  'messageReactionFailed', 'friendRelationCheckFailed', 'friendAddFailed', 'attachmentDownloadOperationFailed',
+  'credentialRestoreFailed', 'lineSyncFailed',
+  'mediaWasNotSentTryAgain', 'mediaSendingRequiresDirectOrGroupChat',
 ] as const;
 const slots = (text: string): string[] => [...text.matchAll(/\{arg\d+\}/g)].map(([slot]) => slot).sort();
 
 describe('Japanese desktop copy part 9', () => {
-  it('contains exactly the ten newly added permission keys', () => {
+  it('contains the rotation interval label, permission keys, and unsend keys', () => {
     expect(Object.keys(JAPANESE_DESKTOP_COPY_PART9).sort()).toEqual([...expectedKeys].sort());
   });
 

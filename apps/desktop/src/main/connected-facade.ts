@@ -26,6 +26,11 @@ import { AgentAttachmentError } from './services/agent-attachments.js';
 import { loadLinejsMcpSkill } from './services/mcp-skill.js';
 import { AgentJobEnvironmentService } from './services/agent-job-environment.js';
 import { ChatFolderError, ChatFolderService } from './services/chat-folders.js';
+import { ChatResourceArchiveService, isNativeNotePostNotification, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
+import { ChatResourceAccountAdmission } from './services/chat-resource-admission.js';
+import { ChatResourceArchive, createChatResourceStoreAdapter } from './services/chat-resource-archive.js';
+import { createChatResourceDiagnostics, parseChatResourceDiagnostic } from './services/chat-resource-diagnostics.js';
+import { createMcpChatResourceArchiveReader } from './services/mcp-chat-resource-reader.js';
 import { WorkspaceAuthority, InvalidWorkspaceError } from './services/workspace-authority.js';
 import { AttachmentService } from './services/attachment-service.js';
 import { DeliveryService } from './services/delivery-service.js';
@@ -41,7 +46,6 @@ import { AgentApprovalBroker, AgentApprovalBrokerError } from './services/agent-
 import { resolveWritePathEvidence } from './services/write-path-evidence.js';
 import { McpHttpServer } from './services/mcp-http-server.js';
 import { LocalMcpConfigError, McpLocalClients, type LocalClientKind } from './services/mcp-local-clients.js';
-import type { OfficialLineSessionGuard, OfficialSourceVerification } from './services/official-line-session-guard.js';
 import type { SecretStore } from './services/secret-store.js';
 import { AttachmentPreviewService, createRepositoryPreviewAuthority, type PreviewPresenter } from './attachment-preview.js';
 import { AttachmentOpenService } from './attachment-open.js';
@@ -51,13 +55,19 @@ import { createCoalescedSnapshotPublisher } from './domain-event-publisher.js';
 import type { OfficialBuildTrustService } from './services/official-build-trust.js';
 import {probeInitialProviderAuth} from './provider-auth.js';
 import { AUDIT_ERROR_CODES, type AuditErrorCode, type OperationalAudit } from './services/operational-audit.js';
+import { diagnosticFailure, parseSafeDiagnostic } from '@line-agent/contracts';
 import type { AuditEventsReadResult } from './services/operational-audit-runtime.js';
 import { systemActivityResult, systemErrorsResult } from './services/system-records.js';
 import { createSingleFlightRead } from './services/system-read-flight.js';
 import { runCleanupInOrder, StartupCleanup } from './startup-cleanup.js';
 import type { DirectMonitorPage, ImportCatalogPage, ImportCursor, ImportDirectoryPage, ImportProgress, ImportRow, NativeMonitorAccess } from './services/js-external-reader/protocol.js';
 import { createFirstImportProgressLog } from './services/first-import-progress-log.js';
+import { classifyExternalMonitorFailure, clearExternalMonitorDiagnostic, ExternalMonitorDiagnosticFailure, externalMonitorDatabaseFailure, externalMonitorFailureDetail, recordExternalMonitorDiagnostic as persistExternalMonitorDiagnostic, type ExternalMonitorFailurePhase } from './services/external-monitor-diagnostics.js';
 import { linePrompt } from './services/line-prompts.js';
+import { createOwnAvatarRefreshScheduler, runOwnAvatarRefreshes } from './services/own-avatar-refresh-scheduler.js';
+import { cleanupStaleManualMedia, ManualMediaError, stageManualMedia } from './services/manual-media-staging.js';
+import { createManualMediaAdmission } from './services/manual-media-admission.js';
+import { ManualSendNotStartedError } from './services/manual-send-errors.js';
 
 const REPLY_SENDER_NAME_SQL = senderNameSql({ m: 'qm', la: 'qla', c: 'qc', cm: 'qcm',
   senderContact: 'quoted_sender_contact', peerContact: 'quoted_peer_contact' });
@@ -69,7 +79,7 @@ type SendResult = Extract<LineWorkerEvent, { type: 'sendResult' }>;
 const MACHINE_CODE_PATTERN = /^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)*$/;
 /** Caller-supplied part of a media send; the gateway adds owner fields, ids, permit and timeout. */
 export type SendMediaRequest = Pick<Extract<LineWorkerCommand, { type: 'sendMedia' }>,
-  'accountId' | 'workerInstanceId' | 'controlEpoch' | 'chatType' | 'chatId' | 'requestId' | 'kind' | 'filePath' | 'fileName' | 'sizeBytes' | 'sha256'>;
+  'accountId' | 'workerInstanceId' | 'controlEpoch' | 'chatType' | 'chatId' | 'requestId' | 'kind' | 'filePath' | 'fileName' | 'sizeBytes' | 'sha256' | 'manualSend'>;
 
 export interface IntegratedWorkerGateway {
   onEvent(listener: (workerInstanceId: string, event: LineWorkerEvent) => Promise<void>): (() => void) | void;
@@ -82,14 +92,17 @@ export interface IntegratedWorkerGateway {
   start(accountId: string, binding: Bound): Promise<Bound>;
   binding(accountId: string): Promise<Bound | null>;
   send(command: LineWorkerCommand, signal?: AbortSignal): Promise<SendResult>;
+  unsend?(command: Extract<LineWorkerCommand, { type: 'unsendMessage' }>, signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'unsendResult' }>>;
   sendManual(command: Extract<LineWorkerCommand, { type: 'sendText' }>, signal?: AbortSignal): Promise<SendResult>;
   /** Internal only (agent send tools); one media send at a time gateway-wide. */
   sendMedia?(command: SendMediaRequest, signal?: AbortSignal): Promise<SendResult>;
   isCurrentActiveControlBinding(binding: WorkerBinding): boolean;
   isCurrentManualSendBinding(binding: WorkerBinding): boolean;
   checkFriendRelation(command: Extract<LineWorkerCommand, { type: 'checkFriendRelation' }>): Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>;
+  refreshOwnProfile?(command: Extract<LineWorkerCommand, { type: 'refreshOwnProfile' }>): Promise<Extract<LineWorkerEvent, { type: 'ownProfileResult' }>>;
   addFriendByMid(command: Extract<LineWorkerCommand, { type: 'addFriendByMid' }>): Promise<Extract<LineWorkerEvent, { type: 'addFriendResult' }>>;
   download(command: Extract<LineWorkerCommand, { type: 'downloadAttachment' }>, signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'attachmentResult' }>>;
+  readChatResource?(command: ChatResourceRequest, signal?: AbortSignal): Promise<ChatResourceReadResult>;
   adoptDownloadAuth?(command: Extract<LineWorkerCommand, { type: 'adoptDownloadAuth' }>, signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'downloadAuthResult' }>>;
   isDownloadReady?(binding: WorkerBinding): boolean;
   waitModeAck(accountId: string, mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY', timeoutMs: number): Promise<boolean>;
@@ -122,6 +135,9 @@ export interface ConnectedFacadeOptions {
   attachmentRoot: string;
   previewCacheRoot?: string;
   mediaCacheRoot?: string;
+  /** Handle-anchored Main archive store; absent adapters fail closed. */
+  chatResourceStore?: ChatResourceStore;
+  chatResourceDiagnosticsDirectory?: string;
   openAttachmentPath?: (file: string) => Promise<string>;
   /** Opens a chat folder in Explorer (shell.openPath); falls back to openAttachmentPath. Resolves to '' on success. */
   openFolderPath?: (folder: string) => Promise<string>;
@@ -146,10 +162,9 @@ export interface ConnectedFacadeOptions {
   skillsDirectory?: string;
   officialSnapshotImporter?: OfficialSnapshotImporter;
   externalImportProgressPath?: string;
+  externalMonitorDiagnosticPath?: string;
   /** Persisted official LINE build trust; drives the Primary Admin build status and signer approval. */
   officialBuildTrust?: OfficialBuildTrustService;
-  /** Guards system logins against signing out the official LINE desktop app. Absent means unguarded (tests). */
-  officialLineSessionGuard?: OfficialLineSessionGuard;
 }
 
 export function resolveMcpLocalClientBridgePath(appPath: string, packaged: boolean): string {
@@ -160,6 +175,10 @@ export function resolveMcpLocalClientBridgePath(appPath: string, packaged: boole
 export type OfficialIdentityRead =
   | { status: 'supported'; mid: string; displayName: string | null; picturePath?: string | null; candidateCount: number }
   | { status: 'unsupported'; errorCode: string };
+
+export type OfficialSourceVerification =
+  | Readonly<{ status: 'supported' }>
+  | Readonly<{ status: 'unsupported'; errorCode: string }>;
 
 export type OfficialSnapshotImporter = {
   verifyOfficialSource?(input: { expectedMid: string; signal: AbortSignal }): Promise<OfficialSourceVerification>;
@@ -183,6 +202,7 @@ export type OfficialSnapshotImporter = {
     sourceIdentityDigest: string;
     cursor: ImportCursor | null;
     signal: AbortSignal;
+    onPhase?(phase: ExternalMonitorFailurePhase): void;
     onProgress(progress: ImportProgress): void;
     onReady?(access: NativeMonitorAccess, signal?: AbortSignal): Promise<void> | void;
     onDirectoryPage?(page: ImportDirectoryPage, signal?: AbortSignal): Promise<void> | void;
@@ -195,7 +215,6 @@ const failure = (requestId: string, code: string, message: string, retryable = f
   ({ type: 'error', requestId, ok: false, code, message, retryable });
 const JOB_NOT_RETRYABLE = 'AGENT_JOB_NOT_RETRYABLE';
 const JOB_NOT_RETRYABLE_MESSAGE = '此任務目前無法重試（可能已取消、已產生輸出，或所屬 Agent 會話已變更）。';
-const OFFICIAL_LINE_SESSION_ACTIVE = 'OFFICIAL_LINE_SESSION_ACTIVE';
 
 function applyProviderAuthStatus(health: HealthService, auth: {
   provider: AgentProvider; status: 'not_installed' | 'logged_out' | 'authenticated' | 'error'; detail?: string;
@@ -271,7 +290,7 @@ export function sameJsonValue(left: unknown, right: unknown): boolean {
 }
 
 function workerOperationErrorCode(code: string): AuditErrorCode {
-  if (code === 'INVALID_COMMAND' || code === 'QUEUE_FULL' || code === 'CATALOG_REFRESH_FAILED') return code;
+  if (AUDIT_ERROR_CODES.includes(code as AuditErrorCode) && code !== 'UNKNOWN') return code as AuditErrorCode;
   return 'WORKER_OPERATION_FAILED';
 }
 
@@ -287,8 +306,16 @@ function recordWorkerDiagnostic(options: ConnectedFacadeOptions, event: Extract<
     }
     const errorCode = workerOperationErrorCode(event.code);
     if (!AUDIT_ERROR_CODES.includes(errorCode)) return;
+    if (event.diagnostic) {
+      options.audit.failure(event.diagnostic, { initiator: 'worker', accountId: event.accountId,
+        workerInstanceId: event.workerInstanceId, ...(event.requestId ? { requestId: event.requestId } : {}),
+        background: !event.requestId && (event.diagnostic.operation === 'poll' || event.diagnostic.category === 'event_publish_failed' || event.diagnostic.category === 'queue_full') }, errorCode, 'worker_operation_error');
+      return;
+    }
     options.audit.observed('worker_operation_error', { initiator: 'worker', accountId: event.accountId,
-      workerInstanceId: event.workerInstanceId, errorCode });
+      workerInstanceId: event.workerInstanceId, errorCode,
+      ...(event.diagnostic ? { diagnostic: event.diagnostic } : {}),
+      ...(event.requestId ? { requestId: event.requestId } : {}) });
   } catch { /* Diagnostics cannot affect command results or worker readiness. */ }
 }
 
@@ -298,12 +325,14 @@ export function createPermissionCommandService(
   transport: PermissionCommandTransport,
   onPolicyChanged: () => void,
   locale: Locale | string = 'en',
+  onDiagnostic?: (diagnostic: import('@line-agent/contracts').SafeDiagnostic) => void,
 ): PermissionCommandService {
-  return new PermissionCommandService(repository, transport, { onPolicyChanged, locale });
+  return new PermissionCommandService(repository, transport, { onPolicyChanged, locale, ...(onDiagnostic ? { onDiagnostic } : {}) });
 }
 
 export async function createConnectedFacade(options: ConnectedFacadeOptions): Promise<DesktopServiceFacade> {
   const cleanup = new StartupCleanup();
+  await cleanupStaleManualMedia();
   try {
     const facade = await createConnectedFacadeInternal(options, cleanup);
     cleanup.commit();
@@ -315,9 +344,18 @@ export async function createConnectedFacade(options: ConnectedFacadeOptions): Pr
 }
 
 async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, startupCleanup: StartupCleanup): Promise<DesktopServiceFacade> {
+  async function recordExternalMonitorDiagnostic(...args: Parameters<typeof persistExternalMonitorDiagnostic>): Promise<void> {
+    const correlationId = options.audit?.failure({ operation: 'external_monitor', stage: args[4] ?? (args[1] === 'startup' ? 'bootstrap' : 'execute'),
+      reason: args[2], category: args[2] === 'external_monitor_database_failed' ? 'persistence_failed'
+        : args[2] === 'external_monitor_authority_stale' || args[2] === 'external_monitor_source_changed' ? 'stale_binding' : 'unknown',
+      recovery: 'check_configuration' });
+    await persistExternalMonitorDiagnostic(args[0], args[1], args[2], args[3], args[4], args[5],
+      () => { options.audit?.failure(diagnosticFailure('external_monitor', 'write')); }, correlationId);
+  }
   let closing = false;
   let shutdownPromise: Promise<void> | undefined;
   const inFlight = new Set<Promise<unknown>>();
+  const manualMediaAdmission = createManualMediaAdmission();
   const externalMonitor = new ExternalMonitorRepository(options.pool);
   type ExternalImportProgress = NonNullable<import('@line-agent/contracts').LineAccountSummary['externalImportProgress']>;
   const externalImportProgress = new Map<string, ExternalImportProgress>();
@@ -328,6 +366,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const nativeMonitorAccess = new Map<string, { sourceId: string; generation: number; access: NativeMonitorAccess; signal: AbortSignal }>();
   const downloadAuthFlights = new Map<string, Promise<boolean>>();
   const recoveryTimers = new Set<ReturnType<typeof setTimeout>>();
+  const avatarRefreshFlights = new Map<string, Promise<IpcResult>>();
+  let ownAvatarRefreshScheduler: ReturnType<typeof createOwnAvatarRefreshScheduler> | undefined;
   let unsubscribeAuth: (() => void) | void;
   let unsubscribeWorkerExit: (() => void) | void;
   let unsubscribeEvent: (() => void) | void;
@@ -359,10 +399,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let lineServiceReady = false;
   startupCleanup.beforeUnwind(async () => {
     closing = true;
-    options.officialLineSessionGuard?.shutdown();
+    manualMediaAdmission.shutdown();
     externalImportOwner?.abort.abort();
     identityReadAbort?.abort();
     const earlyErrors = await runCleanupInOrder([
+      () => ownAvatarRefreshScheduler?.shutdown(),
       () => { for (const timer of recoveryTimers) clearTimeout(timer); recoveryTimers.clear(); },
       () => unsubscribeAuth?.(), () => unsubscribeWorkerExit?.(), () => unsubscribeEvent?.(),
       () => unsubscribeBinding?.(), () => unsubscribeRestartBinding?.(), () => unsubscribeModeChange?.(),
@@ -382,7 +423,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   function track<T>(work: () => Promise<T>): Promise<T> {
     const operation = Promise.resolve().then(work);
     inFlight.add(operation);
-    void operation.then(() => inFlight.delete(operation), () => inFlight.delete(operation));
+    void operation.then(() => inFlight.delete(operation), (error: unknown) => {
+      inFlight.delete(operation);
+      if (!closing) options.audit?.failure(diagnosticFailure('unknown', 'execute', error));
+    });
     return operation;
   }
   function admitted<T>(work: () => Promise<T>): Promise<T> {
@@ -390,7 +434,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   }
   function onceCleanup(action: () => void | Promise<void>): () => Promise<void> {
     let result: Promise<void> | undefined;
-    return () => result ??= Promise.resolve().then(action);
+    return () => result ??= Promise.resolve().then(action).catch((error: unknown) => {
+      options.audit?.failure(diagnosticFailure('shutdown', 'cleanup', error));
+      throw error;
+    });
   }
   async function stopExternalImportForAccount(accountId: string): Promise<void> {
     const owner = externalImportOwner;
@@ -405,7 +452,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   if (options.runMigrations !== false) await migrate(options.pool, options.migrationDirectory);
   if (options.contentReprojection === true) {
     const reprojection = new ContentReprojectionService(options.pool, {
-      onError: (error) => console.warn('[content-bridge] re-projection stopped:', error instanceof Error ? error.name : 'unknown') });
+      onError: (error) => options.audit?.failure(diagnosticFailure('database', 'persist', error)) });
     stopContentReprojection = onceCleanup(() => reprojection.shutdown());
     startupCleanup.add(stopContentReprojection);
     reprojection.start();
@@ -417,7 +464,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (!await canWriteLine(accountId)) throw new Error('EXTERNAL_MONITOR_READ_ONLY');
   };
   const sendLineCommand = async (command: LineWorkerCommand, signal?: AbortSignal): Promise<SendResult> => {
-    if (command.type === 'sendText' || command.type === 'reactMessage') await assertLineWriteAllowed(command.accountId);
+    if (command.type === 'sendText' || command.type === 'reactMessage' || command.type === 'unsendMessage') await assertLineWriteAllowed(command.accountId);
     return options.workers.send(command, signal);
   };
   const messages = new MessageRepository(options.pool);
@@ -425,8 +472,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const settings = new SettingsRepository(options.pool);
   let conversationSettingsError: string | null = null;
   let conversationSettings = await settings.getConversationSettings().catch((error: unknown) => {
-    conversationSettingsError = error instanceof Error ? error.message : 'Unable to load conversation settings';
-    return { attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: DEFAULT_AGENT_STATUS_ICONS };
+    options.audit?.failure(diagnosticFailure('database', 'read', error));
+    conversationSettingsError = 'Unable to load conversation settings';
+    return { attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: DEFAULT_AGENT_STATUS_ICONS,
+      agentStatusRotationIntervalSeconds: 10 };
   });
   let settingsTail: Promise<void> = Promise.resolve();
   const friendWhitelist = new FriendWhitelistRepository(options.pool);
@@ -436,11 +485,60 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const admins = new AdminRepository(options.pool);
   const permissionRepository = new AgentPermissionRepository(options.pool);
   const chatFolders = new ChatFolderService(permissionRepository, workspace);
+  const diagnostics = options.chatResourceDiagnosticsDirectory
+    ? createChatResourceDiagnostics({ appDataDirectory: options.chatResourceDiagnosticsDirectory,
+      onSinkFailure: (stage) => options.audit?.failure({ operation: 'chat_resource', stage,
+        category: stage === 'queue' ? 'queue_full' : 'persistence_failed', recovery: 'check_configuration' }) }) : undefined;
+  let archiveOwner: ChatResourceArchive | undefined;
+  let chatResourceStore = options.chatResourceStore;
+  if (!chatResourceStore && process.versions.electron && process.platform === 'win32') {
+    archiveOwner = new ChatResourceArchive({ workspaceRoot: await workspace.current() });
+    chatResourceStore = createChatResourceStoreAdapter({ archive: archiveOwner, folders: chatFolders });
+  }
+  if (diagnostics) startupCleanup.add(() => diagnostics.shutdown());
+  const chatResources = new ChatResourceArchiveService({
+    readChatResource: (command, signal) => {
+      if (!options.workers.readChatResource) throw new Error('LINE Note and Album reads are unavailable in this worker.');
+      return options.workers.readChatResource(command, signal);
+    },
+    isWritableAccount: canWriteLine,
+    ...(chatResourceStore ? { store: chatResourceStore } : {}),
+    recordDiagnostic: (record) => {
+      const safe = parseChatResourceDiagnostic(record);
+      const correlationId = safe?.status === 'failure' && safe.errorCode !== 'CANCELLED' ? options.audit?.failure({
+        operation: safe.action, stage: safe.failureStage === 'gateway_admission' ? 'admission' : 'response',
+        category: safe.errorCode === 'TIMEOUT' ? 'timeout' : 'invalid_response', recovery: 'retry',
+        ...(safe.failureCategory ? { reason: safe.failureCategory } : {}),
+        ...(typeof safe.responseCode === 'number' ? { statusCode: safe.responseCode } : {}) }, { accountId: safe.accountId }) : undefined;
+      if (safe) diagnostics?.record({ ...safe, ...(correlationId ? { correlationId } : {}) });
+    },
+    ...(options.audit ? { audit: options.audit } : {}),
+    getBinding: async (accountId) => {
+      const binding = await options.workers.binding(accountId);
+      if (!binding || typeof binding.transportOwnerId !== 'string' || typeof binding.transportGeneration !== 'number'
+        || typeof binding.writeGrantVersion !== 'number') return null;
+      return { ...binding, transportOwnerId: binding.transportOwnerId, transportGeneration: binding.transportGeneration,
+        writeGrantVersion: binding.writeGrantVersion };
+    },
+    isCurrentBinding: (binding) => binding.mode === 'ACTIVE_CONTROL' && lineService.isAuthenticatedReady(binding)
+      && options.workers.isCurrentActiveControlBinding(binding),
+    conversationExists: async (key) => (await options.pool.query('SELECT 1 FROM conversations WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 LIMIT 1',
+      [key.accountId, key.chatType, key.chatId])).rowCount === 1,
+  });
+  const chatResourceAdmission = new ChatResourceAccountAdmission(chatResources,
+    (binding) => lineService.isAuthenticatedReady(binding) && options.workers.isCurrentActiveControlBinding(binding));
+  startupCleanup.add(() => chatResources.shutdown());
   const agentJobEnvironment = new AgentJobEnvironmentService({
     resolvePolicy: (jobId) => resolveJobPolicy(options.pool, jobId),
     getExecutionLevel: async () => (await permissionRepository.getExecutionPolicy()).level,
     folders: chatFolders, workspace });
   const mcpTokens = new McpTokenRepository(options.pool);
+  const getMcpLiveLoginBinding = async (accountId: string): Promise<Bound | null> => {
+    if ((await accounts.resolveCapabilities(accountId))?.connectionMode !== 'SYSTEM_LOGIN') return null;
+    const binding = await options.workers.binding(accountId);
+    return !!binding && binding.mode === 'ACTIVE_CONTROL' && lineService.isAuthenticatedReady(binding)
+      && options.workers.isCurrentActiveControlBinding(binding) ? binding : null;
+  };
   // Single owner of pending interactive tool approvals (memory only, bounded); the renderer only answers by approvalId.
   const approvalBroker = new AgentApprovalBroker({ repository: permissionRepository, resolveWritePathEvidence,
     publish: (event) => {
@@ -459,6 +557,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   stopLineSend = onceCleanup(() => agentLineSend.shutdown());
   startupCleanup.add(stopLineSend);
   mcpService = new McpService({ pool: options.pool, tokens: mcpTokens, messages, approvalBroker, lineSend: agentLineSend,
+    onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
+    ...(chatResourceStore ? { chatResources: createMcpChatResourceArchiveReader(chatResources, diagnostics ? (record) => diagnostics.record(record) : undefined) } : {}),
+    getLiveLoginBinding: getMcpLiveLoginBinding,
     onInternalObservation: (jobId, observation) => agentService?.noteMcpObservation(jobId, observation) });
   /** Tells subscribers to re-read the execution policy after a successful write. */
   const publishExecutionPolicyChanged = (): void => { options.publish?.({ type: 'agentExecutionPolicyChanged' }); };
@@ -466,6 +567,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   stopMcpService = onceCleanup(async () => { await approvalBroker.close(); await mcpService.shutdown(); });
   startupCleanup.add(stopMcpService);
   mcpHttpServer = new McpHttpServer(mcpService, { unref: true,
+    onDiagnostic: () => options.audit?.failure(diagnosticFailure('mcp', 'response')),
     ...(options.mcpHttpPort === undefined ? {} : { port: options.mcpHttpPort }) });
   const userProfile = process.env.USERPROFILE ?? homedir();
   const appData = process.env.APPDATA ?? path.join(userProfile, 'AppData', 'Roaming');
@@ -556,14 +658,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   }
   unsubscribeAuth = options.agent.onAuthStatus?.((auth) => {
     if (closing) return;
+    if (auth.status === 'error') options.audit?.failure({ ...diagnosticFailure('provider_auth', 'authenticate'), provider: auth.provider });
     applyProviderAuthStatus(health, auth);
     void publishSnapshot().catch(() => undefined);
   });
   if (unsubscribeAuth) startupCleanup.add(unsubscribeAuth);
-  unsubscribeWorkerExit = options.workers.onWorkerExit?.((binding) => options.audit?.observed('worker_exited', {
-    initiator: 'worker', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
-    reasonCode: 'worker_exit', correlationId: binding.workerInstanceId,
-  }));
+  unsubscribeWorkerExit = options.workers.onWorkerExit?.((binding) => {
+    chatResourceAdmission.close(binding.accountId, 'The account worker exited.');
+    options.audit?.observed('worker_exited', {
+      initiator: 'worker', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+      reasonCode: 'worker_exit', correlationId: binding.workerInstanceId,
+    });
+  });
   if (unsubscribeWorkerExit) startupCleanup.add(unsubscribeWorkerExit);
   let skillText: string | undefined;
   const internalMcpLauncher: InternalMcpLauncher = {
@@ -585,6 +691,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   };
   agentService = new AgentService(agents, workspace, options.agent,
     async (jobId, event) => {
+      if (event.type === 'failed') options.audit?.failure({ operation: 'agent',
+        stage: event.code === 'BRIDGE_ERROR' ? 'spawn' : event.code === 'INVALID_JSONL' ? 'parse' : 'execute',
+        category: event.code === 'AUTH_REQUIRED' ? 'authentication_required' : event.code === 'TIMEOUT' ? 'timeout' : 'unknown',
+        recovery: event.code === 'AUTH_REQUIRED' ? 'check_configuration' : 'retry' }, { jobId });
       options.publish?.({ type: 'agentEvent', jobId, event });
       if (event.type === 'started' || event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
         await publishSnapshot().catch(() => undefined);
@@ -595,7 +705,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     async (_jobId, key, messageId, reaction) => lineService.reactToMessage(key, messageId, reaction),
     (job) => mcpService.resolvePromptContext(job),
     (projection) => publishAgentJobStatus(projection),
-    internalMcpLauncher, agentJobEnvironment);
+    internalMcpLauncher, agentJobEnvironment,
+    (diagnostic, jobId) => options.audit?.failure(diagnostic, { ...(jobId ? { jobId } : {}) }));
+  agentService.setStatusRotationIntervalSeconds(conversationSettings.agentStatusRotationIntervalSeconds);
   stopAgentService = onceCleanup(() => agentService.shutdown());
   startupCleanup.add(stopAgentService);
 
@@ -737,23 +849,26 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   }, options.attachmentRoot, 4, async (attachmentId) => {
     options.publish?.({ type: 'attachmentChanged', attachmentId });
     void publishSnapshot().catch(() => undefined);
-  }, undefined, resolveNativeAttachment, async (accountId) =>
+  }, (error, identity) => options.audit?.failure(parseSafeDiagnostic(error) ?? diagnosticFailure('attachment', 'execute', error), identity), resolveNativeAttachment, async (accountId) =>
     (await options.pool.query<{ status: string }>('SELECT status FROM line_accounts WHERE account_id=$1', [accountId])).rows[0]?.status === 'connected');
   stopAttachmentService = onceCleanup(() => attachmentService.shutdown());
   startupCleanup.add(stopAttachmentService);
   attachmentService.setAutomaticAttemptLimit(conversationSettings.attachmentAutoAttemptLimit);
   previewService = options.previewPresenter ? new AttachmentPreviewService({ root: options.attachmentRoot,
+    onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
     ...(options.previewCacheRoot ? { cacheRoot: options.previewCacheRoot } : {}),
     authority: createRepositoryPreviewAuthority(messages), presenter: options.previewPresenter }) : null;
   stopPreview = onceCleanup(() => previewService?.shutdown());
   if (previewService) startupCleanup.add(stopPreview);
   if (options.openAttachmentPath) {
     attachmentOpenService = new AttachmentOpenService({ root: options.attachmentRoot,
+      onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
       authority: createRepositoryPreviewAuthority(messages), openPath: options.openAttachmentPath });
     stopAttachmentOpen = onceCleanup(() => attachmentOpenService?.shutdown());
     startupCleanup.add(stopAttachmentOpen);
   }
   lineMedia = new LineMediaService({
+    onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
     ...(options.mediaCacheRoot ? { cacheRoot: options.mediaCacheRoot } : {}),
     loadAttachment: async (key, attachmentId, signal) => previewService?.readImage(attachmentId, key, { senderId: 0 }, 8 * 1024 * 1024, signal) ?? null,
   });
@@ -790,10 +905,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const roomAutomation = new RoomAutomationService(roomActivation, autoresponders,
     await options.secretStore?.loadOrCreateRoomActivationDigestKey() ?? randomBytes(32), 1, lineReplyTransport, options.locale ?? 'en');
   const permissionCommands = createPermissionCommandService(permissionRepository, lineReplyTransport,
-    publishExecutionPolicyChanged, options.locale ?? 'en');
+    publishExecutionPolicyChanged, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic));
   lineService = new LineService(accounts, messages, settings,
     { send: async (command) => { await sendLineCommand(command); } }, agentService, options.secretStore, attachmentService,
     async (envelope, secretCandidate, ownMid, capturedBinding) => {
+      if (!closing && capturedBinding?.mode === 'ACTIVE_CONTROL' && isNativeNotePostNotification(envelope)) {
+        void chatResources.refreshNotesFromNotification({ accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId });
+      }
       const paired = await adminPairings.consume(envelope);
       if (paired) {
         void publishSnapshot().catch(() => console.warn('[admin-pairing] snapshot publish failed'));
@@ -840,13 +958,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           if (conversation) options.publish?.({ type: 'messageStored', key: change.key, messageId: change.messageId, conversation });
         }
       }).catch(() => undefined);
-    }, options.locale ?? 'en');
+    }, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic));
   lineServiceReady = true;
   delivery = new DeliveryService(agents, {
     binding: (accountId) => options.workers.binding(accountId),
     waitModeAck: (accountId, mode, timeoutMs) => options.workers.waitModeAck(accountId, mode, timeoutMs),
     send: sendLineCommand,
-  }, canWriteLine);
+  }, canWriteLine, (diagnostic, identity) => options.audit?.failure(diagnostic, identity));
   stopDelivery = onceCleanup(() => delivery.shutdown());
   startupCleanup.add(stopDelivery);
   // Queued jobs are reclaimed only after the MCP listener is bound (see below) so their capability can be minted.
@@ -862,7 +980,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       await options.workers.start(accountId, binding);
       try {
         if (!bindsOnStart) await lineService.bind(binding);
-        await restoreTokenForBinding(binding);
       } catch (error) {
         await auditWorkerStop(binding, () => options.workers.stopBinding(binding)).catch(() => undefined);
         lineService.unbind(binding.workerInstanceId);
@@ -884,6 +1001,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     recoveryTimers.add(timer);
   }
 
+  async function updateChatResourceReadiness(instance: string, event: Extract<LineWorkerEvent, { type: 'login' | 'status' }>): Promise<void> {
+    const binding = await options.workers.binding(event.accountId);
+    if (!binding || binding.workerInstanceId !== instance || binding.workerInstanceId !== event.workerInstanceId
+      || binding.controlEpoch !== event.controlEpoch || !lineService.isCurrentWorkerEvent(instance, event)) return;
+    if (event.type === 'login') chatResourceAdmission.authenticated(binding);
+    else if (event.state === 'ready') chatResourceAdmission.ready(binding);
+  }
+
   unsubscribeEvent = options.workers.onEvent((instance, event) => closing ? Promise.resolve() : track(async () => {
     if (event.type === 'downloadAuthInvalidated') {
       const binding = await options.workers.binding(event.accountId);
@@ -896,6 +1021,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (event.type === 'downloadAuthResult' || event.type === 'downloadReady') return;
     if (!lineService.isCurrentWorkerEvent(instance, event)) return;
     if (event.type === 'authInvalidated') {
+      // Fence archived resource IO before lifecycle/database teardown can yield.
+      chatResourceAdmission.close(event.accountId, 'LINE authentication was invalidated.');
       const binding: WorkerBinding = event;
       const loginAttemptId = loginAttempts.get(event.accountId) ?? null;
       await supervisor.runLifecycle(async () => {
@@ -916,6 +1043,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     }
     if (event.type === 'loginFailure') {
       if (loginAttempts.get(event.accountId) !== event.loginAttemptId) return;
+      options.audit?.failure({ operation: 'loginQr', stage: 'authenticate', reason: event.code,
+        category: event.code === 'LOGIN_TIMEOUT' ? 'timeout' : event.code === 'LOGIN_ATTEMPT_REPLACED' ? 'cancelled' : 'authentication_required',
+        recovery: event.code === 'LOGIN_ATTEMPT_REPLACED' ? 'none' : 'relogin' },
+        { accountId: event.accountId, workerInstanceId: event.workerInstanceId, loginAttemptId: event.loginAttemptId });
       loginAttempts.delete(event.accountId);
       await lineService.handleWorkerEvent(instance, event);
       if (!lineService.isCurrentWorkerEvent(instance, event)) return;
@@ -963,10 +1094,16 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (event.type === 'pin') options.publish?.({ type: 'linePin', accountId: event.accountId, loginAttemptId: event.loginAttemptId, pin: event.pin });
     if (event.type === 'login') {
       if (!lineService.isCurrentWorkerEvent(instance, event)) return;
+      await updateChatResourceReadiness(instance, event);
+      await noteOwnAvatarAccountConnected(event.accountId);
       options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId: event.loginAttemptId, state: 'connected', message: null });
       await publishSnapshot();
     }
     if (event.type === 'status') {
+      if (event.state === 'ready') {
+        await updateChatResourceReadiness(instance, event);
+        await noteOwnAvatarAccountConnected(event.accountId);
+      }
       if (event.state === 'ready') await attachmentService.recover(event.accountId);
       options.publish?.({ type: 'lineLoginState', accountId: event.accountId,
         loginAttemptId: loginAttempts.get(event.accountId) ?? null,
@@ -985,6 +1122,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (event.type === 'historyResult') {
       options.publish?.({ type: 'lineHistorySynced', requestId: event.requestId,
         accountId: event.accountId, chatType: event.chatType, chatId: event.chatId, nextCursor: event.nextCursor });
+      for (const messageId of insertedMessageIds ?? []) {
+        const key = { accountId: event.accountId, chatType: event.chatType, chatId: event.chatId } as const;
+        const conversation = await health.conversation(key);
+        if (conversation) options.publish?.({ type: 'messageStored', key, messageId, conversation });
+      }
       await publishSnapshot();
     }
     if (event.type === 'batch') {
@@ -1015,48 +1157,67 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       throw error;
     }
   }
-  unsubscribeBinding = options.workers.onBinding?.((binding, signal) => admitted(async () => {
-    if (signal.aborted) throw new Error('Worker binding cancelled');
-    if (binding.purpose === 'DOWNLOAD_ONLY') {
-      await accounts.bindWorker(binding, signal);
-      return;
-    }
-    await lineService.bind(binding, signal);
-    if (signal.aborted) throw new Error('Worker binding cancelled');
-    if (!closing) void track(() => recoverPendingAfterReady(binding, signal)).catch(() => undefined);
-  }));
-  if (unsubscribeBinding) startupCleanup.add(unsubscribeBinding);
-  unsubscribeRestartBinding = options.workers.onRestartBinding?.((binding, signal) => admitted(async () => {
-    // Automatic utility-process restarts receive a new instance ID. Adopt the
-    // acknowledged replacement under the same durable epoch before allowing
-    // facade sends to treat it as current. Keeping this separate from a normal
-    // start avoids recursively queueing adoption inside switchTo's spawn.
-    if (signal.aborted) return;
-    await supervisor.runLifecycle(async () => {
-      if (signal.aborted) return;
-      const current = await options.workers.binding(binding.accountId);
-      if (signal.aborted || !current || current.accountId !== binding.accountId
-        || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch) return;
-      if (current.purpose === 'DOWNLOAD_ONLY') {
-        await accounts.bindWorker(current, signal);
-        await ensureDownloadOnlyAuth(current, signal);
+  unsubscribeBinding = options.workers.onBinding?.((binding, signal) => {
+    chatResourceAdmission.close(binding.accountId, 'A new account worker binding was observed.');
+    chatResourceAdmission.observeBinding(binding);
+    return admitted(async () => {
+      if (signal.aborted) throw new Error('Worker binding cancelled');
+      if (binding.purpose === 'DOWNLOAD_ONLY') {
+        await accounts.bindWorker(binding, signal);
         return;
       }
-      await restoreTokenForBinding(current, signal);
-      if (binding.mode === 'ACTIVE_CONTROL'
-        && !await supervisor.adoptWithinLifecycle(current, supervisedWorker(current), true)) return;
-    }, signal);
-    if (signal.aborted) return;
-    if (binding.mode === 'ACTIVE_CONTROL') schedulePendingDeliveryRecovery(binding.accountId);
-  }));
+      await lineService.bind(binding, signal);
+      if (signal.aborted) throw new Error('Worker binding cancelled');
+      if (!closing) void track(() => recoverPendingAfterReady(binding, signal)).catch(() => undefined);
+    });
+  });
+  if (unsubscribeBinding) startupCleanup.add(unsubscribeBinding);
+  unsubscribeRestartBinding = options.workers.onRestartBinding?.((binding, signal) => {
+    chatResourceAdmission.close(binding.accountId, 'The account worker binding restarted.');
+    chatResourceAdmission.observeBinding(binding);
+    return admitted(async () => {
+      // Automatic utility-process restarts receive a new instance ID. Adopt the
+      // acknowledged replacement under the same durable epoch before allowing
+      // facade sends to treat it as current. Keeping this separate from a normal
+      // start avoids recursively queueing adoption inside switchTo's spawn.
+      if (signal.aborted) return;
+      await supervisor.runLifecycle(async () => {
+        if (signal.aborted) return;
+        const current = await options.workers.binding(binding.accountId);
+        if (signal.aborted || !current || current.accountId !== binding.accountId
+          || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch) return;
+        if (current.purpose === 'DOWNLOAD_ONLY') {
+          await accounts.bindWorker(current, signal);
+          await ensureDownloadOnlyAuth(current, signal);
+          return;
+        }
+        if (binding.mode === 'ACTIVE_CONTROL'
+          && !await supervisor.adoptWithinLifecycle(current, supervisedWorker(current), true)) return;
+      }, signal);
+      if (signal.aborted) return;
+      if (binding.mode === 'ACTIVE_CONTROL') schedulePendingDeliveryRecovery(binding.accountId);
+    });
+  });
   if (unsubscribeRestartBinding) startupCleanup.add(unsubscribeRestartBinding);
-  unsubscribeModeChange = options.workers.onModeChange?.((binding, signal) => admitted(async () => {
-    if (signal.aborted) return;
-    if (binding.purpose === 'DOWNLOAD_ONLY') return;
-    await lineService.bind(binding, signal);
-    if (signal.aborted) return;
-    if (binding.mode === 'ACTIVE_CONTROL') schedulePendingDeliveryRecovery(binding.accountId);
-  }));
+  unsubscribeModeChange = options.workers.onModeChange?.((binding, signal) => {
+    chatResourceAdmission.close(binding.accountId, 'The account mode changed.', true);
+    return admitted(async () => {
+      if (signal.aborted) return;
+      if (binding.purpose === 'DOWNLOAD_ONLY') return;
+      await lineService.bind(binding, signal);
+      if (signal.aborted) return;
+      const mode = binding.mode;
+      if (mode !== 'PAUSED') void track(async () => {
+        if (signal.aborted || !await options.workers.waitModeAck(binding.accountId, mode, 3000) || signal.aborted) return;
+        const current = await options.workers.binding(binding.accountId);
+        if (signal.aborted || !current || current.workerInstanceId !== binding.workerInstanceId
+          || current.controlEpoch !== binding.controlEpoch || current.mode !== mode) return;
+        chatResourceAdmission.ready(current);
+        chatResourceAdmission.modeReady(current);
+      }).catch(() => undefined);
+      if (binding.mode === 'ACTIVE_CONTROL') schedulePendingDeliveryRecovery(binding.accountId);
+    });
+  });
   if (unsubscribeModeChange) startupCleanup.add(unsubscribeModeChange);
 
   async function recoverPendingAfterReady(binding: Bound, signal?: AbortSignal): Promise<void> {
@@ -1069,23 +1230,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch) return;
     await delivery.recoverPending(binding.accountId);
   }
-
-  /** Returns a blocking failure when the official LINE app may be signed out by this login; null to proceed. */
-  async function officialLogoutBlock(requestId: string, accountId: string | null, confirmed: boolean | undefined): Promise<IpcResult | null> {
-    const guard = options.officialLineSessionGuard;
-    if (!guard || confirmed === true) return null;
-    const account = accountId ? await accounts.getAccount(accountId) : null;
-    if (accountId && !account) return null;
-    const verdict = await guard.check({ accountId: accountId ?? '', ownMid: account?.ownMid ?? null });
-    if (verdict !== 'same_account' && verdict !== 'unknown') return null;
-    return { type: 'error', requestId, ok: false, code: OFFICIAL_LINE_SESSION_ACTIVE, retryable: false, detail: verdict,
-      message: verdict === 'same_account' ? 'LINE 目前正以此帳號登入，繼續將使 LINE 被登出。'
-        : 'LINE 正在執行，無法確認登入的帳號。若為同一帳號，繼續將使 LINE 被登出。' };
-  }
-
-  /** Avoids an extra microtask turn when unguarded so lifecycle ordering is unchanged. */
-  const guardedLoginBlock = (requestId: string, accountId: string | null, confirmed: boolean | undefined): Promise<IpcResult | null> | null =>
-    options.officialLineSessionGuard ? officialLogoutBlock(requestId, accountId, confirmed) : null;
 
   async function startStoredAccount(account: Awaited<ReturnType<AccountRepository['getAccount']>> & {}): Promise<Bound> {
     await stopExternalImportForAccount(account.accountId);
@@ -1174,8 +1318,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       options.publish?.({ type: 'lineLoginState', accountId, loginAttemptId, state: 'connecting', message: null });
       try { await lineService.requestQrLogin(accountId, binding.workerInstanceId, loginAttemptId); }
       catch (error) {
+        options.audit?.failure(diagnosticFailure('loginQr', 'dispatch', error), { accountId, loginAttemptId });
         options.publish?.({ type: 'lineLoginState', accountId, loginAttemptId, state: 'degraded',
-          message: error instanceof Error ? error.message : 'LINE QR login failed to start.' });
+          message: 'LINE QR login failed to start.' });
         throw error;
       }
       return accepted(requestId);
@@ -1188,13 +1333,22 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     setProgress(progress: ExternalImportProgress): void;
   }): Promise<void> {
     const importer = options.officialSnapshotImporter?.readOfficialMonitor;
-    if (!importer) throw new Error('Direct LINE monitoring is unavailable in this build.');
+    let readerReady = false;
+    let diagnosticPhase: ExternalMonitorFailurePhase = 'facade_checkpoint_fence';
+    let readinessDiagnosticClear: Promise<void> | undefined;
+    const repository = async <T>(operation: () => Promise<T>): Promise<T> => {
+      try { return await operation(); } catch (error) {
+        const failure = externalMonitorDatabaseFailure(error, readerReady ? 'runtime' : 'startup');
+        throw new ExternalMonitorDiagnosticFailure(failure.code, failure.stage, failure.detail, diagnosticPhase);
+      }
+    };
+    if (!importer) throw new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup');
     const committer: Pick<ExternalMonitorRepository, 'commitDirectPoll'> = externalMonitor;
     let checkpoint = input.checkpoint;
-    const initialState = await externalMonitor.getInitialImportState({ accountId: input.accountId, sourceId: input.sourceId,
-      generation: input.generation, signal: input.signal });
+    const initialState = await repository(() => externalMonitor.getInitialImportState({ accountId: input.accountId, sourceId: input.sourceId,
+      generation: input.generation, signal: input.signal }));
     if (!initialState?.initialImportComplete || initialState.sourceIdentityDigest !== input.sourceIdentityDigest) {
-      throw new Error('Completed LINE import checkpoint could not be verified.');
+      throw new ExternalMonitorDiagnosticFailure('external_monitor_checkpoint_changed', 'startup', undefined, 'facade_checkpoint_fence');
     }
     input.setProgress({ stage: 'monitoring', copiedBytes: null, totalBytes: null,
       committedRows: initialState.committedCount, eligibleRows: initialState.eligibleCount, message: null });
@@ -1203,11 +1357,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       pendingMonitorRefresh = { accountId: input.accountId, sourceId: input.sourceId, generation: input.generation, pending: false };
     }
     try {
-    await importer({
+    try { await importer({
       expectedMid: input.ownMid, sourceIdentityDigest: input.sourceIdentityDigest,
       cursor: importCursor(checkpoint) as ImportCursor | null, signal: input.signal,
+      onPhase: (phase) => { diagnosticPhase = phase; },
       onReady: (access) => {
         if (input.signal.aborted) return;
+        readerReady = true;
+        readinessDiagnosticClear = clearExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath);
         const current = { sourceId: input.sourceId, generation: input.generation, access, signal: input.signal };
         nativeMonitorAccess.set(input.accountId, current);
         // The session owns the access object for the full monitor lifetime.
@@ -1220,21 +1377,23 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           committedRows: initialState.committedCount, eligibleRows: initialState.eligibleCount, message: null });
       },
       onDirectoryPage: async (page, callbackSignal) => {
+        diagnosticPhase = 'directory_callback_ack';
         const signal = callbackSignal ?? input.signal;
         if (signal.aborted) throw new Error('Direct LINE monitoring cancelled.');
-        const stored = await externalMonitor.storeNativeDirectoryPage({ accountId: input.accountId, sourceId: input.sourceId,
-          generation: input.generation, expectedModeRevision: input.modeRevision, rows: page.rows, signal });
+        const stored = await repository(() => externalMonitor.storeNativeDirectoryPage({ accountId: input.accountId, sourceId: input.sourceId,
+          generation: input.generation, expectedModeRevision: input.modeRevision, rows: page.rows, signal }));
         // A changed name must reach the open window even when no message arrives.
         if (stored.contactsChanged > 0 || stored.conversationsChanged > 0) pendingMonitorRefresh!.pending = true;
       },
       onPage: async (page, callbackSignal) => {
+        diagnosticPhase = 'first_poll_callback_ack';
         const signal = callbackSignal ?? input.signal;
         if (signal.aborted) throw new Error('Direct LINE monitoring cancelled.');
         if (page.rows.length > 100 || page.tailRows.length > 50 || (page.rows.length > 0 && !page.lastCursor)) {
           throw new Error('Direct LINE source page is malformed.');
         }
-        const fence = await externalMonitor.readBatchFence({ accountId: input.accountId, sourceId: input.sourceId,
-          generation: input.generation, signal });
+        const fence = await repository(() => externalMonitor.readBatchFence({ accountId: input.accountId, sourceId: input.sourceId,
+          generation: input.generation, signal }));
         if (fence.expectedModeRevision !== input.modeRevision || !sameJsonValue(fence.expectedCheckpoint, checkpoint)) {
           throw new Error('Direct LINE source checkpoint or authority changed.');
         }
@@ -1249,7 +1408,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
             ids: [...page.tailWindow.ids] } }),
           ...(page.unreadCounts === undefined ? {} : { unreadCounts: { entries: page.unreadCounts.entries.map(([id, n]): [string, number] => [id, n]) } }),
           signal };
-        const committed: ExternalDirectPollResult = await committer.commitDirectPoll(poll);
+        const committed: ExternalDirectPollResult = await repository(() => committer.commitDirectPoll(poll));
         // The repository commits this cursor atomically with the page. Advance
         // the local predecessor only after that transaction resolves.
         checkpoint = poll.cursor;
@@ -1261,7 +1420,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         }
         return importCursor(checkpoint);
       },
-    });
+    }); } catch (error) {
+      await readinessDiagnosticClear;
+      const stage = readerReady ? 'runtime' : 'startup';
+      const phase = error instanceof ExternalMonitorDiagnosticFailure && error.phase ? error.phase : diagnosticPhase;
+      throw new ExternalMonitorDiagnosticFailure(classifyExternalMonitorFailure(error, stage), stage, externalMonitorFailureDetail(error), phase);
+    }
     } finally {
       await downloadAuthFlights.get(input.accountId)?.catch(() => false);
       const currentAccess = nativeMonitorAccess.get(input.accountId);
@@ -1301,7 +1465,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       externalImportOwner = { accountId, abort };
       const progressLog = !previousState?.initialImportComplete && options.externalImportProgressPath
         ? createFirstImportProgressLog(options.externalImportProgressPath, {
-          onError: (error) => console.warn('[external-import] progress log write failed:', error instanceof Error ? error.message : 'unknown'),
+          onError: (error) => options.audit?.failure(diagnosticFailure('external_monitor', 'write', error)),
         }) : null;
       let progressLogReady = false;
       let latestCompletedPage: number | null = null;
@@ -1324,8 +1488,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           let activeSnapshotDigest: string | null = null;
           let activeSourceIdentityDigest: string | null = null;
           if (previousState?.initialImportComplete && expectedSource) {
-            const fence = await externalMonitor.readBatchFence({ accountId, sourceId: expectedSource.sourceId,
-              generation: expectedSource.generation, signal: abort.signal });
+            let fence: Awaited<ReturnType<ExternalMonitorRepository['readBatchFence']>>;
+            try {
+              fence = await externalMonitor.readBatchFence({ accountId, sourceId: expectedSource.sourceId,
+                generation: expectedSource.generation, signal: abort.signal });
+            } catch (error) {
+              throw externalMonitorDatabaseFailure(error, 'startup');
+            }
             await runDirectMonitor({ accountId, ownMid: account.ownMid!, sourceId: expectedSource.sourceId,
               generation: expectedSource.generation, modeRevision: fence.expectedModeRevision,
               sourceIdentityDigest: previousState.sourceIdentityDigest, checkpoint: fence.expectedCheckpoint ?? {},
@@ -1484,11 +1653,15 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
               eligibleRows: externalImportProgress.get(accountId)?.eligibleRows ?? previousState?.eligibleCount ?? null,
               message: 'External monitoring paused.' });
           } else {
+            const monitorFailure = error instanceof ExternalMonitorDiagnosticFailure ? error : null;
+            const safeCode = monitorFailure?.code ?? null;
+            if (monitorFailure) await recordExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath, monitorFailure.stage, monitorFailure.code,
+              monitorFailure.detail, monitorFailure.phase, 'manual_start');
             setProgress({ stage: 'failed', copiedBytes: externalImportProgress.get(accountId)?.copiedBytes ?? null,
               totalBytes: externalImportProgress.get(accountId)?.totalBytes ?? null,
               committedRows: externalImportProgress.get(accountId)?.committedRows ?? previousState?.committedCount ?? '0',
               eligibleRows: externalImportProgress.get(accountId)?.eligibleRows ?? previousState?.eligibleCount ?? null,
-              message: error instanceof Error ? error.message.slice(0, 500) : 'LINE import failed.' });
+              message: safeCode ?? externalMonitorFailureDetail(error) ?? 'LINE import failed.' });
           }
         } finally {
           if (progressLog) await progressLog.close({ remove: false });
@@ -1525,8 +1698,19 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     const agent = authenticated.find((item) => item.productRole === 'AGENT');
     const control = await accounts.getControlState();
     if (control.activeAccountId === candidate.account_id || !await externalAdminAuthorized(agent, candidate.own_mid)) return;
-    const state = await externalMonitor.getInitialImportState({ accountId: candidate.account_id,
-      sourceId: candidate.source_id, generation });
+    let state: Awaited<ReturnType<ExternalMonitorRepository['getInitialImportState']>>;
+    try {
+      state = await externalMonitor.getInitialImportState({ accountId: candidate.account_id,
+        sourceId: candidate.source_id, generation });
+    } catch (error) {
+      const diagnostic = externalMonitorDatabaseFailure(error, 'startup');
+      await recordExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath, diagnostic.stage, diagnostic.code,
+        undefined, 'facade_checkpoint_fence', 'startup_resume');
+      externalImportProgress.set(candidate.account_id, { stage: 'failed', copiedBytes: null, totalBytes: null,
+        committedRows: '0', eligibleRows: null, message: diagnostic.code });
+      await publishSnapshot().catch(() => undefined);
+      return;
+    }
     if (closing || externalImportOwner || !state?.initialImportComplete || state.sourceIdentityDigest !== candidate.identity_digest) return;
     const abort = new AbortController();
     externalImportOwner = { accountId: candidate.account_id, abort };
@@ -1538,16 +1722,26 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       committedRows: state.committedCount, eligibleRows: state.eligibleCount, message: null });
     const task = track(async () => {
       try {
-        const fence = await externalMonitor.readBatchFence({ accountId: candidate.account_id, sourceId: candidate.source_id,
-          generation, signal: abort.signal });
+        let fence: Awaited<ReturnType<ExternalMonitorRepository['readBatchFence']>>;
+        try {
+          fence = await externalMonitor.readBatchFence({ accountId: candidate.account_id, sourceId: candidate.source_id,
+            generation, signal: abort.signal });
+        } catch (error) {
+          const failure = externalMonitorDatabaseFailure(error, 'startup');
+          throw new ExternalMonitorDiagnosticFailure(failure.code, failure.stage, failure.detail, 'facade_checkpoint_fence');
+        }
         await runDirectMonitor({ accountId: candidate.account_id, ownMid: candidate.own_mid, sourceId: candidate.source_id,
           generation, modeRevision: fence.expectedModeRevision,
           sourceIdentityDigest: candidate.identity_digest, checkpoint: fence.expectedCheckpoint ?? {}, signal: abort.signal, setProgress });
       } catch (error) {
+        const failureStage = error instanceof ExternalMonitorDiagnosticFailure ? error.stage : 'startup';
+        const failureCode = abort.signal.aborted ? null : classifyExternalMonitorFailure(error, failureStage);
+        if (failureCode) await recordExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath, failureStage, failureCode,
+          externalMonitorFailureDetail(error), error instanceof ExternalMonitorDiagnosticFailure ? error.phase : undefined, 'startup_resume');
         setProgress({ stage: abort.signal.aborted ? 'complete' : 'failed', copiedBytes: null, totalBytes: null,
           committedRows: state.committedCount, eligibleRows: state.eligibleCount,
           message: abort.signal.aborted ? 'External monitoring paused.'
-            : error instanceof Error ? error.message.slice(0, 500) : 'External monitoring failed.' });
+            : failureCode });
       } finally {
         if (externalImportOwner?.abort === abort) externalImportOwner = null;
         await publishSnapshot().catch(() => undefined);
@@ -1598,7 +1792,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return { identity: { mid: read.mid, displayName: read.displayName, ...(read.picturePath === undefined ? {} : { picturePath: read.picturePath }) }, candidateCount: read.candidateCount };
     } catch (error) {
       // Never log the MID; the reader error is a finite code.
-      console.warn('[external-admin-binding] official identity read failed:', error instanceof Error ? error.message.slice(0, 120) : 'unknown');
+      options.audit?.failure(diagnosticFailure('native_reader', 'read', error));
       // Only a finite machine code (bare, or `prefix:<code>`) reaches the renderer; any other text becomes `reader_failed`.
       const raw = error instanceof Error ? error.message : '';
       const last = raw.slice(raw.lastIndexOf(':') + 1);
@@ -1639,13 +1833,88 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       message: started.ok ? null : started.message };
   }
 
-  async function dispatch(request: IpcRequest): Promise<IpcResult> {
+  async function refreshOwnAvatar(accountId: string, requestId: string): Promise<IpcResult> {
+    const currentFlight = avatarRefreshFlights.get(accountId);
+    if (currentFlight) {
+      const result = await currentFlight;
+      return { ...result, requestId } as IpcResult;
+    }
+    const flight = (async (): Promise<IpcResult> => {
+      if (closing) return failure(requestId, 'SERVICE_CLOSING', 'Service is closing.');
+      const account = await accounts.getAccount(accountId);
+      const capability = await accounts.resolveCapabilities(accountId);
+      const binding = await options.workers.binding(accountId);
+      if (!account?.ownMid || !account.productRole || !['AGENT', 'PRIMARY_ADMIN'].includes(account.productRole)
+        || account.mode === 'PAUSED' || !binding
+        || capability?.connectionMode !== 'SYSTEM_LOGIN' || capability.selectedSourceType === 'EXTERNAL_MONITOR'
+        || capability.sourceState === 'FENCED' || capability.sourceState === 'RETIRED'
+        || binding.mode === 'PAUSED' || binding.purpose === 'DOWNLOAD_ONLY' || !options.workers.refreshOwnProfile
+        || !await accounts.canRefreshWorkerAvatar(binding, account.ownMid)) {
+        return failure(requestId, 'LINE_PROFILE_REFRESH_UNAVAILABLE', 'A connected signed-in LINE account is required.', true);
+      }
+      const capturedBinding = { ...binding };
+      try {
+        const profile = await options.workers.refreshOwnProfile({ ...capturedBinding, type: 'refreshOwnProfile', requestId, timeoutMs: 15_000 });
+        if (!profile.ok || profile.ownMid !== account.ownMid) return failure(requestId,
+          'LINE_PROFILE_REFRESH_FAILED', profile.error === 'PROFILE_MISMATCH' ? 'The LINE account identity changed. Refresh was discarded.' : 'LINE profile could not be refreshed.', true);
+        const [current, currentCapabilities, currentBinding] = await Promise.all([
+          accounts.getAccount(accountId), accounts.resolveCapabilities(accountId), options.workers.binding(accountId),
+        ]);
+        if (!current?.ownMid || current.ownMid !== account.ownMid || current.productRole !== account.productRole || current.mode === 'PAUSED'
+          || currentBinding?.workerInstanceId !== capturedBinding.workerInstanceId
+          || currentBinding.controlEpoch !== capturedBinding.controlEpoch || currentCapabilities?.connectionMode !== 'SYSTEM_LOGIN'
+          || currentCapabilities.selectedSourceType === 'EXTERNAL_MONITOR'
+          || currentCapabilities.sourceState !== capability.sourceState
+          || currentCapabilities.selectedSourceId !== capability.selectedSourceId
+          || currentCapabilities.selectedSourceGeneration !== capability.selectedSourceGeneration
+          || !await accounts.canRefreshWorkerAvatar(capturedBinding, current.ownMid)) {
+          return failure(requestId, 'LINE_PROFILE_REFRESH_STALE', 'The account connection changed during refresh. Try again.', true);
+        }
+        if (typeof profile.picturePath === 'string' && profile.picturePath.length > 0) await lineMedia.invalidateAvatar(profile.picturePath);
+        if (!await accounts.refreshWorkerAvatar(capturedBinding, profile.ownMid, profile.displayName, profile.picturePath)) {
+          return failure(requestId, 'LINE_PROFILE_REFRESH_STALE', 'The account connection changed during refresh. Try again.', true);
+        }
+        await publishSnapshot();
+        options.publish?.({ type: 'lineAvatarRefreshed', accountId, ownMid: profile.ownMid });
+        return { type: 'accepted', requestId, ok: true, ownMid: profile.ownMid };
+      } catch {
+        return failure(requestId, 'LINE_PROFILE_REFRESH_FAILED', 'LINE profile could not be refreshed.', true);
+      }
+    })();
+    const tracked = flight.finally(() => { if (avatarRefreshFlights.get(accountId) === tracked) avatarRefreshFlights.delete(accountId); });
+    avatarRefreshFlights.set(accountId, tracked);
+    return tracked;
+  }
+
+  async function noteOwnAvatarAccountConnected(accountId: string): Promise<void> {
+    const account = await accounts.getAccount(accountId);
+    ownAvatarRefreshScheduler?.noteConnected(accountId, account?.productRole ?? null);
+  }
+
+  async function runPeriodicOwnAvatarRefreshes(accountsToRefresh: readonly { accountId: string; productRole: string }[]): Promise<void> {
+    await runOwnAvatarRefreshes(accountsToRefresh,
+      (accountId) => refreshOwnAvatar(accountId, `periodic-avatar-${randomUUID()}`), () => !closing);
+  }
+
+  async function dispatch(request: IpcRequest, signal?: AbortSignal): Promise<IpcResult> {
     const requestId = request.requestId;
     try {
+      if (request.type === 'reportRendererFailure') {
+        options.audit?.failure({ operation: 'renderer', stage: 'execute', category: 'unknown', recovery: 'reopen_app' }, { requestId });
+        return accepted(requestId);
+      }
       if (request.type === 'getSnapshot') return { type: request.type, requestId: request.requestId, ok: true, snapshot: await publishSnapshot.read() };
       if (request.type === 'getConversationSettings') {
         if (conversationSettingsError) return failure(requestId, 'SETTINGS_LOAD_FAILED', conversationSettingsError, true);
         return { type: request.type, requestId, ok: true, settings: await settings.getConversationSettings() };
+      }
+      if (request.type === 'getManualUnsendWindow') {
+        const saved = await settings.getAppSetting('manual_unsend_window');
+        return { type: request.type, requestId, ok: true, window: saved === '7d' ? '7d' : '1h' };
+      }
+      if (request.type === 'setManualUnsendWindow') {
+        await settings.setAppSetting('manual_unsend_window', request.window);
+        return { type: request.type, requestId, ok: true, window: request.window };
       }
       if (request.type === 'setConversationSettings') {
         let resolve!: (value: IpcResult) => void;
@@ -1655,13 +1924,15 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           conversationSettings = request.settings;
           conversationSettingsError = null;
           attachmentService.setAutomaticAttemptLimit(request.settings.attachmentAutoAttemptLimit);
+          agentService.setStatusRotationIntervalSeconds(request.settings.agentStatusRotationIntervalSeconds);
           resolve({ type: request.type, requestId, ok: true, settings: request.settings });
-        }).catch((error: unknown) => { resolve(failure(requestId, 'SETTINGS_SAVE_FAILED', error instanceof Error ? error.message : 'Unable to save settings', true)); });
+        }).catch((error: unknown) => {
+          options.audit?.failure(diagnosticFailure('database', 'persist', error), { requestId });
+          resolve(failure(requestId, 'SETTINGS_SAVE_FAILED', 'Unable to save settings', true));
+        });
         return await result;
       }
       if (request.type === 'lineStart') {
-        const blockedCheck = guardedLoginBlock(request.requestId, request.accountId, request.confirmOfficialLogout); const blocked = blockedCheck ? await blockedCheck : null;
-        if (blocked) return blocked;
         return await supervisor.runLifecycle(async () => {
           await stopExternalImportForAccount(request.accountId);
           const account = await accounts.getAccount(request.accountId);
@@ -1670,6 +1941,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           await startStoredAccount(account);
           return accepted(request.requestId);
         });
+      }
+      if (request.type === 'refreshLineAvatar') {
+        return refreshOwnAvatar(request.accountId, request.requestId);
       }
       if (request.type === 'externalImportStop') {
         return await supervisor.runLifecycle(async () => {
@@ -1716,6 +1990,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return accepted(requestId);
       }
       if (request.type === 'lineLogout') {
+        // Dispatch has validated the logout request; invalidate before entering the async lifecycle lock.
+        chatResourceAdmission.close(request.accountId, 'LINE logout was requested.');
         return await supervisor.runLifecycle(async () => {
         await stopExternalImportForAccount(request.accountId);
         const account = await accounts.getAccount(request.accountId);
@@ -1751,7 +2027,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           const pairing = await adminPairings.begin(request.accountId);
           return { type: 'lineAdminPairing', requestId, ok: true, ...pairing };
         } catch (error) {
-          return failure(request.requestId, 'ADMIN_ALREADY_EXISTS', error instanceof Error ? error.message : '無法建立主要管理者驗證。');
+          options.audit?.failure(diagnosticFailure('ipc', 'execute', error), { requestId });
+          return failure(request.requestId, 'ADMIN_ALREADY_EXISTS', '無法建立主要管理者驗證。');
         }
       }
       if (request.type === 'switchControl') {
@@ -1787,6 +2064,88 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return result.status === 'failed'
           ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', result.error || 'LINE message was not sent.')
           : failure(request.requestId, 'LINE_SEND_OUTCOME_UNKNOWN', 'LINE send outcome is unknown.');
+      }
+      if (request.type === 'sendManualMedia') {
+        type ManualMediaAdmissionResult = { failure: { code: string; message: string } }
+          | { binding: Bound; chatType: 'direct' | 'group' };
+        const admission: ManualMediaAdmissionResult = await supervisor.runLifecycle(async (): Promise<ManualMediaAdmissionResult> => {
+          if (!await canWriteLine(request.accountId)) return { failure: { code: 'EXTERNAL_MONITOR_READ_ONLY', message: 'External monitoring is read-only.' } };
+          if (isLocalAgentRoom(request) || (request.chatType !== 'direct' && request.chatType !== 'group')) {
+            return { failure: { code: 'LINE_MEDIA_UNSUPPORTED_CHAT', message: 'Attachments can only be sent to direct and group chats.' } };
+          }
+          const account = await accounts.getAccount(request.accountId);
+          if (!account?.ownMid || (account.productRole !== 'AGENT' && account.productRole !== 'PRIMARY_ADMIN') || account.mode === 'PAUSED') {
+            return { failure: { code: 'ACCOUNT_NOT_READY', message: 'LINE account is not ready for manual sending.' } };
+          }
+          const current = await options.workers.binding(request.accountId);
+          if (!current || current.mode === 'PAUSED' || !options.workers.isCurrentManualSendBinding(current)) {
+            return { failure: { code: 'ACCOUNT_NOT_ACTIVE', message: 'LINE worker is not ready for manual sending.' } };
+          }
+          if (!lineService.isAuthenticatedReady(current)) return { failure: { code: 'ACCOUNT_NOT_READY', message: 'LINE account has not completed native login and connection readiness.' } };
+          if (request.files.length > 0 && !options.workers.sendMedia) return { failure: { code: 'LINE_MEDIA_UNAVAILABLE', message: 'LINE media sending is unavailable.' } };
+          return { binding: current, chatType: request.chatType as 'direct' | 'group' };
+        });
+        if ('failure' in admission) return failure(request.requestId, admission.failure.code, admission.failure.message);
+        if (signal?.aborted) return failure(request.requestId, 'LINE_SEND_NOT_STARTED', 'LINE attachment send was cancelled before staging.');
+        let staged: Awaited<ReturnType<typeof stageManualMedia>> | undefined;
+        try {
+          staged = await stageManualMedia(request.files, undefined, signal);
+          if (signal?.aborted) return failure(request.requestId, 'LINE_SEND_NOT_STARTED', 'LINE attachment send was cancelled before worker admission.');
+          for (const item of staged.items) {
+            const result = await options.workers.sendMedia!({ accountId: request.accountId, workerInstanceId: admission.binding.workerInstanceId,
+              controlEpoch: admission.binding.controlEpoch, chatType: admission.chatType, chatId: request.chatId, requestId: randomUUID(),
+              kind: item.kind, filePath: item.filePath, fileName: item.fileName, sizeBytes: item.sizeBytes, sha256: item.sha256,
+              manualSend: true }, signal);
+            if (result.status !== 'sent') return result.status === 'failed'
+              ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', result.error || 'LINE attachment was not sent.')
+              : failure(request.requestId, 'LINE_SEND_OUTCOME_UNKNOWN', 'LINE attachment outcome is unknown.');
+          }
+          return accepted(request.requestId);
+        } catch (error) {
+          if (error instanceof ManualMediaError) return failure(request.requestId, 'LINE_SEND_NOT_STARTED', error.message);
+          if (error instanceof ManualSendNotStartedError) return failure(request.requestId, 'LINE_SEND_NOT_STARTED', error.message);
+          return failure(request.requestId, 'LINE_SEND_OUTCOME_UNKNOWN', 'LINE send outcome is unknown.');
+        } finally { await staged?.cleanup().catch(() => undefined); }
+      }
+      if (request.type === 'unsendMessage') {
+        if (!['direct', 'group', 'room'].includes(request.chatType)) return failure(request.requestId, 'UNSEND_CHAT_UNSUPPORTED', 'This conversation does not support message unsend.');
+        const chatType = request.chatType as 'direct' | 'group' | 'room';
+        if (!options.workers.unsend) return failure(request.requestId, 'LINE_UNSEND_NOT_STARTED', 'LINE worker does not support message unsend.');
+        let resultPromise: Promise<Extract<LineWorkerEvent, { type: 'unsendResult' }>> | undefined;
+        let ownMid: string | undefined;
+        const admissionFailure = await supervisor.runLifecycle(async () => {
+          if (!await canWriteLine(request.accountId)) return { code: 'EXTERNAL_MONITOR_READ_ONLY', message: 'External monitoring is read-only.' };
+          if (isLocalAgentRoom(request)) return { code: 'LOCAL_ROUTE_DENIED', message: 'This conversation is local only.' };
+          const account = await accounts.getAccount(request.accountId);
+          if (!account?.ownMid || (account.productRole !== 'AGENT' && account.productRole !== 'PRIMARY_ADMIN') || account.mode === 'PAUSED') {
+            return { code: 'ACCOUNT_NOT_READY', message: 'LINE account is not ready to unsend messages.' };
+          }
+          const storedMessage = await messages.getMessage(request, request.messageId);
+          if (!storedMessage || storedMessage.senderId !== account.ownMid || storedMessage.content?.type === 'unsent' || storedMessage.sourceDeleted) {
+            return { code: 'MESSAGE_NOT_ELIGIBLE', message: 'Only your own unrecalled messages can be unsent.' };
+          }
+          const binding = await options.workers.binding(request.accountId);
+          if (!binding || binding.mode === 'PAUSED' || !options.workers.isCurrentManualSendBinding(binding)) {
+            return { code: 'ACCOUNT_NOT_ACTIVE', message: 'LINE worker is not ready to unsend messages.' };
+          }
+          if (!lineService.isAuthenticatedReady(binding)) return { code: 'ACCOUNT_NOT_READY', message: 'LINE account is not connected.' };
+          ownMid = account.ownMid;
+          resultPromise = options.workers.unsend!({ type: 'unsendMessage', ...binding, accountId: request.accountId,
+            chatType, chatId: request.chatId, requestId: request.requestId, messageId: request.messageId });
+          return null;
+        });
+        if (admissionFailure) return failure(request.requestId, admissionFailure.code, admissionFailure.message);
+        if (!resultPromise || !ownMid) return failure(request.requestId, 'LINE_UNSEND_NOT_STARTED', 'LINE account is not ready to unsend messages.');
+        const result = await resultPromise;
+        if (result.status === 'failed') return failure(request.requestId, 'LINE_UNSEND_NOT_STARTED', result.error || 'LINE message was not unsent.');
+        if (result.status === 'unknown') return failure(request.requestId, 'LINE_UNSEND_OUTCOME_UNKNOWN', 'LINE unsend outcome is unknown.');
+        try {
+          await messages.recordManualUnsend(request, request.messageId, ownMid);
+          return accepted(request.requestId);
+        } catch (error) {
+          options.audit?.failure(diagnosticFailure('unsendMessage', 'persist', error), { requestId });
+          return failure(request.requestId, 'LINE_UNSEND_RECONCILIATION_FAILED', 'LINE unsend succeeded but local reconciliation failed.');
+        }
       }
       // The shared Agent room is the operator's own: no LINE account, so no canWriteLine / ACTIVE_CONTROL gate.
       if (request.type === 'submitAgentRoomPrompt') {
@@ -1831,6 +2190,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       if (request.type === 'listMessages') { const page = await messages.listMessages(request, request.before, request.limit); return { type: request.type, requestId: request.requestId, ok: true, ...page }; }
       if (request.type === 'listAttachments') { const page = await messages.listAttachments(request, request.before, request.limit); return { type: request.type, requestId: request.requestId, ok: true, ...page }; }
+      if (request.type === 'listChatNotes') return { type: request.type, requestId: request.requestId, ok: true,
+        ...await chatResources.dispatchIpc(request, signal) };
+      if (request.type === 'getChatNote') return { type: request.type, requestId: request.requestId, ok: true,
+        ...await chatResources.dispatchIpc(request, signal) };
+      if (request.type === 'listChatAlbums') return { type: request.type, requestId: request.requestId, ok: true,
+        ...await chatResources.dispatchIpc(request, signal) };
+      if (request.type === 'listChatAlbumPhotos') return { type: request.type, requestId: request.requestId, ok: true,
+        ...await chatResources.dispatchIpc(request, signal) };
+      if (request.type === 'downloadChatAlbumPhoto') return { type: request.type, requestId: request.requestId, ok: true,
+        ...await chatResources.dispatchIpc(request, signal) };
+      if (request.type === 'openChatAlbum') return { type: request.type, requestId: request.requestId, ok: true,
+        ...await chatResources.dispatchIpc(request, signal) };
       if (request.type === 'getAutoResponderSettings') {
         return { type: request.type, requestId, ok: true, settings: await autoresponders.get() };
       }
@@ -1850,6 +2221,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (request.type === 'setWorkspace') { await workspace.configure(request.workspacePath); return accepted(request.requestId); }
       if (request.type === 'agentRefreshStatus') {
         const auth = await options.agent.agentRefreshStatus(request.provider);
+        if (auth.status === 'error') options.audit?.failure({ ...diagnosticFailure('provider_auth', 'authenticate'), provider: request.provider });
         applyProviderAuthStatus(health, {provider:request.provider,...auth});
         await publishSnapshot();
         return accepted(request.requestId);
@@ -1864,9 +2236,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         try {
           result = request.type === 'agentLogin' ? await options.agent.openLogin(request.provider) : await options.agent.logout(request.provider);
           if (correlationId) options.audit?.complete(correlationId, result.ok ? 'succeeded' : 'failed', result.ok
-            ? { resultCode: 'agent_auth_action_completed' } : { errorCode: 'AGENT_AUTH_FAILED' });
+            ? { resultCode: 'agent_auth_action_completed' } : { errorCode: 'AGENT_AUTH_FAILED',
+              diagnostic: { ...diagnosticFailure('provider_auth', 'authenticate'), provider: request.provider } });
         } catch (error) {
-          if (correlationId) options.audit?.complete(correlationId, 'failed', { errorCode: 'AGENT_AUTH_FAILED' });
+          if (correlationId) options.audit?.complete(correlationId, 'failed', { errorCode: 'AGENT_AUTH_FAILED',
+            diagnostic: { ...diagnosticFailure('provider_auth', 'authenticate', error), provider: request.provider } });
           throw error;
         }
         const auth = await options.agent.getAuthStatus(request.provider);
@@ -1875,12 +2249,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return result.ok ? accepted(request.requestId) : failure(request.requestId, 'AGENT_AUTH_FAILED', result.detail ?? 'Agent 登入操作失敗。');
       }
       if (request.type === 'lineLoginQr') {
-        const blockedCheck = guardedLoginBlock(request.requestId, request.accountId, request.confirmOfficialLogout); const blocked = blockedCheck ? await blockedCheck : null;
-        return blocked ?? await reloginAccountWithQr(request.accountId, request.requestId);
+        return await reloginAccountWithQr(request.accountId, request.requestId);
       }
       if (request.type === 'lineAddAccountQr') {
-        const blockedCheck = guardedLoginBlock(request.requestId, null, request.confirmOfficialLogout); const blocked = blockedCheck ? await blockedCheck : null;
-        if (blocked) return blocked;
         return await supervisor.runLifecycle(async () => {
         const account = await accounts.reserveAccountSlot();
         const binding = await options.workers.binding(account.accountId) ?? await startStoredAccount(account);
@@ -1891,8 +2262,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           state: 'connecting', message: null });
         try { await lineService.requestQrLogin(binding.accountId, binding.workerInstanceId, loginAttemptId); }
         catch (error) {
+          options.audit?.failure(diagnosticFailure('loginQr', 'dispatch', error), { accountId: binding.accountId, loginAttemptId });
           options.publish?.({ type: 'lineLoginState', accountId: binding.accountId, loginAttemptId,
-            state: 'degraded', message: error instanceof Error ? error.message : 'LINE QR 登入啟動失敗' });
+            state: 'degraded', message: 'LINE QR 登入啟動失敗' });
           throw error;
         }
         return accepted(request.requestId);
@@ -2049,7 +2421,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (error instanceof InvalidWorkspaceError) return failure(requestId, error.code, error.message);
       if (error instanceof McpDomainError) return failure(requestId, error.code, error.message);
       if (error instanceof LocalMcpConfigError) return failure(requestId, error.code, error.message);
-      return failure(requestId, 'SERVICE_ERROR', error instanceof Error ? error.message : '服務錯誤', true);
+      if (signal?.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError')))
+        return failure(requestId, 'CANCELLED', 'Chat resource request cancelled');
+      options.audit?.failure(diagnosticFailure('ipc', 'execute', error), { requestId, initiator: 'user' });
+      return failure(requestId, 'SERVICE_ERROR', 'The operation failed. See System Errors for diagnostic details.', true);
     }
   }
 
@@ -2065,12 +2440,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         || (owner.activeAccountId === account.accountId && account.productRole !== 'AGENT')) continue;
       const saved = await options.secretStore.load(account.accountId);
       if (!saved?.token) {
-        await accounts.setConnectionStatus(account.accountId, 'disconnected');
-        continue;
-      }
-      const official = options.officialLineSessionGuard
-        ? await options.officialLineSessionGuard.check({ accountId: account.accountId, ownMid: account.ownMid ?? null }) : 'not_running';
-      if (official === 'same_account' || official === 'unknown') {
         await accounts.setConnectionStatus(account.accountId, 'disconnected');
         continue;
       }
@@ -2121,7 +2490,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   });
 
   const facade: DesktopServiceFacade = {
-    dispatch: (request) => closing ? Promise.resolve(failure(request.requestId, 'SERVICE_CLOSING', 'Service is closing.')) : track(() => dispatch(request)),
+    dispatch: (request, signal) => {
+      if (closing) return Promise.resolve(failure(request.requestId, 'SERVICE_CLOSING', 'Service is closing.'));
+      if (request.type !== 'sendManualMedia') return track(() => dispatch(request, signal));
+      if (signal?.aborted) return Promise.resolve(failure(request.requestId, 'LINE_SEND_NOT_STARTED', 'LINE attachment send was cancelled before admission.'));
+      const lease = manualMediaAdmission.acquire(request.accountId, signal);
+      if (!lease) return Promise.resolve(failure(request.requestId, 'LINE_MEDIA_BUSY', 'Another attachment send is active or the media send limit is full.'));
+      return track(() => dispatch(request, lease.signal)).finally(() => lease.release());
+    },
     async openAttachment(attachmentId, senderId = -1) {
       if (closing) return false;
       return attachmentOpenService?.open(attachmentId, { senderId }) ?? false;
@@ -2189,16 +2565,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       const picturePath = result.rows[0]?.picture_path;
       return serve(picturePath ? lineMedia.avatarSource(picturePath) : null);
     },
-    async listMessages(key, cursor, limit) {
-      const page = await messages.listMessages(key, cursor, limit);
+    async listMessages(key, cursor, limit, exactMessageId) {
+      const page = exactMessageId
+        ? { messages: [await messages.getMessage(key, exactMessageId)].filter((item): item is NonNullable<typeof item> => item !== null), nextCursor: null }
+        : await messages.listMessages(key, cursor, limit);
       // External-monitor accounts mirror LINE's own unread count; opening a chat here must not clear it.
-      if (cursor === null && (await accounts.resolveCapabilities(key.accountId))?.connectionMode !== 'EXTERNAL_MONITOR') {
+      if (cursor === null && !exactMessageId && (await accounts.resolveCapabilities(key.accountId))?.connectionMode !== 'EXTERNAL_MONITOR') {
         await messages.markConversationRead(key);
       }
       const sticonRows = page.messages.length ? await options.pool.query<{ message_id: string; raw: unknown; text_content: string | null }>(
         `SELECT message_id,text_content,${boundedSticonRawSql()} raw
          FROM messages WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND message_id=ANY($4::text[]) LIMIT 100`,
-        [key.accountId, key.chatType, key.chatId, page.messages.slice(0, 100).map((item) => item.messageId)]) : { rows: [] };
+          [key.accountId, key.chatType, key.chatId, page.messages.slice(0, 100).map((item) => item.messageId)]) : { rows: [] };
       const sticonsById = new Map(sticonRows.rows.map((row) => {
         const raw = row.raw && typeof row.raw === 'object' && !Array.isArray(row.raw) ? row.raw as Record<string, unknown> : {};
         return [row.message_id, projectSticons(raw, row.text_content)] as const;
@@ -2313,6 +2691,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           canRetryManually: attachment.canRetryManually })) }); });
       return { messages: timeline, olderCursor: page.nextCursor };
     },
+    async listChatNotes(key, cursor) { return chatResources.listNotes(key, cursor); },
+    async getChatNote(key, postId) { return chatResources.getNote(key, postId); },
+    async listChatAlbums(key, cursor) { return chatResources.listAlbums(key, cursor); },
+    async listChatAlbumPhotos(key, albumId, cursor) { return chatResources.listAlbumPhotos(key, albumId, cursor); },
+    async downloadChatAlbumPhoto(key, albumId, photoId, oid, prefix) { return chatResources.downloadAlbumPhoto(key, albumId, photoId, oid, prefix); },
+    async openChatAlbum(key, albumId, signal) { return chatResources.openAlbum(key, albumId, signal); },
     async listAttachmentStates(key, attachmentIds) {
       return messages.listAttachmentStates(key, attachmentIds, conversationSettings.attachmentAutoAttemptLimit);
     },
@@ -2357,6 +2741,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     },
     shutdown() {
       closing = true;
+      manualMediaAdmission.shutdown();
       return shutdownPromise ??= (async () => {
         const errors: unknown[] = [];
         externalImportOwner?.abort.abort();
@@ -2365,6 +2750,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           for (const result of results) if (result.status === 'rejected') errors.push(result.reason);
         };
         const synchronousCleanup = [
+          () => chatResources.shutdown(),
+          () => ownAvatarRefreshScheduler?.shutdown(),
           () => { for (const timer of recoveryTimers) clearTimeout(timer); recoveryTimers.clear(); },
           () => unsubscribeAuth?.(), () => unsubscribeWorkerExit?.(), () => unsubscribeEvent?.(),
           () => unsubscribeBinding?.(), () => unsubscribeRestartBinding?.(), () => unsubscribeModeChange?.(),
@@ -2394,11 +2781,27 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   await options.beforeMcpListen?.();
   await mcpHttpServer.start();
   await agentService.recoverQueued();
-  void track(() => resumeExternalMonitorOnStartup()).catch((error: unknown) =>
-    console.warn('[external-monitor] startup resume failed:', error instanceof Error ? error.message : 'unknown'));
+  void track(() => resumeExternalMonitorOnStartup()).catch((error: unknown) => {
+    const stage = error instanceof ExternalMonitorDiagnosticFailure ? error.stage : 'startup';
+    const code = classifyExternalMonitorFailure(error, stage);
+    void recordExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath, stage, code, externalMonitorFailureDetail(error),
+      error instanceof ExternalMonitorDiagnosticFailure ? error.phase : 'facade_startup_selection', 'startup_resume');
+    console.warn('[external-monitor] startup resume failed:', code);
+  });
+  ownAvatarRefreshScheduler = createOwnAvatarRefreshScheduler(async (accounts) => {
+    try { await runPeriodicOwnAvatarRefreshes(accounts); }
+    catch (error) { options.audit?.failure(diagnosticFailure('refreshOwnProfile', 'recover', error)); throw error; }
+  });
+  ownAvatarRefreshScheduler.start(await accounts.listAuthenticatedAccounts());
   return { ...facade,
     openAttachment: (...args) => admitted(() => facade.openAttachment!(...args)),
     listMessages: (...args) => admitted(() => facade.listMessages(...args)),
+    listChatNotes: (...args) => admitted(() => chatResources.listNotes(...args)),
+    getChatNote: (...args) => admitted(() => chatResources.getNote(...args)),
+    listChatAlbums: (...args) => admitted(() => chatResources.listAlbums(...args)),
+    listChatAlbumPhotos: (...args) => admitted(() => chatResources.listAlbumPhotos(...args)),
+    downloadChatAlbumPhoto: (...args) => admitted(() => chatResources.downloadAlbumPhoto(...args)),
+    openChatAlbum: (...args) => admitted(() => chatResources.openAlbum(...args)),
     listAttachmentStates: (...args) => admitted(() => facade.listAttachmentStates(...args)),
     listAgentStatuses: (...args) => admitted(() => facade.listAgentStatuses(...args)),
     listWorkRecords: (...args) => admitted(() => facade.listWorkRecords(...args)),

@@ -1,8 +1,9 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, open, realpath, type FileHandle } from 'node:fs/promises';
 import { lstatSync } from 'node:fs';
 import path from 'node:path';
 import type { PreviewAuthority, PreviewRequester, PreviewRecord } from './attachment-preview.js';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
@@ -48,12 +49,14 @@ export class AttachmentOpenService {
   readonly #authority: PreviewAuthority;
   readonly #openPath: (file: string) => Promise<string>;
   readonly #afterAcquire: (() => Promise<void>) | undefined;
+  readonly #onDiagnostic: ((diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void) | undefined;
   readonly #handles = new Set<FileHandle>();
   readonly #cancelSubscribers = new Set<() => void>();
   #closed = false;
   #active = 0;
 
-  constructor(options: { root: string; authority: PreviewAuthority; openPath(file: string): Promise<string>; afterAcquire?: () => Promise<void> }) {
+  constructor(options: { root: string; authority: PreviewAuthority; openPath(file: string): Promise<string>; afterAcquire?: () => Promise<void>;
+    onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void }) {
     if (!path.isAbsolute(options.root)) throw new Error('Attachment root must be absolute');
     const configuredRoot = path.resolve(options.root), rootInfo = lstatSync(configuredRoot);
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error('Attachment root must be a managed directory');
@@ -61,6 +64,7 @@ export class AttachmentOpenService {
     this.#authority = options.authority;
     this.#openPath = options.openPath;
     this.#afterAcquire = options.afterAcquire;
+    this.#onDiagnostic = options.onDiagnostic;
   }
 
   open(attachmentId: string, requester: PreviewRequester): Promise<boolean> {
@@ -70,7 +74,11 @@ export class AttachmentOpenService {
     let cancel!: () => void;
     const cancelled = new Promise<boolean>((resolve) => { cancel = () => resolve(false); });
     this.#cancelSubscribers.add(cancel);
-    const operation = this.#doOpen(attachmentId, requester).catch(() => false)
+    const identity = { requestId: attachmentId, correlationId: randomUUID() };
+    const operation = this.#doOpen(attachmentId, requester, identity).catch((error: unknown) => {
+      if (!this.#closed) try { this.#onDiagnostic?.(diagnosticFailure('attachment', 'read', error), identity); } catch { /* observer only */ }
+      return false;
+    })
       .finally(() => { this.#active--; this.#cancelSubscribers.delete(cancel); });
     return Promise.race([operation, cancelled]).finally(() => this.#cancelSubscribers.delete(cancel));
   }
@@ -89,7 +97,7 @@ export class AttachmentOpenService {
     return Promise.resolve();
   }
 
-  async #doOpen(id: string, requester: PreviewRequester): Promise<boolean> {
+  async #doOpen(id: string, requester: PreviewRequester, identity: import('@line-agent/contracts').DiagnosticIdentity): Promise<boolean> {
     let source: HeldSource | null = null;
     try {
       const first = await this.#authority.lookup(id, requester);
@@ -118,6 +126,9 @@ export class AttachmentOpenService {
       if (this.#closed || !this.#sameIdentity(source, immediatelyBeforeLaunch)
         || !await this.#namedSourceIsSame(first.relativePath, source) || this.#closed) return false;
       const error = await this.#openPath(source.launchPath);
+      if (!this.#closed && error !== '') {
+        try { this.#onDiagnostic?.({ operation: 'attachment', stage: 'execute', category: 'unavailable', recovery: 'check_configuration', outcome: 'failed' }, { ...identity, accountId: first.accountId }); } catch { /* observer only */ }
+      }
       return !this.#closed && error === '';
     } finally {
       if (source) {

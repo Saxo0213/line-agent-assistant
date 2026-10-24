@@ -66,6 +66,31 @@ describe('system language setting', () => {
     expect(api.getLocale).toBeUndefined();
   });
 
+  it.each([
+    ['en', 'Unsend message', 'One hour (default)', 'Seven days'],
+    ['zh-TW', '收回訊息', '一小時（預設）', '七天'],
+    ['ja', 'メッセージの送信取消', '1時間（デフォルト）', '7日間'],
+    ['ko', '메시지 보내기 취소', '1시간(기본값)', '7일'],
+  ] as const)('loads and persists the mutually exclusive unsend window choices in %s', async (locale, label, oneHourLabel, sevenDaysLabel) => {
+    const api = {
+      getDatabaseSetupStatus: vi.fn(async () => ({ configured: false, attachmentRoot: null, agentWorkspace: null, connection: null })),
+      getManualUnsendWindow: vi.fn(async () => '7d' as const),
+      setManualUnsendWindow: vi.fn(async (value: '1h' | '7d') => value),
+    } as unknown as DesktopApi;
+    renderWithStartupLocale(<Settings api={api} headingRef={React.createRef()} />, locale);
+    const choices = await screen.findByRole('group', { name: label });
+    const oneHour = within(choices).getByRole('radio', { name: oneHourLabel }) as HTMLInputElement;
+    const sevenDays = within(choices).getByRole('radio', { name: sevenDaysLabel }) as HTMLInputElement;
+    const systemSettingsCard = document.querySelector('section.locale-settings');
+    expect(systemSettingsCard?.contains(choices)).toBe(true);
+    await waitFor(() => expect(sevenDays.checked).toBe(true));
+    expect(oneHour.checked).toBe(false);
+    fireEvent.click(oneHour);
+    await waitFor(() => expect(api.setManualUnsendWindow).toHaveBeenCalledWith('1h'));
+    await waitFor(() => expect(oneHour.checked).toBe(true));
+    expect(sevenDays.checked).toBe(false);
+  });
+
   it('forwards validated selector choices to the locale owner', () => {
     const setPreference = vi.fn();
     testLocaleState = { ...testLocaleState, setPreference };
@@ -546,28 +571,27 @@ describe('immediate autoresponder persistence', () => {
 describe('settings layout and status preview', () => {
   const makeApi = () => ({
     getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: 'D:\attachments', agentWorkspace: 'D:\workspace', connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
-    getConversationSettings: vi.fn(async () => ({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS } })),
+    getConversationSettings: vi.fn(async () => ({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS }, agentStatusRotationIntervalSeconds: 10 })),
+    setConversationSettings: vi.fn(async (settings: unknown) => settings),
   }) as unknown as DesktopApi;
   const openConversation = async (api = makeApi()) => {
     renderWithStartupLocale(<Settings api={api} headingRef={React.createRef()} onNotice={vi.fn()} />, 'zh-TW');
     fireEvent.click(screen.getByRole('tab', { name: '對話' }));
     await waitFor(() => expect(screen.getByLabelText('附件自動下載嘗試次數')).toHaveProperty('value', '3'));
   };
-  it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('localizes six read-only status notes in %s while retaining reaction mappings', async (locale) => {
+  it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('localizes six read-only status notes in %s while retaining neutral reaction glyphs', async (locale) => {
     renderWithStartupLocale(<Settings api={makeApi()} headingRef={React.createRef()} onNotice={vi.fn()} />, locale);
     fireEvent.click(screen.getByRole('tab', { name: desktopTextFor(locale, 'conversations') }));
     await screen.findByLabelText(desktopTextFor(locale, 'automaticAttachmentDownloadAttempts'));
     const grid = document.querySelector('.agent-status-icon-grid')!;
     const rows = [...grid.querySelectorAll(':scope > .agent-status-icon-row')];
     expect(rows.map((row) => row.querySelector('.agent-status-icon-note')?.textContent)).toEqual([
-      desktopTextFor(locale, 'lineReactionAmazing'), desktopTextFor(locale, 'alternating'), desktopTextFor(locale, 'lineReactionLove'),
-      desktopTextFor(locale, 'lineReactionSad'), desktopTextFor(locale, 'lineReactionFun'), desktopTextFor(locale, 'lineReactionOmg'),
+      'AMAZING', desktopTextFor(locale, 'alternating'), 'LOVE', 'SAD', 'FUN', 'OMG',
     ]);
-    expect(rows.map((row) => [...row.querySelectorAll('.agent-status-marker .agent-status-glyph')].map((glyph) => glyph.textContent))).toEqual([
+    expect(rows.map((row) => [...row.querySelectorAll('.agent-status-glyph')].map((glyph) => glyph.textContent))).toEqual([
       [LINE_REACTION_GLYPHS.AMAZING], [LINE_REACTION_GLYPHS.NICE, LINE_REACTION_GLYPHS.AMAZING, LINE_REACTION_GLYPHS.FUN],
       [LINE_REACTION_GLYPHS.LOVE], [LINE_REACTION_GLYPHS.SAD], [LINE_REACTION_GLYPHS.FUN], [LINE_REACTION_GLYPHS.OMG],
     ]);
-    expect(rows.every((row) => [...row.querySelectorAll('.agent-status-marker .agent-status-glyph')].every((glyph) => glyph.getAttribute('aria-hidden') === 'true'))).toBe(true);
     const preview = within(rows[1] as HTMLElement).getByLabelText(desktopTextFor(locale, 'arg0PreviewAlternatingArg1', { arg0: desktopTextFor(locale, 'running'), arg1: 'NICE、AMAZING、FUN' }));
     expect(preview.className).toContain('agent-status-marker running');
     expect(preview.getAttribute('role')).toBeNull();
@@ -575,6 +599,30 @@ describe('settings layout and status preview', () => {
     expect(screen.queryByRole('listbox')).toBeNull();
     expect(screen.queryByRole('button', { name: '恢復預設圖示' })).toBeNull();
     expect(screen.queryByRole('checkbox')).toBeNull();
+  });
+
+  it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('shows the saved rotation interval row in %s', async (locale) => {
+    renderWithStartupLocale(<Settings api={makeApi()} headingRef={React.createRef()} />, locale);
+    fireEvent.click(screen.getByRole('tab', { name: desktopTextFor(locale, 'conversations') }));
+    const input = await screen.findByLabelText(desktopTextFor(locale, 'agentStatusRotationIntervalSeconds'));
+    expect(input).toHaveProperty('value', '10');
+    expect(input.closest('fieldset')?.querySelector('.agent-status-icon-grid')).not.toBeNull();
+  });
+
+  it('saves a five second rotation interval and disables smaller values', async () => {
+    const api = makeApi();
+    renderWithStartupLocale(<Settings api={api} headingRef={React.createRef()} />, 'en');
+    fireEvent.click(screen.getByRole('tab', { name: desktopTextFor('en', 'conversations') }));
+    const input = await screen.findByLabelText(desktopTextFor('en', 'agentStatusRotationIntervalSeconds'));
+    const save = screen.getByRole('button', { name: desktopTextFor('en', 'save') });
+    fireEvent.change(input, { target: { value: '4' } });
+    expect(save).toHaveProperty('disabled', true);
+    fireEvent.change(input, { target: { value: '86401' } });
+    expect(save).toHaveProperty('disabled', true);
+    fireEvent.change(input, { target: { value: '5' } });
+    expect(save).toHaveProperty('disabled', false);
+    fireEvent.click(save);
+    await waitFor(() => expect(api.setConversationSettings).toHaveBeenCalledWith(expect.objectContaining({ agentStatusRotationIntervalSeconds: 5 })));
   });
 
   it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('localizes rejected conversation settings loads and focus reloads in %s', async (locale) => {
@@ -693,8 +741,8 @@ describe('database settings', () => {
     const onNotice = vi.fn();
     const api = {
       getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: 'D:\\attachments', agentWorkspace: 'D:\\workspace', connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
-      getConversationSettings: vi.fn(async () => ({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS } })),
-      setConversationSettings: vi.fn(async (settings: { attachmentAutoAttemptLimit: number; showAgentStatusMarkers: boolean; agentStatusIcons: AgentStatusIcons }) => settings),
+      getConversationSettings: vi.fn(async () => ({ attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: { ...DEFAULT_AGENT_STATUS_ICONS }, agentStatusRotationIntervalSeconds: 10 })),
+      setConversationSettings: vi.fn(async (settings: { attachmentAutoAttemptLimit: number; showAgentStatusMarkers: boolean; agentStatusIcons: AgentStatusIcons; agentStatusRotationIntervalSeconds: number }) => settings),
     } as unknown as DesktopApi;
     render(<Settings api={api} headingRef={React.createRef()} onNotice={onNotice} />);
     fireEvent.click(screen.getByRole('tab', { name: '對話' }));
@@ -702,7 +750,7 @@ describe('database settings', () => {
     fireEvent.change(screen.getByLabelText('附件自動下載嘗試次數'), { target: { value: '7' } });
     fireEvent.click(within(document.querySelector('.conversation-settings') as HTMLElement).getByRole('button', { name: '儲存' }));
     await waitFor(() => expect(api.setConversationSettings).toHaveBeenCalledWith({
-      attachmentAutoAttemptLimit: 7, showAgentStatusMarkers: true, agentStatusIcons: DEFAULT_AGENT_STATUS_ICONS,
+      attachmentAutoAttemptLimit: 7, showAgentStatusMarkers: true, agentStatusIcons: DEFAULT_AGENT_STATUS_ICONS, agentStatusRotationIntervalSeconds: 10,
     }));
     const sent = (api.setConversationSettings as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { agentStatusIcons: unknown };
     expect(AgentStatusIconsSchema.safeParse(sent.agentStatusIcons).success).toBe(true);

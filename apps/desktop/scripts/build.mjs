@@ -28,6 +28,7 @@ export async function buildDesktop({ sourcemap = true, minify = false } = {}) {
   await viteBuild({ configFile: path.join(root, 'vite.config.ts') });
   if (process.platform === 'win32' && process.arch === 'x64') {
     execFileSync(process.execPath, [path.join(root, 'scripts', 'build-js-external-reader.mjs'), ...(minify ? ['--minify'] : [])], { stdio: 'inherit', windowsHide: true });
+    execFileSync(process.execPath, [path.join(root, 'scripts', 'build-chat-resource-archive.mjs')], { stdio: 'inherit', windowsHide: true });
   }
   const scripts = path.join(root, 'dist', 'scripts');
   await mkdir(scripts, { recursive: true });

@@ -108,6 +108,32 @@ it('keeps poll and text sends moving while the independent Reaction lane is unre
   releaseReaction();
 });
 
+it('cancels a resource read without fencing later authorized sends', async () => {
+  const channel = port();
+  const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+  let readSignal: AbortSignal | undefined;
+  transport.readChatResource = async (_command, options) => await new Promise((_resolve, reject) => {
+    readSignal = options.signal;
+    options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+  });
+  runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
+  const request = { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch,
+    chatType: 'group' as const, chatId: 'c-group', requestId: 'read-cancelled', action: 'listNotes' as const, timeoutMs: 10_000 };
+  channel.post({ type: 'chatResourceRead', ...request });
+  await vi.waitFor(() => expect(readSignal).toBeDefined());
+  channel.post({ type: 'cancelChatResourceRead', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+    controlEpoch: binding.controlEpoch, chatType: request.chatType, chatId: request.chatId, requestId: request.requestId });
+  await vi.waitFor(() => expect(readSignal?.aborted).toBe(true));
+  await vi.waitFor(() => expect(channel.events).toContainEqual(expect.objectContaining({
+    type: 'chatResourceResult', requestId: request.requestId, error: 'CANCELLED' })));
+  await channel.send({ type: 'sendText', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'after-cancel',
+    text: 'authorized send', replyToMessageId: null });
+  await vi.waitFor(() => expect(transport.sendCalls).toHaveLength(1));
+  expect(channel.events).toContainEqual(expect.objectContaining({ type: 'sendResult', requestId: 'after-cancel', status: 'sent' }));
+});
+
 it('bounds Reaction work to one active and one coalesced pending command per worker', async () => {
   const channel = port();
   let releaseFirst!: () => void;
@@ -159,6 +185,17 @@ it('binds the port to its first account and emits a correlated grant acknowledge
   expect(channel.events.at(-1)).toMatchObject({ type: 'error', ...binding, code: 'INVALID_COMMAND' });
 });
 
+it('retains command and admission stage without exposing rejected command content', async () => {
+  const channel = port();
+  runWorkerLoopOnPort(channel, async () => new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' }));
+  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'history', ...binding, accountId: 'other-account', chatType: 'direct', chatId: 'private-chat',
+    requestId: 'history-request', cursor: null, limit: 10 });
+  expect(channel.events.at(-1)).toMatchObject({ type: 'error', code: 'INVALID_COMMAND', requestId: 'history-request',
+    diagnostic: { operation: 'history', stage: 'admission', category: 'unknown' } });
+  expect(JSON.stringify(channel.events.at(-1))).not.toContain('private-chat');
+});
+
 it('rejects a cross-binding addFriendByMid command before it reaches the worker transport', async () => {
   const channel = port();
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
@@ -192,6 +229,21 @@ it('reports login timeouts through a fixed correlated diagnostic without exposin
     code: 'LOGIN_TIMEOUT', message: 'LINE login timed out. Try again.' });
   expect(JSON.stringify(channel.events)).not.toContain('token abc');
   expect(channel.events.some((event) => event.type === 'error' && event.code === 'INVALID_COMMAND')).toBe(false);
+});
+
+it('classifies a rejected history command with a fixed safe operation code', async () => {
+  const channel = port();
+  const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+  Object.defineProperty(transport, 'history', { value: async () => { throw new Error('private chat text and access token'); } });
+  runWorkerLoopOnPort(channel, async () => transport);
+  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'history', ...binding, chatType: 'direct', chatId: `u${'a'.repeat(32)}`,
+    requestId: 'history-1', cursor: null, limit: 20 });
+
+  expect(channel.events.at(-1)).toMatchObject({ type: 'error', code: 'HISTORY_READ_FAILED',
+    message: 'LINE chat history could not be read.' });
+  expect(JSON.stringify(channel.events)).not.toContain('private chat text');
+  expect(JSON.stringify(channel.events)).not.toContain('access token');
 });
 
 it('maps the exact local stale-attempt rejection to the replacement code', async () => {
@@ -230,7 +282,7 @@ it('lets a triggered authentication invalidation own the terminal result', async
   expect(JSON.stringify(channel.events)).not.toContain('private data');
 });
 
-it('keeps non-login command rejections on the generic invalid command path', async () => {
+it('classifies a failed credential restore without exposing the exception', async () => {
   const channel = port();
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   runWorkerLoopOnPort(channel, async () => transport);
@@ -239,7 +291,8 @@ it('keeps non-login command rejections on the generic invalid command path', asy
     secrets: { token: null, qrCert: null, e2eeStorage: null } });
   await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'second-attempt',
     secrets: { token: null, qrCert: null, e2eeStorage: null } });
-  expect(channel.events.at(-1)).toMatchObject({ type: 'error', code: 'INVALID_COMMAND' });
+  expect(channel.events.at(-1)).toMatchObject({ type: 'error', code: 'CREDENTIAL_RESTORE_FAILED',
+    message: 'LINE credentials could not be restored.' });
 });
 
 it('serializes commands received while the LINE transport is still initializing', async () => {

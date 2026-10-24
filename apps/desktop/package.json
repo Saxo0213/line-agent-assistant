@@ -2,7 +2,7 @@
   "name": "@line-agent/desktop",
   "private": true,
   "type": "module",
-  "version": "1.0.207",
+  "version": "1.0.238",
   "description": "Windows desktop console for LINE account automation with subscription agent CLIs",
   "author": "LINE Agent Assistant contributors",
   "main": "dist/main.js",
@@ -11,6 +11,7 @@
     "start": "electron .",
     "build": "node scripts/build.mjs",
     "build:native:js-external-reader": "node scripts/build-js-external-reader.mjs",
+    "verify:desktop-lifecycle": "node scripts/desktop-lifecycle-verify.mjs",
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "test": "vitest run src"
   },

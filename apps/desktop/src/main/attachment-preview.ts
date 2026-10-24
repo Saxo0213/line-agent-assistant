@@ -1,4 +1,5 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { lstat, open, realpath, type FileHandle, mkdir, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { ChatType } from '@line-agent/contracts';
@@ -291,6 +292,7 @@ async function readHeldBytes(source: { handle: FileHandle; target: string }, max
 }
 
 export class AttachmentPreviewService {
+  readonly #onDiagnostic: ((diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void) | undefined;
   readonly #root: string;
   readonly #cacheRoot: string | null;
   readonly #authority: PreviewAuthority;
@@ -306,12 +308,14 @@ export class AttachmentPreviewService {
   #pendingCacheWrites = 0;
   readonly #activeImageReads = new Set<AbortController>();
 
-  constructor(options: { root: string; cacheRoot?: string; authority: PreviewAuthority; presenter: PreviewPresenter; now?: () => number; limits?: Partial<PreviewLimits> }) {
+  constructor(options: { root: string; cacheRoot?: string; authority: PreviewAuthority; presenter: PreviewPresenter; now?: () => number; limits?: Partial<PreviewLimits>;
+    onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void }) {
     if (options.cacheRoot && pathsOverlap(options.root, options.cacheRoot)) throw new Error('Preview cache must be separate from attachment storage');
     this.#root = options.root;
     this.#cacheRoot = options.cacheRoot ?? null;
     this.#authority = options.authority;
     this.#presenter = options.presenter;
+    this.#onDiagnostic = options.onDiagnostic;
     this.#now = options.now ?? Date.now;
     this.#limits = { ...DEFAULT_LIMITS, ...options.limits };
   }
@@ -443,6 +447,7 @@ export class AttachmentPreviewService {
   async open(attachmentId: string, requester: PreviewRequester): Promise<boolean> {
     if (this.#shutDown || !UUID.test(attachmentId) || !Number.isSafeInteger(requester.senderId) || requester.senderId < 0) return false;
     const generation = this.#generation;
+    const identity = { requestId: attachmentId, correlationId: randomUUID() };
     let revokeIssued = () => {};
     try {
       const record = await this.#authority.lookup(attachmentId, requester);
@@ -478,7 +483,8 @@ export class AttachmentPreviewService {
       });
       if (!presented || !this.#isCurrent(generation)) revokeIssued();
       return presented && issued && this.#isCurrent(generation);
-    } catch {
+    } catch (error) {
+      if (this.#isCurrent(generation)) try { this.#onDiagnostic?.(diagnosticFailure('attachment', 'read', error), identity); } catch { /* observer only */ }
       revokeIssued();
       return false;
     }

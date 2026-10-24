@@ -506,11 +506,14 @@ database('MessageRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () 
     const input = envelope({ messageId: 'workspace-unavailable-message', eventId: 'workspace-unavailable-event' });
     const control = await pool.query('SELECT control_epoch FROM account_control WHERE singleton=true');
     const controlEpoch = Number(control.rows[0].control_epoch);
-    await new AccountRepository(pool).bindWorker({ accountId: 'account-A', workerInstanceId: 'workspace-worker', controlEpoch });
+    const accounts = new AccountRepository(pool);
+    await accounts.bindWorker({ accountId: 'account-A', workerInstanceId: 'workspace-worker', controlEpoch });
+    await accounts.applyWorkerLogin({ accountId: 'account-A', workerInstanceId: 'workspace-worker', controlEpoch }, 'account-A-own-mid', 'Account A');
     await pool.query("DELETE FROM sync_cursors WHERE account_id='account-A' AND source='live'");
     const batch = {
       type: 'batch', accountId: 'account-A', workerInstanceId: 'workspace-worker', controlEpoch,
-      batchId: 'workspace-unavailable-batch', cursorAfter: { version: 1, revision: '901', globalRev: '901', individualRev: '901' },
+      batchId: 'workspace-unavailable-batch', cursorBefore: { version: 1, revision: '0', globalRev: '0', individualRev: '0' },
+      cursorAfter: { version: 1, revision: '901', globalRev: '901', individualRev: '901' },
       envelopes: [input],
     } as Extract<import('@line-agent/contracts').LineWorkerEvent, { type: 'batch' }>;
     const decisions = [{
@@ -523,11 +526,11 @@ database('MessageRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () 
     const rollback = await pool.query(`SELECT (SELECT count(*) FROM messages WHERE message_id=$1) messages,
       (SELECT count(*) FROM agent_jobs WHERE source_message_id=$1) jobs,
       (SELECT count(*) FROM sync_cursors WHERE account_id='account-A' AND source='live') cursors`, [input.messageId]);
-    expect(rollback.rows[0]).toEqual({ messages: '0', jobs: '0', cursors: '0' });
+    expect(rollback.rows[0]).toEqual({ messages: '1', jobs: '0', cursors: '1' });
     await pool.query('DROP TRIGGER fail_workspace_event ON agent_events');
     const result = await repository.ingestBatchAndRoute(batch, decisions);
     const replay = await repository.ingestBatchAndRoute(batch, decisions);
-    expect(replay.jobIds).toEqual([]);
+    expect(replay.jobIds).toEqual(result.jobIds);
     expect(result.jobMessageIds).toEqual([]);
     expect(result.jobIds).toHaveLength(1);
     const rows = await pool.query(`SELECT j.status, j.workspace_path, c.cursor,

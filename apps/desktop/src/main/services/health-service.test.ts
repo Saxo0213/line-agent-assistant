@@ -4,7 +4,7 @@ import type { Pool } from 'pg';
 import { createTestDatabase } from '../../../../../packages/database/src/test-database.js';
 import { AccountRepository, AgentRepository, MessageRepository, SettingsRepository } from '../../../../../packages/database/src/index.js';
 import { AppSnapshotSchema } from '@line-agent/contracts';
-import { HealthService, mapConversation } from './health-service.js';
+import { boundedNotificationProjectionSql, HealthService, mapConversation } from './health-service.js';
 
 describe('localized preview metadata', () => {
   const row: Parameters<typeof mapConversation>[0] = {
@@ -30,6 +30,26 @@ describe('localized preview metadata', () => {
     expect(mapConversation({ ...row, latest_content: event }).latestMessageDisplay).toBeUndefined();
     expect(mapConversation({ ...row, latest_content: { ...event, text: null } }).latestMessageDisplay).toEqual({ kind: 'chat_event' });
     expect(mapConversation({ ...row, latest_source_deleted: true, latest_text: '原始文字' }).latestMessageDisplay).toEqual({ kind: 'deleted' });
+  });
+  it('projects Note and Album notification labels from stored metadata and keeps recall priority', () => {
+    const event = { format: 1 as const, type: 'event' as const, nativeContentType: 16, text: 'POSTNOTIFICATION' };
+    const note = mapConversation({ ...row, latest_text: 'POSTNOTIFICATION', latest_content: event, latest_notification_projection: { serviceType: 'GB' } });
+    const album = mapConversation({ ...row, latest_text: 'POSTNOTIFICATION', latest_content: event, latest_notification_projection: { serviceType: 'AB' } });
+    expect(note).toMatchObject({ latestMessagePreview: '記事本通知', latestMessageDisplay: { kind: 'post_note' } });
+    expect(album).toMatchObject({ latestMessagePreview: '相簿通知', latestMessageDisplay: { kind: 'post_album' } });
+    expect(mapConversation({ ...row, latest_text: 'POSTNOTIFICATION', latest_content: event, latest_notification_projection: { serviceType: 'UNKNOWN' } }))
+      .toMatchObject({ latestMessagePreview: '貼文通知', latestMessageDisplay: { kind: 'post' } });
+    expect(mapConversation({ ...row, latest_content: event, latest_notification_projection: { serviceType: 'GB' }, latest_source_deleted: true }))
+      .toMatchObject({ latestMessagePreview: '已刪除訊息', latestMessageDisplay: { kind: 'deleted' } });
+    expect(mapConversation({ ...row, latest_text: 'POSTNOTIFICATION', latest_content: event,
+      latest_notification_projection: { contentType: 16, metadataText: '{"serviceType":"AB"}' } }))
+      .toMatchObject({ latestMessagePreview: '相簿通知', latestMessageDisplay: { kind: 'post_album' } });
+    expect(mapConversation({ ...row, latest_text: 'POSTNOTIFICATION', latest_content: event,
+      latest_notification_projection: { contentType: 16, metadataText: '{bad' } }))
+      .toMatchObject({ latestMessagePreview: '貼文通知', latestMessageDisplay: { kind: 'post' } });
+    expect(mapConversation({ ...row, latest_text: 'POSTNOTIFICATION', latest_content: event,
+      latest_notification_projection: { contentType: 16, metadataText: 'base64:/w==' } }))
+      .toMatchObject({ latestMessagePreview: '貼文通知', latestMessageDisplay: { kind: 'post' } });
   });
 });
 
@@ -139,6 +159,12 @@ describe('snapshot hot path', () => {
     const snapshot = await health.snapshot();
 
     expect(status).not.toHaveBeenCalled();
+    const conversationSql = String(query.mock.calls[2]?.[0]);
+    expect(conversationSql).toContain("m.content->>'nativeContentType'='16'");
+    expect(conversationSql).toContain("THEN jsonb_build_object('serviceType', m.raw#>>'{message,contentMetadata,serviceType}')");
+    expect(conversationSql).toContain('latest.notification_projection latest_notification_projection');
+    expect(conversationSql).not.toContain('latest.notification_raw latest_raw');
+    expect(conversationSql).not.toContain('m.kind, m.raw,');
     expect(snapshot.providers.map((provider) => provider.status)).toEqual(['unknown', 'unknown']);
     expect(snapshot.conversations).toContainEqual(expect.objectContaining({ chatId: 'g',
       latestMessagePreview: '圖面.pdf（下載中）', latestAttachmentStatus: 'downloading' }));
@@ -293,6 +319,57 @@ database('authoritative health snapshot', () => {
   let pool: Pool; let close: () => Promise<void>;
   beforeAll(async () => { ({ pool, close } = await createTestDatabase()); });
   afterAll(async () => { await close?.(); });
+  it('bounds notification SQL projections before oversized raw cells leave PostgreSQL', async () => {
+    const live = { message: { contentType: 16, contentMetadata: { serviceType: 'GB', extra: 'x'.repeat(100_000) } }, unrelated: 'y'.repeat(100_000) };
+    const nativeRaw = (metadata: unknown, typeCell: unknown = { sqliteType: 'integer', value: '16' }) => ({ native: { format: 2, encoding: 'plain', table: '_message', row: {
+      columns: ['_contentType', '_contentMetadata'], cells: [typeCell, metadata],
+    } } });
+    const hugeAncillary = 'oversized-ancillary-field-' + 'z'.repeat(100_000);
+    const noteMetadata = '{"serviceType":"GB"}';
+    const inputs = [
+      { name: 'live', raw: live, content: { format: 1, type: 'event', nativeContentType: 16 } },
+      { name: 'native-oversized-string', raw: nativeRaw('x'.repeat(16_385)), content: { format: 1, type: 'event', nativeContentType: 16 } },
+      { name: 'native-oversized-base64', raw: nativeRaw({ sqliteType: 'blob', encoding: 'base64', data: 'eA=='.repeat(6_000) }), content: { format: 1, type: 'event', nativeContentType: 16 } },
+      { name: 'native-note', raw: nativeRaw('{"serviceType":"GB"}'), content: { format: 1, type: 'event', nativeContentType: 16 } },
+      { name: 'native-album', raw: nativeRaw('{"serviceType":"AB"}'), content: { format: 1, type: 'event', nativeContentType: 16 } },
+      { name: 'native-huge-type-cell-ancillary', raw: nativeRaw(noteMetadata, { sqliteType: 'integer', value: '16', data: hugeAncillary }), content: { format: 1, type: 'event', nativeContentType: 16 } },
+      { name: 'native-huge-metadata-cell-ancillary', raw: nativeRaw({ sqliteType: 'text', encoding: 'base64', data: Buffer.from(noteMetadata).toString('base64'), extra: hugeAncillary }), content: { format: 1, type: 'event', nativeContentType: 16 } },
+    ];
+    const projections = await Promise.all(inputs.map(async ({ raw, content }) => {
+      const result = await pool.query<{ projected: unknown; bytes: number | null }>(
+        `SELECT projection.projected, octet_length(projection.projected::text) AS bytes
+         FROM (SELECT 'event'::text AS kind, $2::jsonb AS content, $1::jsonb AS raw) m
+         CROSS JOIN LATERAL (SELECT
+           (SELECT (m.raw#>'{native,row,cells}') -> (c.ordinality - 1)::int
+            FROM jsonb_array_elements_text(m.raw#>'{native,row,columns}') WITH ORDINALITY c(value, ordinality)
+            WHERE c.value='_contentType' LIMIT 1) AS content_type,
+           (SELECT (m.raw#>'{native,row,cells}') -> (c.ordinality - 1)::int
+            FROM jsonb_array_elements_text(m.raw#>'{native,row,columns}') WITH ORDINALITY c(value, ordinality)
+            WHERE c.value='_contentMetadata' LIMIT 1) AS metadata) native_fields
+         CROSS JOIN LATERAL (SELECT ${boundedNotificationProjectionSql} AS projected) projection`, [raw, content]);
+      return result.rows[0]!;
+    }));
+    expect(projections[0]!.bytes).toBeLessThan(200);
+    expect(projections[0]!.projected).toEqual({ serviceType: 'GB' });
+    expect(projections[1]!.projected).toBeNull();
+    expect(projections[2]!.projected).toBeNull();
+    expect(projections[3]!.bytes).toBeLessThan(200);
+    expect(projections[4]!.bytes).toBeLessThan(200);
+    expect(projections[5]!.projected).toEqual({ contentType: 16, metadataText: noteMetadata });
+    expect(projections[6]!.projected).toEqual({ contentType: 16, metadataText: `base64:${Buffer.from(noteMetadata).toString('base64')}` });
+    expect(projections[5]!.bytes).toBeLessThan(200);
+    expect(projections[6]!.bytes).toBeLessThan(200);
+    expect(JSON.stringify(projections[5]!.projected)).not.toContain(hugeAncillary);
+    expect(JSON.stringify(projections[6]!.projected)).not.toContain(hugeAncillary);
+    expect(projections[5]!.projected).not.toHaveProperty('native');
+    expect(projections[5]!.projected).not.toHaveProperty('cells');
+    for (const [index, expected] of [[3, 'note'], [4, 'album'], [5, 'note'], [6, 'note']] as const) {
+      expect(mapConversation({ account_id: 'a', chat_type: 'group', chat_id: 'g', title: 'G', agent_enabled: false, default_provider: 'codex',
+        unread_count: 0, latest_text: 'POSTNOTIFICATION', latest_content: inputs[index]!.content as never, latest_notification_projection: projections[index]!.projected,
+        latest_occurred_at: null, latest_attachment_name: null, latest_attachment_kind: null, latest_attachment_status: null }))
+        .toMatchObject({ latestMessageDisplay: { kind: expected === 'note' ? 'post_note' : 'post_album' } });
+    }
+  });
   it('finds old task matches beyond snapshot limits, respects sources and filters, and pages ties without duplicates', async () => {
     const rows = Array.from({ length: 105 }, (_, index) => ({ jobId: randomUUID(), at: new Date(Date.UTC(2010, 0, index + 1)),
       prompt: index === 0 ? 'target prompt' : `bulk ${index}`, provider: index === 0 ? 'codex' as const : 'claude' as const,

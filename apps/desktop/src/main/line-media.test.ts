@@ -129,6 +129,25 @@ describe('fixed LINE media reads', () => {
   afterEach(() => { for (const service of services.splice(0)) service.shutdown(); });
   afterAll(async () => { await rm(ROOT, { recursive: true, force: true }); });
 
+  it('reports HTTP failure once per flight without remote text and keeps success/cancel quiet', async () => {
+    const reports: unknown[][] = [];
+    let status = 500;
+    const service = createService({ fetch: async () => new Response(status === 200 ? PNG : 'private-response-sentinel',
+      { status, headers: { 'content-type': 'image/png' } }), onDiagnostic: (...args) => { reports.push(args); } });
+    services.push(service);
+    expect((await service.handle(service.avatarSource('https://profile.line-scdn.net/private-url-sentinel.png'))).status).toBe(404);
+    expect(reports).toMatchObject([[{ operation: 'attachment', stage: 'download', category: 'transport_failed', statusCode: 500 }, { correlationId: expect.any(String) }]]);
+    const first = reports[0]?.[1];
+    await service.handle(service.avatarSource('https://profile.line-scdn.net/another.png'));
+    expect(reports[1]?.[1]).not.toEqual(first);
+    expect(JSON.stringify(reports)).not.toMatch(/private-response-sentinel|private-url-sentinel|https:/);
+    reports.length = 0; status = 200;
+    expect((await service.handle(service.avatarSource('https://profile.line-scdn.net/success.png'))).status).toBe(200);
+    const controller = new AbortController(); controller.abort();
+    await service.handle(service.avatarSource('https://profile.line-scdn.net/cancel.png'), controller.signal);
+    expect(reports).toEqual([]);
+  });
+
   it('serves an allowlisted remote image through a fixed source', async () => {
     const service = createService({
       fetch: async () => new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } }),
@@ -142,6 +161,25 @@ describe('fixed LINE media reads', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toBe('image/png');
     expect(Buffer.from(await response.arrayBuffer())).toEqual(PNG);
+  });
+
+  it('invalidates only the cached URL for an explicitly refreshed account avatar', async () => {
+    let fetches = 0;
+    const service = createService({ fetch: async () => {
+      fetches++;
+      return new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } });
+    } });
+    services.push(service);
+    const first = service.avatarSource('https://profile.line-scdn.net/own-avatar.png')!;
+    const unrelated = service.avatarSource('https://profile.line-scdn.net/peer-avatar.png')!;
+
+    await service.handle(first);
+    await service.handle(unrelated);
+    await service.invalidateAvatar('https://profile.line-scdn.net/own-avatar.png');
+    await service.handle(unrelated);
+    await service.handle(first);
+
+    expect(fetches).toBe(3);
   });
 
   it('rejects unsafe sources and non-image responses', async () => {

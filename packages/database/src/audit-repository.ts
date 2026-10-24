@@ -1,8 +1,10 @@
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
+import { parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
 
 const activeAuditPools = new WeakSet<Pool>();
 
 export interface SafeAuditRecord {
+  diagnostic?: SafeDiagnostic;
   action: string;
   phase: 'requested' | 'succeeded' | 'failed' | 'observed';
   initiator: 'user' | 'system' | 'worker';
@@ -89,6 +91,7 @@ export class AuditRepository {
       ...(event.resultCode ? { result_code: event.resultCode } : {}),
       ...(event.errorCode ? { error_code: event.errorCode } : {}),
       ...(event.droppedCount !== undefined ? { dropped_count: event.droppedCount } : {}),
+      ...(parseSafeDiagnostic(event.diagnostic) ? { diagnostic: parseSafeDiagnostic(event.diagnostic) } : {}),
     };
     let timedOut = false;
     let acquisitionSettled = false;
@@ -163,6 +166,7 @@ export class AuditRepository {
       ...(typeof row.details.result_code === 'string' ? { resultCode: row.details.result_code } : {}),
       ...(typeof row.details.error_code === 'string' ? { errorCode: row.details.error_code } : {}),
       ...(typeof row.details.dropped_count === 'number' ? { droppedCount: row.details.dropped_count } : {}),
+      ...(parseSafeDiagnostic(row.details.diagnostic) ? { diagnostic: parseSafeDiagnostic(row.details.diagnostic)! } : {}),
       createdAt: row.created_at.toISOString(),
     }));
   }

@@ -1,6 +1,6 @@
 import { generatedMessageText, useDesktopText, useExtraText, useSafeErrorText } from '../desktop-i18n.js';
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { DEFAULT_AGENT_STATUS_ICONS, DEFAULT_AUTORESPONDER_FALLBACK, MCP_TOOL_NAMES, normalizeAutoresponderTrigger, validateAutoresponderConfig, type AgentStatusIcons, type AutoResponderRule, type AutoResponderSettings, type ComponentHealth, type ConversationKey, type LineAccountSummary, type McpLocalClientKind, type McpLocalClientStatus, type McpServerStatus, type McpTokenSummary, type McpToolName, type ProviderStatus } from '@line-agent/contracts';
+import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, DEFAULT_AGENT_STATUS_ICONS, DEFAULT_AUTORESPONDER_FALLBACK, MCP_TOOL_NAMES, normalizeAutoresponderTrigger, validateAutoresponderConfig, type AgentStatusIcons, type AutoResponderRule, type AutoResponderSettings, type ComponentHealth, type ConversationKey, type LineAccountSummary, type McpLocalClientKind, type McpLocalClientStatus, type McpServerStatus, type McpTokenSummary, type McpToolName, type ProviderStatus } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import { isValidEmbeddedPassword } from '../../setup-protocol.js';
 import { storeSettingsTab, type SettingsTabId } from '../settings-tab-storage.js';
@@ -43,8 +43,11 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
   // The app can redirect here after Settings has already mounted.
   useEffect(() => { setTabState(initialTab); }, [initialTab]);
   const [attachmentAttemptLimit, setAttachmentAttemptLimit] = useState(3);
+  const [agentStatusRotationIntervalSeconds, setAgentStatusRotationIntervalSeconds] = useState(10);
   const [agentStatusIcons, setAgentStatusIcons] = useState<AgentStatusIcons>({ ...DEFAULT_AGENT_STATUS_ICONS });
   const [conversationSettingsBusy, setConversationSettingsBusy] = useState(false);
+  const [manualUnsendWindow, setManualUnsendWindow] = useState<'1h' | '7d'>('1h');
+  const [manualUnsendBusy, setManualUnsendBusy] = useState(false);
   const [workspace, setWorkspace] = useState('');
   const [provider, setProvider] = useState<'codex' | 'claude'>(defaultProvider);
   const [providerDirty, setProviderDirty] = useState(false);
@@ -61,9 +64,11 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
   const agentStatusLabel: Record<ProviderStatus['status'], string> = { unknown: desktopText('checkedAtRuntime'), logged_in: desktopText('loggedIn'), logged_out: desktopText('notLoggedIn'), not_installed: desktopText('notInstalled'), error: desktopText('unavailable') };
   const MCP_TOOL_LABEL: Record<McpToolName, string> = {
     list_targets: desktopText('listChats'), query_target_messages: desktopText('queryChatMessages'), query_target_messages_by_time: desktopText('queryMessagesByTime'),
+    list_chat_notes: 'List saved Notes', get_chat_note: 'Read saved Note', list_chat_albums: 'List saved Albums', get_chat_album: 'Read saved Album',
   };
   const MCP_TOOL_DESCRIPTION: Record<McpToolName, string> = {
     list_targets: desktopText('listLineConversationsAndParticipantsInAuthorizedAccounts'), query_target_messages: desktopText('searchSelectedAccountsHistoryByTargetNameChatidOr'), query_target_messages_by_time: desktopText('searchSelectedAccountsHistoryWithinAFromToTime'),
+    list_chat_notes: 'List Notes already saved for an authorized chat.', get_chat_note: 'Read a saved Note by its stable ID.', list_chat_albums: 'List Albums already saved for an authorized chat.', get_chat_album: 'Read saved Album metadata and photo availability.',
   };
   const MCP_ACCOUNT_ROLE_LABEL: Record<NonNullable<LineAccountSummary['productRole']>, string> = {
     AGENT: desktopText('agentAccount'), PRIMARY_ADMIN: desktopText('administratorAccount'),
@@ -405,10 +410,25 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
     let live = true;
     const load = () => { void api.getConversationSettings().then((saved) => { if (live) {
       setAttachmentAttemptLimit(saved.attachmentAutoAttemptLimit); setAgentStatusIcons(saved.agentStatusIcons);
+      setAgentStatusRotationIntervalSeconds(saved.agentStatusRotationIntervalSeconds ?? 10);
     } }).catch((error: unknown) => { if (live) setStatus(safeErrorText(error, extraText('operationFailed'))); }); };
     load(); window.addEventListener('focus', load);
     return () => { live = false; window.removeEventListener('focus', load); };
   }, [api, tab]);
+  useEffect(() => {
+    if (tab !== 'system' || typeof api.getManualUnsendWindow !== 'function') return;
+    let live = true;
+    void api.getManualUnsendWindow().then((value) => { if (live) setManualUnsendWindow(value); })
+      .catch((error: unknown) => { if (live) setStatus(safeErrorText(error, extraText('operationFailed'))); });
+    return () => { live = false; };
+  }, [api, tab]);
+  async function saveManualUnsendWindow(value: '1h' | '7d') {
+    if (manualUnsendBusy) return;
+    setManualUnsendBusy(true); setStatus('');
+    try { setManualUnsendWindow(await api.setManualUnsendWindow(value)); setStatus(desktopText('unsendWindowSaved')); }
+    catch (error) { setStatus(safeErrorText(error, desktopText('unableToSaveConversationSettings'))); }
+    finally { setManualUnsendBusy(false); }
+  }
 
   async function chooseAgentWorkspace() {
     try { const selected = await api.chooseAgentWorkspace(); if (selected) setWorkspace(selected); }
@@ -521,7 +541,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
       <button role="tab" aria-selected={tab === 'about'} className={tab === 'about' ? 'active' : ''} onClick={() => setTab('about')}>{desktopText('about')}</button>
     </div>
     <div className="settings-panel-scroll" ref={panelScrollRef}>
-    {tab === 'system' ? <div role="tabpanel" className="settings-card-stack"><LineLogin api={api} accounts={accounts} live={live} embedded {...(onNotice ? { onNotice } : {})} />
+    {tab === 'system' ? <div role="tabpanel" className="settings-card-stack system-settings-card-stack"><LineLogin api={api} accounts={accounts} live={live} embedded {...(onNotice ? { onNotice } : {})} />
       <section className="panel database-settings database-summary"><div className="panel-top"><div><h2>{desktopText('databaseAndAttachments')}</h2><p>{desktopText('viewCurrentDatabaseAndAttachmentStorageLocations')}</p></div></div>
       <div className="system-location-rows">
         <div className="system-location-row"><label>{desktopText('database')}</label><div className="system-location-field"><span className="system-location-value">{databaseStatusText}</span>{embedded && <div className="button-row"><button onClick={() => void showConnectionInfo()}>{desktopText('showPassword')}</button><button onClick={() => setPasswordDialog(true)}>{desktopText('changePassword')}</button></div>}</div></div>
@@ -543,17 +563,27 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
           <option value="ko">{localeText('korean')}</option>
         </select><span className="system-location-value" aria-live="polite">{localeText('effectiveLanguage')}: {locale === 'en' ? 'English' : locale === 'zh-TW' ? '繁體中文' : locale === 'ja' ? '日本語' : '한국어'}</span>
         </>}
-      </div></div></div>
-    </section></div>
+      </div></div>
+      <div className="system-location-row"><span id="manual-unsend-window-label">{desktopText('unsendTimeWindow')}</span><div className="system-location-field">
+        <fieldset className="manual-unsend-window-options" aria-labelledby="manual-unsend-window-label" disabled={manualUnsendBusy}>
+          <label><input type="radio" name="manual-unsend-window" value="1h" checked={manualUnsendWindow === '1h'} onChange={() => void saveManualUnsendWindow('1h')} />{desktopText('unsendOneHour')}</label>
+          <label><input type="radio" name="manual-unsend-window" value="7d" checked={manualUnsendWindow === '7d'} onChange={() => void saveManualUnsendWindow('7d')} />{desktopText('unsendSevenDays')}</label>
+        </fieldset>
+      </div></div>
+    </div></section></div>
       : tab === 'conversation' ? <div role="tabpanel" className="settings-card-stack"><section className="panel conversation-settings">
       <div className="panel-top"><div><h2>{desktopText('conversations')}</h2></div><button className="primary"
-        disabled={conversationSettingsBusy || !Number.isInteger(attachmentAttemptLimit) || attachmentAttemptLimit < 3 || attachmentAttemptLimit > 10}
+        disabled={conversationSettingsBusy || !Number.isInteger(attachmentAttemptLimit) || attachmentAttemptLimit < 3 || attachmentAttemptLimit > 10
+          || !Number.isInteger(agentStatusRotationIntervalSeconds) || agentStatusRotationIntervalSeconds < AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN
+          || agentStatusRotationIntervalSeconds > AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX}
         onClick={() => {
           setConversationSettingsBusy(true); setStatus('');
-          void api.setConversationSettings({ attachmentAutoAttemptLimit: attachmentAttemptLimit, showAgentStatusMarkers: true, agentStatusIcons })
+          void api.setConversationSettings({ attachmentAutoAttemptLimit: attachmentAttemptLimit, showAgentStatusMarkers: true, agentStatusIcons,
+            agentStatusRotationIntervalSeconds })
             .then((saved) => {
               setAttachmentAttemptLimit(saved.attachmentAutoAttemptLimit);
               setAgentStatusIcons(saved.agentStatusIcons); setStatus(desktopText('conversationSettingsSaved'));
+              setAgentStatusRotationIntervalSeconds(saved.agentStatusRotationIntervalSeconds ?? 10);
             })
             .catch(async (error: unknown) => {
               setStatus(safeErrorText(error, desktopText('unableToSaveConversationSettings')));
@@ -561,6 +591,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
                 const saved = await api.getConversationSettings();
                 setAttachmentAttemptLimit(saved.attachmentAutoAttemptLimit);
                 setAgentStatusIcons(saved.agentStatusIcons);
+                setAgentStatusRotationIntervalSeconds(saved.agentStatusRotationIntervalSeconds ?? 10);
               } catch { /* Retain the draft if reconciliation also fails. */ }
             }).finally(() => setConversationSettingsBusy(false));
         }}>{desktopText('save')}</button></div>
@@ -575,6 +606,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
           <span className="agent-status-icon-note">{agentStatusNote(key)}</span>
         </div>)}
         </div>
+        <label className="agent-status-rotation-row">{desktopText('agentStatusRotationIntervalSeconds')}<input aria-label={desktopText('agentStatusRotationIntervalSeconds')} type="number" min={AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN} max={AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX} step={1} value={agentStatusRotationIntervalSeconds} onChange={(event) => setAgentStatusRotationIntervalSeconds(Number(event.target.value))} /></label>
       </fieldset>
     </section>
       <section className="panel autoresponder-settings">

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { MCP_TOOL_EFFECTS } from '@line-agent/contracts';
+import { MCP_TOOL_EFFECTS, MCP_TOOL_NAMES } from '@line-agent/contracts';
 import type { Pool } from 'pg';
 import { createTestDatabase } from './test-database.js';
 import { AccountRepository } from './account-repository.js';
@@ -15,6 +15,49 @@ import { join } from 'node:path';
 import { loadMigrations, migrate } from './migrate.js';
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
+
+database('MCP tool scope structure migration', () => {
+  it('accepts current tools, rejects invalid scopes, and keeps unknown stored tools non-executable', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'mcp-tool-scope-migration-'));
+    let close: (() => Promise<void>) | undefined;
+    try {
+      for (const migration of await loadMigrations()) {
+        if (migration.name !== '057_mcp_tool_scope_structure.sql') await writeFile(join(directory, migration.name), migration.sql);
+      }
+      const migrated = await createTestDatabase(directory);
+      close = migrated.close;
+      await new AccountRepository(migrated.pool).ensureAccount('migration-account');
+      await migrate(migrated.pool);
+      const repository = new McpTokenRepository(migrated.pool);
+      const issued = await repository.issueToken({ deviceLabel: 'All external tools', accountScopes: ['migration-account'],
+        toolScopes: [...MCP_TOOL_NAMES], expiration: { mode: 'never' } });
+      expect(issued.token.toolScopes).toEqual([...MCP_TOOL_NAMES]);
+
+      await expect(repository.issueToken({ deviceLabel: 'Unknown', accountScopes: ['migration-account'],
+        toolScopes: ['future_tool' as never], expiration: { mode: 'never' } })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+      await expect(repository.issueToken({ deviceLabel: 'Internal', accountScopes: ['migration-account'],
+        toolScopes: ['send_to_target' as never], expiration: { mode: 'never' } })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+
+      await migrated.pool.query("UPDATE mcp_agent_tokens SET tool_scopes = ARRAY['future_tool']::text[] WHERE token_id = $1", [issued.token.tokenId]);
+      let executed = false;
+      await expect(repository.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'future_tool' as never,
+        execute: async () => { executed = true; return { data: 'must not run' }; } })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+      expect(executed).toBe(false);
+
+      const invalidScopes = [[], [null], [''], Array.from({ length: 65 }, (_, index) => `tool_${index}`), ['x'.repeat(129)]];
+      for (const scopes of invalidScopes) {
+        await expect(migrated.pool.query(
+          `INSERT INTO mcp_agent_tokens (token_id, token_digest, principal_id, device_label, account_scopes, tool_scopes, expires_at)
+           VALUES ($1, $2, 'migration', 'invalid', ARRAY['migration-account'], $3::text[], now() + interval '1 day')`,
+          [randomUUID(), createHash('sha256').update(randomUUID()).digest(), scopes],
+        )).rejects.toThrow();
+      }
+    } finally {
+      await close?.();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
 
 database('optional MCP expiry migration', () => {
   it('preserves an existing expired finite token while enabling null expiry issuance', async () => {

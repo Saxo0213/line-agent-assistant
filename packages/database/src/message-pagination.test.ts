@@ -24,6 +24,25 @@ database('message and attachment pagination', () => {
     expect(attachments.attachments).toHaveLength(2);
     expect((await repo.listAttachments(key, attachments.nextCursor, 2)).attachments).toHaveLength(1);
   });
+  it('reads an exact older message with the same projection as timeline pages', async () => {
+    const oldMessage = await repo.getMessage(key, 'm1');
+    expect(oldMessage).toMatchObject({ messageId: 'm1', text: 'item 1', kind: 'text', content: null });
+    expect(await repo.getMessage(key, 'missing')).toBeNull();
+  });
+  it('projects live chat event names from contacts and the account owner without exposing MIDs', async () => {
+    const eventKey = { accountId: 'chat-event-names', chatType: 'group' as const, chatId: `c${'8'.repeat(32)}` };
+    const actor = `u${'1'.repeat(32)}`; const own = `u${'2'.repeat(32)}`;
+    await pool.query("INSERT INTO line_accounts(account_id,display_name,own_mid) VALUES ($1,'Account Owner',$2)", [eventKey.accountId, own]);
+    await pool.query("INSERT INTO line_contacts(account_id,mid,display_name) VALUES ($1,$2,'Contact Actor')", [eventKey.accountId, actor]);
+    await repo.ingestAndRoute({ eventId: 'chat-event-name-event', ...eventKey, senderId: 'sender-safe', messageId: 'chat-event-name-row',
+      kind: 'event', text: null, mentionIds: [], mentionRanges: [], replyToMessageId: null,
+      ingestion: { source: 'live', cursor: null }, occurredAt: '2026-10-15T00:00:05.000Z',
+      raw: { message: { contentType: 18, text: '', contentMetadata: { LOC_KEY: 'C_MI', LOC_ARGS: `${actor}\u001e${own}` } } }, attachments: [] }, { eligible: false });
+    const row = (await repo.listMessages(eventKey, null, 10)).messages[0]!;
+    expect(row.content).toMatchObject({ type: 'event', text: 'Contact Actor已新增Account Owner至群組。' });
+    expect(JSON.stringify(row)).not.toContain(actor);
+    expect(JSON.stringify(row)).not.toContain(own);
+  });
   it('filters search by account, date and attachment presence', async () => {
     expect((await repo.searchMessages({ accountId: 'a', from: '2026-10-15T00:00:02Z', hasAttachment: true, limit: 10 })).map((row) => row.messageId)).toEqual(['m3', 'm2']);
     expect(await repo.searchMessages({ accountId: 'other', limit: 10 })).toHaveLength(0);

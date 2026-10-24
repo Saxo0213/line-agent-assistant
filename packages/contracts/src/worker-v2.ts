@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { SafeDiagnosticSchema } from './diagnostics.js';
 import { AccountModeSchema, WritableConversationKeySchema, WorkerBindingSchema } from './account.js';
 import { NativeAttachmentDownloadInputSchema } from './native-source.js';
 import { JsonValueSchema } from './json.js';
@@ -23,6 +24,12 @@ export type ReadReceiptDto = z.infer<typeof ReadReceiptSchema>;
 
 const Bound = WorkerBindingSchema;
 export const WORKER_PROTOCOL_VERSION = 4 as const;
+export const WORKER_ERROR_CODES = ['INVALID_COMMAND', 'QUEUE_FULL', 'CATALOG_REFRESH_FAILED', 'WORKER_OPERATION_FAILED',
+  'HISTORY_READ_FAILED', 'CHAT_RESOURCE_READ_FAILED', 'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED',
+  'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED', 'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED',
+  'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED'] as const;
+export type WorkerErrorCode = typeof WORKER_ERROR_CODES[number];
+const WorkerErrorCodeSchema = z.enum(WORKER_ERROR_CODES);
 const UserMid = z.string().regex(/^u[0-9a-fA-F]{32}$/);
 const Conversation = Bound.merge(WritableConversationKeySchema);
 const LoginAttempt = Bound.extend({ loginAttemptId: Id });
@@ -70,6 +77,52 @@ export type DownloadAuthProbe = z.infer<typeof DownloadAuthProbeSchema>;
 
 export const MEDIA_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 export const MEDIA_FILE_MAX_BYTES = 100 * 1024 * 1024;
+export const CHAT_RESOURCE_MAX_BYTES = 20 * 1024 * 1024;
+const ChatResourceAction = z.enum(['listNotes', 'getNote', 'listAlbums', 'listAlbumPhotos', 'downloadAlbumPhoto']);
+const ResourceCursor = z.string().max(2048).nullable();
+const ResourceId = z.string().min(1).max(256).refine((value) => !/[\u0000-\u001f\u007f]/.test(value));
+const ChatResourceNote = z.strictObject({ postId: ResourceId, createdTime: z.number().int().nonnegative().nullable(),
+  text: z.string().max(64 * 1024).nullable(), content: z.record(z.string().max(128), JsonValueSchema).optional() });
+const ChatResourceAlbum = z.strictObject({ albumId: ResourceId, chatId: Id.max(256), title: z.string().max(512).nullable(),
+  photoCount: z.number().int().nonnegative().nullable(), createTime: z.number().int().nonnegative().nullable(),
+  updateTime: z.number().int().nonnegative().nullable() });
+const ChatResourcePhoto = z.strictObject({ photoId: ResourceId, oid: ResourceId, prefix: z.enum(['album/a', 'album/v']),
+  shotTime: z.number().int().nonnegative().nullable(), width: z.number().int().positive().nullable(), height: z.number().int().positive().nullable() });
+export const ChatResourceReadCommandSchema = Conversation.extend({ type: z.literal('chatResourceRead'), requestId: Id.max(128),
+  action: ChatResourceAction, cursor: ResourceCursor.optional(), limit: z.number().int().min(1).max(50).optional(),
+  postId: ResourceId.optional(), albumId: ResourceId.optional(), photoId: ResourceId.optional(), oid: ResourceId.optional(),
+  prefix: z.enum(['album/a', 'album/v']).optional(), maxBytes: z.number().int().positive().max(CHAT_RESOURCE_MAX_BYTES).optional(),
+  timeoutMs: z.number().int().min(1_000).max(120_000) }).superRefine((command, context) => {
+  const required: Partial<Record<typeof command.action, (keyof typeof command)[]>> = {
+    getNote: ['postId'], listAlbumPhotos: ['albumId'], downloadAlbumPhoto: ['albumId', 'photoId', 'oid', 'prefix', 'maxBytes'],
+  };
+  for (const key of required[command.action] ?? []) if (command[key] === undefined) context.addIssue({ code: 'custom', path: [key], message: 'Required for action' });
+});
+export type ChatResourceReadCommand = z.infer<typeof ChatResourceReadCommandSchema>;
+export const ChatResourceReadResultSchema = Conversation.extend({ type: z.literal('chatResourceResult'), requestId: Id.max(128),
+  action: ChatResourceAction, ok: z.boolean(), error: z.string().max(80).nullable(),
+  responseCode: z.union([z.number().finite().min(-1_000_000_000).max(1_000_000_000), z.enum(['missing', 'non_numeric'])]).optional(),
+  nextCursor: ResourceCursor.optional(),
+  notes: z.array(ChatResourceNote).max(50).optional(), note: ChatResourceNote.optional(), albums: z.array(ChatResourceAlbum).max(50).optional(),
+  photos: z.array(ChatResourcePhoto).max(50).optional(), bytes: z.custom<Uint8Array>((value) => value instanceof Uint8Array)
+    .refine((value) => value.byteLength <= CHAT_RESOURCE_MAX_BYTES).optional() }).superRefine((result, context) => {
+  const payload = ['notes', 'note', 'albums', 'photos', 'bytes'].some((key) => Object.hasOwn(result, key));
+  if (result.responseCode !== undefined && (result.ok || result.error !== 'response_code_invalid'
+    || (result.action !== 'listNotes' && result.action !== 'getNote'))) {
+    context.addIssue({ code: 'custom', path: ['responseCode'], message: 'Response code is restricted to failed Note reads' });
+  }
+  if (!result.ok) {
+    if (result.error === null || payload) context.addIssue({ code: 'custom', path: ['error'], message: 'Failed reads require an error without payload' });
+    return;
+  }
+  if (result.error !== null) context.addIssue({ code: 'custom', path: ['error'], message: 'Successful reads cannot include an error' });
+  const expected = result.action === 'listNotes' ? 'notes' : result.action === 'getNote' ? 'note'
+    : result.action === 'listAlbums' ? 'albums' : result.action === 'listAlbumPhotos' ? 'photos' : 'bytes';
+  if (!Object.hasOwn(result, expected)) context.addIssue({ code: 'custom', path: [expected], message: 'Successful read is missing its payload' });
+  for (const key of ['notes', 'note', 'albums', 'photos', 'bytes']) if (key !== expected && Object.hasOwn(result, key)) {
+    context.addIssue({ code: 'custom', path: [key], message: 'Payload does not match action' });
+  }
+});
 
 export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Bound.extend({ type: z.literal('init'), protocolVersion: z.literal(WORKER_PROTOCOL_VERSION), mode: AccountModeSchema, durableCursor: TalkCursorV1Schema,
@@ -82,11 +135,15 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Bound.extend({ type: z.literal('poll') }),
   Bound.extend({ type: z.literal('ackBatch'), batchId: Id, cursorAfter: TalkCursorV1Schema }),
   Conversation.extend({ type: z.literal('history'), requestId: Id, cursor: Id.nullable(), limit: z.number().int().min(1).max(100) }),
+  ChatResourceReadCommandSchema,
+  Bound.extend({ type: z.literal('refreshOwnProfile'), requestId: Id.max(128), timeoutMs: z.number().int().min(1_000).max(30_000) }),
+  Conversation.extend({ type: z.literal('cancelChatResourceRead'), requestId: Id.max(128) }),
   Conversation.extend({ type: z.literal('sendText'), requestId: Id, text: Id, replyToMessageId: Id.nullable(),
     operationId: Id.optional(), attemptId: Id.optional(), effectPermit: Id.optional() }),
   Conversation.extend({ type: z.literal('manualSendText'), requestId: Id, text: Id, replyToMessageId: Id.nullable(),
     operationId: Id.optional(), attemptId: Id.optional(), effectPermit: Id.optional() }),
   Conversation.extend({ type: z.literal('sendMedia'), chatType: z.enum(['direct', 'group']), requestId: Id,
+    manualSend: z.literal(true).optional(),
     kind: z.enum(['image', 'file']), filePath: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/),
     fileName: z.string().min(1).refine((value) => new TextEncoder().encode(value).length <= 180, 'fileName exceeds 180 bytes'),
     sizeBytes: z.number().int().positive().max(MEDIA_FILE_MAX_BYTES), sha256: z.string().regex(/^[0-9a-f]{64}$/),
@@ -95,6 +152,7 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
     command.kind !== 'image' || command.sizeBytes <= MEDIA_IMAGE_MAX_BYTES, 'image exceeds 20 MiB'),
   Conversation.extend({ type: z.literal('reactMessage'), requestId: Id, messageId: Decimal,
     reaction: z.enum(['NICE', 'AMAZING', 'FUN', 'LOVE', 'SAD', 'OMG', 'UNDO']) }),
+  Conversation.extend({ type: z.literal('unsendMessage'), requestId: Id, messageId: Decimal }),
   Bound.extend({ type: z.literal('checkFriendRelation'), requestId: Id, targetMid: UserMid }),
   Bound.extend({ type: z.literal('addFriendByMid'), requestId: Id, targetMid: UserMid }),
   Conversation.extend({ type: z.literal('downloadAttachment'), requestId: Id, attemptToken: z.uuid(), messageId: Id, attachmentId: z.uuid(), externalAttachmentId: Id, kind: z.enum(['image', 'video', 'audio', 'file']), occurredAt: z.iso.datetime({ offset: true }), originalFileName: z.string(), lineMessage: JsonValueSchema, nativeAttachment: NativeAttachmentDownloadInputSchema.optional(), maxBytes: z.number().int().positive(), timeoutMs: z.number().int().positive() }),
@@ -119,17 +177,25 @@ export const LineWorkerEventSchema = z.union([
   Bound.extend({ type: z.literal('downloadReady'), ownMid: Id }),
   Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('degraded'), code: z.literal('CATALOG_REFRESH_FAILED') }),
   Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('ready'), code: z.literal('CATALOG_REFRESH_RECOVERED') }),
+  z.discriminatedUnion('ok', [
+    Bound.extend({ type: z.literal('ownProfileResult'), requestId: Id.max(128), ok: z.literal(true), error: z.null(), ownMid: UserMid,
+      displayName: z.string().max(256).nullable(), picturePath: z.string().max(2048).nullable().optional() }),
+    Bound.extend({ type: z.literal('ownProfileResult'), requestId: Id.max(128), ok: z.literal(false), error: z.string().max(80) }),
+  ]),
   Bound.extend({ type: z.literal('batch'), batchId: Id, cursorBefore: TalkCursorV1Schema, cursorAfter: TalkCursorV1Schema, envelopes: z.array(InboundEnvelopeSchema),
     readReceipts: z.array(ReadReceiptSchema).max(500).optional() }),
   Bound.extend({ type: z.literal('conversationCatalog'), conversations: z.array(ConversationCatalogItemSchema) }),
   Conversation.extend({ type: z.literal('historyResult'), requestId: Id, nextCursor: Id.nullable(), envelopes: z.array(InboundEnvelopeSchema) }),
+  ChatResourceReadResultSchema,
   Bound.extend({ type: z.literal('sendResult'), requestId: Id, status: z.enum(['sent', 'failed', 'unknown']), messageId: Id.nullable(), error: z.string().nullable(),
     operationId: Id.optional(), attemptId: Id.optional() }),
+  Conversation.extend({ type: z.literal('unsendResult'), requestId: Id, messageId: Decimal, status: z.enum(['unsent', 'failed', 'unknown']), error: z.string().nullable() }),
   Bound.extend({ type: z.literal('friendRelationResult'), requestId: Id, targetMid: UserMid,
     status: z.enum(['friend', 'not_friend', 'unknown']), error: z.string().nullable() }),
   Bound.extend({ type: z.literal('addFriendResult'), requestId: Id, targetMid: UserMid,
     status: z.enum(['added', 'failed', 'unknown']), error: z.string().nullable() }),
-  Bound.extend({ type: z.literal('error'), code: Id, message: Id, retryable: z.boolean() }),
+  Bound.extend({ type: z.literal('error'), code: WorkerErrorCodeSchema, message: Id, retryable: z.boolean(),
+    diagnostic: SafeDiagnosticSchema.optional(), requestId: Id.max(128).optional() }),
   AttachmentResultSchema,
   Bound.extend({ type: z.literal('attachmentCancelAck'), attachmentId: z.uuid(), attemptToken: z.uuid(), cancelled: z.boolean() }),
 ]);

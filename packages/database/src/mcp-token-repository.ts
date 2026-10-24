@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, McpTokenExpirationSchema, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpTokenExpiration, type McpTokenSummary, type McpToolName } from '@line-agent/contracts';
+import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MAX_MCP_TOOL_SCOPES, McpTokenExpirationSchema, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpTokenExpiration, type McpTokenSummary, type McpToolName } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
 import { lockAndCheckAgentAuthorization } from './agent-authorization.js';
 import { findSharedAdminChat, type SharedAdminChat } from './agent-repository.js';
@@ -205,8 +205,8 @@ export class McpTokenRepository {
     if (toolScopes.some((tool) => !McpToolNameSchema.safeParse(tool).success)) {
       throw new McpDomainError('INVALID_INPUT', 'Unsupported MCP tool scope.');
     }
-    if (accountScopes.length === 0 || toolScopes.length === 0) {
-      throw new McpDomainError('INVALID_INPUT', 'At least one account scope and one tool scope are required.');
+    if (accountScopes.length === 0 || toolScopes.length === 0 || toolScopes.length > MAX_MCP_TOOL_SCOPES) {
+      throw new McpDomainError('INVALID_INPUT', 'At least one account scope and 1..64 supported tool scopes are required.');
     }
     const expiration = McpTokenExpirationSchema.safeParse(input.expiration);
     if (!expiration.success) throw new McpDomainError('INVALID_INPUT', 'Invalid token expiration.');

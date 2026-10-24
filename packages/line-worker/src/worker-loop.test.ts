@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { FakeLineTransport } from './fake-transport.js';
-import { LineWorkerLoop } from './worker-loop.js';
+import { LineWorkerLoop, type TransportIdentity } from './worker-loop.js';
 import { createLinejsAdapter } from './linejs-adapter.js';
 import { decodeHistoryCursor, encodeHistoryCursor } from './cursor.js';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SafeAttachmentError } from './attachment-error.js';
 import { InternalError } from '@evex/linejs/base';
+import { ChatResourceFailure } from './chat-resource-error.js';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const protocolVersion = 4 as const;
@@ -54,6 +55,61 @@ async function runAttachmentAttempt(transport: FakeLineTransport, attachmentRoot
 }
 
 describe('one-account worker loop', () => {
+  it('preserves only fixed chat resource failure categories from a fake adapter', async () => {
+    const categories = ['bootstrap_failure', 'list_get_transport_failure', 'response_code_invalid', 'response_shape_invalid',
+      'normalization_failure', 'response_validation', 'unknown'] as const;
+    for (const category of categories) {
+      const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
+      Object.assign(transport, { readChatResource: async () => { throw new ChatResourceFailure(category); } });
+      const events: any[] = [];
+      const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => true });
+      await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
+      await authenticate(worker);
+      await worker.handle({ type: 'chatResourceRead', ...binding, chatType: 'group', chatId: attachmentChat,
+        requestId: `failure-${category}`, action: 'listNotes', timeoutMs: 5000 });
+      expect(events.at(-1)).toMatchObject({ type: 'chatResourceResult', ok: false, error: category });
+      expect(JSON.stringify(events.at(-1))).not.toContain('secret');
+      await worker.handle({ type: 'stop', ...binding });
+    }
+  });
+
+  it.each([
+    [321, 321],
+    [-1_000_000_000, -1_000_000_000],
+    ['missing', 'missing'],
+    ['non_numeric', 'non_numeric'],
+  ] as const)('carries only the bounded Note response code diagnostic (%s)', async (_label, responseCode) => {
+    const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
+    Object.assign(transport, { readChatResource: async () => { throw new ChatResourceFailure('response_code_invalid', responseCode); } });
+    const events: any[] = [];
+    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => true });
+    await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
+    await authenticate(worker);
+    await worker.handle({ type: 'chatResourceRead', ...binding, chatType: 'group', chatId: attachmentChat,
+      requestId: 'failure-response-code', action: 'listNotes', timeoutMs: 5000 });
+    expect(events.at(-1)).toMatchObject({ type: 'chatResourceResult', ok: false, error: 'response_code_invalid', responseCode });
+    await worker.handle({ type: 'stop', ...binding });
+  });
+
+  it('refreshes the logged-in identity only on an explicit request and rejects a MID change', async () => {
+    const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
+    const readProfile = vi.fn<() => Promise<TransportIdentity>>(async () => ({ ownMid: selfMid, displayName: 'Updated Agent', picturePath: 'https://profile.line-scdn.net/new.png' }));
+    Object.assign(transport, { refreshOwnProfile: readProfile });
+    const events: any[] = [];
+    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => true });
+    await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
+    await worker.handle({ type: 'loginQr', ...binding, loginAttemptId: 'profile-login' });
+    expect(readProfile).not.toHaveBeenCalled();
+    await worker.handle({ type: 'refreshOwnProfile', ...binding, requestId: 'avatar-refresh', timeoutMs: 15_000 });
+    expect(readProfile).toHaveBeenCalledTimes(1);
+    expect(events.at(-1)).toMatchObject({ type: 'ownProfileResult', requestId: 'avatar-refresh', ok: true,
+      ownMid: selfMid, displayName: 'Updated Agent', picturePath: 'https://profile.line-scdn.net/new.png' });
+
+    readProfile.mockResolvedValueOnce({ ownMid: `u${'d'.repeat(32)}`, displayName: 'Other', picturePath: 'https://profile.line-scdn.net/other.png' });
+    await worker.handle({ type: 'refreshOwnProfile', ...binding, requestId: 'avatar-refresh-mismatch', timeoutMs: 15_000 });
+    expect(events.at(-1)).toMatchObject({ type: 'ownProfileResult', requestId: 'avatar-refresh-mismatch', ok: false, error: 'PROFILE_MISMATCH' });
+  });
+
   it('adopts official auth via download probe in download-only purpose without login events or receive', async () => {
     const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Official' });
     const adoptionCalls: unknown[] = [];
@@ -286,6 +342,92 @@ describe('one-account worker loop', () => {
     expect(monitor.transport.reactCalls).toHaveLength(0);
   });
 
+  it.each(['ACTIVE_CONTROL', 'MONITOR_ONLY'] as const)('makes one guarded unsend request for an authenticated %s worker', async (mode) => {
+    const state = setup(mode);
+    await state.init;
+    await authenticate(state.worker);
+    await state.worker.handle({ type: 'unsendMessage', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'unsend-1', messageId: '9' });
+    expect(state.transport.unsendCalls).toEqual([{ chatType: 'direct', chatId: 'u-peer', messageId: '9', lease: expect.objectContaining(binding) }]);
+    expect(state.events).toContainEqual(expect.objectContaining({ type: 'unsendResult', requestId: 'unsend-1', messageId: '9', status: 'unsent' }));
+  });
+
+  it('reports a transport error as unknown and does not retry unsend', async () => {
+    const state = setup('ACTIVE_CONTROL');
+    await state.init;
+    await authenticate(state.worker);
+    state.transport.unsendError = new Error('simulated lost response');
+    await state.worker.handle({ type: 'unsendMessage', ...binding, chatType: 'group', chatId: 'c-group', requestId: 'unsend-unknown', messageId: '9' });
+    expect(state.transport.unsendCalls).toHaveLength(1);
+    expect(state.events).toContainEqual(expect.objectContaining({ type: 'unsendResult', requestId: 'unsend-unknown', status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' }));
+  });
+
+  it('reserves the shared mutation slot before deferred lease checks for overlapping send and unsend', async () => {
+    const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+    const events: any[] = [];
+    let deferNextLease = false;
+    let leaseStarted!: () => void;
+    const checkingLease = new Promise<void>((resolve) => { leaseStarted = resolve; });
+    const releaseLeases: ((valid: boolean) => void)[] = [];
+    let leaseChecks = 0;
+    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => {
+      if (!deferNextLease) return true;
+      deferNextLease = false;
+      leaseStarted();
+      const check = new Promise<boolean>((resolve) => { releaseLeases.push(resolve); });
+      leaseChecks += 1;
+      return check;
+    } });
+    await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+    await authenticate(worker);
+    deferNextLease = true;
+
+    const first = worker.handle({ type: 'unsendMessage', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'unsend-held', messageId: '9' });
+    const started = await Promise.race([checkingLease.then(() => true), first.then(() => false)]);
+    expect(started, JSON.stringify(events)).toBe(true);
+    const burst = [
+      worker.handle({ type: 'unsendMessage', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'unsend-burst-1', messageId: '10' }),
+      worker.handle({ type: 'sendText', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'send-burst-1', text: 'hello', replyToMessageId: null }),
+      worker.handle({ type: 'sendText', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'send-burst-2', text: 'hello', replyToMessageId: null }),
+    ];
+    expect(leaseChecks).toBe(1);
+    expect(transport.unsendCalls).toHaveLength(0);
+    expect(transport.sendCalls).toHaveLength(0);
+
+    for (const release of releaseLeases) release(true);
+    await Promise.all([first, ...burst]);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'unsendResult', requestId: 'unsend-burst-1', status: 'failed', error: 'SIDE_EFFECT_DENIED' }));
+    expect(events.filter((event) => event.type === 'sendResult' && event.status === 'failed')).toHaveLength(2);
+    expect(transport.unsendCalls).toHaveLength(1);
+    expect(transport.sendCalls).toHaveLength(0);
+  });
+
+  it('keeps the shared mutation slot held through unsend transport settlement and releases it afterward', async () => {
+    const state = setup('ACTIVE_CONTROL');
+    await state.init;
+    await authenticate(state.worker);
+    let transportStarted!: () => void;
+    const started = new Promise<void>((resolve) => { transportStarted = resolve; });
+    let releaseTransport!: () => void;
+    const hold = new Promise<void>((resolve) => { releaseTransport = resolve; });
+    const transport = state.transport.unsend.bind(state.transport);
+    state.transport.unsend = async (...args) => { transportStarted(); await hold; await transport(...args); };
+
+    const first = state.worker.handle({ type: 'unsendMessage', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'unsend-transport-held', messageId: '9' });
+    await started;
+    const burst = await Promise.all([...Array.from({ length: 5 }, (_, index) => state.worker.handle({
+      type: 'unsendMessage', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: `unsend-transport-burst-${index}`, messageId: String(index + 10),
+    })), state.worker.handle({ type: 'sendText', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'send-transport-burst', text: 'hello', replyToMessageId: null })]);
+    expect(state.transport.unsendCalls).toHaveLength(0);
+    expect(state.transport.sendCalls).toHaveLength(0);
+    expect(state.events.filter((event) => event.type === 'unsendResult' && event.status === 'failed')).toHaveLength(5);
+    releaseTransport();
+    await Promise.all([first, ...burst]);
+    expect(state.transport.unsendCalls).toHaveLength(1);
+
+    await state.worker.handle({ type: 'unsendMessage', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'unsend-after-release', messageId: '20' });
+    expect(state.transport.unsendCalls).toHaveLength(2);
+  });
+
   it('routes a source-message reaction through the active LINE transport owner only', async () => {
     const active = setup('ACTIVE_CONTROL');
     await active.init;
@@ -490,6 +632,22 @@ describe('one-account worker loop', () => {
     await worker.flushEvents();
     expect(events).toContainEqual({ type: 'secretRotation', ...binding, loginAttemptId: 'login-1',
       secrets: { token: 'new-token', qrCert: 'certificate', e2eeStorage: {} } });
+  });
+
+  it('persists a native refresh as one complete account-bound secret rotation', async () => {
+    const { worker, transport, events, init } = setup();
+    await init;
+    await worker.handle({ type: 'setSecretState', ...binding, loginAttemptId: 'restore-A',
+      secrets: { token: 'old-token', qrCert: null, e2eeStorage: { refreshToken: 'old-refresh', expire: 1 } } });
+    await worker.handle({ type: 'loginToken', ...binding, loginAttemptId: 'restore-A' });
+
+    transport.rotateCredentials({ token: 'new-token', e2eeStorage: { refreshToken: 'new-refresh', expire: 4_000_000_000 } });
+    await worker.flushEvents();
+
+    expect(events.filter((event) => event.type === 'secretRotation')).toEqual([{
+      type: 'secretRotation', ...binding, loginAttemptId: 'restore-A',
+      secrets: { token: 'new-token', qrCert: null, e2eeStorage: { refreshToken: 'new-refresh', expire: 4_000_000_000 } },
+    }]);
   });
 
   it.each(['qr', 'pin'] as const)('keeps native %s login pending beyond the former application deadline', async (stage) => {

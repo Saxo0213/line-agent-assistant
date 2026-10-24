@@ -1,4 +1,4 @@
-import type { ConversationCatalogItem } from '@line-agent/contracts';
+import type { ChatResourceReadCommand, ConversationCatalogItem } from '@line-agent/contracts';
 import type { HistoryCursorV1 } from './cursor.js';
 import type { FriendAddResult, FriendRelation, LineTransport, SyncResult, TransportIdentity } from './worker-loop.js';
 
@@ -7,15 +7,19 @@ export class FakeLineTransport implements LineTransport {
   readonly syncCalls: unknown[] = [];
   readonly sendCalls: unknown[] = [];
   readonly reactCalls: unknown[] = [];
+  readonly unsendCalls: unknown[] = [];
   readonly historyCalls: unknown[] = [];
   readonly downloadCalls: unknown[] = [];
   readonly friendCheckCalls: unknown[] = [];
   readonly friendAddCalls: unknown[] = [];
+  readonly chatResourceCalls: unknown[] = [];
+  readonly #chatResourceQueue: Array<Readonly<{ nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[]; photos?: readonly unknown[]; bytes?: Uint8Array }>> = [];
   catalogCalls = 0;
   catalogError?: Error;
   readonly #historyQueue: (readonly unknown[])[] = [];
   readonly #downloadQueue: Array<{ bytes: Uint8Array; name: string | null }> = [];
   sendError?: Error;
+  unsendError?: Error;
   friendCheckResult: FriendRelation = 'not_friend';
   friendAddResult: FriendAddResult = { status: 'added', error: null };
   friendAddError?: Error;
@@ -26,9 +30,12 @@ export class FakeLineTransport implements LineTransport {
   readonly #identity: TransportIdentity;
   readonly #syncQueue: SyncResult[] = [];
   readonly #catalogQueue: (readonly ConversationCatalogItem[])[] = [];
-  #listeners: Partial<Record<'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'authInvalidated', (value?: any) => void>> = {};
+  #listeners: Partial<Record<'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated', (value?: any) => void>> = {};
   constructor(identity: TransportIdentity) { this.#identity = identity; }
-  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'authInvalidated', listener: (value?: any) => void): void { this.#listeners[event] = listener; }
+  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated', listener: (value?: any) => void): void { this.#listeners[event] = listener; }
+  rotateCredentials(credentials: { token: string; e2eeStorage: import('@line-agent/contracts').JsonValue }): void {
+    this.#listeners.credentials?.(credentials);
+  }
   async installSecrets(_secrets: unknown): Promise<void> {}
   async loginQr(): Promise<TransportIdentity> {
     this.loginCalls.push('qr');
@@ -59,6 +66,16 @@ export class FakeLineTransport implements LineTransport {
     limit: number): Promise<readonly unknown[]> {
     this.historyCalls.push({ conversation, cursor, limit });
     return this.#historyQueue.shift() ?? [];
+  }
+  enqueueChatResource(result: Readonly<{ nextCursor?: string | null; notes?: readonly unknown[]; note?: unknown; albums?: readonly unknown[]; photos?: readonly unknown[]; bytes?: Uint8Array }>): void {
+    this.#chatResourceQueue.push(result);
+  }
+  async readChatResource(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>) {
+    this.chatResourceCalls.push(command);
+    if (options.signal.aborted) throw options.signal.reason;
+    const result = this.#chatResourceQueue.shift();
+    if (!result) throw new Error('fake chat resource unavailable');
+    return result;
   }
   enqueueDownload(bytes: Uint8Array, name: string | null = null): void { this.#downloadQueue.push({ bytes, name }); }
   async download(kind: 'image' | 'video' | 'audio' | 'file', messageId: string,
@@ -92,6 +109,10 @@ export class FakeLineTransport implements LineTransport {
   }
   async react(conversation: { chatType: string; chatId: string }, messageId: string, reaction: string, _lease: unknown): Promise<void> {
     this.reactCalls.push({ ...conversation, messageId, reaction });
+  }
+  async unsend(conversation: { chatType: string; chatId: string }, messageId: string, lease: unknown): Promise<void> {
+    this.unsendCalls.push({ ...conversation, messageId, lease });
+    if (this.unsendError) throw this.unsendError;
   }
   async checkFriendRelation(targetMid: string, lease: unknown): Promise<FriendRelation> {
     this.friendCheckCalls.push({ targetMid, lease });
