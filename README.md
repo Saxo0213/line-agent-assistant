@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-The v1.0.244 release improves Album photo loading, pagination, and recovery after LINE becomes ready. See the [v1.0.244 release notes](docs/releases/v1.0.244.md).
+The v1.0.249 release improves Album browsing and saved photo previews, makes saved photos easier to find on disk, and clarifies operation failures and primary administrator friend confirmation. See the [v1.0.249 release notes](docs/releases/v1.0.249.md).
 
 ## Installation
 
