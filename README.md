@@ -11,6 +11,12 @@ Using LINE Chrome-type client sessions, the app lets two LINE accounts serve dif
 - **Message assistant:** Shows conversations and attachments from both accounts in one place, searches message history, and lets the administrator ask the Agent to summarize conversations.
 - **Conversation assistant:** Lets the Agent participate in conversations, help download files and images, and set up automatic reply rules.
 
+### Agent conversation example
+
+The Agent can respond to instructions directly in a LINE chat:
+
+![Example LINE conversation with the Agent responding to a user instruction](docs/images/agent-line-conversation.png)
+
 ## Installation
 
 ### Windows installer
