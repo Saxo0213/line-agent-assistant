@@ -4,12 +4,20 @@
 
 ## 功能
 
-透過 LINE Chrome 類型用戶端的工作階段，讓兩個 LINE 帳號在同一台 Windows 電腦上分工：
-
-- **Agent 帳號：** 使用登入模式，透過 LINE 接收管理者指令，交由本機的 Codex 或 Claude 執行任務。
-- **管理者帳號：** 可選擇登入或監控模式；監控模式讀取 LINE 本機儲存的訊息紀錄。
-- **訊息助理：** 集中查看兩個帳號的對話與附件、搜尋歷史訊息，並請 Agent 協助摘要對話內容。
-- **對話助理：** 讓 Agent 參與對話，協助下載檔案與圖片，並設定自動回覆規則。
+<table>
+<tr>
+<td width="60%" valign="top">
+<p>透過 LINE Chrome 類型用戶端的工作階段，讓兩個 LINE 帳號在同一台 Windows 電腦上分工：</p>
+<ul>
+<li><strong>Agent 帳號：</strong> 使用登入模式，透過 LINE 接收管理者指令，交由本機的 Codex 或 Claude 執行任務。</li>
+<li><strong>管理者帳號：</strong> 可選擇登入或監控模式；監控模式讀取 LINE 本機儲存的訊息紀錄。</li>
+<li><strong>訊息助理：</strong> 集中查看兩個帳號的對話與附件、搜尋歷史訊息，並請 Agent 協助摘要對話內容。</li>
+<li><strong>對話助理：</strong> 讓 Agent 參與對話，協助下載檔案與圖片，並設定自動回覆規則。</li>
+</ul>
+</td>
+<td width="40%" valign="top"><img src="docs/images/agent-line-conversation.png" alt="Agent 在 LINE 對話中回應使用者指令的畫面" width="320"></td>
+</tr>
+</table>
 
 ## 安裝
 

@@ -4,18 +4,20 @@
 
 ## Features
 
-Using LINE Chrome-type client sessions, the app lets two LINE accounts serve different roles on the same Windows computer:
-
-- **Agent account:** Signs in to LINE, receives instructions from the administrator, and runs tasks through a locally installed Codex or Claude agent.
-- **Administrator account:** Supports sign-in or monitoring mode. Monitoring reads message records stored locally by LINE.
-- **Message assistant:** Shows conversations and attachments from both accounts in one place, searches message history, and lets the administrator ask the Agent to summarize conversations.
-- **Conversation assistant:** Lets the Agent participate in conversations, help download files and images, and set up automatic reply rules.
-
-### Agent conversation example
-
-The Agent can respond to instructions directly in a LINE chat:
-
-![Example LINE conversation with the Agent responding to a user instruction](docs/images/agent-line-conversation.png)
+<table>
+<tr>
+<td width="60%" valign="top">
+<p>Using LINE Chrome-type client sessions, the app lets two LINE accounts serve different roles on the same Windows computer:</p>
+<ul>
+<li><strong>Agent account:</strong> Signs in to LINE, receives instructions from the administrator, and runs tasks through a locally installed Codex or Claude agent.</li>
+<li><strong>Administrator account:</strong> Supports sign-in or monitoring mode. Monitoring reads message records stored locally by LINE.</li>
+<li><strong>Message assistant:</strong> Shows conversations and attachments from both accounts in one place, searches message history, and lets the administrator ask the Agent to summarize conversations.</li>
+<li><strong>Conversation assistant:</strong> Lets the Agent participate in conversations, help download files and images, and set up automatic reply rules.</li>
+</ul>
+</td>
+<td width="40%" valign="top"><img src="docs/images/agent-line-conversation.png" alt="Example LINE conversation with the Agent responding to a user instruction" width="320"></td>
+</tr>
+</table>
 
 ## Installation
 

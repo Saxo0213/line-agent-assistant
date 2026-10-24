@@ -4,12 +4,20 @@
 
 ## 기능
 
-LINE Chrome 유형 클라이언트 세션을 사용하여 한 대의 Windows 컴퓨터에서 두 LINE 계정이 역할을 나누어 수행합니다.
-
-- **Agent 계정:** LINE에 로그인해 관리자의 지시를 받고, 로컬에 설치된 Codex 또는 Claude로 작업을 수행합니다.
-- **관리자 계정:** 로그인 모드와 모니터링 모드 중에서 선택할 수 있습니다. 모니터링 모드에서는 LINE이 로컬에 저장한 메시지 기록을 읽습니다.
-- **메시지 도우미:** 두 계정의 대화와 첨부 파일을 한곳에서 확인하고, 과거 메시지를 검색하며, Agent에게 대화 요약을 요청할 수 있습니다.
-- **대화 도우미:** Agent가 대화에 참여해 파일과 이미지 다운로드를 돕고 자동 응답 규칙을 설정할 수 있습니다.
+<table>
+<tr>
+<td width="60%" valign="top">
+<p>LINE Chrome 유형 클라이언트 세션을 사용하여 한 대의 Windows 컴퓨터에서 두 LINE 계정이 역할을 나누어 수행합니다.</p>
+<ul>
+<li><strong>Agent 계정:</strong> LINE에 로그인해 관리자의 지시를 받고, 로컬에 설치된 Codex 또는 Claude로 작업을 수행합니다.</li>
+<li><strong>관리자 계정:</strong> 로그인 모드와 모니터링 모드 중에서 선택할 수 있습니다. 모니터링 모드에서는 LINE이 로컬에 저장한 메시지 기록을 읽습니다.</li>
+<li><strong>메시지 도우미:</strong> 두 계정의 대화와 첨부 파일을 한곳에서 확인하고, 과거 메시지를 검색하며, Agent에게 대화 요약을 요청할 수 있습니다.</li>
+<li><strong>대화 도우미:</strong> Agent가 대화에 참여해 파일과 이미지 다운로드를 돕고 자동 응답 규칙을 설정할 수 있습니다.</li>
+</ul>
+</td>
+<td width="40%" valign="top"><img src="docs/images/agent-line-conversation.png" alt="LINE 대화에서 Agent가 사용자 지시에 응답하는 예시" width="320"></td>
+</tr>
+</table>
 
 ## 설치
 
