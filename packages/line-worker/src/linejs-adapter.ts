@@ -19,7 +19,8 @@ import { safeRaw } from './normalizer.js';
 import { verifyLinejsPackage } from './version.js';
 import { SafeAttachmentError } from './attachment-error.js';
 import { parseEncryptedAccessToken, validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
-import { boundedChatResourceResponseCode, ChatResourceFailure } from './chat-resource-error.js';
+import { boundedChatResourceResponseCode, ChatResourceFailure, safeChatResourceFailureDetails,
+  safeChatResourceUpstreamCode, safeChatResourceUpstreamNumber } from './chat-resource-error.js';
 
 type OpaqueCall = () => Promise<unknown>;
 type SourceCall = Readonly<{
@@ -1016,7 +1017,8 @@ export class LinejsAdapter implements LineTransport {
     const stage = async <T>(category: 'bootstrap_failure' | 'list_get_transport_failure' | 'normalization_failure', operation: () => Promise<T> | T): Promise<T> => {
       try { return await operation(); } catch (error) {
         if (options.signal.aborted) throw error;
-        throw new ChatResourceFailure(category);
+        const fields = safeChatResourceFailureDetails(error);
+        throw new ChatResourceFailure(category, undefined, fields.failureKind, fields.upstreamStatus, fields.upstreamCode);
       }
     };
     const listGet = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -1024,13 +1026,17 @@ export class LinejsAdapter implements LineTransport {
         if (options.signal.aborted) throw error;
         if (error instanceof InternalError && error.type === 'MoaError') {
           const data = error.data as Record<string, unknown> | undefined;
-          if (data && Object.hasOwn(data, 'code')) throw new ChatResourceFailure('response_code_invalid');
-          if (data && !Object.hasOwn(data, 'status')) throw new ChatResourceFailure('response_shape_invalid');
+          if (data && Object.hasOwn(data, 'code')) throw new ChatResourceFailure('response_code_invalid', undefined,
+            'linejs_internal', safeChatResourceUpstreamNumber(data.status), safeChatResourceUpstreamCode(data.code));
+          if (data && Object.hasOwn(data, 'status')) throw new ChatResourceFailure('list_get_transport_failure', undefined,
+            'linejs_internal', safeChatResourceUpstreamNumber(data.status));
+          if (data) throw new ChatResourceFailure('response_shape_invalid', undefined, 'linejs_internal');
           if (error.message === 'Moa returned invalid JSON' || error.message === 'Moa returned an invalid response object') {
-            throw new ChatResourceFailure('response_shape_invalid');
+            throw new ChatResourceFailure('response_shape_invalid', undefined, 'linejs_internal');
           }
         }
-        throw new ChatResourceFailure('list_get_transport_failure');
+        const fields = safeChatResourceFailureDetails(error);
+        throw new ChatResourceFailure('list_get_transport_failure', undefined, fields.failureKind, fields.upstreamStatus, fields.upstreamCode);
       }
     };
     if (command.action === 'listNotes' || command.action === 'getNote') {

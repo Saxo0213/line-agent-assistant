@@ -106,6 +106,9 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
             <dt>{diagnosticLabels[locale].operation}</dt><dd><code>{row.diagnostic.operation}</code></dd>
             <dt>{diagnosticLabels[locale].stage}</dt><dd><code>{row.diagnostic.stage}</code></dd>
             <dt>{diagnosticLabels[locale].reason}</dt><dd><code>{row.diagnostic.reason ?? row.diagnostic.category}</code>{row.diagnostic.statusCode !== undefined ? ` (${row.diagnostic.statusCode})` : ''}</dd>
+            {row.diagnostic.failureKind && <><dt>{diagnosticLabels[locale].failureKind}</dt><dd><code>{row.diagnostic.failureKind}</code></dd></>}
+            {row.diagnostic.upstreamStatus !== undefined && <><dt>{diagnosticLabels[locale].upstreamStatus}</dt><dd><code>{row.diagnostic.upstreamStatus}</code></dd></>}
+            {row.diagnostic.upstreamCode !== undefined && <><dt>{diagnosticLabels[locale].upstreamCode}</dt><dd><code>{row.diagnostic.upstreamCode}</code></dd></>}
             <dt>{diagnosticLabels[locale].recovery}</dt><dd>{diagnosticRecovery(locale, row.diagnostic)}</dd>
             {row.correlationId && <><dt>{diagnosticLabels[locale].reference}</dt><dd><code>{row.correlationId}</code></dd></>}
           </dl> : <p>{diagnosticLabels[locale].legacy}</p>}

@@ -34,10 +34,66 @@ describe('chat resource diagnostics', () => {
     expect(parseChatResourceDiagnostic({ ...validRecord, source: 'mcp' })?.source).toBe('mcp');
   });
 
+  it('preserves a bounded album identifier and automatic scan limit reason', () => {
+    expect(parseChatResourceDiagnostic({ ...validRecord, source: 'notification', action: 'album_photos', albumId: 'album:one',
+      status: 'failure', errorCode: 'RESPONSE_INVALID', failureStage: 'archive_scan', failureReason: 'page_limit' }))
+      .toMatchObject({ albumId: 'album:one', failureStage: 'archive_scan', failureReason: 'page_limit' });
+    expect(parseChatResourceDiagnostic({ ...validRecord, source: 'notification', action: 'album_photos', albumId: 'album:one',
+      status: 'failure', errorCode: 'UNKNOWN', failureStage: 'archive_write', failureReason: 'photo_write_failed' }))
+      .toMatchObject({ failureStage: 'archive_write', failureReason: 'photo_write_failed' });
+    expect(parseChatResourceDiagnostic({ ...validRecord, source: 'notification', action: 'album_list',
+      status: 'failure', errorCode: 'UNKNOWN', failureStage: 'archive_scan', failureReason: 'archive_incomplete' }))
+      .toMatchObject({ failureStage: 'archive_scan', failureReason: 'archive_incomplete' });
+    expect(parseChatResourceDiagnostic({ ...validRecord, source: 'notification', action: 'album_list',
+      status: 'failure', errorCode: 'UNKNOWN', failureStage: 'archive_scan', failureReason: 'archive_reconciliation_failed' }))
+      .toMatchObject({ failureStage: 'archive_scan', failureReason: 'archive_reconciliation_failed' });
+    expect(parseChatResourceDiagnostic({ ...validRecord, source: 'notification', action: 'album_photos',
+      status: 'failure', errorCode: 'UNKNOWN', failureStage: 'archive_contains', failureReason: 'unknown' }))
+      .toMatchObject({ failureStage: 'archive_contains', failureReason: 'unknown' });
+  });
+
   it('persists only allowlisted worker failure categories', () => {
     expect(parseChatResourceDiagnostic({ ...validRecord, status: 'failure', failureCategory: 'bootstrap_failure' })?.failureCategory)
       .toBe('bootstrap_failure');
     expect(parseChatResourceDiagnostic({ ...validRecord, failureCategory: 'server response token=secret' })).toBeNull();
+  });
+
+  it('writes bounded upstream album facts through the production parser and sink', async () => {
+    const logger = createChatResourceDiagnostics({ appDataDirectory: await tempRoot() });
+    logger.record({ ...validRecord, source: 'notification', action: 'album_list', status: 'failure',
+      failureCategory: 'response_code_invalid', failureKind: 'linejs_internal', upstreamCode: 102001,
+      responseFields: [] });
+    await logger.shutdown();
+    const lines = (await readFile(logger.filePath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(lines).toContainEqual(expect.objectContaining({ action: 'album_list', failureKind: 'linejs_internal', upstreamCode: 102001 }));
+  });
+
+  it('persists normalized upstream facts while rejecting invalid status and fractional code', async () => {
+    const root = await tempRoot();
+    const logger = createChatResourceDiagnostics({ appDataDirectory: root });
+    const normalized = parseChatResourceDiagnostic({ ...validRecord, source: 'notification', action: 'album_list', status: 'failure',
+      failureCategory: 'list_get_transport_failure', failureKind: 'linejs_internal', upstreamCode: 'non_numeric' });
+    expect(normalized).not.toBeNull();
+    logger.record(normalized!);
+    expect(parseChatResourceDiagnostic({ ...validRecord, status: 'failure', upstreamStatus: 0 })).toBeNull();
+    expect(parseChatResourceDiagnostic({ ...validRecord, status: 'failure', upstreamStatus: 799 })).toBeNull();
+    expect(parseChatResourceDiagnostic({ ...validRecord, status: 'failure', upstreamCode: 1.5 })).toBeNull();
+    await logger.shutdown();
+    const lines = (await readFile(logger.filePath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(lines).toContainEqual(expect.objectContaining({ action: 'album_list', failureKind: 'linejs_internal', upstreamCode: 'non_numeric' }));
+    expect(JSON.stringify(lines)).not.toContain('secret');
+  });
+
+  it('preserves bounded native failure kind, HTTP status, and LINE response code', () => {
+    expect(parseChatResourceDiagnostic({ ...validRecord, action: 'album_list', status: 'failure',
+      failureCategory: 'response_code_invalid', failureKind: 'linejs_internal', upstreamCode: 102001 }))
+      .toMatchObject({ failureKind: 'linejs_internal', upstreamCode: 102001 });
+    expect(parseChatResourceDiagnostic({ ...validRecord, action: 'album_list', status: 'failure',
+      failureCategory: 'list_get_transport_failure', failureKind: 'linejs_internal', upstreamStatus: 503 }))
+      .toMatchObject({ upstreamStatus: 503 });
+    expect(parseChatResourceDiagnostic({ ...validRecord, action: 'album_list', status: 'failure', upstreamCode: 'private response' })).toBeNull();
+    expect(parseChatResourceDiagnostic({ ...validRecord, action: 'album_list', upstreamStatus: 799 })).toBeNull();
+    expect(parseChatResourceDiagnostic({ ...validRecord, status: 'success', failureKind: 'other' })).toBeNull();
   });
 
   it.each([[-1_000_000_000, -1_000_000_000], [1_000_000_000, 1_000_000_000], ['missing', 'missing'], ['non_numeric', 'non_numeric']] as const)

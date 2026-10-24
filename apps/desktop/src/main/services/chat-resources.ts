@@ -22,6 +22,8 @@ export type ChatResourceRequest = ConversationKey & { requestId: string; type: '
   postId?: string; albumId?: string; photoId?: string; oid?: string; prefix?: string };
 export type ChatResourceReadResult = { type: 'chatResourceResult'; requestId: string; action: ChatResourceAction; ok: boolean; error?: string | null | undefined;
   responseCode?: number | 'missing' | 'non_numeric' | undefined;
+  failureKind?: 'linejs_internal' | 'effect_denied' | 'type_error' | 'range_error' | 'timeout_error' | 'abort_error' | 'other' | undefined;
+  upstreamStatus?: number | undefined; upstreamCode?: number | 'missing' | 'non_numeric' | undefined;
   accountId: string; workerInstanceId: string; controlEpoch: number; chatType: ConversationKey['chatType']; chatId: string;
   notes?: NoteDto[] | undefined; note?: NoteDto | undefined; albums?: AlbumDto[] | undefined; photos?: PhotoDto[] | undefined;
   nextCursor?: string | null | undefined; bytes?: Uint8Array | undefined };
@@ -31,7 +33,7 @@ export type ChatResourceArchiveVersion = { revision: number; savedAt: string; co
 export type ChatResourceArchiveItem = { resourceId: string; revision: number; savedAt: string; contentHash: string; byteLength: number };
 export type ChatResourceArchivePage = { items: ChatResourceArchiveItem[]; nextCursor: string | null };
 export type AlbumOpenResult = { albumId: string; savedCount: number; failedCount: number; totalCount: number; byteCount: number;
-  complete: boolean; failureCodes: string[]; errorCode: string | null };
+  complete: boolean; failureCodes: string[]; errorCode: string | null; nextCursor: string | null; nextPhotoIndex: number };
 
 /** Main-facing boundary implemented by the one bounded native archive owner. Paths never cross this seam.
  * `publish` stages first, invokes guard immediately before final commit, and serializes commit/cancel messages. */
@@ -102,19 +104,39 @@ export const unavailableChatResourceStore: ChatResourceStore = {
   forceClose() {},
 };
 
-/** Recognizes only the native live Note post notification; generic message events are not refresh signals. */
-export function isNativeNotePostNotification(envelope: InboundEnvelope): boolean {
-  if (envelope.kind !== 'event' || envelope.ingestion.source !== 'live' || typeof envelope.raw !== 'object' || envelope.raw === null || Array.isArray(envelope.raw)) return false;
+/** Classifies only native live POSTNOTIFICATION subtypes; generic, historical, and unknown events are not refresh signals. */
+export function nativePostNotificationSubtype(envelope: InboundEnvelope): 'note' | 'album' | null {
+  if (envelope.kind !== 'event' || envelope.ingestion.source !== 'live' || typeof envelope.raw !== 'object' || envelope.raw === null || Array.isArray(envelope.raw)) return null;
   const raw = envelope.raw as Record<string, unknown>;
   const message = raw.message;
-  if (typeof message !== 'object' || message === null || Array.isArray(message)) return false;
-  const contentType = (message as Record<string, unknown>).contentType;
-  return contentType === 16 || contentType === '16' || contentType === 'POSTNOTIFICATION';
+  if (typeof message !== 'object' || message === null || Array.isArray(message)) return null;
+  const nativeMessage = message as Record<string, unknown>;
+  const contentType = nativeMessage.contentType;
+  if (contentType !== 16 && contentType !== '16' && contentType !== 'POSTNOTIFICATION') return null;
+  const metadata = nativeMessage.contentMetadata;
+  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) return null;
+  const serviceType = (metadata as Record<string, unknown>).serviceType;
+  return serviceType === 'GB' ? 'note' : serviceType === 'AB' ? 'album' : null;
+}
+
+export function isNativeNotePostNotification(envelope: InboundEnvelope): boolean {
+  return nativePostNotificationSubtype(envelope) === 'note';
 }
 
 function boundedId(value: string, name: string): string {
   if (typeof value !== 'string' || value.length < 1 || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value)) throw new Error(`Invalid ${name}.`);
   return value;
+}
+function sameChatResourceBinding(left: ChatResourceBinding, right: ChatResourceBinding): boolean {
+  return left.accountId === right.accountId && left.workerInstanceId === right.workerInstanceId && left.controlEpoch === right.controlEpoch
+    && left.transportOwnerId === right.transportOwnerId && left.transportGeneration === right.transportGeneration
+    && left.writeGrantVersion === right.writeGrantVersion && left.mode === right.mode;
+}
+function wasChatResourceDiagnosticLogged(error: unknown): boolean {
+  return !!error && typeof error === 'object' && (error as { chatResourceDiagnosticLogged?: unknown }).chatResourceDiagnosticLogged === true;
+}
+function markChatResourceDiagnosticLogged(error: unknown): void {
+  if (error && typeof error === 'object') (error as { chatResourceDiagnosticLogged?: boolean }).chatResourceDiagnosticLogged = true;
 }
 function safeId(value: string): string { return Buffer.from(value, 'utf8').toString('base64url'); }
 function boundedText(value: unknown, limit: number, name: string): string {
@@ -346,11 +368,11 @@ export class ChatResourceArchiveService {
     return note;
   }
 
-  async listAlbums(key: ConversationKey, cursor: string | null, signal?: AbortSignal) {
-    return this.admit(key, signal, (operationSignal, generation) => this.listAlbumsImpl(key, cursor, operationSignal, generation));
+  async listAlbums(key: ConversationKey, cursor: string | null, signal?: AbortSignal, source: 'modal' | 'notification' = 'modal', expectedBinding?: ChatResourceBinding) {
+    return this.admit(key, signal, (operationSignal, generation) => this.listAlbumsImpl(key, cursor, operationSignal, generation, source, expectedBinding));
   }
-  private async listAlbumsImpl(key: ConversationKey, cursor: string | null, signal: AbortSignal, generation: number) {
-    const { value, binding } = await this.read(key, 'listAlbums', { cursor, limit: CHAT_RESOURCE_PAGE_LIMIT }, signal, generation);
+  private async listAlbumsImpl(key: ConversationKey, cursor: string | null, signal: AbortSignal, generation: number, source: 'modal' | 'notification', expectedBinding?: ChatResourceBinding) {
+    const { value, binding } = await this.read(key, 'listAlbums', { cursor, limit: CHAT_RESOURCE_PAGE_LIMIT }, signal, generation, source, expectedBinding);
     const page = arrayResult<unknown>(value, 'albums', CHAT_RESOURCE_PAGE_LIMIT);
     const albums = page.rows.map((row) => albumDto(row, key.chatId));
     for (const album of albums) await this.publish(key, 'album', album.albumId, contentBytes({ _linejsGenerated: 'album-v1', ...album }, MAX_METADATA_TEXT * 2), signal, generation, binding);
@@ -376,25 +398,29 @@ export class ChatResourceArchiveService {
     return this.admit(key, signal, (operationSignal, generation) => this.downloadAlbumPhotoImpl(key, albumId, photoId, oid, prefix, operationSignal, generation));
   }
 
-  openAlbum(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<AlbumOpenResult> {
+  openAlbum(key: ConversationKey, albumId: string, signal?: AbortSignal, source: 'modal' | 'notification' = 'modal', expectedBinding?: ChatResourceBinding,
+    startCursor: string | null = null, startPhotoIndex = 0): Promise<AlbumOpenResult> {
     const id = boundedId(albumId, 'album ID');
     const flightKey = `${key.accountId}\0${key.chatType}\0${key.chatId}\0${id}`;
     const current = this.albumFlights.get(flightKey);
-    if (current) return Promise.reject(new Error('ALBUM_ARCHIVE_ALREADY_RUNNING'));
-    const flight = this.admit(key, signal, (operationSignal, generation) => this.openAlbumImpl(key, id, operationSignal, generation))
+    if (current) {
+      if (source === 'notification') return current.then(() => this.openAlbum(key, id, signal, source, expectedBinding, startCursor, startPhotoIndex));
+      return Promise.reject(new Error('ALBUM_ARCHIVE_ALREADY_RUNNING'));
+    }
+    const flight = this.admit(key, signal, (operationSignal, generation) => this.openAlbumImpl(key, id, operationSignal, generation, source, expectedBinding, startCursor, startPhotoIndex))
       .finally(() => { if (this.albumFlights.get(flightKey) === flight) this.albumFlights.delete(flightKey); });
     this.albumFlights.set(flightKey, flight);
     return flight;
   }
 
-  private async openAlbumImpl(key: ConversationKey, albumId: string, signal: AbortSignal, generation: number): Promise<AlbumOpenResult> {
-    const firstBinding = await this.authorize(key, signal, generation);
+  private async openAlbumImpl(key: ConversationKey, albumId: string, signal: AbortSignal, generation: number,
+    source: 'modal' | 'notification', expectedBinding?: ChatResourceBinding, startCursor: string | null = null, startPhotoIndex = 0): Promise<AlbumOpenResult> {
+    const firstBinding = await this.authorize(key, signal, generation, expectedBinding);
     const store = this.store();
     if (!store.ensureAlbumFolder || !store.publishAlbumPhoto) throw new Error('ALBUM_FOLDER_ARCHIVE_UNAVAILABLE');
     const guard = () => this.assertCurrent(key.accountId, generation, firstBinding, signal);
     guard();
-    await store.ensureAlbumFolder({ key, albumId, signal, guard });
-    let cursor: string | null = null;
+    let cursor: string | null = startCursor;
     const seenCursors = new Set<string>();
     const seenPhotos = new Set<string>();
     let savedCount = 0, failedCount = 0, totalBytes = 0, itemCount = 0;
@@ -402,6 +428,7 @@ export class ChatResourceArchiveService {
     let complete = true;
     let stopCode: string | null = null;
     let pageCount = 0;
+    let nextPhotoIndex = 0;
     do {
       guard();
       if (pageCount >= MAX_ALBUM_OPEN_PAGES) { complete = false; stopCode = 'PAGE_LIMIT'; break; }
@@ -410,25 +437,41 @@ export class ChatResourceArchiveService {
         seenCursors.add(cursor);
       }
       let page: { value: ChatResourceReadResult; binding: ChatResourceBinding };
-      try { page = await this.read(key, 'listAlbumPhotos', { albumId, cursor, limit: CHAT_RESOURCE_PHOTO_LIMIT }, signal, generation); }
+      try { page = await this.read(key, 'listAlbumPhotos', { albumId, cursor, limit: CHAT_RESOURCE_PHOTO_LIMIT }, signal, generation, source, firstBinding); }
       catch (error) { complete = false; stopCode = archiveFailureCode(error); break; }
       pageCount += 1;
       let rows: PhotoDto[];
       try { rows = arrayResult<unknown>(page.value, 'photos', CHAT_RESOURCE_PHOTO_LIMIT).rows.map(photoDto); }
       catch (error) { complete = false; stopCode = archiveFailureCode(error); break; }
+      let photoIndex = 0;
+      if (pageCount === 1) {
+        const folderStartedAt = Date.now();
+        try { guard(); await store.ensureAlbumFolder({ key, albumId, signal, guard }); }
+        catch (error) {
+          this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, albumId, action: 'album_photos',
+            occurredAt: new Date(folderStartedAt).toISOString(), durationMs: Date.now() - folderStartedAt, status: 'failure', errorCode: 'UNKNOWN',
+            failureStage: 'archive_write', failureReason: 'folder_write_failed', failureCategory: 'unknown', itemCount: 0, byteCount: 0, responseFields: [] });
+          markChatResourceDiagnosticLogged(error);
+          throw error;
+        }
+      }
       for (const photo of rows) {
+        const currentPhotoIndex = photoIndex++;
+        if (pageCount === 1 && currentPhotoIndex < startPhotoIndex) continue;
         guard();
         if (seenPhotos.has(photo.photoId)) continue;
-        if (itemCount >= CHAT_RESOURCE_ALBUM_OPEN_ITEM_LIMIT) { complete = false; stopCode = 'ITEM_LIMIT'; break; }
+        if (itemCount >= CHAT_RESOURCE_ALBUM_OPEN_ITEM_LIMIT) { complete = false; stopCode = 'PAGE_LIMIT'; nextPhotoIndex = currentPhotoIndex; break; }
         seenPhotos.add(photo.photoId); itemCount += 1;
         const remainingBytes = this.albumOpenByteLimit - totalBytes;
-        if (remainingBytes <= 0) { complete = false; stopCode = 'BYTE_LIMIT'; break; }
+        if (remainingBytes <= 0) { complete = false; stopCode = 'BYTE_LIMIT'; nextPhotoIndex = currentPhotoIndex; break; }
+        let failureStage: 'archive_contains' | 'resource_read' | 'archive_write' = 'archive_contains';
         try {
           if (store.hasAlbumPhoto && await store.hasAlbumPhoto({ key, albumId, photoId: photo.photoId, signal, guard })) {
             guard(); savedCount += 1; continue;
           }
+          failureStage = 'resource_read';
           const { value, binding } = await this.read(key, 'downloadAlbumPhoto', { albumId, photoId: photo.photoId, oid: photo.oid,
-            prefix: photo.prefix, maxBytes: Math.min(CHAT_RESOURCE_IMAGE_LIMIT, remainingBytes) }, signal, generation);
+            prefix: photo.prefix, maxBytes: Math.min(CHAT_RESOURCE_IMAGE_LIMIT, remainingBytes) }, signal, generation, source, firstBinding);
           guard();
           const image = value.bytes;
           if (image instanceof Uint8Array) totalBytes += image.byteLength;
@@ -437,14 +480,28 @@ export class ChatResourceArchiveService {
             failedCount += 1;
             failureCodes.push('BYTE_LIMIT');
             this.recordAlbumPhotoOutcome(key, 'failed');
-            complete = false; stopCode = 'BYTE_LIMIT'; break;
+            complete = false; stopCode = 'BYTE_LIMIT'; nextPhotoIndex = currentPhotoIndex; break;
           }
+          guard();
+          failureStage = 'archive_write';
           await store.publishAlbumPhoto({ key, albumId, photoId: photo.photoId, content: image, signal, guard: () => this.assertCurrent(key.accountId, generation, binding, signal) });
           guard(); savedCount += 1;
           this.recordAlbumPhotoOutcome(key, 'succeeded');
         } catch (error) {
           this.recordAlbumPhotoOutcome(key, 'failed');
           const failureCode = archiveFailureCode(error);
+          if (failureStage === 'archive_write') this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, albumId,
+            action: 'album_photos', occurredAt: new Date().toISOString(), durationMs: 0, status: 'failure', errorCode: 'UNKNOWN',
+            failureStage: 'archive_write', failureReason: 'photo_write_failed', failureCategory: 'unknown', itemCount: 1,
+            byteCount: 0, responseFields: [] });
+          else if (failureStage === 'archive_contains') this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, albumId,
+            action: 'album_photos', occurredAt: new Date().toISOString(), durationMs: 0, status: 'failure', errorCode: 'UNKNOWN',
+            failureStage: 'archive_contains', failureReason: 'unknown', failureCategory: 'unknown', itemCount: 1,
+            byteCount: 0, responseFields: [] });
+          else if (!wasChatResourceDiagnosticLogged(error)) this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, albumId,
+            action: 'photo_download', occurredAt: new Date().toISOString(), durationMs: 0, status: 'failure', errorCode: diagnosticErrorCode(error),
+            failureStage: 'resource_read', failureReason: error instanceof Error && error.message.toLowerCase().includes('binding changed') ? 'stale_binding' : 'unknown',
+            failureCategory: 'unknown', itemCount: 1, byteCount: 0, responseFields: [] });
           if (signal.aborted || generation !== (this.accountGeneration.get(key.accountId) ?? 0)
             || this.stopped || !this.deps.isCurrentBinding(firstBinding)
             || ['REPARSE_POINT', 'CHAT_IDENTITY_CHANGED', 'CHAT_FOLDER_UNAVAILABLE', 'CLOSED', 'ABORTED'].includes(failureCode)) {
@@ -459,7 +516,8 @@ export class ChatResourceArchiveService {
     } while (cursor !== null);
     guard();
     return { albumId, savedCount, failedCount, totalCount: itemCount, byteCount: totalBytes, complete: complete && failedCount === 0,
-      failureCodes: failureCodes.slice(0, CHAT_RESOURCE_ALBUM_OPEN_ITEM_LIMIT), errorCode: stopCode };
+      failureCodes: failureCodes.slice(0, CHAT_RESOURCE_ALBUM_OPEN_ITEM_LIMIT), errorCode: stopCode,
+      nextCursor: stopCode === 'PAGE_LIMIT' || stopCode === 'BYTE_LIMIT' ? cursor : null, nextPhotoIndex };
   }
   private async downloadAlbumPhotoImpl(key: ConversationKey, albumId: string, photoId: string, oid: string, prefix: string, signal: AbortSignal, generation: number) {
     const aid = boundedId(albumId, 'album ID');
@@ -493,6 +551,17 @@ export class ChatResourceArchiveService {
       this.assertCurrent(key.accountId, generation, binding, operationSignal);
       return result ? validateArchiveVersion(result) : null;
     });
+  }
+
+  recordNotificationFailure(key: ConversationKey, error: unknown): void {
+    if (wasChatResourceDiagnosticLogged(error)) return;
+    const message = error instanceof Error ? error.message.toLowerCase() : '';
+    this.logDiagnostic({ source: 'notification', accountId: key.accountId, chatId: key.chatId, action: 'album_list',
+      occurredAt: new Date().toISOString(), durationMs: 0, status: 'failure', errorCode: diagnosticErrorCode(error),
+      failureStage: 'archive_scan', failureReason: message.includes('cursor_loop') ? 'cursor_loop'
+        : message.includes('binding') ? 'stale_binding' : message.includes('incomplete') ? 'archive_incomplete' : 'archive_reconciliation_failed',
+      failureCategory: 'unknown', itemCount: 0, byteCount: 0, responseFields: [] });
+    markChatResourceDiagnosticLogged(error);
   }
 
   private admit<T>(key: ConversationKey, signal: AbortSignal | undefined,
@@ -568,7 +637,7 @@ export class ChatResourceArchiveService {
     if (binding && (!this.deps.isCurrentBinding(binding) || binding.mode !== 'ACTIVE_CONTROL')) throw new Error('The account binding changed during the LINE read.');
   }
 
-  private async authorize(key: ConversationKey, signal: AbortSignal, generation: number): Promise<ChatResourceBinding> {
+  private async authorize(key: ConversationKey, signal: AbortSignal, generation: number, expectedBinding?: ChatResourceBinding): Promise<ChatResourceBinding> {
     boundedId(key.accountId, 'account ID'); boundedId(key.chatId, 'chat ID');
     if (!await this.deps.isWritableAccount(key.accountId)) throw new Error('LINE resource reads are disabled for a read-only account.');
     this.assertCurrent(key.accountId, generation, null, signal);
@@ -577,6 +646,7 @@ export class ChatResourceArchiveService {
     const binding = await this.deps.getBinding(key.accountId);
     this.assertCurrent(key.accountId, generation, binding, signal);
     if (!binding || binding.accountId !== key.accountId || binding.mode !== 'ACTIVE_CONTROL' || !this.deps.isCurrentBinding(binding)) throw new Error('The account has no current logged-in worker binding.');
+    if (expectedBinding && !sameChatResourceBinding(binding, expectedBinding)) throw new Error('The account binding changed during the album reconciliation.');
     return binding;
   }
 
@@ -596,10 +666,10 @@ export class ChatResourceArchiveService {
 
   private async read(key: ConversationKey, action: ChatResourceAction,
     extra: Omit<Pick<ChatResourceRequest, 'cursor' | 'postId' | 'albumId' | 'photoId' | 'oid' | 'prefix' | 'limit' | 'maxBytes'>, 'cursor'>
-      & { cursor?: string | null }, signal: AbortSignal, generation: number, source: 'modal' | 'notification' = 'modal'): Promise<{ value: ChatResourceReadResult; binding: ChatResourceBinding }> {
+      & { cursor?: string | null }, signal: AbortSignal, generation: number, source: 'modal' | 'notification' = 'modal', expectedBinding?: ChatResourceBinding): Promise<{ value: ChatResourceReadResult; binding: ChatResourceBinding }> {
     if (extra.cursor !== undefined && extra.cursor !== null && (typeof extra.cursor !== 'string' || extra.cursor.length > 2048)) throw new Error('Invalid chat resource cursor.');
     if (!this.deps.store) throw new Error('CHAT_RESOURCE_STORE_UNAVAILABLE');
-    const binding = await this.authorize(key, signal, generation);
+    const binding = await this.authorize(key, signal, generation, expectedBinding);
     const { cursor, ...commandOptions } = extra;
     const command: ChatResourceRequest = { type: 'chatResourceRead', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId, ...commandOptions,
       ...(cursor !== undefined && cursor !== null ? { cursor } : {}), action, requestId: randomUUID(), timeoutMs: 30_000,
@@ -612,7 +682,9 @@ export class ChatResourceArchiveService {
     catch (error) {
       const failure = diagnosticFailure(error);
       this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, action: diagnosticAction(action), occurredAt, correlationId: command.requestId,
+        ...(typeof extra.albumId === 'string' ? { albumId: extra.albumId } : {}),
         durationMs: Date.now() - startedAt, status: 'failure', errorCode: diagnosticErrorCode(error), ...failure, itemCount: 0, byteCount: 0, responseFields: [] });
+      markChatResourceDiagnosticLogged(error);
       throw error;
     }
     const responseFields = Object.entries(response).slice(0, 32).map(([name, value]) => ({ name,
@@ -622,9 +694,13 @@ export class ChatResourceArchiveService {
     let byteCount = 0;
     try { byteCount = response.bytes?.byteLength ?? Buffer.byteLength(JSON.stringify(response), 'utf8'); } catch { byteCount = 0; }
     this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, action: diagnosticAction(action), occurredAt, correlationId: command.requestId,
+      ...(typeof extra.albumId === 'string' ? { albumId: extra.albumId } : {}),
       durationMs: Date.now() - startedAt, status: response.ok ? 'success' : 'failure',
       ...(!response.ok ? { errorCode: diagnosticErrorCode(response.error), failureStage: 'worker_response', failureReason: 'worker_response_error',
         failureCategory: chatResourceFailureCategory(response.error),
+        ...(response.failureKind ? { failureKind: response.failureKind } : {}),
+        ...(response.upstreamStatus === undefined ? {} : { upstreamStatus: response.upstreamStatus }),
+        ...(response.upstreamCode === undefined ? {} : { upstreamCode: response.upstreamCode }),
         ...(source === 'modal' && (action === 'listNotes' || action === 'getNote') && response.error === 'response_code_invalid'
           && response.responseCode !== undefined ? { responseCode: response.responseCode } : {}),
       } : {}), itemCount: rows?.length ?? (response.note ? 1 : 0), byteCount, responseFields });
@@ -632,11 +708,16 @@ export class ChatResourceArchiveService {
     if (response.type !== 'chatResourceResult' || response.requestId !== command.requestId || response.action !== action
       || response.accountId !== key.accountId || response.workerInstanceId !== binding.workerInstanceId || response.controlEpoch !== binding.controlEpoch
       || response.chatType !== key.chatType || response.chatId !== key.chatId) throw new Error('Invalid LINE resource response.');
-    if (!response.ok) throw new Error(isChatResourceFailureCode(response.error) ? 'LINE_READ_FAILED' : response.error ?? 'LINE resource read failed.');
+    if (!response.ok) {
+      const error = new Error(isChatResourceFailureCode(response.error) ? 'LINE_READ_FAILED' : response.error ?? 'LINE resource read failed.');
+      markChatResourceDiagnosticLogged(error);
+      throw error;
+    }
     return { value: response, binding };
   }
 
   private logDiagnostic(record: unknown): void { try { this.deps.recordDiagnostic?.(record); } catch { /* diagnostics never change a read result */ } }
+
   private recordAlbumPhotoOutcome(key: ConversationKey, phase: 'succeeded' | 'failed'): void {
     try { this.deps.audit?.outcome('album_photo_download', phase, { initiator: 'user', accountId: key.accountId,
       correlationId: randomUUID(), requestId: randomUUID(), ...(phase === 'failed' ? { errorCode: 'CHAT_RESOURCE_READ_FAILED' } : {}) }); }
@@ -680,7 +761,7 @@ function diagnosticErrorCode(error: unknown): 'UNKNOWN' | 'TIMEOUT' | 'CANCELLED
   | 'ACCOUNT_BINDING_CHANGED' | 'ACCOUNT_DISCONNECTED' | 'WORKER_UNAVAILABLE' {
   const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
   const reason = error && typeof error === 'object' ? (error as { diagnostic?: { reason?: string } }).diagnostic?.reason : undefined;
-  return reason === 'stale_binding' ? 'ACCOUNT_BINDING_CHANGED' : reason === 'missing_worker' ? 'WORKER_UNAVAILABLE'
+  return reason === 'stale_binding' || message.includes('binding changed') ? 'ACCOUNT_BINDING_CHANGED' : reason === 'missing_worker' ? 'WORKER_UNAVAILABLE'
     : reason === 'not_ready_worker' ? 'ACCOUNT_DISCONNECTED' : message.includes('timeout') ? 'TIMEOUT' : message.includes('cancel') || message.includes('abort') ? 'CANCELLED'
       : message.includes('large') || message.includes('oversized') ? 'RESPONSE_TOO_LARGE'
         : message.includes('invalid') ? 'RESPONSE_INVALID' : message.includes('network') ? 'NETWORK_ERROR' : 'UNKNOWN';

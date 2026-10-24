@@ -102,6 +102,9 @@ export type ChatResourceReadCommand = z.infer<typeof ChatResourceReadCommandSche
 export const ChatResourceReadResultSchema = Conversation.extend({ type: z.literal('chatResourceResult'), requestId: Id.max(128),
   action: ChatResourceAction, ok: z.boolean(), error: z.string().max(80).nullable(),
   responseCode: z.union([z.number().finite().min(-1_000_000_000).max(1_000_000_000), z.enum(['missing', 'non_numeric'])]).optional(),
+  failureKind: z.enum(['linejs_internal', 'effect_denied', 'type_error', 'range_error', 'timeout_error', 'abort_error', 'other']).optional(),
+  upstreamStatus: z.number().int().min(100).max(599).optional(),
+  upstreamCode: z.union([z.number().finite().min(-1_000_000_000).max(1_000_000_000), z.enum(['missing', 'non_numeric'])]).optional(),
   nextCursor: ResourceCursor.optional(),
   notes: z.array(ChatResourceNote).max(50).optional(), note: ChatResourceNote.optional(), albums: z.array(ChatResourceAlbum).max(50).optional(),
   photos: z.array(ChatResourcePhoto).max(50).optional(), bytes: z.custom<Uint8Array>((value) => value instanceof Uint8Array)
@@ -110,6 +113,9 @@ export const ChatResourceReadResultSchema = Conversation.extend({ type: z.litera
   if (result.responseCode !== undefined && (result.ok || result.error !== 'response_code_invalid'
     || (result.action !== 'listNotes' && result.action !== 'getNote'))) {
     context.addIssue({ code: 'custom', path: ['responseCode'], message: 'Response code is restricted to failed Note reads' });
+  }
+  if ((result.failureKind !== undefined || result.upstreamStatus !== undefined || result.upstreamCode !== undefined) && result.ok) {
+    context.addIssue({ code: 'custom', path: ['failureKind'], message: 'Failure diagnostics require a failed read' });
   }
   if (!result.ok) {
     if (result.error === null || payload) context.addIssue({ code: 'custom', path: ['error'], message: 'Failed reads require an error without payload' });

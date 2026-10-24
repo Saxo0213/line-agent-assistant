@@ -7,10 +7,10 @@ const recovery: Record<Locale, Record<SafeDiagnostic['recovery'], string>> = {
   ja: { retry: '操作を再試行してください。', reconnect: 'アカウントを再接続してください。', relogin: 'LINE QR コードで再度ログインしてください。', check_configuration: '設定とアクセス権を確認してください。', reopen_app: 'アプリを開き直してください。', wait: '復旧をお待ちください。', none: '操作は不要です。', inspect_outcome: '再試行する前に結果を確認してください。' },
   ko: { retry: '작업을 다시 시도하세요.', reconnect: '계정을 다시 연결하세요.', relogin: 'LINE QR 코드로 다시 로그인하세요.', check_configuration: '설정과 접근 권한을 확인하세요.', reopen_app: '앱을 다시 여세요.', wait: '복구를 기다리세요.', none: '조치가 필요하지 않습니다.', inspect_outcome: '다시 시도하기 전에 결과를 확인하세요.' },
 };
-export const diagnosticLabels: Record<Locale, { operation: string; stage: string; reason: string; recovery: string; reference: string; legacy: string }> = {
-  en: { operation: 'Operation', stage: 'Stage', reason: 'Reason', recovery: 'Recovery', reference: 'Reference', legacy: 'Diagnostic detail was not recorded.' },
-  'zh-TW': { operation: '操作', stage: '階段', reason: '原因', recovery: '處理方式', reference: '紀錄編號', legacy: '當時未記錄詳細診斷資訊。' },
-  ja: { operation: '操作', stage: '段階', reason: '理由', recovery: '対処', reference: '参照番号', legacy: '詳細な診断情報は記録されていません。' },
-  ko: { operation: '작업', stage: '단계', reason: '원인', recovery: '복구 방법', reference: '참조', legacy: '진단 세부 정보가 기록되지 않았습니다.' },
+export const diagnosticLabels: Record<Locale, { operation: string; stage: string; reason: string; failureKind: string; upstreamStatus: string; upstreamCode: string; recovery: string; reference: string; legacy: string }> = {
+  en: { operation: 'Operation', stage: 'Stage', reason: 'Reason', failureKind: 'Native error kind', upstreamStatus: 'HTTP status', upstreamCode: 'LINE response code', recovery: 'Recovery', reference: 'Reference', legacy: 'Diagnostic detail was not recorded.' },
+  'zh-TW': { operation: '操作', stage: '階段', reason: '原因', failureKind: 'LINEJS 錯誤類型', upstreamStatus: 'HTTP 狀態碼', upstreamCode: 'LINE 回應碼', recovery: '處理方式', reference: '紀錄編號', legacy: '當時未記錄詳細診斷資訊。' },
+  ja: { operation: '操作', stage: '段階', reason: '理由', failureKind: 'LINEJS エラー種別', upstreamStatus: 'HTTP ステータス', upstreamCode: 'LINE 応答コード', recovery: '対処', reference: '参照番号', legacy: '詳細な診断情報は記録されていません。' },
+  ko: { operation: '작업', stage: '단계', reason: '원인', failureKind: 'LINEJS 오류 종류', upstreamStatus: 'HTTP 상태', upstreamCode: 'LINE 응답 코드', recovery: '복구 방법', reference: '참조', legacy: '진단 세부 정보가 기록되지 않았습니다.' },
 };
 export function diagnosticRecovery(locale: Locale, diagnostic: SafeDiagnostic): string { return recovery[locale][diagnostic.recovery]; }

@@ -6,15 +6,18 @@ export const CHAT_RESOURCE_DIAGNOSTIC_ERRORS = [
   'UNKNOWN', 'REQUEST_REJECTED', 'RESPONSE_INVALID', 'RESPONSE_TOO_LARGE', 'TIMEOUT', 'CANCELLED',
   'ACCOUNT_DISCONNECTED', 'ACCOUNT_BINDING_CHANGED', 'WORKER_UNAVAILABLE', 'NETWORK_ERROR', 'NOT_FOUND',
 ] as const;
-export const CHAT_RESOURCE_DIAGNOSTIC_STAGES = ['gateway_admission', 'pending_request', 'worker_response', 'resource_read'] as const;
-export const CHAT_RESOURCE_DIAGNOSTIC_REASONS = ['missing_worker', 'not_ready_worker', 'stale_binding', 'pending_stopped', 'worker_response_error', 'unknown'] as const;
+export const CHAT_RESOURCE_DIAGNOSTIC_STAGES = ['gateway_admission', 'pending_request', 'worker_response', 'resource_read', 'archive_scan', 'archive_contains', 'archive_write'] as const;
+export const CHAT_RESOURCE_DIAGNOSTIC_REASONS = ['missing_worker', 'not_ready_worker', 'stale_binding', 'pending_stopped', 'worker_response_error',
+  'page_limit', 'cursor_loop', 'folder_write_failed', 'photo_write_failed', 'archive_incomplete', 'archive_reconciliation_failed', 'unknown'] as const;
 export const CHAT_RESOURCE_FAILURE_CATEGORIES = ['bootstrap_failure', 'list_get_transport_failure', 'response_code_invalid', 'response_shape_invalid',
   'normalization_failure', 'response_validation', 'timeout', 'cancellation', 'unknown'] as const;
+export const CHAT_RESOURCE_FAILURE_KINDS = ['linejs_internal', 'effect_denied', 'type_error', 'range_error', 'timeout_error', 'abort_error', 'other'] as const;
 export type ChatResourceDiagnosticAction = typeof CHAT_RESOURCE_DIAGNOSTIC_ACTIONS[number];
 export type ChatResourceDiagnostic = {
   source: 'modal' | 'notification' | 'mcp';
   accountId: string;
   chatId: string;
+  albumId?: string;
   action: ChatResourceDiagnosticAction;
   correlationId?: string;
   occurredAt: string;
@@ -25,6 +28,9 @@ export type ChatResourceDiagnostic = {
   failureReason?: typeof CHAT_RESOURCE_DIAGNOSTIC_REASONS[number];
   failureCategory?: typeof CHAT_RESOURCE_FAILURE_CATEGORIES[number];
   responseCode?: number | 'missing' | 'non_numeric';
+  failureKind?: typeof CHAT_RESOURCE_FAILURE_KINDS[number];
+  upstreamStatus?: number;
+  upstreamCode?: number | 'missing' | 'non_numeric';
   currentBindingMatch?: boolean;
   currentEpochMatch?: boolean;
   workerReady?: boolean;
@@ -58,10 +64,19 @@ export function parseChatResourceDiagnostic(value: unknown): ChatResourceDiagnos
   if (input.failureStage !== undefined && !CHAT_RESOURCE_DIAGNOSTIC_STAGES.includes(input.failureStage as typeof CHAT_RESOURCE_DIAGNOSTIC_STAGES[number])) return null;
   if (input.failureReason !== undefined && !CHAT_RESOURCE_DIAGNOSTIC_REASONS.includes(input.failureReason as typeof CHAT_RESOURCE_DIAGNOSTIC_REASONS[number])) return null;
   if (input.failureCategory !== undefined && !CHAT_RESOURCE_FAILURE_CATEGORIES.includes(input.failureCategory as typeof CHAT_RESOURCE_FAILURE_CATEGORIES[number])) return null;
+  if (input.albumId !== undefined && (typeof input.albumId !== 'string' || input.albumId.length < 1 || input.albumId.length > 256
+    || /[\u0000-\u001f\u007f]/.test(input.albumId))) return null;
   if (input.responseCode !== undefined && !(typeof input.responseCode === 'number' && Number.isFinite(input.responseCode)
     && Math.abs(input.responseCode) <= 1_000_000_000 || input.responseCode === 'missing' || input.responseCode === 'non_numeric')) return null;
   if (input.responseCode !== undefined && (input.status !== 'failure' || input.failureCategory !== 'response_code_invalid'
     || (input.action !== 'note_list' && input.action !== 'note_detail'))) return null;
+  if (input.failureKind !== undefined && (!CHAT_RESOURCE_FAILURE_KINDS.includes(input.failureKind as typeof CHAT_RESOURCE_FAILURE_KINDS[number])
+    || input.status !== 'failure')) return null;
+  if (input.upstreamStatus !== undefined && (input.status !== 'failure' || !Number.isInteger(input.upstreamStatus)
+    || (input.upstreamStatus as number) < 100 || (input.upstreamStatus as number) > 599)) return null;
+  if (input.upstreamCode !== undefined && (input.status !== 'failure' || !(typeof input.upstreamCode === 'number'
+    && Number.isFinite(input.upstreamCode) && Number.isInteger(input.upstreamCode) && Math.abs(input.upstreamCode) <= 1_000_000_000
+    || input.upstreamCode === 'missing' || input.upstreamCode === 'non_numeric'))) return null;
   for (const field of ['currentBindingMatch', 'currentEpochMatch', 'workerReady'] as const) {
     if (input[field] !== undefined && typeof input[field] !== 'boolean') return null;
   }
@@ -83,11 +98,15 @@ export function parseChatResourceDiagnostic(value: unknown): ChatResourceDiagnos
     if (!boundedId(input.correlationId)) return null;
     result.correlationId = input.correlationId;
   }
+  if (input.albumId !== undefined) result.albumId = input.albumId;
   if (input.errorCode !== undefined) result.errorCode = input.errorCode as NonNullable<ChatResourceDiagnostic['errorCode']>;
   if (input.failureStage !== undefined) result.failureStage = input.failureStage as NonNullable<ChatResourceDiagnostic['failureStage']>;
   if (input.failureReason !== undefined) result.failureReason = input.failureReason as NonNullable<ChatResourceDiagnostic['failureReason']>;
   if (input.failureCategory !== undefined) result.failureCategory = input.failureCategory as NonNullable<ChatResourceDiagnostic['failureCategory']>;
   if (input.responseCode !== undefined) result.responseCode = input.responseCode as NonNullable<ChatResourceDiagnostic['responseCode']>;
+  if (input.failureKind !== undefined) result.failureKind = input.failureKind as NonNullable<ChatResourceDiagnostic['failureKind']>;
+  if (input.upstreamStatus !== undefined) result.upstreamStatus = input.upstreamStatus as number;
+  if (input.upstreamCode !== undefined) result.upstreamCode = input.upstreamCode as NonNullable<ChatResourceDiagnostic['upstreamCode']>;
   if (input.currentBindingMatch !== undefined) result.currentBindingMatch = input.currentBindingMatch as boolean;
   if (input.currentEpochMatch !== undefined) result.currentEpochMatch = input.currentEpochMatch as boolean;
   if (input.workerReady !== undefined) result.workerReady = input.workerReady as boolean;

@@ -12,7 +12,7 @@ import { mkdir, open, statfs } from 'node:fs/promises';
 import { sanitizeAttachmentFilename, storeAttachment, type AttachmentStoreRuntime } from './attachment-store.js';
 import { SafeAttachmentError } from './attachment-error.js';
 import { validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
-import { isChatResourceFailure } from './chat-resource-error.js';
+import { isChatResourceFailure, safeChatResourceFailureDetails } from './chat-resource-error.js';
 
 export type TransportIdentity = Readonly<{ ownMid: string; displayName: string | null; picturePath?: string | null }>;
 export type SyncItem = unknown | Readonly<{
@@ -687,9 +687,12 @@ export class LineWorkerLoop {
     const identity = this.#identity();
     const base = { type: 'chatResourceResult' as const, ...identity, chatType: command.chatType, chatId: command.chatId,
       requestId: command.requestId, action: command.action };
-    const fail = async (error: string, responseCode?: number | 'missing' | 'non_numeric') => this.#emit({ ...base, ok: false, error,
+    const fail = async (error: string, responseCode?: number | 'missing' | 'non_numeric', failureKind?: ReturnType<typeof safeChatResourceFailureDetails>['failureKind'],
+      upstreamStatus?: number, upstreamCode?: number | 'missing' | 'non_numeric') => this.#emit({ ...base, ok: false, error,
       ...(typeof responseCode === 'number' && Number.isFinite(responseCode) && Math.abs(responseCode) <= 1_000_000_000
-        || responseCode === 'missing' || responseCode === 'non_numeric' ? { responseCode } : {}) });
+        || responseCode === 'missing' || responseCode === 'non_numeric' ? { responseCode } : {}),
+      ...(failureKind ? { failureKind } : {}), ...(upstreamStatus === undefined ? {} : { upstreamStatus }),
+      ...(upstreamCode === undefined ? {} : { upstreamCode }) });
     if (this.#stopped || this.#revoked || this.#authInvalidated || this.#binding?.mode === 'PAUSED') {
       await fail('WORKER_NOT_ACTIVE'); return;
     }
@@ -724,8 +727,12 @@ export class LineWorkerLoop {
       if (reason?.code === 'TIMEOUT') await fail('TIMEOUT');
       else if (controller.signal.aborted) await fail('CANCELLED');
       else if (isChatResourceFailure(error)) await fail(error.category,
-        error.category === 'response_code_invalid' ? error.responseCode : undefined);
-      else await fail('unknown');
+        error.category === 'response_code_invalid' ? error.responseCode : undefined,
+        error.failureKind ?? safeChatResourceFailureDetails(error).failureKind, error.upstreamStatus, error.upstreamCode);
+      else {
+        const details = safeChatResourceFailureDetails(error);
+        await fail('unknown', undefined, details.failureKind, details.upstreamStatus, details.upstreamCode);
+      }
     } finally {
       clearTimeout(timeout);
       if (this.#activeChatResourceReads.get(command.requestId) === controller) this.#activeChatResourceReads.delete(command.requestId);

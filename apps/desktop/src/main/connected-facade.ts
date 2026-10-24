@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType } from '@line-agent/contracts';
 import {
-  AccountRepository, AdminRepository, AgentPermissionError, AgentPermissionRepository, AgentRepository, resolveJobPolicy, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, RoomActivationRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
+  AccountRepository, AdminRepository, AgentPermissionError, AgentPermissionRepository, AgentRepository, resolveJobPolicy, AlbumNotificationTaskRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, RoomActivationRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
 import type { Attachment, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
@@ -26,7 +26,8 @@ import { AgentAttachmentError } from './services/agent-attachments.js';
 import { loadLinejsMcpSkill } from './services/mcp-skill.js';
 import { AgentJobEnvironmentService } from './services/agent-job-environment.js';
 import { ChatFolderError, ChatFolderService } from './services/chat-folders.js';
-import { ChatResourceArchiveService, isNativeNotePostNotification, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
+import { ChatResourceArchiveService, nativePostNotificationSubtype, type ChatResourceBinding, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
+import { AlbumNotificationDispatcher, archiveAlbumContinuations } from './services/album-notification-dispatcher.js';
 import { ChatResourceAccountAdmission } from './services/chat-resource-admission.js';
 import { ChatResourceArchive, createChatResourceStoreAdapter } from './services/chat-resource-archive.js';
 import { createChatResourceDiagnostics, parseChatResourceDiagnostic } from './services/chat-resource-diagnostics.js';
@@ -77,6 +78,30 @@ const REPLY_SENDER_PICTURE_SQL = senderPictureSql({ m: 'qm', la: 'qla', c: 'qc',
 type Bound = WorkerBinding & { mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; purpose?: 'DOWNLOAD_ONLY'; expectedMid?: string; application?: string };
 type SendResult = Extract<LineWorkerEvent, { type: 'sendResult' }>;
 const MACHINE_CODE_PATTERN = /^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)*$/;
+function asChatResourceBinding(binding: (Bound | null) | undefined): ChatResourceBinding | null {
+  if (!binding || binding.mode !== 'ACTIVE_CONTROL' || typeof binding.transportOwnerId !== 'string'
+    || typeof binding.transportGeneration !== 'number' || typeof binding.writeGrantVersion !== 'number') return null;
+  return { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch,
+    transportOwnerId: binding.transportOwnerId, transportGeneration: binding.transportGeneration,
+    writeGrantVersion: binding.writeGrantVersion, mode: binding.mode };
+}
+function sameCapturedBinding(left: ChatResourceBinding, right: Bound | undefined): boolean {
+  return !!right && left.accountId === right.accountId && left.workerInstanceId === right.workerInstanceId
+    && left.controlEpoch === right.controlEpoch && left.transportOwnerId === right.transportOwnerId
+    && left.transportGeneration === right.transportGeneration && left.writeGrantVersion === right.writeGrantVersion;
+}
+function cursorCycleDetector(): (cursor: string) => boolean {
+  let anchor: string | undefined;
+  let power = 1;
+  let length = 0;
+  return (cursor) => {
+    if (anchor === undefined) { anchor = cursor; return false; }
+    length += 1;
+    if (cursor === anchor) return true;
+    if (length === power) { anchor = cursor; power *= 2; length = 0; }
+    return false;
+  };
+}
 /** Caller-supplied part of a media send; the gateway adds owner fields, ids, permit and timeout. */
 export type SendMediaRequest = Pick<Extract<LineWorkerCommand, { type: 'sendMedia' }>,
   'accountId' | 'workerInstanceId' | 'controlEpoch' | 'chatType' | 'chatId' | 'requestId' | 'kind' | 'filePath' | 'fileName' | 'sizeBytes' | 'sha256' | 'manualSend'>;
@@ -506,9 +531,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     recordDiagnostic: (record) => {
       const safe = parseChatResourceDiagnostic(record);
       const correlationId = safe?.status === 'failure' && safe.errorCode !== 'CANCELLED' ? options.audit?.failure({
-        operation: safe.action, stage: safe.failureStage === 'gateway_admission' ? 'admission' : 'response',
+        operation: safe.action, stage: safe.failureStage === 'gateway_admission' ? 'admission'
+          : safe.failureStage === 'archive_contains' ? 'archive_contains' : 'response',
         category: safe.errorCode === 'TIMEOUT' ? 'timeout' : 'invalid_response', recovery: 'retry',
         ...(safe.failureCategory ? { reason: safe.failureCategory } : {}),
+        ...(safe.failureKind ? { failureKind: safe.failureKind } : {}),
+        ...(safe.upstreamStatus === undefined ? {} : { upstreamStatus: safe.upstreamStatus }),
+        ...(safe.upstreamCode === undefined ? {} : { upstreamCode: safe.upstreamCode }),
         ...(typeof safe.responseCode === 'number' ? { statusCode: safe.responseCode } : {}) }, { accountId: safe.accountId }) : undefined;
       if (safe) diagnostics?.record({ ...safe, ...(correlationId ? { correlationId } : {}) });
     },
@@ -524,6 +553,98 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       && options.workers.isCurrentActiveControlBinding(binding),
     conversationExists: async (key) => (await options.pool.query('SELECT 1 FROM conversations WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 LIMIT 1',
       [key.accountId, key.chatType, key.chatId])).rowCount === 1,
+  });
+  const reconcileAlbumChat = async (key: ConversationKey, binding: ChatResourceBinding): Promise<void> => {
+    let albumCursor: string | null = null;
+    const albumCursorRepeats = cursorCycleDetector();
+    do {
+      const albums = await chatResources.listAlbums(key, albumCursor, undefined, 'notification', binding);
+      for (const album of albums.albums) {
+        await archiveAlbumContinuations((cursor, photoIndex) =>
+          chatResources.openAlbum(key, album.albumId, undefined, 'notification', binding, cursor, photoIndex));
+      }
+      albumCursor = albums.nextCursor;
+      if (albumCursor !== null && albumCursorRepeats(albumCursor)) throw new Error('ALBUM_LIST_CURSOR_LOOP');
+    } while (albumCursor !== null);
+  };
+  const albumNotificationTasks = new AlbumNotificationTaskRepository(options.pool);
+  const albumTaskRecovery = new Set<string>();
+  const albumDispatcher = new AlbumNotificationDispatcher(async (accountId, binding, target, dispatchOptions) => {
+    const isCurrent = () => !closing && options.workers.isCurrentActiveControlBinding(binding);
+    if (!isCurrent()) return null;
+    if (dispatchOptions.recover) {
+      await albumNotificationTasks.recoverRunning(accountId);
+      albumTaskRecovery.add(accountId);
+    }
+    if (dispatchOptions.backfill) {
+      const current = await walkAlbumTaskMessagePages((afterMessageId) => albumNotificationTasks.backfillMissingPage({
+        accountId, ...(afterMessageId ? { afterMessageId } : {}), limit: 64,
+      }), isCurrent);
+      if (!current) return null;
+    }
+    if (!albumTaskRecovery.has(accountId)) {
+      await albumNotificationTasks.recoverRunning(accountId);
+      albumTaskRecovery.add(accountId);
+    }
+    const skipInvalid = (chat?: AlbumNotificationTaskChat) => walkAlbumTaskMessagePages((afterMessageId) =>
+      albumNotificationTasks.skipInvalidPage({ accountId, ...(afterMessageId ? { afterMessageId } : {}), limit: 64,
+        ...(chat ? { chat } : {}) }), isCurrent);
+    const targetTaskChat = target && (target.chatType === 'direct' || target.chatType === 'group' || target.chatType === 'room')
+      ? { chatType: target.chatType, chatId: target.chatId } : undefined;
+    if (!await skipInvalid(dispatchOptions.sweep ? undefined : targetTaskChat)) return null;
+    let nextRetryAt: number | null = null;
+    const processChat = async (key: ConversationKey): Promise<'continue' | 'retry' | 'stale'> => {
+      if (closing || !options.workers.isCurrentActiveControlBinding(binding)) return 'stale';
+      const claim = await albumNotificationTasks.claimChat(key);
+      if (claim.retryAt !== null) { nextRetryAt = claim.retryAt; return 'retry'; }
+      if (!claim.claimed) {
+        const taskChat = key.chatType === 'direct' || key.chatType === 'group' || key.chatType === 'room'
+          ? { chatType: key.chatType, chatId: key.chatId } : undefined;
+        if (taskChat && !await skipInvalid(taskChat)) return 'stale';
+        return 'continue';
+      }
+      if (closing || !options.workers.isCurrentActiveControlBinding(binding)) return 'stale';
+      try {
+        await reconcileAlbumChat(key, binding);
+        if (closing || !options.workers.isCurrentActiveControlBinding(binding)) return 'stale';
+        if (!await albumNotificationTasks.completeClaimedChat(key, binding)) return 'stale';
+      } catch (error) {
+        chatResources.recordNotificationFailure(key, error);
+        const safeCode: AlbumNotificationTaskErrorCode = error instanceof Error && error.message === 'ALBUM_ARCHIVE_INCOMPLETE'
+          ? 'ALBUM_ARCHIVE_INCOMPLETE' : error instanceof Error && error.message === 'ALBUM_PHOTO_CURSOR_LOOP'
+            ? 'ALBUM_PHOTO_CURSOR_LOOP' : 'ALBUM_RECONCILIATION_FAILED';
+        const retryAt = await albumNotificationTasks.retryClaimedChat(key, binding, { stage: 'archive_scan', code: safeCode });
+        if (retryAt === null && !isCurrent()) return 'stale';
+        if (retryAt !== null) { nextRetryAt = retryAt; return 'retry'; }
+      }
+      return 'continue';
+    };
+    if (!dispatchOptions.sweep && target) {
+      const result = await processChat(target);
+      if (result === 'stale') return null;
+    } else {
+      let after: AlbumNotificationTaskChat | undefined;
+      for (;;) {
+        if (closing || !options.workers.isCurrentActiveControlBinding(binding)) return nextRetryAt;
+        const page = await albumNotificationTasks.dueChatsPage({ accountId, ...(after ? { after } : {}), limit: 32 });
+        if (!page.chats.length) break;
+        for (const chat of page.chats) {
+          const result = await processChat({ accountId, ...chat });
+          if (result === 'stale') return nextRetryAt;
+          if (result === 'retry') return nextRetryAt;
+          after = chat;
+        }
+        if (!page.nextChat) break;
+      }
+    }
+    return nextRetryAt ?? await albumNotificationTasks.nextRetryAt(accountId);
+  }, async (accountId) => {
+    const current = await options.workers.binding(accountId);
+    if (!current || current.mode !== 'ACTIVE_CONTROL' || typeof current.transportOwnerId !== 'string'
+      || typeof current.transportGeneration !== 'number' || typeof current.writeGrantVersion !== 'number'
+      || !lineService.isAuthenticatedReady(current) || !options.workers.isCurrentActiveControlBinding(current)) return null;
+    return { ...current, transportOwnerId: current.transportOwnerId, transportGeneration: current.transportGeneration,
+      writeGrantVersion: current.writeGrantVersion };
   });
   const chatResourceAdmission = new ChatResourceAccountAdmission(chatResources,
     (binding) => lineService.isAuthenticatedReady(binding) && options.workers.isCurrentActiveControlBinding(binding));
@@ -883,6 +1004,104 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     async checkFriendRelation(command) { await assertLineWriteAllowed(command.accountId); return options.workers.checkFriendRelation(command); },
     async addFriendByMid(command) { await assertLineWriteAllowed(command.accountId); return options.workers.addFriendByMid(command); },
   }, audit: options.audit, locale: options.locale ?? 'en' });
+  const primaryFriendshipLifetime = new AbortController();
+  const primaryFriendshipReadiness = new Map<string, { key: string; abort: AbortController; promise: Promise<void>;
+    trigger: 'worker-ready' | 'admin-bound' }>();
+  startupCleanup.add(() => primaryFriendshipLifetime.abort());
+  const samePrimaryFriendshipBinding = (left: Bound | null, right: Bound): boolean => !!left
+    && left.accountId === right.accountId && left.workerInstanceId === right.workerInstanceId
+    && left.controlEpoch === right.controlEpoch && left.mode === right.mode
+    && left.transportOwnerId === right.transportOwnerId && left.transportGeneration === right.transportGeneration
+    && left.writeGrantVersion === right.writeGrantVersion;
+  const schedulePrimaryAdministratorFriendship = (binding: Bound, _signal: AbortSignal,
+    trigger: 'worker-ready' | 'admin-bound' = 'worker-ready') => {
+    const key = JSON.stringify([binding.accountId, binding.workerInstanceId, binding.controlEpoch, binding.mode,
+      binding.transportOwnerId, binding.transportGeneration, binding.writeGrantVersion, binding.purpose]);
+    const existing = primaryFriendshipReadiness.get(binding.accountId);
+    if (existing?.key === key) {
+      if (trigger === 'admin-bound') existing.trigger = trigger;
+      return;
+    }
+    existing?.abort.abort();
+    primaryFriendshipReadiness.delete(binding.accountId);
+    if (binding.mode !== 'ACTIVE_CONTROL' || binding.purpose === 'DOWNLOAD_ONLY' || closing) return;
+    const abort = new AbortController();
+    const lifetimeSignal = AbortSignal.any([abort.signal, primaryFriendshipLifetime.signal]);
+    let consumedTrigger = trigger;
+    const task = track(async () => {
+      // The worker ACK can be delayed. Recheck the captured binding while that
+      // bounded ACK wait is pending so teardown does not depend on ACK arrival.
+      while (!lifetimeSignal.aborted && !closing) {
+        const acknowledgement = options.workers.waitModeAck(binding.accountId, 'ACTIVE_CONTROL', 100);
+        let ready = false;
+        while (!lifetimeSignal.aborted && !closing) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          let cancel: (() => void) | undefined;
+          const tick = new Promise<{ type: 'tick' }>((resolve) => {
+            timer = setTimeout(() => resolve({ type: 'tick' }), 100);
+            cancel = () => resolve({ type: 'tick' });
+            lifetimeSignal.addEventListener('abort', cancel, { once: true });
+          });
+          const outcome = await Promise.race([
+            acknowledgement.then((acknowledged) => ({ type: 'ack' as const, acknowledged })),
+            tick,
+          ]);
+          if (timer !== undefined) clearTimeout(timer);
+          if (cancel) lifetimeSignal.removeEventListener('abort', cancel);
+          if (outcome.type === 'ack') { ready = outcome.acknowledged; break; }
+          if (lifetimeSignal.aborted || closing) return;
+          const current = await options.workers.binding(binding.accountId);
+          if (lifetimeSignal.aborted || !samePrimaryFriendshipBinding(current, binding)) return;
+        }
+        if (!ready) {
+          await new Promise<void>((resolve) => {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const finish = () => {
+              if (timer !== undefined) clearTimeout(timer);
+              lifetimeSignal.removeEventListener('abort', finish);
+              resolve();
+            };
+            timer = setTimeout(finish, 100);
+            lifetimeSignal.addEventListener('abort', finish, { once: true });
+          });
+          const current = await options.workers.binding(binding.accountId);
+          if (lifetimeSignal.aborted || !samePrimaryFriendshipBinding(current, binding)) return;
+          continue;
+        }
+        break;
+      }
+      if (lifetimeSignal.aborted || closing) return;
+      const current = await options.workers.binding(binding.accountId);
+      if (lifetimeSignal.aborted || !samePrimaryFriendshipBinding(current, binding)
+        || !options.workers.isCurrentActiveControlBinding(binding)) return;
+      while (!lifetimeSignal.aborted && !closing) {
+        const currentTask = primaryFriendshipReadiness.get(binding.accountId);
+        const requestedTrigger = currentTask?.abort === abort ? currentTask.trigger : consumedTrigger;
+        await friendEnrollment.ensurePrimaryAdministratorFriendship(binding as Bound & { mode: 'ACTIVE_CONTROL' }, lifetimeSignal,
+          requestedTrigger);
+        consumedTrigger = requestedTrigger;
+        // A same-binding admin-bound notification can arrive after the current
+        // call has read its trigger. Consume it serially before releasing this
+        // single-flight job, so it cannot be lost or start a concurrent check.
+        const latestTask = primaryFriendshipReadiness.get(binding.accountId);
+        if (latestTask?.abort !== abort || latestTask.trigger === consumedTrigger) break;
+      }
+    }).catch((error) => {
+      if (!lifetimeSignal.aborted && !closing) console.warn('[primary-admin-friendship] operational check failed', error);
+    }).finally(() => {
+      const latestTask = primaryFriendshipReadiness.get(binding.accountId);
+      if (latestTask?.abort !== abort) return;
+      const pendingAdminBinding = latestTask.trigger === 'admin-bound' && consumedTrigger !== 'admin-bound';
+      primaryFriendshipReadiness.delete(binding.accountId);
+      // Deleting and handing off are one synchronous turn: a same-binding
+      // admin-bound callback that arrived after the loop's last read cannot
+      // fall between the final trigger check and slot release.
+      if (pendingAdminBinding && !lifetimeSignal.aborted && !closing) {
+        schedulePrimaryAdministratorFriendship(binding, lifetimeSignal, 'admin-bound');
+      }
+    });
+    primaryFriendshipReadiness.set(binding.accountId, { key, abort, promise: task, trigger });
+  };
   const roomIsCurrentControl = async (binding: WorkerBinding): Promise<boolean> => {
     const [control, current] = await Promise.all([accounts.getControlState(), options.workers.binding(binding.accountId)]);
     return control.activeAccountId === binding.accountId && control.controlEpoch === binding.controlEpoch
@@ -909,12 +1128,30 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   lineService = new LineService(accounts, messages, settings,
     { send: async (command) => { await sendLineCommand(command); } }, agentService, options.secretStore, attachmentService,
     async (envelope, secretCandidate, ownMid, capturedBinding) => {
-      if (!closing && capturedBinding?.mode === 'ACTIVE_CONTROL' && isNativeNotePostNotification(envelope)) {
+      const postNotificationSubtype = nativePostNotificationSubtype(envelope);
+      if (!closing && capturedBinding?.mode === 'ACTIVE_CONTROL' && postNotificationSubtype === 'note') {
         void chatResources.refreshNotesFromNotification({ accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId });
+      } else if (!closing && capturedBinding?.mode === 'ACTIVE_CONTROL' && postNotificationSubtype === 'album') {
+        const current = await options.workers.binding(envelope.accountId);
+        const archiveBinding = asChatResourceBinding(current);
+        if (archiveBinding && sameCapturedBinding(archiveBinding, capturedBinding)) {
+          const key = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId } as const;
+          try {
+            if (await albumNotificationTasks.enqueueCommitted({ ...key, messageId: envelope.messageId })) {
+              albumDispatcher.request(key, archiveBinding);
+            }
+          } catch {
+            chatResources.recordNotificationFailure(key, new Error('ALBUM_TASK_PERSIST_FAILED'));
+            albumDispatcher.recover(envelope.accountId, archiveBinding);
+          }
+        }
       }
       const paired = await adminPairings.consume(envelope);
       if (paired) {
         void publishSnapshot().catch(() => console.warn('[admin-pairing] snapshot publish failed'));
+        if (capturedBinding?.mode === 'ACTIVE_CONTROL') {
+          schedulePrimaryAdministratorFriendship(capturedBinding as Bound, primaryFriendshipLifetime.signal, 'admin-bound');
+        }
         if (!closing) void track(async () => {
           if (closing) return;
           const binding = await options.workers.binding(envelope.accountId);
@@ -1168,6 +1405,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       await lineService.bind(binding, signal);
       if (signal.aborted) throw new Error('Worker binding cancelled');
+      schedulePrimaryAdministratorFriendship(binding, signal);
       if (!closing) void track(() => recoverPendingAfterReady(binding, signal)).catch(() => undefined);
     });
   });
@@ -1196,6 +1434,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }, signal);
       if (signal.aborted) return;
       if (binding.mode === 'ACTIVE_CONTROL') schedulePendingDeliveryRecovery(binding.accountId);
+      schedulePrimaryAdministratorFriendship(binding, signal);
     });
   });
   if (unsubscribeRestartBinding) startupCleanup.add(unsubscribeRestartBinding);
@@ -1207,6 +1446,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       await lineService.bind(binding, signal);
       if (signal.aborted) return;
       const mode = binding.mode;
+      schedulePrimaryAdministratorFriendship(binding, signal);
       if (mode !== 'PAUSED') void track(async () => {
         if (signal.aborted || !await options.workers.waitModeAck(binding.accountId, mode, 3000) || signal.aborted) return;
         const current = await options.workers.binding(binding.accountId);
@@ -1229,6 +1469,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (!current || current.mode !== 'ACTIVE_CONTROL' || current.accountId !== binding.accountId
       || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch) return;
     await delivery.recoverPending(binding.accountId);
+    if ((await accounts.getAccount(binding.accountId))?.productRole !== 'AGENT') return;
+    if (signal?.aborted || closing || !options.workers.isCurrentActiveControlBinding(current)) return;
+    const archiveBinding = asChatResourceBinding(current);
+    if (archiveBinding) albumDispatcher.recover(binding.accountId, archiveBinding);
   }
 
   async function startStoredAccount(account: Awaited<ReturnType<AccountRepository['getAccount']>> & {}): Promise<Bound> {
@@ -1826,6 +2070,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return failure(requestId, bound.code, message);
     }
     console.info(`[external-admin-binding] primary admin bound from official LINE ${maskMid(mid)}`);
+    const activeControl = await accounts.getControlState();
+    const activeBinding = activeControl.activeAccountId ? await options.workers.binding(activeControl.activeAccountId) : null;
+    if (activeBinding?.mode === 'ACTIVE_CONTROL') {
+      schedulePrimaryAdministratorFriendship(activeBinding as Bound, primaryFriendshipLifetime.signal, 'admin-bound');
+    }
     await publishSnapshot().catch(() => undefined);
     // The admin is confirmed by the user and now bound; a failed start leaves the card to retry.
     const started = await beginExternalImport(requestId, bound.accountId);
@@ -2744,12 +2993,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       manualMediaAdmission.shutdown();
       return shutdownPromise ??= (async () => {
         const errors: unknown[] = [];
+        primaryFriendshipLifetime.abort();
         externalImportOwner?.abort.abort();
         identityReadAbort?.abort();
         const collect = (results: PromiseSettledResult<unknown>[]) => {
           for (const result of results) if (result.status === 'rejected') errors.push(result.reason);
         };
         const synchronousCleanup = [
+          () => albumDispatcher.shutdown(),
           () => chatResources.shutdown(),
           () => ownAvatarRefreshScheduler?.shutdown(),
           () => { for (const timer of recoveryTimers) clearTimeout(timer); recoveryTimers.clear(); },

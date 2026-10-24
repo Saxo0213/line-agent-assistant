@@ -111,6 +111,8 @@ function targetMention(envelope: InboundEnvelope, ownMid: string): string | null
 
 export class FriendEnrollmentService {
   private readonly flows = new Map<string, Flow>();
+  private readonly primaryFriendshipJobs = new Map<string, { bindingKey: string; promise: Promise<boolean>;
+    adminBindingObserved: boolean; pending: boolean; result: boolean | null }>();
   private readonly digestKey: Buffer;
 
   constructor(private readonly deps: {
@@ -131,6 +133,81 @@ export class FriendEnrollmentService {
 
   private readonly now: () => number;
   private readonly makeCode: () => string;
+
+  /** Runs once for each ready worker binding; lifecycle owners pass their cancellation signal. */
+  ensurePrimaryAdministratorFriendship(binding: ActiveBinding, signal: AbortSignal, trigger: 'worker-ready' | 'admin-bound' = 'worker-ready'): Promise<void> {
+    const bindingKey = JSON.stringify(workerFields(binding));
+    const previous = this.primaryFriendshipJobs.get(binding.accountId);
+    if (previous?.bindingKey === bindingKey) {
+      if (trigger !== 'admin-bound' || previous.pending || previous.result !== false) {
+        if (trigger === 'admin-bound' && previous.pending) previous.adminBindingObserved = true;
+        return previous.promise.then(() => undefined);
+      }
+      this.primaryFriendshipJobs.delete(binding.accountId);
+    }
+    const job = { bindingKey, promise: Promise.resolve(false), adminBindingObserved: trigger === 'admin-bound', pending: true, result: null as boolean | null };
+    const promise = (async () => {
+      try {
+        const checked = await this.checkPrimaryAdministratorFriendship(binding, signal);
+        const result = !checked && job.adminBindingObserved && !signal.aborted
+          ? await this.checkPrimaryAdministratorFriendship(binding, signal) : checked;
+        job.result = result;
+        return result;
+      } finally {
+        job.pending = false;
+      }
+    })();
+    job.promise = promise;
+    this.primaryFriendshipJobs.set(binding.accountId, job);
+    void promise.then((checked) => {
+      const current = this.primaryFriendshipJobs.get(binding.accountId);
+      if (!checked && current?.bindingKey === bindingKey && current.promise === promise) {
+        this.primaryFriendshipJobs.delete(binding.accountId);
+      }
+    }, () => undefined);
+    return promise.then(() => undefined);
+  }
+
+  private async checkPrimaryAdministratorFriendship(binding: ActiveBinding, signal: AbortSignal): Promise<boolean> {
+    const current = async () => {
+      if (signal.aborted || !this.deps.workers.isCurrentActiveControlBinding(binding)) return false;
+      const [control, latest] = await Promise.all([this.deps.accounts.getControlState(), this.deps.workers.binding(binding.accountId)]);
+      return !signal.aborted && control.activeAccountId === binding.accountId && control.controlEpoch === binding.controlEpoch
+        && complete(latest) && matchesResult(latest, binding) && this.deps.workers.isCurrentActiveControlBinding(binding);
+    };
+    if (!(await current())) return true;
+    const account = await this.deps.accounts.getAccount(binding.accountId);
+    if (!(await current()) || account?.productRole !== 'AGENT') return true;
+    const primary = await this.deps.admins.getPrimaryAdministrator(binding.accountId);
+    if (!(await current())) return true;
+    if (!primary) return false;
+    if (!await this.canWriteLine(binding.accountId)) return true;
+    if (!LINE_MID.test(primary.userId)) throw new Error('primary administrator LINE MID is invalid');
+    const primaryVersion = await this.deps.admins.getPrimaryAdministratorVersion(binding.accountId);
+    if (!(await current()) || primaryVersion === null) return true;
+    const capturedPrimary = { ...primary };
+    const primaryStillCurrent = async () => {
+      if (await this.deps.admins.getPrimaryAdministratorVersion(binding.accountId) !== primaryVersion) return false;
+      const latest = await this.deps.admins.getPrimaryAdministrator(binding.accountId);
+      return latest?.chatId === capturedPrimary.chatId && latest.userId === capturedPrimary.userId;
+    };
+    const fields = workerFields(binding);
+    const requestId = randomUUID();
+    const relation = await this.deps.workers.checkFriendRelation({ type: 'checkFriendRelation', ...fields, requestId, targetMid: primary.userId });
+    if (!(await current())) return true;
+    if (!matchesResult(relation, binding) || relation.requestId !== requestId || relation.targetMid !== primary.userId)
+      throw new Error('primary administrator relation check returned a stale or mismatched result');
+    if (relation.status === 'friend') return true;
+    if (relation.status !== 'not_friend') throw new Error(`primary administrator relation is unknown (${relation.error ?? 'unknown'})`);
+    if (!(await current()) || !await primaryStillCurrent() || !(await current())
+      || !await this.canWriteLine(binding.accountId) || !(await current())) return true;
+    const addRequestId = randomUUID();
+    const added = await this.deps.workers.addFriendByMid({ type: 'addFriendByMid', ...fields, requestId: addRequestId, targetMid: primary.userId });
+    if (!(await current())) return true;
+    if (!matchesResult(added, binding) || added.requestId !== addRequestId || added.targetMid !== primary.userId || added.status !== 'added')
+      throw new Error(`primary administrator friend add failed (${added.error ?? added.status})`);
+    return true;
+  }
 
   private async canWriteLine(accountId: string): Promise<boolean> {
     return (await this.deps.accounts.resolveCapabilities(accountId))?.canWriteLine === true;
@@ -386,23 +463,35 @@ export class FriendEnrollmentService {
   }
 
   private exactConfirmation(envelope: InboundEnvelope, candidate: Exclude<SecretCandidate, null | undefined>,
-    context: FlowContext, ownMid: string | null): boolean {
+    context: FlowContext, targetMid: string, ownMid: string | null): boolean {
     if (!candidate.exact || !CODE_PATTERN.test(candidate.code) || envelope.kind !== 'text'
-      || envelope.ingestion.source !== 'live' || envelope.chatType !== context.originChatType
-      || envelope.chatId !== context.originChatId || envelope.senderId !== context.adminSenderId) return false;
-    if (context.originChatType === 'direct') return true;
+      || envelope.ingestion.source !== 'live') return false;
+    if (context.originChatType === 'direct') {
+      // Direct challenges are initiated in the administrator's chat, but proof
+      // must arrive from the selected target in that target's own 1:1 chat.
+      return envelope.chatType === 'direct' && envelope.senderId === targetMid && envelope.chatId === targetMid;
+    }
+    if (envelope.chatType !== context.originChatType || envelope.chatId !== context.originChatId
+      || envelope.senderId !== context.adminSenderId) return false;
     if (!ownMid) return false;
     return envelope.mentionIds.filter((id) => id === ownMid).length === 1
       && envelope.mentionRanges.filter((range) => range.userId === ownMid).length === 1;
   }
 
   private async consume(envelope: InboundEnvelope, candidate: Exclude<SecretCandidate, null | undefined>, ownMid: string | null): Promise<void> {
-    const key = keyFor(envelope.accountId, envelope.chatType, envelope.chatId, envelope.senderId);
-    const captured = this.liveFlow(key);
+    let key = keyFor(envelope.accountId, envelope.chatType, envelope.chatId, envelope.senderId);
+    let captured = this.liveFlow(key);
+    if (envelope.chatType === 'direct') {
+      const targetFlow = [...this.flows.entries()].find(([, flow]) => flow.phase === 'challenge'
+        && flow.context.accountId === envelope.accountId && flow.context.originChatType === 'direct'
+        && flow.targetMid === envelope.senderId);
+      if (!targetFlow) return;
+      [key, captured] = targetFlow;
+    }
     if (captured?.phase !== 'challenge') return;
     const challengeId = captured.challengeId;
     const flowId = captured.context.flowId;
-    if (!this.exactConfirmation(envelope, candidate, captured.context, ownMid)) return;
+    if (!this.exactConfirmation(envelope, candidate, captured.context, captured.targetMid, ownMid)) return;
     if (!await this.isPrimary(captured.context)) {
       this.deleteIfCurrent(key, challengeId);
       return;

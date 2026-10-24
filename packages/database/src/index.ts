@@ -5,6 +5,7 @@ export * from './content-bridge/reproject.js';
 export * from './account-repository.js';
 export * from './migrate.js';
 export * from './message-repository.js';
+export * from './album-notification-task-repository.js';
 export * from './native-reactions.js';
 export * from './sticker-descriptor.js';
 export * from './agent-repository.js';

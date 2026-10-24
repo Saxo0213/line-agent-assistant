@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { realpath, readFile, writeFile } from 'node:fs/promises';
+import { realpath, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { access } from 'node:fs/promises';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -205,6 +205,10 @@ database('connected facade account login semantics', () => {
   };
   let commands: LineWorkerCommand[];
   let friendRemoteCalls: number;
+  let friendRelationCommands: Extract<LineWorkerCommand, { type: 'checkFriendRelation' }>[];
+  let friendAddCommands: Extract<LineWorkerCommand, { type: 'addFriendByMid' }>[];
+  let friendAddStatus: Extract<LineWorkerEvent, { type: 'addFriendResult' }>['status'];
+  let pendingFriendRelation: { started(): void; wait: Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>> } | null;
   let starts: Array<{ accountId: string; mode: string; controlEpoch: number }>;
   let stops: string[];
   let stoppedWorkerInstances: string[];
@@ -217,6 +221,9 @@ database('connected facade account login semantics', () => {
   let manualSendFailure: string | null;
   let manualUnsendFailure: string | null;
   let manualUnsendFenced = false;
+  let activeControlAckFailures = new Set<string>();
+  let activeControlAckDelays = new Set<string>();
+  let activeControlAckChecks = 0;
   let welcomeSendOutcome: 'sent' | 'failed' | 'unknown' | 'throw';
   let refreshedOwnProfile: { ownMid: string; displayName: string; picturePath: string } | null;
   let monitorAckFailures = new Set<string>();
@@ -284,6 +291,13 @@ database('connected facade account login semantics', () => {
     }, async unprotect(value) { return value; } });
     commands = [];
     friendRemoteCalls = 0;
+    friendRelationCommands = [];
+    friendAddCommands = [];
+    friendAddStatus = 'unknown';
+    pendingFriendRelation = null;
+    activeControlAckFailures = new Set();
+    activeControlAckDelays = new Set();
+    activeControlAckChecks = 0;
     starts = [];
     stops = [];
     stoppedWorkerInstances = [];
@@ -415,8 +429,19 @@ database('connected facade account login semantics', () => {
           status: manualUnsendFailure === '__UNKNOWN__' ? 'unknown' : manualUnsendFailure ? 'failed' : 'unsent',
           error: manualUnsendFailure === '__UNKNOWN__' ? 'TRANSPORT_OUTCOME_UNKNOWN' : manualUnsendFailure };
       },
-      async checkFriendRelation(command) { friendRemoteCalls++; return { ...command, type: 'friendRelationResult', status: 'unknown', error: 'RELATION_OUTCOME_UNKNOWN' }; },
-      async addFriendByMid(command) { friendRemoteCalls++; return { ...command, type: 'addFriendResult', status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' }; },
+      async checkFriendRelation(command) {
+        friendRemoteCalls++;
+        friendRelationCommands.push(command);
+        const gate = pendingFriendRelation;
+        if (gate) { pendingFriendRelation = null; gate.started(); return gate.wait; }
+        return { ...command, type: 'friendRelationResult', status: 'unknown', error: 'RELATION_OUTCOME_UNKNOWN' };
+      },
+      async addFriendByMid(command) {
+        friendRemoteCalls++;
+        friendAddCommands.push(command);
+        return { ...command, type: 'addFriendResult', status: friendAddStatus,
+          error: friendAddStatus === 'added' ? null : 'TRANSPORT_OUTCOME_UNKNOWN' };
+      },
       async download() { throw new Error('No attachment download expected'); },
       async readChatResource(command: ChatResourceRequest): Promise<ChatResourceReadResult> {
         archiveReads++;
@@ -424,7 +449,15 @@ database('connected facade account login semantics', () => {
           accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
           chatType: command.chatType, chatId: command.chatId, note: { postId: command.postId ?? 'note-a', createdTime: 1, text: 'archive test' } };
       },
-      async waitModeAck(accountId, mode) {
+      async waitModeAck(accountId, mode, timeoutMs) {
+        if (mode === 'ACTIVE_CONTROL' && timeoutMs === 100) activeControlAckChecks++;
+        // Startup ACKs remain immediate. Friendship readiness gets a pending
+        // worker ACK that can be cancelled while the response is outstanding.
+        if (mode === 'ACTIVE_CONTROL' && timeoutMs === 100 && activeControlAckDelays.has(accountId)) {
+          await new Promise((resolve) => setTimeout(resolve, 75));
+          return !activeControlAckFailures.has(accountId);
+        }
+        if (mode === 'ACTIVE_CONTROL' && timeoutMs === 100 && activeControlAckFailures.has(accountId)) return false;
         return mode !== 'MONITOR_ONLY' || !monitorAckFailures.has(bindings.get(accountId)?.workerInstanceId ?? '');
       },
       async stop(accountId) {
@@ -2430,6 +2463,61 @@ database('connected facade account login semantics', () => {
       diagnostic: expect.objectContaining({ category: 'unknown' }) }));
   });
 
+  it.each(['group', 'direct'] as const)('archives a committed live Album POSTNOTIFICATION in a %s chat without renderer action or Note reads', async (chatType) => {
+    const accountId = 'automatic-album-notification';
+    const chatId = `automatic-album-chat-${chatType}`;
+    await addStoredAccounts(accountId);
+    const binding = await loginReady(accountId);
+    await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES ($1,$2,$3,'Automatic archive') ON CONFLICT DO NOTHING", [accountId, chatType, chatId]);
+    Object.assign(bindings.get(accountId)!, { transportOwnerId: 'automatic-album-owner', transportGeneration: 1, writeGrantVersion: 1 });
+    const actions: string[] = [];
+    const savedAlbumFolder = join(secretRoot, 'automatic-album-folder');
+    const savedPhotoPath = join(savedAlbumFolder, 'automatic-photo.bin');
+    const photoBytes = new Uint8Array([1, 2, 3, 4, 5]);
+    let photos = 0;
+    archiveStore.ensureAlbumFolder = async () => { await mkdir(savedAlbumFolder, { recursive: true }); };
+    archiveStore.hasAlbumPhoto = async () => false;
+    archiveStore.publishAlbumPhoto = async ({ content }) => { await writeFile(savedPhotoPath, content); photos++; };
+    workers.readChatResource = async (command) => {
+      actions.push(command.action);
+      const data = command.action === 'listAlbums' ? { albums: [{ albumId: 'automatic-album', chatId, title: 'Album',
+        photoCount: 1, createTime: 1, updateTime: 2 }], nextCursor: null }
+        : command.action === 'listAlbumPhotos' ? { photos: [{ photoId: 'automatic-photo', oid: 'automatic-oid', prefix: 'album/a',
+          shotTime: 1, width: 2, height: 3 }], nextCursor: null } : { bytes: photoBytes };
+      return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true, accountId: command.accountId,
+        workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch, chatType: command.chatType, chatId: command.chatId, ...data } as ChatResourceReadResult;
+    };
+    const checkpoint = await pool.query<{ cursor: { version: 1; revision: string; globalRev: string; individualRev: string } }>(
+      'SELECT cursor FROM external_source_checkpoints WHERE account_id=$1 AND source_id=(SELECT selected_source_id FROM line_accounts WHERE account_id=$1)', [accountId]);
+    const before = checkpoint.rows[0]!.cursor;
+    const after = { version: 1 as const, revision: (BigInt(before.revision) + 1n).toString(),
+      globalRev: (BigInt(before.globalRev) + 1n).toString(), individualRev: before.individualRev };
+    const raw = { message: { id: 'album-notification-message', from: 'friend-mid', to: chatId, toType: chatType === 'group' ? 2 : 0,
+      contentType: 16, contentMetadata: { serviceType: 'AB' } } };
+    await workerEventHandler!(binding.workerInstanceId, { type: 'batch', ...binding, batchId: 'automatic-album-notification-batch',
+      cursorBefore: before, cursorAfter: after, envelopes: [{ eventId: 'automatic-album-notification-event', messageId: 'album-notification-message',
+        accountId, chatType, chatId, senderId: 'friend-mid', kind: 'event', text: null,
+        mentionIds: [], mentionRanges: [], replyToMessageId: null, ingestion: { source: 'live', cursor: null },
+        occurredAt: new Date().toISOString(), attachments: [], raw }] });
+
+    await vi.waitFor(() => expect(actions).toHaveLength(3));
+    await vi.waitFor(() => expect(photos).toBe(1));
+    expect(actions).toEqual(['listAlbums', 'listAlbumPhotos', 'downloadAlbumPhoto']);
+    expect(actions).not.toContain('listNotes');
+    expect(await readdir(savedAlbumFolder)).toEqual(['automatic-photo.bin']);
+    expect(new Uint8Array(await readFile(savedPhotoPath))).toEqual(photoBytes);
+
+    await expect(pool.query<{ status: string }>(`SELECT status FROM album_notification_tasks
+      WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND message_id='album-notification-message'`, [accountId, chatType, chatId]))
+      .resolves.toMatchObject({ rows: [{ status: 'completed' }] });
+
+    const persisted = await pool.query<{ chat_type: string; chat_id: string }>(
+      `SELECT DISTINCT chat_type, chat_id FROM messages WHERE account_id = $1 AND ingestion_source = 'live'
+       AND raw #>> '{message,contentType}' IN ('16', 'POSTNOTIFICATION')
+       AND raw #>> '{message,contentMetadata,serviceType}' = 'AB'`, [accountId]);
+    expect(persisted.rows).toContainEqual({ chat_type: chatType, chat_id: chatId });
+  });
+
   it('ignores an invalidation whose database binding has already been replaced', async () => {
     await addStoredAccounts('account-a');
     await activate('account-a');
@@ -4157,6 +4245,214 @@ database('connected facade account login semantics', () => {
         const rows = await pool.query("SELECT picture_path FROM line_accounts WHERE product_role='PRIMARY_ADMIN'");
         expect(rows.rows).toEqual([{ picture_path: 'https://profile.line-scdn.net/path' }]);
       });
+    });
+
+    it('checks the active Agent binding after external admin binding even when the slot account ID differs', async () => {
+      await addAgentOnly();
+      // External binding writes account_administrators only when the Agent has
+      // completed login. A role-only row keeps the admin pending in the slot.
+      await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
+      await restartFacadeWithImporter(importer(() => supported()));
+      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
+      activeControlAckFailures.add('bind-agent');
+      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-ready', accountId: 'bind-agent' })).ok).toBe(true);
+      // The worker gateway returns its transport/write authority binding after
+      // startup. Model that activation callback before releasing its delayed ACK.
+      const startedBinding = bindings.get('bind-agent')!;
+      const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
+      bindings.set('bind-agent', readyBinding);
+      await workerBindingHandler?.(readyBinding, new AbortController().signal);
+      let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
+      const relation = new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; });
+      pendingFriendRelation = { started() {}, wait: relation };
+      expect(await facade.dispatch({ type: 'startExternalMonitorAsAdmin', requestId: 'bind-agent-external', mid: MID }))
+        .toMatchObject({ ok: true, bound: true });
+      const slot = await pool.query("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN'");
+      expect(slot.rows).toHaveLength(1);
+      expect(slot.rows[0]!.account_id).not.toBe('bind-agent');
+      expect(await new AdminRepository(pool).getPrimaryAdministrator('bind-agent')).toEqual({ chatId: MID, userId: MID });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(0);
+      activeControlAckFailures.delete('bind-agent');
+      await vi.waitFor(() => expect(friendRelationCommands.some((command) => command.accountId === 'bind-agent')).toBe(true));
+      expect(friendRelationCommands.filter((command) => command.accountId === slot.rows[0]!.account_id)).toEqual([]);
+      expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(1);
+      expect(friendRelationCommands.find((command) => command.accountId === 'bind-agent')?.targetMid).toBe(MID);
+      const relationCommand = friendRelationCommands.find((command) => command.accountId === 'bind-agent')!;
+      resolveRelation({ ...relationCommand, type: 'friendRelationResult', status: 'friend', error: null });
+      await facade.shutdown();
+      expect(friendAddCommands.filter((command) => command.accountId === 'bind-agent')).toEqual([]);
+    });
+
+    it.each(['stopped', 'paused', 'replaced'] as const)('ends delayed friendship readiness polling when the binding is %s before ACK', async (change) => {
+      await addAgentOnly();
+      await restartFacadeWithImporter(importer(() => supported()));
+      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
+      activeControlAckDelays.add('bind-agent');
+      activeControlAckFailures.add('bind-agent');
+      expect((await facade.dispatch({ type: 'lineStart', requestId: `bind-agent-${change}`, accountId: 'bind-agent' })).ok).toBe(true);
+      await vi.waitFor(() => expect(activeControlAckChecks).toBeGreaterThan(0));
+      const original = bindings.get('bind-agent')!;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const checksBeforeChange = activeControlAckChecks;
+      if (change === 'stopped') bindings.delete('bind-agent');
+      if (change === 'paused') bindings.set('bind-agent', { ...original, mode: 'PAUSED' });
+      if (change === 'replaced') bindings.set('bind-agent', { ...original, workerInstanceId: 'replacement-before-ack' });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(activeControlAckChecks - checksBeforeChange).toBeLessThanOrEqual(1);
+      expect(friendRemoteCalls).toBe(0);
+      const shutdown = facade.shutdown();
+      await expect(Promise.race([shutdown.then(() => 'drained'), new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 500))]))
+        .resolves.toBe('drained');
+      expect(friendRemoteCalls).toBe(0);
+    });
+
+    it('keeps one readiness waiter across repeated binding callbacks and drains it at shutdown', async () => {
+      await addAgentOnly();
+      await restartFacadeWithImporter(importer(() => supported()));
+      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
+      activeControlAckDelays.add('bind-agent');
+      activeControlAckFailures.add('bind-agent');
+      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-readiness-burst', accountId: 'bind-agent' })).ok).toBe(true);
+      const binding = bindings.get('bind-agent')!;
+      for (let index = 0; index < 12; index++) await workerBindingHandler?.(binding, new AbortController().signal);
+      const checksAtStart = activeControlAckChecks;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(activeControlAckChecks - checksAtStart).toBeLessThanOrEqual(4);
+      expect(friendRemoteCalls).toBe(0);
+      const shutdown = facade.shutdown();
+      await expect(Promise.race([shutdown.then(() => 'drained'), new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 500))]))
+        .resolves.toBe('drained');
+    });
+
+    it.each(['shutdown', 'replacement'] as const)('fences a deferred primary relation result during %s before it can add', async (fence) => {
+      await addAgentOnly();
+      await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
+      await restartFacadeWithImporter(importer(() => supported()));
+      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
+      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-shutdown-ready', accountId: 'bind-agent' })).ok).toBe(true);
+      const startedBinding = bindings.get('bind-agent')!;
+      const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
+      bindings.set('bind-agent', readyBinding);
+      await workerBindingHandler?.(readyBinding, new AbortController().signal);
+      let relationStarted!: () => void;
+      const started = new Promise<void>((resolve) => { relationStarted = resolve; });
+      let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
+      const relation = new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; });
+      pendingFriendRelation = { started: relationStarted, wait: relation };
+      await facade.dispatch({ type: 'startExternalMonitorAsAdmin', requestId: 'bind-agent-shutdown', mid: MID });
+      await started;
+      const command = friendRelationCommands.at(-1)!;
+      if (fence === 'replacement') {
+        bindings.set('bind-agent', { ...readyBinding, workerInstanceId: 'replacement-after-relation-check' });
+      }
+      resolveRelation({ ...command, type: 'friendRelationResult', status: 'not_friend', error: null });
+      if (fence === 'replacement') await new Promise((resolve) => setTimeout(resolve, 50));
+      await facade.shutdown();
+      expect(friendRelationCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
+      expect(friendAddCommands.filter((item) => item.accountId === 'bind-agent')).toEqual([]);
+      expect(friendRemoteCalls).toBe(1);
+    });
+
+    it('consumes a late admin-bound notification on the existing friendship job without duplicate relation or add', async () => {
+      await addAgentOnly();
+      await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
+      activeControlAckDelays.add('bind-agent');
+      activeControlAckFailures.add('bind-agent');
+      await restartFacadeWithImporter(importer(() => supported()));
+      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
+      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-overlap-ready', accountId: 'bind-agent' })).ok).toBe(true);
+      const startedBinding = bindings.get('bind-agent')!;
+      const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
+      bindings.set('bind-agent', readyBinding);
+      await workerBindingHandler?.(readyBinding, new AbortController().signal);
+      activeControlAckFailures.delete('bind-agent');
+      await vi.waitFor(() => expect(activeControlAckChecks).toBeGreaterThan(0));
+      let relationStarted!: () => void;
+      const started = new Promise<void>((resolve) => { relationStarted = resolve; });
+      let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
+      const relation = new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; });
+      pendingFriendRelation = { started: relationStarted, wait: relation };
+      const bindingResult = facade.dispatch({ type: 'startExternalMonitorAsAdmin', requestId: 'bind-agent-overlap-external', mid: MID });
+      await started;
+      // External admin binding emits admin-bound while the worker-ready job
+      // already owns this binding's single-flight slot.
+      const command = friendRelationCommands.at(-1)!;
+      resolveRelation({ ...command, type: 'friendRelationResult', status: 'not_friend', error: null });
+      await bindingResult;
+      await vi.waitFor(() => expect(friendAddCommands).toHaveLength(1));
+      expect(friendRelationCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
+      expect(friendAddCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
+    });
+
+    it('does not lose admin-bound delivered in completion microtasks after the initial no-admin check', async () => {
+      await addAgentOnly();
+      friendAddStatus = 'added';
+      await new AdminRepository(pool).bindPrimary('bind-agent', MID, MID);
+      await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
+      await restartFacadeWithImporter(importer(() => supported()));
+      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
+      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-completion-ready', accountId: 'bind-agent' })).ok).toBe(true);
+      const binding = bindings.get('bind-agent')!;
+      const readyBinding = { ...binding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
+      bindings.set('bind-agent', readyBinding);
+      let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
+      let relationStarted!: () => void;
+      const started = new Promise<void>((resolve) => { relationStarted = resolve; });
+      pendingFriendRelation = {
+        started: relationStarted,
+        wait: new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; }),
+      };
+
+      // Model the admin-bound notification landing after the no-admin loop's
+      // final trigger read but before its promise finalizer. The initial query
+      // is deliberately stale; the follow-up query sees the persisted row.
+      const originalAdminRead = AdminRepository.prototype.getPrimaryAdministrator;
+      let staleNoAdminReadUsed = false;
+      const adminReadSpy = vi.spyOn(AdminRepository.prototype, 'getPrimaryAdministrator').mockImplementation(function (this: AdminRepository, accountId) {
+        if (accountId === 'bind-agent' && !staleNoAdminReadUsed) {
+          staleNoAdminReadUsed = true;
+          return Promise.resolve(null);
+        }
+        return originalAdminRead.call(this, accountId);
+      });
+      const originalMapGet = Map.prototype.get;
+      let injectedCompletionTrigger = false;
+      const mapGetSpy = vi.spyOn(Map.prototype, 'get').mockImplementation(function (this: Map<any, any>, key: any): any {
+        const value = originalMapGet.call(this, key);
+        if (key === 'bind-agent' && value && typeof value === 'object' && 'abort' in value && 'promise' in value && 'trigger' in value
+          && !Object.getOwnPropertyDescriptor(value, 'trigger')?.get) {
+          let trigger = value.trigger;
+          let triggerReads = 0;
+          Object.defineProperty(value, 'trigger', { configurable: true, get() {
+            triggerReads++;
+            if (triggerReads === 2 && !injectedCompletionTrigger) {
+              injectedCompletionTrigger = true;
+              queueMicrotask(() => { trigger = 'admin-bound'; });
+            }
+            return trigger;
+          }, set(next: 'worker-ready' | 'admin-bound') { trigger = next; } });
+        }
+        return value;
+      });
+      try {
+        await workerBindingHandler?.(readyBinding, new AbortController().signal);
+        await started;
+        expect(staleNoAdminReadUsed).toBe(true);
+        expect(injectedCompletionTrigger).toBe(true);
+        expect(friendRelationCommands).toHaveLength(1);
+        const command = friendRelationCommands[0]!;
+        expect(command.accountId).toBe('bind-agent');
+        expect(command.targetMid).toBe(MID);
+        resolveRelation({ ...command, type: 'friendRelationResult', status: 'not_friend', error: null });
+        await vi.waitFor(() => expect(friendAddCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1));
+        expect(friendRelationCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
+        expect(friendAddCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
+        expect(friendAddCommands.find((item) => item.accountId === 'bind-agent')?.targetMid).toBe(MID);
+      } finally {
+        mapGetSpy.mockRestore();
+        adminReadSpy.mockRestore();
+      }
     });
 
     it('refuses when the primary admin is already bound and leaves existing flows alone', async () => {

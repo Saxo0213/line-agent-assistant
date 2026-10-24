@@ -24,13 +24,20 @@ describe('WorkRecords system tabs', () => {
     const api = { listSystemActivity: vi.fn(async () => ({ activity: [], partial: false })), listSystemErrors: vi.fn(async () => ({ partial: false, errors: [
       { createdAt: '2026-10-24T10:00:00.000Z', action: 'LINE 操作失敗', code: 'HISTORY_READ_FAILED', correlationId: 'local-reference',
         diagnostic: { operation: 'history', stage: 'read', category: 'timeout', recovery: 'retry' } },
+      { createdAt: '2026-10-24T10:01:00.000Z', action: '相簿照片下載', code: 'UNKNOWN_ERROR',
+        diagnostic: { operation: 'album_list', stage: 'response', category: 'invalid_response', reason: 'response_code_invalid',
+          failureKind: 'linejs_internal', upstreamCode: 102001, recovery: 'retry' } },
       { createdAt: '2026-10-24T09:00:00.000Z', action: 'LINE 操作失敗', code: 'WORKER_OPERATION_FAILED' },
     ] })) } as unknown as DesktopApi;
     renderAtLocale(<WorkRecords api={api} onOpen={vi.fn()} headingRef={React.createRef()} />, 'en');
     fireEvent.click(screen.getByRole('tab', { name: 'System errors' }));
     expect(await screen.findByText('history')).toBeTruthy();
-    expect(screen.getByText('Retry this action.')).toBeTruthy();
+    expect(screen.getAllByText('Retry this action.')).toHaveLength(2);
     expect(screen.getByText('local-reference')).toBeTruthy();
+    expect(screen.getByText('LINE response code')).toBeTruthy();
+    expect(screen.getByText('Native error kind')).toBeTruthy();
+    expect(screen.getByText('linejs_internal')).toBeTruthy();
+    expect(screen.getByText('102001')).toBeTruthy();
     expect(screen.getByText('Diagnostic detail was not recorded.')).toBeTruthy();
   });
 

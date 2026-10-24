@@ -25,6 +25,12 @@ it('bounds chat resource reads and image result payloads', () => {
   for (const responseCode of [-1_000_000_001, 1_000_000_001, 'private response']) {
     expect(LineWorkerEventSchema.safeParse({ ...failed, responseCode }).success).toBe(false);
   }
+  const albumFailure = { ...eventBase, action: 'listAlbums', ok: false, error: 'response_code_invalid',
+    failureKind: 'linejs_internal', upstreamCode: 102001 };
+  expect(LineWorkerEventSchema.safeParse(albumFailure).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ ...albumFailure, upstreamCode: 'private response' }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...albumFailure, upstreamStatus: 503 }).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ ...event, failureKind: 'other' }).success).toBe(false);
 });
 
 it('carries optional nullable picture paths through login identity and scoped catalog entries', () => {

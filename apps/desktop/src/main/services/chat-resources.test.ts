@@ -1,11 +1,15 @@
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { ConversationKey } from '@line-agent/contracts';
-import { ChatResourceArchiveService, isNativeNotePostNotification, type ChatResourceArchiveDependencies, type ChatResourceArchiveItem,
+import { ChatResourceArchiveService, isNativeNotePostNotification, nativePostNotificationSubtype, type ChatResourceArchiveDependencies, type ChatResourceArchiveItem,
   type ChatResourceArchiveVersion, type ChatResourceBinding, type ChatResourceKind, type ChatResourceReadResult, type ChatResourceRequest,
   type ChatResourceStore } from './chat-resources.js';
 import { ChatResourceAccountAdmission } from './chat-resource-admission.js';
 import { createOperationalAudit, type AuditEvent } from './operational-audit.js';
+import { createChatResourceDiagnostics, parseChatResourceDiagnostic } from './chat-resource-diagnostics.js';
 
 const noteA = { postId: 'post/one', createdTime: 1_700_000_000_000, text: 'A', content: { html: '<b>data</b>' } };
 const album = { albumId: 'album:one', chatId: 'chat-1', title: 'Photos', photoCount: 1, createTime: 1_700_000_000_000, updateTime: 1_700_000_000_001 };
@@ -247,6 +251,56 @@ describe('ChatResourceArchiveService', () => {
     expect(store.publishAlbumPhoto).toHaveBeenCalledOnce();
   });
 
+  it('returns a resumable cursor after the bounded album-photo page budget', async () => {
+    const { service, readChatResource } = await setup({ readChatResource: async (command) => {
+      const page = command.cursor === undefined ? 0 : Number(command.cursor.replace('page-', ''));
+      const photos = Array.from({ length: 50 }, (_, index) => ({ ...photo, photoId: `photo-${page * 50 + index}` }));
+      return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true, accountId: command.accountId,
+        workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch, chatType: command.chatType, chatId: command.chatId,
+        photos, nextCursor: page < 10 ? `page-${page + 1}` : null } as ChatResourceReadResult;
+    } }, { ensureAlbumFolder: vi.fn(async () => {}), hasAlbumPhoto: vi.fn(async () => true), publishAlbumPhoto: vi.fn(async () => {}) });
+    const first = await service.openAlbum(key, album.albumId);
+    expect(first).toMatchObject({ complete: false, errorCode: 'PAGE_LIMIT', nextCursor: 'page-10', nextPhotoIndex: 0, totalCount: 500 });
+    const second = await service.openAlbum(key, album.albumId, undefined, 'notification', undefined, first.nextCursor, first.nextPhotoIndex);
+    expect(second).toMatchObject({ complete: true, nextCursor: null, totalCount: 50 });
+    expect(readChatResource.mock.calls.filter(([command]) => command.action === 'listAlbumPhotos')).toHaveLength(11);
+  });
+
+  it('persists a producer incomplete failure through the production diagnostic parser and sink', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'album-failure-diagnostic-'));
+    const diagnostics = createChatResourceDiagnostics({ appDataDirectory: root });
+    const parsed: unknown[] = [];
+    const { service } = await setup({ recordDiagnostic: (record) => {
+      const safe = parseChatResourceDiagnostic(record);
+      parsed.push(safe);
+      if (safe) diagnostics.record(safe);
+    } });
+    service.recordNotificationFailure(key, new Error('ALBUM_ARCHIVE_INCOMPLETE'));
+    await diagnostics.shutdown();
+    expect(parsed[0]).toMatchObject({ failureStage: 'archive_scan', failureReason: 'archive_incomplete' });
+    const stored = (await readFile(diagnostics.filePath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(stored).toContainEqual(expect.objectContaining({ failureStage: 'archive_scan', failureReason: 'archive_incomplete' }));
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('resumes at the first unsaved photo after a per-pass byte budget', async () => {
+    const firstPhoto = { ...photo, photoId: 'photo-first' };
+    const secondPhoto = { ...photo, photoId: 'photo-second' };
+    const published: string[] = [];
+    const { service, readChatResource } = await setup({ albumOpenByteLimit: 3, readChatResource: async (command) => {
+      const data = command.action === 'listAlbumPhotos' ? { photos: [firstPhoto, secondPhoto], nextCursor: null }
+        : command.action === 'downloadAlbumPhoto' ? { bytes: new Uint8Array([1, 2]) } : {};
+      return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true, accountId: command.accountId,
+        workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch, chatType: command.chatType, chatId: command.chatId, ...data } as ChatResourceReadResult;
+    } }, { ensureAlbumFolder: vi.fn(async () => {}), publishAlbumPhoto: vi.fn(async ({ photoId }: { photoId: string }) => { published.push(photoId); }) });
+    const first = await service.openAlbum(key, album.albumId);
+    expect(first).toMatchObject({ complete: false, errorCode: 'BYTE_LIMIT', nextCursor: null, nextPhotoIndex: 1, savedCount: 1 });
+    const second = await service.openAlbum(key, album.albumId, undefined, 'notification', undefined, first.nextCursor, first.nextPhotoIndex);
+    expect(second).toMatchObject({ complete: true, savedCount: 1, nextCursor: null });
+    expect(published).toEqual(['photo-first', 'photo-second']);
+    expect(readChatResource.mock.calls.filter(([command]) => command.action === 'downloadAlbumPhoto')).toHaveLength(3);
+  });
+
   it('rejects monitor-only album opens before creating a folder or reading LINE', async () => {
     const store = { ensureAlbumFolder: vi.fn(async () => {}), publishAlbumPhoto: vi.fn(async () => {}) };
     const { service, readChatResource } = await setup({ isWritableAccount: async () => false }, store);
@@ -303,6 +357,39 @@ describe('ChatResourceArchiveService', () => {
     }
   });
 
+  it('reports album folder and photo write failures at the bounded archive-write stage', async () => {
+    const diagnostics: unknown[] = [];
+    const folderFailure = await setup({ recordDiagnostic: (record) => diagnostics.push(record) }, {
+      ensureAlbumFolder: async () => { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }); }, publishAlbumPhoto: async () => {},
+    });
+    await expect(folderFailure.service.openAlbum(key, album.albumId, undefined, 'notification')).rejects.toThrow('permission denied');
+    expect(diagnostics).toContainEqual(expect.objectContaining({ source: 'notification', action: 'album_photos', failureStage: 'archive_write', failureReason: 'folder_write_failed' }));
+
+    diagnostics.length = 0;
+    const photoFailure = await setup({ recordDiagnostic: (record) => diagnostics.push(record) }, {
+      ensureAlbumFolder: async () => {}, publishAlbumPhoto: async () => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); },
+    });
+    await photoFailure.service.openAlbum(key, album.albumId, undefined, 'notification');
+    expect(diagnostics).toContainEqual(expect.objectContaining({ source: 'notification', action: 'album_photos',
+      failureStage: 'archive_write', failureReason: 'photo_write_failed' }));
+  });
+
+  it('identifies archive contains failures separately and does not issue a LINE photo download', async () => {
+    const diagnostics: unknown[] = [];
+    const { service, readChatResource } = await setup({ recordDiagnostic: (record) => diagnostics.push(record) }, {
+      ensureAlbumFolder: async () => {},
+      hasAlbumPhoto: async () => { throw new Error('archive index unavailable'); },
+      publishAlbumPhoto: async () => {},
+    });
+
+    await service.openAlbum(key, album.albumId, undefined, 'notification');
+
+    expect(readChatResource.mock.calls.map(([command]) => command.action)).toEqual(['listAlbumPhotos']);
+    expect(diagnostics).toContainEqual(expect.objectContaining({ source: 'notification', action: 'album_photos',
+      failureStage: 'archive_contains', failureReason: 'unknown' }));
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({ action: 'photo_download' }));
+  });
+
   it('does not infer binding failures from broad caller error text', async () => {
     const records: unknown[] = [];
     const { service } = await setup({ readChatResource: async () => { throw new Error('account is temporarily unavailable'); },
@@ -321,6 +408,18 @@ describe('ChatResourceArchiveService', () => {
     expect(records[0]).toMatchObject({ failureStage: 'worker_response', failureReason: 'worker_response_error',
       failureCategory: 'normalization_failure' });
     expect(JSON.stringify(records[0])).not.toContain('normalization_failure token');
+  });
+
+  it('passes bounded native album failure facts into the production diagnostic record', async () => {
+    const records: unknown[] = [];
+    const { service } = await setup({ readChatResource: async (command) => ({ type: 'chatResourceResult',
+      requestId: command.requestId, action: command.action, accountId: key.accountId, workerInstanceId: 'worker-1', controlEpoch: 1,
+      chatType: key.chatType, chatId: key.chatId, ok: false, error: 'response_code_invalid', failureKind: 'linejs_internal',
+      upstreamCode: 102001 }) as never, recordDiagnostic: (record) => records.push(record) });
+    await expect(service.listAlbums(key, null)).rejects.toThrow('LINE_READ_FAILED');
+    expect(records[0]).toMatchObject({ action: 'album_list', failureCategory: 'response_code_invalid',
+      failureKind: 'linejs_internal', upstreamCode: 102001 });
+    expect(JSON.stringify(records[0])).not.toContain('message');
   });
 
   it.each([
@@ -584,17 +683,39 @@ describe('ChatResourceArchiveService', () => {
     await Promise.all([first, second]);
     expect(readChatResource).toHaveBeenCalledTimes(2);
   });
+
+  it('stops an album reconciliation when its captured binding changes between operations', async () => {
+    const diagnostics: unknown[] = [];
+    const originalBinding: ChatResourceBinding = { accountId: key.accountId, workerInstanceId: 'worker-1', controlEpoch: 1,
+      transportOwnerId: 'owner-1', transportGeneration: 2, writeGrantVersion: 3, mode: 'ACTIVE_CONTROL' };
+    const { service, readChatResource, setBinding } = await setup({ recordDiagnostic: (record) => diagnostics.push(record),
+      readChatResource: async (command) => {
+        setBinding({ ...originalBinding, workerInstanceId: 'replacement-worker' });
+        return { type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true,
+          accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+          chatType: command.chatType, chatId: command.chatId, albums: [album], nextCursor: null } as ChatResourceReadResult;
+      } });
+    await expect(service.listAlbums(key, null, undefined, 'notification', originalBinding)).rejects.toThrow('binding changed');
+    expect(readChatResource.mock.calls.map(([command]) => command.action)).toEqual(['listAlbums']);
+    expect(diagnostics).not.toHaveLength(0);
+  });
+
 });
 
 describe('native Note notification recognition', () => {
   const envelope = { eventId: 'event-1', accountId: 'account-1', chatType: 'group' as const, chatId: 'chat-1', senderId: 'sender-1',
     messageId: 'message-1', kind: 'event' as const, text: null, mentionIds: [], mentionRanges: [], replyToMessageId: null,
     ingestion: { source: 'live' as const, cursor: 'cursor' }, occurredAt: new Date(0).toISOString(), attachments: [],
-    raw: { message: { contentType: 16 } } };
-  it('recognizes only live POSTNOTIFICATION content with a native message envelope', () => {
+    raw: { message: { contentType: 16, contentMetadata: { serviceType: 'GB' } } } };
+  it('recognizes only exact live GB Note POSTNOTIFICATION content with a native message envelope', () => {
     expect(isNativeNotePostNotification(envelope)).toBe(true);
+    expect(nativePostNotificationSubtype(envelope)).toBe('note');
+    expect(nativePostNotificationSubtype({ ...envelope, raw: { message: { contentType: 16, contentMetadata: { serviceType: 'AB' } } } })).toBe('album');
+    expect(isNativeNotePostNotification({ ...envelope, raw: { message: { contentType: 16, contentMetadata: { serviceType: 'AB' } } } })).toBe(false);
+    expect(isNativeNotePostNotification({ ...envelope, raw: { message: { contentType: 16, contentMetadata: { serviceType: 'UNKNOWN' } } } })).toBe(false);
     expect(isNativeNotePostNotification({ ...envelope, ingestion: { source: 'history' as const, cursor: 'cursor' } })).toBe(false);
     expect(isNativeNotePostNotification({ ...envelope, raw: { message: { contentType: 1 } } })).toBe(false);
     expect(isNativeNotePostNotification({ ...envelope, raw: {} })).toBe(false);
   });
+
 });

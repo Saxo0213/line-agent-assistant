@@ -18,6 +18,15 @@ describe('safe operational diagnostics', () => {
     expect(diagnosticFailure('history', 'read', { name: 'AbortError' })).toMatchObject({ category: 'cancelled', recovery: 'none' });
   });
 
+  it('keeps only bounded upstream LINE failure facts for operational records', () => {
+    const result = parseSafeDiagnostic({ operation: 'album_list', stage: 'response', category: 'invalid_response',
+      recovery: 'retry', reason: 'response_code_invalid', failureKind: 'linejs_internal', upstreamCode: 102001, upstreamStatus: 503 });
+    expect(result).toMatchObject({ reason: 'response_code_invalid', failureKind: 'linejs_internal', upstreamCode: 102001, upstreamStatus: 503 });
+    expect(parseSafeDiagnostic({ ...result, upstreamCode: 1_000_000_001 })).toBeUndefined();
+    expect(parseSafeDiagnostic({ ...result, upstreamStatus: 799 })).toBeUndefined();
+    expect(parseSafeDiagnostic({ ...result, upstreamCode: 'non_numeric' })).toMatchObject({ upstreamCode: 'non_numeric' });
+  });
+
   it('contains hostile diagnostic and exception getters', () => {
     const hostile = Object.defineProperty({}, 'name', { get() { throw new Error('private'); } });
     expect(() => diagnosticFailure('ipc', 'read', hostile)).not.toThrow();

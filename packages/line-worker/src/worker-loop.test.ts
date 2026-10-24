@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { SafeAttachmentError } from './attachment-error.js';
 import { InternalError } from '@evex/linejs/base';
 import { ChatResourceFailure } from './chat-resource-error.js';
+import { LineWorkerEventSchema } from '@line-agent/contracts';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const protocolVersion = 4 as const;
@@ -71,6 +72,29 @@ describe('one-account worker loop', () => {
       expect(JSON.stringify(events.at(-1))).not.toContain('secret');
       await worker.handle({ type: 'stop', ...binding });
     }
+  });
+
+  it.each([
+    { label: 'zero status with fractional code', data: { status: 0, code: 1.5 }, upstreamStatus: undefined, upstreamCode: 'non_numeric' },
+    { label: 'out-of-range status', data: { status: 799, code: 102001 }, upstreamStatus: undefined, upstreamCode: 102001 },
+  ])('keeps worker failure events valid for $label', async ({ data, upstreamStatus, upstreamCode }) => {
+    const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
+    Object.assign(transport, { readChatResource: async () => {
+      throw new InternalError('MoaError', 'private response message token=secret', { ...data, message: 'private response message token=secret' });
+    } });
+    const events: any[] = [];
+    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => true });
+    await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
+    await authenticate(worker);
+    await worker.handle({ type: 'chatResourceRead', ...binding, chatType: 'group', chatId: attachmentChat,
+      requestId: 'failure-moa-native', action: 'listAlbums', timeoutMs: 5000 });
+    const result = LineWorkerEventSchema.parse(events.at(-1));
+    expect(result).toMatchObject({ type: 'chatResourceResult', ok: false, error: 'unknown',
+      failureKind: 'linejs_internal', upstreamCode });
+    if (upstreamStatus === undefined) expect(result).not.toHaveProperty('upstreamStatus');
+    expect(JSON.stringify(result)).not.toContain('private response');
+    expect(JSON.stringify(result)).not.toContain('secret');
+    await worker.handle({ type: 'stop', ...binding });
   });
 
   it.each([

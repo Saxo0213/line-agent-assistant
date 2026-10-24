@@ -85,6 +85,41 @@ it('normalizes a successful fake LINEJS Note list response without using the net
   } finally { login.mockRestore(); init.mockRestore(); list.mockRestore(); }
 });
 
+it.each([
+  { label: 'LINE response code', nativeError: new InternalError('MoaError', 'private Moa message token=secret', { code: 102001, message: 'private Moa message token=secret' }), upstreamCode: 102001, upstreamStatus: undefined },
+  { label: 'HTTP status', nativeError: new InternalError('MoaError', 'private HTTP message token=secret', { status: 503 }), upstreamCode: undefined, upstreamStatus: 503 },
+  { label: 'invalid zero status and fractional code', nativeError: new InternalError('MoaError', 'private invalid response token=secret', { status: 0, code: 1.5 }), upstreamCode: 'non_numeric', upstreamStatus: undefined },
+  { label: 'invalid high status', nativeError: new InternalError('MoaError', 'private invalid status token=secret', { status: 799 }), upstreamCode: undefined, upstreamStatus: undefined },
+])('preserves only bounded Moa failure facts ($label)', async ({ nativeError, upstreamCode, upstreamStatus }) => {
+  const { Login } = await import(new URL('../../../node_modules/@evex/linejs/base/login/mod.js', import.meta.url).href) as {
+    Login: { prototype: { login: (...args: any[]) => Promise<unknown> } };
+  };
+  const { MoaService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/moa/mod.js', import.meta.url).href) as {
+    MoaService: { prototype: { getAlbumChannelToken: (...args: any[]) => Promise<string>; getAlbums: (...args: any[]) => Promise<unknown> } };
+  };
+  const login = vi.spyOn(Login.prototype, 'login').mockImplementation(async function (this: { client: BaseClient }) {
+    this.client.profile = { mid: `u${'a'.repeat(32)}` } as never;
+    this.client.authToken = jwt;
+  });
+  const token = vi.spyOn(MoaService.prototype, 'getAlbumChannelToken').mockResolvedValue('fixture-token');
+  const albums = vi.spyOn(MoaService.prototype, 'getAlbums').mockRejectedValue(nativeError);
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async () => { throw new Error('fake Moa failure must not use the network'); } });
+  try {
+    await adapter.loginToken(jwt);
+    const failure = await adapter.readChatResource({ type: 'chatResourceRead', ...lease, chatType: 'group', chatId: attachmentIdentity.chatId,
+      requestId: 'album-moa-failure', action: 'listAlbums', timeoutMs: 5000 }, { signal: new AbortController().signal })
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({ category: upstreamCode === undefined ? 'list_get_transport_failure' : 'response_code_invalid',
+      failureKind: 'linejs_internal', ...(upstreamCode === undefined ? {} : { upstreamCode }),
+      ...(upstreamStatus === undefined ? {} : { upstreamStatus }) });
+    expect(JSON.stringify(failure)).not.toContain('private Moa message');
+    expect(JSON.stringify(failure)).not.toContain('secret');
+    expect(token).toHaveBeenCalledOnce();
+    expect(albums).toHaveBeenCalledOnce();
+  } finally { adapter.revoke(); login.mockRestore(); token.mockRestore(); albums.mockRestore(); }
+});
+
 const openablePng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64');
 const archivedOid = `OID_123${'a'.repeat(56)}`;
 
