@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-The v1.0.258 release stops adding LINE friends automatically, moves the embedded database to a free port when its port is taken, and redesigns the System Errors table. See the [v1.0.258 release notes](docs/releases/v1.0.258.md).
+In v1.0.260, you can replace the Agent LINE account while its old chats and attachments stay with the old account and the replacement starts with separate data. New System Errors record the validated IPC action name; historical errors say when the action was not recorded. See the [v1.0.260 release notes](docs/releases/v1.0.260.md).
 
 ## Installation
 

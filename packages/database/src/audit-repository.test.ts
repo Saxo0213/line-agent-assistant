@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { createTestDatabase } from './test-database.js';
 import { AuditRepository } from './audit-repository.js';
 import { DIAGNOSTIC_OPERATIONS, DIAGNOSTIC_STAGES, DIAGNOSTIC_CATEGORIES, DIAGNOSTIC_RECOVERIES, DIAGNOSTIC_REASONS, DIAGNOSTIC_FAILURE_KINDS } from '@line-agent/contracts';
+import { IPC_ACTION_CODES } from '../../contracts/src/ipc-actions.js';
+import { readFile } from 'node:fs/promises';
 
 it('keeps at most one audit connection waiter per shared pool during sustained exhaustion', async () => {
   vi.useFakeTimers();
@@ -73,6 +75,26 @@ it('keeps a timed out audit query fenced until it settles and destroys its clien
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 
 database('AuditRepository', () => {
+  it('upgrades the previous trigger without changing legacy rows and allows rerunning the IPC migration', async () => {
+    const { pool, close } = await createTestDatabase();
+    try {
+      await pool.query(await readFile(new URL('../migrations/067_primary_admin_not_friend_audit_code.sql', import.meta.url), 'utf8'));
+      const repository = new AuditRepository(pool);
+      const legacy = { operation: 'ipc', stage: 'execute', category: 'unknown', recovery: 'retry' } as const;
+      const base = { action: 'runtime_error', phase: 'observed', initiator: 'user', createdAt: new Date().toISOString() } as const;
+      await repository.append({ ...base, correlationId: 'legacy', diagnostic: legacy });
+      const diagnostic = { ...legacy, ipcAction: 'lineLogout' } as const;
+      await expect(repository.append({ ...base, correlationId: 'before-migration', diagnostic })).rejects.toThrow();
+      const migration = await readFile(new URL('../migrations/068_ipc_action_diagnostics.sql', import.meta.url), 'utf8');
+      await pool.query(migration);
+      await pool.query(migration);
+      await repository.append({ ...base, correlationId: 'new', diagnostic });
+      const rows = await repository.list();
+      expect(rows.find((row) => row.correlationId === 'legacy')?.diagnostic).toEqual(legacy);
+      expect(rows.find((row) => row.correlationId === 'new')?.diagnostic).toEqual(diagnostic);
+    } finally { await close(); }
+  });
+
   it('keeps the installed SQL trigger vocabulary aligned with every shared diagnostic enum', async () => {
     const { pool, close } = await createTestDatabase();
     try {
@@ -84,6 +106,7 @@ database('AuditRepository', () => {
         ...DIAGNOSTIC_RECOVERIES.map((recovery) => ({ ...base, recovery })),
         ...DIAGNOSTIC_REASONS.map((reason) => ({ ...base, reason })),
         ...DIAGNOSTIC_FAILURE_KINDS.map((failureKind) => ({ ...base, failureKind })),
+        ...IPC_ACTION_CODES.map((ipcAction) => ({ ...base, ipcAction })),
         { ...base, upstreamStatus: 100, upstreamCode: -1_000_000_000 },
         { ...base, upstreamStatus: 599, upstreamCode: 1_000_000_000 },
         { ...base, upstreamCode: 'missing' },
@@ -102,11 +125,12 @@ database('AuditRepository', () => {
     const { pool, close } = await createTestDatabase();
     try {
       const repository = new AuditRepository(pool);
-      const diagnostic = { operation: 'history', stage: 'read', category: 'timeout', recovery: 'retry', statusCode: 504 } as const;
+      const diagnostic = { operation: 'history', stage: 'read', category: 'timeout', recovery: 'retry', statusCode: 504, ipcAction: 'lineLoginQr' } as const;
       await repository.append({ action: 'worker_operation_error', phase: 'observed', initiator: 'worker', correlationId: 'diagnostic-a',
         errorCode: 'HISTORY_READ_FAILED', diagnostic, createdAt: new Date().toISOString() });
       expect(await repository.list()).toMatchObject([{ diagnostic }]);
       for (const unsafe of [{ ...diagnostic, operation: 'secret-sentinel' }, { ...diagnostic, message: 'secret-sentinel' },
+        { ...diagnostic, ipcAction: 'secret-sentinel' }, { ...diagnostic, ipcAction: null }, { ...diagnostic, ipcAction: 7 },
         { ...diagnostic, statusCode: 1.5 }, { ...diagnostic, category: null },
         { ...diagnostic, failureKind: 'secret-sentinel' }, { ...diagnostic, failureKind: 7 },
         { ...diagnostic, upstreamStatus: 99 }, { ...diagnostic, upstreamStatus: 600 }, { ...diagnostic, upstreamStatus: 500.5 },

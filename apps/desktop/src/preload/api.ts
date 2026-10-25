@@ -101,6 +101,7 @@ export type DesktopApi = {
   resolveFileTypeIcon(extension: string): Promise<string | null>;
   lineAddAccountQr(): Promise<IpcResult>;
   lineLoginQr(accountId: string): Promise<IpcResult>;
+  lineReplaceAgentQr(accountId: string): Promise<IpcResult>;
   lineLogout(accountId: string): Promise<IpcResult>;
   refreshLineAvatar(accountId: string): Promise<IpcResult>;
   lineSetAutoLogin(accountId: string, enabled: boolean): Promise<IpcResult>;
@@ -257,6 +258,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async resolveFileTypeIcon(extension) { if (!/^[a-z0-9]{1,12}$/.test(extension)) return null; const result = await request({ type: 'resolveFileTypeIcon', extension }); return result.type === 'resolveFileTypeIcon' ? result.dataUrl : null; },
     lineAddAccountQr: () => request({ type: 'lineAddAccountQr' }),
     lineLoginQr: (accountId) => request({ type: 'lineLoginQr', accountId }),
+    lineReplaceAgentQr: (accountId) => request({ type: 'lineReplaceAgentQr', accountId }),
     lineLogout: (accountId) => request({ type: 'lineLogout', accountId }),
     refreshLineAvatar: (accountId) => request({ type: 'refreshLineAvatar', accountId }),
     lineSetAutoLogin: (accountId, enabled) => request({ type: 'lineSetAutoLogin', accountId, enabled }),

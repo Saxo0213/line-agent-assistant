@@ -740,6 +740,21 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     }
   };
 
+  const stopAndClearWorkerBinding = async (accountId: string, initiator: 'user' | 'system'): Promise<void> => {
+    const running = await options.workers.binding(accountId) ?? supervisor.binding(accountId);
+    const durable = running ?? await accounts.getWorkerBinding(accountId);
+    if (running) {
+      await auditWorkerStop(running, () => options.workers.stopBinding(running), initiator);
+      lineService.unbind(running.workerInstanceId);
+      if (supervisor.isCurrent(running) && !supervisor.retireWithinLifecycle(running)) {
+        throw new Error('Stopped LINE worker no longer owns active control');
+      }
+    }
+    if (durable && !await accounts.clearStoppedWorkerBinding(durable)) {
+      throw new Error('Stopped LINE worker binding changed before compare-clear');
+    }
+  };
+
   const health = new HealthService(options.pool, options.workers.health
     ? { status: () => options.workers.health!() }
     : undefined);
@@ -1330,7 +1345,20 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           const rejectedAccount = await accounts.getAccount(event.accountId);
           const slotAccount = (await accounts.listAuthenticatedAccounts()).find((item) => item.productRole === 'PRIMARY_ADMIN');
           const sameAsAdmin = rejectedAccount?.productRole === 'AGENT' && !!slotAccount?.ownMid && slotAccount.ownMid === event.ownMid;
-          options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId: event.loginAttemptId,
+          const identityMismatch = rejectedAccount?.productRole === 'AGENT' && !!rejectedAccount.ownMid && rejectedAccount.ownMid !== event.ownMid;
+          if (identityMismatch) {
+            options.audit?.failure({ ...diagnosticFailure('loginQr', 'authenticate'), reason: 'AGENT_IDENTITY_MISMATCH',
+              category: 'denied', recovery: 'relogin' }, { accountId: event.accountId, workerInstanceId: instance, loginAttemptId: event.loginAttemptId });
+            await accounts.setConnectionStatus(event.accountId, 'disconnected');
+            const snapshot = await publishSnapshot.read();
+            const oldDisplayName = (snapshot.accounts.find((item) => item.accountId === event.accountId)?.displayName ?? 'Agent')
+              .replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 256);
+            const scannedDisplayName = event.displayName?.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim().slice(0, 256) || null;
+            options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId: event.loginAttemptId,
+              state: 'disconnected', message: 'A different LINE account was scanned; the Agent account was not changed.' });
+            options.publish?.({ type: 'agentIdentityMismatch', accountId: event.accountId, loginAttemptId: event.loginAttemptId,
+              oldDisplayName, scannedDisplayName });
+          } else options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId: event.loginAttemptId,
             state: 'degraded', message: sameAsAdmin
               ? '這個 LINE 帳號已被設為主要管理者，Agent 不能與主要管理者是同一個帳號，請改用另一個 LINE 帳號登入 Agent。'
               : 'LINE MID does not match the reserved account role or verified Primary Admin binding.' });
@@ -1592,12 +1620,75 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       options.publish?.({ type: 'lineLoginState', accountId, loginAttemptId, state: 'connecting', message: null });
       try { await lineService.requestQrLogin(accountId, binding.workerInstanceId, loginAttemptId); }
       catch (error) {
+        if (loginAttempts.get(accountId) === loginAttemptId) loginAttempts.delete(accountId);
+        await options.secretStore?.closeLogin(accountId, binding.workerInstanceId, loginAttemptId).catch(() => undefined);
         options.audit?.failure(diagnosticFailure('loginQr', 'dispatch', error), { accountId, loginAttemptId });
         options.publish?.({ type: 'lineLoginState', accountId, loginAttemptId, state: 'degraded',
           message: 'LINE QR login failed to start.' });
         throw error;
       }
       return accepted(requestId);
+    });
+  }
+
+  async function replaceAgentAccountWithQr(accountId: string, requestId: string): Promise<IpcResult> {
+    return supervisor.runLifecycle(async () => {
+      let createdAccountId: string | null = null;
+      try {
+        chatResourceAdmission.close(accountId, 'Agent account replacement was requested.');
+        await stopExternalImportForAccount(accountId);
+        const old = await accounts.getAccount(accountId);
+        if (!old || old.productRole !== 'AGENT' || !old.ownMid) return failure(requestId, 'AGENT_REPLACEMENT_STALE', 'Agent 帳號已變更，請重新整理後再試。');
+        if (loginAttempts.has(accountId)) return failure(requestId, 'AGENT_LOGIN_IN_PROGRESS', '請先取消目前的 LINE 登入，再更換 Agent 帳號。', true);
+        await stopAndClearWorkerBinding(accountId, 'user');
+        let control = await accounts.getControlState();
+        if (control.activeAccountId && control.activeAccountId !== accountId) {
+          options.audit?.failure({ ...diagnosticFailure('revokeControl', 'admission'), category: 'denied', recovery: 'none' }, { accountId, requestId });
+          return failure(requestId, 'AGENT_CONTROL_CONFLICT', '另一個帳號仍持有控制權，Agent 帳號尚未更換。');
+        }
+        if (control.activeAccountId === accountId) {
+          const revoked = await supervisor.revokeControlAndCancel(control.controlEpoch);
+          if (!revoked.revoked) return failure(requestId, 'AGENT_CONTROL_CONFLICT', 'Agent 控制狀態已變更，請重新整理後再試。');
+          control = await accounts.getControlState();
+        }
+        await auditSecretClear(accountId, 'user', { requestId });
+        await accounts.setConnectionStatus(accountId, 'disconnected');
+        const reserved = await accounts.replaceAgentAccount(accountId, control.controlEpoch);
+        if (!reserved.ok) {
+          const message = reserved.code === 'AGENT_WORKER_ACTIVE' ? 'Agent LINE 工作程序尚未停止，帳號未更換。'
+            : reserved.code === 'AGENT_CONTROL_ACTIVE' ? 'Agent 控制權尚未停止，帳號未更換。' : 'Agent 帳號已變更，請重新整理後再試。';
+          options.audit?.failure({ ...diagnosticFailure('database', 'persist'), category: 'denied', recovery: 'retry' }, { accountId, requestId });
+          return failure(requestId, reserved.code, message, true);
+        }
+        createdAccountId = reserved.account.accountId;
+        const binding = await startStoredAccount(reserved.account);
+        const loginAttemptId = randomUUID();
+        loginAttempts.set(binding.accountId, loginAttemptId);
+        options.publish?.({ type: 'lineLoginState', accountId: binding.accountId, loginAttemptId, state: 'connecting', message: null });
+        await lineService.requestQrLogin(binding.accountId, binding.workerInstanceId, loginAttemptId);
+        await publishSnapshot();
+        return accepted(requestId);
+      } catch (error) {
+        options.audit?.failure({ ...(createdAccountId ? diagnosticFailure('loginQr', 'dispatch', error)
+          : diagnosticFailure('revokeControl', 'execute', error)), ipcAction: 'lineReplaceAgentQr' }, { accountId, requestId });
+        if (!createdAccountId) return failure(requestId, 'AGENT_REPLACEMENT_FAILED', 'Agent 帳號未更換；舊帳號的聊天與附件仍保留。請確認狀態後重試。', true);
+        if (createdAccountId) {
+          const newId = createdAccountId;
+          const attemptId = loginAttempts.get(newId);
+          if (attemptId) loginAttempts.delete(newId);
+          const binding = await options.workers.binding(newId).catch(() => null);
+          if (binding) {
+            if (attemptId) await options.secretStore?.closeLogin(newId, binding.workerInstanceId, attemptId).catch(() => undefined);
+            await auditWorkerStop(binding, () => options.workers.stopBinding(binding)).catch(() => undefined);
+            lineService.unbind(binding.workerInstanceId);
+            if (supervisor.isCurrent(binding)) supervisor.retireWithinLifecycle(binding);
+          }
+          const control = await accounts.getControlState().catch(() => null);
+          if (control?.activeAccountId === newId) await supervisor.revokeControlAndCancel(control.controlEpoch).catch(() => undefined);
+          await accounts.setConnectionStatus(newId, 'disconnected').catch(() => undefined);
+        }
+        return failure(requestId, 'AGENT_REPLACEMENT_QR_START_FAILED', '新 Agent 帳號已保留，但 QR 登入未能啟動；請重試登入。', true);
+      }
     });
   }
 
@@ -2275,15 +2366,23 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return await supervisor.runLifecycle(async () => {
         await stopExternalImportForAccount(request.accountId);
         const account = await accounts.getAccount(request.accountId);
-        if (!account?.ownMid) return failure(request.requestId, 'ACCOUNT_NOT_AUTHENTICATED', '這不是已完成登入的 LINE 帳號。');
-        const binding = await options.workers.binding(request.accountId);
-        if (binding) await auditWorkerStop(binding, () => options.workers.stop(request.accountId), 'user');
+        if (!account) return failure(request.requestId, 'ACCOUNT_NOT_FOUND', '找不到這個 LINE 帳號。');
+        const loginAttemptId = loginAttempts.get(request.accountId);
+        if (!account.ownMid && !loginAttemptId) return failure(request.requestId, 'ACCOUNT_NOT_AUTHENTICATED', '這不是已完成登入的 LINE 帳號。');
+        const binding = await options.workers.binding(request.accountId) ?? supervisor.binding(request.accountId);
+        if (binding) await auditWorkerStop(binding, () => options.workers.stopBinding(binding), 'user');
         const control = await accounts.getControlState();
         if (control.activeAccountId === request.accountId) {
           if (binding && supervisor.isCurrent(binding)) supervisor.retireWithinLifecycle(binding);
           else await supervisor.revokeControlAndCancel(control.controlEpoch);
         }
         loginAttempts.delete(request.accountId);
+        if (binding) lineService.unbind(binding.workerInstanceId);
+        const durableBinding = binding ?? await accounts.getWorkerBinding(request.accountId);
+        if (loginAttemptId && durableBinding) await lineService.cancelLoginAttempt(request.accountId, durableBinding.workerInstanceId, loginAttemptId);
+        if (durableBinding && !await accounts.clearStoppedWorkerBinding(durableBinding)) {
+          throw new Error('Stopped LINE worker binding changed before compare-clear');
+        }
         await auditSecretClear(request.accountId, 'user', { requestId: request.requestId });
         await accounts.setConnectionStatus(request.accountId, 'disconnected');
         options.publish?.({ type: 'lineLoginState', accountId: request.accountId, loginAttemptId: null,
@@ -2291,6 +2390,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         options.publish?.({ type: 'controlChanged', control: (await publishSnapshot.read()).control });
         await publishSnapshot();
         return accepted(request.requestId);
+        }).catch((error: unknown) => {
+          options.audit?.failure({ ...diagnosticFailure('revokeControl', 'execute', error), ipcAction: request.type }, { accountId: request.accountId, requestId: request.requestId });
+          return failure(request.requestId, 'LINE_LOGOUT_FAILED', 'LINE 登出未能安全完成，請確認帳號狀態後再試。', true);
         });
       }
       if (request.type === 'lineSetAutoLogin') {
@@ -2545,10 +2647,17 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return result.ok ? accepted(request.requestId) : failure(request.requestId, 'AGENT_AUTH_FAILED', result.detail ?? 'Agent 登入操作失敗。');
       }
       if (request.type === 'lineLoginQr') {
-        return await reloginAccountWithQr(request.accountId, request.requestId);
+        try { return await reloginAccountWithQr(request.accountId, request.requestId); }
+        catch (error) {
+          options.audit?.failure({ ...diagnosticFailure('loginQr', 'dispatch', error), ipcAction: request.type }, { accountId: request.accountId, requestId: request.requestId });
+          return failure(request.requestId, 'LINE_LOGIN_QR_START_FAILED', 'LINE QR 登入未能啟動，請重試。', true);
+        }
+      }
+      if (request.type === 'lineReplaceAgentQr') {
+        return await replaceAgentAccountWithQr(request.accountId, request.requestId);
       }
       if (request.type === 'lineAddAccountQr') {
-        return await supervisor.runLifecycle(async () => {
+        try { return await supervisor.runLifecycle(async () => {
         const account = await accounts.reserveAccountSlot();
         const binding = await options.workers.binding(account.accountId) ?? await startStoredAccount(account);
         await publishSnapshot();
@@ -2558,13 +2667,24 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           state: 'connecting', message: null });
         try { await lineService.requestQrLogin(binding.accountId, binding.workerInstanceId, loginAttemptId); }
         catch (error) {
+          if (loginAttempts.get(binding.accountId) === loginAttemptId) loginAttempts.delete(binding.accountId);
+          await options.secretStore?.closeLogin(binding.accountId, binding.workerInstanceId, loginAttemptId).catch(() => undefined);
           options.audit?.failure(diagnosticFailure('loginQr', 'dispatch', error), { accountId: binding.accountId, loginAttemptId });
           options.publish?.({ type: 'lineLoginState', accountId: binding.accountId, loginAttemptId,
             state: 'degraded', message: 'LINE QR 登入啟動失敗' });
+          await auditWorkerStop(binding, () => options.workers.stopBinding(binding)).catch(() => undefined);
+          lineService.unbind(binding.workerInstanceId);
+          if (supervisor.isCurrent(binding)) supervisor.retireWithinLifecycle(binding);
+          const control = await accounts.getControlState().catch(() => null);
+          if (control?.activeAccountId === binding.accountId) await supervisor.revokeControlAndCancel(control.controlEpoch).catch(() => undefined);
+          await accounts.setConnectionStatus(binding.accountId, 'disconnected').catch(() => undefined);
           throw error;
         }
         return accepted(request.requestId);
-        });
+        }); } catch (error) {
+          options.audit?.failure({ ...diagnosticFailure('loginQr', 'dispatch', error), ipcAction: request.type }, { requestId: request.requestId });
+          return failure(request.requestId, 'LINE_LOGIN_QR_START_FAILED', 'LINE QR 登入未能啟動，請重試。', true);
+        }
       }
       if (request.type === 'lineSyncHistory') {
         if (isLocalAgentRoom(request)) return failure(request.requestId, 'LOCAL_ONLY', 'Agent 室沒有 LINE 歷史訊息。');
@@ -2719,7 +2839,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (error instanceof LocalMcpConfigError) return failure(requestId, error.code, error.message);
       if (signal?.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError')))
         return failure(requestId, 'CANCELLED', 'Chat resource request cancelled');
-      options.audit?.failure(diagnosticFailure('ipc', 'execute', error), { requestId, initiator: 'user' });
+      options.audit?.failure({ ...diagnosticFailure('ipc', 'execute', error), ipcAction: request.type }, { requestId, initiator: 'user' });
       return failure(requestId, 'SERVICE_ERROR', 'The operation failed. See System Errors for diagnostic details.', true);
     }
   }

@@ -220,6 +220,7 @@ function fakeApi(): DesktopApi {
     resolveFileTypeIcon: vi.fn(async () => null),
     lineAddAccountQr: vi.fn(async () => accepted),
     lineLoginQr: vi.fn(async () => accepted),
+    lineReplaceAgentQr: vi.fn(async () => accepted),
     lineLogout: vi.fn(async () => accepted),
     refreshLineAvatar: vi.fn(async () => accepted),
     lineSetAutoLogin: vi.fn(async () => accepted),

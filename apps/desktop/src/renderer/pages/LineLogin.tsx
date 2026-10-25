@@ -74,6 +74,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   const [refreshingAvatar, setRefreshingAvatar] = useState<string | null>(null);
   const [approvingSigner, setApprovingSigner] = useState(false);
   const [progress, setProgress] = useState<{ title: string; step: string; error?: string; errorCode?: string | null; confirmation?: string; accountId?: string;
+    confirmationAction?: string;
     /** After 確定: follow the Primary Admin account's first-import progress from the snapshot. */ following?: boolean; followWarning?: string | null } | null>(null);
   const confirmationResolve = useRef<((confirmed: boolean) => void) | null>(null);
   const notify = (message: string) => { if (onNotice) onNotice(message); else setStatus(message); };
@@ -117,6 +118,29 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       setProgress((current) => current?.title === desktopText('startExternalMonitoring') ? null : current);
     }
   }, [accounts]);
+  useEffect(() => api.onEvent?.((event) => {
+    if (event.type !== 'agentIdentityMismatch') return;
+    const oldName = event.oldDisplayName || accounts.find((account) => account.accountId === event.accountId)?.displayName || 'Agent';
+    const newName = event.scannedDisplayName || desktopText('differentLineAccount');
+    void requestAgentReplacement(event.accountId, oldName, newName);
+  }), [api, accounts]);
+  async function requestAgentReplacement(accountId: string, oldName: string, newName?: string) {
+    setProgress({ get title() { return desktopText('replaceAgentAccount'); }, step: desktopText('agentArchiveRemainsSeparate'),
+      confirmationAction: desktopText('replaceAgentAccount'),
+      confirmation: newName ? desktopText('replaceAgentAccountWithArg0Arg1', { arg0: oldName, arg1: newName })
+        : desktopText('replaceAgentAccountPromptArg0', { arg0: oldName }) });
+    const confirmed = await new Promise<boolean>((resolve) => { confirmationResolve.current = resolve; });
+    confirmationResolve.current = null;
+    if (!confirmed) { setProgress(null); return; }
+    setProgress({ get title() { return desktopText('replaceAgentAccount'); }, step: desktopText('startingLogin') });
+    try {
+      const result = await api.lineReplaceAgentQr(accountId);
+      if (result.ok) setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: desktopText('scanTheQrCodeWithLineOnYourPhone') });
+      else setProgress({ get title() { return desktopText('replaceAgentAccount'); }, step: '', error: safeErrorText(result), errorCode: result.type === 'error' ? result.code : null });
+    } catch (cause) {
+      setProgress({ get title() { return desktopText('replaceAgentAccount'); }, step: '', error: safeErrorText(cause, desktopText('unableToStartLineLogin')) });
+    }
+  }
   async function addAccount(slot: 'add:agent' | 'add:admin') {
     flushSync(() => setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: desktopText('startingLogin') }));
     setPending({ target: slot, action: 'add' });
@@ -385,6 +409,8 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
         {account.productRole === 'AGENT' && account.hasPrimaryAdmin !== true && <button className="primary" onClick={() => void beginAdminPairing(account)}>{desktopText('addAdministrator')}</button>}
         <button disabled={account.status === 'disconnected' || busy} onClick={() => void restart(account.accountId)}>{desktopText('restart')}</button>
         <button aria-label={`${account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')} ${account.displayName}`} disabled={busy} onClick={() => void relogin(account.accountId)}>{account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')}</button>
+        {account.productRole === 'AGENT' && account.hasVerifiedLineIdentity === true && account.status === 'disconnected' && <button disabled={busy || loginActive}
+          onClick={() => void requestAgentReplacement(account.accountId, account.displayName)}>{desktopText('replaceAgentAccount')}</button>}
         <button aria-label={desktopText('logOutArg0', { arg0: account.displayName })} disabled={account.status === 'disconnected' || busy || loggingOut === account.accountId} onClick={() => void logout(account)}>{loggingOut === account.accountId ? desktopText('loggingOut') : desktopText('logOut')}</button>
         {busy && <InlineBusy>{desktopText('startingLineLogin')}</InlineBusy>}
         {loggingOut === account.accountId && <InlineBusy>{desktopText('loggingOut')}</InlineBusy>}
@@ -436,6 +462,11 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     {embedded && <h2 className="combined-account-title">{desktopText('account')}</h2>}
     <div className="account-role-slots">
       <section className="account-role-slot" aria-label={extraText('agentAccountSlot')}><div className="account-role-heading"><h2>Agent</h2><p>{agent?.displayName ?? desktopText('notLoggedIn182')}</p></div>{agent ? accountCard(agent) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}>{admin ? <p>{desktopText('primaryAdministratorConfiguredANewAgentAccountWillBe')}</p> : null}<div className="action-with-status"><button className="primary" disabled={loginActive || addPending} onClick={() => void addAccount('add:agent')}>{desktopText('logInToAgentLineAccount')}</button>{vacantPending('add:agent') && <InlineBusy>{vacantPending('add:agent')!}</InlineBusy>}</div></article>}</section>
+      {accounts.some((account) => account.productRole === null && account.hasVerifiedLineIdentity === true) && <section className="account-role-slot" aria-label={desktopText('historicalAgentAccounts')}><div className="account-role-heading"><h2>{desktopText('historicalAgentAccounts')}</h2></div>
+        {accounts.filter((account) => account.productRole === null && account.hasVerifiedLineIdentity === true).map((account) => <article className="account-record" key={account.accountId}>
+          <strong>{account.displayName}</strong><p>{desktopText('historicalAgentReadOnly')}</p>
+        </article>)}
+      </section>}
       <section className="account-role-slot" aria-label={extraText('primaryAdminAccountSlot')}><div className="account-role-heading"><h2>Primary Admin</h2><p>{admin?.displayName ?? desktopText('notLoggedIn182')}</p></div>{admin ? accountCard(admin) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}><div className="action-with-status"><button className="primary" disabled={loginActive || addPending || agent?.hasPrimaryAdmin !== true} onClick={() => void addAccount('add:admin')}>{desktopText('logInToPrimaryAdminLineAccount')}</button>{vacantPending('add:admin') && <InlineBusy>{vacantPending('add:admin')!}</InlineBusy>}</div>
         {embedded && canBindAdminFromSettings && <div className="action-with-status"><button className="primary" disabled={bindingAdmin || addPending} onClick={() => void bindAdminFromOfficialLine()}>{desktopText('setAdministratorFromLineAndStartExternalMonitoring')}</button>{bindingAdmin && <InlineBusy>{desktopText('settingPrimaryAdministrator')}</InlineBusy>}</div>}
         {!embedded && (!agent || agent.hasPrimaryAdmin !== true) && <div className="action-with-status"><button className="primary" disabled={bindingAdmin || addPending} onClick={() => void bindAdminFromOfficialLine()}>{desktopText('setAdministratorFromLineAndStartExternalMonitoring')}</button></div>}</article>}</section>
@@ -470,7 +501,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     {!onNotice && status && <div role="status" className="system-toast">{generatedMessageText(status)}</div>}
     {progress && <ProgressOverlay title={generatedMessageText(progress.title)} step={followStep ?? progress.step} error={progress.error ?? null} errorCode={progress.errorCode ?? null}
       spinner={!progress.confirmation} onClose={() => setProgress(null)}>
-      {progress.confirmation && <><p className="progress-confirmation">{progress.confirmation}</p><div className="progress-actions"><button onClick={() => confirmationResolve.current?.(false)}>{desktopText('cancel')}</button><button className="primary" onClick={() => confirmationResolve.current?.(true)}>{desktopText('confirm')}</button></div></>}
+      {progress.confirmation && <><p className="progress-confirmation">{progress.confirmation}</p><div className="progress-actions"><button onClick={() => confirmationResolve.current?.(false)}>{desktopText('cancel')}</button><button className="primary" onClick={() => confirmationResolve.current?.(true)}>{progress.confirmationAction ?? desktopText('confirm')}</button></div></>}
       {followImport?.stage === 'copying_snapshot' && <progress aria-label={desktopText('snapshotCopyProgress')} max={100} {...(percent(followImport.copiedBytes, followImport.totalBytes) === undefined
         ? {} : { value: percent(followImport.copiedBytes, followImport.totalBytes) })} />}
       {followImport?.stage === 'importing_history' && <progress aria-label={desktopText('messageHistoryImportProgress')} max={100} {...(percent(followImport.committedRows, followImport.eligibleRows) === undefined

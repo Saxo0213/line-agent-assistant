@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { diagnosticFailure, parseSafeDiagnostic } from './diagnostics.js';
+import { IPC_ACTION_CODES } from './ipc-actions.js';
+import { IpcRequestSchema } from './ipc.js';
+
+it('allows only fixed IPC action discriminants and preserves legacy diagnostics', () => {
+  expect(IPC_ACTION_CODES).toEqual(IpcRequestSchema.options.map((option) => option.shape.type.value));
+  const legacy = diagnosticFailure('ipc', 'execute');
+  expect(parseSafeDiagnostic(legacy)).toEqual(legacy);
+  for (const ipcAction of IPC_ACTION_CODES) expect(parseSafeDiagnostic({ ...legacy, ipcAction })?.ipcAction).toBe(ipcAction);
+  for (const ipcAction of ['private-sentinel', 'x'.repeat(129), null, 7]) {
+    expect(parseSafeDiagnostic({ ...legacy, ipcAction })).toBeUndefined();
+  }
+});
 
 describe('safe operational diagnostics', () => {
   it('keeps fixed categories while dropping arbitrary error text, payload and cause', () => {

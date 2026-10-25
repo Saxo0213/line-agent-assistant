@@ -62,6 +62,93 @@ async function readControl(client: PoolClient): Promise<ControlState> {
 export class AccountRepository {
   constructor(private readonly pool: Pool) {}
 
+  async replaceAgentAccount(accountId: string, expectedControlEpoch: number): Promise<
+    { ok: true; account: ReservedAccountState; controlEpoch: number } |
+    { ok: false; code: 'AGENT_REPLACEMENT_STALE' | 'AGENT_WORKER_ACTIVE' | 'AGENT_CONTROL_ACTIVE' }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const state = await readControl(client);
+      if (state.controlEpoch !== expectedControlEpoch || state.activeAccountId !== null) {
+        await client.query('ROLLBACK');
+        return { ok: false, code: state.activeAccountId ? 'AGENT_CONTROL_ACTIVE' : 'AGENT_REPLACEMENT_STALE' };
+      }
+      await client.query("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN' FOR UPDATE");
+      await client.query(`SELECT source_id FROM line_account_sources
+        WHERE source_type='EXTERNAL_MONITOR' AND state='ACTIVE' AND admin_binding_account_id=$1 FOR UPDATE`, [accountId]);
+      const verifiedAdmin = await client.query<{ chat_type: 'direct'; chat_id: string; user_id: string }>(
+        `SELECT admin_auth.chat_type,admin_auth.chat_id,admin_auth.user_id
+         FROM account_administrators admin_auth
+         JOIN line_accounts admin ON admin.product_role='PRIMARY_ADMIN' AND admin.own_mid=admin_auth.user_id
+         WHERE admin_auth.account_id=$1 AND admin_auth.role='PRIMARY_ADMIN'
+           AND admin_auth.chat_type='direct' AND admin_auth.chat_id=admin_auth.user_id
+         FOR UPDATE OF admin_auth`, [accountId]);
+      const agent = await client.query<{ account_id: string; mode: AccountMode; own_mid: string | null; status: string;
+        worker_instance_id: string | null; worker_binding_epoch: string | null }>(
+        `SELECT account_id,mode,own_mid,status,worker_instance_id,worker_binding_epoch FROM line_accounts
+         WHERE product_role='AGENT' FOR UPDATE`);
+      const old = agent.rows[0];
+      if (!old || old.account_id !== accountId || !old.own_mid) {
+        await client.query('ROLLBACK');
+        return { ok: false, code: 'AGENT_REPLACEMENT_STALE' };
+      }
+      if (old.worker_instance_id !== null || old.worker_binding_epoch !== null || old.status !== 'disconnected') {
+        await client.query('ROLLBACK');
+        return { ok: false, code: 'AGENT_WORKER_ACTIVE' };
+      }
+      await client.query<{ job_id: string }>(
+        `SELECT job_id FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND creation_epoch=$2
+         AND status IN ('queued','running') FOR UPDATE`, [accountId, expectedControlEpoch]);
+      await client.query<{ delivery_id: string }>(
+        `SELECT d.delivery_id FROM agent_deliveries d JOIN agent_jobs j USING(job_id)
+         WHERE j.account_id=$1 AND j.source_type='line' AND j.creation_epoch=$2 AND d.status='sending' FOR UPDATE`,
+        [accountId, expectedControlEpoch]);
+      await transitionAgentJobStatus(client, 'cancelled',
+        "account_id=$1 AND source_type='line' AND creation_epoch=$2 AND status IN ('queued','running')",
+        [accountId, expectedControlEpoch]);
+      await client.query(
+        `UPDATE agent_deliveries d SET status=CASE WHEN d.status='sending' THEN 'unknown' ELSE 'cancelled' END,updated_at=now()
+         FROM agent_jobs j WHERE j.job_id=d.job_id AND j.account_id=$1 AND j.source_type='line' AND j.creation_epoch=$2
+           AND d.status IN ('pending','sending')`, [accountId, expectedControlEpoch]);
+      await client.query(
+        `UPDATE line_accounts SET product_role=NULL,mode='MONITOR_ONLY',role_revision=role_revision+1,status='disconnected',
+           worker_instance_id=NULL,worker_binding_epoch=NULL,auto_login_on_startup=false,connection_mode='OFFLINE',
+           selected_source_id=NULL,selected_source_generation=NULL,updated_at=now() WHERE account_id=$1`, [accountId]);
+      await client.query(
+        `UPDATE line_account_sources SET state='RETIRED',retired_at=now()
+         WHERE account_id=$1 AND state<>'RETIRED'`, [accountId]);
+      const epoch = await client.query<{ control_epoch: string }>(
+        'UPDATE account_control SET control_epoch=control_epoch+1,updated_at=now() WHERE singleton=true RETURNING control_epoch');
+      const nextId = `account-${randomUUID()}`;
+      const inserted = await client.query<{ account_id: string; mode: AccountMode; own_mid: string | null }>(
+        `INSERT INTO line_accounts(account_id,display_name,product_role) VALUES($1,'LINE Agent','AGENT')
+         RETURNING account_id,mode,own_mid`, [nextId]);
+      await client.query(
+        `INSERT INTO conversations(account_id,chat_type,chat_id,title,agent_enabled)
+         VALUES($1,'direct',$2,$3,true) ON CONFLICT(account_id,chat_type,chat_id) DO NOTHING`,
+        [nextId, LOCAL_AGENT_ROOM_CHAT_ID, LOCAL_AGENT_ROOM_TITLE]);
+      const adminBinding = verifiedAdmin.rows[0];
+      if (adminBinding) {
+        await client.query(`DELETE FROM account_administrators WHERE account_id=$1 AND role='PRIMARY_ADMIN'
+          AND chat_type=$2 AND chat_id=$3 AND user_id=$4`,
+        [accountId, adminBinding.chat_type, adminBinding.chat_id, adminBinding.user_id]);
+        await client.query(`INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
+          VALUES($1,$2,$3,$4,'PRIMARY_ADMIN')`, [nextId, adminBinding.chat_type, adminBinding.chat_id, adminBinding.user_id]);
+        const version = await client.query<{ version: string }>(
+          'SELECT version FROM account_administrator_versions WHERE account_id=$1', [nextId]);
+        await client.query(`UPDATE line_account_sources SET admin_binding_account_id=$1,admin_binding_version=$2
+          WHERE source_type='EXTERNAL_MONITOR' AND state='ACTIVE' AND admin_binding_account_id=$3
+            AND admin_binding_mid=$4 AND verified_account_mid=$4`,
+        [nextId, version.rows[0]!.version, accountId, adminBinding.user_id]);
+      }
+      await client.query('COMMIT');
+      const row = inserted.rows[0]!;
+      return { ok: true, controlEpoch: Number(epoch.rows[0]!.control_epoch),
+        account: { accountId: row.account_id, mode: row.mode, ownMid: row.own_mid, productRole: 'AGENT' } };
+    } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; }
+    finally { client.release(); }
+  }
+
   async reserveAccountSlot(): Promise<ReservedAccountState> {
     const client = await this.pool.connect();
     try {
@@ -365,6 +452,22 @@ export class AccountRepository {
        WHERE account_id=$1 AND worker_instance_id=$2 AND worker_binding_epoch=$3`,
       [binding.accountId, binding.workerInstanceId, binding.controlEpoch],
     );
+    return result.rowCount === 1;
+  }
+
+  async getWorkerBinding(accountId: string): Promise<WorkerBinding | null> {
+    const result = await this.pool.query<{ worker_instance_id: string | null; worker_binding_epoch: string | null }>(
+      'SELECT worker_instance_id,worker_binding_epoch FROM line_accounts WHERE account_id=$1', [accountId]);
+    const row = result.rows[0];
+    if (!row?.worker_instance_id || row.worker_binding_epoch === null) return null;
+    return { accountId, workerInstanceId: row.worker_instance_id, controlEpoch: Number(row.worker_binding_epoch) };
+  }
+
+  async clearStoppedWorkerBinding(binding: WorkerBinding): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE line_accounts SET worker_instance_id=NULL,worker_binding_epoch=NULL,updated_at=now()
+       WHERE account_id=$1 AND worker_instance_id=$2 AND worker_binding_epoch=$3`,
+      [binding.accountId, binding.workerInstanceId, binding.controlEpoch]);
     return result.rowCount === 1;
   }
 

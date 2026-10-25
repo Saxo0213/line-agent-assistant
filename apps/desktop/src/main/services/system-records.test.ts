@@ -9,6 +9,21 @@ const audit = (values: Partial<SafeAuditRecord> = {}): SafeAuditRecord => ({ act
   initiator: 'system', correlationId: 'private-correlation', createdAt: '2026-10-17T10:00:00.000Z', ...values });
 
 describe('system record projection', () => {
+  it('preserves distinct safe IPC actions and correlation IDs through the System Errors schema', () => {
+    const events = (['lineLoginQr', 'lineLogout', 'getManualUnsendWindow'] as const).map((ipcAction, index) => audit({
+      action: 'runtime_error', phase: 'observed', errorCode: 'UNKNOWN', correlationId: `reference-${index}`,
+      diagnostic: { operation: 'ipc', stage: 'execute', category: 'unknown', recovery: 'retry', ipcAction },
+    }));
+    const projected = projectSystemErrors(events, []);
+    const result = SystemErrorsResultSchema.parse({ errors: projected, partial: false });
+    expect(result.errors.map((row) => row.diagnostic?.ipcAction)).toEqual(['lineLoginQr', 'lineLogout', 'getManualUnsendWindow']);
+    expect(result.errors.map((row) => row.correlationId)).toEqual(['reference-0', 'reference-1', 'reference-2']);
+    const unsafe = projectSystemErrors([audit({ errorCode: 'UNKNOWN', diagnostic: {
+      operation: 'ipc', stage: 'execute', category: 'unknown', recovery: 'retry', ipcAction: 'PRIVATE_SENTINEL',
+    } as never })], []);
+    expect(JSON.stringify(unsafe)).not.toContain('PRIVATE_SENTINEL');
+  });
+
   it('retains validated operation, stage, recovery and correlation while legacy rows remain unchanged', () => {
     const diagnostic = { operation: 'history', stage: 'read', category: 'timeout', recovery: 'retry' } as const;
     expect(projectSystemErrors([audit({ errorCode: 'HISTORY_READ_FAILED', diagnostic })], []))

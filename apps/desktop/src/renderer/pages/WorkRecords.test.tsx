@@ -42,6 +42,22 @@ describe('WorkRecords system tabs', () => {
     expect(screen.getByText('Diagnostic detail was not recorded.')).toBeTruthy();
   });
 
+  it('shows recorded IPC actions and a truthful legacy label without guessing an old action', async () => {
+    const api = { listSystemActivity: vi.fn(async () => ({ activity: [], partial: false })), listSystemErrors: vi.fn(async () => ({ partial: false, errors: [
+      ...(['lineLoginQr', 'lineLogout', 'getManualUnsendWindow', undefined] as const).map((ipcAction, index) => ({
+        createdAt: '2026-10-25T10:00:00.000Z', action: '系統錯誤', code: 'UNKNOWN_ERROR', correlationId: `reference-${index}`,
+        diagnostic: { operation: ipcAction === 'lineLogout' ? 'revokeControl' : 'ipc', stage: 'execute', category: 'unknown', recovery: 'retry', ...(ipcAction ? { ipcAction } : {}) },
+      })),
+    ] })) } as unknown as DesktopApi;
+    render(<WorkRecords api={api} onOpen={vi.fn()} headingRef={React.createRef()} />);
+    fireEvent.click(screen.getByRole('tab', { name: '系統錯誤' }));
+    expect(await screen.findByText('lineLoginQr')).toBeTruthy();
+    expect(screen.getByText('lineLogout')).toBeTruthy();
+    expect(screen.getByText('getManualUnsendWindow')).toBeTruthy();
+    expect(screen.getByText('未記錄操作')).toBeTruthy();
+    expect(screen.getByText('reference-3')).toBeTruthy();
+  });
+
   it('opens the stored tab and stores the tab the user selects', async () => {
     const api = { listSystemActivity: vi.fn(async () => ({ activity: [], partial: false })), listSystemErrors: vi.fn(async () => ({ partial: false, errors: [] })) } as unknown as DesktopApi;
     window.localStorage.setItem('line-agent:work-records-tab', 'errors');

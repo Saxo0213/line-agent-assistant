@@ -499,6 +499,25 @@ database('connected facade account login semantics', () => {
     vi.unstubAllGlobals();
   });
 
+  it.each(['lineLoginQr', 'lineReplaceAgentQr', 'lineLogout', 'getManualUnsendWindow'] as const)('identifies thrown %s failures without private exception text', async (type) => {
+    const sentinel = 'PRIVATE_IPC_SENTINEL token=secret C:\\private\\qr-pin';
+    const error = type === 'lineLogout' ? Object.assign(new Error(sentinel), { code: 'ETIMEDOUT' }) : new Error(sentinel);
+    const spy = type === 'getManualUnsendWindow'
+      ? vi.spyOn(SettingsRepository.prototype, 'getAppSetting').mockRejectedValue(error)
+      : vi.spyOn(AccountRepository.prototype, 'getAccount').mockRejectedValue(error);
+    const requestId = randomUUID();
+    try {
+      const result = await facade.dispatch(type === 'getManualUnsendWindow' ? { type, requestId } : { type, requestId, accountId: 'account-a' });
+      const codes = { lineLoginQr: 'LINE_LOGIN_QR_START_FAILED', lineReplaceAgentQr: 'AGENT_REPLACEMENT_FAILED', lineLogout: 'LINE_LOGOUT_FAILED', getManualUnsendWindow: 'SERVICE_ERROR' };
+      expect(result).toMatchObject({ ok: false, code: codes[type], requestId });
+      await audit.flush();
+      const events = auditEvents.filter((event) => event.requestId === requestId && event.diagnostic?.ipcAction === type);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ correlationId: requestId, diagnostic: { ipcAction: type, category: type === 'lineLogout' ? 'timeout' : 'unknown' } });
+      expect(JSON.stringify([result, events])).not.toContain(sentinel);
+    } finally { spy.mockRestore(); }
+  });
+
   it('uses the default manual unsend window and persists the selected value', async () => {
     expect(await facade.dispatch({ type: 'getManualUnsendWindow', requestId: 'unsend-window-default' }))
       .toMatchObject({ type: 'getManualUnsendWindow', ok: true, window: '1h' });
@@ -4902,5 +4921,173 @@ database('connected facade account login semantics', () => {
     ]);
     expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='account-a'")).rows[0].status).toBe('degraded');
     expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='account-b'")).rows[0].status).toBe('disconnected');
+  });
+
+  it('allows facade logout followed by Agent replacement without repairing durable worker binding in the test', async () => {
+    await addStoredAccounts('replace-after-logout-agent');
+    expect(await facade.dispatch({ type: 'lineStart', requestId: 'replace-logout-start', accountId: 'replace-after-logout-agent' }))
+      .toMatchObject({ ok: true });
+    const initialBinding = bindings.get('replace-after-logout-agent')!;
+    expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'replace-logout-login', accountId: initialBinding.accountId }))
+      .toMatchObject({ ok: true });
+    const original = bindings.get(initialBinding.accountId)!;
+    const attempt = latestLoginAttempt(original.accountId);
+    await workerEventHandler?.(original.workerInstanceId, { type: 'secretRotation', ...original, loginAttemptId: attempt,
+      secrets: { token: 'old-agent-token', qrCert: 'old-cert', e2eeStorage: null } });
+    await workerEventHandler?.(original.workerInstanceId, { type: 'login', ...original, loginAttemptId: attempt,
+      ownMid: `own-${original.accountId}`, displayName: 'Original Agent' });
+    expect((await pool.query('SELECT worker_instance_id,worker_binding_epoch FROM line_accounts WHERE account_id=$1', [original.accountId])).rows[0])
+      .toEqual({ worker_instance_id: original.workerInstanceId, worker_binding_epoch: String(original.controlEpoch) });
+    expect(await secretStore.load(original.accountId)).toMatchObject({ token: 'old-agent-token' });
+
+    expect(await facade.dispatch({ type: 'lineLogout', requestId: 'replace-logout', accountId: original.accountId }))
+      .toMatchObject({ ok: true });
+    expect((await pool.query('SELECT worker_instance_id,worker_binding_epoch FROM line_accounts WHERE account_id=$1', [original.accountId])).rows[0])
+      .toEqual({ worker_instance_id: null, worker_binding_epoch: null });
+    expect(await secretStore.load(original.accountId)).toBeNull();
+
+    const replaced = await facade.dispatch({ type: 'lineReplaceAgentQr', requestId: 'replace-after-logout', accountId: original.accountId });
+    expect(replaced, JSON.stringify(replaced)).toMatchObject({ ok: true });
+    expect((await pool.query("SELECT account_id,product_role FROM line_accounts WHERE product_role='AGENT'")).rows)
+      .toEqual([{ account_id: expect.not.stringMatching(/^replace-after-logout-agent$/), product_role: 'AGENT' }]);
+  });
+
+  it('confirms replacement after a different LINE identity is scanned without relabeling the old account', async () => {
+    const oldMid = `u${'4'.repeat(32)}`;
+    const scannedMid = `u${'5'.repeat(32)}`;
+    await addStoredAccounts('mismatch-replace-agent');
+    await pool.query('UPDATE line_accounts SET own_mid=$2 WHERE account_id=$1', ['mismatch-replace-agent', oldMid]);
+    expect(await facade.dispatch({ type: 'lineStart', requestId: 'mismatch-replace-start', accountId: 'mismatch-replace-agent' }))
+      .toMatchObject({ ok: true });
+    expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'mismatch-replace-qr', accountId: 'mismatch-replace-agent' }))
+      .toMatchObject({ ok: true });
+    const attempt = latestLoginAttempt('mismatch-replace-agent');
+    const mismatchedWorker = bindings.get('mismatch-replace-agent')!;
+    await workerEventHandler?.(mismatchedWorker.workerInstanceId, { type: 'login', ...mismatchedWorker,
+      loginAttemptId: attempt, ownMid: scannedMid, displayName: 'Different LINE identity' });
+    expect(published.some((event) => event.type === 'agentIdentityMismatch' && event.accountId === 'mismatch-replace-agent')).toBe(true);
+    expect((await pool.query('SELECT own_mid,product_role FROM line_accounts WHERE account_id=$1', ['mismatch-replace-agent'])).rows)
+      .toEqual([{ own_mid: oldMid, product_role: 'AGENT' }]);
+
+    expect(await facade.dispatch({ type: 'lineReplaceAgentQr', requestId: 'mismatch-replace-confirm', accountId: 'mismatch-replace-agent' }))
+      .toMatchObject({ ok: true });
+    expect((await pool.query('SELECT own_mid,product_role FROM line_accounts WHERE account_id=$1', ['mismatch-replace-agent'])).rows)
+      .toEqual([{ own_mid: oldMid, product_role: null }]);
+    expect((await pool.query("SELECT own_mid FROM line_accounts WHERE product_role='AGENT'")).rows).toEqual([{ own_mid: null }]);
+  });
+
+  it('compare-clears a persisted worker binding after restart when no live worker is registered', async () => {
+    await addStoredAccounts('restart-logout-agent');
+    expect(await facade.dispatch({ type: 'lineStart', requestId: 'restart-logout-start', accountId: 'restart-logout-agent' }))
+      .toMatchObject({ ok: true });
+    const staleBinding = bindings.get('restart-logout-agent')!;
+    await facade.shutdown(); // The gateway stops its process; the row intentionally retains its durable binding.
+    expect(bindings.has('restart-logout-agent')).toBe(false);
+    expect((await pool.query('SELECT worker_instance_id FROM line_accounts WHERE account_id=$1', [staleBinding.accountId])).rows[0])
+      .toEqual({ worker_instance_id: staleBinding.workerInstanceId });
+    await restartFacadeWithImporter({ async readOfficialSnapshot() { throw new Error('unused'); } });
+
+    expect(await facade.dispatch({ type: 'lineLogout', requestId: 'restart-logout', accountId: staleBinding.accountId }))
+      .toMatchObject({ ok: true });
+    expect((await pool.query('SELECT worker_instance_id,worker_binding_epoch,status FROM line_accounts WHERE account_id=$1', [staleBinding.accountId])).rows[0])
+      .toEqual({ worker_instance_id: null, worker_binding_epoch: null, status: 'disconnected' });
+  });
+
+  it('clears the stopped account credential before direct replacement and serializes duplicate requests', async () => {
+    await addStoredAccounts('direct-replace-agent');
+    expect(await facade.dispatch({ type: 'lineStart', requestId: 'direct-replace-start', accountId: 'direct-replace-agent' }))
+      .toMatchObject({ ok: true });
+    const oldWorker = bindings.get('direct-replace-agent')!;
+    secretStore.beginLogin(oldWorker.accountId, oldWorker.workerInstanceId, 'seed-old-credential');
+    await expect(secretStore.saveRotation(oldWorker.accountId, oldWorker.workerInstanceId, 'seed-old-credential',
+      { token: 'old-saved-token', qrCert: 'old-cert', e2eeStorage: null })).resolves.toBe(true);
+    expect(await secretStore.load(oldWorker.accountId)).toMatchObject({ token: 'old-saved-token' });
+
+    const clear = vi.spyOn(secretStore, 'clear').mockRejectedValueOnce(new Error('simulated credential store failure'));
+    expect(await facade.dispatch({ type: 'lineReplaceAgentQr', requestId: 'direct-replace-clear-fails', accountId: oldWorker.accountId }))
+      .toMatchObject({ ok: false, code: 'AGENT_REPLACEMENT_FAILED' });
+    expect((await pool.query('SELECT product_role,own_mid FROM line_accounts WHERE account_id=$1', [oldWorker.accountId])).rows)
+      .toEqual([{ product_role: 'AGENT', own_mid: `own-${oldWorker.accountId}` }]);
+    expect(await secretStore.load(oldWorker.accountId)).toMatchObject({ token: 'old-saved-token' });
+    clear.mockRestore();
+
+    const results = await Promise.all([1, 2].map((index) => facade.dispatch({ type: 'lineReplaceAgentQr',
+      requestId: `direct-replace-race-${index}`, accountId: oldWorker.accountId })));
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(results.filter((result) => !result.ok)).toHaveLength(1);
+    expect((await pool.query("SELECT count(*) FROM line_accounts WHERE product_role='AGENT'")).rows[0].count).toBe('1');
+    expect((await pool.query('SELECT product_role FROM line_accounts WHERE account_id=$1', [oldWorker.accountId])).rows)
+      .toEqual([{ product_role: null }]);
+    expect(await secretStore.load(oldWorker.accountId)).toBeNull();
+    await workerEventHandler?.(oldWorker.workerInstanceId, { type: 'secretRotation', ...oldWorker,
+      loginAttemptId: 'seed-old-credential', secrets: { token: 'stale-rotation', qrCert: null, e2eeStorage: null } });
+    expect(await secretStore.load(oldWorker.accountId)).toBeNull();
+  });
+
+  it('cancels a pending replacement QR, ignores late worker events, retries login, and preserves active Admin monitor authority', async () => {
+    const adminMid = `u${'6'.repeat(32)}`;
+    const agentMid = `u${'7'.repeat(32)}`;
+    await addStoredAccounts('monitor-switch-agent');
+    await pool.query('UPDATE line_accounts SET own_mid=$2 WHERE account_id=$1', ['monitor-switch-agent', agentMid]);
+    const identity = { status: 'supported' as const, mid: adminMid, displayName: 'Primary Admin', candidateCount: 1 };
+    await restartFacadeWithImporter({
+      async readOfficialIdentity() { return identity; },
+      async readOfficialSnapshot(input) {
+        await input.onReady({ sourceIdentityDigest: 'a'.repeat(64), snapshotDigest: 'b'.repeat(64), schemaVersion: 'line-schema-v1',
+          highWatermark: null, eligibleCount: '0' });
+        return { sourceIdentityDigest: 'a'.repeat(64), snapshotDigest: 'b'.repeat(64), pageCount: 0, rowCount: 0, highWatermark: null };
+      },
+    });
+    expect(await facade.dispatch({ type: 'startExternalMonitorAsAdmin', requestId: 'monitor-switch-start', mid: adminMid }))
+      .toMatchObject({ ok: true, bound: true });
+    await waitForState(async () => expect((await pool.query(`SELECT 1 FROM external_source_checkpoints c
+      JOIN line_accounts a ON a.account_id=c.account_id WHERE a.product_role='PRIMARY_ADMIN' AND c.initial_import_complete`)).rowCount).toBe(1));
+    const adminAccountId = (await pool.query("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows[0]!.account_id as string;
+    const checkpointBefore = (await pool.query(`SELECT source_id,generation,cursor,initial_import_complete
+      FROM external_source_checkpoints WHERE account_id=$1`, [adminAccountId])).rows;
+    const sourceBefore = (await pool.query(`SELECT source_id,generation,admin_binding_account_id,admin_binding_mid,admin_binding_version,state
+      FROM line_account_sources WHERE account_id=$1 AND source_type='EXTERNAL_MONITOR' AND state='ACTIVE'`, [adminAccountId])).rows[0];
+    expect(sourceBefore).toMatchObject({ admin_binding_account_id: 'monitor-switch-agent', admin_binding_mid: adminMid });
+
+    expect(await facade.dispatch({ type: 'lineReplaceAgentQr', requestId: 'monitor-switch-replace', accountId: 'monitor-switch-agent' }))
+      .toMatchObject({ ok: true });
+    const pendingAgentId = (await pool.query("SELECT account_id FROM line_accounts WHERE product_role='AGENT'")).rows[0]!.account_id as string;
+    const pendingWorker = bindings.get(pendingAgentId)!;
+    const pendingAttempt = latestLoginAttempt(pendingAgentId);
+    await workerEventHandler?.(pendingWorker.workerInstanceId, { type: 'secretRotation', ...pendingWorker, loginAttemptId: pendingAttempt,
+      secrets: { token: 'pending-token', qrCert: 'pending-cert', e2eeStorage: null } });
+    expect(await facade.dispatch({ type: 'lineLogout', requestId: 'monitor-switch-cancel', accountId: pendingAgentId }))
+      .toMatchObject({ ok: true });
+    for (const event of [
+      { type: 'qr', ...pendingWorker, loginAttemptId: pendingAttempt, code: 'late-qr' },
+      { type: 'pin', ...pendingWorker, loginAttemptId: pendingAttempt, pin: '123456' },
+      { type: 'secretRotation', ...pendingWorker, loginAttemptId: pendingAttempt, secrets: { token: 'late-token', qrCert: null, e2eeStorage: null } },
+      { type: 'login', ...pendingWorker, loginAttemptId: pendingAttempt, ownMid: agentMid, displayName: 'Late login' },
+    ] as const) await workerEventHandler?.(pendingWorker.workerInstanceId, event as LineWorkerEvent);
+    expect((await pool.query('SELECT own_mid,product_role,worker_instance_id,worker_binding_epoch FROM line_accounts WHERE account_id=$1', [pendingAgentId])).rows)
+      .toEqual([{ own_mid: null, product_role: 'AGENT', worker_instance_id: null, worker_binding_epoch: null }]);
+    expect(await secretStore.load(pendingAgentId)).toBeNull();
+
+    expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'monitor-switch-retry', accountId: pendingAgentId })).toMatchObject({ ok: true });
+    const retryWorker = bindings.get(pendingAgentId)!;
+    expect(retryWorker.workerInstanceId).not.toBe(pendingWorker.workerInstanceId);
+    const retryAttempt = latestLoginAttempt(pendingAgentId);
+    await workerEventHandler?.(retryWorker.workerInstanceId, { type: 'secretRotation', ...retryWorker, loginAttemptId: retryAttempt,
+      secrets: { token: 'new-agent-token', qrCert: null, e2eeStorage: null } });
+    await workerEventHandler?.(retryWorker.workerInstanceId, { type: 'login', ...retryWorker, loginAttemptId: retryAttempt,
+      ownMid: agentMid, displayName: 'New Agent' });
+
+    const sourceAfter = (await pool.query(`SELECT source_id,generation,admin_binding_account_id,admin_binding_mid,admin_binding_version,state
+      FROM line_account_sources WHERE account_id=$1 AND source_type='EXTERNAL_MONITOR' AND state='ACTIVE'`, [adminAccountId])).rows[0];
+    expect(sourceAfter).toMatchObject({ source_id: sourceBefore.source_id, generation: sourceBefore.generation,
+      admin_binding_account_id: pendingAgentId, admin_binding_mid: adminMid, state: 'ACTIVE' });
+    expect(sourceAfter.admin_binding_version).not.toBeNull();
+    expect((await pool.query(`SELECT source_id,generation,cursor,initial_import_complete
+      FROM external_source_checkpoints WHERE account_id=$1`, [adminAccountId])).rows).toEqual(checkpointBefore);
+    expect((await pool.query("SELECT account_id,chat_id,user_id FROM account_administrators WHERE role='PRIMARY_ADMIN'")).rows)
+      .toEqual([{ account_id: pendingAgentId, chat_id: adminMid, user_id: adminMid }]);
+    const capability = await new AccountRepository(pool).resolveCapabilities(adminAccountId);
+    await expect(new ExternalMonitorRepository(pool).readBatchFence({ accountId: adminAccountId,
+      sourceId: capability!.selectedSourceId!, generation: capability!.selectedSourceGeneration! })).resolves.toBeTruthy();
   });
 });

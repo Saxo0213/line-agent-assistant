@@ -256,6 +256,15 @@ export class LineService {
     await this.worker.send({ type: 'loginQr', accountId, workerInstanceId, controlEpoch: binding.controlEpoch, loginAttemptId });
   }
 
+  async cancelLoginAttempt(accountId: string, workerInstanceId: string, loginAttemptId: string): Promise<void> {
+    const attempt = this.qrAttempts.get(accountId);
+    if (attempt?.workerInstanceId === workerInstanceId && attempt.loginAttemptId === loginAttemptId) {
+      this.qrAttempts.delete(accountId);
+      this.qrPendingSecrets.delete(accountId);
+    }
+    await this.secrets?.closeLogin(accountId, workerInstanceId, loginAttemptId);
+  }
+
   async requestTokenLogin(accountId: string, workerInstanceId: string, loginAttemptId: string): Promise<void> {
     const binding = this.requireBinding(accountId, workerInstanceId);
     const secrets = await this.secrets?.load(accountId);

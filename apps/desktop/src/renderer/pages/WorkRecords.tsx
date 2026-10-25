@@ -114,7 +114,9 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
           {row.correlationId && <p className="work-record-reference">{diagnosticLabels[locale].reference}: <code>{row.correlationId}</code></p>}
         </div>
         <div className="work-record-row-action">{row.diagnostic ? <dl>
-            <dt>{diagnosticLabels[locale].operation}</dt><dd><code>{row.diagnostic.operation}</code></dd>
+            <dt>{diagnosticLabels[locale].operation}</dt><dd><code>{row.diagnostic.ipcAction ?? (row.diagnostic.operation === 'ipc'
+              ? row.diagnostic.ipcAction ?? ({ en: 'Action was not recorded', 'zh-TW': '未記錄操作', ja: '操作は記録されていません', ko: '작업이 기록되지 않음' }[locale])
+              : row.diagnostic.operation)}</code></dd>
             <dt>{diagnosticLabels[locale].stage}</dt><dd><code>{row.diagnostic.stage}</code></dd>
             <dt>{diagnosticLabels[locale].reason}</dt><dd><code>{row.diagnostic.reason ?? row.diagnostic.category}</code>{row.diagnostic.statusCode !== undefined ? ` (${row.diagnostic.statusCode})` : ''}</dd>
             {row.diagnostic.failureKind && <><dt>{diagnosticLabels[locale].failureKind}</dt><dd><code>{row.diagnostic.failureKind}</code></dd></>}

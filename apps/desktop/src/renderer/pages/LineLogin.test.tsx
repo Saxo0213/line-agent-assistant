@@ -328,6 +328,34 @@ describe('inline account action status', () => {
   });
 });
 
+it('offers an explicit, archive-separate confirmation after a mismatched Agent QR login', async () => {
+  const listeners: Array<(event: IpcEvent) => void> = [];
+  const lineReplaceAgentQr = vi.fn(async () => ({ type: 'accepted', requestId: 'replace', ok: true } as const));
+  const api = { lineReplaceAgentQr, onEvent: vi.fn((listener: (event: IpcEvent) => void) => {
+    listeners.push(listener); return () => { listeners.splice(listeners.indexOf(listener), 1); };
+  }) } as unknown as DesktopApi;
+  render(<LineLogin api={api} accounts={[{ ...buildAgent, displayName: 'Old account', hasVerifiedLineIdentity: true }]} headingRef={React.createRef()} />);
+  act(() => listeners.forEach((listener) => listener({ type: 'agentIdentityMismatch', accountId: buildAgent.accountId,
+    loginAttemptId: '11111111-1111-4111-8111-111111111111', oldDisplayName: 'Old account', scannedDisplayName: 'New account' })));
+  expect(await screen.findByText('要將「Old account」更換為剛掃描的 LINE 帳號「New account」嗎？')).toBeTruthy();
+  expect(screen.getByText('舊帳號的聊天與附件會保留在舊帳號下；新帳號會從頭分開開始。')).toBeTruthy();
+  expect(document.body.textContent).not.toContain('11111111-1111-4111-8111-111111111111');
+  fireEvent.click(screen.getAllByRole('button', { name: '更換 Agent 帳號' }).at(-1)!);
+  await waitFor(() => expect(lineReplaceAgentQr).toHaveBeenCalledWith(buildAgent.accountId));
+});
+
+it('lets the operator choose replacement before scanning and leaves the old account untouched on cancel', async () => {
+  const lineReplaceAgentQr = vi.fn(async () => ({ type: 'accepted', requestId: 'replace', ok: true } as const));
+  const api = { lineReplaceAgentQr } as unknown as DesktopApi;
+  render(<LineLogin api={api} accounts={[{ ...buildAgent, displayName: 'Old account', hasVerifiedLineIdentity: true }]} headingRef={React.createRef()} />);
+  fireEvent.click(screen.getByRole('button', { name: '更換 Agent 帳號' }));
+  expect(await screen.findByText('要將 Agent 帳號「Old account」更換為新的 LINE 帳號嗎？')).toBeTruthy();
+  expect(screen.getByText('舊帳號的聊天與附件會保留在舊帳號下；新帳號會從頭分開開始。')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: '取消' }));
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(lineReplaceAgentQr).not.toHaveBeenCalled();
+});
+
 
 const accepted: IpcResult = { type: 'accepted', requestId: 'x', ok: true };
 

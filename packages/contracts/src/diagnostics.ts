@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { IPC_ACTION_CODES } from './ipc-actions.js';
 
 /** Existing application-owned identities only; never URLs, paths or external RPC IDs. */
 export type DiagnosticIdentity = { accountId?: string; workerInstanceId?: string; requestId?: string; jobId?: string; loginAttemptId?: string; correlationId?: string; background?: boolean };
@@ -28,9 +29,10 @@ export const DIAGNOSTIC_REASONS = ['external_monitor_authority_stale', 'external
   'external_monitor_source_changed', 'external_monitor_reader_startup_failed', 'external_monitor_reader_failed',
   'external_monitor_database_failed', 'external_monitor_unknown', 'bootstrap_failure', 'list_get_transport_failure',
   'response_code_invalid', 'response_shape_invalid', 'normalization_failure', 'response_validation',
-  'timeout', 'cancellation', 'unknown', 'LOGIN_TIMEOUT', 'LOGIN_IN_PROGRESS', 'LOGIN_ATTEMPT_REPLACED', 'LOGIN_FAILED'] as const;
+  'timeout', 'cancellation', 'unknown', 'AGENT_IDENTITY_MISMATCH', 'LOGIN_TIMEOUT', 'LOGIN_IN_PROGRESS', 'LOGIN_ATTEMPT_REPLACED', 'LOGIN_FAILED'] as const;
 export const DIAGNOSTIC_FAILURE_KINDS = ['linejs_internal', 'effect_denied', 'type_error', 'range_error', 'timeout_error', 'abort_error', 'other'] as const;
 export const SafeDiagnosticSchema = z.object({
+  ipcAction: z.enum(IPC_ACTION_CODES).optional(),
   operation: z.enum(DIAGNOSTIC_OPERATIONS), stage: z.enum(DIAGNOSTIC_STAGES),
   category: z.enum(DIAGNOSTIC_CATEGORIES), recovery: z.enum(DIAGNOSTIC_RECOVERIES),
   reason: z.enum(DIAGNOSTIC_REASONS).optional(),

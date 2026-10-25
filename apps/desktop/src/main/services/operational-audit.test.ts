@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import { createOperationalAudit, parseOperationalAuditEvent, type AuditEvent } from './operational-audit.js';
+import { diagnosticFailure } from '@line-agent/contracts';
+
+it('retains safe IPC actions in fallback while excluding arbitrary thrown details', async () => {
+  const fallback: AuditEvent[] = [];
+  const audit = createOperationalAudit({ append: async () => { throw new Error('PRIVATE_SINK_SENTINEL'); },
+    appendFallback: async (event) => { fallback.push(event); }, logSinkState() {}, retryDelayMs: 0 });
+  let index = 0;
+  for (const ipcAction of ['lineLoginQr', 'lineLogout', 'getManualUnsendWindow'] as const) {
+    audit.failure({ ...diagnosticFailure('ipc', 'execute', new Error('PRIVATE_ERROR_SENTINEL')), ipcAction }, { requestId: `request-${index++}` });
+  }
+  await audit.flush();
+  expect(fallback.map((event) => event.diagnostic?.ipcAction)).toEqual(['lineLoginQr', 'lineLogout', 'getManualUnsendWindow']);
+  expect(fallback.map((event) => event.correlationId)).toEqual(['request-0', 'request-1', 'request-2']);
+  expect(JSON.stringify(fallback)).not.toContain('PRIVATE_');
+});
 
 describe('operational audit', () => {
   it('never coalesces unidentified independent operations and retains identified repeats once', async () => {

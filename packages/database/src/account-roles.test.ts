@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
 import { AccountRepository } from './account-repository.js';
 import { createTestDatabase } from './test-database.js';
@@ -37,6 +37,10 @@ database('fixed account role slots', () => {
     ({ pool, close } = await createTestDatabase());
     accounts = new AccountRepository(pool);
   });
+  beforeEach(async () => {
+    await pool.query('TRUNCATE line_accounts CASCADE');
+    await pool.query('UPDATE account_control SET control_epoch=1 WHERE singleton=true');
+  });
   afterAll(async () => { await close?.(); });
 
   it('reserves Agent once, then reuses its pending slot after restart', async () => {
@@ -52,6 +56,87 @@ database('fixed account role slots', () => {
     expect(new Set(slots.map((slot) => slot.accountId)).size).toBe(1);
     expect(new Set(slots.map((slot) => slot.productRole))).toEqual(new Set(['AGENT']));
     expect((await pool.query('SELECT count(*) FROM line_accounts')).rows[0].count).toBe('1');
+  });
+
+  it('replaces a stopped Agent in isolation and advances the control fence once', async () => {
+    const old = await accounts.reserveAccountSlot();
+    const mid = `u${'a'.repeat(32)}`;
+    await accounts.activateControl(old.accountId, 0);
+    await accounts.bindWorker({ accountId: old.accountId, workerInstanceId: 'old-worker', controlEpoch: 0 });
+    expect(await accounts.applyWorkerLogin({ accountId: old.accountId, workerInstanceId: 'old-worker', controlEpoch: 0 }, mid, 'Old Agent')).toBe(true);
+    await pool.query(`INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES ($1,'direct','old-chat','Old archive')`, [old.accountId]);
+    await pool.query(`INSERT INTO messages(account_id,message_id,event_id,chat_type,chat_id,sender_id,kind,text_content,ingestion_source,occurred_at,raw)
+      VALUES ($1,'old-message','old-event','direct','old-chat','friend-mid','text','Archived message','history',now(),'{}')`, [old.accountId]);
+    await pool.query(`INSERT INTO attachments(attachment_id,external_attachment_id,account_id,message_id,chat_type,chat_id,kind,name,mime_type,size_bytes,status,relative_path,sha256)
+      VALUES ('00000000-0000-4000-8000-000000000001','old-external',$1,'old-message','direct','old-chat','file','archive.txt','text/plain',12,'ready','old/archive.txt',repeat('a',64))`, [old.accountId]);
+    await pool.query(`INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
+      VALUES ($1,'direct','admin-mid','admin-mid','PRIMARY_ADMIN')`, [old.accountId]);
+    const epoch = await accounts.getControlState();
+    await accounts.revokeControl(epoch.controlEpoch);
+    await accounts.clearStoppedWorkerBinding({ accountId: old.accountId, workerInstanceId: 'old-worker', controlEpoch: 0 });
+    await accounts.setConnectionStatus(old.accountId, 'disconnected');
+    const stoppedEpoch = await accounts.getControlState();
+
+    const replaced = await accounts.replaceAgentAccount(old.accountId, stoppedEpoch.controlEpoch);
+    expect(replaced.ok).toBe(true);
+    if (!replaced.ok) return;
+    expect(replaced.account.accountId).not.toBe(old.accountId);
+    expect(replaced.account).toMatchObject({ ownMid: null, productRole: 'AGENT' });
+    expect(await accounts.getControlState()).toMatchObject({ activeAccountId: null, controlEpoch: stoppedEpoch.controlEpoch + 1 });
+    expect((await pool.query('SELECT account_id,own_mid,product_role,status FROM line_accounts WHERE account_id=ANY($1)', [[old.accountId, replaced.account.accountId]])).rows)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ account_id: old.accountId, own_mid: mid, product_role: null, status: 'disconnected' }),
+        expect.objectContaining({ account_id: replaced.account.accountId, own_mid: null, product_role: 'AGENT' }),
+      ]));
+    expect((await pool.query("SELECT account_id,chat_id FROM conversations WHERE account_id=$1 AND chat_id='old-chat'", [old.accountId])).rows)
+      .toEqual([{ account_id: old.accountId, chat_id: 'old-chat' }]);
+    expect((await pool.query("SELECT count(*) FROM conversations WHERE account_id=$1 AND chat_id='old-chat'", [replaced.account.accountId])).rows[0].count).toBe('0');
+    expect((await pool.query("SELECT message_id,text_content FROM messages WHERE account_id=$1 AND chat_id='old-chat'", [old.accountId])).rows)
+      .toEqual([{ message_id: 'old-message', text_content: 'Archived message' }]);
+    expect((await pool.query("SELECT attachment_id,relative_path,sha256 FROM attachments WHERE account_id=$1 AND message_id='old-message'", [old.accountId])).rows)
+      .toEqual([{ attachment_id: '00000000-0000-4000-8000-000000000001', relative_path: 'old/archive.txt', sha256: 'a'.repeat(64) }]);
+    expect(await accounts.resolveCapabilities(old.accountId)).toMatchObject({ productRole: null, connectionMode: 'OFFLINE', canWriteLine: false });
+    expect(await accounts.applyWorkerLogin({ accountId: old.accountId, workerInstanceId: 'old-worker', controlEpoch: stoppedEpoch.controlEpoch }, mid, 'Old Agent')).toBe(false);
+    expect((await pool.query('SELECT account_id FROM account_administrators WHERE account_id=ANY($1)', [[old.accountId, replaced.account.accountId]])).rows)
+      .toEqual([{ account_id: old.accountId }]);
+  });
+
+  it('does not retire the old Agent or create a second slot on a failed or duplicate replacement', async () => {
+    const old = await accounts.reserveAccountSlot();
+    const mid = `u${'b'.repeat(32)}`;
+    const initialState = await accounts.getControlState();
+    expect((await accounts.activateControl(old.accountId, initialState.controlEpoch)).activated).toBe(true);
+    await accounts.bindWorker({ accountId: old.accountId, workerInstanceId: 'old-worker', controlEpoch: initialState.controlEpoch });
+    expect(await accounts.applyWorkerLogin({ accountId: old.accountId, workerInstanceId: 'old-worker', controlEpoch: initialState.controlEpoch }, mid, 'Old Agent')).toBe(true);
+    const epoch = await accounts.getControlState();
+    const activeControl = await accounts.replaceAgentAccount(old.accountId, epoch.controlEpoch);
+    expect(activeControl).toMatchObject({ ok: false, code: 'AGENT_CONTROL_ACTIVE' });
+    await accounts.revokeControl(epoch.controlEpoch);
+    const notStopped = await accounts.replaceAgentAccount(old.accountId, epoch.controlEpoch + 1);
+    expect(notStopped).toMatchObject({ ok: false, code: 'AGENT_WORKER_ACTIVE' });
+    expect(await accounts.getAccount(old.accountId)).toMatchObject({ productRole: 'AGENT', ownMid: mid });
+    await accounts.clearStoppedWorkerBinding({ accountId: old.accountId, workerInstanceId: 'old-worker', controlEpoch: epoch.controlEpoch });
+    await accounts.setConnectionStatus(old.accountId, 'disconnected');
+    const stoppedEpoch = await accounts.getControlState();
+    const first = await accounts.replaceAgentAccount(old.accountId, stoppedEpoch.controlEpoch);
+    expect(first.ok).toBe(true);
+    const duplicate = await accounts.replaceAgentAccount(old.accountId, stoppedEpoch.controlEpoch);
+    expect(duplicate).toMatchObject({ ok: false, code: 'AGENT_REPLACEMENT_STALE' });
+    expect((await pool.query("SELECT count(*) FROM line_accounts WHERE product_role='AGENT'")).rows[0].count).toBe('1');
+  });
+
+  it('keeps same-MID login on its original account', async () => {
+    const original = await accounts.reserveAccountSlot();
+    const mid = `u${'c'.repeat(32)}`;
+    await accounts.activateControl(original.accountId, 0);
+    await accounts.bindWorker({ accountId: original.accountId, workerInstanceId: 'worker-one', controlEpoch: 0 });
+    expect(await accounts.applyWorkerLogin({ accountId: original.accountId, workerInstanceId: 'worker-one', controlEpoch: 0 }, mid, 'Agent')).toBe(true);
+    await pool.query("UPDATE line_accounts SET worker_instance_id=NULL,worker_binding_epoch=NULL,status='disconnected' WHERE account_id=$1", [original.accountId]);
+    await accounts.bindWorker({ accountId: original.accountId, workerInstanceId: 'worker-two', controlEpoch: 0 });
+    expect(await accounts.applyWorkerLogin({ accountId: original.accountId, workerInstanceId: 'worker-two', controlEpoch: 0 }, mid, 'Agent'))
+      .toBe(true);
+    expect((await pool.query("SELECT count(*) FROM line_accounts WHERE product_role='AGENT'")).rows[0].count).toBe('1');
+    expect((await accounts.getAccount(original.accountId))?.ownMid).toBe(mid);
   });
 
   it('rejects reserving a third account after both roles are assigned', async () => {
