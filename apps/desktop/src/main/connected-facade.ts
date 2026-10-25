@@ -1011,7 +1011,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     isCurrentActiveControlBinding: (binding) => options.workers.isCurrentActiveControlBinding(binding),
     async send(command) { await assertLineWriteAllowed(command.accountId); return options.workers.send(command); },
     async checkFriendRelation(command) { await assertLineWriteAllowed(command.accountId); return options.workers.checkFriendRelation(command); },
-    async addFriendByMid(command) { await assertLineWriteAllowed(command.accountId); return options.workers.addFriendByMid(command); },
   }, audit: options.audit, locale: options.locale ?? 'en' });
   const primaryFriendshipLifetime = new AbortController();
   const primaryFriendshipReadiness = new Map<string, { key: string; abort: AbortController; promise: Promise<void>;
@@ -1083,6 +1082,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       const current = await options.workers.binding(binding.accountId);
       if (lifetimeSignal.aborted || !samePrimaryFriendshipBinding(current, binding)
         || !options.workers.isCurrentActiveControlBinding(binding)) return;
+      // The mode ACK arrives on init, before login. The relation check needs the logged-in LINE session; the login/ready
+      // event re-schedules this job through updateChatResourceReadiness.
+      if (!lineService.isAuthenticatedReady(binding)) return;
       while (!lifetimeSignal.aborted && !closing) {
         const currentTask = primaryFriendshipReadiness.get(binding.accountId);
         const requestedTrigger = currentTask?.abort === abort ? currentTask.trigger : consumedTrigger;
@@ -1259,6 +1261,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       void track(() => recoverPendingAfterReady(binding),
         { operation: 'delivery', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } })
         .catch(() => undefined);
+      if (binding.mode === 'ACTIVE_CONTROL' && binding.purpose !== 'DOWNLOAD_ONLY') {
+        schedulePrimaryAdministratorFriendship(binding as Bound, primaryFriendshipLifetime.signal);
+      }
     }
   }
 

@@ -18,7 +18,7 @@ const expectedKeys = [
   'permissionLocalToolsDescription',
   'unsendMessage', 'unsendConfirm', 'unsendTimeWindow', 'unsendOneHour', 'unsendSevenDays', 'unsendWindowSaved', 'unsendFailed',
   'historyReadFailed', 'chatResourceReadFailed', 'profileRefreshFailed', 'messageSendFailed', 'messageUnsendFailed',
-  'messageReactionFailed', 'friendRelationCheckFailed', 'friendAddFailed', 'attachmentDownloadOperationFailed',
+  'messageReactionFailed', 'friendRelationCheckFailed', 'friendAddFailed', 'primaryAdminNotFriend', 'attachmentDownloadOperationFailed',
   'credentialRestoreFailed', 'lineSyncFailed',
   'mediaWasNotSentTryAgain', 'mediaSendingRequiresDirectOrGroupChat',
 ] as const;

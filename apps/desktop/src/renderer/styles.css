@@ -317,3 +317,14 @@ span.avatar-placeholder{background:#e6ecea;color:#6c817d}
 .jobs-search-keyword input{width:100%}
 .jobs-search-card .jobs-search-scope{margin-left:auto}
 @media(max-width:560px){.jobs-search-row-main .jobs-search-provider,.search-row-filters .jobs-search-status{flex-basis:112px}.jobs-search-row-main .jobs-search-keyword{flex-basis:160px;min-width:160px}}
+.work-record-row-meta time{display:flex;flex-direction:column;gap:2px}
+.work-record-row-content code,.work-record-row-action code{overflow-wrap:anywhere;word-break:break-word}
+.work-record-reference{margin-top:4px!important;overflow-wrap:anywhere}
+.work-record-row-action{min-width:0;overflow-wrap:anywhere;font-size:12px}
+.work-record-row-action dl{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 8px}
+.work-record-row-action dt{color:var(--secondary)}
+.work-record-row-action dd{margin:0;min-width:0}
+.work-record-row-action p{margin:0;color:var(--secondary)}
+.work-record-row.work-record-error-row,.work-record-column-header.work-record-error-header{grid-template-columns:100px minmax(0,1fr) minmax(0,1.2fr) 96px}
+.work-record-row.work-record-error-row{align-items:start}
+@media(max-width:640px){.work-record-row.work-record-error-row{grid-template-columns:minmax(0,1fr) auto}}

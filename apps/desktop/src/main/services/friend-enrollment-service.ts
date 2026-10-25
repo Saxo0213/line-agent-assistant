@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import type { InboundEnvelope, LineWorkerCommand, LineWorkerEvent, WorkerBinding } from '@line-agent/contracts';
+import { diagnosticFailure, type InboundEnvelope, type LineWorkerCommand, type LineWorkerEvent, type SafeDiagnostic, type WorkerBinding } from '@line-agent/contracts';
 import type { AccountRepository, AdminRepository, FriendWhitelistRepository } from '@line-agent/database';
 import type { OperationalAudit, AuditErrorCode, AuditResultCode } from './operational-audit.js';
 import type { Locale } from '../../locale.js';
@@ -12,7 +12,6 @@ type EnrollmentWorker = {
   isCurrentActiveControlBinding(binding: WorkerBinding): boolean;
   send(command: LineWorkerCommand): Promise<Extract<LineWorkerEvent, { type: 'sendResult' }>>;
   checkFriendRelation(command: Extract<LineWorkerCommand, { type: 'checkFriendRelation' }>): Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>;
-  addFriendByMid(command: Extract<LineWorkerCommand, { type: 'addFriendByMid' }>): Promise<Extract<LineWorkerEvent, { type: 'addFriendResult' }>>;
 };
 type FlowContext = { flowId: string; accountId: string; originChatType: 'direct' | 'group' | 'room'; originChatId: string;
   adminSenderId: string; primaryChatId: string; binding: ActiveBinding; expiresAt: number;
@@ -36,6 +35,23 @@ const RELATION_ERROR_CODES = new Set<AuditErrorCode>(['RELATION_LIST_RPC_FAILED'
   'RELATION_BINDING_REVOKED', 'RELATION_RESPONSE_TIMEOUT', 'RELATION_WORKER_EXIT', 'RELATION_OUTCOME_UNKNOWN']);
 function relationErrorCode(value: unknown): AuditErrorCode {
   return typeof value === 'string' && RELATION_ERROR_CODES.has(value as AuditErrorCode) ? value as AuditErrorCode : 'UNKNOWN';
+}
+
+type FailureShape = Pick<SafeDiagnostic, 'category' | 'recovery'> & Partial<Pick<SafeDiagnostic, 'reason' | 'outcome'>>;
+function relationFailureDiagnostic(code: AuditErrorCode): FailureShape {
+  switch (code) {
+    case 'RELATION_RESPONSE_TIMEOUT': return { category: 'timeout', recovery: 'retry', reason: 'timeout' };
+    case 'RELATION_WORKER_EXIT': return { category: 'process_exit', recovery: 'wait' };
+    case 'RELATION_OUTCOME_UNKNOWN': return { category: 'outcome_unknown', recovery: 'inspect_outcome', outcome: 'unknown' };
+    case 'RELATION_CANCELLED': return { category: 'cancelled', recovery: 'none' };
+    case 'RELATION_BINDING_REVOKED': return { category: 'stale_binding', recovery: 'retry' };
+    case 'RELATION_LIST_RPC_FAILED': return { category: 'transport_failed', recovery: 'retry', reason: 'list_get_transport_failure' };
+    case 'RELATION_DETAIL_RPC_FAILED': return { category: 'transport_failed', recovery: 'retry' };
+    case 'RELATION_LIST_SHAPE_INVALID': case 'RELATION_DETAIL_SHAPE_INVALID':
+      return { category: 'invalid_response', recovery: 'retry', reason: 'response_shape_invalid' };
+    case 'RELATION_LIST_LIMIT': return { category: 'unsupported', recovery: 'check_configuration' };
+    default: return { category: 'unknown', recovery: 'retry' };
+  }
 }
 
 function keyFor(accountId: string, chatType: string, chatId: string, senderId: string): string {
@@ -171,7 +187,11 @@ export class FriendEnrollmentService {
       if (!checked && current?.bindingKey === bindingKey && current.promise === promise) {
         this.primaryFriendshipJobs.delete(binding.accountId);
       }
-    }, () => undefined);
+    }, () => {
+      // A rejected check drops its job (only if it is still the current one) so the next trigger runs a fresh check.
+      const current = this.primaryFriendshipJobs.get(binding.accountId);
+      if (current?.bindingKey === bindingKey && current.promise === promise) this.primaryFriendshipJobs.delete(binding.accountId);
+    });
     return promise.then(() => undefined);
   }
 
@@ -188,8 +208,16 @@ export class FriendEnrollmentService {
     const primary = await this.deps.admins.getPrimaryAdministrator(binding.accountId);
     if (!(await current())) return true;
     if (!primary) return false;
-    if (!await this.canWriteLine(binding.accountId)) return true;
-    if (!LINE_MID.test(primary.userId)) throw new Error('primary administrator LINE MID is invalid');
+    if (!await this.canWriteLine(binding.accountId)) {
+      if (await current()) this.recordPrimaryFriendshipFailure(binding, 'relation', 'SIDE_EFFECT_DENIED',
+        { stage: 'admission', category: 'denied', recovery: 'check_configuration', outcome: 'not_started' });
+      return true;
+    }
+    if (!LINE_MID.test(primary.userId)) {
+      throw this.primaryFriendshipFailure(binding, 'relation', 'FRIEND_RELATION_CHECK_FAILED',
+        { stage: 'admission', category: 'invalid_input', recovery: 'check_configuration', outcome: 'not_started' }, undefined,
+        'primary administrator LINE MID is invalid');
+    }
     const primaryVersion = await this.deps.admins.getPrimaryAdministratorVersion(binding.accountId);
     if (!(await current()) || primaryVersion === null) return true;
     const capturedPrimary = { ...primary };
@@ -199,30 +227,69 @@ export class FriendEnrollmentService {
       return latest?.chatId === capturedPrimary.chatId && latest.userId === capturedPrimary.userId;
     };
     const persistConfirmation = async () => {
-      if (!(await current()) || !(await primaryStillCurrent()) || !(await current())) return;
+      if (!(await current()) || !(await primaryStillCurrent()) || !(await current())) return false;
       await this.deps.admins.confirmPrimaryAdministratorFriendship(binding.accountId, primary.userId, primaryVersion);
+      return true;
     };
     if (await this.deps.admins.hasPrimaryAdministratorFriendConfirmation(binding.accountId, primary.userId, primaryVersion)) return true;
     const fields = workerFields(binding);
     const requestId = randomUUID();
-    const relation = await this.deps.workers.checkFriendRelation({ type: 'checkFriendRelation', ...fields, requestId, targetMid: primary.userId });
+    let relation: Awaited<ReturnType<EnrollmentWorker['checkFriendRelation']>>;
+    try {
+      relation = await this.deps.workers.checkFriendRelation({ type: 'checkFriendRelation', ...fields, requestId, targetMid: primary.userId });
+    } catch (error) {
+      if (!(await current())) throw error;
+      throw this.primaryFriendshipFailure(binding, 'relation', 'FRIEND_RELATION_CHECK_FAILED',
+        { stage: 'execute', category: diagnosticFailure('checkFriendRelation', 'execute', error).category, recovery: 'retry' }, requestId,
+        'primary administrator relation check was rejected', error);
+    }
     if (!(await current())) return true;
-    if (!matchesResult(relation, binding) || relation.requestId !== requestId || relation.targetMid !== primary.userId)
-      throw new Error('primary administrator relation check returned a stale or mismatched result');
+    if (!matchesResult(relation, binding) || relation.requestId !== requestId || relation.targetMid !== primary.userId) {
+      throw this.primaryFriendshipFailure(binding, 'relation', 'ENROLLMENT_BINDING_CHANGED',
+        { stage: 'response', category: 'stale_binding', recovery: 'retry' }, requestId,
+        'primary administrator relation check returned a stale or mismatched result');
+    }
     if (relation.status === 'friend') {
-      await persistConfirmation();
+      if (await persistConfirmation()) this.recordPrimaryFriendshipSuccess(binding, 'friend_relation_initial', 'relation_friend');
       return true;
     }
-    if (relation.status !== 'not_friend') throw new Error(`primary administrator relation is unknown (${relation.error ?? 'unknown'})`);
-    if (!(await current()) || !await primaryStillCurrent() || !(await current())
-      || !await this.canWriteLine(binding.accountId) || !(await current())) return true;
-    const addRequestId = randomUUID();
-    const added = await this.deps.workers.addFriendByMid({ type: 'addFriendByMid', ...fields, requestId: addRequestId, targetMid: primary.userId });
-    if (!(await current())) return true;
-    if (!matchesResult(added, binding) || added.requestId !== addRequestId || added.targetMid !== primary.userId || added.status !== 'added')
-      throw new Error(`primary administrator friend add failed (${added.error ?? added.status})`);
-    await persistConfirmation();
+    if (relation.status !== 'not_friend') {
+      const code = relationErrorCode(relation.error);
+      const shape = relationFailureDiagnostic(code);
+      if (shape.category === 'cancelled') return true;
+      throw this.primaryFriendshipFailure(binding, 'relation', code === 'UNKNOWN' ? 'FRIEND_RELATION_CHECK_FAILED' : code,
+        { stage: 'response', ...shape }, requestId, `primary administrator relation is unknown (${relation.error ?? 'unknown'})`);
+    }
+    // The main process never adds a friend. Record why, once per login; the job stays cached as done for this binding.
+    if (await current()) this.recordPrimaryFriendshipFailure(binding, 'relation', 'PRIMARY_ADMIN_NOT_FRIEND',
+      { stage: 'response', category: 'denied', recovery: 'check_configuration' }, requestId);
     return true;
+  }
+
+  /** Marks an error whose specific diagnostic is already persisted, so the generic background wrapper does not add a second row. */
+  private primaryFriendshipFailure(binding: ActiveBinding, step: 'relation' | 'add', errorCode: AuditErrorCode,
+    diagnostic: Pick<SafeDiagnostic, 'stage' | 'category' | 'recovery'> & Partial<Pick<SafeDiagnostic, 'reason' | 'outcome'>>,
+    requestId: string | undefined, message: string, cause?: unknown): Error {
+    this.recordPrimaryFriendshipFailure(binding, step, errorCode, diagnostic, requestId);
+    return Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { diagnosticLogged: true });
+  }
+
+  /** One audit failure with a code-only diagnostic. Never throws and never carries the MID or any error text. */
+  private recordPrimaryFriendshipFailure(binding: ActiveBinding, step: 'relation' | 'add', errorCode: AuditErrorCode,
+    diagnostic: Pick<SafeDiagnostic, 'stage' | 'category' | 'recovery'> & Partial<Pick<SafeDiagnostic, 'reason' | 'outcome'>>,
+    requestId?: string): void {
+    try {
+      this.deps.audit?.failure({ operation: step === 'relation' ? 'checkFriendRelation' : 'addFriendByMid', ...diagnostic },
+        { initiator: 'system', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, reasonCode: 'startup',
+          ...(requestId ? { requestId } : {}) }, errorCode, step === 'relation' ? 'friend_relation_initial' : 'friend_add_attempt');
+    } catch { /* Audit is diagnostic only. */ }
+  }
+
+  private recordPrimaryFriendshipSuccess(binding: ActiveBinding, action: 'friend_relation_initial' | 'friend_add_attempt', resultCode: AuditResultCode): void {
+    try {
+      this.deps.audit?.outcome(action, 'succeeded', { initiator: 'system', accountId: binding.accountId,
+        workerInstanceId: binding.workerInstanceId, reasonCode: 'startup', resultCode });
+    } catch { /* Audit is diagnostic only. */ }
   }
 
   private async canWriteLine(accountId: string): Promise<boolean> {
@@ -560,10 +627,12 @@ export class FriendEnrollmentService {
     };
     const reportFailure = async () => {
       if (active()) await this.sendText(context, context.originChatType, context.originChatId,
-        linePrompt(this.deps.locale ?? 'en', context.originChatType === 'direct' ? 'enrollmentDirectFailed' : 'enrollmentGroupFailed'), active);
+        linePrompt(this.deps.locale ?? 'en', addAgentFirst ? 'enrollmentAddAgentFirst'
+          : context.originChatType === 'direct' ? 'enrollmentDirectFailed' : 'enrollmentGroupFailed'), active);
       finishAudit('failed', 'authorization_denied', failureCode);
     };
     let verifiedFriend = context.originChatType !== 'direct';
+    let addAgentFirst = false;
     try {
       if (!await admitted()) return;
       try { auditCorrelation = this.deps.audit?.request('friend_enrollment', auditFields) ?? randomUUID(); }
@@ -578,41 +647,10 @@ export class FriendEnrollmentService {
         }
         if (relation.status === 'friend') { verifiedFriend = true; observed('friend_relation_initial', 'relation_friend'); }
         else if (relation.status === 'not_friend') {
+          // The main process never adds a friend: ask the person to add the Agent first.
           observed('friend_relation_initial', 'relation_not_friend');
-          if (!await admitted()) { failureCode = 'ENROLLMENT_BINDING_CHANGED'; await reportFailure(); return; }
-          const addRequestId = randomUUID();
-          const added = await this.deps.workers.addFriendByMid({ type: 'addFriendByMid', ...workerFields(context.binding),
-            requestId: addRequestId, targetMid });
-          if (!await admitted() || !matchesResult(added, context.binding) || added.requestId !== addRequestId || added.targetMid !== targetMid) {
-            failureCode = 'ENROLLMENT_BINDING_CHANGED';
-            observed('friend_add_attempt', undefined, failureCode);
-            await reportFailure(); return;
-          }
-          if (added.status !== 'added' && added.status !== 'unknown') {
-            failureCode = added.error === 'SIDE_EFFECT_DENIED' || added.error === 'NOT_STARTED' ? added.error : 'TRANSPORT_OUTCOME_UNKNOWN';
-            observed('friend_add_attempt', undefined, failureCode);
-            await reportFailure(); return;
-          }
-          observed('friend_add_attempt', added.status === 'added' ? 'add_added' : 'add_unknown');
-          const recheckId = randomUUID();
-          const recheck = await this.deps.workers.checkFriendRelation({ type: 'checkFriendRelation', ...workerFields(context.binding),
-            requestId: recheckId, targetMid });
-          const recheckBindingMatches = await admitted() && matchesResult(recheck, context.binding)
-            && recheck.requestId === recheckId && recheck.targetMid === targetMid;
-          verifiedFriend = recheckBindingMatches && recheck.status === 'friend';
-          if (!recheckBindingMatches) {
-            failureCode = 'ENROLLMENT_BINDING_CHANGED';
-            observed('friend_relation_recheck', undefined, failureCode);
-          } else if (recheck.status === 'friend') {
-            failureCode = undefined;
-            observed('friend_relation_recheck', 'relation_friend');
-          } else if (recheck.status === 'not_friend') {
-            failureCode = undefined;
-            observed('friend_relation_recheck', 'relation_not_friend');
-          } else {
-            failureCode = relationErrorCode(recheck.error);
-            observed('friend_relation_recheck', undefined, failureCode);
-          }
+          failureCode = undefined;
+          addAgentFirst = true;
         } else {
           observed('friend_relation_initial', undefined, relationErrorCode(relation.error));
           failureCode = relationErrorCode(relation.error);

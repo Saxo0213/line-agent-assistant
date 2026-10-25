@@ -11,9 +11,9 @@ export const bindPort: BindPort = (port) => new Promise<boolean>((resolve) => {
   server.listen({ host: '127.0.0.1', port, exclusive: true }, () => { server.close(() => resolve(true)); });
 });
 
-export async function chooseFreePort(bind: BindPort): Promise<number> {
+export async function chooseFreePort(bind: BindPort, skip?: number): Promise<number> {
   for (let port = EMBEDDED_PG_PORT_RANGE.first; port <= EMBEDDED_PG_PORT_RANGE.last; port += 1) {
-    if (await bind(port)) return port;
+    if (port !== skip && await bind(port)) return port;
   }
   throw new EmbeddedPgError('pg_port_unavailable');
 }

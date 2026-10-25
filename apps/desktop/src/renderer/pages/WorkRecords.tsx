@@ -6,6 +6,13 @@ import type { SystemErrorCode } from '../../desktop-protocol.js';
 import { diagnosticLabels, diagnosticRecovery } from '../diagnostic-copy.js';
 
 type Tab = 'activity' | 'errors';
+const WORK_RECORDS_TAB_KEY = 'line-agent:work-records-tab';
+function readStoredTab(): Tab {
+  try { const value = window.localStorage.getItem(WORK_RECORDS_TAB_KEY); return value === 'errors' ? 'errors' : 'activity'; } catch { return 'activity'; }
+}
+function storeTab(tab: Tab): void {
+  try { window.localStorage.setItem(WORK_RECORDS_TAB_KEY, tab); } catch { /* Storage can be disabled; the tab still switches. */ }
+}
 const errorExplanationText: Record<SystemErrorCode, (text: ReturnType<typeof useDesktopText>) => string> = {
   DATABASE_WRITE_FAILED: (text) => text('unableToWriteSystemRecordToDatabase'), FALLBACK_WRITE_FAILED: (text) => text('unableToWriteSystemRecordFallback'),
   WORKER_STOP_FAILED: (text) => text('unableToStopWorker'), WORKER_STOP_TIMEOUT: (text) => text('timedOutWaitingForWorkerToStop'), AGENT_AUTH_FAILED: (text) => text('agentAuthorizationActionFailed'),
@@ -27,7 +34,7 @@ const errorExplanationText: Record<SystemErrorCode, (text: ReturnType<typeof use
   HISTORY_READ_FAILED: (text) => text('historyReadFailed'), CHAT_RESOURCE_READ_FAILED: (text) => text('chatResourceReadFailed'),
   PROFILE_REFRESH_FAILED: (text) => text('profileRefreshFailed'), MESSAGE_SEND_FAILED: (text) => text('messageSendFailed'),
   MESSAGE_UNSEND_FAILED: (text) => text('messageUnsendFailed'), MESSAGE_REACTION_FAILED: (text) => text('messageReactionFailed'),
-  FRIEND_RELATION_CHECK_FAILED: (text) => text('friendRelationCheckFailed'), FRIEND_ADD_FAILED: (text) => text('friendAddFailed'),
+  FRIEND_RELATION_CHECK_FAILED: (text) => text('friendRelationCheckFailed'), FRIEND_ADD_FAILED: (text) => text('friendAddFailed'), PRIMARY_ADMIN_NOT_FRIEND: (text) => text('primaryAdminNotFriend'),
   ATTACHMENT_DOWNLOAD_OPERATION_FAILED: (text) => text('attachmentDownloadOperationFailed'),
   CREDENTIAL_RESTORE_FAILED: (text) => text('credentialRestoreFailed'), LINE_SYNC_FAILED: (text) => text('lineSyncFailed'),
 };
@@ -36,7 +43,7 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
   const desktopText = useDesktopText();
   const systemLabel = useSystemLabel();
   const locale = useDesktopLocale();
-  const [tab, setTab] = useState<Tab>('activity');
+  const [tab, setTab] = useState<Tab>(readStoredTab);
   const [refresh, setRefresh] = useState(0);
   const [activity, setActivity] = useState<Awaited<ReturnType<DesktopApi['listSystemActivity']>> | null>(null);
   const [activityError, setActivityError] = useState('');
@@ -63,7 +70,7 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
 
   const selectTab = (value: Tab) => {
     if (value === tab) setRefresh((current) => current + 1);
-    else { setTab(value); setRefresh((current) => current + 1); }
+    else { setTab(value); storeTab(value); setRefresh((current) => current + 1); }
   };
   const onTabKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     const next = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 'errors'
@@ -75,6 +82,8 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
     document.getElementById(next === 'activity' ? 'work-tab-activity' : 'work-tab-errors')?.focus();
   };
   const localTime = (value: string) => new Date(value).toLocaleString(locale);
+  const localDate = (value: string) => new Date(value).toLocaleDateString(locale);
+  const localClock = (value: string) => new Date(value).toLocaleTimeString(locale);
 
   return <div className="page work-records-page">
     <section className="panel work-records-card">
@@ -99,10 +108,12 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
       {errorsLoading && <p role="status">{desktopText('loadingSystemErrors')}</p>}
       {systemError && <p role="alert" className="error-banner">{generatedMessageText(systemError)}</p>}
       {errors?.partial && <p className="monitor-note">{desktopText('someRecordsAreTemporarilyUnavailable')}</p>}
-      <div className="work-record-list"><div className="work-record-column-header work-record-grid" aria-hidden="true"><span>{desktopText('time')}</span><span>{desktopText('records')}</span><span>{desktopText('action')}</span><span>{desktopText('status')}</span></div>{errors?.errors.map((row, index) => <article className="work-record-row work-record-grid" key={`${row.createdAt}:${row.code}:${index}`}>
-        <div className="work-record-row-meta"><time>{localTime(row.createdAt)}</time></div>
+      <div className="work-record-list"><div className="work-record-column-header work-record-grid work-record-error-header" aria-hidden="true"><span>{desktopText('time')}</span><span>{desktopText('records')}</span><span>{desktopText('action')}</span><span>{desktopText('status')}</span></div>{errors?.errors.map((row, index) => <article className="work-record-row work-record-grid work-record-error-row" key={`${row.createdAt}:${row.code}:${index}`}>
+        <div className="work-record-row-meta"><time dateTime={row.createdAt}><span className="work-record-date">{localDate(row.createdAt)}</span><span className="work-record-clock">{localClock(row.createdAt)}</span></time></div>
         <div className="work-record-row-content"><h2>{systemLabel(row.action)}</h2><p>{errorExplanationText[row.code](desktopText)}</p><code>{row.code}</code>
-          {row.diagnostic ? <dl>
+          {row.correlationId && <p className="work-record-reference">{diagnosticLabels[locale].reference}: <code>{row.correlationId}</code></p>}
+        </div>
+        <div className="work-record-row-action">{row.diagnostic ? <dl>
             <dt>{diagnosticLabels[locale].operation}</dt><dd><code>{row.diagnostic.operation}</code></dd>
             <dt>{diagnosticLabels[locale].stage}</dt><dd><code>{row.diagnostic.stage}</code></dd>
             <dt>{diagnosticLabels[locale].reason}</dt><dd><code>{row.diagnostic.reason ?? row.diagnostic.category}</code>{row.diagnostic.statusCode !== undefined ? ` (${row.diagnostic.statusCode})` : ''}</dd>
@@ -110,10 +121,7 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
             {row.diagnostic.upstreamStatus !== undefined && <><dt>{diagnosticLabels[locale].upstreamStatus}</dt><dd><code>{row.diagnostic.upstreamStatus}</code></dd></>}
             {row.diagnostic.upstreamCode !== undefined && <><dt>{diagnosticLabels[locale].upstreamCode}</dt><dd><code>{row.diagnostic.upstreamCode}</code></dd></>}
             <dt>{diagnosticLabels[locale].recovery}</dt><dd>{diagnosticRecovery(locale, row.diagnostic)}</dd>
-            {row.correlationId && <><dt>{diagnosticLabels[locale].reference}</dt><dd><code>{row.correlationId}</code></dd></>}
-          </dl> : <p>{diagnosticLabels[locale].legacy}</p>}
-        </div>
-        <div className="work-record-row-action"></div><span className="badge">{desktopText('error')}</span>
+          </dl> : <p>{diagnosticLabels[locale].legacy}</p>}</div><span className="badge">{desktopText('error')}</span>
       </article>)}</div>
     </section>}
     </section>

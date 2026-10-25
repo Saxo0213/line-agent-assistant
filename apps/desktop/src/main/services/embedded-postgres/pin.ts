@@ -14,7 +14,7 @@ export const EMBEDDED_PG_MANIFEST_URL = 'https://raw.githubusercontent.com/Saxo0
 export const EMBEDDED_PG_MANIFEST_URL_PATTERN = /^https:\/\/get\.enterprisedb\.com\/postgresql\/postgresql-(18\.\d+)-\d+-windows-x64-binaries\.zip$/;
 export const EMBEDDED_PG_ADMIN_USER = 'line_agent_admin';
 export const EMBEDDED_PG_DATABASE = 'line_agent';
-export const EMBEDDED_PG_PORT_RANGE = Object.freeze({ first: 55432, last: 55531 });
+export const EMBEDDED_PG_PORT_RANGE = Object.freeze({ first: 45432, last: 45531 });
 export const VC_REDIST_URL = 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
 export const MANAGED_CONF_MARKER = '# --- line-agent managed settings ---';
 

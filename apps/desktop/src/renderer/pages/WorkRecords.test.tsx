@@ -16,6 +16,7 @@ const render = (ui: React.ReactNode) => renderAtLocale(ui);
 
 afterEach(() => {
   cleanup();
+  try { window.localStorage.removeItem('line-agent:work-records-tab'); } catch { /* ignore */ }
   document.querySelectorAll('[data-work-records-tab-style]').forEach((style) => style.remove());
 });
 
@@ -39,6 +40,46 @@ describe('WorkRecords system tabs', () => {
     expect(screen.getByText('linejs_internal')).toBeTruthy();
     expect(screen.getByText('102001')).toBeTruthy();
     expect(screen.getByText('Diagnostic detail was not recorded.')).toBeTruthy();
+  });
+
+  it('opens the stored tab and stores the tab the user selects', async () => {
+    const api = { listSystemActivity: vi.fn(async () => ({ activity: [], partial: false })), listSystemErrors: vi.fn(async () => ({ partial: false, errors: [] })) } as unknown as DesktopApi;
+    window.localStorage.setItem('line-agent:work-records-tab', 'errors');
+    render(<WorkRecords api={api} onOpen={vi.fn()} headingRef={React.createRef()} />);
+    await waitFor(() => expect(screen.getByRole('tab', { name: '系統錯誤' }).getAttribute('aria-selected')).toBe('true'));
+    fireEvent.click(screen.getByRole('tab', { name: '系統紀錄' }));
+    expect(window.localStorage.getItem('line-agent:work-records-tab')).toBe('activity');
+    fireEvent.click(screen.getByRole('tab', { name: '系統錯誤' }));
+    expect(window.localStorage.getItem('line-agent:work-records-tab')).toBe('errors');
+    cleanup();
+    window.localStorage.setItem('line-agent:work-records-tab', 'bogus');
+    render(<WorkRecords api={api} onOpen={vi.fn()} headingRef={React.createRef()} />);
+    expect(screen.getByRole('tab', { name: '系統紀錄' }).getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('splits an error row into date/time, record (with reference) and operation (with recovery) columns', async () => {
+    const api = { listSystemActivity: vi.fn(async () => ({ activity: [], partial: false })), listSystemErrors: vi.fn(async () => ({ partial: false, errors: [
+      { createdAt: '2026-10-24T10:00:00.000Z', action: 'LINE 操作失敗', code: 'HISTORY_READ_FAILED', correlationId: 'local-reference',
+        diagnostic: { operation: 'history', stage: 'read', category: 'timeout', recovery: 'retry' } },
+    ] })) } as unknown as DesktopApi;
+    renderAtLocale(<WorkRecords api={api} onOpen={vi.fn()} headingRef={React.createRef()} />, 'en');
+    fireEvent.click(screen.getByRole('tab', { name: 'System errors' }));
+    await screen.findByText('local-reference');
+    const row = document.querySelector('#work-panel-errors .work-record-row')!;
+    expect(row.classList.contains('work-record-error-row')).toBe(true);
+    const time = row.querySelector('.work-record-row-meta time')!;
+    expect(time.getAttribute('datetime')).toBe('2026-10-24T10:00:00.000Z');
+    expect(time.querySelector('.work-record-date')?.textContent).toBeTruthy();
+    expect(time.querySelector('.work-record-clock')?.textContent).toBeTruthy();
+    const content = row.querySelector('.work-record-row-content')!;
+    expect(content.textContent).toContain('local-reference');
+    expect(content.textContent).toContain('HISTORY_READ_FAILED');
+    expect(content.querySelector('dl')).toBeNull();
+    const action = row.querySelector('.work-record-row-action')!;
+    expect(action.querySelector('dl')).toBeTruthy();
+    expect(action.textContent).toContain('history');
+    expect(action.textContent).toContain('Retry this action.');
+    expect(action.textContent).not.toContain('local-reference');
   });
 
   it('uses bottom-underline tabs and keeps keyboard selection behavior', async () => {

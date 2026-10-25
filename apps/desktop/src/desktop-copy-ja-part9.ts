@@ -34,6 +34,7 @@ export const JAPANESE_DESKTOP_COPY_PART9: Partial<Record<keyof typeof ENGLISH_DE
   messageReactionFailed: 'LINE のリアクションを適用できませんでした。',
   friendRelationCheckFailed: 'LINE の友だち関係を確認できませんでした。',
   friendAddFailed: 'LINE の友だちを追加できませんでした。',
+  primaryAdminNotFriend: 'メイン管理者はまだ Agent の友だちではありません。メイン管理者の LINE から Agent を友だち追加してください。',
   attachmentDownloadOperationFailed: 'LINE 添付ファイルをダウンロードできませんでした。',
   credentialRestoreFailed: 'LINE 認証情報を復元できませんでした。',
   lineSyncFailed: 'LINE の更新を同期できませんでした。',

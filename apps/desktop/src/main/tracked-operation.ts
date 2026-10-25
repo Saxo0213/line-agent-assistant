@@ -15,7 +15,8 @@ export type TrackedOperationState = {
 
 function wasChatResourceDiagnosticLogged(error: unknown): boolean {
   return !!error && typeof error === 'object'
-    && (error as { chatResourceDiagnosticLogged?: unknown }).chatResourceDiagnosticLogged === true;
+    && ((error as { chatResourceDiagnosticLogged?: unknown }).chatResourceDiagnosticLogged === true
+      || (error as { diagnosticLogged?: unknown }).diagnosticLogged === true);
 }
 
 export function trackOperation<T>(

@@ -2085,6 +2085,15 @@ database('connected facade account login semantics', () => {
     return binding;
   }
 
+  /** The worker's login and ready events: the primary-admin friend check starts only after both. */
+  async function signalLoggedInReady(accountId: string, ownMid = `own-${accountId}`) {
+    expect((await facade.dispatch({ type: 'lineLoginQr', requestId: `qr-ready-${accountId}`, accountId })).ok).toBe(true);
+    const binding = bindings.get(accountId)!;
+    const attempt = latestLoginAttempt(accountId);
+    await workerEventHandler?.(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: attempt, ownMid, displayName: 'Agent' });
+    await workerEventHandler?.(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
+  }
+
   async function seedManualUnsendMessage(binding: TestBinding, messageId: string, senderId: string, occurredAt: string) {
     const raw = { message: { id: messageId, from: senderId, to: 'unsend-chat', toType: 1, contentType: 0,
       text: `source ${messageId}`, createdTime: Date.parse(occurredAt), contentMetadata: {} } };
@@ -4366,6 +4375,7 @@ database('connected facade account login semantics', () => {
       const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
       bindings.set('bind-agent', readyBinding);
       await workerBindingHandler?.(readyBinding, new AbortController().signal);
+      await signalLoggedInReady('bind-agent');
       let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
       const relation = new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; });
       pendingFriendRelation = { started() {}, wait: relation };
@@ -4386,6 +4396,26 @@ database('connected facade account login semantics', () => {
       resolveRelation({ ...relationCommand, type: 'friendRelationResult', status: 'friend', error: null });
       await facade.shutdown();
       expect(friendAddCommands.filter((command) => command.accountId === 'bind-agent')).toEqual([]);
+    });
+
+    it('sends no friend relation check on the mode ACK alone and exactly one after the worker login and ready events', async () => {
+      await addAgentOnly();
+      await new AdminRepository(pool).bindPrimary('bind-agent', MID, MID);
+      await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
+      await restartFacadeWithImporter(importer(() => supported()));
+      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
+      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-ack-only', accountId: 'bind-agent' })).ok).toBe(true);
+      const startedBinding = bindings.get('bind-agent')!;
+      const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
+      bindings.set('bind-agent', readyBinding);
+      await workerBindingHandler?.(readyBinding, new AbortController().signal);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(0);
+      await signalLoggedInReady('bind-agent');
+      await vi.waitFor(() => expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(1);
+      await facade.shutdown();
     });
 
     it.each(['stopped', 'paused', 'replaced'] as const)('ends delayed friendship readiness polling when the binding is %s before ACK', async (change) => {
@@ -4439,6 +4469,7 @@ database('connected facade account login semantics', () => {
       const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
       bindings.set('bind-agent', readyBinding);
       await workerBindingHandler?.(readyBinding, new AbortController().signal);
+      await signalLoggedInReady('bind-agent');
       let relationStarted!: () => void;
       const started = new Promise<void>((resolve) => { relationStarted = resolve; });
       let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
@@ -4470,6 +4501,7 @@ database('connected facade account login semantics', () => {
       const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
       bindings.set('bind-agent', readyBinding);
       await workerBindingHandler?.(readyBinding, new AbortController().signal);
+      await signalLoggedInReady('bind-agent');
       activeControlAckFailures.delete('bind-agent');
       await vi.waitFor(() => expect(activeControlAckChecks).toBeGreaterThan(0));
       let relationStarted!: () => void;
@@ -4540,6 +4572,7 @@ database('connected facade account login semantics', () => {
         return value;
       });
       try {
+        await signalLoggedInReady('bind-agent');
         await workerBindingHandler?.(readyBinding, new AbortController().signal);
         await started;
         expect(staleNoAdminReadUsed).toBe(true);

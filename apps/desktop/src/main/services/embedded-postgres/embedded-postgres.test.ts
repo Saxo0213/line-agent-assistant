@@ -37,8 +37,8 @@ const manifestWith = async (body: string | HttpResponse, logs: string[] = []) =>
 describe('port selection', () => {
   it('returns the first free port in range and fails when none is free', async () => {
     const tried: number[] = [];
-    expect(await chooseFreePort(async (port) => { tried.push(port); return port === 55434; })).toBe(55434);
-    expect(tried).toEqual([55432, 55433, 55434]);
+    expect(await chooseFreePort(async (port) => { tried.push(port); return port === 45434; })).toBe(45434);
+    expect(tried).toEqual([45432, 45433, 45434]);
     await expect(chooseFreePort(async () => false)).rejects.toMatchObject({ code: 'pg_port_unavailable' });
   });
 });
@@ -183,7 +183,7 @@ describe('server lifecycle', () => {
     await server.start();
     expect(calls).toEqual(['status', 'stop:fast', 'start']);
   });
-  it.each([['another port', { pidPort: 55500 }], ['another process image', { image: 'C:\\other\\postgres.exe' }], ['unknown image', { image: null }]])(
+  it.each([['another process image', { image: 'C:\\other\\postgres.exe' }], ['unknown image', { image: null }]])(
     'never touches a running postmaster with %s', async (_name, overrides) => {
       const { server, calls } = harness({ status: 0, ...overrides });
       await expect(server.start()).rejects.toMatchObject({ code: 'pg_port_in_use' });
@@ -267,7 +267,7 @@ describe('provisioner', () => {
       return ok();
     };
     let clock = 0;
-    const deps: ProvisionerDeps = { programData: root, getSid: async () => SID, fs, run, httpGet, bindPort: async (port) => port !== 55432, now: () => (clock += 1000),
+    const deps: ProvisionerDeps = { programData: root, getSid: async () => SID, fs, run, httpGet, bindPort: async (port) => port !== 45432, now: () => (clock += 1000),
       env: { SystemRoot: 'C:\\Windows' }, log: (message) => state.logs.push(message), randomBytes: (size) => Buffer.alloc(size, 7), randomUUID: () => crypto.randomUUID(),
       fileVersions: async (paths) => overrides.vc ?? paths.map(() => '14.38'), processImage: async () => join(base, '18.7', 'bin', 'postgres.exe'),
       ensureDatabase: async (_url, name) => { state.databases.push(name); },
@@ -283,14 +283,14 @@ describe('provisioner', () => {
     const { go, state, calls } = build();
     const events: ProvisionProgress[] = [];
     const result = await go(undefined, events);
-    expect(result).toEqual({ version: '18.7', port: 55433 });
+    expect(result).toEqual({ version: '18.7', port: 45433 });
     expect(JSON.parse(await fs.readFile(join(base, '18.7', '.installed.json'), 'utf8'))).toEqual({ version: '18.7', sha256: sha, source: 'manifest' });
     expect(await downloadsLeft()).toEqual([]);
     expect(events.map((event) => event.phase)).toEqual(expect.arrayContaining(['runtime', 'download', 'verify', 'extract', 'initdb', 'start', 'database']));
     const conf = await fs.readFile(join(base, 'data', 'postgresql.conf'), 'utf8');
     expect(conf).toContain(MANAGED_CONF_MARKER);
     expect(conf).toContain("listen_addresses = '127.0.0.1'");
-    expect(conf).toContain('port = 55433');
+    expect(conf).toContain('port = 45433');
     expect(conf).toContain('max_connections = 30');
     expect(conf).toContain('logging_collector = off');
     const password = state.pwfileSeen;
@@ -299,7 +299,7 @@ describe('provisioner', () => {
     expect(calls.find((call) => call.exe === 'initdb.exe')!.args).toEqual(expect.arrayContaining(['-U', 'line_agent_admin', '-A', 'scram-sha-256', '-E', 'UTF8', '--locale=C']));
     expect((await fs.readdir(base)).filter((name) => name.startsWith('pw-'))).toEqual([]);
     expect(state.databases).toEqual(['line_agent']);
-    expect(state.saved).toEqual([{ databaseUrl: `postgresql://line_agent_admin:${password}@127.0.0.1:55433/line_agent?sslmode=disable`, embedded: { version: '18.7', port: 55433 } }]);
+    expect(state.saved).toEqual([{ databaseUrl: `postgresql://line_agent_admin:${password}@127.0.0.1:45433/line_agent?sslmode=disable`, embedded: { version: '18.7', port: 45433 } }]);
     expect(state.registered).toBe(1);
   });
 

@@ -1,6 +1,6 @@
 import { dirname, join, normalize } from 'node:path';
 import { EmbeddedPgError } from './errors.js';
-import type { BindPort } from './port.js';
+import { chooseFreePort, type BindPort } from './port.js';
 import type { RunProcess } from './process.js';
 
 export type ServerDeps = {
@@ -32,9 +32,12 @@ const nonAscii = (value: string) => /[^\x00-\x7f]/.test(value);
  */
 export class EmbeddedPostgresServer {
   private started = false;
-  constructor(private readonly options: { binDirectory: string; dataDirectory: string; logFile: string; port: number }, private readonly deps: ServerDeps) {}
+  private usedPort: number;
+  constructor(private readonly options: { binDirectory: string; dataDirectory: string; logFile: string; port: number }, private readonly deps: ServerDeps) { this.usedPort = options.port; }
 
   get isStarted(): boolean { return this.started; }
+  /** The port the server runs on after `start`; the configured port before. */
+  get port(): number { return this.usedPort; }
 
   private pgCtl(args: string[], timeoutMs: number) {
     return this.deps.run(join(this.options.binDirectory, 'pg_ctl.exe'), ['-D', this.options.dataDirectory, ...args],
@@ -68,16 +71,26 @@ export class EmbeddedPostgresServer {
     return true;
   }
 
-  async start(): Promise<void> {
-    await this.stopOrphan();
-    if (!(await this.deps.bindPort(this.options.port))) throw new EmbeddedPgError('pg_port_in_use');
+  /**
+   * Starts on the stored port, passed on the command line so `bootstrap.json` stays the one port authority. With
+   * `fallbackPorts`, a stored port that cannot be bound is replaced by the first free port of the range (the caller
+   * persists the new port, see `port`). A running postmaster of ours on any port is stopped first.
+   */
+  async start(options: { fallbackPorts?: boolean } = {}): Promise<void> {
+    await this.stopOrphan({ anyPort: true });
+    let port = this.options.port;
+    if (!(await this.deps.bindPort(port))) {
+      if (options.fallbackPorts !== true) throw new EmbeddedPgError('pg_port_in_use');
+      port = await chooseFreePort(this.deps.bindPort, port);
+    }
     await this.deps.mkdir(dirname(this.options.logFile));
-    const result = await this.pgCtl(['-l', this.options.logFile, '-w', '-t', '60', 'start'], 75_000);
+    const result = await this.pgCtl(['-l', this.options.logFile, '-o', `-p ${port}`, '-w', '-t', '60', 'start'], 75_000);
     if (result.code !== 0 || result.timedOut) {
       this.deps.log('pg_start_failed');
       throw new EmbeddedPgError(nonAscii(this.options.dataDirectory) || nonAscii(this.options.binDirectory) ? 'pg_path_unsupported' : 'pg_start_failed',
         result.stderr.slice(0, 500));
     }
+    this.usedPort = port;
     this.started = true;
   }
 

@@ -34,6 +34,7 @@ import { createFirstRunSetupSession, decideFirstRunSetup, isFirstRunSetupMode } 
 import { SETUP_PROGRESS_CHANNEL } from '../setup-protocol.js';
 import { EmbeddedPostgresProvisioner } from './services/embedded-postgres/provisioner.js';
 import { EmbeddedPostgresServer } from './services/embedded-postgres/server.js';
+import { persistMovedEmbeddedPort } from './services/embedded-postgres/port-move.js';
 import { createNodeProvisionerDeps, createServerDeps, createSidReader, resolveCurrentEmbeddedRoot } from './services/embedded-postgres/node-deps.js';
 import { embeddedPaths } from './services/embedded-postgres/pin.js';
 import { runProcess } from './services/embedded-postgres/process.js';
@@ -147,6 +148,7 @@ async function initializeServices(): Promise<void> {
   let bootstrap = await bootstrapSettings.load();
   if (!bootstrap) { bootstrap = bootstrapFromEnvironment(process.env); if (bootstrap) await bootstrapSettings.save(bootstrap); }
   if (!bootstrap) return;
+  const attachmentRoot = bootstrap.attachmentRoot;
   const startupCleanup = new StartupCleanup();
   try {
   if (bootstrap.embedded && !embeddedServer) {
@@ -154,12 +156,14 @@ async function initializeServices(): Promise<void> {
     const paths = embeddedPaths(await resolveCurrentEmbeddedRoot(), bootstrap.embedded.version);
     const server = new EmbeddedPostgresServer({ binDirectory: paths.bin, dataDirectory: paths.data, logFile: paths.log, port: bootstrap.embedded.port },
       createServerDeps(process.env, embeddedLog));
-    await server.start();
+    await server.start({ fallbackPorts: true });
     embeddedServer = server;
     startupCleanup.add(() => stopEmbeddedServer());
+    // A stored port held by another process moves the server to a free one; persist it before the pool connects.
+    bootstrap = await persistMovedEmbeddedPort(bootstrap, server, (next) => bootstrapSettings.save(next), (message) => console.info(`[embedded-postgres] ${message}`));
   }
-  const databaseUrl = bootstrap.databaseUrl;
-  const embeddedConfiguration = bootstrap.embedded;
+  let databaseUrl = bootstrap.databaseUrl;
+  let embeddedConfiguration = bootstrap.embedded;
   const pool = embeddedConfiguration ? await connectWithPasswordRecovery({
     connect: async () => {
       const candidate = createPool(databaseUrl);
@@ -170,14 +174,19 @@ async function initializeServices(): Promise<void> {
     recover: async () => {
       embeddedLog('pg_password_recovery');
       await stopEmbeddedServer();
-      const paths = embeddedPaths(await resolveCurrentEmbeddedRoot(), embeddedConfiguration.version);
+      const recoveryConfiguration = embeddedConfiguration!;
+      const paths = embeddedPaths(await resolveCurrentEmbeddedRoot(), recoveryConfiguration.version);
+      // The effective port: the one the server actually started on and persisted.
       await resetAdminPasswordViaLocalSocket({ run: runProcess, fs: fsPromises, binDirectory: paths.bin, dataDirectory: paths.data, logFile: paths.log,
-        port: embeddedConfiguration.port, env: process.env, password: passwordFromDatabaseUrl(databaseUrl),
+        port: recoveryConfiguration.port, env: process.env, password: passwordFromDatabaseUrl(databaseUrl),
         scratchParent: process.env.ProgramData ?? process.env.PROGRAMDATA ?? '', sid: await createSidReader(process.env)(), randomBytes });
-      const server = new EmbeddedPostgresServer({ binDirectory: paths.bin, dataDirectory: paths.data, logFile: paths.log, port: embeddedConfiguration.port },
+      const server = new EmbeddedPostgresServer({ binDirectory: paths.bin, dataDirectory: paths.data, logFile: paths.log, port: recoveryConfiguration.port },
         createServerDeps(process.env, embeddedLog));
-      await server.start();
+      await server.start({ fallbackPorts: true });
       embeddedServer = server;
+      bootstrap = await persistMovedEmbeddedPort(bootstrap!, server, (next) => bootstrapSettings.save(next), (message) => console.info(`[embedded-postgres] ${message}`));
+      databaseUrl = bootstrap.databaseUrl;
+      embeddedConfiguration = bootstrap.embedded;
     },
   }) : createPool(databaseUrl);
   startupCleanup.add(() => pool.end());
@@ -221,7 +230,7 @@ async function initializeServices(): Promise<void> {
       const child = utilityProcess.fork(workerEntry, [], {
         env: { SYSTEMROOT: process.env.SYSTEMROOT, WINDIR: process.env.WINDIR, TEMP: process.env.TEMP, TMP: process.env.TMP,
           PATH: process.env.PATH, USERPROFILE: process.env.USERPROFILE, LOCALAPPDATA: process.env.LOCALAPPDATA,
-          LINE_WORKER_ATTACHMENT_ROOT: bootstrap.attachmentRoot }, serviceName: `line-worker-${binding.accountId}`,
+          LINE_WORKER_ATTACHMENT_ROOT: attachmentRoot }, serviceName: `line-worker-${binding.accountId}`,
       });
       return child;
     },

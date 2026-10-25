@@ -35,6 +35,7 @@ export const KOREAN_DESKTOP_COPY_PART9 = {
   messageReactionFailed: 'LINE 반응을 적용할 수 없습니다.',
   friendRelationCheckFailed: 'LINE 친구 관계를 확인할 수 없습니다.',
   friendAddFailed: 'LINE 친구를 추가할 수 없습니다.',
+  primaryAdminNotFriend: '주 관리자가 아직 Agent의 친구가 아닙니다. 주 관리자의 LINE에서 Agent를 친구로 추가해 주세요.',
   attachmentDownloadOperationFailed: 'LINE 첨부 파일을 다운로드할 수 없습니다.',
   credentialRestoreFailed: 'LINE 인증 정보를 복원할 수 없습니다.',
   lineSyncFailed: 'LINE 업데이트를 동기화할 수 없습니다.',

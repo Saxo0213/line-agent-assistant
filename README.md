@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-The v1.0.254 release adds Album covers, keeps the account connected when a read fails, and fixes how community and group notices are shown. See the [v1.0.254 release notes](docs/releases/v1.0.254.md).
+The v1.0.258 release stops adding LINE friends automatically, moves the embedded database to a free port when its port is taken, and redesigns the System Errors table. See the [v1.0.258 release notes](docs/releases/v1.0.258.md).
 
 ## Installation
 
