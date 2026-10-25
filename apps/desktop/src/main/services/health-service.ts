@@ -216,9 +216,20 @@ export class HealthService {
          LEFT JOIN line_accounts a ON a.mode = 'ACTIVE_CONTROL' WHERE c.singleton = true`,
       ),
       this.pool.query<{ account_id: string; display_name: string | null; status: 'connected' | 'disconnected' | 'degraded' | 'reauth_required'; last_synced_at: Date | null; mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; product_role: 'AGENT' | 'PRIMARY_ADMIN' | null; has_primary_admin: boolean; auto_login_on_startup: boolean; picture_path: string | null }>(
-        `SELECT la.account_id,la.display_name,la.status,la.last_synced_at,la.mode,la.picture_path,la.product_role,la.auto_login_on_startup,
+        `SELECT la.account_id,la.display_name,la.status,
+         CASE WHEN la.product_role='PRIMARY_ADMIN' AND la.connection_mode='EXTERNAL_MONITOR'
+           THEN monitor_checkpoint.updated_at ELSE la.last_synced_at END AS last_synced_at,
+         la.mode,la.picture_path,la.product_role,la.auto_login_on_startup,
          EXISTS(SELECT 1 FROM account_administrators aa WHERE aa.account_id=la.account_id AND aa.role='PRIMARY_ADMIN') has_primary_admin
          FROM line_accounts la
+         LEFT JOIN LATERAL (
+           SELECT c.updated_at FROM line_account_sources s
+           JOIN external_source_checkpoints c ON c.source_id=s.source_id AND c.account_id=s.account_id AND c.generation=s.generation
+           WHERE s.account_id=la.account_id AND s.source_id=la.selected_source_id AND s.generation=la.selected_source_generation
+             AND s.source_type='EXTERNAL_MONITOR' AND s.state='ACTIVE' AND c.initial_import_complete=true
+             AND la.source_transition_state='STABLE'
+           LIMIT 1
+         ) monitor_checkpoint ON true
          ORDER BY CASE la.product_role WHEN 'AGENT' THEN 0 WHEN 'PRIMARY_ADMIN' THEN 1 ELSE 2 END,la.account_id`,
       ),
       this.pool.query<ConversationRow>(

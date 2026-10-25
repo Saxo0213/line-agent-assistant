@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { diagnosticFailure, type InboundEnvelope, type LineWorkerCommand, type LineWorkerEvent, type SafeDiagnostic, type WorkerBinding } from '@line-agent/contracts';
+import { diagnosticFailure, parseSafeDiagnostic, type InboundEnvelope, type LineWorkerCommand, type LineWorkerEvent, type SafeDiagnostic, type WorkerBinding } from '@line-agent/contracts';
 import type { AccountRepository, AdminRepository, FriendWhitelistRepository } from '@line-agent/database';
 import type { OperationalAudit, AuditErrorCode, AuditResultCode } from './operational-audit.js';
 import type { Locale } from '../../locale.js';
@@ -37,8 +37,10 @@ function relationErrorCode(value: unknown): AuditErrorCode {
   return typeof value === 'string' && RELATION_ERROR_CODES.has(value as AuditErrorCode) ? value as AuditErrorCode : 'UNKNOWN';
 }
 
-type FailureShape = Pick<SafeDiagnostic, 'category' | 'recovery'> & Partial<Pick<SafeDiagnostic, 'reason' | 'outcome'>>;
-function relationFailureDiagnostic(code: AuditErrorCode): FailureShape {
+type FailureShape = Pick<SafeDiagnostic, 'category' | 'recovery'> & Partial<Pick<SafeDiagnostic,
+  'reason' | 'outcome' | 'failureKind' | 'upstreamStatus' | 'upstreamCode'>>;
+function relationFailureDiagnostic(code: AuditErrorCode, relation?: Pick<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>,
+  'failureKind' | 'upstreamStatus' | 'upstreamCode'>): FailureShape {
   switch (code) {
     case 'RELATION_RESPONSE_TIMEOUT': return { category: 'timeout', recovery: 'retry', reason: 'timeout' };
     case 'RELATION_WORKER_EXIT': return { category: 'process_exit', recovery: 'wait' };
@@ -46,7 +48,16 @@ function relationFailureDiagnostic(code: AuditErrorCode): FailureShape {
     case 'RELATION_CANCELLED': return { category: 'cancelled', recovery: 'none' };
     case 'RELATION_BINDING_REVOKED': return { category: 'stale_binding', recovery: 'retry' };
     case 'RELATION_LIST_RPC_FAILED': return { category: 'transport_failed', recovery: 'retry', reason: 'list_get_transport_failure' };
-    case 'RELATION_DETAIL_RPC_FAILED': return { category: 'transport_failed', recovery: 'retry' };
+    case 'RELATION_DETAIL_RPC_FAILED': {
+      const safe = parseSafeDiagnostic({ operation: 'checkFriendRelation', stage: 'response', category: 'transport_failed', recovery: 'retry',
+        ...(relation?.failureKind === undefined ? {} : { failureKind: relation.failureKind }),
+        ...(relation?.upstreamStatus === undefined ? {} : { upstreamStatus: relation.upstreamStatus }),
+        ...(relation?.upstreamCode === undefined ? {} : { upstreamCode: relation.upstreamCode }) });
+      return { category: 'transport_failed', recovery: 'retry',
+        ...(safe?.failureKind === undefined ? {} : { failureKind: safe.failureKind }),
+        ...(safe?.upstreamStatus === undefined ? {} : { upstreamStatus: safe.upstreamStatus }),
+        ...(safe?.upstreamCode === undefined ? {} : { upstreamCode: safe.upstreamCode }) };
+    }
     case 'RELATION_LIST_SHAPE_INVALID': case 'RELATION_DETAIL_SHAPE_INVALID':
       return { category: 'invalid_response', recovery: 'retry', reason: 'response_shape_invalid' };
     case 'RELATION_LIST_LIMIT': return { category: 'unsupported', recovery: 'check_configuration' };
@@ -255,7 +266,7 @@ export class FriendEnrollmentService {
     }
     if (relation.status !== 'not_friend') {
       const code = relationErrorCode(relation.error);
-      const shape = relationFailureDiagnostic(code);
+      const shape = relationFailureDiagnostic(code, relation);
       if (shape.category === 'cancelled') return true;
       throw this.primaryFriendshipFailure(binding, 'relation', code === 'UNKNOWN' ? 'FRIEND_RELATION_CHECK_FAILED' : code,
         { stage: 'response', ...shape }, requestId, `primary administrator relation is unknown (${relation.error ?? 'unknown'})`);
@@ -268,7 +279,8 @@ export class FriendEnrollmentService {
 
   /** Marks an error whose specific diagnostic is already persisted, so the generic background wrapper does not add a second row. */
   private primaryFriendshipFailure(binding: ActiveBinding, step: 'relation' | 'add', errorCode: AuditErrorCode,
-    diagnostic: Pick<SafeDiagnostic, 'stage' | 'category' | 'recovery'> & Partial<Pick<SafeDiagnostic, 'reason' | 'outcome'>>,
+    diagnostic: Pick<SafeDiagnostic, 'stage' | 'category' | 'recovery'> & Partial<Pick<SafeDiagnostic,
+      'reason' | 'outcome' | 'failureKind' | 'upstreamStatus' | 'upstreamCode'>>,
     requestId: string | undefined, message: string, cause?: unknown): Error {
     this.recordPrimaryFriendshipFailure(binding, step, errorCode, diagnostic, requestId);
     return Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { diagnosticLogged: true });
@@ -276,7 +288,8 @@ export class FriendEnrollmentService {
 
   /** One audit failure with a code-only diagnostic. Never throws and never carries the MID or any error text. */
   private recordPrimaryFriendshipFailure(binding: ActiveBinding, step: 'relation' | 'add', errorCode: AuditErrorCode,
-    diagnostic: Pick<SafeDiagnostic, 'stage' | 'category' | 'recovery'> & Partial<Pick<SafeDiagnostic, 'reason' | 'outcome'>>,
+    diagnostic: Pick<SafeDiagnostic, 'stage' | 'category' | 'recovery'> & Partial<Pick<SafeDiagnostic,
+      'reason' | 'outcome' | 'failureKind' | 'upstreamStatus' | 'upstreamCode'>>,
     requestId?: string): void {
     try {
       this.deps.audit?.failure({ operation: step === 'relation' ? 'checkFriendRelation' : 'addFriendByMid', ...diagnostic },

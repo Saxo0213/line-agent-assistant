@@ -1142,6 +1142,21 @@ describe('one-account worker loop', () => {
     expect(events.at(-1)).toMatchObject({ requestId: 'check-2', targetMid: `u${'b'.repeat(32)}`, status: 'not_friend' });
   });
 
+  it('forwards safe friend-detail failure fields while keeping the relation unknown', async () => {
+    const { worker, transport, events, init } = setup('ACTIVE_CONTROL');
+    await init;
+    await authenticate(worker);
+    const targetMid = `u${'a'.repeat(32)}`;
+    Object.defineProperty(transport, 'checkFriendRelationDiagnostic', { value: vi.fn(async () => ({
+      status: 'unknown', error: 'RELATION_DETAIL_RPC_FAILED', failureKind: 'linejs_internal', upstreamStatus: 503, upstreamCode: 102001,
+    })) });
+    await worker.handle({ type: 'checkFriendRelation', ...binding, requestId: 'detail-failed', targetMid });
+    const result = LineWorkerEventSchema.parse(events.at(-1));
+    expect(result).toMatchObject({ type: 'friendRelationResult', status: 'unknown', error: 'RELATION_DETAIL_RPC_FAILED',
+      failureKind: 'linejs_internal', upstreamStatus: 503, upstreamCode: 102001 });
+    await worker.handle({ type: 'stop', ...binding });
+  });
+
   it('returns unknown for malformed relation data and when the exact requested MID is missing', async () => {
     const { worker, transport, events, init } = setup('ACTIVE_CONTROL');
     await init;

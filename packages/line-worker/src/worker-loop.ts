@@ -12,7 +12,7 @@ import { mkdir, open, statfs } from 'node:fs/promises';
 import { sanitizeAttachmentFilename, storeAttachment, type AttachmentStoreRuntime } from './attachment-store.js';
 import { SafeAttachmentError } from './attachment-error.js';
 import { validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
-import { isChatResourceFailure, safeChatResourceFailureDetails } from './chat-resource-error.js';
+import { isChatResourceFailure, safeChatResourceFailureDetails, type ChatResourceFailureKind, type ChatResourceResponseCode } from './chat-resource-error.js';
 
 export type TransportIdentity = Readonly<{ ownMid: string; displayName: string | null; picturePath?: string | null }>;
 export type SyncItem = unknown | Readonly<{
@@ -21,7 +21,8 @@ export type SyncItem = unknown | Readonly<{
 export type SyncResult = Readonly<{ cursorAfter: TalkCursorV1Dto; operations: readonly SyncItem[];
   readReceipts?: readonly Readonly<{ chatId: string; readerMid: string; messageId: string; readAt: string }>[] }>;
 export type FriendRelation = 'friend' | 'not_friend' | 'unknown';
-export type FriendRelationDiagnostic = Readonly<{ status: FriendRelation; error: string | null }>;
+export type FriendRelationDiagnostic = Readonly<{ status: FriendRelation; error: string | null; failureKind?: ChatResourceFailureKind;
+  upstreamStatus?: number; upstreamCode?: ChatResourceResponseCode }>;
 export type FriendAddResult = Readonly<{ status: 'added' | 'failed' | 'unknown'; error: string | null }>;
 export type RelationCancellation = Readonly<{ aborted: boolean }>;
 export interface LineTransport {
@@ -1060,6 +1061,7 @@ export class LineWorkerLoop {
     const identity = this.#identity();
     let status: FriendRelation = 'unknown';
     let error: string | null = 'RELATION_OUTCOME_UNKNOWN';
+    let failureDetails: Pick<FriendRelationDiagnostic, 'failureKind' | 'upstreamStatus' | 'upstreamCode'> = {};
     let expired = false;
     const controller = new AbortController();
     try {
@@ -1072,6 +1074,11 @@ export class LineWorkerLoop {
         if (this.#transport.checkFriendRelationDiagnostic) {
           const result = await this.#withTransportCall(() => this.#transport.checkFriendRelationDiagnostic!(command.targetMid, identity, controller.signal));
           error = result.error;
+          if (result.status === 'unknown' && result.error === 'RELATION_DETAIL_RPC_FAILED') {
+            failureDetails = { ...(result.failureKind === undefined ? {} : { failureKind: result.failureKind }),
+              ...(result.upstreamStatus === undefined ? {} : { upstreamStatus: result.upstreamStatus }),
+              ...(result.upstreamCode === undefined ? {} : { upstreamCode: result.upstreamCode }) };
+          }
           return result.status;
         }
         const result = await this.#withTransportCall(() => this.#transport.checkFriendRelation(command.targetMid, identity, controller.signal));
@@ -1083,7 +1090,8 @@ export class LineWorkerLoop {
     if (expired) error = 'RELATION_RESPONSE_TIMEOUT';
     if (this.#revoked) { status = 'unknown'; error = 'RELATION_BINDING_REVOKED'; }
     await this.#emit({ type: 'friendRelationResult', ...identity, requestId: command.requestId,
-      targetMid: command.targetMid, status, error: status === 'unknown' ? error : null });
+      targetMid: command.targetMid, status, error: status === 'unknown' ? error : null,
+      ...(status === 'unknown' && error === 'RELATION_DETAIL_RPC_FAILED' ? failureDetails : {}) });
   }
 
   async #addFriend(command: Extract<LineWorkerCommand, { type: 'addFriendByMid' }>): Promise<void> {

@@ -468,6 +468,39 @@ database('authoritative health snapshot', () => {
     expect(snapshot.jobs).toContainEqual(expect.objectContaining({ prompt: 'work' }));
     expect(snapshot.providers).toHaveLength(2);
   });
+  it('projects only a selected completed Primary Admin monitor checkpoint while preserving Agent sync time', async () => {
+    const accounts = new AccountRepository(pool);
+    await accounts.ensureAccount('monitor-complete', 'Monitor complete');
+    const selectedSourceId = randomUUID();
+    const incompleteSourceId = randomUUID();
+    const completedAt = new Date('2026-10-25T04:05:06.000Z');
+    const agentSyncedAt = new Date('2026-10-24T03:02:01.000Z');
+    await accounts.ensureAccount('a', 'Agent');
+    await pool.query(`INSERT INTO line_account_sources(source_id,account_id,source_type,generation,identity_digest,verified_account_mid)
+      VALUES ($1,'monitor-complete','EXTERNAL_MONITOR',7,$3,'admin-mid'),($2,'monitor-complete','EXTERNAL_MONITOR',8,$3,'admin-mid')`,
+      [selectedSourceId, incompleteSourceId, 'a'.repeat(64)]);
+    await pool.query(`UPDATE line_accounts SET product_role='PRIMARY_ADMIN',connection_mode='EXTERNAL_MONITOR',
+      selected_source_id=$1,selected_source_generation=7 WHERE account_id='monitor-complete'`, [selectedSourceId]);
+    await pool.query(`INSERT INTO external_source_checkpoints(source_id,account_id,generation,cursor,initial_import_complete,updated_at)
+      VALUES ($1,'monitor-complete',7,'{}',true,$2)`, [selectedSourceId, completedAt]);
+    // The completed source remains unselected after switching to the incomplete source.
+    await pool.query(`INSERT INTO external_source_checkpoints(source_id,account_id,generation,cursor,initial_import_complete)
+      VALUES ($1,'monitor-complete',8,'{}',false)`, [incompleteSourceId]);
+    await pool.query("UPDATE line_accounts SET product_role='AGENT',last_synced_at=$1 WHERE account_id='a'", [agentSyncedAt]);
+
+    const health = new HealthService(pool);
+    const selectedSnapshot = await health.snapshot();
+    expect(selectedSnapshot.accounts.find((account) => account.accountId === 'monitor-complete')?.lastSyncedAt).toBe(completedAt.toISOString());
+    expect(selectedSnapshot.accounts.find((account) => account.accountId === 'a')?.lastSyncedAt).toBe(agentSyncedAt.toISOString());
+
+    await pool.query(`UPDATE line_accounts SET selected_source_id=$1,selected_source_generation=8 WHERE account_id='monitor-complete'`,
+      [incompleteSourceId]);
+    const changedSelectionSnapshot = await health.snapshot();
+
+    expect(changedSelectionSnapshot.accounts.find((account) => account.accountId === 'monitor-complete')?.lastSyncedAt).toBeNull();
+    expect(changedSelectionSnapshot.accounts.find((account) => account.accountId === 'a')?.lastSyncedAt).toBe(agentSyncedAt.toISOString());
+    await pool.query("DELETE FROM line_accounts WHERE account_id='monitor-complete'");
+  });
   it('uses the account picture for its own direct conversation avatar', async () => {
     await pool.query("UPDATE line_accounts SET picture_path='https://profile.line-scdn.net/own-avatar' WHERE account_id='a'");
     await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES('a','direct','agent-mid','Primary Admin') ON CONFLICT DO NOTHING");

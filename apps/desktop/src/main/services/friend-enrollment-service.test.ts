@@ -156,6 +156,21 @@ describe('FriendEnrollmentService', () => {
       expect(JSON.stringify(ctx.auditFailures)).not.toContain(targetMid);
     });
 
+    it('records allowlisted friend-detail failure facts in the single failure audit row', async () => {
+      const ctx = setup();
+      ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
+      ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => event('friendRelationResult', {
+        requestId: command.requestId, targetMid: command.targetMid, status: 'unknown', error: 'RELATION_DETAIL_RPC_FAILED',
+        failureKind: 'linejs_internal', upstreamStatus: 503, upstreamCode: 102001,
+      }));
+      await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toMatchObject({ diagnosticLogged: true });
+      expect(ctx.auditFailures).toHaveLength(1);
+      expect(ctx.auditFailures[0]).toMatchObject({ errorCode: 'RELATION_DETAIL_RPC_FAILED', action: 'friend_relation_initial',
+        diagnostic: { operation: 'checkFriendRelation', stage: 'response', category: 'transport_failed', recovery: 'retry',
+          failureKind: 'linejs_internal', upstreamStatus: 503, upstreamCode: 102001 } });
+      expect(JSON.stringify(ctx.auditFailures)).not.toMatch(/private|secret|https|u[a-f]{32}/i);
+    });
+
     it('records PRIMARY_ADMIN_NOT_FRIEND once and never adds the friend', async () => {
       const ctx = setup();
       ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);

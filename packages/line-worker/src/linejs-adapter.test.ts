@@ -1422,6 +1422,44 @@ it('uses the pinned Relation read response shape and requires the exact target M
   } finally { ids.mockRestore(); details.mockRestore(); }
 });
 
+it('preserves only bounded details when the positive friend-detail RPC throws', async () => {
+  const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
+    RelationService: { prototype: { getUserFriendIds(...args: any[]): Promise<unknown>; getFriendDetails(...args: any[]): Promise<unknown> } };
+  };
+  const mid = `u${'a'.repeat(32)}`;
+  const ids = vi.spyOn(RelationService.prototype, 'getUserFriendIds').mockResolvedValue({ userFriendMids: [mid], nextUserPageToken: '' });
+  const details = vi.spyOn(RelationService.prototype, 'getFriendDetails').mockRejectedValue(
+    new InternalError('MoaError', `private exception token=secret url=https://private.invalid/${mid}`, { code: 102001, status: 503,
+      message: `private payload ${mid}` }));
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true,
+    physicalTransport: async () => new Response() });
+  try {
+    const result = await adapter.checkFriendRelationDiagnostic(mid, lease);
+    expect(result).toEqual({ status: 'unknown', error: 'RELATION_DETAIL_RPC_FAILED', failureKind: 'linejs_internal',
+      upstreamStatus: 503, upstreamCode: 102001 });
+    expect(ids).toHaveBeenCalledOnce();
+    expect(details).toHaveBeenCalledWith({ request: { targetUsers: [{ targetUserMid: mid }], syncReason: 'AUTO_REPAIR' } });
+    expect(JSON.stringify(result)).not.toMatch(/private|secret|https|u[a-f]{32}/i);
+  } finally { ids.mockRestore(); details.mockRestore(); }
+});
+
+it('scrubs generic sensitive friend-detail exceptions to the safe failure kind', async () => {
+  const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
+    RelationService: { prototype: { getUserFriendIds(...args: any[]): Promise<unknown>; getFriendDetails(...args: any[]): Promise<unknown> } };
+  };
+  const mid = `u${'a'.repeat(32)}`;
+  const ids = vi.spyOn(RelationService.prototype, 'getUserFriendIds').mockResolvedValue({ userFriendMids: [mid], nextUserPageToken: '' });
+  const details = vi.spyOn(RelationService.prototype, 'getFriendDetails').mockRejectedValue(
+    new Error(`sensitive message ${mid} token=secret https://private.invalid/`));
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true,
+    physicalTransport: async () => new Response() });
+  try {
+    const result = await adapter.checkFriendRelationDiagnostic(mid, lease);
+    expect(result).toEqual({ status: 'unknown', error: 'RELATION_DETAIL_RPC_FAILED', failureKind: 'other' });
+    expect(JSON.stringify(result)).not.toMatch(/sensitive|secret|https|u[a-f]{32}/i);
+  } finally { ids.mockRestore(); details.mockRestore(); }
+});
+
 it('accepts unrelated string IDs of any format but fails closed on non-string entries after the target', async () => {
   const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
     RelationService: { prototype: { getUserFriendIds(...args: any[]): Promise<unknown>; getFriendDetails(...args: any[]): Promise<unknown> } };

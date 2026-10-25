@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-In v1.0.260, you can replace the Agent LINE account while its old chats and attachments stay with the old account and the replacement starts with separate data. New System Errors record the validated IPC action name; historical errors say when the action was not recorded. See the [v1.0.260 release notes](docs/releases/v1.0.260.md).
+v1.0.261 fixes the external monitor showing “Not synchronized” after synchronization has completed, and adds filtered error details when checking LINE friend information fails. See the [v1.0.261 release notes](docs/releases/v1.0.261.md). Agent-account replacement and IPC diagnostics were introduced in [v1.0.260](docs/releases/v1.0.260.md).
 
 ## Installation
 

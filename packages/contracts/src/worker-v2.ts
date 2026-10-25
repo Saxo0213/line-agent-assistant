@@ -207,7 +207,16 @@ export const LineWorkerEventSchema = z.union([
     operationId: Id.optional(), attemptId: Id.optional() }),
   Conversation.extend({ type: z.literal('unsendResult'), requestId: Id, messageId: Decimal, status: z.enum(['unsent', 'failed', 'unknown']), error: z.string().nullable() }),
   Bound.extend({ type: z.literal('friendRelationResult'), requestId: Id, targetMid: UserMid,
-    status: z.enum(['friend', 'not_friend', 'unknown']), error: z.string().nullable() }),
+    status: z.enum(['friend', 'not_friend', 'unknown']), error: z.string().nullable(),
+    failureKind: z.enum(['linejs_internal', 'effect_denied', 'type_error', 'range_error', 'timeout_error', 'abort_error', 'other']).optional(),
+    upstreamStatus: z.number().int().min(100).max(599).optional(),
+    upstreamCode: z.union([z.number().int().min(-1_000_000_000).max(1_000_000_000), z.enum(['missing', 'non_numeric'])]).optional()
+  }).superRefine((result, context) => {
+    if ((result.failureKind !== undefined || result.upstreamStatus !== undefined || result.upstreamCode !== undefined)
+      && (result.status !== 'unknown' || result.error !== 'RELATION_DETAIL_RPC_FAILED')) {
+      context.addIssue({ code: 'custom', path: ['failureKind'], message: 'Failure diagnostics require a failed friend-detail read' });
+    }
+  }),
   Bound.extend({ type: z.literal('addFriendResult'), requestId: Id, targetMid: UserMid,
     status: z.enum(['added', 'failed', 'unknown']), error: z.string().nullable() }),
   Bound.extend({ type: z.literal('error'), code: WorkerErrorCodeSchema, message: Id, retryable: z.boolean(),

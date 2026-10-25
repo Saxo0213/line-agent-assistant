@@ -1371,10 +1371,11 @@ export class LinejsAdapter implements LineTransport {
       if (keys.length !== 1 || !['user', 'bot', 'notFriend'].includes(keys[0]!)) return unknown('RELATION_DETAIL_SHAPE_INVALID');
       if (!isRecord(value[keys[0]!])) return unknown('RELATION_DETAIL_SHAPE_INVALID');
       return { status: keys[0] === 'notFriend' ? 'not_friend' : 'friend', error: null };
-    } catch {
+    } catch (error) {
       if (this.#revoked) return unknown('RELATION_BINDING_REVOKED');
       if (signal.aborted) return unknown('RELATION_CANCELLED');
-      return unknown(stage === 'list' ? 'RELATION_LIST_RPC_FAILED' : 'RELATION_DETAIL_RPC_FAILED');
+      if (stage === 'list') return unknown('RELATION_LIST_RPC_FAILED');
+      return { ...unknown('RELATION_DETAIL_RPC_FAILED'), ...safeChatResourceFailureDetails(error) };
     }
   }
   async addFriendByMid(targetMid: string, lease: ControlLease, onPhysicalStart: () => void,
