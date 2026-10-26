@@ -37,6 +37,13 @@ npm run build
 npm run start --workspace @line-agent/desktop
 ```
 
+## 参照したオープンソースプロジェクト
+
+- [OkLine](https://github.com/NiceDayZc/OkLine)（[ドキュメント](https://nicedayzc.github.io/OkLine/#start-here)、[MIT License](https://github.com/NiceDayZc/OkLine/blob/main/LICENSE)）：LINE Chrome クライアントのログイン、ログアウト、トークン更新、サーバーレスポンス処理を比較・確認するための実装資料として参照しています。実行時の依存関係ではありません。
+- [LINEJS / `@evex/linejs`](https://github.com/evex-dev/linejs)（[ドキュメント](https://linejs.evex.land)、[MIT License](https://github.com/evex-dev/linejs/blob/main/LICENSE)）：本アプリがバージョンを固定して利用する JavaScript 製 LINE クライアントライブラリで、LINE セッション、認証、プロトコル要求、認証情報の保存を提供します。
+
+著作権表示およびライセンス条件は、各プロジェクトのリポジトリを参照してください。
+
 ## ライセンス
 
 MIT License のもとで公開されています。詳しくは [LICENSE](LICENSE) をご覧ください。

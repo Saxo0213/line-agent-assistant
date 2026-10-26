@@ -37,6 +37,13 @@ npm run build
 npm run start --workspace @line-agent/desktop
 ```
 
+## 참고한 오픈 소스 프로젝트
+
+- [OkLine](https://github.com/NiceDayZc/OkLine) ([문서](https://nicedayzc.github.io/OkLine/#start-here), [MIT License](https://github.com/NiceDayZc/OkLine/blob/main/LICENSE)): LINE Chrome 클라이언트의 로그인, 로그아웃, 토큰 갱신 및 서버 응답 처리를 비교·확인하는 구현 참고 자료로 사용했습니다. 런타임 의존성은 아닙니다.
+- [LINEJS / `@evex/linejs`](https://github.com/evex-dev/linejs) ([문서](https://linejs.evex.land), [MIT License](https://github.com/evex-dev/linejs/blob/main/LICENSE)): 이 앱이 버전을 고정해 사용하는 JavaScript LINE 클라이언트 라이브러리로, LINE 세션, 인증, 프로토콜 요청 및 인증 정보 저장을 제공합니다.
+
+저작권 고지와 라이선스 조건은 각 프로젝트 저장소를 확인하세요.
+
 ## 라이선스
 
 MIT License로 배포됩니다. 자세한 내용은 [LICENSE](LICENSE)를 참조하세요.

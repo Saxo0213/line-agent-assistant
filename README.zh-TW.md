@@ -37,6 +37,13 @@ npm run build
 npm run start --workspace @line-agent/desktop
 ```
 
+## 參考的開源專案
+
+- [OkLine](https://github.com/NiceDayZc/OkLine)（[說明文件](https://nicedayzc.github.io/OkLine/#start-here)、[MIT License](https://github.com/NiceDayZc/OkLine/blob/main/LICENSE)）：用於比對 LINE Chrome 用戶端的登入、登出、Token 更新與伺服器回應處理方式；本程式不在執行階段依賴 OkLine。
+- [LINEJS / `@evex/linejs`](https://github.com/evex-dev/linejs)（[說明文件](https://linejs.evex.land)、[MIT License](https://github.com/evex-dev/linejs/blob/main/LICENSE)）：本程式固定版本使用的 JavaScript LINE 用戶端函式庫，提供 LINE 工作階段、登入驗證、協定請求與憑證儲存功能。
+
+著作權聲明與授權條款以各專案的 Repository 為準。
+
 ## 授權
 
 本專案採用 MIT License，詳見 [LICENSE](LICENSE)。
