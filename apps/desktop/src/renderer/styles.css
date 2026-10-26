@@ -259,8 +259,8 @@ span.avatar-placeholder{background:#e6ecea;color:#6c817d}
 .work-record-row-action>button{white-space:nowrap}
 @media(max-width:640px){.work-record-row{grid-template-columns:minmax(0,1fr) auto;gap:8px 12px}.work-record-column-header{display:none}.work-record-row-meta{grid-column:2;grid-row:1;flex-direction:column;align-items:end;gap:4px}.work-record-row-content{grid-column:1;grid-row:1/3}.work-record-row-action{grid-column:1/-1;grid-row:3}.work-record-row-action>button{justify-self:start}.work-record-row>.badge{grid-column:2;grid-row:2;justify-self:end}}
 .agent-status-marker { display: flex; align-items: center; margin: 0.25rem 0 0 2.5rem; line-height: 0; }
-/* Icon only, fixed 20px. Official reaction artwork; no ancestor font-size, zoom or max-width may scale it. */
-.agent-status-marker img { display: block; flex: none; width: 20px; height: 20px; min-width: 20px; max-width: none; max-height: none; }
+/* Neutral status glyphs stay fixed at 20px; accessible labels are provided by the marker. */
+.agent-status-glyph { display: inline-flex; flex: none; width: 20px; height: 20px; align-items: center; justify-content: center; font: 600 16px/20px system-ui, sans-serif; }
 .agent-status-icon-settings{display:grid;gap:10px;margin:16px 0 0;padding:12px;border:1px solid var(--border);border-radius:8px}.agent-status-icon-settings>p{margin:0;color:var(--secondary);font-size:12px}.agent-status-icon-label{min-width:3.5rem}.agent-status-icon-note{margin-left:auto;min-width:0;color:var(--secondary);font-size:12px;text-align:right}
 .search-account-tabs{flex-wrap:wrap}.conversation-sort{padding:0 10px 8px}.conversation-sort select{width:100%;min-height:32px;padding:5px 9px;background:var(--subtle);border-color:transparent;font-size:12px}
 .conversation-sort{display:flex;align-items:stretch;gap:6px}

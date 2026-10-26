@@ -2335,7 +2335,7 @@ describe('operator console', () => {
     expect(marker.querySelector('[aria-hidden="true"]')?.classList.contains('agent-status-glyph')).toBe(true);
     expect(marker.getAttribute('aria-label')).toBe('Agent 執行中');
     expect(marker.getAttribute('title')).toBe('Agent 執行中');
-    expect(marker.textContent).toBe('');
+    expect(marker.textContent).toBe(LINE_REACTION_GLYPHS.NICE);
     const row = marker.closest('.message-row')!;
     const bubble = row.querySelector('.message')!;
     expect(bubble.contains(marker)).toBe(false);
