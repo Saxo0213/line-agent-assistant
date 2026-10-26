@@ -442,6 +442,9 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
       async shutdown() {},
     };
 
+    const startupLegacy = await tokens.issueToken({ deviceLabel: 'Pre-start managed Agent', accountScopes: ['account-agent'],
+      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    await pool.query("UPDATE mcp_agent_tokens SET principal_id='local-client:codex' WHERE token_id=$1", [startupLegacy.token.tokenId]);
     const facade = await createConnectedFacade({
       pool,
       workers,
@@ -453,6 +456,9 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
     });
 
     try {
+      // Startup has normalized the managed credential before any Settings request or MCP listener admission.
+      expect(await tokens.findTokenByBearerToken(startupLegacy.plaintextToken))
+        .toMatchObject({ state: 'ACTIVE', accountScopes: ['role:AGENT'] });
       await facade.dispatch({
         type: 'setWorkspace',
         requestId: 'ws-1',
@@ -495,7 +501,7 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
       });
       expect(revokeRes).toMatchObject({ type: 'mcpRevokeToken', ok: true, revoked: true });
 
-      const localConnect = await facade.dispatch({ type: 'mcpLocalClientConnect', requestId: 'local-connect', client: 'claude-desktop', accountScopes: ['account-admin'] });
+      const localConnect = await facade.dispatch({ type: 'mcpLocalClientConnect', requestId: 'local-connect', client: 'claude-desktop', accountScopes: ['role:PRIMARY_ADMIN'] });
       expect(localConnect.type).toBe('mcpLocalClientConnect');
       if (localConnect.type !== 'mcpLocalClientConnect') throw new Error('Expected local MCP client connection');
       expect(localConnect).not.toHaveProperty('plaintextToken');

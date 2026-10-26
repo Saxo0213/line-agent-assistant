@@ -49,7 +49,8 @@ export class AttachmentService {
     private readonly onDispatcherError?: (error: unknown, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void,
     private readonly resolveNativeAttachment?: (attachment: Attachment, signal: AbortSignal) => Promise<NativeAttachmentDownloadInput | null>,
     private readonly isAccountConnected?: (accountId: string) => Promise<boolean>,
-    private readonly random: () => number = Math.random) {
+    private readonly random: () => number = Math.random,
+    private readonly onServerRejection?: (result: Extract<AttachmentResult, { status: 'failed' | 'expired' }>) => void) {
     void maxConcurrent;
   }
 
@@ -209,6 +210,9 @@ export class AttachmentService {
       }
       if (result.status === 'expired') await this.messages.markAttachmentExpired(attempt, result.error);
       else await this.messages.markAttachmentFailed(attempt, result.error, this.automaticAttemptLimit);
+      if (result.serverErrorCode) {
+        try { this.onServerRejection?.(result); } catch { /* Diagnostics cannot change attachment state. */ }
+      }
       this.reportFailure('download', undefined, identity);
       this.notifyChanged(attachmentId);
       return false;

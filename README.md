@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.261 fixes the external monitor showing “Not synchronized” after synchronization has completed, and adds filtered error details when checking LINE friend information fails. See the [v1.0.261 release notes](docs/releases/v1.0.261.md). Agent-account replacement and IPC diagnostics were introduced in [v1.0.260](docs/releases/v1.0.260.md).
+v1.0.270 improves fixed account roles and search navigation, preserves LINE server and attachment errors, and hardens logout and token refresh handling. See the [v1.0.270 release notes](docs/releases/v1.0.270.md). Earlier changes are listed in [v1.0.261](docs/releases/v1.0.261.md) and [v1.0.260](docs/releases/v1.0.260.md).
 
 ## Installation
 

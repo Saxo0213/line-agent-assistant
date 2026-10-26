@@ -3,7 +3,9 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { LineWorkerEventSchema } from '@line-agent/contracts';
 import { FakeLineTransport } from './fake-transport.js';
+import { LineServerRejection } from './line-server-error.js';
 import { EffectDeniedError } from './mutation-gate.js';
 import { LineWorkerLoop, MediaUploadFailedError } from './worker-loop.js';
 
@@ -91,6 +93,20 @@ describe('worker sendMedia', () => {
     transport.sendMediaError = new EffectDeniedError('denied');
     await worker.handle({ ...command, requestId: 'm3', effectPermit: 'permit-3' });
     expect(events.at(-1)).toMatchObject({ status: 'failed', error: 'SIDE_EFFECT_DENIED' });
+  });
+
+  it('keeps a media preparation server rejection as a fixed code without leaking server text', async () => {
+    const { worker, transport, events, command } = await setup();
+    const secret = 'token=private-token MID=u-private text=private-message';
+    transport.sendMediaError = new LineServerRejection('LINE_TALK_E2EE_UPDATE_RECEIVER_KEY', 84);
+    (transport.sendMediaError as Error & { serverMessage?: string }).serverMessage = secret;
+
+    await worker.handle(command);
+
+    expect(transport.sendMediaCalls).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ status: 'failed', error: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY' });
+    expect(LineWorkerEventSchema.safeParse(events.at(-1)).success).toBe(true);
+    expect(JSON.stringify(events)).not.toContain(secret);
   });
 
   it('reports unknown on timeout and holds the send slot until the transport settles', async () => {

@@ -143,7 +143,7 @@ async function hashFile(file: string, signal: AbortSignal): Promise<{ sha256: st
 }
 
 /**
- * Agent LINE send behind the internal MCP tools (docs/architecture/agent-line-send-2026-10-22.md).
+ * Agent LINE send behind the internal MCP tools (docs/architecture/agent-line-send.md).
  * Owns one FIFO queue of authorized items that are sent one at a time, outside any database transaction. The random
  * gap between sends is the worker gateway's per-account pacing; there is no second delay here.
  */

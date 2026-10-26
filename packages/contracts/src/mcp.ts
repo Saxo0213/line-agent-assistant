@@ -385,7 +385,7 @@ export const McpAgentRoomHistoryOutputSchema = McpAgentRoomHistoryPageSchema.ext
 });
 export type McpAgentRoomHistoryOutput = z.infer<typeof McpAgentRoomHistoryOutputSchema>;
 
-/** Agent LINE send (internal-only tools; see docs/architecture/agent-line-send-2026-10-22.md). */
+/** Agent LINE send (internal-only tools; see docs/architecture/agent-line-send.md). */
 export const SEND_ITEMS_MAX = 10;
 export const SEND_TEXT_MAX_CHARS = 5_000;
 export const SEND_ITEMS_PER_JOB_MAX = 30;

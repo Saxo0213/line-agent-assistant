@@ -1,5 +1,5 @@
 /**
- * Official LINE build trust (docs/architecture/official-line-build-trust-update-2026-10-20.md).
+ * Official LINE build trust (docs/architecture/official-line-build-trust-update.md).
  *
  * The native bridge decides `accepted` / `candidate` / `rotation` / `untrusted`
  * from the executable identity and its Authenticode signature before any

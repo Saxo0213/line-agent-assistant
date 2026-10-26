@@ -28,6 +28,33 @@ function readyAttachmentResult(command: Extract<LineWorkerCommand, { type: 'down
 }
 
 describe('AttachmentService queued automatic downloads', () => {
+  it('persists the attachment phase code and forwards the trusted Talk result once for audit', async () => {
+    const row = queuedAttachment('talk-token-rejection');
+    const saved: string[] = [];
+    const observed: AttachmentResult[] = [];
+    const repository = { async getAttachment() { return row; }, async claimAttachmentDownload() { return randomUUID(); },
+      async markAttachmentFailed(_attempt: unknown, code: string) { saved.push(code); row.status = 'failed' as never; return true; },
+      async recoverAttachmentPage() { return { items: [], hasMore: false }; }, async recoverAttachments() { return []; },
+      async revokeAttachmentOwner() {} } as unknown as MessageRepository;
+    const download = vi.fn(async (command: Extract<LineWorkerCommand, { type: 'downloadAttachment' }>) => ({
+      type: 'attachmentResult' as const, status: 'failed' as const, accountId: command.accountId,
+      chatType: command.chatType, chatId: command.chatId, attachmentId: command.attachmentId,
+      attemptToken: command.attemptToken, workerInstanceId: command.workerInstanceId,
+      error: 'LINE_OBS_TOKEN_RPC_FAILED', serverErrorCode: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY' as const,
+      upstreamCode: 84 }));
+    const service = new AttachmentService(repository, { async binding(accountId) {
+      return { accountId, workerInstanceId: 'worker', controlEpoch: 1, mode: 'MONITOR_ONLY' as const };
+    }, async isReady() { return true; }, download }, undefined, 4, undefined, undefined, undefined, undefined,
+    () => 0, (result) => observed.push(result));
+    try {
+      await expect(service.downloadById(row.attachmentId)).resolves.toBe(false);
+      expect(download).toHaveBeenCalledOnce();
+      expect(saved).toEqual(['LINE_OBS_TOKEN_RPC_FAILED']);
+      expect(observed).toMatchObject([{ error: 'LINE_OBS_TOKEN_RPC_FAILED',
+        serverErrorCode: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY', upstreamCode: 84 }]);
+    } finally { await service.shutdown(); }
+  });
+
   it.each([
     ['attachment.bin', undefined],
     ['attachment.jpg', undefined],

@@ -9,7 +9,7 @@ type Reproject = (pool: Pool, options: ReprojectionOptions) => Promise<Reproject
 let activeRun: Promise<void> | null = null;
 
 /**
- * Owner of the content-bridge re-projection job (docs/architecture/content-bridge-two-layer-2026-10-20.md).
+ * Owner of the content-bridge re-projection job (docs/architecture/content-bridge-two-layer.md).
  * Started once after migrations, runs batches of at most 500 rows one at a time (each its own transaction),
  * has no timers, and stops on shutdown: the batch in flight finishes, then the run ends within a bounded wait.
  */

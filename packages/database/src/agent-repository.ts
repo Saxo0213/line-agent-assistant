@@ -118,7 +118,7 @@ type Queryable = Pick<Pool, 'query'> | Pick<PoolClient, 'query'>;
 
 /**
  * The admin's direct chat with the Agent account: the one LINE conversation whose provider memory the local Agent room
- * shares (docs/architecture/agent-room-shared-admin-memory-2026-10-20.md). Derived from the existing binding on every
+ * shares (docs/architecture/agent-room-shared-admin-memory.md). Derived from the existing binding on every
  * call; there is no stored copy. The conversation row must exist because LINE session rows reference it.
  */
 export const sharedAdminChatSql = `SELECT ag.account_id, adm.chat_id AS admin_mid

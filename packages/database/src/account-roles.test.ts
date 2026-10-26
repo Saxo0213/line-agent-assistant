@@ -69,8 +69,9 @@ database('fixed account role slots', () => {
       VALUES ($1,'old-message','old-event','direct','old-chat','friend-mid','text','Archived message','history',now(),'{}')`, [old.accountId]);
     await pool.query(`INSERT INTO attachments(attachment_id,external_attachment_id,account_id,message_id,chat_type,chat_id,kind,name,mime_type,size_bytes,status,relative_path,sha256)
       VALUES ('00000000-0000-4000-8000-000000000001','old-external',$1,'old-message','direct','old-chat','file','archive.txt','text/plain',12,'ready','old/archive.txt',repeat('a',64))`, [old.accountId]);
+    const adminMid = `u${'d'.repeat(32)}`;
     await pool.query(`INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
-      VALUES ($1,'direct','admin-mid','admin-mid','PRIMARY_ADMIN')`, [old.accountId]);
+      VALUES ($1,'direct',$2,$2,'PRIMARY_ADMIN')`, [old.accountId, adminMid]);
     const epoch = await accounts.getControlState();
     await accounts.revokeControl(epoch.controlEpoch);
     await accounts.clearStoppedWorkerBinding({ accountId: old.accountId, workerInstanceId: 'old-worker', controlEpoch: 0 });
@@ -98,7 +99,116 @@ database('fixed account role slots', () => {
     expect(await accounts.resolveCapabilities(old.accountId)).toMatchObject({ productRole: null, connectionMode: 'OFFLINE', canWriteLine: false });
     expect(await accounts.applyWorkerLogin({ accountId: old.accountId, workerInstanceId: 'old-worker', controlEpoch: stoppedEpoch.controlEpoch }, mid, 'Old Agent')).toBe(false);
     expect((await pool.query('SELECT account_id FROM account_administrators WHERE account_id=ANY($1)', [[old.accountId, replaced.account.accountId]])).rows)
-      .toEqual([{ account_id: old.accountId }]);
+      .toEqual([{ account_id: replaced.account.accountId }]);
+    const repairedAdmin = (await pool.query(`SELECT account_id,own_mid,connection_mode,status,auto_login_on_startup,
+      worker_instance_id,selected_source_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN'`)).rows[0];
+    expect(repairedAdmin).toMatchObject({ own_mid: adminMid, connection_mode: 'OFFLINE', status: 'disconnected',
+      auto_login_on_startup: false, worker_instance_id: null, selected_source_id: null });
+    expect(await accounts.bindPrimaryAdministrator(replaced.account.accountId, adminMid, adminMid)).toBe(false);
+    expect((await pool.query("SELECT count(*) FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows[0].count).toBe('1');
+  });
+
+  it('creates one offline Primary Admin holder with the pairing binding and reuses it for the same MID', async () => {
+    const agent = await accounts.reserveAccountSlot();
+    await accounts.setOwnMid(agent.accountId, `u${'a'.repeat(32)}`);
+    const mid = `u${'b'.repeat(32)}`;
+    expect(await accounts.bindPrimaryAdministrator(agent.accountId, mid, mid)).toBe(true);
+    const holder = (await pool.query(`SELECT account_id,own_mid,status,connection_mode,auto_login_on_startup,
+      worker_instance_id,worker_binding_epoch,selected_source_id,selected_source_generation
+      FROM line_accounts WHERE product_role='PRIMARY_ADMIN'`)).rows[0];
+    expect(holder).toMatchObject({ own_mid: mid, status: 'disconnected', connection_mode: 'OFFLINE',
+      auto_login_on_startup: false, worker_instance_id: null, worker_binding_epoch: null,
+      selected_source_id: null, selected_source_generation: null });
+    const version = (await pool.query('SELECT version FROM account_administrator_versions WHERE account_id=$1', [agent.accountId])).rows[0].version;
+    expect(await accounts.bindPrimaryAdministrator(agent.accountId, mid, mid)).toBe(true);
+    expect((await pool.query("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows).toEqual([{ account_id: holder.account_id }]);
+    expect((await pool.query('SELECT account_id,chat_id,user_id FROM account_administrators')).rows)
+      .toEqual([{ account_id: agent.accountId, chat_id: mid, user_id: mid }]);
+    expect((await pool.query('SELECT version FROM account_administrator_versions WHERE account_id=$1', [agent.accountId])).rows[0].version).toBe(version);
+    expect((await pool.query('SELECT count(*) FROM line_account_sources')).rows[0].count).toBe('0');
+  });
+
+  it('rejects a conflicting holder MID without writing the pairing binding', async () => {
+    const agent = await accounts.reserveAccountSlot();
+    await accounts.setOwnMid(agent.accountId, `u${'a'.repeat(32)}`);
+    const existingMid = `u${'b'.repeat(32)}`;
+    await accounts.bindPrimaryAdminFromExternalMonitor({ mid: existingMid, correlationId: 'existing-admin' });
+    await pool.query('DELETE FROM account_administrators WHERE account_id=$1', [agent.accountId]);
+    const differentMid = `u${'c'.repeat(32)}`;
+    await expect(accounts.bindPrimaryAdministrator(agent.accountId, differentMid, differentMid)).rejects.toThrow('PRIMARY_ADMIN_IDENTITY_CONFLICT');
+    expect((await pool.query('SELECT count(*) FROM account_administrators')).rows[0].count).toBe('0');
+    expect((await pool.query("SELECT own_mid FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows).toEqual([{ own_mid: existingMid }]);
+    expect((await pool.query('SELECT count(*) FROM line_accounts')).rows[0].count).toBe('2');
+  });
+
+  it('activates an offline pairing holder only for an explicit QR login with the verified native MID', async () => {
+    const agent = await accounts.reserveAccountSlot();
+    await accounts.setOwnMid(agent.accountId, `u${'a'.repeat(32)}`);
+    const mid = `u${'b'.repeat(32)}`;
+    await accounts.bindPrimaryAdministrator(agent.accountId, mid, mid);
+    const admin = (await pool.query("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows[0].account_id as string;
+    const binding = { accountId: admin, workerInstanceId: 'explicit-admin-qr', controlEpoch: 1 };
+    await accounts.bindWorker(binding);
+    let commits = 0;
+    const commit = async () => { commits++; };
+    expect(await accounts.applyWorkerLogin(binding, mid, 'Admin', undefined, commit)).toBe(false);
+    expect(await accounts.applyWorkerLogin(binding, `u${'c'.repeat(32)}`, 'Wrong Admin', undefined, commit, true)).toBe(false);
+    expect(commits).toBe(0);
+    expect((await pool.query('SELECT connection_mode,selected_source_id,status FROM line_accounts WHERE account_id=$1', [admin])).rows)
+      .toEqual([{ connection_mode: 'OFFLINE', selected_source_id: null, status: 'disconnected' }]);
+    expect(await accounts.applyWorkerLogin(binding, mid, 'Admin', undefined, commit, true)).toBe(true);
+    expect(commits).toBe(1);
+    expect(await accounts.resolveCapabilities(admin)).toMatchObject({ productRole: 'PRIMARY_ADMIN',
+      connectionMode: 'SYSTEM_LOGIN', selectedSourceType: 'SYSTEM_LOGIN', sourceState: 'ACTIVE' });
+  });
+
+  it.each(['historical', 'external-source'] as const)('rejects an explicit QR mode transition for a %s identity', async (state) => {
+    const agent = await accounts.reserveAccountSlot();
+    await accounts.setOwnMid(agent.accountId, `u${'a'.repeat(32)}`);
+    const mid = `u${'b'.repeat(32)}`;
+    await accounts.bindPrimaryAdministrator(agent.accountId, mid, mid);
+    const admin = (await pool.query("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows[0].account_id as string;
+    const binding = { accountId: admin, workerInstanceId: `denied-admin-${state}`, controlEpoch: 1 };
+    await accounts.bindWorker(binding);
+    if (state === 'historical') {
+      await pool.query('UPDATE line_accounts SET product_role=NULL WHERE account_id=$1', [admin]);
+    } else {
+      const sourceId = '00000000-0000-4000-8000-000000000002';
+      await pool.query(`INSERT INTO line_account_sources(source_id,account_id,source_type,generation,identity_digest,verified_account_mid,state,read_capability,write_capability)
+        VALUES($1,$2,'EXTERNAL_MONITOR',1,repeat('a',64),$3,'ACTIVE',true,false)`, [sourceId, admin, mid]);
+      await pool.query(`UPDATE line_accounts SET connection_mode='EXTERNAL_MONITOR',selected_source_id=$2,selected_source_generation=1
+        WHERE account_id=$1`, [admin, sourceId]);
+    }
+    const before = (await pool.query('SELECT product_role,connection_mode,selected_source_id,status FROM line_accounts WHERE account_id=$1', [admin])).rows;
+    let committed = false;
+    expect(await accounts.applyWorkerLogin(binding, mid, 'Admin', undefined, async () => { committed = true; }, true)).toBe(false);
+    expect(committed).toBe(false);
+    expect((await pool.query('SELECT product_role,connection_mode,selected_source_id,status FROM line_accounts WHERE account_id=$1', [admin])).rows).toEqual(before);
+  });
+
+  it('reuses the same external-monitor holder without changing its source configuration', async () => {
+    const agent = await accounts.reserveAccountSlot();
+    await accounts.setOwnMid(agent.accountId, `u${'a'.repeat(32)}`);
+    const mid = `u${'b'.repeat(32)}`;
+    await accounts.bindPrimaryAdminFromExternalMonitor({ mid, correlationId: 'external-admin' });
+    const before = (await pool.query("SELECT * FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows;
+    expect(await accounts.bindPrimaryAdministrator(agent.accountId, mid, mid)).toBe(true);
+    expect((await pool.query("SELECT * FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows).toEqual(before);
+  });
+
+  it('rolls replacement back when the legacy binding conflicts with the current Primary Admin holder', async () => {
+    const agent = await accounts.reserveAccountSlot();
+    await accounts.setOwnMid(agent.accountId, `u${'a'.repeat(32)}`);
+    const holderMid = `u${'b'.repeat(32)}`;
+    await accounts.bindPrimaryAdminFromExternalMonitor({ mid: holderMid, correlationId: 'conflicting-admin' });
+    const bindingMid = `u${'c'.repeat(32)}`;
+    await pool.query('UPDATE account_administrators SET chat_id=$2,user_id=$2 WHERE account_id=$1', [agent.accountId, bindingMid]);
+    const control = await accounts.getControlState();
+    await expect(accounts.replaceAgentAccount(agent.accountId, control.controlEpoch)).rejects.toThrow('PRIMARY_ADMIN_IDENTITY_CONFLICT');
+    expect(await accounts.getAccount(agent.accountId)).toMatchObject({ productRole: 'AGENT', ownMid: `u${'a'.repeat(32)}` });
+    expect(await accounts.getControlState()).toEqual(control);
+    expect((await pool.query('SELECT count(*) FROM line_accounts')).rows[0].count).toBe('2');
+    expect((await pool.query('SELECT user_id FROM account_administrators WHERE account_id=$1', [agent.accountId])).rows).toEqual([{ user_id: bindingMid }]);
   });
 
   it('does not retire the old Agent or create a second slot on a failed or duplicate replacement', async () => {

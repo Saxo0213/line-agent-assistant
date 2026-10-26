@@ -4,6 +4,7 @@ import { createLinejsAdapter } from './linejs-adapter.js';
 import { LineWorkerLoop, type LineTransport, type LineWorkerOptions } from './worker-loop.js';
 import { createWindowsAttachmentBroker } from './windows-attachment-broker.js';
 import { DIAGNOSTIC_OPERATIONS, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+import { isLineServerRejection } from './line-server-error.js';
 
 const COMMAND_TYPES: ReadonlySet<string> = new Set(LineWorkerCommandSchema.options.map((option) => option.shape.type.value));
 const DIAGNOSTIC_OPERATION_SET: ReadonlySet<string> = new Set(DIAGNOSTIC_OPERATIONS);
@@ -197,9 +198,12 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
       } else {
         const diagnostic = commandExecutionStarted ? operationError(command)
           : { code: 'INVALID_COMMAND' as const, message: 'Worker command rejected' };
-        await emit({ type: 'error', ...identity, ...diagnostic, retryable: false,
-          diagnostic: diagnosticFailure(command?.type ?? rejectedOperation(input), commandExecutionStarted ? 'execute'
+        const serverRejection = isLineServerRejection(error) ? error : null;
+        await emit({ type: 'error', ...identity, ...diagnostic,
+          ...(serverRejection ? { code: serverRejection.code, message: serverRejection.message } : {}), retryable: false,
+          diagnostic: { ...diagnosticFailure(command?.type ?? rejectedOperation(input), commandExecutionStarted ? 'execute'
             : command?.type === 'init' && initializing ? 'bootstrap' : 'admission', error),
+            ...(serverRejection ? { category: 'denied' as const, recovery: 'none' as const, upstreamCode: serverRejection.upstreamCode } : {}) },
           ...(command ? ('requestId' in command ? { requestId: command.requestId } : {})
             : rejectedRequestId(input) !== undefined ? { requestId: rejectedRequestId(input)! } : {}) });
       }

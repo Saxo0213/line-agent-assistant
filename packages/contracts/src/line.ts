@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isLineServerErrorCode } from './line-server-error.js';
 import { JsonValueSchema } from './json.js';
 import { AccountModeSchema, ChatTypeSchema, WritableChatTypeSchema, ControlEpochSchema, WritableConversationKeySchema, WorkerBindingSchema } from './account.js';
 
@@ -186,7 +187,9 @@ export const AttachmentResultSchema = z.discriminatedUnion('status', [
     sha256: z.string().regex(/^[a-fA-F0-9]{64}$/), sizeBytes: z.number().int().nonnegative(), name: z.string().min(1) }),
   WritableConversationKeySchema.extend({ type: z.literal('attachmentResult'), attachmentId: UuidSchema, attemptToken: UuidSchema, workerInstanceId: IdSchema,
     controlEpoch: ControlEpochSchema.optional(), transportOwnerId: IdSchema.optional(), transportGeneration: ControlEpochSchema.optional(),
-    writeGrantVersion: ControlEpochSchema.optional(), status: z.enum(['failed', 'expired']), error: z.string().min(1) }),
+    writeGrantVersion: ControlEpochSchema.optional(), status: z.enum(['failed', 'expired']), error: z.string().min(1),
+    serverErrorCode: z.string().max(80).refine((value) => value.startsWith('LINE_TALK_') && isLineServerErrorCode(value)).optional(),
+    upstreamCode: z.number().int().min(-1_000_000_000).max(1_000_000_000).optional() }),
 ]);
 export type AttachmentResult = z.infer<typeof AttachmentResultSchema>;
 

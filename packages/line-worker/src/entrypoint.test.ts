@@ -1,9 +1,29 @@
 import { expect, it, vi } from 'vitest';
 import { FakeLineTransport } from './fake-transport.js';
 import { fetchLineRequest, fetchWithTimeout, runWorkerLoopOnPort } from './entrypoint.js';
+import { LineServerRejection } from './line-server-error.js';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const cursor = { version: 1 as const, revision: '0', globalRev: '0', individualRev: '0' };
+
+it('projects a rejected reaction into fixed event text and numeric audit diagnostic', async () => {
+  const channel = port();
+  const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+  const secret = 'token=private MID=u12345678901234567890123456789012 text=private';
+  const rejection = Object.assign(new LineServerRejection('LINE_TALK_MESSAGE_NOT_FOUND', 64),
+    { reason: secret, parameterMap: { token: secret }, rawBody: secret });
+  transport.react = async () => { throw rejection; };
+  runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
+  await channel.send({ type: 'reactMessage', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'reaction-rejected',
+    messageId: '9', reaction: 'NICE' });
+  await vi.waitFor(() => expect(channel.events).toContainEqual(expect.objectContaining({ type: 'error',
+    requestId: 'reaction-rejected', code: 'LINE_TALK_MESSAGE_NOT_FOUND',
+    message: 'LINE_TALK_MESSAGE_NOT_FOUND',
+    diagnostic: expect.objectContaining({ category: 'denied', recovery: 'none', upstreamCode: 64 }) })));
+  expect(JSON.stringify(channel.events)).not.toContain(secret);
+});
 
 it('passes the native LINE request signal and body straight to production fetch', async () => {
   const controller = new AbortController();

@@ -5,10 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { BaseClient, InternalError } from '@evex/linejs/base';
 import { MemoryStorage } from '@evex/linejs/storage';
 import { Protocols } from '@evex/linejs/thrift';
-import { normalizeNativePicturePath, type AccountMode, type ChatResourceReadCommand, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue, type NativeAttachmentDownloadInput, type TalkCursorV1Dto } from '@line-agent/contracts';
+import { normalizeNativePicturePath, relationAddServerError, TALK_SERVER_ERRORS, type AccountMode, type ChatResourceReadCommand, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue, type NativeAttachmentDownloadInput, type RelationAddServerErrorCode, type TalkCursorV1Dto } from '@line-agent/contracts';
 import {
   createMutationGate, EffectDeniedError, isReadOnlyRpc,
-  type ControlLease, type ControlLeasePhase, type DirectFetchEffect, type MediaUploadScope, type RpcCallContext, type RpcTransportState,
+  type ControlLease, type ControlLeasePhase, type DirectFetchEffect, type MediaUploadScope, type RpcCallContext, type RpcTransportState, type ServerLogoutPermit,
   type ChatResourceFetchEffect,
   type TrustedInvocationDispatch, type TrustedRequestClient,
 } from './mutation-gate.js';
@@ -21,6 +21,7 @@ import { SafeAttachmentError } from './attachment-error.js';
 import { parseEncryptedAccessToken, validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { boundedChatResourceResponseCode, ChatResourceFailure, safeChatResourceFailureDetails,
   safeChatResourceUpstreamCode, safeChatResourceUpstreamNumber } from './chat-resource-error.js';
+import { decodeLinejsServerRejection, isLineServerRejection, isTalkAuthInvalidation } from './line-server-error.js';
 
 type OpaqueCall = () => Promise<unknown>;
 type SourceCall = Readonly<{
@@ -34,12 +35,68 @@ type AttachmentDownloadContext = Readonly<{ signal: AbortSignal; maxBytes: numbe
 /** Bounds only the token RPC and OBS preflight responses during download-auth adoption. */
 const DOWNLOAD_AUTH_PREFLIGHT_MAX_BYTES = 64 * 1024;
 type RelationAddContext = { consumed: boolean; signal: RelationCancellation; onPhysicalStart: () => void };
+type ServerLogoutContext = Readonly<{ permit: ServerLogoutPermit; signal: AbortSignal }>;
+
+function isExplicitAuthInvalidation(error: unknown): boolean {
+  if (!(error instanceof InternalError) || error.name !== 'RequestError' || error.type !== 'RequestError'
+    || !error.data || typeof error.data !== 'object' || Array.isArray(error.data)) return false;
+  const code = Object.getOwnPropertyDescriptor(error.data, 'code');
+  return !!code && Object.hasOwn(code, 'value')
+    && ['AUTHENTICATION_FAILED', 'NOT_AVAILABLE_USER', 'NOT_AUTHORIZED_DEVICE'].includes(String(code.value));
+}
+
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error('LINE server logout aborted'));
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const onAbort = () => { cleanup(); reject(signal.reason instanceof Error ? signal.reason : new Error('LINE server logout aborted')); };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then((value) => { cleanup(); resolve(value); }, (error) => { cleanup(); reject(error); });
+  });
+}
+
+const FRIEND_ADD_RESULT_ERRORS = [
+  'UNKNOWN', 'INVALID_TARGET_USER', 'AGE_VALIDATION', 'TOO_MANY_FRIENDS', 'TOO_MANY_REQUESTS',
+  'MALFORMED_REQUEST', 'TRACKING_META_QRCODE_FAVORED', 'TRACKING_META_UPGRADE_FAVORED',
+] as const;
+const FRIEND_ADD_REJECTION_NAMES = new Set<string>(FRIEND_ADD_RESULT_ERRORS);
+
+function friendAddResultCode(value: unknown): RelationAddServerErrorCode | null {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < FRIEND_ADD_RESULT_ERRORS.length) {
+    return relationAddServerError(FRIEND_ADD_RESULT_ERRORS[value])?.code ?? null;
+  }
+  return null;
+}
+
+function friendAddRejectionReason(value: unknown): RelationAddServerErrorCode | null {
+  return friendAddResultCode(value) ?? (typeof value === 'string' && FRIEND_ADD_REJECTION_NAMES.has(value)
+    ? relationAddServerError(value)?.code ?? null : null);
+}
+
+function ownDataValue(object: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(object, key);
+  return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+}
+
+function friendAddRejectionError(error: unknown): RelationAddServerErrorCode | null {
+  if (!(error instanceof InternalError) || error.name !== 'RequestError' || error.type !== 'RequestError') return null;
+  if (!error.data || typeof error.data !== 'object' || Array.isArray(error.data)) return null;
+  const data = error.data as Record<string, unknown>;
+  if (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null) return null;
+  const gatewayError = friendAddResultCode(ownDataValue(data, 'code'));
+  if (gatewayError) return gatewayError;
+  const nested = ownDataValue(data, 'be');
+  if (!nested || typeof nested !== 'object' || Array.isArray(nested)
+    || (Object.getPrototypeOf(nested) !== Object.prototype && Object.getPrototypeOf(nested) !== null)) return null;
+  return friendAddRejectionReason(ownDataValue(nested, 'rejectionReason'));
+}
 
 function isNotAuthorizedDeviceRequestError(error: unknown): boolean {
-  if (!(error instanceof Error) || error.name !== 'RequestError') return false;
-  const requestError = error as Error & { type?: unknown; data?: unknown };
-  if (requestError.type !== 'RequestError' || !requestError.data || typeof requestError.data !== 'object') return false;
-  return (requestError.data as Record<string, unknown>).code === 'NOT_AUTHORIZED_DEVICE';
+  if (!(error instanceof InternalError) || error.name !== 'RequestError' || error.type !== 'RequestError') return false;
+  if (!error.data || typeof error.data !== 'object' || Array.isArray(error.data)) return false;
+  const data = error.data as Record<string, unknown>;
+  if (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null) return false;
+  return ownDataValue(data, 'code') === 'NOT_AUTHORIZED_DEVICE';
 }
 
 export type LinejsAdapterOptions = Readonly<ControlLease & {
@@ -317,6 +374,7 @@ function classifyNativeAttachmentFailure(error: unknown): SafeAttachmentError {
 
 function classifyAttachmentRpcPhase(error: unknown,
   phaseCode: 'LINE_E2EE_METADATA_RPC_FAILED' | 'LINE_OBS_TOKEN_RPC_FAILED', requestFailed: boolean): SafeAttachmentError {
+  if (isLineServerRejection(error)) return new SafeAttachmentError(phaseCode, error.code, error.upstreamCode);
   const safe = error instanceof SafeAttachmentError ? error : classifyNativeAttachmentFailure(error);
   if (safe.code === 'LINE_AUTH_INVALIDATED' || safe.code === 'ATTACHMENT_EFFECT_DENIED'
     || safe.code === 'LINE_E2EE_SELF_KEY_MISSING' || safe.code === 'LINE_E2EE_PEER_KEY_UNAVAILABLE'
@@ -566,15 +624,20 @@ export class LinejsAdapter implements LineTransport {
   readonly #storage: RotatingMemoryStorage;
   readonly #options: LinejsAdapterOptions;
   readonly #gate: ReturnType<typeof createMutationGate<OpaqueCall, unknown, Response>>;
-  readonly #listeners: Partial<Record<'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated', (value?: any) => void>> = {};
+  readonly #listeners: Partial<Record<'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated' | 'refreshFailure', (value?: any) => void>> = {};
   readonly #directFetchContext = new AsyncLocalStorage<DirectFetchEffect>();
   readonly #chatResourceFetchContext = new AsyncLocalStorage<ChatResourceFetchEffect>();
   readonly #attachmentDownloadContext = new AsyncLocalStorage<AttachmentDownloadContext>();
   readonly #mediaUploadContext = new AsyncLocalStorage<MediaUploadScope>();
+  readonly #serverLogoutContext = new AsyncLocalStorage<ServerLogoutContext>();
   readonly #requestFailures = new WeakSet<object>();
   #revoked = false;
   #refreshingCredentials = false;
   #refreshInFlight: Promise<void> | undefined;
+  #refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  #refreshTimerGeneration = 0;
+  #tokenScheduleActive = true;
+  #serverLogoutStarted = false;
   #downloadAuthAdopted = false;
   #adoptedObsToken: string | null = null;
   #activeRelationAdd: RelationAddContext | undefined;
@@ -598,6 +661,12 @@ export class LinejsAdapter implements LineTransport {
         const source = sourceContext.getStore();
         const dispatch = dispatchContext.getStore();
         if (!source || !dispatch) {
+          const serverLogout = this.#serverLogoutContext.getStore();
+          if (serverLogout) {
+            const response = await this.#gate.runServerLogout(request, serverLogout.permit, serverLogout.signal);
+            await this.#validateServerLogoutResponse(response, serverLogout.signal);
+            return response;
+          }
           const upload = this.#mediaUploadContext.getStore();
           if (upload) {
             // linejs appends "/r/..." to a prefix that already ends in "/", so the path arrives as "//r/...".
@@ -663,16 +732,22 @@ export class LinejsAdapter implements LineTransport {
       if (source && !isReadOnlyRpc(source.path, source.methodName)) {
         throw new EffectDeniedError('native token refresh is denied for a non-read RPC to prevent mutation replay');
       }
+      if (this.#serverLogoutStarted && !this.#refreshInFlight) {
+        throw new EffectDeniedError('token refresh is paused during server logout');
+      }
       let inFlight = this.#refreshInFlight;
       if (!inFlight) {
+        const generation = this.#refreshTimerGeneration;
         inFlight = (async () => {
           this.#refreshingCredentials = true;
           try {
             await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' },
               () => this.#storage.suppressEvents(nativeRefresh));
+            if (!this.#tokenScheduleActive || this.#revoked || generation !== this.#refreshTimerGeneration) return;
             const token = this.#base.authToken;
             if (!token) throw new Error('LINEJS refresh returned no access token');
             this.#listeners.credentials?.({ token, e2eeStorage: safeRaw(this.#storage.getAll()) });
+            void this.#scheduleTokenRefresh();
           } finally { this.#refreshingCredentials = false; }
         })();
         this.#refreshInFlight = inFlight;
@@ -691,7 +766,16 @@ export class LinejsAdapter implements LineTransport {
           if (error !== null && (typeof error === 'object' || typeof error === 'function')) {
             this.#requestFailures.add(error as object);
           }
-          if (isNotAuthorizedDeviceRequestError(error)) this.#listeners.authInvalidated?.();
+          if (isTalkAuthInvalidation(error, path, methodName, protocolType)
+            || (path === '/EXT/auth/tokenrefresh/v1' && isNotAuthorizedDeviceRequestError(error))) {
+            this.#cancelTokenRefresh(true);
+            this.#listeners.authInvalidated?.();
+          }
+          const rejection = decodeLinejsServerRejection(error, path, methodName, protocolType);
+          if (rejection) {
+            this.#requestFailures.add(rejection);
+            throw rejection;
+          }
           throw error;
         }
       });
@@ -736,7 +820,10 @@ export class LinejsAdapter implements LineTransport {
       if (!this.#refreshingCredentials) this.#listeners.token?.(token);
     });
     base.on('update:qrcert', (qrCert) => this.#listeners.qrCert?.(qrCert));
-    this.#storage.setListener((snapshot) => this.#listeners.storage?.(snapshot));
+    this.#storage.setListener((snapshot) => {
+      this.#listeners.storage?.(snapshot);
+      void this.#scheduleTokenRefresh();
+    });
   }
 
   static async create(options: LinejsAdapterOptions): Promise<LinejsAdapter> {
@@ -745,7 +832,7 @@ export class LinejsAdapter implements LineTransport {
     if (verified.status !== 'verified') throw new ProtocolUnverifiedError(verified.reason);
     return new LinejsAdapter(options);
   }
-  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated', listener: (value?: any) => void): void {
+  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated' | 'refreshFailure', listener: (value?: any) => void): void {
     this.#listeners[event] = listener;
   }
   async installSecrets(secrets: { token: string | null; qrCert: string | null; e2eeStorage: JsonValue | null }): Promise<void> {
@@ -755,11 +842,13 @@ export class LinejsAdapter implements LineTransport {
     await this.#storage.load(secrets.e2eeStorage, secrets.qrCert);
     if (secrets.token === null) delete this.#base.authToken;
     else this.#base.authToken = secrets.token;
+    await this.#scheduleTokenRefresh();
   }
   async loginQr(): Promise<TransportIdentity> {
     this.#downloadAuthAdopted = false;
     this.#adoptedObsToken = null;
     await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ qr: true, v3: true }));
+    await this.#scheduleTokenRefresh();
     return this.#profile();
   }
   async loginToken(token: string): Promise<TransportIdentity> {
@@ -776,7 +865,96 @@ export class LinejsAdapter implements LineTransport {
       tokenToUse = refreshedToken;
     }
     await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ authToken: tokenToUse }));
+    await this.#scheduleTokenRefresh();
     return this.#profile();
+  }
+  async #validateServerLogoutResponse(response: Response, signal: AbortSignal): Promise<void> {
+    let parsed: ReturnType<BaseClient['thrift']['readThrift']>;
+    try {
+      const bytes = new Uint8Array(await abortable(response.clone().arrayBuffer(), signal));
+      parsed = this.#base.thrift.readThrift(bytes, Protocols[4]!);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      throw new Error('LINE_LOGOUT_MALFORMED_RESPONSE');
+    }
+    if (parsed._info.fname !== 'logoutZ' || parsed._info.mtype !== 2
+      || !parsed.data || typeof parsed.data !== 'object' || Array.isArray(parsed.data)) {
+      throw new Error('LINE_LOGOUT_MALFORMED_RESPONSE');
+    }
+    const fields = parsed.data as Record<string, unknown>;
+    const responseFieldIds = Object.keys(fields);
+    if (responseFieldIds.length === 0) {
+      if (!response.ok) throw new Error('LINE_LOGOUT_SERVER_REJECTED');
+      return;
+    }
+    const exception = fields['1'];
+    if (responseFieldIds.length !== 1 || !exception || typeof exception !== 'object' || Array.isArray(exception)) {
+      throw new Error('LINE_LOGOUT_MALFORMED_RESPONSE');
+    }
+    const code = (exception as Record<string, unknown>)['1'];
+    if (typeof code !== 'number' || !Number.isSafeInteger(code)) throw new Error('LINE_LOGOUT_MALFORMED_RESPONSE');
+    const errorName = Object.entries(TALK_SERVER_ERRORS).find(([, [upstreamCode]]) => upstreamCode === code)?.[0];
+    if (errorName === 'AUTHENTICATION_FAILED' || errorName === 'NOT_AVAILABLE_USER' || errorName === 'NOT_AUTHORIZED_DEVICE') {
+      throw new InternalError('RequestError', 'LINE authentication was invalidated during logout', { code: errorName });
+    }
+    throw new Error('LINE_LOGOUT_SERVER_REJECTED');
+  }
+
+  async logoutServer(signal: AbortSignal = new AbortController().signal): Promise<void> {
+    if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('LINE server logout aborted');
+    if (this.#serverLogoutStarted) throw new EffectDeniedError('server logout already started');
+    this.#serverLogoutStarted = true;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    try {
+      const refreshInFlight = this.#refreshInFlight;
+      if (refreshInFlight) await abortable(refreshInFlight.catch(() => undefined), signal);
+      if (!this.#tokenScheduleActive || this.#revoked) return;
+      const token = this.#base.authToken;
+      if (typeof token !== 'string' || token.length === 0) throw new Error('LINE_LOGOUT_NO_TOKEN');
+      const permit = this.#gate.createServerLogoutPermit(token);
+      await this.#serverLogoutContext.run({ permit, signal }, () => this.#base.auth.logoutZ());
+      this.#cancelTokenRefresh(true);
+    } catch (error) {
+      if (isExplicitAuthInvalidation(error)) {
+        this.#cancelTokenRefresh(true);
+        this.#listeners.authInvalidated?.();
+        return;
+      }
+      this.#serverLogoutStarted = false;
+      // An aborted wait leaves the refresh running. Its completion will persist
+      // the rotated credentials and schedule from their new expiry exactly once.
+      if (!this.#refreshInFlight) await this.#scheduleTokenRefresh();
+      throw error;
+    }
+  }
+  async #scheduleTokenRefresh(): Promise<void> {
+    if (!this.#tokenScheduleActive || this.#revoked) return;
+    const generation = ++this.#refreshTimerGeneration;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    if (this.#serverLogoutStarted) return;
+    try {
+      const [expire, refreshToken] = await Promise.all([this.#storage.get('expire'), this.#storage.get('refreshToken')]);
+      if (!this.#tokenScheduleActive || this.#revoked || generation !== this.#refreshTimerGeneration || this.#serverLogoutStarted
+        || typeof expire !== 'number' || !Number.isFinite(expire) || typeof refreshToken !== 'string' || !refreshToken) return;
+      const earlyBoundaryMs = Math.random() * 1000;
+      const delayMs = Math.max(0, expire * 1000 - Date.now() - earlyBoundaryMs);
+      this.#refreshTimer = setTimeout(() => {
+        if (!this.#tokenScheduleActive || this.#revoked || generation !== this.#refreshTimerGeneration || this.#serverLogoutStarted) return;
+        this.#refreshTimer = undefined;
+        void this.#base.auth.tryRefreshToken().catch(() => {
+          if (this.#tokenScheduleActive && !this.#revoked) this.#listeners.refreshFailure?.({ code: 'LINE_TOKEN_REFRESH_FAILED' });
+        });
+      }, Math.min(delayMs, 2_147_000_000));
+      this.#refreshTimer.unref?.();
+    } catch { /* Missing or unreadable stored auth does not invalidate a usable session. */ }
+  }
+  #cancelTokenRefresh(deactivate = false): void {
+    if (deactivate) this.#tokenScheduleActive = false;
+    this.#refreshTimerGeneration += 1;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
   }
   async adoptDownloadAuth(token: string, application: string,
     options?: Readonly<{ expectedMid?: string; probe?: DownloadAuthProbe; signal?: AbortSignal }>): Promise<TransportIdentity> {
@@ -1223,7 +1401,10 @@ export class LinejsAdapter implements LineTransport {
         throw new SafeAttachmentError(reason?.code === 'TIMEOUT' ? 'LINE_DOWNLOAD_TIMEOUT' : 'LINE_DOWNLOAD_CANCELLED');
       }
       const safe = error instanceof SafeAttachmentError ? error : classifyNativeAttachmentFailure(error);
-      if (safe.code === 'LINE_AUTH_INVALIDATED') this.#listeners.authInvalidated?.();
+      if (safe.code === 'LINE_AUTH_INVALIDATED') {
+        this.#cancelTokenRefresh(true);
+        this.#listeners.authInvalidated?.();
+      }
       throw safe;
     }
   }
@@ -1271,7 +1452,7 @@ export class LinejsAdapter implements LineTransport {
             contentType as never)) as Buffer[];
         prepared = { objId, size: encrypted.size, chunks };
       } catch (error) {
-        if (error instanceof EffectDeniedError) throw error;
+        if (error instanceof EffectDeniedError || isLineServerRejection(error)) throw error;
         throw new MediaUploadFailedError();
       }
       const extension = media.fileName.split('.').at(-1);
@@ -1321,13 +1502,11 @@ export class LinejsAdapter implements LineTransport {
   async checkFriendRelationDiagnostic(targetMid: string, lease: ControlLease,
     signal: RelationCancellation = { aborted: false }): Promise<FriendRelationDiagnostic> {
     if (this.#options.mode !== 'ACTIVE_CONTROL' || this.#revoked) return { status: 'unknown', error: 'RELATION_BINDING_REVOKED' };
-    let stage: 'list' | 'detail' = 'list';
     const unknown = (error: string): FriendRelationDiagnostic => ({ status: 'unknown', error });
     try {
       const seenTokens = new Set<string>();
       let token: string | undefined;
       let entries = 0;
-      let found = false;
       for (let page = 0; page < 100; page += 1) {
         if (signal.aborted || this.#revoked) return unknown(this.#revoked ? 'RELATION_BINDING_REVOKED' : 'RELATION_CANCELLED');
         const response = await this.#gate.invokeRpc({ phase: 'CONTROL_READ', lease }, () =>
@@ -1342,10 +1521,8 @@ export class LinejsAdapter implements LineTransport {
         const mids = midsValue === undefined ? [] : midsValue as unknown[];
         entries += mids.length;
         if (entries > 100_000) return unknown('RELATION_LIST_LIMIT');
-        for (const mid of mids) {
-          if (typeof mid !== 'string') return unknown('RELATION_LIST_SHAPE_INVALID');
-          if (mid === targetMid) found = true;
-        }
+        if (mids.some((mid) => typeof mid !== 'string')) return unknown('RELATION_LIST_SHAPE_INVALID');
+        if (mids.includes(targetMid)) return { status: 'friend', error: null };
         const next = tokenValue === undefined ? '' : tokenValue as string;
         if (next === '') break;
         if (seenTokens.has(next)) return unknown('RELATION_LIST_LIMIT');
@@ -1353,33 +1530,15 @@ export class LinejsAdapter implements LineTransport {
         if (page === 99) return unknown('RELATION_LIST_LIMIT');
         token = next;
       }
-      if (!found) return { status: 'not_friend', error: null };
-      if (signal.aborted || this.#revoked) return unknown(this.#revoked ? 'RELATION_BINDING_REVOKED' : 'RELATION_CANCELLED');
-      stage = 'detail';
-      const details = await this.#gate.invokeRpc({ phase: 'CONTROL_READ', lease }, () =>
-        this.#base.relation.getFriendDetails({ request: {
-          targetUsers: [{ targetUserMid: targetMid }], syncReason: 'AUTO_REPAIR',
-        } })) as { responses: unknown[] };
-      if (signal.aborted || this.#revoked) return unknown(this.#revoked ? 'RELATION_BINDING_REVOKED' : 'RELATION_CANCELLED');
-      if (!details || !Array.isArray(details.responses) || details.responses.length !== 1) return unknown('RELATION_DETAIL_SHAPE_INVALID');
-      const detail = details.responses[0] as { targetUserMid?: unknown; friendDetail?: unknown } | undefined;
-      if (!detail || detail.targetUserMid !== targetMid || !detail.friendDetail || typeof detail.friendDetail !== 'object') return unknown('RELATION_DETAIL_SHAPE_INVALID');
-      const isRecord = (item: unknown): item is Record<string, unknown> => item !== null && typeof item === 'object' && !Array.isArray(item);
-      const value = detail.friendDetail;
-      if (!isRecord(value)) return unknown('RELATION_DETAIL_SHAPE_INVALID');
-      const keys = Object.keys(value);
-      if (keys.length !== 1 || !['user', 'bot', 'notFriend'].includes(keys[0]!)) return unknown('RELATION_DETAIL_SHAPE_INVALID');
-      if (!isRecord(value[keys[0]!])) return unknown('RELATION_DETAIL_SHAPE_INVALID');
-      return { status: keys[0] === 'notFriend' ? 'not_friend' : 'friend', error: null };
-    } catch (error) {
+      return { status: 'not_friend', error: null };
+    } catch {
       if (this.#revoked) return unknown('RELATION_BINDING_REVOKED');
       if (signal.aborted) return unknown('RELATION_CANCELLED');
-      if (stage === 'list') return unknown('RELATION_LIST_RPC_FAILED');
-      return { ...unknown('RELATION_DETAIL_RPC_FAILED'), ...safeChatResourceFailureDetails(error) };
+      return unknown('RELATION_LIST_RPC_FAILED');
     }
   }
   async addFriendByMid(targetMid: string, lease: ControlLease, onPhysicalStart: () => void,
-    signal: RelationCancellation = { aborted: false }): Promise<FriendAddResult> {
+    signal: RelationCancellation = { aborted: false }, sourceChatMid?: string): Promise<FriendAddResult> {
     if (this.#options.mode !== 'ACTIVE_CONTROL' || this.#revoked || this.#activeRelationAdd) {
       return { status: 'failed', error: 'SIDE_EFFECT_DENIED' };
     }
@@ -1391,15 +1550,19 @@ export class LinejsAdapter implements LineTransport {
           if (signal.aborted || this.#revoked || this.#options.mode !== 'ACTIVE_CONTROL') {
             throw new EffectDeniedError('Relation add cancelled before LINEJS call');
           }
-          return this.#base.relation.addFriendByMid({ mid: targetMid });
+          return this.#base.relation.addFriendByMid(sourceChatMid === undefined
+            ? { mid: targetMid, reference: '', trackingMetaType: 10 }
+            : { mid: targetMid, reference: '', trackingMetaType: 5, trackingMetaHint: sourceChatMid });
         });
       return { status: 'added', error: null };
     } catch (error) {
-      return state.consumed ? { status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' }
-        : { status: 'failed', error: error instanceof EffectDeniedError ? 'SIDE_EFFECT_DENIED' : 'NOT_STARTED' };
+      if (!state.consumed) return { status: 'failed', error: error instanceof EffectDeniedError ? 'SIDE_EFFECT_DENIED' : 'NOT_STARTED' };
+      const rejectionError = friendAddRejectionError(error);
+      return rejectionError ? { status: 'failed', error: rejectionError }
+        : { status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' };
     } finally { this.#activeRelationAdd = undefined; }
   }
-  revoke(): void { this.#revoked = true; this.#adoptedObsToken = null; }
+  revoke(): void { this.#revoked = true; this.#adoptedObsToken = null; this.#cancelTokenRefresh(true); }
   #clearChatResourceTokens(): void {
     const timeline = this.#base.timeline as unknown as { timelineToken?: string; timelineHeaders: Record<string, string | undefined> };
     delete timeline.timelineToken;

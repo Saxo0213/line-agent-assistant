@@ -2,13 +2,13 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 import type {
   AgentEvent, AgentProvider, AgentRunRequest, ConversationKey, DiagnosticIdentity, DownloadAuthProbe, IpcEvent, IpcRequest, IpcResult, LineWorkerCommand,
-  LineWorkerEvent, WorkerBinding, ComponentHealth,
+  LineWorkerEvent, WorkerBinding, ComponentHealth, LineServerErrorCode,
 } from '@line-agent/contracts';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType } from '@line-agent/contracts';
+import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
 import {
   AccountRepository, AdminRepository, AgentPermissionError, AgentPermissionRepository, AgentRepository, resolveJobPolicy, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, RoomActivationRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
@@ -239,8 +239,10 @@ export type OfficialSnapshotImporter = {
 };
 
 const accepted = (requestId: string): IpcResult => ({ type: 'accepted', requestId, ok: true });
-const failure = (requestId: string, code: string, message: string, retryable = false): IpcResult =>
-  ({ type: 'error', requestId, ok: false, code, message, retryable });
+const failure = (requestId: string, code: string, message: string, retryable = false,
+  serverErrorCode?: LineServerErrorCode): IpcResult =>
+  ({ type: 'error', requestId, ok: false, code, message, retryable,
+    ...(serverErrorCode ? { serverErrorCode } : {}) });
 const JOB_NOT_RETRYABLE = 'AGENT_JOB_NOT_RETRYABLE';
 const JOB_NOT_RETRYABLE_MESSAGE = '此任務目前無法重試（可能已取消、已產生輸出，或所屬 Agent 會話已變更）。';
 
@@ -322,14 +324,19 @@ function workerOperationErrorCode(code: string): AuditErrorCode {
   return 'WORKER_OPERATION_FAILED';
 }
 
-function recordWorkerDiagnostic(options: ConnectedFacadeOptions, event: Extract<LineWorkerEvent,
+export function recordWorkerDiagnostic(options: ConnectedFacadeOptions, event: Extract<LineWorkerEvent,
   { type: 'error' | 'catalogRefreshStatus' }>): void {
   if (!options.audit) return;
   try {
     if (event.type === 'catalogRefreshStatus') {
+      const upstreamCode = event.state === 'degraded' && event.serverError
+        ? talkServerError(event.serverError.slice('LINE_TALK_'.length))?.upstreamCode : undefined;
       options.audit.observed('line_catalog_refresh', { initiator: 'worker', accountId: event.accountId,
-        workerInstanceId: event.workerInstanceId, ...(event.state === 'degraded'
-          ? { errorCode: workerOperationErrorCode(event.code) } : { resultCode: 'catalog_refresh_recovered' }) });
+        workerInstanceId: event.workerInstanceId,
+        ...(upstreamCode === undefined ? {} : { diagnostic: { operation: 'catalog_refresh', stage: 'read',
+          category: 'denied', recovery: 'none', upstreamCode } as const }),
+        ...(event.state === 'degraded'
+          ? { errorCode: workerOperationErrorCode(event.serverError ?? event.code) } : { resultCode: 'catalog_refresh_recovered' }) });
       return;
     }
     const errorCode = workerOperationErrorCode(event.code);
@@ -345,6 +352,37 @@ function recordWorkerDiagnostic(options: ConnectedFacadeOptions, event: Extract<
       ...(event.diagnostic ? { diagnostic: event.diagnostic } : {}),
       ...(event.requestId ? { requestId: event.requestId } : {}) });
   } catch { /* Diagnostics cannot affect command results or worker readiness. */ }
+}
+
+export function recordKnownServerResult(options: ConnectedFacadeOptions, event: Extract<LineWorkerEvent,
+  { type: 'ownProfileResult' | 'sendResult' | 'unsendResult' | 'addFriendResult' }>): void {
+  if (!options.audit || typeof event.error !== 'string' || !isLineServerErrorCode(event.error)) return;
+  const relation = event.type === 'addFriendResult';
+  const projection = relation
+    ? event.error.startsWith('LINE_RELATION_ADD_') && relationAddServerError(event.error.slice('LINE_RELATION_ADD_'.length))
+    : event.error.startsWith('LINE_TALK_') && talkServerError(event.error.slice('LINE_TALK_'.length));
+  if (!projection) return;
+  const operation = event.type === 'ownProfileResult' ? 'refreshOwnProfile' : event.type === 'sendResult' ? 'sendText'
+    : event.type === 'unsendResult' ? 'unsendMessage' : 'addFriendByMid';
+  try {
+    options.audit.failure({ operation, stage: 'response', category: 'denied', recovery: 'none',
+      upstreamCode: projection.upstreamCode }, { initiator: 'worker', accountId: event.accountId,
+      workerInstanceId: event.workerInstanceId, requestId: event.requestId }, projection.code,
+    relation ? 'friend_add_attempt' : 'worker_operation_error');
+  } catch { /* Diagnostics cannot affect command results. */ }
+}
+
+export function recordAttachmentServerResult(options: ConnectedFacadeOptions,
+  event: Extract<LineWorkerEvent, { type: 'attachmentResult'; status: 'failed' | 'expired' }>): void {
+  if (!options.audit || !event.serverErrorCode?.startsWith('LINE_TALK_')) return;
+  const projection = talkServerError(event.serverErrorCode.slice('LINE_TALK_'.length));
+  if (!projection || event.upstreamCode !== projection.upstreamCode) return;
+  try {
+    options.audit.failure({ operation: 'downloadAttachment', stage: 'response', category: 'denied',
+      recovery: 'none', upstreamCode: projection.upstreamCode },
+    { initiator: 'worker', accountId: event.accountId, workerInstanceId: event.workerInstanceId,
+      requestId: event.attachmentId }, projection.code, 'worker_operation_error');
+  } catch { /* Diagnostics cannot affect downloads. */ }
 }
 
 /** Production composition root. Every external process and OS effect is supplied explicitly. */
@@ -662,6 +700,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     getExecutionLevel: async () => (await permissionRepository.getExecutionPolicy()).level,
     folders: chatFolders, workspace });
   const mcpTokens = new McpTokenRepository(options.pool);
+  await mcpTokens.normalizeManagedLocalClientScopes();
   const getMcpLiveLoginBinding = async (accountId: string): Promise<Bound | null> => {
     if ((await accounts.resolveCapabilities(accountId))?.connectionMode !== 'SYSTEM_LOGIN') return null;
     const binding = await options.workers.binding(accountId);
@@ -994,7 +1033,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     options.publish?.({ type: 'attachmentChanged', attachmentId });
     void publishSnapshot().catch(() => undefined);
   }, (error, identity) => options.audit?.failure(parseSafeDiagnostic(error) ?? diagnosticFailure('attachment', 'execute', error), identity), resolveNativeAttachment, async (accountId) =>
-    (await options.pool.query<{ status: string }>('SELECT status FROM line_accounts WHERE account_id=$1', [accountId])).rows[0]?.status === 'connected');
+    (await options.pool.query<{ status: string }>('SELECT status FROM line_accounts WHERE account_id=$1', [accountId])).rows[0]?.status === 'connected',
+  Math.random, (result) => recordAttachmentServerResult(options, result));
   stopAttachmentService = onceCleanup(() => attachmentService.shutdown());
   startupCleanup.add(stopAttachmentService);
   attachmentService.setAutomaticAttemptLimit(conversationSettings.attachmentAutoAttemptLimit);
@@ -1020,7 +1060,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   stopLineMedia = onceCleanup(() => lineMedia.shutdown());
   startupCleanup.add(stopLineMedia);
   const loginAttempts = new Map<string, string>();
-  const adminPairings = new AdminPairingService(admins);
+  const adminPairings = new AdminPairingService({
+    hasPrimary: (accountId) => admins.hasPrimary(accountId),
+    bindPrimary: (accountId, chatId, userId) => accounts.bindPrimaryAdministrator(accountId, chatId, userId),
+  });
   const friendEnrollment = new FriendEnrollmentService({ admins, whitelist: friendWhitelist, accounts, workers: {
     binding: (accountId) => options.workers.binding(accountId),
     isCurrentActiveControlBinding: (binding) => options.workers.isCurrentActiveControlBinding(binding),
@@ -1294,6 +1337,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (event.type === 'downloadAuthResult' || event.type === 'downloadReady') return;
     if (!lineService.isCurrentWorkerEvent(instance, event)) return;
     if (event.type === 'authInvalidated') {
+      // Settle a pending user logout from this exact binding before teardown unbinds it.
+      await lineService.handleWorkerEvent(instance, event);
       // Fence archived resource IO before lifecycle/database teardown can yield.
       chatResourceAdmission.close(event.accountId, 'LINE authentication was invalidated.');
       const binding: WorkerBinding = event;
@@ -1400,6 +1445,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       recordWorkerDiagnostic(options, event);
       return;
     }
+    if (event.type === 'sendResult' || event.type === 'unsendResult' || event.type === 'addFriendResult'
+      || event.type === 'ownProfileResult') recordKnownServerResult(options, event);
     if (event.type === 'conversationCatalog') await publishSnapshot();
     if (event.type === 'catalogRefreshStatus') {
       recordWorkerDiagnostic(options, event);
@@ -2227,7 +2274,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       try {
         const profile = await options.workers.refreshOwnProfile({ ...capturedBinding, type: 'refreshOwnProfile', requestId, timeoutMs: 15_000 });
         if (!profile.ok || profile.ownMid !== account.ownMid) return failure(requestId,
-          'LINE_PROFILE_REFRESH_FAILED', profile.error === 'PROFILE_MISMATCH' ? 'The LINE account identity changed. Refresh was discarded.' : 'LINE profile could not be refreshed.', true);
+          'LINE_PROFILE_REFRESH_FAILED', profile.error === 'PROFILE_MISMATCH' ? 'The LINE account identity changed. Refresh was discarded.' : 'LINE profile could not be refreshed.', true,
+          isLineServerErrorCode(profile.error) ? profile.error : undefined);
         const [current, currentCapabilities, currentBinding] = await Promise.all([
           accounts.getAccount(accountId), accounts.resolveCapabilities(accountId), options.workers.binding(accountId),
         ]);
@@ -2361,15 +2409,19 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return accepted(requestId);
       }
       if (request.type === 'lineLogout') {
-        // Dispatch has validated the logout request; invalidate before entering the async lifecycle lock.
-        chatResourceAdmission.close(request.accountId, 'LINE logout was requested.');
         return await supervisor.runLifecycle(async () => {
-        await stopExternalImportForAccount(request.accountId);
         const account = await accounts.getAccount(request.accountId);
         if (!account) return failure(request.requestId, 'ACCOUNT_NOT_FOUND', '找不到這個 LINE 帳號。');
         const loginAttemptId = loginAttempts.get(request.accountId);
         if (!account.ownMid && !loginAttemptId) return failure(request.requestId, 'ACCOUNT_NOT_AUTHENTICATED', '這不是已完成登入的 LINE 帳號。');
         const binding = await options.workers.binding(request.accountId) ?? supervisor.binding(request.accountId);
+        if (account.ownMid) {
+          if (!binding) throw new Error('LINE_LOGOUT_WORKER_UNAVAILABLE');
+          const logout = await lineService.requestLogout(request.accountId, binding.workerInstanceId);
+          if (!logout.ok && logout.error !== 'LINE_AUTH_INVALIDATED') throw new Error('LINE_LOGOUT_FAILED');
+        }
+        chatResourceAdmission.close(request.accountId, 'LINE logout was confirmed.');
+        await stopExternalImportForAccount(request.accountId);
         if (binding) await auditWorkerStop(binding, () => options.workers.stopBinding(binding), 'user');
         const control = await accounts.getControlState();
         if (control.activeAccountId === request.accountId) {
@@ -2444,7 +2496,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const result = await sendResult;
         if (result.status === 'sent') return accepted(request.requestId);
         return result.status === 'failed'
-          ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', result.error || 'LINE message was not sent.')
+          ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', lineResultErrorMessage(result.error, 'LINE message was not sent.'), false,
+            isLineServerErrorCode(result.error) ? result.error : undefined)
           : failure(request.requestId, 'LINE_SEND_OUTCOME_UNKNOWN', 'LINE send outcome is unknown.');
       }
       if (request.type === 'sendManualMedia') {
@@ -2479,7 +2532,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
               kind: item.kind, filePath: item.filePath, fileName: item.fileName, sizeBytes: item.sizeBytes, sha256: item.sha256,
               manualSend: true }, signal);
             if (result.status !== 'sent') return result.status === 'failed'
-              ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', result.error || 'LINE attachment was not sent.')
+              ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', lineResultErrorMessage(result.error, 'LINE attachment was not sent.'), false,
+                isLineServerErrorCode(result.error) ? result.error : undefined)
               : failure(request.requestId, 'LINE_SEND_OUTCOME_UNKNOWN', 'LINE attachment outcome is unknown.');
           }
           return accepted(request.requestId);
@@ -2519,7 +2573,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         if (admissionFailure) return failure(request.requestId, admissionFailure.code, admissionFailure.message);
         if (!resultPromise || !ownMid) return failure(request.requestId, 'LINE_UNSEND_NOT_STARTED', 'LINE account is not ready to unsend messages.');
         const result = await resultPromise;
-        if (result.status === 'failed') return failure(request.requestId, 'LINE_UNSEND_NOT_STARTED', result.error || 'LINE message was not unsent.');
+        if (result.status === 'failed') return failure(request.requestId, 'LINE_UNSEND_NOT_STARTED',
+          lineResultErrorMessage(result.error, 'LINE message was not unsent.'), false,
+          isLineServerErrorCode(result.error) ? result.error : undefined);
         if (result.status === 'unknown') return failure(request.requestId, 'LINE_UNSEND_OUTCOME_UNKNOWN', 'LINE unsend outcome is unknown.');
         try {
           await messages.recordManualUnsend(request, request.messageId, ownMid);

@@ -22,6 +22,7 @@ import type { Locale } from '../locale.js';
 import type { GeneratedPreview } from '@line-agent/contracts';
 import { EXTRA_DESKTOP_COPY, EXTRA_TRADITIONAL_COPY, EXTRA_JAPANESE_COPY, EXTRA_KOREAN_COPY, SYSTEM_DISPLAY_COPY, SYSTEM_LABELS } from '../desktop-system-copy.js';
 import { DESKTOP_ERROR_COPY, desktopErrorText } from '../desktop-error-copy.js';
+import { lineServerErrorText } from './line-server-error-copy.js';
 import { localeFromState, useLocale } from './locale-context.js';
 
 export type DesktopCopyKey = keyof typeof ENGLISH_DESKTOP_COPY;
@@ -60,6 +61,10 @@ export function desktopText<K extends DesktopCopyKey>(key: K, ...args: Arguments
 
 /** Finite machine codes choose copy; backend prose, paths and stacks never become UI text. */
 export function safeErrorTextFor(locale: Locale, error: unknown, fallback?: string): string {
+  const serverErrorCode = typeof error === 'object' && error !== null
+    ? (error as { serverErrorCode?: unknown }).serverErrorCode : undefined;
+  const serverText = lineServerErrorText(locale, serverErrorCode);
+  if (serverText) return serverText;
   const code = typeof error === 'object' && error !== null
     ? (error as { code?: unknown; errorCode?: unknown }).code ?? (error as { errorCode?: unknown }).errorCode : error;
   if (code === 'AUTORESPONDER_VERSION_CONFLICT') return desktopTextFor(locale, 'settingsChangedElsewhereAndHaveBeenReloaded');

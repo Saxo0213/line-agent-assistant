@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { SafeDiagnosticSchema } from '@line-agent/contracts';
+import { SafeDiagnosticSchema, isLineServerErrorCode, type LineServerErrorCode } from '@line-agent/contracts';
 import { ConversationKeySchema, GeneratedPreviewSchema, MentionRangeSchema, MessageContentSchema, normalizeMentionRanges, SticonRangeSchema, StickerDescriptorSchema } from '@line-agent/contracts';
 
 const AttachmentSchema = z.strictObject({ id: z.uuid(), kind: z.enum(['image', 'video', 'audio', 'file']), name: z.string(), mimeType: z.string(), sizeBytes: z.number().int().nonnegative(), status: z.string(), canRetryManually: z.boolean().optional() });
@@ -59,7 +59,7 @@ const SystemActionLabel = z.enum(['系統操作失敗', '系統啟動', '系統�
   '新增使用者：加入 LINE 好友', '新增使用者：重新確認好友', '新增使用者：授權預檢', '新增使用者：寫入白名單', '相簿照片下載']);
 const SystemPhaseLabel = z.enum(['已提出', '已完成', '失敗', '已記錄']);
 const AttachmentStatusLabel = z.enum(['等待下載', '下載中', '已完成', '已過期', '重試中', '下載失敗']);
-const SystemErrorCode = z.enum(['DATABASE_WRITE_FAILED', 'FALLBACK_WRITE_FAILED', 'WORKER_STOP_FAILED', 'WORKER_STOP_TIMEOUT',
+const LocalSystemErrorCode = z.enum(['DATABASE_WRITE_FAILED', 'FALLBACK_WRITE_FAILED', 'WORKER_STOP_FAILED', 'WORKER_STOP_TIMEOUT',
   'AGENT_AUTH_FAILED', 'SECRET_CLEAR_FAILED', 'OPERATOR_ACTION_FAILED', 'STARTUP_FAILED', 'SHUTDOWN_FAILED', 'WORKER_EXITED',
   'AUTH_INVALIDATED', 'RECOVERY_FAILED', 'PROVIDER_STATUS_FAILED', 'ATTACHMENT_EXPIRED', 'ATTACHMENT_DOWNLOAD_FAILED',
   'RELATION_LIST_RPC_FAILED', 'RELATION_LIST_SHAPE_INVALID', 'RELATION_LIST_LIMIT', 'RELATION_DETAIL_RPC_FAILED',
@@ -71,6 +71,8 @@ const SystemErrorCode = z.enum(['DATABASE_WRITE_FAILED', 'FALLBACK_WRITE_FAILED'
   'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED', 'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED', 'PRIMARY_ADMIN_NOT_FRIEND',
   'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED',
   'UNKNOWN_ERROR']);
+const SystemErrorCode = z.union([LocalSystemErrorCode,
+  z.custom<LineServerErrorCode>((value) => typeof value === 'string' && value.length <= 80 && isLineServerErrorCode(value))]);
 const SystemActivityAuditSchema = z.strictObject({ kind: z.literal('audit'), createdAt: z.iso.datetime({ offset: true }),
   action: SystemActionLabel, phase: SystemPhaseLabel });
 const SystemActivityAttachmentSchema = z.strictObject({ kind: z.literal('attachment'), createdAt: z.iso.datetime({ offset: true }),

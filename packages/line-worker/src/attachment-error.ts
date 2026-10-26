@@ -1,3 +1,5 @@
+import type { LineServerErrorCode } from '@line-agent/contracts';
+
 const FIXED_CODES = new Set([
   'LINE_MEDIA_AUTH_FAILED', 'LINE_E2EE_SELF_KEY_MISSING', 'LINE_E2EE_PEER_KEY_UNAVAILABLE',
   'LINE_E2EE_KEY_MISMATCH', 'LINE_E2EE_UNSUPPORTED', 'LINE_RPC_FAILED', 'LINE_AUTH_INVALIDATED',
@@ -20,7 +22,7 @@ export function isSafeAttachmentFailureCode(value: unknown): value is Attachment
 
 export class SafeAttachmentError extends Error {
   readonly code: AttachmentFailureCode;
-  constructor(code: string) {
+  constructor(code: string, readonly serverErrorCode?: LineServerErrorCode, readonly upstreamCode?: number) {
     if (!isSafeAttachmentFailureCode(code)) throw new TypeError('Invalid safe attachment failure code');
     super(code);
     this.name = 'SafeAttachmentError';

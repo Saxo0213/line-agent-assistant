@@ -9,7 +9,7 @@ export const DIAGNOSTIC_OPERATIONS = [
   'init', 'adoptDownloadAuth', 'loginQr', 'loginToken', 'setSecretState', 'poll', 'ackBatch', 'history',
   'chatResourceRead', 'refreshOwnProfile', 'cancelChatResourceRead', 'sendText', 'manualSendText', 'sendMedia',
   'unsendMessage', 'reactMessage', 'checkFriendRelation', 'addFriendByMid', 'downloadAttachment',
-  'cancelAttachmentDownload', 'revokeControl', 'stop', 'ipc', 'database', 'attachment', 'agent', 'mcp',
+  'cancelAttachmentDownload', 'logout', 'revokeControl', 'stop', 'ipc', 'database', 'attachment', 'agent', 'mcp',
   'external_monitor', 'chat_resource', 'startup', 'shutdown', 'snapshot', 'audit_sink', 'line_ingest',
   'delivery', 'secret_store', 'provider_auth', 'native_reader', 'renderer', 'catalog_refresh', 'unknown',
   'note_list', 'note_detail', 'album_list', 'album_photos', 'photo_download',

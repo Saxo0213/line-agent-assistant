@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import type { ConversationKey } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import type { SystemErrorCode } from '../../desktop-protocol.js';
+import { lineServerErrorText } from '../line-server-error-copy.js';
 import { diagnosticLabels, diagnosticRecovery } from '../diagnostic-copy.js';
 
 type Tab = 'activity' | 'errors';
@@ -13,7 +14,7 @@ function readStoredTab(): Tab {
 function storeTab(tab: Tab): void {
   try { window.localStorage.setItem(WORK_RECORDS_TAB_KEY, tab); } catch { /* Storage can be disabled; the tab still switches. */ }
 }
-const errorExplanationText: Record<SystemErrorCode, (text: ReturnType<typeof useDesktopText>) => string> = {
+const errorExplanationText: Partial<Record<SystemErrorCode, (text: ReturnType<typeof useDesktopText>) => string>> = {
   DATABASE_WRITE_FAILED: (text) => text('unableToWriteSystemRecordToDatabase'), FALLBACK_WRITE_FAILED: (text) => text('unableToWriteSystemRecordFallback'),
   WORKER_STOP_FAILED: (text) => text('unableToStopWorker'), WORKER_STOP_TIMEOUT: (text) => text('timedOutWaitingForWorkerToStop'), AGENT_AUTH_FAILED: (text) => text('agentAuthorizationActionFailed'),
   SECRET_CLEAR_FAILED: (text) => text('unableToClearLoginCredentials'), OPERATOR_ACTION_FAILED: (text) => text('userActionFailed'), STARTUP_FAILED: (text) => text('systemStartupFailed'),
@@ -110,7 +111,7 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
       {errors?.partial && <p className="monitor-note">{desktopText('someRecordsAreTemporarilyUnavailable')}</p>}
       <div className="work-record-list"><div className="work-record-column-header work-record-grid work-record-error-header" aria-hidden="true"><span>{desktopText('time')}</span><span>{desktopText('records')}</span><span>{desktopText('action')}</span><span>{desktopText('status')}</span></div>{errors?.errors.map((row, index) => <article className="work-record-row work-record-grid work-record-error-row" key={`${row.createdAt}:${row.code}:${index}`}>
         <div className="work-record-row-meta"><time dateTime={row.createdAt}><span className="work-record-date">{localDate(row.createdAt)}</span><span className="work-record-clock">{localClock(row.createdAt)}</span></time></div>
-        <div className="work-record-row-content"><h2>{systemLabel(row.action)}</h2><p>{errorExplanationText[row.code](desktopText)}</p><code>{row.code}</code>
+        <div className="work-record-row-content"><h2>{systemLabel(row.action)}</h2><p>{lineServerErrorText(locale, row.code) ?? errorExplanationText[row.code]?.(desktopText) ?? desktopText('unknownError')}</p><code>{row.code}</code>
           {row.correlationId && <p className="work-record-reference">{diagnosticLabels[locale].reference}: <code>{row.correlationId}</code></p>}
         </div>
         <div className="work-record-row-action">{row.diagnostic ? <dl>

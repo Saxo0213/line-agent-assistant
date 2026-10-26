@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
-  isLocalAgentRoom, MEDIA_FILE_MAX_BYTES, MEDIA_IMAGE_MAX_BYTES, LineWorkerCommandSchema, LineWorkerEventSchema,
+  isLineServerErrorCode, isLocalAgentRoom, talkServerError, MEDIA_FILE_MAX_BYTES, MEDIA_IMAGE_MAX_BYTES, LineWorkerCommandSchema, LineWorkerEventSchema,
   WORKER_PROTOCOL_VERSION, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue as ContractJsonValue, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto,
   type ChatResourceReadCommand, type ChatResourcePhotoPageShape,
 } from '@line-agent/contracts';
@@ -13,6 +13,7 @@ import { sanitizeAttachmentFilename, storeAttachment, type AttachmentStoreRuntim
 import { SafeAttachmentError } from './attachment-error.js';
 import { validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { isChatResourceFailure, safeChatResourceFailureDetails, type ChatResourceFailureKind, type ChatResourceResponseCode } from './chat-resource-error.js';
+import { isLineServerRejection } from './line-server-error.js';
 
 export type TransportIdentity = Readonly<{ ownMid: string; displayName: string | null; picturePath?: string | null }>;
 export type SyncItem = unknown | Readonly<{
@@ -24,15 +25,26 @@ export type FriendRelation = 'friend' | 'not_friend' | 'unknown';
 export type FriendRelationDiagnostic = Readonly<{ status: FriendRelation; error: string | null; failureKind?: ChatResourceFailureKind;
   upstreamStatus?: number; upstreamCode?: ChatResourceResponseCode }>;
 export type FriendAddResult = Readonly<{ status: 'added' | 'failed' | 'unknown'; error: string | null }>;
+
+const FRIEND_ADD_LOCAL_FAILURES = new Set(['SIDE_EFFECT_DENIED', 'NOT_STARTED', 'NOT_READY', 'REQUEST_ID_CONFLICT', 'QUEUE_FULL']);
+export const LOGOUT_DEADLINE_MS = 10_000;
+function safeFriendAddResult(result: FriendAddResult): FriendAddResult {
+  if (result.status === 'added') return { status: 'added', error: null };
+  if (result.status === 'failed' && typeof result.error === 'string' &&
+    (FRIEND_ADD_LOCAL_FAILURES.has(result.error)
+      || (result.error.startsWith('LINE_RELATION_ADD_') && isLineServerErrorCode(result.error)))) return result;
+  return { status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' };
+}
 export type RelationCancellation = Readonly<{ aborted: boolean }>;
 export interface LineTransport {
-  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated', listener: (value?: any) => void): void;
+  on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated' | 'refreshFailure', listener: (value?: any) => void): void;
   installSecrets(secrets: { token: string | null; qrCert: string | null; e2eeStorage: ContractJsonValue | null }): Promise<void>;
   adoptDownloadAuth?(token: string, application: string,
     options?: Readonly<{ expectedMid?: string; probe?: DownloadAuthProbe; signal?: AbortSignal }>): Promise<TransportIdentity>;
   clearDownloadAuth?(): void;
   loginQr(): Promise<TransportIdentity>;
   loginToken(token: string): Promise<TransportIdentity>;
+  logoutServer?(signal?: AbortSignal): Promise<void>;
   listConversations(): Promise<readonly ConversationCatalogItem[]>;
   refreshOwnProfile?(): Promise<TransportIdentity>;
   sync(cursor: TalkCursorV1Dto): Promise<SyncResult>;
@@ -58,7 +70,8 @@ export interface LineTransport {
   unsend?(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string }, messageId: string, lease: ControlLease): Promise<void>;
   checkFriendRelation(targetMid: string, lease: ControlLease, signal?: RelationCancellation): Promise<FriendRelation>;
   checkFriendRelationDiagnostic?(targetMid: string, lease: ControlLease, signal?: RelationCancellation): Promise<FriendRelationDiagnostic>;
-  addFriendByMid(targetMid: string, lease: ControlLease, onPhysicalStart: () => void, signal?: RelationCancellation): Promise<FriendAddResult>;
+  addFriendByMid(targetMid: string, lease: ControlLease, onPhysicalStart: () => void, signal?: RelationCancellation,
+    sourceChatMid?: string): Promise<FriendAddResult>;
   revoke?(): void;
 }
 
@@ -172,7 +185,7 @@ export class LineWorkerLoop {
   #syncFailures = 0;
   #sending = false;
   #currentSend: Promise<void> | undefined;
-  readonly #addLedger = new Map<string, { targetMid: string; result: Promise<FriendAddResult> }>();
+  readonly #addLedger = new Map<string, { targetMid: string; sourceChatMid?: string; result: Promise<FriendAddResult> }>();
   #relationPending = 0;
   #relationTail: Promise<void> = Promise.resolve();
   #eventTail: Promise<void> = Promise.resolve();
@@ -245,6 +258,13 @@ export class LineWorkerLoop {
       this.#secrets = { ...this.#secrets, token: credentials.token, e2eeStorage: credentials.e2eeStorage };
       this.#emitSecretRotation();
     });
+    this.#transport.on('refreshFailure', () => {
+      if (this.#stopped || !this.#binding) return;
+      void this.#emit({ type: 'error', ...this.#identity(), code: 'WORKER_OPERATION_FAILED',
+        message: 'LINE token refresh failed', retryable: true,
+        diagnostic: { operation: 'loginToken', stage: 'execute', category: 'transport_failed', recovery: 'retry', outcome: 'failed' } })
+        .catch(() => undefined);
+    });
   }
 
   get durableCursor(): TalkCursorV1Dto {
@@ -293,7 +313,7 @@ export class LineWorkerLoop {
     if (binding.purpose === 'DOWNLOAD_ONLY' && !['adoptDownloadAuth', 'downloadAttachment', 'cancelAttachmentDownload', 'revokeControl', 'stop'].includes(command.type)) {
       throw new EffectDeniedError('download-only worker rejects non-download command');
     }
-    if (this.#authInvalidated && command.type !== 'stop' && command.type !== 'revokeControl') {
+    if (this.#authInvalidated && command.type !== 'stop' && command.type !== 'revokeControl' && command.type !== 'logout') {
       if (command.type === 'poll') return;
       throw new Error('LINE authentication is invalidated');
     }
@@ -407,8 +427,37 @@ export class LineWorkerLoop {
             ownMid: profile.ownMid, displayName: profile.displayName, ...(profile.picturePath === undefined ? {} : { picturePath: profile.picturePath }) });
         } catch (error) {
           await this.#emit({ type: 'ownProfileResult', ...this.#identity(), requestId: command.requestId, ok: false,
-            error: error instanceof Error && ['PROFILE_READ_UNAVAILABLE', 'PROFILE_MISMATCH'].includes(error.message) ? error.message : 'PROFILE_READ_FAILED' });
+            error: isLineServerRejection(error) ? error.code
+              : error instanceof Error && ['PROFILE_READ_UNAVAILABLE', 'PROFILE_MISMATCH'].includes(error.message) ? error.message : 'PROFILE_READ_FAILED' });
         } finally { this.#profileReadInFlight = false; }
+        return;
+      }
+      case 'logout': {
+        const identity = this.#identity();
+        let ok = false;
+        let error: 'LINE_LOGOUT_FAILED' | 'LINE_AUTH_INVALIDATED' | null = null;
+        if (this.#authInvalidated) {
+          ok = false;
+          error = 'LINE_AUTH_INVALIDATED';
+        } else if (!this.#ownMid || !this.#transport.logoutServer) {
+          error = 'LINE_LOGOUT_FAILED';
+        } else {
+          const controller = new AbortController();
+          const deadline = setTimeout(() => controller.abort(new Error('LINE_LOGOUT_DEADLINE_EXCEEDED')), LOGOUT_DEADLINE_MS);
+          try {
+            this.#transportQuarantined = true;
+            await this.#waitForTransportDrain(controller.signal);
+            await this.#transport.logoutServer(controller.signal);
+            if (this.#authInvalidated) error = 'LINE_AUTH_INVALIDATED';
+            else ok = true;
+          } catch {
+            error = 'LINE_LOGOUT_FAILED';
+          } finally {
+            clearTimeout(deadline);
+            if (!ok) this.#transportQuarantined = false;
+          }
+        }
+        await this.#emit({ type: 'logoutResult', ...identity, requestId: command.requestId, ok, error });
         return;
       }
       case 'cancelChatResourceRead':
@@ -475,6 +524,22 @@ export class LineWorkerLoop {
       this.#activeTransportCalls -= 1;
       if (this.#activeTransportCalls === 0) for (const resolve of this.#transportDrainWaiters.splice(0)) resolve();
     }
+  }
+
+  async #waitForTransportDrain(signal: AbortSignal): Promise<void> {
+    if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('LINE_LOGOUT_ABORTED');
+    if (this.#activeTransportCalls === 0) return;
+    await new Promise<void>((resolve, reject) => {
+      const waiter = () => { signal.removeEventListener('abort', onAbort); resolve(); };
+      const onAbort = () => {
+        const index = this.#transportDrainWaiters.indexOf(waiter);
+        if (index >= 0) this.#transportDrainWaiters.splice(index, 1);
+        reject(signal.reason instanceof Error ? signal.reason : new Error('LINE_LOGOUT_ABORTED'));
+      };
+      this.#transportDrainWaiters.push(waiter);
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
   }
 
   async #withCredentialSwap<T>(operation: (owner: number) => Promise<T>, deadlineMs: number | null = 10_000): Promise<T> {
@@ -561,7 +626,7 @@ export class LineWorkerLoop {
         await this.#emit({ type: 'conversationCatalog', ...this.#identity(), conversations });
         this.#catalogRefreshComplete = true;
         this.#catalogRetryAttempt = 0;
-      } catch {
+      } catch (error) {
         if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
         this.#catalogRetryAttempt = Math.min(this.#catalogRetryAttempt + 1, 6);
         const retryDelay = [1, 2, 4, 8, 16, 32][this.#catalogRetryAttempt - 1]!;
@@ -569,7 +634,8 @@ export class LineWorkerLoop {
         this.#catalogRequested = true;
         if (!this.#catalogFailureReported) {
           this.#catalogFailureReported = true;
-          await this.#emit({ type: 'catalogRefreshStatus', ...this.#identity(), state: 'degraded', code: 'CATALOG_REFRESH_FAILED' }).catch(() => undefined);
+          await this.#emit({ type: 'catalogRefreshStatus', ...this.#identity(), state: 'degraded', code: 'CATALOG_REFRESH_FAILED',
+            ...(isLineServerRejection(error) ? { serverError: error.code } : {}) }).catch(() => undefined);
         }
       } finally {
         if (this.#catalogRefreshFlight === task) this.#catalogRefreshFlight = undefined;
@@ -641,10 +707,15 @@ export class LineWorkerLoop {
         const recovered = this.#syncFailures >= 5;
         this.#syncFailures = 0;
         if (recovered) await this.#emit({ type: 'status', ...this.#identity(), state: 'ready', message: null });
-      } catch {
+      } catch (error) {
         this.#syncFailures += 1;
+        if (isLineServerRejection(error)) await this.#emit({ type: 'error', ...this.#identity(),
+          code: error.code, message: error.code, retryable: false,
+          diagnostic: { operation: 'poll', stage: 'response', category: 'denied', recovery: 'none',
+            upstreamCode: error.upstreamCode } });
         if (this.#syncFailures === 5) {
-          await this.#emit({ type: 'status', ...this.#identity(), state: 'degraded', message: null });
+          await this.#emit({ type: 'status', ...this.#identity(), state: 'degraded',
+            message: isLineServerRejection(error) ? error.message : null });
         }
         return;
       }
@@ -800,9 +871,14 @@ export class LineWorkerLoop {
         relativePath: stored.managedRelativePath.replaceAll('\\', '/'),
         sha256: stored.sha256, sizeBytes: stored.size, name: stored.sanitizedDisplayFileName });
     } catch (error) {
+      const serverRejection = error instanceof SafeAttachmentError && error.serverErrorCode?.startsWith('LINE_TALK_')
+        ? talkServerError(error.serverErrorCode.slice('LINE_TALK_'.length)) : null;
       await this.#emit({ type: 'attachmentResult', ...this.#identity(), ...conversation,
         attachmentId: command.attachmentId, attemptToken: command.attemptToken, status: 'failed',
-        error: attachmentFailureCode(error, stage, controller.signal.aborted) });
+        error: attachmentFailureCode(error, stage, controller.signal.aborted),
+        ...(serverRejection && error instanceof SafeAttachmentError && error.upstreamCode === serverRejection.upstreamCode
+          && !controller.signal.aborted
+          ? { serverErrorCode: serverRejection.code, upstreamCode: serverRejection.upstreamCode } : {}) });
     } finally {
       clearTimeout(timer);
       if (acquired) this.#releaseDownload();
@@ -892,10 +968,11 @@ export class LineWorkerLoop {
         status: 'sent', messageId: result.messageId, error: null });
     } catch (error) {
       const denied = error instanceof EffectDeniedError;
+      const rejected = isLineServerRejection(error);
       await this.#emit({ type: 'sendResult', ...identity, requestId: command.requestId,
         operationId: command.operationId, attemptId: command.attemptId,
-        status: denied ? 'failed' : 'unknown', messageId: null,
-        error: denied ? 'SIDE_EFFECT_DENIED' : 'TRANSPORT_OUTCOME_UNKNOWN' });
+        status: denied || rejected ? 'failed' : 'unknown', messageId: null,
+        error: denied ? 'SIDE_EFFECT_DENIED' : rejected ? error.code : 'TRANSPORT_OUTCOME_UNKNOWN' });
     } finally {
       this.#sending = false;
     }
@@ -983,6 +1060,7 @@ export class LineWorkerLoop {
         else if ('timeout' in outcome) await result('unknown', null, 'TRANSPORT_OUTCOME_UNKNOWN');
         else if (outcome.error instanceof EffectDeniedError) await result('failed', null, 'SIDE_EFFECT_DENIED');
         else if (outcome.error instanceof MediaUploadFailedError) await result('failed', null, 'UPLOAD_FAILED');
+        else if (isLineServerRejection(outcome.error)) await result('failed', null, outcome.error.code);
         else await result('unknown', null, 'TRANSPORT_OUTCOME_UNKNOWN');
       } finally {
         if (timer !== undefined) clearTimeout(timer);
@@ -1028,7 +1106,9 @@ export class LineWorkerLoop {
         requestId: command.requestId, messageId: command.messageId, status: 'unsent', error: null });
     } catch (error) {
       const denied = error instanceof EffectDeniedError;
-      await failed(denied ? 'failed' : 'unknown', denied ? 'SIDE_EFFECT_DENIED' : 'TRANSPORT_OUTCOME_UNKNOWN');
+      const rejected = isLineServerRejection(error);
+      await failed(denied || rejected ? 'failed' : 'unknown', denied ? 'SIDE_EFFECT_DENIED'
+        : rejected ? error.code : 'TRANSPORT_OUTCOME_UNKNOWN');
     } finally { this.#sending = false; }
   }
 
@@ -1097,7 +1177,7 @@ export class LineWorkerLoop {
   async #addFriend(command: Extract<LineWorkerCommand, { type: 'addFriendByMid' }>): Promise<void> {
     const existing = this.#addLedger.get(command.requestId);
     if (existing) {
-      if (existing.targetMid === command.targetMid) {
+      if (existing.targetMid === command.targetMid && existing.sourceChatMid === command.sourceChatMid) {
         const outcome = await existing.result;
         await this.#emit({ type: 'addFriendResult', ...this.#identity(), requestId: command.requestId,
           targetMid: command.targetMid, ...outcome });
@@ -1124,9 +1204,9 @@ export class LineWorkerLoop {
           if (!this.#ownMid) return { status: 'failed', error: 'NOT_READY' } as const;
           if (!await this.#relationAuthorized()) return { status: 'failed', error: 'SIDE_EFFECT_DENIED' } as const;
           if (expired) return { status: 'failed', error: 'NOT_STARTED' } as const;
-          return await this.#withTransportCall(() => this.#transport.addFriendByMid(command.targetMid,
+          return safeFriendAddResult(await this.#withTransportCall(() => this.#transport.addFriendByMid(command.targetMid,
             { accountId: this.#binding!.accountId, workerInstanceId: this.#binding!.workerInstanceId,
-              controlEpoch: this.#binding!.controlEpoch }, () => { started.value = true; }, controller.signal));
+              controlEpoch: this.#binding!.controlEpoch }, () => { started.value = true; }, controller.signal, command.sourceChatMid)));
         });
         return await this.#withRelationDeadline(queued,
           () => started.value ? { status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' } : { status: 'failed', error: 'NOT_STARTED' },
@@ -1136,7 +1216,8 @@ export class LineWorkerLoop {
           : { status: 'failed', error: 'SIDE_EFFECT_DENIED' };
       }
     });
-    this.#addLedger.set(command.requestId, { targetMid: command.targetMid, result });
+    this.#addLedger.set(command.requestId, { targetMid: command.targetMid,
+      ...(command.sourceChatMid === undefined ? {} : { sourceChatMid: command.sourceChatMid }), result });
     const outcome = await result;
     await this.#emit({ type: 'addFriendResult', ...identity, requestId: command.requestId,
       targetMid: command.targetMid, ...outcome });

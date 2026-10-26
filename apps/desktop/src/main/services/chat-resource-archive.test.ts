@@ -284,7 +284,7 @@ describe.runIf(process.platform === 'win32')('ChatResourceArchive', () => {
 
   it('publishes raw image bytes that a standard PNG decoder accepts', async () => {
     const { chat, chatPath } = await fixture();
-    const original = await readFile(join(desktopRoot, 'assets', 'icons', 'line-agent-spring.png'));
+    const original = await readFile(join(desktopRoot, 'assets', 'icons', 'line-agent-teal.png'));
     const saved = await broker!.publish({ chat, kind: 'photo', resourceId: 'photo-original', content: original });
     const image = await broker!.read({ chat, kind: 'photo', resourceId: 'photo-original' });
     expect(saved.byteLength).toBe(original.byteLength); expect(image?.content).toEqual(original);

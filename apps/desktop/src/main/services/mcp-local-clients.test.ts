@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { addCodexManagedBlock, removeCodexManagedBlock, updateClaudeManagedEntry, writeClientConfig, McpLocalClients, type LocalClientKind } from './mcp-local-clients.js';
 
 const roots: string[] = [];
@@ -12,7 +12,7 @@ async function tempFile(name: string, contents?: string): Promise<string> {
   if (contents !== undefined) await writeFile(file, contents, 'utf8');
   return file;
 }
-afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => { vi.unstubAllGlobals(); await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe('Codex managed config', () => {
   it.each([
@@ -77,8 +77,14 @@ describe('McpLocalClients lifecycle', () => {
     await import('node:fs/promises').then(({ mkdir }) => Promise.all([mkdir(path.dirname(file), { recursive: true }), mkdir(path.dirname(client === 'codex' ? claudeConfigPath : codexConfigPath), { recursive: true })]));
     if (initial) await writeFile(file, initial, 'utf8');
     const rows: Array<{ token: any; plaintextToken: string }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_endpoint: URL, init: RequestInit) => {
+      const headers = init.headers as Record<string, string>;
+      return { ok: headers.authorization === 'Bearer la_mcp_secret', json: async () => ({ jsonrpc: '2.0', id: 'local-client-status', result: {} }) };
+    }));
     const tokens = {
       async listTokens() { return rows.map(({ token }) => token); },
+      async normalizeManagedLocalClientScopes() {},
+      async findTokenByBearerToken(plaintextToken: string) { return rows.find(({ plaintextToken: saved, token }) => saved === plaintextToken && token.state === 'ACTIVE')?.token ?? null; },
       async issueToken(input: any) {
         const token = { tokenId: `token-${rows.length}`, principalId: input.principalId, deviceLabel: input.deviceLabel, state: 'ACTIVE', expiresAt: null, accountScopes: [...input.accountScopes] };
         rows.push({ token, plaintextToken: 'la_mcp_secret' });
@@ -93,19 +99,42 @@ describe('McpLocalClients lifecycle', () => {
 
   it('reconnects by revoking the old token and replacing the single managed entry', async () => {
     const { service, file, rows } = await setup('codex', '');
-    await service.connect('codex', ['account-a']);
+    await service.connect('codex', ['role:AGENT']);
     expect(rows[0]?.token.deviceLabel).toBe('Codex（本機）');
-    await service.connect('codex', ['account-b']);
+    await service.connect('codex', ['role:PRIMARY_ADMIN']);
     const config = await readFile(file, 'utf8');
     expect(config.match(/\[mcp_servers\.linejs\]/g)).toHaveLength(1);
     expect(config).toContain('Bearer la_mcp_secret');
     expect(rows.map(({ token }) => token.state)).toEqual(['REVOKED', 'ACTIVE']);
-    expect(rows[1]?.token.accountScopes).toEqual(['account-b']);
+    expect(rows[1]?.token.accountScopes).toEqual(['role:PRIMARY_ADMIN']);
+  });
+
+  it('persists stable role selectors for managed client tokens', async () => {
+    const { service, rows } = await setup('codex', '');
+    await service.connect('codex', ['role:AGENT', 'role:PRIMARY_ADMIN']);
+    expect(rows[0]?.token.accountScopes).toEqual(['role:AGENT', 'role:PRIMARY_ADMIN']);
+  });
+
+  it('reports disconnected when the configured token is stale despite another active token', async () => {
+    const { service, file, rows } = await setup('codex', '');
+    await service.connect('codex', ['role:AGENT']);
+    await writeFile(file, (await readFile(file, 'utf8')).replace('la_mcp_secret', 'la_mcp_' + 'x'.repeat(43)));
+    const status = (await service.status()).find((item) => item.client === 'codex');
+    expect(rows.some(({ token }) => token.state === 'ACTIVE')).toBe(true);
+    expect(status).toMatchObject({ connected: false, tokenId: null, accountScopes: [] });
+  });
+
+  it('reports disconnected when the token still in managed config has been revoked', async () => {
+    const { service, rows } = await setup('claude-desktop', '{}');
+    await service.connect('claude-desktop', ['role:AGENT']);
+    rows[0]!.token.state = 'REVOKED';
+    expect((await service.status()).find((item) => item.client === 'claude-desktop'))
+      .toMatchObject({ connected: false, tokenId: null, accountScopes: [] });
   });
 
   it('serializes concurrent connects for the same client kind', async () => {
     const { service, file, rows } = await setup('codex', '');
-    await Promise.all([service.connect('codex', ['account-a']), service.connect('codex', ['account-b'])]);
+    await Promise.all([service.connect('codex', ['role:AGENT']), service.connect('codex', ['role:PRIMARY_ADMIN'])]);
     expect(rows.filter(({ token }) => token.state === 'ACTIVE')).toHaveLength(1);
     expect((await readFile(file, 'utf8')).match(/\[mcp_servers\.linejs\]/g)).toHaveLength(1);
   });
@@ -123,7 +152,7 @@ describe('McpLocalClients lifecycle', () => {
 
   it('writes Claude Desktop stdio config and disconnects only the managed entry', async () => {
     const { service, file, rows } = await setup('claude-desktop', '{"other":true,"mcpServers":{"keep":{"command":"keep"}}}');
-    await service.connect('claude-desktop', ['account-a']);
+    await service.connect('claude-desktop', ['role:AGENT']);
     expect(rows[0]?.token.deviceLabel).toBe('Claude Desktop（本機）');
     const connected = JSON.parse(await readFile(file, 'utf8'));
     expect(connected.other).toBe(true);
@@ -136,15 +165,15 @@ describe('McpLocalClients lifecycle', () => {
 
   it('connects Claude Desktop when its config file is missing', async () => {
     const { service, file } = await setup('claude-desktop', '');
-    await service.connect('claude-desktop', ['account-a']);
+    await service.connect('claude-desktop', ['role:AGENT']);
     expect(JSON.parse(await readFile(file, 'utf8')).mcpServers.linejs.env.LINEJS_MCP_URL).toBe('http://127.0.0.1:38500/mcp');
   });
 
   it('keeps the active token and config when reconnect validation fails', async () => {
     const { service, file, rows } = await setup('claude-desktop', '{}');
-    await service.connect('claude-desktop', ['account-a']);
+    await service.connect('claude-desktop', ['role:AGENT']);
     await writeFile(file, '{ broken', 'utf8');
-    await expect(service.connect('claude-desktop', ['account-b'])).rejects.toMatchObject({ code: 'LOCAL_MCP_CONFIG_INVALID' });
+    await expect(service.connect('claude-desktop', ['role:PRIMARY_ADMIN'])).rejects.toMatchObject({ code: 'LOCAL_MCP_CONFIG_INVALID' });
     expect(rows.map(({ token }) => token.state)).toEqual(['ACTIVE']);
     expect(await readFile(file, 'utf8')).toBe('{ broken');
   });

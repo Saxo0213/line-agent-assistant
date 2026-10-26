@@ -1,4 +1,4 @@
-/** Synthetic fixtures modeled on the native reaction data shape. */
-export const SAMPLE_NICE = '{"reactionList":[{"PaidType":{},"PredefinedType":2,"createdAt":1700000000000,"reactor":"u00000000000000000000000000000001","type":1,"updatedAt":1700000000000,"cancel":false}],"totalCount":0,"countByType":{}}';
-export const SAMPLE_FUN = '{"reactionList":[{"reactor":"u00000000000000000000000000000002","type":1,"createdAt":1700000001000,"updatedAt":1700000001000,"PredefinedType":4,"PaidType":{}}],"totalCount":0,"countByType":{}}';
-export const SAMPLE_PAID = '{"reactionList":[{"reactor":"u00000000000000000000000000000003","type":2,"createdAt":1700000002000,"updatedAt":1700000002000,"PredefinedType":0,"PaidType":{"emojiId":"004","productId":"60ebfdc03cc24041bb139cf5","resourceType":1,"version":2}}],"totalCount":0,"countByType":{}}';
+/** Real `_reactionStatus` cell samples read from the live database. */
+export const SAMPLE_NICE = '{"reactionList":[{"PaidType":{},"PredefinedType":2,"createdAt":1792277695027,"reactor":"ub6f5a192eaf1fc1acc3c61508b4fd6da","type":1,"updatedAt":1792277695027,"cancel":false}],"totalCount":0,"countByType":{}}';
+export const SAMPLE_FUN = '{"reactionList":[{"reactor":"ufaeaefdf10160b3aa1f38d2f57e68736","type":1,"createdAt":1792635926799,"updatedAt":1792635926799,"PredefinedType":4,"PaidType":{}}],"totalCount":0,"countByType":{}}';
+export const SAMPLE_PAID = '{"reactionList":[{"reactor":"ub254b3c8c4fc001b1862a8eef68f4f00","type":2,"createdAt":1792638565546,"updatedAt":1792638565546,"PredefinedType":0,"PaidType":{"emojiId":"004","productId":"60ebfdc03cc24041bb139cf5","resourceType":1,"version":2}}],"totalCount":0,"countByType":{}}';

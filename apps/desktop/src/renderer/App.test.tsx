@@ -776,6 +776,24 @@ describe('operator console', () => {
     await waitFor(() => expect(ownRow.querySelector('.message-recalled-label')?.textContent).toContain('已收回'));
   });
 
+  it('shows the fixed Talk reason for a failed unsend without exposing server prose', async () => {
+    const secret = 'token=private MID=u-private text=private';
+    const api = fakeApi();
+    const own = { ...message('account-A', 'unsend-rejected'), senderId: 'own-account-A', direction: 'outbound' as const,
+      occurredAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() };
+    api.listMessages = vi.fn(async () => ({ messages: [own], olderCursor: null }));
+    api.unsendMessage = vi.fn(async () => ({ type: 'error', requestId: 'unsend', ok: false, code: 'LINE_UNSEND_NOT_STARTED',
+      serverErrorCode: 'LINE_TALK_NOT_YOUR_MESSAGE', message: secret, retryable: false } as const));
+    const view = await renderLineApp(api);
+    await screen.findByText('unsend-rejected');
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    fireEvent.contextMenu(view.container.querySelector('#message-unsend-rejected')!.closest('.message-row')!);
+    fireEvent.click(await screen.findByRole('menuitem', { name: desktopTextFor('zh-TW', 'unsendMessage') }));
+    expect(await screen.findByText('只能收回自己傳送的 LINE 訊息。')).toBeTruthy();
+    expect(document.body.textContent).not.toContain(secret);
+    expect(api.unsendMessage).toHaveBeenCalledOnce();
+  });
+
   it('shows the context action for older own messages only with the seven day window', async () => {
     const oldOwn = { ...message('account-A', 'old-own'), senderId: 'own-account-A', direction: 'outbound' as const,
       occurredAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString() };
@@ -1363,6 +1381,85 @@ describe('operator console', () => {
     expect(screen.getByRole('button', { name: '查看觀察' }).getAttribute('aria-pressed')).toBe('true');
   });
 
+  it('shows every account in search and scopes historical and current accounts by their account IDs', async () => {
+    const api = fakeApi();
+    const currentAgentId = 'account-agent-replacement';
+    api.searchMessages = vi.fn(async (query: Parameters<DesktopApi['searchMessages']>[0]) => query.accountId === 'account-retired-agent' ? [{
+      accountId: 'account-retired-agent', chatType: 'group' as const, chatId: 'retired-chat', messageId: 'retired-message',
+      senderId: 'sender', senderName: 'Sender', text: 'historical result', occurredAt: '2026-10-16T05:39:00.000Z',
+    }] : []);
+    api.getSnapshot = vi.fn(async () => ({
+      ...snapshot,
+      control: { ...snapshot.control, activeAccountId: currentAgentId },
+      accounts: [
+        { ...snapshot.accounts[0]!, accountId: 'account-retired-agent', displayName: 'saxoAgent', mode: 'MONITOR_ONLY' as const, productRole: null },
+        { ...snapshot.accounts[1]!, accountId: 'account-admin', displayName: '徐佳誠', productRole: 'PRIMARY_ADMIN' as const },
+        { ...snapshot.accounts[0]!, accountId: currentAgentId, displayName: 'Agentsaxo', mode: 'ACTIVE_CONTROL' as const, productRole: 'AGENT' as const },
+      ],
+      conversations: [
+        { ...snapshot.conversations[0]!, accountId: 'account-retired-agent', chatId: 'retired-chat', title: '舊 Agent 聊天' },
+        { ...snapshot.conversations[1]!, accountId: 'account-admin' },
+        { ...snapshot.conversations[0]!, accountId: currentAgentId, chatId: 'replacement-chat', title: '新 Agent 聊天' },
+      ],
+    }));
+    render(<App api={api} />);
+    fireEvent.click(await screen.findByRole('button', { name: '搜尋' }));
+
+    const tabs = within(await screen.findByRole('tablist', { name: '帳號篩選' }));
+    const agentTab = await tabs.findByRole('tab', { name: 'Agentsaxo' });
+    const adminTab = await tabs.findByRole('tab', { name: '徐佳誠' });
+    const retiredAgentTab = await tabs.findByRole('tab', { name: 'saxoAgent' });
+    expect(document.querySelector('[data-account-id="account-retired-agent"]')).toBeNull();
+
+    fireEvent.click(retiredAgentTab);
+    expect(retiredAgentTab.getAttribute('aria-selected')).toBe('true');
+    fireEvent.submit(document.querySelector('form.filter-grid')!);
+    await waitFor(() => expect(api.searchMessages).toHaveBeenLastCalledWith({ accountId: 'account-retired-agent', text: '', limit: 100 }));
+
+    fireEvent.click(adminTab);
+    expect(adminTab.getAttribute('aria-selected')).toBe('true');
+    expect(retiredAgentTab.getAttribute('aria-selected')).toBe('false');
+    fireEvent.submit(document.querySelector('form.filter-grid')!);
+    await waitFor(() => expect(api.searchMessages).toHaveBeenLastCalledWith({ accountId: 'account-admin', text: '', limit: 100 }));
+
+    fireEvent.click(agentTab);
+    expect(agentTab.getAttribute('aria-selected')).toBe('true');
+    expect(adminTab.getAttribute('aria-selected')).toBe('false');
+    expect(retiredAgentTab.getAttribute('aria-selected')).toBe('false');
+    fireEvent.submit(document.querySelector('form.filter-grid')!);
+    await waitFor(() => expect(api.searchMessages).toHaveBeenLastCalledWith({ accountId: currentAgentId, text: '', limit: 100 }));
+
+    fireEvent.click(tabs.getByRole('tab', { name: '全部帳號' }));
+    expect(tabs.getByRole('tab', { name: '全部帳號' }).getAttribute('aria-selected')).toBe('true');
+    expect(retiredAgentTab.getAttribute('aria-selected')).toBe('false');
+    fireEvent.submit(document.querySelector('form.filter-grid')!);
+    await waitFor(() => expect(api.searchMessages).toHaveBeenLastCalledWith({ text: '', limit: 100 }));
+
+    fireEvent.click(retiredAgentTab);
+    fireEvent.submit(document.querySelector('form.filter-grid')!);
+    const historicalGroup = await screen.findByRole('button', { name: /舊 Agent 聊天.*1 則/ });
+    fireEvent.click(historicalGroup);
+    fireEvent.click(screen.getByRole('button', { name: /Sender.*historical result/ }));
+
+    expect(await screen.findByRole('heading', { name: '舊 Agent 聊天' })).toBeTruthy();
+    await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith(
+      { accountId: 'account-retired-agent', chatType: 'group', chatId: 'retired-chat' }, null, expect.any(Number),
+    ));
+    expect(document.querySelector('[data-account-id="account-retired-agent"]')).toBeNull();
+
+    api.listSystemActivity = vi.fn(async () => ({ partial: false, activity: [{ kind: 'attachment' as const,
+      createdAt: '2026-10-17T10:01:00.000Z', action: '圖片下載' as const, status: '等待下載' as const, attachmentKind: 'image' as const, retryCount: 0,
+      key: { accountId: currentAgentId, chatType: 'group' as const, chatId: 'replacement-chat' },
+    }] }));
+    fireEvent.click(screen.getByRole('button', { name: '設定' }));
+    fireEvent.click(await screen.findByRole('tab', { name: '紀錄' }));
+    fireEvent.click(await screen.findByRole('button', { name: '查看來源訊息' }));
+    expect(await screen.findByRole('heading', { name: '新 Agent 聊天' })).toBeTruthy();
+    await waitFor(() => expect(api.listMessages).toHaveBeenLastCalledWith(
+      { accountId: currentAgentId, chatType: 'group', chatId: 'replacement-chat' }, null, expect.any(Number),
+    ));
+  });
+
   it('shows only the selected conversation Agent trigger state beside chat resources', async () => {
     await renderLineApp(fakeApi());
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
@@ -1574,6 +1671,29 @@ describe('operator console', () => {
     expect(monitorAccount.closest('.account-item')?.classList.contains('selected')).toBe(true);
     expect(screen.getAllByRole('button', { name: /同名群組.*群組/ })).toHaveLength(1);
     expect(screen.getByRole('button', { name: /同名群組.*群組/ }).textContent).not.toContain('account-B');
+  });
+
+  it('shows only Agent and Primary Admin accounts in the rail and keeps role switching available', async () => {
+    const api = fakeApi();
+    api.getSnapshot = vi.fn(async () => ({
+      ...snapshot,
+      accounts: [...snapshot.accounts, {
+        ...snapshot.accounts[0]!, accountId: 'account-legacy', displayName: '舊帳號', mode: 'MONITOR_ONLY' as const, productRole: null,
+      }],
+      conversations: [...snapshot.conversations, {
+        ...snapshot.conversations[0]!, accountId: 'account-legacy', chatId: 'legacy-chat', title: '舊帳號聊天',
+      }],
+    }));
+    await renderLineApp(api);
+
+    expect(document.querySelector('[data-account-id="account-A"]')).not.toBeNull();
+    expect(document.querySelector('[data-account-id="account-B"]')).not.toBeNull();
+    expect(document.querySelector('[data-account-id="account-legacy"]')).toBeNull();
+    expect(screen.getByRole('button', { name: '查看工作' }).getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
+    expect(screen.getByRole('button', { name: '查看工作' }).getAttribute('aria-pressed')).toBe('false');
+    expect(screen.getByRole('button', { name: '查看觀察' }).getAttribute('aria-pressed')).toBe('true');
+    expect(screen.queryByRole('button', { name: /舊帳號聊天/ })).toBeNull();
   });
 
   it('creates a three-minute primary administrator pairing token only from account management', async () => {
@@ -2201,7 +2321,7 @@ describe('operator console', () => {
     await waitFor(() => expect(api.resolveFileTypeIcon).toHaveBeenCalledWith('pdf'));
   });
 
-  it('renders Agent lifecycle status (neutral glyph, stored custom icon ignored) below and outside the source message bubble', async () => {
+  it('renders Agent lifecycle status (fixed LINE reaction icon, stored custom icon ignored) below and outside the source message bubble', async () => {
     const api = fakeApi();
     api.getConversationSettings = vi.fn(async () => ({
       attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true,
@@ -2212,10 +2332,10 @@ describe('operator console', () => {
     await renderLineApp(api);
     await waitFor(() => expect(document.querySelector('.agent-status-marker.running .agent-status-glyph')?.textContent).toBe(LINE_REACTION_GLYPHS.NICE));
     const marker = document.querySelector('.agent-status-marker.running')!;
-    expect(marker.querySelector('[aria-hidden="true"]')?.textContent).toBe(LINE_REACTION_GLYPHS.NICE);
+    expect(marker.querySelector('[aria-hidden="true"]')?.classList.contains('agent-status-glyph')).toBe(true);
     expect(marker.getAttribute('aria-label')).toBe('Agent 執行中');
     expect(marker.getAttribute('title')).toBe('Agent 執行中');
-    expect(marker.textContent).toBe(LINE_REACTION_GLYPHS.NICE);
+    expect(marker.textContent).toBe('');
     const row = marker.closest('.message-row')!;
     const bubble = row.querySelector('.message')!;
     expect(bubble.contains(marker)).toBe(false);
@@ -2223,7 +2343,7 @@ describe('operator console', () => {
     expect(bubble.compareDocumentPosition(marker) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it('shows neutral reaction glyphs for running, completed and failed chat markers', async () => {
+  it('shows the mapped neutral glyph for running, completed and failed chat markers', async () => {
     const api = fakeApi();
     api.listMessages = vi.fn(async () => ({ messages: [
       { ...message('account-A', 'agent-r'), agentJobId: 'job-r', agentJobStatus: 'running' as const },
@@ -3302,6 +3422,20 @@ describe('operator console', () => {
     await waitFor(() => expect(api.sendText).toHaveBeenCalledTimes(2));
     expect(api.sendText).toHaveBeenLastCalledWith({ accountId: 'account-A', chatType: 'group', chatId: 'same-chat' }, 'hello');
     await waitFor(() => expect(document.querySelector('.local-send-feedback')).toBeNull());
+  });
+
+  it('shows the fixed Talk reason for a failed send without exposing server prose', async () => {
+    const secret = 'token=private MID=u-private text=private';
+    const api = fakeApi();
+    api.sendText = vi.fn(async () => ({ type: 'error', requestId: 'send', ok: false, code: 'LINE_SEND_NOT_STARTED',
+      serverErrorCode: 'LINE_TALK_E2EE_RETRY_ENCRYPT', message: secret, retryable: false } as const));
+    await renderLineApp(api);
+    await screen.findAllByRole('button', { name: /同名群組.*群組/ });
+    fireEvent.change(screen.getByRole('textbox', { name: 'LINE 訊息' }), { target: { value: 'hello' } });
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
+    expect(await screen.findByText('LINE 要求以加密方式傳送。')).toBeTruthy();
+    expect(document.body.textContent).not.toContain(secret);
+    expect(api.sendText).toHaveBeenCalledOnce();
   });
 
   it('retains and settles send feedback when Conversations unmounts during navigation', async () => {

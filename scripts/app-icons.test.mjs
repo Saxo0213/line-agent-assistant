@@ -6,6 +6,7 @@ import { inflateSync } from 'node:zlib';
 
 const root = path.resolve(import.meta.dirname, '..');
 const iconRoot = path.join(root, 'apps', 'desktop', 'assets', 'icons');
+const themes = ['spring', 'teal', 'natural'];
 const requiredSizes = [16, 32, 48, 64, 128, 256];
 
 function pngChunks(bytes) {
@@ -72,14 +73,16 @@ function icoImages(bytes) {
   });
 }
 
-test('ships normalized spring PNG and multi-size ICO assets', async () => {
-  const png = await readFile(path.join(iconRoot, 'line-agent-spring.png'));
-  assertRgbaPngHasVisiblePixels(png, 512);
-  const images = icoImages(await readFile(path.join(iconRoot, 'line-agent-spring.ico')));
-  assert.deepEqual(images.map((image) => image.width).sort((a, b) => a - b), requiredSizes);
-  for (const image of images) {
-    assert.equal(image.width, image.height);
-    assertRgbaPngHasVisiblePixels(image.bytes, image.width);
+test('ships normalized PNG and multi-size ICO assets for all three approved themes', async () => {
+  for (const theme of themes) {
+    const png = await readFile(path.join(iconRoot, `line-agent-${theme}.png`));
+    assertRgbaPngHasVisiblePixels(png, 512);
+    const images = icoImages(await readFile(path.join(iconRoot, `line-agent-${theme}.ico`)));
+    assert.deepEqual(images.map((image) => image.width).sort((a, b) => a - b), requiredSizes);
+    for (const image of images) {
+      assert.equal(image.width, image.height);
+      assertRgbaPngHasVisiblePixels(image.bytes, image.width);
+    }
   }
 });
 

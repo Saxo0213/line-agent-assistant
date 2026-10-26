@@ -4,6 +4,7 @@ import type { Pool, PoolClient } from 'pg';
 import { lockAndCheckAgentAuthorization } from './agent-authorization.js';
 import { findSharedAdminChat, type SharedAdminChat } from './agent-repository.js';
 import { allPermissions, findPrimaryAdminUser, resolveLinkedChats, resolveUserPermissions } from './agent-permissions.js';
+import { LOCAL_CLIENT_PRINCIPALS, parseRoleScope, normalizeManagedMcpScopes, type ProductRole } from './managed-mcp-scopes.js';
 
 export type McpErrorCode =
   | 'MCP_INVALID_ACCOUNT_SCOPE'
@@ -200,6 +201,14 @@ export class McpTokenRepository {
     const principalId =
       input.principalId?.trim() || `external:${deviceLabel.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').slice(0, 48)}:${tokenId.slice(0, 8)}`;
     const accountScopes = [...new Set(input.accountScopes.map((id) => id.trim()).filter(Boolean))];
+    const roleScopes = accountScopes.filter((scope) => parseRoleScope(scope) !== null);
+    if (roleScopes.length > 0 && !LOCAL_CLIENT_PRINCIPALS.has(principalId)) {
+      throw new McpDomainError('MCP_INVALID_ACCOUNT_SCOPE', 'Stable role scopes are reserved for managed local clients.');
+    }
+    if (LOCAL_CLIENT_PRINCIPALS.has(principalId)
+      && accountScopes.some((scope) => parseRoleScope(scope) === null)) {
+      throw new McpDomainError('MCP_INVALID_ACCOUNT_SCOPE', 'Managed local clients must use stable role scopes.');
+    }
     const toolScopes = [...new Set(input.toolScopes)];
     // External scopes may only name external tools; the Agent room history tool is internal-only.
     if (toolScopes.some((tool) => !McpToolNameSchema.safeParse(tool).success)) {
@@ -223,11 +232,12 @@ export class McpTokenRepository {
       await client.query("SET LOCAL statement_timeout = '2000ms'");
       await client.query("SET LOCAL lock_timeout = '1000ms'");
 
+      const concreteScopes = accountScopes.filter((scope) => parseRoleScope(scope) === null);
       const existingAccounts = await client.query<{ account_id: string }>(
         'SELECT account_id FROM line_accounts WHERE account_id = ANY($1::text[]) FOR SHARE',
-        [accountScopes],
+        [concreteScopes],
       );
-      if (existingAccounts.rowCount !== accountScopes.length) {
+      if (existingAccounts.rowCount !== concreteScopes.length) {
         throw new McpDomainError(
           'MCP_INVALID_ACCOUNT_SCOPE',
           'One or more requested LINE account scopes do not exist.',
@@ -277,6 +287,22 @@ export class McpTokenRepository {
        ORDER BY created_at DESC, token_id DESC`,
     );
     return result.rows.map(toTokenSummary);
+  }
+
+  async normalizeManagedLocalClientScopes(): Promise<void> {
+    await this.withMcpTransaction(undefined, normalizeManagedMcpScopes);
+  }
+
+  async findTokenByBearerToken(plaintextToken: string): Promise<McpTokenSummary | null> {
+    if (!/^la_mcp_[A-Za-z0-9_-]{43}$/.test(plaintextToken)) return null;
+    const digest = hashMcpBearerToken(plaintextToken);
+    const result = await this.pool.query<TokenRow>(
+      `SELECT token_id, principal_id, device_label, account_scopes, tool_scopes,
+              grant_version, state, expires_at, revoked_at, last_used_at, created_at
+       FROM mcp_agent_tokens WHERE token_digest = $1`, [digest],
+    );
+    const row = result.rows[0];
+    return row ? toTokenSummary(row) : null;
   }
 
   async countActiveTokens(): Promise<number> {
@@ -391,7 +417,7 @@ export class McpTokenRepository {
          WHERE token_digest = $1`,
         [digest],
       );
-      const row = snapshot.rows[0];
+      let row = snapshot.rows[0];
 
       // Step 2: Digest Check
       if (
@@ -414,6 +440,11 @@ export class McpTokenRepository {
         throw new McpDomainError('AUTH_INVALID', 'Invalid or unrecognized MCP bearer token.');
       }
 
+      if (LOCAL_CLIENT_PRINCIPALS.has(row.principal_id) && row.account_scopes.some((scope) => parseRoleScope(scope) === null)) {
+        await normalizeManagedMcpScopes(client);
+        row = (await client.query<TokenRow & { is_expired: boolean }>(
+          `SELECT *,COALESCE(expires_at<=clock_timestamp(),false) is_expired FROM mcp_agent_tokens WHERE token_id=$1`, [row.token_id])).rows[0]!;
+      }
       const grantVersion = Number(row.grant_version);
 
       // Step 3: Revocation Check
@@ -512,34 +543,37 @@ export class McpTokenRepository {
 
       // Step 6: Account Scope Check
       const requestedAccount = input.requestedAccountId?.trim();
-      if (requestedAccount && !row.account_scopes.includes(requestedAccount)) {
-        await this.insertAudit(client, {
-          tokenId: row.token_id,
-          principalId: row.principal_id,
-          initiator: 'external_agent',
-          action: 'AUTH_REJECTED',
-          toolName: input.toolName,
-          accountScopes: [requestedAccount],
-          grantVersion,
-          disposition: 'SCOPE_DENIED',
-          resultCount: null,
-        });
-        await client.query('COMMIT');
-        throw new McpDomainError(
-          'SCOPE_DENIED',
-          `Token is not authorized for LINE account "${requestedAccount}".`,
-        );
+      const hasRoleScopes = row.account_scopes.some((scope) => parseRoleScope(scope) !== null);
+      if (hasRoleScopes && !LOCAL_CLIENT_PRINCIPALS.has(row.principal_id)) {
+        throw new McpDomainError('SCOPE_DENIED', 'Stable role scopes are reserved for managed local clients.');
       }
-
-      const candidateAccountIds = requestedAccount ? [requestedAccount] : row.account_scopes;
-      const existingAccounts = await client.query<{ account_id: string; control_epoch: string }>(
-        `SELECT a.account_id, c.control_epoch
+      const concreteAccountIds = row.account_scopes.filter((scope) => parseRoleScope(scope) === null);
+      if (LOCAL_CLIENT_PRINCIPALS.has(row.principal_id) && concreteAccountIds.length > 0) {
+        throw new McpDomainError('SCOPE_DENIED', 'Managed local clients require stable role scopes.');
+      }
+      const roleScopes = row.account_scopes.flatMap((scope) => {
+        const role = parseRoleScope(scope);
+        return role ? [role] : [];
+      });
+      const existingAccounts = await client.query<{ account_id: string; control_epoch: string; product_role: ProductRole | null }>(
+        `SELECT a.account_id, c.control_epoch, a.product_role
          FROM line_accounts a CROSS JOIN account_control c
-         WHERE a.account_id = ANY($1::text[]) AND a.mode <> 'PAUSED' AND c.singleton = true
+         WHERE (a.account_id = ANY($1::text[]) OR a.product_role = ANY($2::text[]))
+           AND a.mode <> 'PAUSED' AND c.singleton = true
          ORDER BY a.account_id ASC`,
-        [candidateAccountIds],
+        [concreteAccountIds, roleScopes],
       );
-      const authorizedAccountIds = existingAccounts.rows.map((item) => item.account_id);
+      const resolvedAccountIds = existingAccounts.rows.map((item) => item.account_id);
+      if (requestedAccount && !resolvedAccountIds.includes(requestedAccount)) {
+        await this.insertAudit(client, { tokenId: row.token_id, principalId: row.principal_id, initiator: 'external_agent',
+          action: 'AUTH_REJECTED', toolName: input.toolName, accountScopes: [requestedAccount], grantVersion,
+          disposition: 'SCOPE_DENIED', resultCount: null });
+        await client.query('COMMIT');
+        throw new McpDomainError('SCOPE_DENIED', `Token is not authorized for LINE account "${requestedAccount}".`);
+      }
+      const authorizedAccountIds = requestedAccount ? [requestedAccount] : resolvedAccountIds;
+      const resolvedRoleBindings = existingAccounts.rows.filter((account) => account.product_role !== null
+        && roleScopes.includes(account.product_role) && authorizedAccountIds.includes(account.account_id));
       const controlEpoch = existingAccounts.rows[0]?.control_epoch;
       if (authorizedAccountIds.length === 0) {
         await this.insertAudit(client, {
@@ -548,7 +582,7 @@ export class McpTokenRepository {
           initiator: 'external_agent',
           action: 'AUTH_REJECTED',
           toolName: input.toolName,
-          accountScopes: candidateAccountIds,
+          accountScopes: row.account_scopes,
           grantVersion,
           disposition: 'SCOPE_DENIED',
           resultCount: null,
@@ -588,7 +622,9 @@ export class McpTokenRepository {
       }
 
 
-      // Step 8: Atomic Post-Query Fenced Update & Revalidation
+      // Step 8: acquire the token mutation lock first. The UPDATE may wait, so its statement snapshot
+      // cannot establish account authority. Recheck with fresh statements after the wait, then hold
+      // control -> account locks only until COMMIT (never across the protected read).
       const fenced = await client.query<{ token_id: string; grant_version: string }>(
         `UPDATE mcp_agent_tokens
          SET last_used_at = clock_timestamp()
@@ -597,16 +633,23 @@ export class McpTokenRepository {
            AND state = 'ACTIVE'
            AND revoked_at IS NULL
            AND (expires_at IS NULL OR expires_at > clock_timestamp())
-           AND (SELECT control_epoch FROM account_control WHERE singleton = true) = $3
-           AND NOT EXISTS (
-             SELECT 1 FROM unnest($4::text[]) AS scoped(account_id)
-             WHERE NOT EXISTS (SELECT 1 FROM line_accounts a WHERE a.account_id = scoped.account_id AND a.mode <> 'PAUSED')
-           )
          RETURNING token_id, grant_version`,
-        [row.token_id, grantVersion, controlEpoch, authorizedAccountIds],
+        [row.token_id, grantVersion],
       );
-
-      if (fenced.rowCount === 0) {
+      let authorityCurrent = false;
+      if (fenced.rowCount !== 0) {
+        const currentControl = (await client.query<{ control_epoch: string }>(
+          'SELECT control_epoch FROM account_control WHERE singleton=true FOR SHARE')).rows[0];
+        const currentAccounts = (await client.query<{ account_id: string; product_role: ProductRole | null; mode: string }>(
+          `SELECT account_id,product_role,mode FROM line_accounts WHERE account_id=ANY($1::text[])
+           ORDER BY CASE product_role WHEN 'PRIMARY_ADMIN' THEN 0 WHEN 'AGENT' THEN 1 ELSE 2 END,account_id FOR SHARE`,
+          [authorizedAccountIds])).rows;
+        authorityCurrent = currentControl?.control_epoch === controlEpoch
+          && currentAccounts.length === authorizedAccountIds.length && currentAccounts.every((account) => account.mode !== 'PAUSED')
+          && resolvedRoleBindings.every((expected) => currentAccounts.some((account) => account.account_id === expected.account_id
+            && account.product_role === expected.product_role));
+      }
+      if (fenced.rowCount === 0 || !authorityCurrent) {
         const postCheck = await client.query<{
           state: 'ACTIVE' | 'REVOKED';
           revoked_at: Date | null;

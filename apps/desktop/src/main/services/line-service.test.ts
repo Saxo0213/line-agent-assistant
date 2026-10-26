@@ -54,6 +54,38 @@ describe('Agent status reply localization', () => {
   });
 });
 
+it('correlates bounded logout results to the current binding and rejects them on unbind', async () => {
+  const commands: LineWorkerCommand[] = [];
+  const service = new BaseLineService({ async bindWorker() {} } as never,
+    { async listPendingRouteActions() { return []; } } as never, {} as never,
+    { async send(command) { commands.push(command); } },
+    { kick() {}, async stopChat() {}, async resetChat() {} });
+  await expect(service.requestLogout('logout-account', 'logout-worker', 10_000)).rejects.toThrow('LINE_LOGOUT_TIMEOUT_INVALID');
+  const binding = { accountId: 'logout-account', workerInstanceId: 'logout-worker', controlEpoch: 19, mode: 'ACTIVE_CONTROL' as const };
+  await service.bind(binding);
+  const pending = service.requestLogout(binding.accountId, binding.workerInstanceId, 11_000);
+  await vi.waitFor(() => expect(commands).toHaveLength(1));
+  const command = commands[0]!;
+  expect(command).toMatchObject({ type: 'logout', accountId: binding.accountId,
+    workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch, requestId: expect.any(String) });
+  if (command.type !== 'logout') throw new Error('logout command not sent');
+  await service.handleWorkerEvent(binding.workerInstanceId, { type: 'logoutResult', accountId: binding.accountId,
+    workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch,
+    requestId: command.requestId, ok: true, error: null });
+  await expect(pending).resolves.toEqual({ ok: true, error: null });
+
+  const invalidated = service.requestLogout(binding.accountId, binding.workerInstanceId, 11_000);
+  await vi.waitFor(() => expect(commands).toHaveLength(2));
+  await service.handleWorkerEvent(binding.workerInstanceId, { type: 'authInvalidated', accountId: binding.accountId,
+    workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch });
+  await expect(invalidated).resolves.toEqual({ ok: false, error: 'LINE_AUTH_INVALIDATED' });
+
+  const abandoned = service.requestLogout(binding.accountId, binding.workerInstanceId, 11_000);
+  await vi.waitFor(() => expect(commands).toHaveLength(3));
+  service.unbind(binding.workerInstanceId);
+  await expect(abandoned).rejects.toThrow('LINE_LOGOUT_WORKER_STOPPED');
+});
+
 it('keeps attachment admission independent from receive health while preserving auth and protocol fences', async () => {
   const service = new BaseLineService({ async bindWorker() {}, async getAccount() { return { ownMid: 'agent-mid' }; },
     async applyWorkerLogin() { return true; }, async applyWorkerConnectionStatus() { return true; } } as never,
@@ -80,6 +112,30 @@ it('keeps attachment admission independent from receive health while preserving 
   expect(service.isAttachmentReady(binding)).toBe(false);
   await service.handleWorkerEvent(binding.workerInstanceId, { type: 'authInvalidated', ...eventBinding });
   expect(service.isAttachmentReady(binding)).toBe(false);
+});
+
+it('keeps worker readiness after a retryable token refresh diagnostic and healthy poll', async () => {
+  const service = new BaseLineService({ async bindWorker() {}, async getAccount() { return { ownMid: 'agent-mid' }; },
+    async applyWorkerLogin() { return true; }, async applyWorkerConnectionStatus() { return true; } } as never,
+    { async listPendingRouteActions() { return []; } } as never, {} as never, { async send() {} },
+    { kick() {}, async stopChat() {}, async resetChat() {} });
+  const binding = { accountId: 'a', workerInstanceId: 'refresh-failure-ready', controlEpoch: 1, mode: 'ACTIVE_CONTROL' as const };
+  const eventBinding = { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch };
+  await service.bind(binding);
+  await service.handleWorkerEvent(binding.workerInstanceId, { type: 'login', ...eventBinding,
+    loginAttemptId: 'refresh-failure-login', ownMid: 'agent-mid', displayName: null });
+  await service.handleWorkerEvent(binding.workerInstanceId, { type: 'status', ...eventBinding, state: 'ready', message: null });
+  const failure = { type: 'error' as const, ...eventBinding, code: 'WORKER_OPERATION_FAILED' as const,
+    message: 'LINE token refresh failed', retryable: true,
+    diagnostic: { operation: 'loginToken' as const, stage: 'execute' as const, category: 'transport_failed' as const,
+      recovery: 'retry' as const, outcome: 'failed' as const } };
+
+  await service.handleWorkerEvent(binding.workerInstanceId, failure);
+  expect(service.isAuthenticatedReady(binding)).toBe(true);
+  expect(service.isAttachmentReady(binding)).toBe(true);
+  await service.handleWorkerEvent(binding.workerInstanceId, { type: 'status', ...eventBinding, state: 'ready', message: null });
+  expect(service.isAuthenticatedReady(binding)).toBe(true);
+  expect(service.isAttachmentReady(binding)).toBe(true);
 });
 
 describe('administrative archive admission', () => {

@@ -579,7 +579,7 @@ describe('settings layout and status preview', () => {
     fireEvent.click(screen.getByRole('tab', { name: '對話' }));
     await waitFor(() => expect(screen.getByLabelText('附件自動下載嘗試次數')).toHaveProperty('value', '3'));
   };
-  it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('localizes six read-only status notes in %s while retaining neutral reaction glyphs', async (locale) => {
+  it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('localizes six read-only status notes and neutral glyphs in %s', async (locale) => {
     renderWithStartupLocale(<Settings api={makeApi()} headingRef={React.createRef()} onNotice={vi.fn()} />, locale);
     fireEvent.click(screen.getByRole('tab', { name: desktopTextFor(locale, 'conversations') }));
     await screen.findByLabelText(desktopTextFor(locale, 'automaticAttachmentDownloadAttempts'));
@@ -588,7 +588,7 @@ describe('settings layout and status preview', () => {
     expect(rows.map((row) => row.querySelector('.agent-status-icon-note')?.textContent)).toEqual([
       'AMAZING', desktopTextFor(locale, 'alternating'), 'LOVE', 'SAD', 'FUN', 'OMG',
     ]);
-    expect(rows.map((row) => [...row.querySelectorAll('.agent-status-glyph')].map((glyph) => glyph.textContent))).toEqual([
+    expect(rows.map((row) => [...row.querySelectorAll('.agent-status-marker .agent-status-glyph')].map((glyph) => glyph.textContent))).toEqual([
       [LINE_REACTION_GLYPHS.AMAZING], [LINE_REACTION_GLYPHS.NICE, LINE_REACTION_GLYPHS.AMAZING, LINE_REACTION_GLYPHS.FUN],
       [LINE_REACTION_GLYPHS.LOVE], [LINE_REACTION_GLYPHS.SAD], [LINE_REACTION_GLYPHS.FUN], [LINE_REACTION_GLYPHS.OMG],
     ]);
@@ -1362,7 +1362,7 @@ describe('database settings', () => {
     expect(api.mcpIssueToken).not.toHaveBeenCalled();
   });
 
-  it('shows local client badges and role-based account scopes mapped to real account IDs', async () => {
+  it('shows only stable role scopes for local clients and excludes retired accounts', async () => {
     const api = {
       getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: null, agentWorkspace: null, connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
       mcpGetStatus: vi.fn(async () => ({ running: true, endpoint: 'http://127.0.0.1:38471/mcp', host: '127.0.0.1' as const, port: 38471, activeTokenCount: 0, inFlightRequests: 0, maxConcurrentRequests: 8 })),
@@ -1377,6 +1377,7 @@ describe('database settings', () => {
     const accounts = [
       { accountId: 'account-agent', displayName: 'Agent LINE', status: 'connected', lastSyncedAt: null, mode: 'ACTIVE_CONTROL', productRole: 'AGENT' },
       { accountId: 'account-admin', displayName: 'Admin LINE', status: 'connected', lastSyncedAt: null, mode: 'MONITOR_ONLY', productRole: 'PRIMARY_ADMIN' },
+      { accountId: 'retired-agent', displayName: 'Retired Agent', status: 'disconnected', lastSyncedAt: null, mode: 'PAUSED', productRole: null },
     ] as unknown as import('@line-agent/contracts').LineAccountSummary[];
     const rendered = render(<Settings api={api} headingRef={React.createRef()} accounts={accounts} />);
     fireEvent.click(screen.getByRole('tab', { name: '助理' }));
@@ -1390,8 +1391,9 @@ describe('database settings', () => {
     expect(within(card).getByText('帳號範圍')).toBeTruthy();
     expect(within(card).getByRole('checkbox', { name: 'Claude Desktop AGENT帳號' })).toHaveProperty('checked', true);
     expect(within(card).getByRole('checkbox', { name: 'Claude Desktop 管理員帳號' })).toHaveProperty('checked', true);
+    expect(within(card).queryByRole('checkbox', { name: 'Claude Desktop Retired Agent' })).toBeNull();
     fireEvent.click(within(card).getByRole('button', { name: '連接' }));
-    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['account-agent', 'account-admin']));
+    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['role:AGENT', 'role:PRIMARY_ADMIN']));
     expect(screen.getByText('需重新啟動 Claude Desktop／Codex 後生效')).toBeTruthy();
     fireEvent.click(screen.getByRole('tab', { name: '指令' }));
     expect(screen.queryByText('需重新啟動 Claude Desktop／Codex 後生效')).toBeNull();
@@ -1438,7 +1440,7 @@ describe('database settings', () => {
     // A 320px card leaves 292px inside its padding; two 132px tracks plus the 12px gap fit.
     expect(getComputedStyle(scopePicker).gridTemplateColumns).toContain('132px');
     fireEvent.click(within(card).getByRole('button', { name: '連接' }));
-    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['account-agent']));
+    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['role:AGENT']));
   });
   it('does not show the restart note when connecting a local MCP client fails', async () => {
     const api = {
@@ -1473,7 +1475,7 @@ describe('database settings', () => {
       mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex', accountScopes: string[]) => ({ client, installed: true, connected: true, tokenId: '22222222-2222-4222-8222-222222222222', accountScopes })),
       mcpLocalClientDisconnect: vi.fn(async () => undefined),
     } as unknown as DesktopApi;
-    const account = { accountId: 'account-A', displayName: 'LINE 帳號 A', productRole: null } as unknown as import('@line-agent/contracts').LineAccountSummary;
+    const account = { accountId: 'account-A', displayName: 'LINE 帳號 A', productRole: 'AGENT' } as unknown as import('@line-agent/contracts').LineAccountSummary;
     render(<Settings api={api} headingRef={React.createRef()} accounts={[account]} />);
     fireEvent.click(screen.getByRole('tab', { name: '助理' }));
     expect(await screen.findByText('運行中 (0 個有效 Token)')).toBeTruthy();
@@ -1488,7 +1490,7 @@ describe('database settings', () => {
     expect(await screen.findByText('運行中 (0 個有效 Token)')).toBeTruthy();
     expect(mcpGetStatus).toHaveBeenCalledTimes(3);
   });
-  it('keeps each local client scope selection independent across equivalent snapshots', async () => {
+  it('keeps stable role selections independent across equivalent account snapshots', async () => {
     const api = {
       getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: null, agentWorkspace: null, connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
       mcpGetStatus: vi.fn(async () => ({ running: true, endpoint: 'http://127.0.0.1:38471/mcp', host: '127.0.0.1' as const, port: 38471, activeTokenCount: 0, inFlightRequests: 0, maxConcurrentRequests: 8 })),
@@ -1499,21 +1501,21 @@ describe('database settings', () => {
       ]),
       mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex', accountScopes: string[]) => ({ client, installed: true, connected: true, tokenId: null, accountScopes })),
     } as unknown as DesktopApi;
-    const a = { accountId: 'A', displayName: 'Account A', status: 'connected' as const, lastSyncedAt: null, mode: 'ACTIVE_CONTROL' as const, productRole: null };
-    const b = { accountId: 'B', displayName: 'Account B', status: 'connected' as const, lastSyncedAt: null, mode: 'ACTIVE_CONTROL' as const, productRole: null };
+    const a = { accountId: 'A', displayName: 'Account A', status: 'connected' as const, lastSyncedAt: null, mode: 'ACTIVE_CONTROL' as const, productRole: 'AGENT' as const };
+    const b = { accountId: 'B', displayName: 'Account B', status: 'connected' as const, lastSyncedAt: null, mode: 'MONITOR_ONLY' as const, productRole: 'PRIMARY_ADMIN' as const };
     const view = render(<Settings api={api} headingRef={React.createRef()} accounts={[a, b]} />);
     fireEvent.click(screen.getByRole('tab', { name: '助理' }));
     const findCard = (client: string) => screen.getAllByRole('region').find((item) => item.getAttribute('aria-label')?.startsWith(`${client} MCP`))!;
     await waitFor(() => expect(findCard('Claude Desktop')).toBeTruthy());
     const claude = findCard('Claude Desktop');
     const codex = findCard('Codex');
-    fireEvent.click(within(claude).getByRole('checkbox', { name: 'Claude Desktop Account B' }));
-    expect(within(codex).getByRole('checkbox', { name: 'Codex Account B' })).toHaveProperty('checked', true);
+    fireEvent.click(within(claude).getByRole('checkbox', { name: 'Claude Desktop 管理員帳號' }));
+    expect(within(codex).getByRole('checkbox', { name: 'Codex 管理員帳號' })).toHaveProperty('checked', true);
     view.rerender(<Settings api={api} headingRef={React.createRef()} accounts={[{ ...a }, { ...b }]} />);
     const updatedClaude = findCard('Claude Desktop');
-    expect(within(updatedClaude).getByRole('checkbox', { name: 'Claude Desktop Account B' })).toHaveProperty('checked', false);
+    expect(within(updatedClaude).getByRole('checkbox', { name: 'Claude Desktop 管理員帳號' })).toHaveProperty('checked', false);
     view.rerender(<Settings api={api} headingRef={React.createRef()} accounts={[{ ...a }]} />);
     fireEvent.click(within(findCard('Claude Desktop')).getAllByRole('button')[0]!);
-    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['A']));
+    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['role:AGENT']));
   });
 });

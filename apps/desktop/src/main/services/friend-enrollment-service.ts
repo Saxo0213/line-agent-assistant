@@ -239,7 +239,12 @@ export class FriendEnrollmentService {
     };
     const persistConfirmation = async () => {
       if (!(await current()) || !(await primaryStillCurrent()) || !(await current())) return false;
-      await this.deps.admins.confirmPrimaryAdministratorFriendship(binding.accountId, primary.userId, primaryVersion);
+      const persisted = await this.deps.admins.confirmPrimaryAdministratorFriendship(binding.accountId, primary.userId, primaryVersion);
+      if (!persisted) {
+        throw this.primaryFriendshipFailure(binding, 'relation', 'DATABASE_WRITE_FAILED',
+          { stage: 'persist', category: 'persistence_failed', recovery: 'retry' }, requestId,
+          'primary administrator friendship confirmation was not persisted');
+      }
       return true;
     };
     if (await this.deps.admins.hasPrimaryAdministratorFriendConfirmation(binding.accountId, primary.userId, primaryVersion)) return true;

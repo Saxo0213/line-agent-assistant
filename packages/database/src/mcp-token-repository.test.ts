@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MCP_TOOL_EFFECTS, MCP_TOOL_NAMES } from '@line-agent/contracts';
 import type { Pool } from 'pg';
 import { createTestDatabase } from './test-database.js';
@@ -15,6 +15,147 @@ import { join } from 'node:path';
 import { loadMigrations, migrate } from './migrate.js';
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
+
+database('managed MCP scopes across real Agent replacement', () => {
+  let pool: Pool;
+  let close: () => Promise<void>;
+  let accounts: AccountRepository;
+  let tokens: McpTokenRepository;
+  let agentId: string;
+  beforeEach(async () => {
+    ({ pool, close } = await createTestDatabase());
+    accounts = new AccountRepository(pool);
+    tokens = new McpTokenRepository(pool);
+    agentId = (await accounts.reserveAccountSlot()).accountId;
+    await accounts.setOwnMid(agentId, `u${'a'.repeat(32)}`);
+    const adminMid = `u${'b'.repeat(32)}`;
+    await accounts.bindPrimaryAdministrator(agentId, adminMid, adminMid);
+  });
+  afterEach(async () => { await close?.(); });
+  const read = (bearerToken: string, requestedAccountId?: string) => tokens.executeWithVerifiedToken({
+    bearerToken, toolName: 'list_targets', requestedAccountId,
+    execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }),
+  });
+  const legacy = async () => {
+    const token = await tokens.issueToken({ deviceLabel: 'Legacy Agent only', accountScopes: [agentId],
+      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    await pool.query("UPDATE mcp_agent_tokens SET principal_id='local-client:codex' WHERE token_id=$1", [token.token.tokenId]);
+    return token;
+  };
+  const replace = async () => {
+    const replaced = await accounts.replaceAgentAccount(agentId, (await accounts.getControlState()).controlEpoch);
+    if (!replaced.ok) throw new Error(replaced.code);
+    expect((await pool.query('SELECT count(*) FROM account_administrators WHERE account_id=$1', [agentId])).rows[0].count).toBe('0');
+    return replaced.account.accountId;
+  };
+
+  it.each(['request-first', 'replacement-first'] as const)('preserves the original Agent-only bearer without opening Settings (%s)', async (order) => {
+    const issued = await legacy();
+    const external = await tokens.issueToken({ deviceLabel: 'Historical external grant', accountScopes: [agentId],
+      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    if (order === 'request-first') expect(await read(issued.plaintextToken)).toEqual([agentId]);
+    const replacementId = await replace();
+    expect(await read(issued.plaintextToken, replacementId)).toEqual([replacementId]);
+    await expect(read(issued.plaintextToken, agentId)).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+    const once = (await tokens.listTokens()).find((token) => token.tokenId === issued.token.tokenId)!;
+    expect(once).toMatchObject({ state: 'ACTIVE', accountScopes: ['role:AGENT'] });
+    await tokens.normalizeManagedLocalClientScopes();
+    expect((await tokens.listTokens()).find((token) => token.tokenId === once.tokenId)!.grantVersion).toBe(once.grantVersion);
+    expect(await read(external.plaintextToken, agentId)).toEqual([agentId]);
+    expect((await tokens.listTokens()).find((token) => token.tokenId === external.token.tokenId)!.accountScopes).toEqual([agentId]);
+  });
+
+  it('recovers an already-retired scope using the real retirement revision after the administrator binding moved', async () => {
+    const issued = await tokens.issueToken({ deviceLabel: 'Pre-upgrade legacy token', accountScopes: [agentId],
+      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    const replacementId = await replace();
+    expect((await pool.query('SELECT role_revision FROM line_accounts WHERE account_id=$1', [agentId])).rows[0].role_revision).toBe('1');
+    // Model a managed token persisted by the old release, which did not normalize before retirement.
+    await pool.query("UPDATE mcp_agent_tokens SET principal_id='local-client:codex' WHERE token_id=$1", [issued.token.tokenId]);
+    expect(await read(issued.plaintextToken)).toEqual([replacementId]);
+    expect((await tokens.listTokens()).find((token) => token.tokenId === issued.token.tokenId))
+      .toMatchObject({ state: 'ACTIVE', accountScopes: ['role:AGENT'] });
+  });
+
+  it('rejects an obsolete result after the final token UPDATE waits while real replacement commits', async () => {
+    const issued = await tokens.issueToken({ deviceLabel: 'Blocked final fence', principalId: 'local-client:codex',
+      accountScopes: ['role:AGENT'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    const blocker = await pool.connect();
+    let request: Promise<unknown> | undefined;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query('SELECT token_id FROM mcp_agent_tokens WHERE token_id=$1 FOR UPDATE', [issued.token.tokenId]);
+      let reached!: (pid: number) => void;
+      const executed = new Promise<number>((resolve) => { reached = resolve; });
+      request = tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'list_targets',
+        execute: async ({ client }) => {
+          reached((await client.query<{ pid: number }>('SELECT pg_backend_pid() pid')).rows[0]!.pid);
+          return { data: 'obsolete account data' };
+        } });
+      void request.catch(() => undefined);
+      const pid = await executed;
+      await vi.waitFor(async () => {
+        const state = (await pool.query('SELECT wait_event_type,query FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0];
+        expect(state.wait_event_type).toBe('Lock');
+        expect(state.query).toContain('UPDATE mcp_agent_tokens');
+      });
+      await replace();
+      await blocker.query('COMMIT');
+      await expect(request).rejects.toMatchObject({ code: 'CONTROL_CHANGED' });
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => undefined);
+      blocker.release();
+      await request?.catch(() => undefined);
+    }
+  });
+
+  it('finishes both-role MCP fencing alongside an Admin-source-Agent writer when the Agent ID sorts first', async () => {
+    await pool.query('TRUNCATE line_accounts CASCADE');
+    const adminMid = `u${'b'.repeat(32)}`;
+    await pool.query(`INSERT INTO line_accounts(account_id,product_role,own_mid,connection_mode)
+      VALUES('a-agent','AGENT',$1,'SYSTEM_LOGIN'),('z-admin','PRIMARY_ADMIN',$2,'EXTERNAL_MONITOR')`,
+    [`u${'a'.repeat(32)}`, adminMid]);
+    await accounts.bindPrimaryAdministrator('a-agent', adminMid, adminMid);
+    const sourceId = randomUUID();
+    await pool.query(`INSERT INTO line_account_sources(source_id,account_id,source_type,generation,identity_digest,
+      verified_account_mid,state,read_capability,write_capability)
+      VALUES($1,'z-admin','EXTERNAL_MONITOR',1,repeat('a',64),$2,'ACTIVE',true,false)`, [sourceId, adminMid]);
+    const issued = await tokens.issueToken({ deviceLabel: 'Both roles lock order', principalId: 'local-client:codex',
+      accountScopes: ['role:AGENT', 'role:PRIMARY_ADMIN'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    const writer = await pool.connect();
+    let request: Promise<unknown> | undefined;
+    try {
+      await writer.query('BEGIN');
+      await writer.query("SET LOCAL lock_timeout='500ms'");
+      // ExternalMonitorRepository writes in Primary Admin -> source -> Agent order.
+      await writer.query("SELECT account_id FROM line_accounts WHERE account_id='z-admin' FOR UPDATE");
+      let reached!: (pid: number) => void;
+      const executed = new Promise<number>((resolve) => { reached = resolve; });
+      request = tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'list_targets',
+        execute: async ({ client, authorizedAccountIds }) => {
+          reached((await client.query<{ pid: number }>('SELECT pg_backend_pid() pid')).rows[0]!.pid);
+          return { data: authorizedAccountIds };
+        } });
+      void request.catch(() => undefined);
+      const pid = await executed;
+      await vi.waitFor(async () => {
+        const state = (await pool.query('SELECT wait_event_type,query FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0];
+        expect(state.wait_event_type).toBe('Lock');
+        expect(state.query).toContain('SELECT account_id,product_role,mode');
+      });
+      await writer.query('SELECT source_id FROM line_account_sources WHERE source_id=$1 FOR UPDATE', [sourceId]);
+      // This succeeds only if the waiting MCP fence has not already locked the lexically earlier Agent.
+      await writer.query("SELECT account_id FROM line_accounts WHERE account_id='a-agent' FOR UPDATE");
+      await writer.query("UPDATE line_accounts SET last_synced_at=now() WHERE account_id='z-admin'");
+      await writer.query('COMMIT');
+      await expect(request).resolves.toEqual(['a-agent', 'z-admin']);
+    } finally {
+      await writer.query('ROLLBACK').catch(() => undefined);
+      writer.release();
+      await request?.catch(() => undefined);
+    }
+  });
+});
 
 database('MCP tool scope structure migration', () => {
   it('accepts current tools, rejects invalid scopes, and keeps unknown stored tools non-executable', async () => {
@@ -468,6 +609,79 @@ database('MCP token & audit repository and target/time message queries', () => {
           row.disposition === 'SCOPE_DENIED',
       ),
     ).toBe(true);
+  });
+
+  it('resolves a managed AGENT role selector to the replacement account before the protected read', async () => {
+    const scoped = await tokens.issueToken({ deviceLabel: 'Managed Agent', principalId: 'local-client:codex',
+      accountScopes: ['role:AGENT'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    await accounts.ensureAccount('account-agent-replacement');
+    try {
+      await pool.query("UPDATE line_accounts SET product_role = NULL, mode = 'MONITOR_ONLY' WHERE account_id = 'account-agent'");
+      await pool.query("UPDATE line_accounts SET product_role = 'AGENT', mode = 'ACTIVE_CONTROL' WHERE account_id = 'account-agent-replacement'");
+      const resolved = await tokens.executeWithVerifiedToken({ bearerToken: scoped.plaintextToken, toolName: 'list_targets',
+        requestedAccountId: 'account-agent-replacement', execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }) });
+      expect(resolved).toEqual(['account-agent-replacement']);
+      await expect(tokens.executeWithVerifiedToken({ bearerToken: scoped.plaintextToken, toolName: 'list_targets',
+        requestedAccountId: 'account-agent', execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+    } finally {
+      await pool.query("UPDATE line_accounts SET product_role = NULL, mode = 'MONITOR_ONLY' WHERE account_id = 'account-agent-replacement'");
+      await pool.query("UPDATE line_accounts SET product_role = 'AGENT', mode = 'ACTIVE_CONTROL' WHERE account_id = 'account-agent'");
+    }
+  });
+
+  it('normalizes legacy managed account scopes to stable roles once and removes retired scopes', async () => {
+    await accounts.ensureAccount('retired-agent-history');
+    const legacy = await tokens.issueToken({ deviceLabel: 'Legacy managed', accountScopes: ['account-agent', 'account-admin', 'retired-agent-history'],
+      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    await pool.query("UPDATE mcp_agent_tokens SET principal_id = 'local-client:codex' WHERE token_id = $1", [legacy.token.tokenId]);
+    await tokens.normalizeManagedLocalClientScopes();
+    const once = (await tokens.listTokens()).find((token) => token.tokenId === legacy.token.tokenId)!;
+    expect(once.accountScopes).toEqual(['role:AGENT', 'role:PRIMARY_ADMIN']);
+    await tokens.normalizeManagedLocalClientScopes();
+    const twice = (await tokens.listTokens()).find((token) => token.tokenId === legacy.token.tokenId)!;
+    expect(twice.accountScopes).toEqual(once.accountScopes);
+    expect(twice.grantVersion).toBe(once.grantVersion);
+  });
+
+  it('discards a role-scoped read when its holder changes before the final authorization fence', async () => {
+    const scoped = await tokens.issueToken({ deviceLabel: 'Managed replacement fence', principalId: 'local-client:codex',
+      accountScopes: ['role:AGENT'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    await accounts.ensureAccount('role-fence-replacement');
+    try {
+      await expect(tokens.executeWithVerifiedToken({ bearerToken: scoped.plaintextToken, toolName: 'list_targets',
+        execute: async ({ authorizedAccountIds }) => {
+          expect(authorizedAccountIds).toEqual(['account-agent']);
+          await pool.query("UPDATE line_accounts SET product_role=NULL,mode='MONITOR_ONLY' WHERE account_id='account-agent'");
+          await pool.query("UPDATE line_accounts SET product_role='AGENT',mode='ACTIVE_CONTROL' WHERE account_id='role-fence-replacement'");
+          return { data: 'obsolete holder result' };
+        } })).rejects.toMatchObject({ code: 'CONTROL_CHANGED' });
+    } finally {
+      await pool.query("UPDATE line_accounts SET product_role=NULL,mode='MONITOR_ONLY' WHERE account_id='role-fence-replacement'");
+      await pool.query("UPDATE line_accounts SET product_role='AGENT',mode='ACTIVE_CONTROL' WHERE account_id='account-agent'");
+    }
+  });
+
+  it('does not infer a former Agent role from an arbitrary historical administrator binding', async () => {
+    const retired = 'retired-verified-agent';
+    const unknown = 'unknown-history-scope';
+    await accounts.ensureAccount(retired);
+    await accounts.setOwnMid(retired, `u${'a'.repeat(32)}`);
+    const adminMid = `u${'b'.repeat(32)}`;
+    await admins.bindPrimary(retired, adminMid, adminMid);
+    await accounts.ensureAccount(unknown);
+    const legacy = await tokens.issueToken({ deviceLabel: 'Retired Agent managed', accountScopes: [retired, unknown],
+      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    const external = await tokens.issueToken({ deviceLabel: 'Explicit historical grant', accountScopes: [retired],
+      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    await pool.query("UPDATE mcp_agent_tokens SET principal_id='local-client:codex' WHERE token_id=$1", [legacy.token.tokenId]);
+    await tokens.normalizeManagedLocalClientScopes();
+    const normalized = (await tokens.listTokens()).find((token) => token.tokenId === legacy.token.tokenId)!;
+    expect(normalized).toMatchObject({ state: 'REVOKED', grantVersion: legacy.token.grantVersion + 1 });
+    expect((await tokens.listTokens()).find((token) => token.tokenId === external.token.tokenId)!.accountScopes).toEqual([retired]);
+    await expect(tokens.executeWithVerifiedToken({ bearerToken: legacy.plaintextToken, toolName: 'list_targets',
+      execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'REVOKED' });
+    await tokens.normalizeManagedLocalClientScopes();
+    expect((await tokens.listTokens()).find((token) => token.tokenId === legacy.token.tokenId)!.grantVersion).toBe(normalized.grantVersion);
   });
 
   it('completes 6 concurrent same-token queries without 40P01 deadlock and fences in-flight reads on revokeToken', async () => {

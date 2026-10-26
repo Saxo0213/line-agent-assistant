@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-// Track A (docs/architecture/official-db-retained-capture-and-content-bridge-2026-10-20.md): every scenario runs the
+// Track A (docs/architecture/official-db-retained-capture-and-content-bridge.md): every scenario runs the
 // native OfficialSnapshotToolHarness against synthetic encrypted fixtures under a private temp directory. Nothing
 // here touches an installed LINE, its process memory, %LOCALAPPDATA%, or any PostgreSQL.
 const desktopRoot = path.resolve(fileURLToPath(new URL('../../../../', import.meta.url)));

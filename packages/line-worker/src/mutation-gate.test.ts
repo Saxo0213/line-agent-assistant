@@ -306,6 +306,30 @@ describe("trusted RequestClient boundary", () => {
     expect(physicalTransport).toHaveBeenCalledTimes(1);
   });
 
+  it('allows one exact authenticated LINE server logout POST through its dedicated effect phase', async () => {
+    const client = encryptedClient();
+    const { gate, physicalTransport } = setup({ requestClient: client });
+    const payload = new Uint8Array([0x82, 0x21, 0x00, 0x07, 0x6c, 0x6f, 0x67, 0x6f, 0x75, 0x74, 0x5a, 0x00]);
+    const request = new Request('https://legy.line-apps.com/RS4', { method: 'POST',
+      headers: { 'x-line-access': 'existing-token', 'x-line-application': 'DESKTOPWIN\t9.0.0' }, body: payload });
+    const permit = gate.createServerLogoutPermit('existing-token');
+    await gate.runServerLogout(request, permit);
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    await expect(gate.runServerLogout(request, permit)).rejects.toMatchObject({ code: 'SIDE_EFFECT_DENIED' });
+  });
+
+  it('rejects server logout without its existing token or with path drift', async () => {
+    const { gate, physicalTransport } = setup({ requestClient: encryptedClient() });
+    const request = new Request('https://legy.line-apps.com/RS4', { method: 'POST',
+      headers: { 'x-line-access': 'existing-token' }, body: new Uint8Array([0x82, 0x21, 0x00, 0x07, 0x6c, 0x6f, 0x67, 0x6f, 0x75, 0x74, 0x5a, 0x00]) });
+    expect(() => gate.createServerLogoutPermit('')).toThrowError();
+    await expect(gate.runServerLogout(request, gate.createServerLogoutPermit('different-token'))).rejects.toMatchObject({ code: 'SIDE_EFFECT_DENIED' });
+    await expect(gate.runServerLogout(new Request('https://legy.line-apps.com/other', { method: 'POST',
+      headers: { 'x-line-access': 'existing-token' }, body: new Uint8Array([0x82, 0x21, 0x00, 0x07, 0x6c, 0x6f, 0x67, 0x6f, 0x75, 0x74, 0x5a, 0x00]) }), gate.createServerLogoutPermit('existing-token')))
+      .rejects.toMatchObject({ code: 'SIDE_EFFECT_DENIED' });
+    expect(physicalTransport).not.toHaveBeenCalled();
+  });
+
   it("permits Relation reads only in CONTROL_READ and permits exactly addFriendByMid as a CONTROL_SEND", async () => {
     const direct = new FidelityRequestClient({ transport: { mode: "direct", tokenState: "v3-jwt" } });
     const { gate, physicalTransport } = setup({ requestClient: direct });

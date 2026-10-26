@@ -289,7 +289,9 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
   const [mcpTokens, setMcpTokens] = useState<McpTokenSummary[]>([]);
   const [mcpLocalClients, setMcpLocalClients] = useState<McpLocalClientStatus[]>([]);
   const [mcpLocalScopes, setMcpLocalScopes] = useState<Record<McpLocalClientKind, string[] | null>>({ 'claude-desktop': null, codex: null });
-  const accountIdsKey = accounts.map((account) => account.accountId).sort().join('\0');
+  const localRoleScopes = (['AGENT', 'PRIMARY_ADMIN'] as const)
+    .filter((role) => accounts.some((account) => account.productRole === role)).map((role) => `role:${role}`);
+  const accountIdsKey = localRoleScopes.join('\0');
   const [mcpLocalBusy, setMcpLocalBusy] = useState<McpLocalClientKind | null>(null);
   const [mcpRestartNotice, setMcpRestartNotice] = useState(false);
   const [mcpDeviceLabel, setMcpDeviceLabel] = useState('');
@@ -302,7 +304,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
   const [mcpBusy, setMcpBusy] = useState(false);
 
   useEffect(() => {
-    const valid = new Set(accounts.map((account) => account.accountId));
+    const valid = new Set(['role:AGENT', 'role:PRIMARY_ADMIN']);
     setMcpLocalScopes((current) => ({ ...current, 'claude-desktop': current['claude-desktop']?.filter((id) => valid.has(id)) ?? null,
       codex: current.codex?.filter((id) => valid.has(id)) ?? null }));
   }, [accountIdsKey]);
@@ -382,7 +384,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
     setMcpLocalBusy(client); setStatus('');
     try {
       if (action === 'connect') {
-        const selectedScopes = mcpLocalScopes[client] ?? accounts.map((account) => account.accountId);
+        const selectedScopes = mcpLocalScopes[client] ?? localRoleScopes;
         if (!selectedScopes.length) { setStatus(desktopText('selectAtLeastOneLineAccountScope')); return; }
         const status = await api.mcpLocalClientConnect(client, selectedScopes);
         setMcpLocalClients((current) => current.map((item) => item.client === client ? status : item));
@@ -643,7 +645,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
           {(['claude-desktop', 'codex'] as const).map((client) => {
             const status = mcpLocalClients.find((item) => item.client === client);
             const title = client === 'claude-desktop' ? 'Claude Desktop' : 'Codex';
-            const selectedScopes = mcpLocalScopes[client] ?? accounts.map((account) => account.accountId);
+            const selectedScopes = mcpLocalScopes[client] ?? localRoleScopes;
             return <section className="mcp-local-client-card" key={client} aria-label={desktopText('arg0McpConnection', { arg0: title })}>
               <div className="panel-top"><h3>{title}</h3><span className="badge">{!status ? desktopText('loading') : !status.installed ? desktopText('notInstalled612') : status.connected ? desktopText('connected613') : desktopText('disconnected614')}</span></div>
               <fieldset className="mcp-local-scope-picker">
@@ -652,16 +654,11 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
                   const account = accounts.find((item) => item.productRole === role);
                   const label = MCP_ACCOUNT_ROLE_LABEL[role];
                   return <label key={`${client}-${role}`}>
-                    <input type="checkbox" aria-label={`${title} ${label}${account ? '' : desktopText('notAddedYet')}`} checked={account ? selectedScopes.includes(account.accountId) : false} disabled={mcpLocalBusy !== null || !account}
-                      onChange={(event) => account && setMcpLocalScopes((current) => { const selected = current[client] ?? accounts.map((item) => item.accountId); return { ...current, [client]: event.target.checked ? [...selected, account.accountId] : selected.filter((id) => id !== account.accountId) }; })} />
+                    <input type="checkbox" aria-label={`${title} ${label}${account ? '' : desktopText('notAddedYet')}`} checked={selectedScopes.includes(`role:${role}`)} disabled={mcpLocalBusy !== null || !account}
+                      onChange={(event) => setMcpLocalScopes((current) => { const selected = current[client] ?? localRoleScopes; const scope = `role:${role}`; return { ...current, [client]: event.target.checked ? [...selected, scope] : selected.filter((id) => id !== scope) }; })} />
                     {label}
                   </label>;
                 })}
-                {accounts.filter((account) => account.productRole == null).map((account) => <label key={`${client}-${account.accountId}`}>
-                  <input type="checkbox" aria-label={`${title} ${account.displayName || account.accountId}`} checked={selectedScopes.includes(account.accountId)} disabled={mcpLocalBusy !== null}
-                    onChange={(event) => setMcpLocalScopes((current) => { const selected = current[client] ?? accounts.map((item) => item.accountId); return { ...current, [client]: event.target.checked ? [...selected, account.accountId] : selected.filter((id) => id !== account.accountId) }; })} />
-                  {account.displayName || account.accountId}
-                </label>)}
                 {accounts.length === 0 && <small>{desktopText('noLineAccountsAvailable')}</small>}
               </fieldset>
               <div className="mcp-local-client-actions">

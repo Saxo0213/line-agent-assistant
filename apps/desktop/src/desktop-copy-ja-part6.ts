@@ -11,8 +11,6 @@ export const JAPANESE_DESKTOP_COPY_PART6: Partial<Record<keyof typeof ENGLISH_DE
   replaceAgentAccountWithArg0Arg1: '「{arg0}」をスキャンした LINE アカウント「{arg1}」に変更しますか？',
   agentArchiveRemainsSeparate: '以前のアカウントのトークと添付ファイルはそのアカウントに残ります。新しいアカウントは別に開始します。',
   differentLineAccount: '別の LINE アカウント',
-  historicalAgentAccounts: '過去の Agent アカウント',
-  historicalAgentReadOnly: '過去のアーカイブ · 読み取り専用',
   logInToPrimaryAdminLineAccount: '主管理者の LINE アカウントにログイン',
   setAdministratorFromLineAndStartExternalMonitoring: 'LINE から管理者を設定して外部監視を開始',
   settingPrimaryAdministrator: '主管理者を設定中…',

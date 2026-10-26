@@ -40,9 +40,11 @@ describe('system record projection', () => {
     expect(SystemActivityResultSchema.safeParse({ activity: rows, partial: false }).success).toBe(true);
   });
   it('keeps every audit error code valid in the IPC result schema', () => {
-    const events = AUDIT_ERROR_CODES.map((errorCode) => audit({ phase: 'observed', errorCode }));
-    const result = { errors: projectSystemErrors(events, []), partial: false };
-    expect(SystemErrorsResultSchema.safeParse(result).success).toBe(true);
+    for (let index = 0; index < AUDIT_ERROR_CODES.length; index += 100) {
+      const events = AUDIT_ERROR_CODES.slice(index, index + 100).map((errorCode) => audit({ phase: 'observed', errorCode }));
+      const result = { errors: projectSystemErrors(events, []), partial: false };
+      expect(SystemErrorsResultSchema.safeParse(result).success).toBe(true);
+    }
   });
   it('projects safe localized activity and current attachment status only', () => {
     const attachment: AttachmentActivityRecord = { accountId: 'account-A', chatType: 'group', chatId: 'chat-A',

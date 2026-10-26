@@ -174,7 +174,7 @@ export const AGENT_ROOM_HISTORY_TOOL_DEFINITION = {
 } as const;
 
 /**
- * Internal-only LINE send tools (docs/architecture/agent-line-send-2026-10-22.md). Listed and callable only for the
+ * Internal-only LINE send tools (docs/architecture/agent-line-send.md). Listed and callable only for the
  * Primary Admin's LINE jobs and the desktop operator; tools/call re-checks on every call.
  */
 export const LIST_SEND_TARGETS_TOOL_DEFINITION = {
@@ -384,6 +384,14 @@ export class McpService {
 
   async listTokens(): Promise<McpTokenSummary[]> {
     return this.options.tokens.listTokens();
+  }
+
+  async normalizeManagedLocalClientScopes(): Promise<void> {
+    return this.options.tokens.normalizeManagedLocalClientScopes();
+  }
+
+  async findTokenByBearerToken(plaintextToken: string): Promise<McpTokenSummary | null> {
+    return this.options.tokens.findTokenByBearerToken(plaintextToken);
   }
 
   async revokeToken(tokenId: string): Promise<boolean> {

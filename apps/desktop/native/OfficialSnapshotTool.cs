@@ -9,7 +9,7 @@ using System.Web.Script.Serialization;
 
 // Standalone developer tool: retained official-database capture, sandboxed aggregate analysis, and live-message
 // correlation. It never prints text, names, IDs, MIDs, file names, key bytes or blob bytes. See
-// docs/architecture/official-db-retained-capture-and-content-bridge-2026-10-20.md (Track A).
+// docs/architecture/official-db-retained-capture-and-content-bridge.md (Track A).
 internal static partial class OfficialSnapshotTool {
   static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = Int32.MaxValue, RecursionLimit = 64 };
   const long MaxDatabaseBytes = 5L * 1024 * 1024 * 1024;

@@ -16,6 +16,137 @@ import type { AttachmentDownloadIdentity } from './attachment-download.js';
 import { normalizeOperation } from './normalizer.js';
 import { validateAttachmentMessage } from './attachment-download.js';
 import { boundedChatResourceResponseCode, ChatResourceFailure } from './chat-resource-error.js';
+import { LineServerRejection } from './line-server-error.js';
+
+it('decodes a physical encrypted sendMessage Talk rejection after one network dispatch', async () => {
+  const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
+    E2EE: { prototype: { encryptE2EEMessage: (...args: any[]) => Promise<Buffer[]> } };
+  };
+  const { LegyEncryptedTransport } = await import(new URL('../../../node_modules/@evex/linejs/base/request/legy.js', import.meta.url).href) as {
+    LegyEncryptedTransport: { prototype: { fetch: (request: Request, fetcher: (request: Request) => Promise<Response>,
+      options: { endpoint?: string }) => Promise<Response> } };
+  };
+  const secret = 'token=private MID=u12345678901234567890123456789012 text=private';
+  const encrypt = vi.spyOn(E2EE.prototype, 'encryptE2EEMessage').mockResolvedValue([Buffer.from([1])]);
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async (_request, fetcher, options) => {
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    return await linejsTalkRejectionResponse('sendMessage', 82, secret);
+  });
+  const physicalTransport = vi.fn(async () => new Response());
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    const error = await adapter.send({ chatType: 'direct', chatId: 'u-peer' }, 'hello', null, lease)
+      .catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(LineServerRejection);
+    expect(error).toMatchObject({ code: 'LINE_TALK_E2EE_RETRY_ENCRYPT', upstreamCode: 82,
+      message: 'LINE_TALK_E2EE_RETRY_ENCRYPT' });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    expect(legy).toHaveBeenCalledOnce();
+  } finally { adapter.revoke(); encrypt.mockRestore(); legy.mockRestore(); }
+});
+
+it('decodes one physical sync Talk rejection without retaining its private reason', async () => {
+  const { LegyEncryptedTransport } = await import(new URL('../../../node_modules/@evex/linejs/base/request/legy.js', import.meta.url).href) as {
+    LegyEncryptedTransport: { prototype: { fetch: (request: Request, fetcher: (request: Request) => Promise<Response>,
+      options: { endpoint?: string }) => Promise<Response> } };
+  };
+  const secret = 'token=private MID=u12345678901234567890123456789012';
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async (_request, fetcher, options) => {
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    return await linejsTalkRejectionResponse('sync', 4, secret);
+  });
+  const physicalTransport = vi.fn(async () => new Response());
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    const error = await adapter.sync(cursor).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: 'LINE_TALK_EXCESSIVE_ACCESS', upstreamCode: 4 });
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    expect(legy).toHaveBeenCalledOnce();
+    expect(JSON.stringify(error)).not.toContain(secret);
+  } finally { adapter.revoke(); legy.mockRestore(); }
+});
+
+it('preserves an E2EE preparation Talk rejection before sendMedia reaches sendMessage', async () => {
+  const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
+    E2EE: { prototype: { encryptByKeyMaterial: (...args: any[]) => Promise<unknown>;
+      encryptE2EEMessage: (...args: any[]) => Promise<Buffer[]> } };
+  };
+  const { LineObs } = await import(new URL('../../../node_modules/@evex/linejs/base/obs/mod.js', import.meta.url).href) as {
+    LineObs: { prototype: { uploadObjectForService: (...args: any[]) => Promise<unknown> } };
+  };
+  const { TalkService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/talk/mod.js', import.meta.url).href) as {
+    TalkService: { prototype: { sendMessage: (...args: any[]) => Promise<unknown> } };
+  };
+  const { LegyEncryptedTransport } = await import(new URL('../../../node_modules/@evex/linejs/base/request/legy.js', import.meta.url).href) as {
+    LegyEncryptedTransport: { prototype: { fetch: (request: Request, fetcher: (request: Request) => Promise<Response>,
+      options: { endpoint?: string }) => Promise<Response> } };
+  };
+  const secret = 'token=private MID=u12345678901234567890123456789012 text=private';
+  const encryptData = vi.spyOn(E2EE.prototype, 'encryptByKeyMaterial').mockResolvedValue({
+    keyMaterial: Buffer.alloc(32, 1), encryptedData: Buffer.from([1, 2, 3]) });
+  const upload = vi.spyOn(LineObs.prototype, 'uploadObjectForService').mockResolvedValue({ objId: 'uploaded-once' });
+  const encryptMessage = vi.spyOn(E2EE.prototype, 'encryptE2EEMessage').mockImplementation(async function (this: { client: BaseClient }) {
+    await this.client.talk.getLastE2EEPublicKeys({ chatMid: 'u-peer' });
+    return [Buffer.from([1])];
+  });
+  const sendMessage = vi.spyOn(TalkService.prototype, 'sendMessage');
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async (_request, fetcher, options) => {
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    return await linejsTalkRejectionResponse('getLastE2EEPublicKeys', 84, secret);
+  });
+  const physicalTransport = vi.fn(async () => new Response());
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    const error = await adapter.sendMedia({ chatType: 'direct', chatId: 'u-peer' },
+      { kind: 'file', bytes: Buffer.from([9]), fileName: 'safe.bin' }, lease).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(LineServerRejection);
+    expect(error).toMatchObject({ code: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY', upstreamCode: 84,
+      message: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY' });
+    expect(upload).toHaveBeenCalledOnce();
+    expect(encryptMessage).toHaveBeenCalledOnce();
+    expect(legy).toHaveBeenCalledOnce();
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(JSON.stringify(error)).not.toContain(secret);
+  } finally { adapter.revoke(); encryptData.mockRestore(); upload.mockRestore(); encryptMessage.mockRestore(); sendMessage.mockRestore(); legy.mockRestore(); }
+});
+
+it.each([
+  ['unsendMessage', 'NOT_YOUR_MESSAGE', 28],
+  ['react', 'MESSAGE_NOT_FOUND', 64],
+  ['getRecentMessagesV2', 'EXPIRED_REVISION', 52],
+] as const)('decodes one native Talk %s rejection with a fixed %s code', async (method, name, number) => {
+  const privateText = 'token=private MID=u12345678901234567890123456789012 body=private';
+  const { RequestClient } = await import(new URL('../../../node_modules/@evex/linejs/base/request/mod.js', import.meta.url).href) as {
+    RequestClient: { prototype: { request: (...args: any[]) => Promise<unknown> } };
+  };
+  const native = new InternalError('RequestError', privateText, { code: name, reason: privateText,
+    parameterMap: { private: privateText }, rawBody: privateText });
+  const request = vi.spyOn(RequestClient.prototype, 'request').mockRejectedValue(native);
+  const physicalTransport = vi.fn(async () => { throw new Error('unexpected physical request'); });
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    const failed = method === 'unsendMessage'
+      ? adapter.unsend({ chatType: 'direct', chatId: 'u-peer' }, '9', lease)
+      : method === 'react'
+        ? adapter.react({ chatType: 'direct', chatId: 'u-peer' }, '9', 'NICE', lease)
+        : adapter.history({ chatType: 'direct', chatId: 'u-peer' }, null, 10);
+    const error = await failed.catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(LineServerRejection);
+    expect(error).toMatchObject({ code: `LINE_TALK_${name}`, upstreamCode: number });
+    expect((error as Error).message).not.toContain(privateText);
+    expect(JSON.stringify(error)).not.toContain(privateText);
+    expect(request).toHaveBeenCalledOnce();
+    expect(request.mock.calls[0]?.[1]).toBe(method);
+    expect(request.mock.calls[0]?.[4]).toBe('/S4');
+    expect(physicalTransport).not.toHaveBeenCalled();
+  } finally { adapter.revoke(); request.mockRestore(); }
+});
 
 it.each([
   [{ code: 0 }, 0],
@@ -209,6 +340,18 @@ async function linejsRefreshResponse(accessToken: string, refreshToken: string):
   client.thrift.readThrift(body, Protocols[4]!);
   return new Response(body);
 }
+async function linejsLogoutResponse(): Promise<Response> {
+  const client = new BaseClient({ device: 'DESKTOPWIN' });
+  const body = Buffer.from(client.thrift.writeThrift([], 'logoutZ', Protocols[4]!));
+  body[1] = 0x41;
+  return new Response(body);
+}
+async function linejsLogoutExceptionResponse(code: number, message = 'server rejection'): Promise<Response> {
+  const client = new BaseClient({ device: 'DESKTOPWIN' });
+  const body = Buffer.from(client.thrift.writeThrift([[12, 1, [[8, 1, code], [11, 2, message]]]], 'logoutZ', Protocols[4]!));
+  body[1] = 0x41;
+  return new Response(body);
+}
 async function linejsRefreshDemandResponse(methodName: string): Promise<Response> {
   const { Protocols } = await import(new URL('../../../node_modules/@evex/linejs/base/thrift/mod.js', import.meta.url).href) as {
     Protocols: Record<number, any>;
@@ -221,6 +364,13 @@ async function linejsRefreshDemandResponse(methodName: string): Promise<Response
   expect(parsed.data.e.code).toBe('MUST_REFRESH_V3_TOKEN');
   return new Response(body);
 }
+async function linejsTalkRejectionResponse(methodName: string, numericCode: number, privateText: string): Promise<Response> {
+  const client = new BaseClient({ device: 'DESKTOPWIN' });
+  const body = Buffer.from(client.thrift.writeThrift([[12, 1, [[8, 1, numericCode], [11, 2, privateText],
+    [13, 3, [11, 11, { private: privateText }]]]]], methodName, Protocols[4]!));
+  body[1] = 0x41; // Compact REPLY, as returned after the pinned LEGY envelope is decrypted.
+  return new Response(body);
+}
 async function linejsProfileResponse(mid: string): Promise<Response> {
   const { Protocols } = await import(new URL('../../../node_modules/@evex/linejs/base/thrift/mod.js', import.meta.url).href) as {
     Protocols: Record<number, any>;
@@ -230,6 +380,307 @@ async function linejsProfileResponse(mid: string): Promise<Response> {
   body[1] = 0x41;
   return new Response(body);
 }
+
+it('routes logoutZ through the single authenticated /RS4 gate request', async () => {
+  const requests: Request[] = [];
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => { requests.push(request); return linejsLogoutResponse(); } });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    await adapter.logoutServer();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ method: 'POST', redirect: 'error' });
+    expect(new URL(requests[0]!.url).pathname).toBe('/RS4');
+    expect(requests[0]!.headers.get('x-line-access')).toBe(jwt);
+    expect(new Uint8Array(await requests[0]!.clone().arrayBuffer())).toEqual(new Uint8Array([0x82, 0x21, 0x00, 0x07,
+      0x6c, 0x6f, 0x67, 0x6f, 0x75, 0x74, 0x5a, 0x00]));
+  } finally { adapter.revoke(); }
+});
+
+it('waits for an in-flight scheduled refresh before logging out with the rotated token', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-26T00:00:00.000Z'));
+  const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  const refreshedToken = [Buffer.from('{"alg":"HS256"}').toString('base64url'),
+    Buffer.from('{"sub":"u-self","v":"logout-race-refresh"}').toString('base64url'), 'signature'].join('.');
+  const requests: Request[] = [];
+  let releaseRefresh!: (response: Response) => void;
+  const credentials = vi.fn();
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => {
+      requests.push(request);
+      if (new URL(request.url).pathname === '/EXT/auth/tokenrefresh/v1') {
+        return await new Promise<Response>((resolve) => { releaseRefresh = resolve; });
+      }
+      return linejsLogoutResponse();
+    } });
+  adapter.on('credentials', credentials);
+  try {
+    await adapter.installSecrets({ token: jwt, qrCert: null,
+      e2eeStorage: { refreshToken: 'refresh-before-logout', expire: Math.floor(Date.now() / 1000) + 1, retained: 'kept' } });
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+
+    const logout = adapter.logoutServer();
+    await Promise.resolve();
+    expect(requests).toHaveLength(1);
+
+    releaseRefresh(await linejsRefreshResponse(refreshedToken, 'refresh-after-logout'));
+    await logout;
+
+    expect(credentials).toHaveBeenCalledOnce();
+    expect(credentials).toHaveBeenCalledWith({ token: refreshedToken, e2eeStorage: {
+      refreshToken: 'refresh-after-logout', expire: expect.any(Number), retained: 'kept',
+    } });
+    expect(requests).toHaveLength(2);
+    expect(new URL(requests[1]!.url).pathname).toBe('/RS4');
+    expect(requests[1]!.headers.get('x-line-access')).toBe(refreshedToken);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { adapter.revoke(); randomSpy.mockRestore(); vi.useRealTimers(); }
+});
+
+it.each(['server rejection', 'logout deadline'] as const)('keeps one refresh scheduled from rotated credentials after an overlapping %s', async (outcome) => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-26T00:00:00.000Z'));
+  const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+  const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  const refreshedToken = [Buffer.from('{"alg":"HS256"}').toString('base64url'),
+    Buffer.from('{"sub":"u-self","v":"logout-failure-refresh"}').toString('base64url'), 'signature'].join('.');
+  const requests: Request[] = [];
+  let releaseRefresh!: (response: Response) => void;
+  const credentials = vi.fn();
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => {
+      requests.push(request);
+      if (new URL(request.url).pathname === '/EXT/auth/tokenrefresh/v1') {
+        return await new Promise<Response>((resolve) => { releaseRefresh = resolve; });
+      }
+      return outcome === 'server rejection' ? linejsLogoutExceptionResponse(4) : linejsLogoutResponse();
+    } });
+  adapter.on('credentials', credentials);
+  try {
+    await adapter.installSecrets({ token: jwt, qrCert: null,
+      e2eeStorage: { refreshToken: 'refresh-before-logout', expire: Math.floor(Date.now() / 1000) + 1, retained: 'kept' } });
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+
+    const controller = new AbortController();
+    const logout = adapter.logoutServer(controller.signal);
+    if (outcome === 'logout deadline') {
+      controller.abort(new Error('logout deadline'));
+      await expect(logout).rejects.toThrow('logout deadline');
+    }
+    releaseRefresh(await linejsRefreshResponse(refreshedToken, 'refresh-after-logout'));
+    if (outcome === 'server rejection') await expect(logout).rejects.toThrow('LINE_LOGOUT_SERVER_REJECTED');
+    await vi.waitFor(() => expect(credentials).toHaveBeenCalledOnce());
+
+    expect(requests).toHaveLength(outcome === 'server rejection' ? 2 : 1);
+    expect(setTimeoutSpy).toHaveBeenCalledTimes(2);
+    expect(setTimeoutSpy.mock.calls[1]?.[1]).toBeGreaterThan(3_500_000);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(requests).toHaveLength(outcome === 'server rejection' ? 2 : 1);
+    expect(vi.getTimerCount()).toBe(1);
+  } finally { adapter.revoke(); randomSpy.mockRestore(); vi.useRealTimers(); }
+});
+
+it.each([
+  ['ordinary rejection', 4],
+  ['refresh-required rejection', 119],
+] as const)('rejects pinned logoutZ wire exception %s without losing auth', async (_name, code) => {
+  const requests: Request[] = [];
+  let attempts = 0;
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => {
+      requests.push(request);
+      return attempts++ === 0 ? linejsLogoutExceptionResponse(code) : linejsLogoutResponse();
+    } });
+  await adapter.installSecrets({ token: jwt, qrCert: null,
+    e2eeStorage: { refreshToken: 'refresh-existing', expire: Math.floor(Date.now() / 1000) + 3_600 } });
+  try {
+    await expect(adapter.logoutServer()).rejects.toThrow('LINE_LOGOUT_SERVER_REJECTED');
+    expect(requests).toHaveLength(1);
+    await adapter.logoutServer();
+    expect(requests).toHaveLength(2);
+    expect(requests.map((request) => request.headers.get('x-line-access'))).toEqual([jwt, jwt]);
+  } finally { adapter.revoke(); }
+});
+
+it('treats only the pinned auth invalidation TalkException as server logout confirmation', async () => {
+  const authInvalidated = vi.fn();
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async () => linejsLogoutExceptionResponse(1) });
+  adapter.on('authInvalidated', authInvalidated);
+  await adapter.installSecrets({ token: jwt, qrCert: null,
+    e2eeStorage: { refreshToken: 'refresh-existing', expire: Math.floor(Date.now() / 1000) + 3_600 } });
+  try {
+    await expect(adapter.logoutServer()).resolves.toBeUndefined();
+    expect(authInvalidated).toHaveBeenCalledOnce();
+  } finally { adapter.revoke(); }
+});
+
+it('rejects malformed pinned logoutZ wire responses before native token clearing', async () => {
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async () => new Response(new Uint8Array([0x82, 0x41, 0x00])) });
+  await adapter.installSecrets({ token: jwt, qrCert: null,
+    e2eeStorage: { refreshToken: 'refresh-existing', expire: Math.floor(Date.now() / 1000) + 3_600 } });
+  try {
+    await expect(adapter.logoutServer()).rejects.toThrow('LINE_LOGOUT_MALFORMED_RESPONSE');
+  } finally { adapter.revoke(); }
+});
+
+it.each(['headers', 'body'] as const)('aborts stalled logout %s and a late response cannot complete the expired attempt', async (stall) => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-26T00:00:00.000Z'));
+  const requests: Request[] = [];
+  let releaseHeaders!: (response: Response) => void;
+  let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => {
+      requests.push(request);
+      if (requests.length > 1) return linejsLogoutResponse();
+      if (stall === 'headers') return await new Promise<Response>((resolve) => { releaseHeaders = resolve; });
+      request.signal.addEventListener('abort', () => bodyController?.error(new Error('body aborted')), { once: true });
+      return new Response(new ReadableStream<Uint8Array>({ start(controller) { bodyController = controller; } }));
+    } });
+  await adapter.installSecrets({ token: jwt, qrCert: null,
+    e2eeStorage: { refreshToken: 'refresh-existing', expire: Math.floor(Date.now() / 1000) + 3_600 } });
+  const controller = new AbortController();
+  try {
+    const attempt = adapter.logoutServer(controller.signal);
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]?.method).toBe('POST');
+    const rejected = expect(attempt).rejects.toThrow('logout deadline');
+    const timeout = setTimeout(() => controller.abort(new Error('logout deadline')), 500);
+    await vi.advanceTimersByTimeAsync(500);
+    await rejected;
+    expect(requests[0]?.signal.aborted).toBe(true);
+    clearTimeout(timeout);
+    expect(requests).toHaveLength(1);
+    if (stall === 'headers') releaseHeaders(await linejsLogoutResponse());
+    const retryController = new AbortController();
+    await adapter.logoutServer(retryController.signal);
+    expect(requests).toHaveLength(2);
+    expect(requests.every((request) => request.method === 'POST')).toBe(true);
+  } finally { adapter.revoke(); vi.useRealTimers(); }
+});
+
+it('cancels the scheduled refresh timer when server logout confirms auth invalidation', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-26T00:00:00.000Z'));
+  const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+  const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+  const invalidation = new InternalError('RequestError', 'fixture LINE auth invalidation', { code: 'NOT_AUTHORIZED_DEVICE' });
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async () => { throw invalidation; } });
+  const authInvalidated = vi.fn();
+  adapter.on('authInvalidated', authInvalidated);
+  try {
+    await adapter.installSecrets({ token: jwt, qrCert: null,
+      e2eeStorage: { refreshToken: 'refresh-existing', expire: Math.floor(Date.now() / 1000) + 3_600 } });
+    const timer = setTimeoutSpy.mock.results[0]!.value;
+    await adapter.logoutServer();
+    expect(authInvalidated).toHaveBeenCalledOnce();
+    expect(clearTimeoutSpy).toHaveBeenCalledWith(timer);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { adapter.revoke(); vi.useRealTimers(); }
+});
+
+it('schedules one refresh from stored expire and persists rotated credentials before scheduling the next refresh', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-26T00:00:00.000Z'));
+  const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+  const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+  const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.25);
+  const nextToken = [Buffer.from('{"alg":"HS256"}').toString('base64url'), Buffer.from('{"sub":"u-self","v":"refreshed"}').toString('base64url'), 'next'].join('.');
+  const credentials = vi.fn();
+  const refreshFailure = vi.fn();
+  const physicalTransport = vi.fn(async () => linejsRefreshResponse(nextToken, 'rotated-refresh'));
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false, physicalTransport });
+  adapter.on('credentials', credentials);
+  adapter.on('refreshFailure', refreshFailure);
+  try {
+    const expire = Math.floor(Date.now() / 1000) + 5;
+    await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: { refreshToken: 'refresh-old', expire } });
+    expect(setTimeoutSpy.mock.calls.map((call) => call[1])).toEqual([4_750]);
+    await vi.advanceTimersByTimeAsync(4_750);
+    await vi.waitFor(() => expect(credentials).toHaveBeenCalledOnce());
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    expect(refreshFailure).not.toHaveBeenCalled();
+    expect(credentials).toHaveBeenCalledWith(expect.objectContaining({ token: nextToken,
+      e2eeStorage: expect.objectContaining({ refreshToken: 'rotated-refresh', expire: expect.any(Number) }) }));
+    expect(randomSpy).toHaveBeenCalled();
+    expect(setTimeoutSpy.mock.calls[0]?.[1]).toBe(4_750);
+    expect(setTimeoutSpy.mock.calls[0]?.[1]).toBeGreaterThanOrEqual(4_000);
+    expect(setTimeoutSpy.mock.calls[0]?.[1]).toBeLessThanOrEqual(5_000);
+    expect(setTimeoutSpy.mock.calls[1]?.[1]).toBeGreaterThanOrEqual(3_598_950);
+    expect(setTimeoutSpy.mock.calls[1]?.[1]).toBeLessThanOrEqual(3_599_000);
+    const nextTimer = setTimeoutSpy.mock.results[1]!.value;
+    adapter.revoke();
+    expect(clearTimeoutSpy).toHaveBeenCalledWith(nextTimer);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { adapter.revoke(); randomSpy.mockRestore(); vi.useRealTimers(); }
+});
+
+it('does not busy-loop token refresh after a failed physical refresh', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-26T00:00:00.000Z'));
+  const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+  const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  const refreshFailure = vi.fn();
+  const physicalTransport = vi.fn(async () => { throw new Error('offline'); });
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false, physicalTransport });
+  adapter.on('refreshFailure', refreshFailure);
+  try {
+    await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: {
+      refreshToken: 'refresh-old', expire: Math.floor(Date.now() / 1000) + 2 } });
+    expect(setTimeoutSpy.mock.calls[0]?.[1]).toBe(1_500);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.waitFor(() => expect(refreshFailure).toHaveBeenCalledOnce());
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    expect(setTimeoutSpy).toHaveBeenCalledOnce();
+  } finally { adapter.revoke(); randomSpy.mockRestore(); vi.useRealTimers(); }
+});
+
+it.each(['revoke', 'auth-invalidation'] as const)('does not rearm scheduled refresh after an in-flight refresh completes following %s', async (stopKind) => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-26T00:00:00.000Z'));
+  const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+  const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  const requests: Request[] = [];
+  let releaseRefresh!: (response: Response) => void;
+  const token = [Buffer.from('{"alg":"HS256"}').toString('base64url'), Buffer.from('{"sub":"u-self","v":"late-refresh"}').toString('base64url'), 'next'].join('.');
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
+    physicalTransport: async (request) => {
+      requests.push(request);
+      if (requests.length === 1) return await new Promise<Response>((resolve) => { releaseRefresh = resolve; });
+      if (stopKind === 'auth-invalidation') throw new InternalError('RequestError', 'fixture invalidation', { code: 'NOT_AUTHORIZED_DEVICE' });
+      return linejsProfileResponse(`u${'a'.repeat(32)}`);
+    } });
+  const credentials = vi.fn();
+  const authInvalidated = vi.fn();
+  adapter.on('credentials', credentials);
+  adapter.on('authInvalidated', authInvalidated);
+  await adapter.installSecrets({ token: jwt, qrCert: null,
+    e2eeStorage: { refreshToken: 'refresh-existing', expire: Math.floor(Date.now() / 1000) + 1 } });
+  try {
+    expect(setTimeoutSpy.mock.calls[0]?.[1]).toBe(500);
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    if (stopKind === 'revoke') adapter.revoke();
+    else {
+      await expect(adapter.refreshOwnProfile()).rejects.toThrow();
+      expect(authInvalidated).toHaveBeenCalledOnce();
+    }
+    releaseRefresh(await linejsRefreshResponse(token, 'rotated-refresh'));
+    for (let index = 0; index < 100; index += 1) await Promise.resolve();
+    expect(credentials).not.toHaveBeenCalled();
+    expect(setTimeoutSpy).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(requests).toHaveLength(stopKind === 'revoke' ? 1 : 2);
+  } finally { adapter.revoke(); randomSpy.mockRestore(); vi.useRealTimers(); }
+});
 const attachmentIdentity = { accountId: 'account-A', chatType: 'group' as const, chatId: `c${'b'.repeat(32)}`,
   ownMid: `u${'a'.repeat(32)}`, messageId: '9', kind: 'file' as const, externalAttachmentId: 'OID_123' };
 function encryptedAttachmentMessage(kind: 'image' | 'file' | 'video' | 'audio' = 'file') {
@@ -1073,6 +1524,70 @@ it('serializes the real LINEJS encrypted-token RPC with feature type 2 before an
   } finally { requestSpy.mockRestore(); rpc.mockRestore(); write.mockRestore(); }
 });
 
+it.each(['token', 'metadata'] as const)('preserves a decoded Talk rejection from the %s attachment RPC after one physical request', async (phase) => {
+  const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
+    E2EE: { prototype: { decryptE2EEDataMessage: (...args: any[]) => Promise<unknown> } };
+  };
+  const { LegyEncryptedTransport } = await import(new URL('../../../node_modules/@evex/linejs/base/request/legy.js', import.meta.url).href) as {
+    LegyEncryptedTransport: { prototype: { fetch: (request: Request, fetcher: (request: Request) => Promise<Response>,
+      options: { endpoint?: string }) => Promise<Response> } };
+  };
+  const secret = 'token=private MID=u12345678901234567890123456789012 reason=private';
+  const method = phase === 'token' ? 'acquireEncryptedAccessToken' : 'getLastE2EEPublicKeys';
+  const decrypt = phase === 'metadata' ? vi.spyOn(E2EE.prototype, 'decryptE2EEDataMessage')
+    .mockImplementation(async function(this: { client: BaseClient }) {
+      await this.client.talk.getLastE2EEPublicKeys({ chatMid: attachmentIdentity.chatId });
+      throw new Error('unreachable');
+    }) : null;
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async (_request, fetcher, options) => {
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    return await linejsTalkRejectionResponse(method, 84, secret);
+  });
+  const physicalTransport = vi.fn(async () => new Response());
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    const identity = { ...attachmentIdentity, kind: 'image' as const,
+      externalAttachmentId: phase === 'token' ? '9' : 'OID_123' };
+    const message = phase === 'token' ? { id: '9', from: `u${'c'.repeat(32)}`, to: identity.chatId,
+      toType: 2, contentType: 1, contentMetadata: {} }
+      : encryptedAttachmentMessage('image');
+    const error = await adapter.download('image', '9', identity.externalAttachmentId, message,
+      { signal: new AbortController().signal, maxBytes: 1024, identity }).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: phase === 'token' ? 'LINE_OBS_TOKEN_RPC_FAILED' : 'LINE_E2EE_METADATA_RPC_FAILED',
+      serverErrorCode: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY', upstreamCode: 84 });
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    expect(legy).toHaveBeenCalledOnce();
+    expect(JSON.stringify(error)).not.toContain(secret);
+  } finally { adapter.revoke(); decrypt?.mockRestore(); legy.mockRestore(); }
+});
+
+it('keeps an unknown Talk token rejection at the attachment phase fallback', async () => {
+  const { LegyEncryptedTransport } = await import(new URL('../../../node_modules/@evex/linejs/base/request/legy.js', import.meta.url).href) as {
+    LegyEncryptedTransport: { prototype: { fetch: (request: Request, fetcher: (request: Request) => Promise<Response>,
+      options: { endpoint?: string }) => Promise<Response> } };
+  };
+  const secret = 'token=private reason=private';
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async (_request, fetcher, options) => {
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    return await linejsTalkRejectionResponse('acquireEncryptedAccessToken', 999, secret);
+  });
+  const physicalTransport = vi.fn(async () => new Response());
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    const identity = { ...attachmentIdentity, kind: 'image' as const, externalAttachmentId: '9' };
+    const error = await adapter.download('image', '9', '9', { id: '9', from: `u${'c'.repeat(32)}`,
+      to: identity.chatId, toType: 2, contentType: 1, contentMetadata: {} },
+    { signal: new AbortController().signal, maxBytes: 1024, identity }).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: 'LINE_OBS_TOKEN_RPC_FAILED' });
+    expect(error.serverErrorCode).toBeUndefined();
+    expect(error.upstreamCode).toBeUndefined();
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    expect(JSON.stringify(error)).not.toContain(secret);
+  } finally { adapter.revoke(); legy.mockRestore(); }
+});
+
 it('decodes the LINEJS Thrift token success field as the wire string consumed by the adapter', async () => {
   const { Protocols } = await import(new URL('../../../node_modules/@evex/linejs/base/thrift/mod.js', import.meta.url).href) as {
     Protocols: Record<number, any>;
@@ -1397,66 +1912,22 @@ it('denies a monitor manual send revoked while E2EE preparation is pending', asy
   }
 });
 
-it('uses the pinned Relation read response shape and requires the exact target MID', async () => {
+it('uses the pinned friend ID list as the authoritative relation result', async () => {
   const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
     RelationService: { prototype: { getUserFriendIds(...args: any[]): Promise<unknown>; getFriendDetails(...args: any[]): Promise<unknown> } };
   };
   const mid = `u${'a'.repeat(32)}`;
   const ids = vi.spyOn(RelationService.prototype, 'getUserFriendIds').mockResolvedValue({ userFriendMids: [mid], nextUserPageToken: '' });
-  const details = vi.spyOn(RelationService.prototype, 'getFriendDetails').mockResolvedValue({ responses: [{
-    targetUserMid: mid, friendDetail: { user: { createdTime: 1, overriddenName: '', favoriteTime: 0,
-      hidden: false, ringtone: '', ringbackTone: '' } },
-  }] });
+  const details = vi.spyOn(RelationService.prototype, 'getFriendDetails').mockRejectedValue(new Error('detail RPC must not run'));
   const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true,
     physicalTransport: async () => new Response() });
   try {
     expect(await adapter.checkFriendRelation(mid, lease)).toBe('friend');
     expect(ids).toHaveBeenCalledWith({ request: { blockStatus: 'NOT_BLOCK' } });
-    expect(details).toHaveBeenCalledWith({ request: { targetUsers: [{ targetUserMid: mid }], syncReason: 'AUTO_REPAIR' } });
-    details.mockResolvedValue({ responses: [{ targetUserMid: `u${'b'.repeat(32)}`,
-      friendDetail: { user: { createdTime: 1, overriddenName: '', favoriteTime: 0, hidden: false, ringtone: '', ringbackTone: '' } } }] });
-    expect(await adapter.checkFriendRelation(mid, lease)).toBe('unknown');
+    expect(details).not.toHaveBeenCalled();
     ids.mockResolvedValue({ userFriendMids: [], nextUserPageToken: '' });
     expect(await adapter.checkFriendRelation(mid, lease)).toBe('not_friend');
-    expect(details).toHaveBeenCalledTimes(2);
-  } finally { ids.mockRestore(); details.mockRestore(); }
-});
-
-it('preserves only bounded details when the positive friend-detail RPC throws', async () => {
-  const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
-    RelationService: { prototype: { getUserFriendIds(...args: any[]): Promise<unknown>; getFriendDetails(...args: any[]): Promise<unknown> } };
-  };
-  const mid = `u${'a'.repeat(32)}`;
-  const ids = vi.spyOn(RelationService.prototype, 'getUserFriendIds').mockResolvedValue({ userFriendMids: [mid], nextUserPageToken: '' });
-  const details = vi.spyOn(RelationService.prototype, 'getFriendDetails').mockRejectedValue(
-    new InternalError('MoaError', `private exception token=secret url=https://private.invalid/${mid}`, { code: 102001, status: 503,
-      message: `private payload ${mid}` }));
-  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true,
-    physicalTransport: async () => new Response() });
-  try {
-    const result = await adapter.checkFriendRelationDiagnostic(mid, lease);
-    expect(result).toEqual({ status: 'unknown', error: 'RELATION_DETAIL_RPC_FAILED', failureKind: 'linejs_internal',
-      upstreamStatus: 503, upstreamCode: 102001 });
-    expect(ids).toHaveBeenCalledOnce();
-    expect(details).toHaveBeenCalledWith({ request: { targetUsers: [{ targetUserMid: mid }], syncReason: 'AUTO_REPAIR' } });
-    expect(JSON.stringify(result)).not.toMatch(/private|secret|https|u[a-f]{32}/i);
-  } finally { ids.mockRestore(); details.mockRestore(); }
-});
-
-it('scrubs generic sensitive friend-detail exceptions to the safe failure kind', async () => {
-  const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
-    RelationService: { prototype: { getUserFriendIds(...args: any[]): Promise<unknown>; getFriendDetails(...args: any[]): Promise<unknown> } };
-  };
-  const mid = `u${'a'.repeat(32)}`;
-  const ids = vi.spyOn(RelationService.prototype, 'getUserFriendIds').mockResolvedValue({ userFriendMids: [mid], nextUserPageToken: '' });
-  const details = vi.spyOn(RelationService.prototype, 'getFriendDetails').mockRejectedValue(
-    new Error(`sensitive message ${mid} token=secret https://private.invalid/`));
-  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true,
-    physicalTransport: async () => new Response() });
-  try {
-    const result = await adapter.checkFriendRelationDiagnostic(mid, lease);
-    expect(result).toEqual({ status: 'unknown', error: 'RELATION_DETAIL_RPC_FAILED', failureKind: 'other' });
-    expect(JSON.stringify(result)).not.toMatch(/sensitive|secret|https|u[a-f]{32}/i);
+    expect(details).not.toHaveBeenCalled();
   } finally { ids.mockRestore(); details.mockRestore(); }
 });
 
@@ -1475,16 +1946,16 @@ it('accepts unrelated string IDs of any format but fails closed on non-string en
     physicalTransport: async () => new Response() });
   try {
     expect(await adapter.checkFriendRelation(mid, lease)).toBe('friend');
-    expect(details).toHaveBeenCalledOnce();
+    expect(details).not.toHaveBeenCalled();
     ids.mockResolvedValue({ userFriendMids: [mid, 7], nextUserPageToken: '' });
     expect(await adapter.checkFriendRelationDiagnostic(mid, lease)).toEqual({
       status: 'unknown', error: 'RELATION_LIST_SHAPE_INVALID',
     });
-    expect(details).toHaveBeenCalledOnce();
+    expect(details).not.toHaveBeenCalled();
   } finally { ids.mockRestore(); details.mockRestore(); }
 });
 
-it('follows Relation pagination and requires native positive detail after finding the target on a later page', async () => {
+it('follows Relation pagination and accepts a target found on a later page', async () => {
   const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
     RelationService: { prototype: { getUserFriendIds(...args: any[]): Promise<unknown>; getFriendDetails(...args: any[]): Promise<unknown> } };
   };
@@ -1492,9 +1963,7 @@ it('follows Relation pagination and requires native positive detail after findin
   const ids = vi.spyOn(RelationService.prototype, 'getUserFriendIds')
     .mockResolvedValueOnce({ userFriendMids: ['other-format-id'], nextUserPageToken: 'next-page' })
     .mockResolvedValueOnce({ userFriendMids: [mid], nextUserPageToken: '' });
-  const details = vi.spyOn(RelationService.prototype, 'getFriendDetails').mockResolvedValue({ responses: [{
-    targetUserMid: mid, friendDetail: { user: {} },
-  }] });
+  const details = vi.spyOn(RelationService.prototype, 'getFriendDetails').mockRejectedValue(new Error('detail RPC must not run'));
   const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true,
     physicalTransport: async () => new Response() });
   try {
@@ -1503,7 +1972,7 @@ it('follows Relation pagination and requires native positive detail after findin
       { request: { blockStatus: 'NOT_BLOCK' } },
       { request: { blockStatus: 'NOT_BLOCK', userPageToken: 'next-page' } },
     ]);
-    expect(details).toHaveBeenCalledWith({ request: { targetUsers: [{ targetUserMid: mid }], syncReason: 'AUTO_REPAIR' } });
+    expect(details).not.toHaveBeenCalled();
   } finally { ids.mockRestore(); details.mockRestore(); }
 });
 
@@ -1513,7 +1982,7 @@ it('returns unknown on repeated or over-limit Relation pagination instead of tru
   };
   const mid = `u${'a'.repeat(32)}`;
   const ids = vi.spyOn(RelationService.prototype, 'getUserFriendIds').mockResolvedValue({
-    userFriendMids: [mid], nextUserPageToken: 'repeat',
+    userFriendMids: [], nextUserPageToken: 'repeat',
   });
   const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true,
     physicalTransport: async () => new Response() });
@@ -1554,7 +2023,7 @@ it('returns unknown for malformed Relation list fields rather than treating them
   } finally { ids.mockRestore(); details.mockRestore(); }
 });
 
-it('applies optional-field presence semantics to object-level Relation responses (evidence 2)', async () => {
+it('validates friend-list fields and never requests friend details', async () => {
   const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
     RelationService: { prototype: { getUserFriendIds(...args: any[]): Promise<unknown>; getFriendDetails(...args: any[]): Promise<unknown> } };
   };
@@ -1572,7 +2041,7 @@ it('applies optional-field presence semantics to object-level Relation responses
     expect(await adapter.checkFriendRelationDiagnostic(mid, lease)).toEqual({ status: 'friend', error: null });
     ids.mockResolvedValueOnce({ userFriendMids: undefined, nextUserPageToken: undefined });
     expect(await adapter.checkFriendRelationDiagnostic(mid, lease)).toEqual({ status: 'not_friend', error: null });
-    expect(details).toHaveBeenCalledOnce();
+    expect(details).not.toHaveBeenCalled();
     const invalid = [
       { userFriendMids: null, nextUserPageToken: '' },
       { userFriendMids: 1, nextUserPageToken: '' },
@@ -1588,7 +2057,7 @@ it('applies optional-field presence semantics to object-level Relation responses
         status: 'unknown', error: 'RELATION_LIST_SHAPE_INVALID',
       });
     }
-    expect(details).toHaveBeenCalledOnce();
+    expect(details).not.toHaveBeenCalled();
   } finally { ids.mockRestore(); details.mockRestore(); }
 });
 
@@ -1631,7 +2100,7 @@ it('decodes optional friend-list fields from real compact Thrift responses (evid
     const firstResult = await adapter.checkFriendRelationDiagnostic(mid, lease);
     expect(listCalls).toBe(1);
     expect(firstResult).toEqual({ status: 'friend', error: null });
-    expect(details).toHaveBeenCalledTimes(1);
+    expect(details).not.toHaveBeenCalled();
 
     scenario = 'b';
     listCalls = 0;
@@ -1644,48 +2113,8 @@ it('decodes optional friend-list fields from real compact Thrift responses (evid
     listCalls = 0;
     expect(await adapter.checkFriendRelationDiagnostic(mid, lease)).toEqual({ status: 'friend', error: null });
     expect(listCalls).toBe(2);
-    expect(details).toHaveBeenCalledOnce();
+    expect(details).not.toHaveBeenCalled();
   } finally { details.mockRestore(); }
-});
-
-it('uses only one recognized Relation discriminator and ignores display-only payload fields', async () => {
-  const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
-    RelationService: { prototype: { getUserFriendIds(...args: any[]): Promise<unknown>; getFriendDetails(...args: any[]): Promise<unknown> } };
-  };
-  const mid = `u${'a'.repeat(32)}`;
-  const ids = vi.spyOn(RelationService.prototype, 'getUserFriendIds').mockResolvedValue({ userFriendMids: [mid], nextUserPageToken: '' });
-  const details = vi.spyOn(RelationService.prototype, 'getFriendDetails').mockResolvedValue({ responses: [{
-    targetUserMid: mid, friendDetail: { user: {} },
-  }] });
-  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true,
-    physicalTransport: async () => new Response() });
-  try {
-    expect(await adapter.checkFriendRelation(mid, lease)).toBe('friend');
-    details.mockResolvedValue({ responses: [{ targetUserMid: mid, friendDetail: { bot: {} } }] });
-    expect(await adapter.checkFriendRelation(mid, lease)).toBe('friend');
-    details.mockResolvedValue({ responses: [{ targetUserMid: mid, friendDetail: { user: { createdTime: 'new LINE value' } } }] });
-    expect(await adapter.checkFriendRelation(mid, lease)).toBe('friend');
-    details.mockResolvedValue({ responses: [{ targetUserMid: mid, friendDetail: { notFriend: {} } }] });
-    expect(await adapter.checkFriendRelation(mid, lease)).toBe('not_friend');
-
-    for (const friendDetail of [
-      {}, { other: {} }, { user: {}, bot: {} }, { user: {}, other: {} },
-      null, [], 'user', 1,
-      { user: null }, { user: [] }, { user: 'user' }, { user: 1 },
-      { notFriend: null }, { notFriend: [] }, { notFriend: false },
-    ]) {
-      details.mockResolvedValue({ responses: [{ targetUserMid: mid, friendDetail }] });
-      expect(await adapter.checkFriendRelation(mid, lease)).toBe('unknown');
-    }
-
-    for (const responses of [[], [{ targetUserMid: mid, friendDetail: { user: {} } },
-      { targetUserMid: mid, friendDetail: { user: {} } }]]) {
-      details.mockResolvedValue({ responses });
-      expect(await adapter.checkFriendRelation(mid, lease)).toBe('unknown');
-    }
-    details.mockResolvedValue({ responses: [{ targetUserMid: `u${'b'.repeat(32)}`, friendDetail: { user: {} } }] });
-    expect(await adapter.checkFriendRelation(mid, lease)).toBe('unknown');
-  } finally { ids.mockRestore(); details.mockRestore(); }
 });
 
 it('classifies an addFriendByMid physical failure as unknown and never retries its write', async () => {
@@ -1697,6 +2126,83 @@ it('classifies an addFriendByMid physical failure as unknown and never retries i
   expect(result).toEqual({ status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' });
   expect(physicalTransport).toHaveBeenCalledTimes(1);
   expect(started).toHaveBeenCalledOnce();
+});
+
+it.each([
+  [undefined, { mid: `u${'a'.repeat(32)}`, reference: '', trackingMetaType: 10 }],
+  [`c${'b'.repeat(32)}`, { mid: `u${'a'.repeat(32)}`, reference: '', trackingMetaType: 5, trackingMetaHint: `c${'b'.repeat(32)}` }],
+])('sends explicit friend add tracking metadata for source %s', async (sourceChatMid, expectedOptions) => {
+  const { RelationService } = await import(new URL('./service/relation/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
+    RelationService: { prototype: { addFriendByMid(options: Record<string, unknown>): Promise<unknown> } };
+  };
+  const original = RelationService.prototype.addFriendByMid;
+  const physicalTransport = vi.fn(async () => { throw new Error('fixture transport stop'); });
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  const dispatchedOptions: Record<string, unknown>[] = [];
+  const dispatch = vi.spyOn(RelationService.prototype, 'addFriendByMid').mockImplementation(async function (options) {
+    dispatchedOptions.push(options);
+    return original.call(this, options);
+  });
+  try {
+    await adapter.addFriendByMid(`u${'a'.repeat(32)}`, lease, () => undefined, undefined, sourceChatMid);
+    expect(dispatchedOptions).toEqual([expectedOptions]);
+    expect(physicalTransport).toHaveBeenCalledOnce();
+  } finally { dispatch.mockRestore(); }
+});
+
+it.each([
+  [0, 'UNKNOWN'],
+  [1, 'INVALID_TARGET_USER'],
+  [2, 'AGE_VALIDATION'],
+  [3, 'TOO_MANY_FRIENDS'],
+  [4, 'TOO_MANY_REQUESTS'],
+  [5, 'MALFORMED_REQUEST'],
+  [6, 'TRACKING_META_QRCODE_FAVORED'],
+  [7, 'TRACKING_META_UPGRADE_FAVORED'],
+])('classifies LINE add friend result code %i as %s', async (code, errorName) => {
+  const physicalTransport = vi.fn(async () => { throw new InternalError('RequestError', 'LINE rejected the friend add', { code }); });
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  expect(await adapter.addFriendByMid(`u${'a'.repeat(32)}`, lease, () => undefined))
+    .toEqual({ status: 'failed', error: `LINE_RELATION_ADD_${errorName}` });
+  expect(physicalTransport).toHaveBeenCalledOnce();
+});
+
+it.each([
+  [0, { status: 'failed', error: 'LINE_RELATION_ADD_UNKNOWN' }],
+  [1, { status: 'failed', error: 'LINE_RELATION_ADD_INVALID_TARGET_USER' }],
+  [2, { status: 'failed', error: 'LINE_RELATION_ADD_AGE_VALIDATION' }],
+  [3, { status: 'failed', error: 'LINE_RELATION_ADD_TOO_MANY_FRIENDS' }],
+  [4, { status: 'failed', error: 'LINE_RELATION_ADD_TOO_MANY_REQUESTS' }],
+  [5, { status: 'failed', error: 'LINE_RELATION_ADD_MALFORMED_REQUEST' }],
+  [6, { status: 'failed', error: 'LINE_RELATION_ADD_TRACKING_META_QRCODE_FAVORED' }],
+  [7, { status: 'failed', error: 'LINE_RELATION_ADD_TRACKING_META_UPGRADE_FAVORED' }],
+  [99, { status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' }],
+])('classifies encoded Thrift addFriendByMid rejection reason %i through BaseClient', async (rejectionCode, expected) => {
+  const thrift = new LineThrift();
+  const wireResponse = thrift.writeThrift([[12, 1, [[8, 1, rejectionCode], [11, 2, 'private rejection hint']]]],
+    'addFriendByMid', Protocols[4]!);
+  const physicalTransport = vi.fn(async () => new Response(wireResponse, {
+    headers: { 'content-type': 'application/x-thrift' },
+  }));
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  const result = await adapter.addFriendByMid(`u${'a'.repeat(32)}`, lease, () => undefined);
+  expect(result).toEqual(expected);
+  expect(physicalTransport).toHaveBeenCalledOnce();
+});
+
+it('keeps non-RequestError and out-of-range LINE error codes as unknown after physical start', async () => {
+  const errors: unknown[] = [new Error('timeout'), new InternalError('RequestError', 'unknown response', { code: 8 })];
+  for (const error of errors) {
+    const physicalTransport = vi.fn(async () => { throw error; });
+    const adapter = await createLinejsAdapter({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true, physicalTransport });
+    await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+    expect(await adapter.addFriendByMid(`u${'a'.repeat(32)}`, lease, () => undefined))
+      .toEqual({ status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' });
+    expect(physicalTransport).toHaveBeenCalledOnce();
+  }
 });
 
 it('consumes the Relation physical boundary on first dispatch and denies a re-entrant second dispatch', async () => {
@@ -1846,8 +2352,7 @@ it('preserves the saved snapshot on a temporary native refresh failure', async (
 });
 
 it('classifies explicit refresh invalidation through the fake physical dispatcher', async () => {
-  const invalidation = Object.assign(new Error('fixture LINE invalidation'), { name: 'RequestError', type: 'RequestError',
-    data: { code: 'NOT_AUTHORIZED_DEVICE' } });
+  const invalidation = new InternalError('RequestError', 'fixture LINE invalidation', { code: 'NOT_AUTHORIZED_DEVICE' });
   const requests: Request[] = [];
   const invalidated = vi.fn();
   const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,

@@ -38,7 +38,9 @@ export interface RoomControlHandler {
 export class LineService {
   private readonly bindings = new Map<string, BoundWorker>();
   private readonly qrPendingSecrets = new Map<string, { workerInstanceId: string; loginAttemptId: string; secrets: Extract<LineWorkerEvent, { type: 'secretRotation' }>['secrets'] }>();
-  private readonly qrAttempts = new Map<string, { workerInstanceId: string; loginAttemptId: string }>();
+  private readonly qrAttempts = new Map<string, { workerInstanceId: string; loginAttemptId: string; kind: 'qr' | 'token' }>();
+  private readonly pendingLogouts = new Map<string, { binding: WorkerBinding; resolve(value: { ok: boolean; error: string | null }): void;
+    reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
   private readonly attachmentReadiness = new Map<string, { accountId: string; controlEpoch: number; authenticated: boolean; ready: boolean; protocolVerified: boolean }>();
   private readonly transportHealth = new Map<string, 'connected' | 'degraded' | 'disconnected' | 'unverified'>();
   private readonly catalogHealth = new Map<string, 'ready' | 'degraded'>();
@@ -171,6 +173,11 @@ export class LineService {
   }
   unbind(workerInstanceId: string): void {
     const binding = this.bindings.get(workerInstanceId);
+    for (const [requestId, pending] of this.pendingLogouts) if (pending.binding.workerInstanceId === workerInstanceId) {
+      clearTimeout(pending.timer);
+      this.pendingLogouts.delete(requestId);
+      pending.reject(new Error('LINE_LOGOUT_WORKER_STOPPED'));
+    }
     if (binding) {
       const qrAttempt = this.qrAttempts.get(binding.accountId);
       if (qrAttempt?.workerInstanceId === workerInstanceId) this.qrAttempts.delete(binding.accountId);
@@ -250,10 +257,39 @@ export class LineService {
 
   async requestQrLogin(accountId: string, workerInstanceId: string, loginAttemptId: string): Promise<void> {
     const binding = this.requireBinding(accountId, workerInstanceId);
-    this.qrAttempts.set(accountId, { workerInstanceId, loginAttemptId });
+    this.qrAttempts.set(accountId, { workerInstanceId, loginAttemptId, kind: 'qr' });
     this.qrPendingSecrets.delete(accountId);
     this.secrets?.beginLogin(accountId, workerInstanceId, loginAttemptId);
     await this.worker.send({ type: 'loginQr', accountId, workerInstanceId, controlEpoch: binding.controlEpoch, loginAttemptId });
+  }
+
+  async requestLogout(accountId: string, workerInstanceId: string, timeoutMs = 12_000): Promise<{ ok: boolean; error: string | null }> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 11_000 || timeoutMs > 30_000) throw new Error('LINE_LOGOUT_TIMEOUT_INVALID');
+    const binding = this.requireBinding(accountId, workerInstanceId);
+    const requestId = randomUUID();
+    const { accountId: boundAccount, workerInstanceId: boundWorker, controlEpoch, transportOwnerId,
+      transportGeneration, writeGrantVersion } = binding;
+    const command: LineWorkerCommand = { type: 'logout', requestId, accountId: boundAccount,
+      workerInstanceId: boundWorker, controlEpoch, ...(transportOwnerId ? { transportOwnerId } : {}),
+      ...(transportGeneration === undefined ? {} : { transportGeneration }),
+      ...(writeGrantVersion === undefined ? {} : { writeGrantVersion }) };
+    const result = new Promise<{ ok: boolean; error: string | null }>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingLogouts.delete(requestId);
+        resolve({ ok: false, error: 'LINE_LOGOUT_FAILED' });
+      }, timeoutMs);
+      this.pendingLogouts.set(requestId, { binding, resolve, reject, timer });
+    });
+    try { await this.worker.send(command); }
+    catch (error) {
+      const pending = this.pendingLogouts.get(requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingLogouts.delete(requestId);
+        pending.reject(error instanceof Error ? error : new Error('LINE_LOGOUT_FAILED'));
+      }
+    }
+    return result;
   }
 
   async cancelLoginAttempt(accountId: string, workerInstanceId: string, loginAttemptId: string): Promise<void> {
@@ -269,7 +305,7 @@ export class LineService {
     const binding = this.requireBinding(accountId, workerInstanceId);
     const secrets = await this.secrets?.load(accountId);
     if (!secrets?.token) throw new Error('No saved LINE token for this account');
-    this.qrAttempts.set(accountId, { workerInstanceId, loginAttemptId });
+    this.qrAttempts.set(accountId, { workerInstanceId, loginAttemptId, kind: 'token' });
     this.qrPendingSecrets.delete(accountId);
     this.secrets?.beginLogin(accountId, workerInstanceId, loginAttemptId);
     await this.worker.send({ type: 'setSecretState', accountId, workerInstanceId,
@@ -360,6 +396,15 @@ export class LineService {
     recovered?: { recovered: true; receiptCurrent: boolean; sensitive: boolean }): Promise<readonly string[] | undefined> {
     const binding = this.bindings.get(processInstanceId);
     if (!binding || !this.isCurrentWorkerEvent(processInstanceId, event)) return;
+    if (event.type === 'logoutResult') {
+      const pending = this.pendingLogouts.get(event.requestId);
+      if (!pending || pending.binding.accountId !== event.accountId || pending.binding.workerInstanceId !== event.workerInstanceId
+        || pending.binding.controlEpoch !== event.controlEpoch) return;
+      clearTimeout(pending.timer);
+      this.pendingLogouts.delete(event.requestId);
+      pending.resolve({ ok: event.ok, error: event.error });
+      return;
+    }
     if ((event.type === 'batch' || event.type === 'historyResult')
       && (await this.accounts.resolveCapabilities?.(event.accountId))?.connectionMode === 'EXTERNAL_MONITOR') return;
     await this.bindingReady.get(processInstanceId);
@@ -384,7 +429,7 @@ export class LineService {
               && pending?.workerInstanceId === processInstanceId && pending.loginAttemptId === event.loginAttemptId) {
               return this.secrets ? await this.secrets.saveRotation(event.accountId, processInstanceId, event.loginAttemptId, pending.secrets) : true;
             }
-          });
+          }, qrAttempt?.kind === 'qr' && qrAttempt.workerInstanceId === processInstanceId && qrAttempt.loginAttemptId === event.loginAttemptId);
       }
       if (!accepted) {
         this.qrAttempts.delete(event.accountId);
@@ -404,6 +449,13 @@ export class LineService {
       return;
     }
     if (event.type === 'authInvalidated') {
+      for (const [requestId, pending] of this.pendingLogouts) {
+        if (pending.binding.accountId !== event.accountId || pending.binding.workerInstanceId !== event.workerInstanceId
+          || pending.binding.controlEpoch !== event.controlEpoch) continue;
+        clearTimeout(pending.timer);
+        this.pendingLogouts.delete(requestId);
+        pending.resolve({ ok: false, error: 'LINE_AUTH_INVALIDATED' });
+      }
       const readiness = this.attachmentReadiness.get(processInstanceId);
       if (readiness?.accountId === binding.accountId && readiness.controlEpoch === binding.controlEpoch) {
         readiness.authenticated = false;

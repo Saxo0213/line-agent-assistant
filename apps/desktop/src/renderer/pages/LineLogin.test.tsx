@@ -10,9 +10,26 @@ import { readFileSync } from 'node:fs';
 import { URL as NodeURL } from 'node:url';
 import { LineLogin } from './LineLogin.js';
 import { accountAvatarRefreshed, LineMediaImage } from '../LineMediaImage.js';
-import { extraTextFor } from '../desktop-i18n.js';
+import { desktopTextFor, extraTextFor } from '../desktop-i18n.js';
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+
+it.each([
+  ['en', 'LINE could not find the requested data.'],
+  ['zh-TW', 'LINE 找不到指定資料。'],
+  ['ja', 'LINE で指定されたデータが見つかりません。'],
+  ['ko', 'LINE에서 요청한 데이터를 찾을 수 없습니다.'],
+] as const)('shows a fixed %s profile rejection in the account card', async (locale, expected) => {
+  const secret = 'token=private MID=u-private message=private';
+  const result: IpcResult = { type: 'error', requestId: 'profile', ok: false, code: 'LINE_PROFILE_REFRESH_FAILED',
+    serverErrorCode: 'LINE_TALK_NOT_FOUND', message: secret, retryable: true };
+  const api = { refreshLineAvatar: vi.fn(async () => result) } as unknown as DesktopApi;
+  const onNotice = vi.fn();
+  render(<LineLogin api={api} accounts={[{ ...buildAdmin(), status: 'connected' }]} headingRef={React.createRef()} onNotice={onNotice} />, locale);
+  fireEvent.click(screen.getByRole('button', { name: desktopTextFor(locale, 'refreshAvatar') }));
+  await waitFor(() => expect(onNotice).toHaveBeenCalledWith(expected));
+  expect(document.body.textContent).not.toContain(secret);
+});
 
 it('reloads the connected account avatar after a successful explicit refresh', async () => {
   const account = { ...buildAdmin(), status: 'connected' as const };
@@ -399,6 +416,15 @@ describe('LineLogin does not inspect or confirm the official LINE process', () =
 });
 
 describe('accounts page header', () => {
+  it('shows only the Agent and Primary Admin account sections', () => {
+    const historical = { ...buildAgent, accountId: 'historical-1', displayName: '舊 Agent 帳號', productRole: null,
+      hasVerifiedLineIdentity: true } satisfies LineAccountSummary;
+    renderBuildPage([buildAgent, buildAdmin(), historical]);
+    expect(document.querySelectorAll('.account-role-slot')).toHaveLength(2);
+    expect(document.body.textContent).not.toContain('舊 Agent 帳號');
+    expect(document.body.textContent).not.toContain('歷史 Agent 帳號');
+  });
+
   it('shows the description on the same row as the title', () => {
     renderBuildPage([buildAgent]);
     const row = screen.getByRole('heading', { name: '帳號' }).parentElement!;

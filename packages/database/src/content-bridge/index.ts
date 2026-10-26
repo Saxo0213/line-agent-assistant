@@ -1,7 +1,7 @@
 import { LINE_CONTENT_KIND_BY_TYPE, LINE_CONTENT_TYPE_NUMBER_BY_NAME, NativeSourceEnvelopeSchema, parseSticonRanges, redactMessageContent, redactSensitiveText, STICON_REPLACE_MAX_BYTES, type ContactDescriptor, type MessageContent, type MessageKind, type NativeSourceEnvelope, type SticonRange } from '@line-agent/contracts';
 
 /**
- * Layer 2 of the two-layer message storage (docs/architecture/content-bridge-two-layer-2026-10-20.md).
+ * Layer 2 of the two-layer message storage (docs/architecture/content-bridge-two-layer.md).
  * Layer 1 (messages.raw / raw.native) is never rewritten here. This module is the only place that parses
  * LINE content types: pure, bounded, synchronous. Both the live worker envelope and the plain native
  * row envelope are first reduced to the same `BridgeFields`, so one rule serves both sources.

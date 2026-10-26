@@ -8,7 +8,7 @@ import type { DesktopApi } from '../../preload/api.js';
 import { LocaleProvider, type LocaleState } from '../locale-context.js';
 import { WorkRecords } from './WorkRecords.js';
 
-function renderAtLocale(ui: React.ReactNode, locale: 'en' | 'zh-TW' = 'zh-TW') {
+function renderAtLocale(ui: React.ReactNode, locale: 'en' | 'zh-TW' | 'ja' | 'ko' = 'zh-TW') {
   const value: LocaleState = { status: 'loaded', effectiveLocale: locale, preference: locale, busy: false, error: null, retry() {}, retryRestart() {}, setPreference() {} };
   return renderUi(<LocaleProvider value={value}>{ui}</LocaleProvider>);
 }
@@ -18,6 +18,43 @@ afterEach(() => {
   cleanup();
   try { window.localStorage.removeItem('line-agent:work-records-tab'); } catch { /* ignore */ }
   document.querySelectorAll('[data-work-records-tab-style]').forEach((style) => style.remove());
+});
+
+it.each([
+  ['en', 'The LINE primary device encryption key needs updating.', 'LINE requires age verification before adding this friend.'],
+  ['zh-TW', 'LINE 主要裝置的加密金鑰需要更新。', 'LINE 要求完成年齡驗證後才能新增好友。'],
+] as const)('shows fixed %s server error descriptions in work records', async (locale, talkText, relationText) => {
+  const api = { listSystemActivity: vi.fn(async () => ({ activity: [], partial: false })), listSystemErrors: vi.fn(async () => ({ partial: false, errors: [
+    { createdAt: '2026-10-24T10:00:00.000Z', action: 'LINE 操作失敗', code: 'LINE_TALK_E2EE_UPDATE_PRIMARY_DEVICE' },
+    { createdAt: '2026-10-24T10:01:00.000Z', action: '新增使用者：加入 LINE 好友', code: 'LINE_RELATION_ADD_AGE_VALIDATION' },
+  ] })) } as unknown as DesktopApi;
+  renderAtLocale(<WorkRecords api={api} onOpen={vi.fn()} headingRef={React.createRef()} />, locale);
+  fireEvent.click(screen.getByRole('tab', { name: locale === 'en' ? 'System errors' : '系統錯誤' }));
+  expect(await screen.findByText(talkText)).toBeTruthy();
+  expect(screen.getByText(relationText)).toBeTruthy();
+});
+
+it.each([
+  ['en', 'The LINE recipient encryption key needs updating.', 'LINE has temporarily limited this request.', 'System errors'],
+  ['zh-TW', 'LINE 接收端加密金鑰需要更新。', 'LINE 暫時限制此請求。', '系統錯誤'],
+  ['ja', 'LINE の受信者側暗号鍵を更新する必要があります。', 'LINE によりこのリクエストが一時的に制限されています。', 'システムエラー'],
+  ['ko', 'LINE 수신자 암호화 키를 업데이트해야 합니다.', 'LINE에서 이 요청을 일시적으로 제한했습니다.', '시스템 오류'],
+] as const)('renders attachment and poll Talk errors in %s without server prose', async (locale, attachmentText, pollText, tab) => {
+  const secret = 'token=private MID=u12345678901234567890123456789012';
+  const api = { listSystemActivity: vi.fn(async () => ({ activity: [], partial: false })),
+    listSystemErrors: vi.fn(async () => ({ partial: false, errors: [
+      { createdAt: '2026-10-24T10:00:00.000Z', action: 'LINE 操作失敗', code: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY',
+        diagnostic: { operation: 'downloadAttachment', stage: 'response', category: 'denied', recovery: 'none', upstreamCode: 84 } },
+      { createdAt: '2026-10-24T10:01:00.000Z', action: 'LINE 操作失敗', code: 'LINE_TALK_EXCESSIVE_ACCESS',
+        diagnostic: { operation: 'poll', stage: 'response', category: 'denied', recovery: 'none', upstreamCode: 4 } },
+    ] })) } as unknown as DesktopApi;
+  renderAtLocale(<WorkRecords api={api} onOpen={vi.fn()} headingRef={React.createRef()} />, locale);
+  fireEvent.click(screen.getByRole('tab', { name: tab }));
+  expect(await screen.findByText(attachmentText)).toBeTruthy();
+  expect(screen.getByText(pollText)).toBeTruthy();
+  expect(screen.getByText('84')).toBeTruthy();
+  expect(screen.getByText('4')).toBeTruthy();
+  expect(document.body.textContent).not.toContain(secret);
 });
 
 describe('WorkRecords system tabs', () => {

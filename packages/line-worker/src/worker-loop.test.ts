@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { FakeLineTransport } from './fake-transport.js';
-import { LineWorkerLoop, type TransportIdentity } from './worker-loop.js';
+import { LineWorkerLoop, LOGOUT_DEADLINE_MS, type TransportIdentity } from './worker-loop.js';
 import { createLinejsAdapter } from './linejs-adapter.js';
 import { decodeHistoryCursor, encodeHistoryCursor } from './cursor.js';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
@@ -11,6 +11,7 @@ import { SafeAttachmentError } from './attachment-error.js';
 import { InternalError } from '@evex/linejs/base';
 import { ChatResourceFailure } from './chat-resource-error.js';
 import { LineWorkerEventSchema } from '@line-agent/contracts';
+import { LineServerRejection } from './line-server-error.js';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const protocolVersion = 4 as const;
@@ -39,6 +40,67 @@ function setup(mode: 'MONITOR_ONLY' | 'ACTIVE_CONTROL' = 'MONITOR_ONLY') {
 async function authenticate(worker: LineWorkerLoop): Promise<void> {
   await worker.handle({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
 }
+
+it('returns a logout result correlated to its command after server logout settles', async () => {
+  const { worker, transport, events, init } = setup();
+  await init;
+  await authenticate(worker);
+  await worker.handle({ type: 'logout', ...binding, requestId: 'logout-request-1' });
+  expect(transport.logoutCalls).toHaveLength(1);
+  expect(events.at(-1)).toMatchObject({ type: 'logoutResult', ...binding, requestId: 'logout-request-1', ok: true, error: null });
+
+  transport.logoutError = new Error('network unavailable');
+  await worker.handle({ type: 'logout', ...binding, requestId: 'logout-request-2' });
+  expect(events.at(-1)).toMatchObject({ type: 'logoutResult', ...binding, requestId: 'logout-request-2', ok: false,
+    error: 'LINE_LOGOUT_FAILED' });
+});
+
+it('times out transport drain, removes its waiter, unquarantines, and permits a fresh logout attempt', async () => {
+  vi.useFakeTimers();
+  const { worker, transport, events, init } = setup('ACTIVE_CONTROL');
+  await init;
+  await authenticate(worker);
+  const release = transport.pauseSend();
+  const send = worker.handle({ type: 'sendText', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'held-send',
+    text: 'hello', replyToMessageId: null });
+  try {
+    await transport.sendStarted;
+    const logout = worker.handle({ type: 'logout', ...binding, requestId: 'drain-timeout' });
+    await vi.advanceTimersByTimeAsync(LOGOUT_DEADLINE_MS);
+    await logout;
+    expect(events.at(-1)).toMatchObject({ type: 'logoutResult', requestId: 'drain-timeout', ok: false,
+      error: 'LINE_LOGOUT_FAILED' });
+    expect(transport.logoutCalls).toHaveLength(0);
+    release();
+    await send;
+    await worker.handle({ type: 'logout', ...binding, requestId: 'drain-retry' });
+    expect(transport.logoutCalls).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'logoutResult', requestId: 'drain-retry', ok: true, error: null });
+  } finally { release(); vi.useRealTimers(); }
+});
+
+it('aborts stalled physical logout, ignores late success, and unquarantines for retry', async () => {
+  vi.useFakeTimers();
+  const { worker, transport, events, init } = setup();
+  await init;
+  await authenticate(worker);
+  let release!: () => void;
+  transport.logoutHold = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    const expired = worker.handle({ type: 'logout', ...binding, requestId: 'physical-timeout' });
+    await vi.advanceTimersByTimeAsync(LOGOUT_DEADLINE_MS);
+    await expired;
+    expect(events.at(-1)).toMatchObject({ type: 'logoutResult', requestId: 'physical-timeout', ok: false,
+      error: 'LINE_LOGOUT_FAILED' });
+    release();
+    await Promise.resolve();
+    expect(events.filter((event) => event.type === 'logoutResult' && event.requestId === 'physical-timeout')).toHaveLength(1);
+    transport.logoutHold = undefined;
+    await worker.handle({ type: 'logout', ...binding, requestId: 'physical-retry' });
+    expect(transport.logoutCalls).toHaveLength(2);
+    expect(events.at(-1)).toMatchObject({ type: 'logoutResult', requestId: 'physical-retry', ok: true, error: null });
+  } finally { release(); vi.useRealTimers(); }
+});
 
 async function runAttachmentAttempt(transport: FakeLineTransport, attachmentRoot?: string) {
   const events: any[] = [];
@@ -133,6 +195,18 @@ describe('one-account worker loop', () => {
     readProfile.mockResolvedValueOnce({ ownMid: `u${'d'.repeat(32)}`, displayName: 'Other', picturePath: 'https://profile.line-scdn.net/other.png' });
     await worker.handle({ type: 'refreshOwnProfile', ...binding, requestId: 'avatar-refresh-mismatch', timeoutMs: 15_000 });
     expect(events.at(-1)).toMatchObject({ type: 'ownProfileResult', requestId: 'avatar-refresh-mismatch', ok: false, error: 'PROFILE_MISMATCH' });
+  });
+
+  it('projects a profile RequestError to a fixed Talk code', async () => {
+    const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
+    Object.assign(transport, { refreshOwnProfile: async () => { throw new LineServerRejection('LINE_TALK_NOT_FOUND', 5); } });
+    const events: any[] = [];
+    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => true });
+    await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
+    await authenticate(worker);
+    await worker.handle({ type: 'refreshOwnProfile', ...binding, requestId: 'profile-server-error', timeoutMs: 15_000 });
+    expect(events.at(-1)).toMatchObject({ type: 'ownProfileResult', requestId: 'profile-server-error', ok: false,
+      error: 'LINE_TALK_NOT_FOUND' });
   });
 
   it('adopts official auth via download probe in download-only purpose without login events or receive', async () => {
@@ -270,6 +344,21 @@ describe('one-account worker loop', () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  it('keeps the attachment result code while forwarding a trusted Talk rejection only', async () => {
+    const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
+    const root = await mkdtemp(join(tmpdir(), 'line-worker-talk-attachment-'));
+    const download = vi.fn(async () => { throw Object.assign(new SafeAttachmentError('LINE_OBS_TOKEN_RPC_FAILED',
+      'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY', 84), { reason: 'token=private' }); });
+    Object.defineProperty(transport, 'download', { value: download });
+    try {
+      const result = LineWorkerEventSchema.parse(await runAttachmentAttempt(transport, root));
+      expect(result).toMatchObject({ type: 'attachmentResult', status: 'failed', error: 'LINE_OBS_TOKEN_RPC_FAILED',
+        serverErrorCode: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY', upstreamCode: 84 });
+      expect(download).toHaveBeenCalledOnce();
+      expect(JSON.stringify(result)).not.toContain('token=private');
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it.each([399, 600, 404.5, '404', null])('does not accept invalid native OBS status %s', async (status) => {
     const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
     Object.defineProperty(transport, 'download', { value: async () => {
@@ -386,6 +475,26 @@ describe('one-account worker loop', () => {
     expect(state.events).toContainEqual(expect.objectContaining({ type: 'unsendResult', requestId: 'unsend-unknown', status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' }));
   });
 
+  it('emits fixed Talk codes for rejected sends and unsends without retrying or exposing server text', async () => {
+    const state = setup('ACTIVE_CONTROL');
+    await state.init;
+    await authenticate(state.worker);
+    state.transport.sendError = new LineServerRejection('LINE_TALK_E2EE_RETRY_ENCRYPT', 82);
+    state.transport.unsendError = new LineServerRejection('LINE_TALK_NOT_YOUR_MESSAGE', 28);
+    await state.worker.handle({ type: 'sendText', ...binding, chatType: 'direct', chatId: 'u-peer',
+      requestId: 'talk-send', text: 'private user text', replyToMessageId: null });
+    await state.worker.handle({ type: 'unsendMessage', ...binding, chatType: 'direct', chatId: 'u-peer',
+      requestId: 'talk-unsend', messageId: '9' });
+    expect(state.events).toContainEqual(expect.objectContaining({ type: 'sendResult', requestId: 'talk-send',
+      status: 'failed', error: 'LINE_TALK_E2EE_RETRY_ENCRYPT' }));
+    expect(state.events).toContainEqual(expect.objectContaining({ type: 'unsendResult', requestId: 'talk-unsend',
+      status: 'failed', error: 'LINE_TALK_NOT_YOUR_MESSAGE' }));
+    expect(state.transport.sendCalls).toHaveLength(1);
+    expect(state.transport.unsendCalls).toHaveLength(1);
+    expect(JSON.stringify(state.events)).not.toContain('private user text');
+    state.events.forEach((event) => expect(LineWorkerEventSchema.safeParse(event).success).toBe(true));
+  });
+
   it('reserves the shared mutation slot before deferred lease checks for overlapping send and unsend', async () => {
     const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
     const events: any[] = [];
@@ -495,6 +604,12 @@ describe('one-account worker loop', () => {
     expect(events).toContainEqual(expect.objectContaining({ type: 'authInvalidated', accountId: binding.accountId }));
     await worker.handle({ type: 'poll', ...binding });
     expect(transport.syncCalls).toHaveLength(0);
+    await worker.handle({ type: 'logout', ...binding, requestId: 'logout-after-invalidation' });
+    const result = events.at(-1);
+    expect(result).toMatchObject({ type: 'logoutResult', ...binding, requestId: 'logout-after-invalidation',
+      ok: false, error: 'LINE_AUTH_INVALIDATED' });
+    expect(LineWorkerEventSchema.safeParse(result).success).toBe(true);
+    expect(transport.logoutCalls).toHaveLength(0);
   });
   it('propagates the attachment deadline into LINEJS acquisition and stays responsive when it stalls', async () => {
     const root = await mkdtemp(join(tmpdir(), 'line-worker-stalled-download-'));
@@ -833,6 +948,17 @@ describe('one-account worker loop', () => {
     expect(events).toContainEqual(expect.objectContaining({ type: 'conversationCatalog', conversations: [
       expect.objectContaining({ chatId: 'u-peer' }),
     ] }));
+  });
+
+  it('retains a fixed Talk code on a degraded catalog event', async () => {
+    const { worker, transport, events, init } = setup();
+    await init;
+    transport.catalogError = new LineServerRejection('LINE_TALK_EXCESSIVE_ACCESS', 4);
+    await authenticate(worker);
+    await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({ type: 'catalogRefreshStatus',
+      state: 'degraded', code: 'CATALOG_REFRESH_FAILED', serverError: 'LINE_TALK_EXCESSIVE_ACCESS' })));
+    const event = events.find((value) => value.type === 'catalogRefreshStatus' && value.state === 'degraded');
+    expect(LineWorkerEventSchema.safeParse(event).success).toBe(true);
   });
 
   it('keeps a stalled catalog request independent and coalesces concurrent poll ticks into one retry', async () => {
@@ -1217,6 +1343,40 @@ describe('one-account worker loop', () => {
     expect(events.filter((event) => event.type === 'addFriendResult')).toHaveLength(3);
   });
 
+  it('passes a fixed Relation code but redacts a poisoned friend-add transport result', async () => {
+    const { worker, transport, events, init } = setup('ACTIVE_CONTROL');
+    await init;
+    await authenticate(worker);
+    const targetMid = `u${'a'.repeat(32)}`;
+    transport.friendAddResult = { status: 'failed', error: 'LINE_RELATION_ADD_AGE_VALIDATION' };
+    await worker.handle({ type: 'addFriendByMid', ...binding, requestId: 'known-add', targetMid });
+    expect(events.at(-1)).toMatchObject({ type: 'addFriendResult', status: 'failed', error: 'LINE_RELATION_ADD_AGE_VALIDATION' });
+    transport.friendAddResult = { status: 'failed', error: 'token=private MID=u12345678901234567890123456789012' };
+    await worker.handle({ type: 'addFriendByMid', ...binding, requestId: 'poisoned-add', targetMid });
+    expect(events.at(-1)).toMatchObject({ type: 'addFriendResult', status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' });
+    expect(JSON.stringify(events.at(-1))).not.toContain('token=private');
+  });
+
+  it('forwards an optional source chat MID to the transport and treats it as part of the request identity', async () => {
+    const { worker, transport, events, init } = setup('ACTIVE_CONTROL');
+    await init;
+    await authenticate(worker);
+    const targetMid = `u${'a'.repeat(32)}`;
+    const sourceChatMid = `c${'d'.repeat(32)}`;
+    const add = vi.fn(async (_mid: string, _lease: unknown, onPhysicalStart: () => void,
+      _signal?: AbortSignal, _sourceChatMid?: string) => {
+      onPhysicalStart();
+      return { status: 'added' as const, error: null };
+    });
+    Object.defineProperty(transport, 'addFriendByMid', { value: add });
+    await worker.handle({ type: 'addFriendByMid', ...binding, requestId: 'source-add', targetMid, sourceChatMid });
+    expect(add).toHaveBeenCalledWith(targetMid, expect.objectContaining({ accountId: binding.accountId }), expect.any(Function), expect.any(AbortSignal), sourceChatMid);
+
+    await worker.handle({ type: 'addFriendByMid', ...binding, requestId: 'source-add', targetMid });
+    expect(add).toHaveBeenCalledOnce();
+    expect(events.at(-1)).toMatchObject({ type: 'addFriendResult', requestId: 'source-add', status: 'failed', error: 'REQUEST_ID_CONFLICT' });
+  });
+
   it('rejects an add request ID reused for a different MID without a second physical call', async () => {
     const { worker, transport, events, init } = setup('ACTIVE_CONTROL');
     await init;
@@ -1416,8 +1576,8 @@ describe('one-account worker loop', () => {
     await worker.handle({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
       secrets: { token: null, qrCert: null, e2eeStorage: {} } });
     transport.rotateToken('new-token');
-    await expect(worker.flushEvents()).rejects.toThrow('private IPC down');
-    await expect(worker.handle({ type: 'poll', ...binding })).rejects.toThrow('private IPC down');
+    await expect(worker.flushEvents()).rejects.toThrow('private event sink failed');
+    await expect(worker.handle({ type: 'poll', ...binding })).rejects.toThrow('private event sink failed');
     expect(transport.syncCalls).toHaveLength(0);
   });
 
@@ -1492,15 +1652,59 @@ describe('one-account worker loop', () => {
     const { worker, transport, events, init } = setup();
     await init;
     await authenticate(worker);
-    transport.syncError = new Error('network unavailable');
+    transport.syncError = new Error('token=private MID=u12345678901234567890123456789012');
     for (let attempt = 0; attempt < 5; attempt++) {
       await expect(worker.handle({ type: 'poll', ...binding })).resolves.toBeUndefined();
     }
     expect(events.at(-1)).toMatchObject({ type: 'status', ...binding, state: 'degraded', message: null });
+    expect(events.filter((event) => event.type === 'error' && event.diagnostic?.operation === 'poll')).toEqual([]);
+    expect(JSON.stringify(events)).not.toContain('token=private');
     transport.syncError = undefined;
     await expect(worker.handle({ type: 'poll', ...binding })).resolves.toBeUndefined();
     expect(transport.syncCalls).toHaveLength(6);
     expect(events.at(-1)).toMatchObject({ type: 'status', ...binding, state: 'ready', message: null });
+  });
+
+  it('emits fixed poll rejection diagnostics on each failure and keeps degraded recovery behavior', async () => {
+    const { worker, transport, events, init } = setup();
+    await init;
+    await authenticate(worker);
+    transport.syncError = new LineServerRejection('LINE_TALK_EXCESSIVE_ACCESS', 4);
+    for (let attempt = 0; attempt < 5; attempt++) await worker.handle({ type: 'poll', ...binding });
+    expect(events.filter((event) => event.type === 'error' && event.code === 'LINE_TALK_EXCESSIVE_ACCESS')).toHaveLength(5);
+    expect(events.find((event) => event.type === 'error' && event.code === 'LINE_TALK_EXCESSIVE_ACCESS')).toMatchObject({
+      message: 'LINE_TALK_EXCESSIVE_ACCESS', retryable: false,
+      diagnostic: { operation: 'poll', stage: 'response', category: 'denied', recovery: 'none', upstreamCode: 4 } });
+    expect(events.at(-1)).toMatchObject({ type: 'status', state: 'degraded', message: 'LINE_TALK_EXCESSIVE_ACCESS' });
+    transport.syncError = undefined;
+    await worker.handle({ type: 'poll', ...binding });
+    expect(transport.syncCalls).toHaveLength(6);
+    expect(events.at(-1)).toMatchObject({ type: 'status', state: 'ready', message: null });
+    expect(JSON.stringify(events)).not.toContain('token=private');
+  });
+
+  it('keeps a ready worker usable after a retryable scheduled token refresh failure', async () => {
+    const { worker, transport, events, init } = setup('ACTIVE_CONTROL');
+    await init;
+    await authenticate(worker);
+    expect(events).toContainEqual({ type: 'status', ...binding, state: 'ready', message: null });
+
+    transport.emitRefreshFailure();
+    await worker.flushEvents();
+    await worker.handle({ type: 'poll', ...binding });
+
+    expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
+    expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ type: 'status', ...binding, state: 'ready', message: null });
+    expect(events.filter((event) => event.type === 'error')).toMatchObject([{
+      code: 'WORKER_OPERATION_FAILED', message: 'LINE token refresh failed', retryable: true,
+      diagnostic: { operation: 'loginToken', stage: 'execute', category: 'transport_failed', recovery: 'retry', outcome: 'failed' },
+    }]);
+
+    await worker.handle({ type: 'sendText', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'send-after-refresh-failure',
+      text: 'Agent remains available', replyToMessageId: null });
+    await worker.handle({ type: 'manualSendText', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'manual-after-refresh-failure',
+      text: 'Human remains available', replyToMessageId: null });
+    expect(transport.sendCalls).toHaveLength(2);
   });
 
   it('keeps a PAUSED binding offline', async () => {

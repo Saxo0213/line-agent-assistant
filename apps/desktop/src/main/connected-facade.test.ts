@@ -26,6 +26,7 @@ import { createDisconnectedFacade } from './service-facade.js';
 import { createIpcAdapter } from './ipc.js';
 import { createDesktopApi } from '../preload/api.js';
 import { ExternalMonitorDiagnosticFailure } from './services/external-monitor-diagnostics.js';
+import { ChatResourceAccountAdmission } from './services/chat-resource-admission.js';
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 const MEDIA_PNG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
@@ -219,6 +220,7 @@ database('connected facade account login semantics', () => {
   let markDownloadReadyOnAccept = true;
   let qrError: Error | null;
   let failedLoginTokenAccount: string | null;
+  let lineLogoutFailure = false;
   let manualSendFailure: string | null;
   let manualUnsendFailure: string | null;
   let manualUnsendFenced = false;
@@ -227,6 +229,7 @@ database('connected facade account login semantics', () => {
   let activeControlAckChecks = 0;
   let welcomeSendOutcome: 'sent' | 'failed' | 'unknown' | 'throw';
   let refreshedOwnProfile: { ownMid: string; displayName: string; picturePath: string } | null;
+  let profileFailure: string | null;
   let monitorAckFailures = new Set<string>();
   let failDownloadOnlyStart = false;
   let workerEventHandler: ((workerInstanceId: string, event: LineWorkerEvent) => Promise<void>) | undefined;
@@ -308,12 +311,14 @@ database('connected facade account login semantics', () => {
     markDownloadReadyOnAccept = true;
     qrError = null;
     failedLoginTokenAccount = null;
+    lineLogoutFailure = false;
     workerRestartBindingHandler = undefined;
     manualSendFailure = null;
     manualUnsendFailure = null;
     manualUnsendFenced = false;
     welcomeSendOutcome = 'sent';
     refreshedOwnProfile = null;
+    profileFailure = null;
     monitorAckFailures = new Set();
     failDownloadOnlyStart = false;
     published = [];
@@ -377,11 +382,17 @@ database('connected facade account login semantics', () => {
       },
       async send(command) {
         commands.push(command);
-        if (command.type === 'sendText' && command.text === '歡迎你成為本系統管理員' && pendingWelcomeSend) {
+        if (command.type === 'logout') {
+          const { type: _type, ...identity } = command;
+          await workerEventHandler?.(command.workerInstanceId, lineLogoutFailure
+            ? { type: 'logoutResult', ...identity, ok: false, error: 'LINE_LOGOUT_FAILED' }
+            : { type: 'logoutResult', ...identity, ok: true, error: null });
+        }
+        if (command.type === 'sendText' && command.text === 'Welcome as the primary administrator.' && pendingWelcomeSend) {
           pendingWelcomeSend.started();
           await pendingWelcomeSend.wait;
         }
-        if (command.type === 'sendText' && command.text === '歡迎你成為本系統管理員' && welcomeSendOutcome === 'throw') {
+        if (command.type === 'sendText' && command.text === 'Welcome as the primary administrator.' && welcomeSendOutcome === 'throw') {
           throw new Error('simulated worker send failure');
         }
         if (command.type === 'loginQr' && qrError) throw qrError;
@@ -391,15 +402,16 @@ database('connected facade account login semantics', () => {
         const welcomeStatus = welcomeSendOutcome === 'throw' ? 'sent' : welcomeSendOutcome;
         return { type: 'sendResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
           requestId: command.type === 'sendText' ? command.requestId : 'send-result',
-          status: command.type === 'sendText' && command.text === '歡迎你成為本系統管理員' ? welcomeStatus : 'sent',
+          status: command.type === 'sendText' && command.text === 'Welcome as the primary administrator.' ? welcomeStatus : 'sent',
           messageId: null, error: welcomeSendOutcome === 'failed' ? 'SIMULATED_FAILURE' : null };
       },
       async refreshOwnProfile(command) {
         commands.push(command);
         const gate = pendingOwnProfileRead;
         if (gate) { pendingOwnProfileRead = null; gate.started(); await gate.wait; }
-        if (!refreshedOwnProfile) throw new Error('No fake profile configured');
         const { type: _type, timeoutMs: _timeoutMs, ...binding } = command;
+        if (profileFailure) return { ...binding, type: 'ownProfileResult', ok: false, error: profileFailure };
+        if (!refreshedOwnProfile) throw new Error('No fake profile configured');
         return { ...binding, type: 'ownProfileResult', ok: true, error: null, ...refreshedOwnProfile };
       },
       async sendManual(command) {
@@ -2105,9 +2117,16 @@ database('connected facade account login semantics', () => {
   }
 
   /** The worker's login and ready events: the primary-admin friend check starts only after both. */
-  async function signalLoggedInReady(accountId: string, ownMid = `own-${accountId}`) {
+  async function signalLoggedInReady(accountId: string, ownMid = `own-${accountId}`, withTransport = false) {
     expect((await facade.dispatch({ type: 'lineLoginQr', requestId: `qr-ready-${accountId}`, accountId })).ok).toBe(true);
-    const binding = bindings.get(accountId)!;
+    // QR login replaces the worker; the gateway handshake belongs to this fresh binding.
+    const binding = withTransport
+      ? { ...bindings.get(accountId)!, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 }
+      : bindings.get(accountId)!;
+    if (withTransport) {
+      bindings.set(accountId, binding);
+      await workerBindingHandler?.(binding, new AbortController().signal);
+    }
     const attempt = latestLoginAttempt(accountId);
     await workerEventHandler?.(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: attempt, ownMid, displayName: 'Agent' });
     await workerEventHandler?.(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
@@ -2153,6 +2172,28 @@ database('connected facade account login semantics', () => {
     });
     expect(published.some((event) => event.type === 'snapshotChanged')).toBe(true);
     expect(published.filter((event) => event.type === 'lineAvatarRefreshed')).toEqual([{ type: 'lineAvatarRefreshed', accountId, ownMid }]);
+  });
+
+  it('preserves a bounded Talk profile failure code without exposing worker prose', async () => {
+    const accountId = 'avatar-refresh-server-error';
+    const ownMid = `u${'c'.repeat(32)}`;
+    await addStoredAccounts(accountId);
+    const binding: TestBinding = { accountId, workerInstanceId: 'avatar-error-worker', controlEpoch: 0, mode: 'MONITOR_ONLY' };
+    await workers.start(accountId, binding);
+    await pool.query(`UPDATE line_accounts SET own_mid=$2,status='connected',mode='MONITOR_ONLY',connection_mode='SYSTEM_LOGIN',
+      worker_instance_id=$3,worker_binding_epoch=$4 WHERE account_id=$1`,
+    [accountId, ownMid, binding.workerInstanceId, binding.controlEpoch]);
+    profileFailure = 'LINE_TALK_NOT_FOUND';
+    const result = await facade.dispatch({ type: 'refreshLineAvatar', requestId: 'profile-5', accountId });
+    expect(result).toMatchObject({ type: 'error', ok: false, code: 'LINE_PROFILE_REFRESH_FAILED',
+      serverErrorCode: 'LINE_TALK_NOT_FOUND', message: 'LINE profile could not be refreshed.' });
+    profileFailure = 'token=private MID=u12345678901234567890123456789012';
+    const poisoned = await facade.dispatch({ type: 'refreshLineAvatar', requestId: 'profile-poison', accountId });
+    expect(poisoned).toMatchObject({ type: 'error', ok: false, code: 'LINE_PROFILE_REFRESH_FAILED',
+      message: 'LINE profile could not be refreshed.' });
+    expect(poisoned).not.toHaveProperty('serverErrorCode');
+    await audit.flush();
+    expect(JSON.stringify(auditEvents)).not.toContain(profileFailure);
   });
 
   it('coalesces overlapping avatar refreshes for the same signed-in account', async () => {
@@ -2245,11 +2286,14 @@ database('connected facade account login semantics', () => {
     return state.loginAttemptId;
   }
 
+  const pairedAdminMid = `u${'e'.repeat(32)}`;
+
   async function prepareAdminPairing(accountId: string) {
     await addStoredAccounts(accountId);
     await pool.query('UPDATE line_accounts SET own_mid=$2 WHERE account_id=$1', [accountId, `own-${accountId}`]);
     expect((await new AccountRepository(pool).activateControl(accountId, 1)).activated).toBe(true);
     expect((await facade.dispatch({ type: 'lineStart', requestId: `pairing-start-${accountId}`, accountId })).ok).toBe(true);
+    await signalLoggedInReady(accountId, `own-${accountId}`, true);
     const binding = bindings.get(accountId);
     if (!binding) throw new Error('Active worker binding was not created');
     const result = await facade.dispatch({ type: 'lineBeginAdminPairing', requestId: `pairing-begin-${accountId}`, accountId });
@@ -2262,7 +2306,7 @@ database('connected facade account login semantics', () => {
       cursorBefore: { version: 1, revision: '0', globalRev: '0', individualRev: '0' },
       cursorAfter: { version: 1, revision: '1', globalRev: '1', individualRev: '0' }, envelopes: [{
         eventId: `${batchId}-event`, messageId: `${batchId}-message`, accountId, chatType: 'direct',
-        chatId: `admin-destination-${accountId}`, senderId: `admin-user-${accountId}`, kind: 'text', text: token,
+        chatId: pairedAdminMid, senderId: pairedAdminMid, kind: 'text', text: token,
         mentionIds: [], mentionRanges: [], replyToMessageId: null,
         ingestion: { source: 'live', cursor: null }, occurredAt: new Date().toISOString(), attachments: [], raw: {},
       }] });
@@ -2933,6 +2977,22 @@ database('connected facade account login semantics', () => {
     expect(commands.some((command) => command.type === 'manualSendText' && command.requestId === 'manual-after-disconnect')).toBe(false);
   });
 
+  it('keeps Agent readiness and manual send admission after a retryable token refresh failure', async () => {
+    await addStoredAccounts('account-a');
+    const binding = await loginReady('account-a');
+    await workerEventHandler?.(binding.workerInstanceId, { type: 'error', ...binding, code: 'WORKER_OPERATION_FAILED',
+      message: 'LINE token refresh failed', retryable: true,
+      diagnostic: { operation: 'loginToken', stage: 'execute', category: 'transport_failed', recovery: 'retry', outcome: 'failed' } });
+    await workerEventHandler?.(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
+
+    expect(await facade.dispatch({ type: 'sendText', requestId: 'agent-send-after-refresh-failure', accountId: 'account-a',
+      chatType: 'direct', chatId: 'chat-a', text: 'Agent remains available' })).toMatchObject({ ok: true });
+    expect(commands.some((command) => command.type === 'manualSendText' && command.requestId === 'agent-send-after-refresh-failure')).toBe(true);
+    expect(published).not.toContainEqual(expect.objectContaining({ type: 'lineLoginState', accountId: 'account-a', state: 'reauth_required' }));
+    expect(auditEvents).toContainEqual(expect.objectContaining({ action: 'worker_operation_error', accountId: 'account-a',
+      diagnostic: { operation: 'loginToken', stage: 'execute', category: 'transport_failed', recovery: 'retry', outcome: 'failed' } }));
+  });
+
   it('allows a natively logged-in Primary Admin to send while remaining monitor-only', async () => {
     const { binding, attempt } = await prepareAdminQrLogin();
     await workerEventHandler?.(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: attempt,
@@ -3028,6 +3088,21 @@ database('connected facade account login semantics', () => {
       chatType: 'direct', chatId: 'chat-a', text: 'send once' });
     expect(result).toMatchObject({ ok: false, code: 'LINE_SEND_NOT_STARTED', message: 'SIDE_EFFECT_DENIED' });
     expect(commands.filter((command) => command.type === 'manualSendText' && command.requestId === 'single-failed-manual-send')).toHaveLength(1);
+
+    manualSendFailure = 'LINE_TALK_E2EE_RETRY_ENCRYPT';
+    expect(await facade.dispatch({ type: 'sendText', requestId: 'talk-rejected-send', accountId: 'account-a',
+      chatType: 'direct', chatId: 'chat-a', text: 'send once' })).toMatchObject({ ok: false,
+      code: 'LINE_SEND_NOT_STARTED', serverErrorCode: 'LINE_TALK_E2EE_RETRY_ENCRYPT', message: 'LINE message was not sent.' });
+    expect(commands.filter((command) => command.type === 'manualSendText' && command.requestId === 'talk-rejected-send')).toHaveLength(1);
+
+    const privateServerText = 'token=private MID=u12345678901234567890123456789012 text=private';
+    manualSendFailure = privateServerText;
+    expect(await facade.dispatch({ type: 'sendText', requestId: 'poisoned-send', accountId: 'account-a',
+      chatType: 'direct', chatId: 'chat-a', text: 'send once' })).toMatchObject({ ok: false,
+      code: 'LINE_SEND_NOT_STARTED', message: 'LINE message was not sent.' });
+    expect(commands.filter((command) => command.type === 'manualSendText' && command.requestId === 'poisoned-send')).toHaveLength(1);
+    await audit.flush();
+    expect(JSON.stringify(auditEvents)).not.toContain(privateServerText);
   });
 
   it('reconciles a confirmed unsend into the exact older timeline row and refuses other senders', async () => {
@@ -3061,6 +3136,10 @@ database('connected facade account login semantics', () => {
 
     manualUnsendFailure = 'SIDE_EFFECT_DENIED';
     expect(await facade.dispatch(request)).toMatchObject({ ok: false, code: 'LINE_UNSEND_NOT_STARTED' });
+    expect(await facade.listMessages(request, null, 1, request.messageId)).toEqual(before);
+    manualUnsendFailure = 'LINE_TALK_NOT_YOUR_MESSAGE';
+    expect(await facade.dispatch({ ...request, requestId: 'unsend-talk-rejection' })).toMatchObject({ ok: false,
+      code: 'LINE_UNSEND_NOT_STARTED', serverErrorCode: 'LINE_TALK_NOT_YOUR_MESSAGE', message: 'LINE message was not unsent.' });
     expect(await facade.listMessages(request, null, 1, request.messageId)).toEqual(before);
     manualUnsendFailure = '__UNKNOWN__';
     expect(await facade.dispatch({ ...request, requestId: 'unsend-unknown' })).toMatchObject({ ok: false, code: 'LINE_UNSEND_OUTCOME_UNKNOWN' });
@@ -3132,6 +3211,7 @@ database('connected facade account login semantics', () => {
     await pool.query('UPDATE line_accounts SET own_mid=$2 WHERE account_id=$1', [accountId, `own-${accountId}`]);
     expect((await new AccountRepository(pool).activateControl(accountId, 1)).activated).toBe(true);
     expect((await facade.dispatch({ type: 'lineStart', requestId: 'pairing-feedback-start', accountId })).ok).toBe(true);
+    await signalLoggedInReady(accountId, `own-${accountId}`, true);
     const binding = bindings.get(accountId)!;
     const challenge = await facade.dispatch({ type: 'lineBeginAdminPairing', requestId: 'pairing-feedback-begin', accountId });
     expect(challenge.type).toBe('lineAdminPairing');
@@ -3142,7 +3222,7 @@ database('connected facade account login semantics', () => {
     const sendStarted = new Promise<void>((resolve) => { entered = resolve; });
     pendingWelcomeSend = { started: entered, wait: pending };
     const envelope = { eventId: 'pairing-feedback-event', messageId: 'pairing-feedback-message', accountId,
-      chatType: 'direct' as const, chatId: 'admin-destination', senderId: 'admin-user', kind: 'text' as const,
+      chatType: 'direct' as const, chatId: pairedAdminMid, senderId: pairedAdminMid, kind: 'text' as const,
       text: challenge.token, mentionIds: [], mentionRanges: [], replyToMessageId: null,
       ingestion: { source: 'live' as const, cursor: null }, occurredAt: new Date().toISOString(), attachments: [], raw: {} };
     await workerEventHandler?.(binding.workerInstanceId, { type: 'batch', ...binding, batchId: 'pairing-feedback-batch',
@@ -3150,10 +3230,12 @@ database('connected facade account login semantics', () => {
       cursorAfter: { version: 1, revision: '1', globalRev: '1', individualRev: '0' }, envelopes: [envelope] });
     await sendStarted;
     expect(commands.filter((command) => command.type === 'sendText'
-      && command.text === '歡迎你成為本系統管理員' && command.chatId === 'admin-destination')).toHaveLength(1);
+      && command.text === 'Welcome as the primary administrator.' && command.chatId === pairedAdminMid)).toHaveLength(1);
     expect(commands.some((command) => command.type === 'ackBatch' && command.batchId === 'pairing-feedback-batch')).toBe(true);
     await waitForState(() => expect(published.some((event) => event.type === 'snapshotChanged'
       && event.snapshot.accounts.some((item) => item.accountId === accountId && item.hasPrimaryAdmin === true))).toBe(true));
+    expect((await pool.query("SELECT own_mid,connection_mode FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows)
+      .toEqual([{ own_mid: pairedAdminMid, connection_mode: 'OFFLINE' }]);
     release();
     pendingWelcomeSend = null;
   });
@@ -3170,35 +3252,33 @@ database('connected facade account login semantics', () => {
     try {
       await deliverPairing(accountId, binding, token, `pairing-outcome-batch-${outcome}`);
       await waitForState(() => expect(warning).toHaveBeenCalledWith(warningText));
-      expect(commands.filter((command) => command.type === 'sendText' && command.text === '歡迎你成為本系統管理員'
-        && command.chatId === `admin-destination-${accountId}`)).toHaveLength(1);
+      expect(commands.filter((command) => command.type === 'sendText' && command.text === 'Welcome as the primary administrator.'
+        && command.chatId === pairedAdminMid)).toHaveLength(1);
       expect(commands.filter((command) => command.type === 'ackBatch' && command.batchId === `pairing-outcome-batch-${outcome}`)).toHaveLength(1);
       expect(await new AdminRepository(pool).hasPrimary(accountId)).toBe(true);
       await new Promise((resolve) => setTimeout(resolve, 25));
-      expect(commands.filter((command) => command.type === 'sendText' && command.text === '歡迎你成為本系統管理員'
-        && command.chatId === `admin-destination-${accountId}`)).toHaveLength(1);
+      expect(commands.filter((command) => command.type === 'sendText' && command.text === 'Welcome as the primary administrator.'
+        && command.chatId === pairedAdminMid)).toHaveLength(1);
     } finally { warning.mockRestore(); }
   });
 
-  it('skips welcome admission when the worker binding is stopped before the async binding check completes', async () => {
+  it('skips welcome admission when the worker stops after the pairing is persisted', async () => {
     const accountId = 'pairing-stopped-before-admission';
     const { binding, token } = await prepareAdminPairing(accountId);
-    let release!: () => void;
-    let entered!: () => void;
-    const wait = new Promise<void>((resolve) => { release = resolve; });
-    const started = new Promise<void>((resolve) => { entered = resolve; });
-    pendingWelcomeBinding = { accountId, started: entered, wait };
+    const bindPrimary = AccountRepository.prototype.bindPrimaryAdministrator;
+    const persisted = vi.spyOn(AccountRepository.prototype, 'bindPrimaryAdministrator').mockImplementation(async function (this: AccountRepository, ...args) {
+      const result = await bindPrimary.apply(this, args);
+      bindings.delete(accountId);
+      return result;
+    });
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
       await deliverPairing(accountId, binding, token, 'pairing-stopped-batch');
-      await started;
-      bindings.delete(accountId);
-      release();
       await waitForState(() => expect(warning).toHaveBeenCalledWith('[admin-pairing] welcome send skipped: binding unavailable'));
-      expect(commands.some((command) => command.type === 'sendText' && command.text === '歡迎你成為本系統管理員')).toBe(false);
+      expect(commands.some((command) => command.type === 'sendText' && command.text === 'Welcome as the primary administrator.')).toBe(false);
       expect(commands.some((command) => command.type === 'ackBatch' && command.batchId === 'pairing-stopped-batch')).toBe(true);
       expect(await new AdminRepository(pool).hasPrimary(accountId)).toBe(true);
-    } finally { release(); warning.mockRestore(); }
+    } finally { warning.mockRestore(); persisted.mockRestore(); }
   });
 
   it('waits for the pending welcome send to settle through worker shutdown', async () => {
@@ -3222,7 +3302,7 @@ database('connected facade account login semantics', () => {
       expect(shutdownSettled).toBe(false);
     } finally { release(); }
     await shutdown;
-    expect(commands.filter((command) => command.type === 'sendText' && command.text === '歡迎你成為本系統管理員')).toHaveLength(1);
+    expect(commands.filter((command) => command.type === 'sendText' && command.text === 'Welcome as the primary administrator.')).toHaveLength(1);
     expect(await new AdminRepository(pool).hasPrimary(accountId)).toBe(true);
     pendingWelcomeSend = null;
   });
@@ -3317,6 +3397,26 @@ database('connected facade account login semantics', () => {
     expect(auditEvents.some((event) => event.action === 'worker_stop' && event.phase === 'requested'
       && event.accountId === 'audit-account' && event.workerInstanceId)).toBe(true);
     expect(JSON.stringify(auditEvents)).not.toMatch(/password|token|oauth/i);
+  });
+
+  it('keeps the worker, secrets, and connected state when server logout fails', async () => {
+    await addStoredAccounts('logout-failure-account');
+    await loginReady('logout-failure-account');
+    lineLogoutFailure = true;
+    stops.length = 0;
+    const before = await pool.query<{ status: string }>("SELECT status FROM line_accounts WHERE account_id='logout-failure-account'");
+    const admissionClose = vi.spyOn(ChatResourceAccountAdmission.prototype, 'close');
+
+    try {
+      const result = await facade.dispatch({ type: 'lineLogout', requestId: 'logout-failure', accountId: 'logout-failure-account' });
+
+      expect(result).toMatchObject({ ok: false, code: 'LINE_LOGOUT_FAILED' });
+      expect(stops).toEqual([]);
+      expect(await secretStore.load('logout-failure-account')).not.toBeNull();
+      expect((await pool.query<{ status: string }>("SELECT status FROM line_accounts WHERE account_id='logout-failure-account'")).rows[0]?.status)
+        .toBe(before.rows[0]?.status);
+      expect(admissionClose.mock.calls.some(([accountId]) => accountId === 'logout-failure-account')).toBe(false);
+    } finally { admissionClose.mockRestore(); }
   });
 
   it('starts with an invalid saved workspace and repairs it live with stable validation errors', async () => {

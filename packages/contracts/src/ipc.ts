@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isLineServerErrorCode } from './line-server-error.js';
 import { AgentAttachmentSummarySchema, AgentAttachmentUploadsSchema, AgentEventSchema, AgentProviderSchema } from './agent.js';
 import { AgentStatusIconsSchema } from './agent-status-icons.js';
 import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN } from './agent-status-rotation.js';
@@ -467,6 +468,8 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('createChatFolder'), requestId: IdSchema, ok: z.literal(true), folder: ChatFolderSummarySchema }),
     z.strictObject({ type: z.literal('openChatFolder'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
   ]),
-  z.strictObject({ type: z.literal('error'), requestId: IdSchema, ok: z.literal(false), code: z.string().min(1), message: z.string().min(1), retryable: z.boolean() }),
+  z.strictObject({ type: z.literal('error'), requestId: IdSchema, ok: z.literal(false), code: z.string().min(1),
+    message: z.string().min(1), retryable: z.boolean(),
+    serverErrorCode: z.string().max(80).refine(isLineServerErrorCode).optional() }),
 ]);
 export type IpcResult = z.infer<typeof IpcResultSchema>;

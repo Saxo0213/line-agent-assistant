@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
+import { LINE_SERVER_ERROR_CODES, parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
 
 export const AUDIT_ACTIONS = [
   'app_start', 'app_stop', 'service_start', 'service_stop', 'worker_start', 'worker_stop', 'worker_restart',
@@ -35,6 +35,7 @@ export const AUDIT_ERROR_CODES = [
   'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED', 'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED',
   'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED', 'PRIMARY_ADMIN_NOT_FRIEND', 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED',
   'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED',
+  ...LINE_SERVER_ERROR_CODES,
 ] as const;
 export type AuditErrorCode = typeof AUDIT_ERROR_CODES[number];
 export const AUDIT_RESULT_CODES = ['worker_stopped', 'secret_removed', 'agent_auth_action_completed', 'audit_sink_recovered',

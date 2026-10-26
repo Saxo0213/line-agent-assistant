@@ -11,6 +11,48 @@ export class LocalMcpConfigError extends Error {
 
 export const CODEX_BLOCK_START = '# >>> LINEJS MCP (managed by LINE Agent Assistant; do not edit)';
 export const CODEX_BLOCK_END = '# <<< LINEJS MCP';
+const STATUS_PROBE_TIMEOUT_MS = 1_500;
+
+interface ConfiguredMcpCredentials { endpoint: string; token: string }
+
+function configuredCredentials(client: LocalClientKind, contents: string): ConfiguredMcpCredentials | null {
+  if (client === 'codex') {
+    const start = contents.indexOf(CODEX_BLOCK_START);
+    const end = contents.indexOf(CODEX_BLOCK_END);
+    if (start < 0 || end < start) return null;
+    const block = contents.slice(start, end);
+    const endpoint = /^url\s*=\s*"([^"]+)"\s*$/m.exec(block)?.[1];
+    const token = /^http_headers\s*=\s*\{\s*Authorization\s*=\s*"Bearer\s+([^"\s]+)"\s*\}\s*$/m.exec(block)?.[1];
+    return endpoint && token ? { endpoint, token } : null;
+  }
+  const entry = parseClaudeConfig(contents).mcpServers;
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const env = (entry as Record<string, unknown>).linejs;
+  if (!env || typeof env !== 'object' || Array.isArray(env)) return null;
+  const config = env as Record<string, unknown>;
+  const vars = config.env;
+  if (!vars || typeof vars !== 'object' || Array.isArray(vars)) return null;
+  const values = vars as Record<string, unknown>;
+  return typeof values.LINEJS_MCP_URL === 'string' && typeof values.LINEJS_MCP_TOKEN === 'string'
+    ? { endpoint: values.LINEJS_MCP_URL, token: values.LINEJS_MCP_TOKEN } : null;
+}
+
+async function probeConfiguredToken(credentials: ConfiguredMcpCredentials): Promise<boolean> {
+  try {
+    const endpoint = new URL(credentials.endpoint);
+    if (endpoint.protocol !== 'http:' || endpoint.hostname !== '127.0.0.1' || endpoint.pathname !== '/mcp') return false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), STATUS_PROBE_TIMEOUT_MS);
+    try {
+      const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${credentials.token}` },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 'local-client-status', method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'LINEJS status', version: '1' } } }),
+        signal: controller.signal });
+      if (!response.ok) return false;
+      const body = await response.json() as { jsonrpc?: unknown; id?: unknown; result?: unknown };
+      return body.jsonrpc === '2.0' && body.id === 'local-client-status' && !!body.result && typeof body.result === 'object';
+    } finally { clearTimeout(timeout); }
+  } catch { return false; }
+}
 
 function block(port: number, token: string): string {
   return `${CODEX_BLOCK_START}\n[mcp_servers.linejs]\nurl = "http://127.0.0.1:${port}/mcp"\nhttp_headers = { Authorization = "Bearer ${token}" }\n${CODEX_BLOCK_END}`;
@@ -109,22 +151,25 @@ export class McpLocalClients {
     return next;
   }
   async status(): Promise<LocalClientStatus[]> {
-    const tokens = await this.options.tokens.listTokens();
+    await this.options.tokens.normalizeManagedLocalClientScopes();
     return Promise.all((['claude-desktop', 'codex'] as const).map(async (client) => {
       const file = this.file(client);
       const installed = await stat(path.dirname(file)).then(() => true, () => false);
-      let managed = false;
+      let credentials: ConfiguredMcpCredentials | null = null;
       if (installed) {
         try {
           const contents = await readClientConfig(file);
-          managed = client === 'codex' ? contents.includes(CODEX_BLOCK_START) && contents.includes(CODEX_BLOCK_END)
-            : JSON.parse(contents || '{}')?.mcpServers?.linejs !== undefined;
-        } catch { managed = false; }
+          credentials = configuredCredentials(client, contents);
+        } catch { credentials = null; }
       }
-      const principal = `local-client:${client}`;
-      const token = tokens.find((item) => item.principalId === principal && item.state === 'ACTIVE' && item.expiresAt === null);
-      return { client, installed, connected: managed && Boolean(token), tokenId: managed ? token?.tokenId ?? null : null,
-        accountScopes: managed ? [...(token?.accountScopes ?? [])] : [] };
+      const token = credentials ? await this.options.tokens.findTokenByBearerToken(credentials.token) : null;
+      const activeEndpoint = this.options.getPort();
+      const endpointMatches = Boolean(credentials && activeEndpoint
+        && credentials.endpoint === `http://127.0.0.1:${activeEndpoint}/mcp`);
+      const connected = Boolean(credentials && token && token.principalId === `local-client:${client}`
+        && token.state === 'ACTIVE' && token.expiresAt === null && endpointMatches && await probeConfiguredToken(credentials));
+      return { client, installed, connected, tokenId: connected ? token!.tokenId : null,
+        accountScopes: connected ? [...token!.accountScopes] : [] };
     }));
   }
   connect(client: LocalClientKind, accountScopes: readonly string[]): Promise<LocalClientStatus> {
@@ -138,6 +183,9 @@ export class McpLocalClients {
       else updateClaudeManagedEntry(current, { command: this.options.execPath, args: [this.options.bridgePath], env: { LINEJS_MCP_TOKEN: 'validation-token' } });
       const principalId = `local-client:${client}`;
       const deviceLabel = client === 'codex' ? 'Codex（本機）' : 'Claude Desktop（本機）';
+      if (accountScopes.length === 0 || accountScopes.some((scope) => scope !== 'role:AGENT' && scope !== 'role:PRIMARY_ADMIN')) {
+        throw new Error('Managed local clients require one or more stable role scopes.');
+      }
       for (const old of (await this.options.tokens.listTokens()).filter((item) => item.principalId === principalId && item.state === 'ACTIVE')) await this.options.tokens.revokeToken(old.tokenId);
       const issued = await this.options.tokens.issueToken({ deviceLabel, principalId, accountScopes,
         toolScopes: [...MCP_TOOL_NAMES], expiration: { mode: 'never' } });

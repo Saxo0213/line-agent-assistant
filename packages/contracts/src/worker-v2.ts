@@ -4,6 +4,7 @@ import { AccountModeSchema, WritableConversationKeySchema, WorkerBindingSchema }
 import { NativeAttachmentDownloadInputSchema } from './native-source.js';
 import { JsonValueSchema } from './json.js';
 import { AttachmentResultSchema, InboundEnvelopeSchema } from './line.js';
+import { lineServerErrorMessage, type LineServerErrorCode } from './line-server-error.js';
 
 const Id = z.string().min(1);
 const Decimal = z.string().regex(/^(?:0|[1-9][0-9]*)$/).refine((value) =>
@@ -28,9 +29,11 @@ export const WORKER_ERROR_CODES = ['INVALID_COMMAND', 'QUEUE_FULL', 'CATALOG_REF
   'HISTORY_READ_FAILED', 'CHAT_RESOURCE_READ_FAILED', 'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED',
   'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED', 'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED',
   'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED'] as const;
-export type WorkerErrorCode = typeof WORKER_ERROR_CODES[number];
-const WorkerErrorCodeSchema = z.enum(WORKER_ERROR_CODES);
+export type WorkerErrorCode = typeof WORKER_ERROR_CODES[number] | LineServerErrorCode;
+const WorkerErrorCodeSchema = z.union([z.enum(WORKER_ERROR_CODES),
+  z.custom<LineServerErrorCode>((value) => lineServerErrorMessage(value) !== null)]);
 const UserMid = z.string().regex(/^u[0-9a-fA-F]{32}$/);
+const SourceChatMid = z.string().regex(/^[ucr][0-9a-fA-F]{32}$/);
 const Conversation = Bound.merge(WritableConversationKeySchema);
 const LoginAttempt = Bound.extend({ loginAttemptId: Id });
 export const WorkerPurposeSchema = z.enum(['STANDARD', 'DOWNLOAD_ONLY']);
@@ -153,6 +156,7 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Conversation.extend({ type: z.literal('history'), requestId: Id, cursor: Id.nullable(), limit: z.number().int().min(1).max(100) }),
   ChatResourceReadCommandSchema,
   Bound.extend({ type: z.literal('refreshOwnProfile'), requestId: Id.max(128), timeoutMs: z.number().int().min(1_000).max(30_000) }),
+  Bound.extend({ type: z.literal('logout'), requestId: Id.max(128) }),
   Conversation.extend({ type: z.literal('cancelChatResourceRead'), requestId: Id.max(128) }),
   Conversation.extend({ type: z.literal('sendText'), requestId: Id, text: Id, replyToMessageId: Id.nullable(),
     operationId: Id.optional(), attemptId: Id.optional(), effectPermit: Id.optional() }),
@@ -170,7 +174,7 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
     reaction: z.enum(['NICE', 'AMAZING', 'FUN', 'LOVE', 'SAD', 'OMG', 'UNDO']) }),
   Conversation.extend({ type: z.literal('unsendMessage'), requestId: Id, messageId: Decimal }),
   Bound.extend({ type: z.literal('checkFriendRelation'), requestId: Id, targetMid: UserMid }),
-  Bound.extend({ type: z.literal('addFriendByMid'), requestId: Id, targetMid: UserMid }),
+  Bound.extend({ type: z.literal('addFriendByMid'), requestId: Id, targetMid: UserMid, sourceChatMid: SourceChatMid.optional() }),
   Conversation.extend({ type: z.literal('downloadAttachment'), requestId: Id, attemptToken: z.uuid(), messageId: Id, attachmentId: z.uuid(), externalAttachmentId: Id, kind: z.enum(['image', 'video', 'audio', 'file']), occurredAt: z.iso.datetime({ offset: true }), originalFileName: z.string(), lineMessage: JsonValueSchema, nativeAttachment: NativeAttachmentDownloadInputSchema.optional(), maxBytes: z.number().int().positive(), timeoutMs: z.number().int().positive() }),
   Bound.extend({ type: z.literal('cancelAttachmentDownload'), attachmentId: z.uuid(), attemptToken: z.uuid() }),
   Bound.extend({ type: z.literal('revokeControl') }),
@@ -191,12 +195,17 @@ export const LineWorkerEventSchema = z.union([
   Bound.extend({ type: z.literal('downloadAuthResult'), requestId: Id, accepted: z.boolean(), error: z.enum(['PROFILE_MISMATCH', 'AUTH_UNAVAILABLE', 'APPLICATION_MISMATCH']).nullable() }),
   Bound.extend({ type: z.literal('downloadAuthInvalidated') }),
   Bound.extend({ type: z.literal('downloadReady'), ownMid: Id }),
-  Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('degraded'), code: z.literal('CATALOG_REFRESH_FAILED') }),
+  Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('degraded'), code: z.literal('CATALOG_REFRESH_FAILED'),
+    serverError: z.string().max(80).refine((value) => lineServerErrorMessage(value) !== null).optional() }),
   Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('ready'), code: z.literal('CATALOG_REFRESH_RECOVERED') }),
   z.discriminatedUnion('ok', [
     Bound.extend({ type: z.literal('ownProfileResult'), requestId: Id.max(128), ok: z.literal(true), error: z.null(), ownMid: UserMid,
       displayName: z.string().max(256).nullable(), picturePath: z.string().max(2048).nullable().optional() }),
     Bound.extend({ type: z.literal('ownProfileResult'), requestId: Id.max(128), ok: z.literal(false), error: z.string().max(80) }),
+  ]),
+  z.discriminatedUnion('ok', [
+    Bound.extend({ type: z.literal('logoutResult'), requestId: Id.max(128), ok: z.literal(true), error: z.null() }),
+    Bound.extend({ type: z.literal('logoutResult'), requestId: Id.max(128), ok: z.literal(false), error: z.enum(['LINE_LOGOUT_FAILED', 'LINE_AUTH_INVALIDATED']) }),
   ]),
   Bound.extend({ type: z.literal('batch'), batchId: Id, cursorBefore: TalkCursorV1Schema, cursorAfter: TalkCursorV1Schema, envelopes: z.array(InboundEnvelopeSchema),
     readReceipts: z.array(ReadReceiptSchema).max(500).optional() }),

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fetchLiveRows } from './official-snapshot-live-rows.mjs';
 
-// Runner for the retained official-database tool (docs/architecture/official-db-retained-capture-and-content-bridge-2026-10-20.md).
+// Runner for the retained official-database tool (docs/architecture/official-db-retained-capture-and-content-bridge.md).
 //   node scripts/official-snapshot.mjs capture                  expected MID read-only from line_accounts, passed on stdin
 //   node scripts/official-snapshot.mjs list
 //   node scripts/official-snapshot.mjs analyze <captureId>

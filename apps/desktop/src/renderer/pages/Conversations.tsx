@@ -468,7 +468,12 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     setUnsendBusy(true);
     try {
       const result = await api.unsendMessage(capturedRoute, message.messageId);
-      if (result.type !== 'accepted') throw new Error(safeErrorTextFor(locale, result, desktopText('unsendFailed')));
+      if (result.type !== 'accepted') {
+        if (generation === requestGeneration.current && currentRoute.current === capturedRouteKey) {
+          notify(safeErrorTextFor(locale, result, desktopText('unsendFailed')));
+        }
+        return;
+      }
       if (generation !== requestGeneration.current || currentRoute.current !== capturedRouteKey || capturedRouteKey !== routeKey) return;
       const projected = await api.listMessages(capturedRoute, null, 1, message.messageId);
       if (generation !== requestGeneration.current || currentRoute.current !== capturedRouteKey || capturedRouteKey !== routeKey) return;
@@ -995,7 +1000,9 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
         } else {
           const notStarted = result.type === 'error' && result.code === 'LINE_SEND_NOT_STARTED';
           settleFeedback(id, notStarted ? 'failed' : 'unknown');
-          if (currentRoute.current === routeKey) setComposerError(notStarted ? desktopText('messageWasNotSentTryAgain') : desktopText('deliveryCouldNotBeConfirmedCheckLineBeforeRetrying'));
+          if (currentRoute.current === routeKey) setComposerError(notStarted
+            ? safeErrorTextFor(locale, result, desktopText('messageWasNotSentTryAgain'))
+            : desktopText('deliveryCouldNotBeConfirmedCheckLineBeforeRetrying'));
           setLineDrafts((drafts) => draftRevisions.current[revisionKey] === submittedRevision && drafts[routeKey] === lineDraft ? { ...drafts, [routeKey]: '' } : drafts);
           return;
         }
@@ -1010,7 +1017,9 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
           const notStarted = result.type === 'error' && ['LINE_SEND_NOT_STARTED', 'LINE_MEDIA_BUSY', 'LINE_MEDIA_UNAVAILABLE',
             'LINE_MEDIA_UNSUPPORTED_CHAT', 'ACCOUNT_NOT_READY', 'ACCOUNT_NOT_ACTIVE', 'EXTERNAL_MONITOR_READ_ONLY',
             'MANUAL_MEDIA_INVALID', 'MANUAL_MEDIA_LIMIT', 'MANUAL_MEDIA_STAGE_FAILED', 'SERVICE_CLOSING'].includes(result.code);
-          if (currentRoute.current === routeKey) setComposerError(notStarted ? desktopText('mediaWasNotSentTryAgain') : desktopText('deliveryCouldNotBeConfirmedCheckLineBeforeRetrying'));
+          if (currentRoute.current === routeKey) setComposerError(notStarted
+            ? safeErrorTextFor(locale, result, desktopText('mediaWasNotSentTryAgain'))
+            : desktopText('deliveryCouldNotBeConfirmedCheckLineBeforeRetrying'));
           return;
         }
         setManualFiles((current) => ({ ...current, [routeKey]: (current[routeKey] ?? []).filter((candidate) => candidate.id !== item.id) }));

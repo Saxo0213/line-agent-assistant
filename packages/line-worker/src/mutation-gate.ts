@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
-export type EffectPhase = "AUTH_BOOTSTRAP" | "MONITOR_READ" | "CONTROL_READ" | "CONTROL_SEND" | "MANUAL_SEND" | "CHAT_RESOURCE_BOOTSTRAP";
+export type EffectPhase = "AUTH_BOOTSTRAP" | "MONITOR_READ" | "CONTROL_READ" | "CONTROL_SEND" | "MANUAL_SEND" | "CHAT_RESOURCE_BOOTSTRAP" | "SERVER_LOGOUT";
 export type ControlLeasePhase = "CONTROL_READ" | "CONTROL_SEND" | "MANUAL_SEND";
 export type ControlLease = Readonly<{ accountId: string; workerInstanceId: string; controlEpoch: number }>;
 export type RpcTransportState =
@@ -91,9 +91,11 @@ const OBS_E2EE_PREFLIGHT_PATH = new RegExp(`^/r/talk/(?:emi|emv|ema|emf)/${IDENT
 const OBS_UPLOAD_PATH = /^\/r\/talk\/(emi|emf)\/reqid-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const OBS_UPLOAD_PREVIEW_PATH = new RegExp(`^/r/talk/emi/${IDENTIFIER_WITH_DIGIT}__ud-preview$`);
 export type MediaUploadKind = "image" | "file";
+export type ServerLogoutPermit = Readonly<object>;
 /** Per-send OBS upload permit: bound to one lease, at most 2 POSTs, each path once. */
 export type MediaUploadScope = Readonly<{ kind: MediaUploadKind; lease: ControlLease; manual: boolean; close(): void }>;
 type MediaUploadState = { closed: boolean; posts: number; readonly paths: Set<string>; manual: boolean };
+type ServerLogoutState = { readonly token: string; consumed: boolean };
 type PhysicalBinding = Readonly<{ url: string; sameAsLogical: boolean }>;
 type RpcPermit = {
   active: boolean;
@@ -106,6 +108,19 @@ type RpcPermit = {
 };
 
 function deny(reason: string): never { throw new EffectDeniedError(reason); }
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("LINE server logout aborted");
+}
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => { cleanup(); reject(signal.reason instanceof Error ? signal.reason : new Error("LINE server logout aborted")); };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then((value) => { cleanup(); resolve(value); }, (error) => { cleanup(); reject(error); });
+  });
+}
 function assertIdentity(value: unknown, field: string): asserts value is string {
   if (typeof value !== "string" || value.length === 0) deny(`${field} must be a non-empty string`);
 }
@@ -126,6 +141,7 @@ export class MutationGate<Call, RpcResult, TransportResult> {
   readonly #physicalTransport: MutationGateOptions<Call, RpcResult, TransportResult>["physicalTransport"];
   readonly #rpcContext = new AsyncLocalStorage<RpcPermit>();
   readonly #mediaScopes = new WeakMap<MediaUploadScope, MediaUploadState>();
+  readonly #serverLogoutPermits = new WeakMap<ServerLogoutPermit, ServerLogoutState>();
 
   constructor(options: MutationGateOptions<Call, RpcResult, TransportResult>) {
     assertIdentity(options.accountId, "accountId");
@@ -175,6 +191,39 @@ export class MutationGate<Call, RpcResult, TransportResult> {
     this.#assertObsRequest(request);
     if (effect.phase === "CONTROL_READ") await this.#assertCurrentLease(this.#bindLease(effect.lease, effect.phase), "CONTROL_READ");
     return this.#physicalTransport(request);
+  }
+
+  /** Create one adapter-owned permit for one server logout invocation. */
+  createServerLogoutPermit(existingToken: string): ServerLogoutPermit {
+    if (typeof existingToken !== "string" || existingToken.length === 0) return deny("server logout requires an existing token");
+    const permit = Object.freeze({});
+    this.#serverLogoutPermits.set(permit, { token: existingToken, consumed: false });
+    return permit;
+  }
+
+  /** One adapter-owned POST to the exact logoutZ endpoint and serializer payload. */
+  async runServerLogout(request: Request, permit: ServerLogoutPermit, signal?: AbortSignal): Promise<TransportResult> {
+    const state = this.#serverLogoutPermits.get(permit);
+    if (!state || state.consumed) return deny("server logout permit is missing or consumed");
+    throwIfAborted(signal);
+    if (!(request instanceof Request) || request.method !== "POST" || request.redirect === "manual") {
+      return deny("server logout must be a POST request");
+    }
+    const url = new URL(request.url);
+    if (url.protocol !== "https:" || url.hostname !== LINE_RPC_HOST || url.port !== "" || url.username !== "" ||
+      url.password !== "" || url.pathname !== "/RS4" || url.search !== "" || url.hash !== "") {
+      return deny("server logout endpoint is not allowlisted");
+    }
+    if (request.headers.get("x-line-access") !== state.token) return deny("server logout token does not match the existing token");
+    const expectedBody = new Uint8Array([0x82, 0x21, 0x00, 0x07, 0x6c, 0x6f, 0x67, 0x6f, 0x75, 0x74, 0x5a, 0x00]);
+    const body = new Uint8Array(await request.clone().arrayBuffer());
+    if (body.length !== expectedBody.length || body.some((value, index) => value !== expectedBody[index])) {
+      return deny("server logout payload is not the pinned logoutZ payload");
+    }
+    // Consume before invoking the transport so re-entrant calls cannot reuse it.
+    state.consumed = true;
+    const physicalRequest = new Request(request, { redirect: "error", ...(signal ? { signal } : {}) });
+    return abortable(this.#physicalTransport(physicalRequest), signal);
   }
 
   /** Narrow direct-fetch permit for LINEJS Notes/Moa calls. It is identity-bound and single-request. */

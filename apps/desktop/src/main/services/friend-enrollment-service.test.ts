@@ -224,6 +224,27 @@ describe('FriendEnrollmentService', () => {
       expect(ctx.auditOutcomes).toEqual([expect.objectContaining({ action: 'friend_relation_initial', phase: 'succeeded', resultCode: 'relation_friend' })]);
       expect(ctx.auditFailures).toHaveLength(0);
     });
+
+    it('does not report or cache success when confirmation persistence returns false, then retries on the next trigger', async () => {
+      const ctx = setup();
+      ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
+      ctx.admins.confirmPrimaryAdministratorFriendship.mockResolvedValueOnce(false);
+      const signal = new AbortController().signal;
+
+      await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, signal))
+        .rejects.toMatchObject({ diagnosticLogged: true });
+      expect(ctx.auditOutcomes).toHaveLength(0);
+      expect(ctx.auditFailures).toHaveLength(1);
+      expect(ctx.auditFailures[0]).toMatchObject({ errorCode: 'DATABASE_WRITE_FAILED', action: 'friend_relation_initial',
+        diagnostic: { operation: 'checkFriendRelation', stage: 'persist', category: 'persistence_failed', recovery: 'retry' } });
+      expect(JSON.stringify(ctx.auditFailures)).not.toContain(targetMid);
+
+      await ctx.service.ensurePrimaryAdministratorFriendship(binding, signal);
+      expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(2);
+      expect(ctx.admins.confirmPrimaryAdministratorFriendship).toHaveBeenCalledTimes(2);
+      expect(ctx.friendConfirmation).toEqual({ userId: targetMid, version: 1 });
+      expect(ctx.auditOutcomes).toEqual([expect.objectContaining({ action: 'friend_relation_initial', phase: 'succeeded', resultCode: 'relation_friend' })]);
+    });
   });
   it('checks and adds the primary administrator once per active binding', async () => {
     const ctx = setup();

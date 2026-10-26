@@ -4,6 +4,30 @@ import { LineWorkerCommandSchema, LineWorkerEventSchema } from './worker-v2.js';
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const cursor = { version: 1, revision: '1', globalRev: '2', individualRev: '3' };
 
+it('binds logout commands and results to the complete worker identity and request id', () => {
+  const command = { type: 'logout', ...binding, requestId: 'logout-1' };
+  expect(LineWorkerCommandSchema.safeParse(command).success).toBe(true);
+  expect(LineWorkerCommandSchema.safeParse({ ...command, path: '/RS4' }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ type: 'logoutResult', ...binding, requestId: 'logout-1', ok: true, error: null }).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ type: 'logoutResult', ...binding, requestId: 'logout-1', ok: false,
+    error: 'LINE_AUTH_INVALIDATED' }).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ type: 'logoutResult', ...binding, requestId: 'logout-1', ok: true,
+    error: 'LINE_AUTH_INVALIDATED' }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ type: 'logoutResult', ...binding, requestId: 'logout-1', ok: false,
+    error: 'private server message' }).success).toBe(false);
+});
+
+it('accepts only restricted Talk codes on failed attachment IPC events', () => {
+  const event = { type: 'attachmentResult', ...binding, chatType: 'group', chatId: 'c-group',
+    attachmentId: '11111111-1111-4111-8111-111111111111',
+    attemptToken: '22222222-2222-4222-8222-222222222222', status: 'failed',
+    error: 'LINE_OBS_TOKEN_RPC_FAILED', serverErrorCode: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY', upstreamCode: 84 };
+  expect(LineWorkerEventSchema.safeParse(event).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ ...event, serverErrorCode: 'LINE_TALK_PRIVATE_SERVER_MESSAGE' }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...event, serverErrorCode: 'token=private' }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...event, upstreamCode: 'token=private' }).success).toBe(false);
+});
+
 it('bounds chat resource reads and image result payloads', () => {
   const command = { type: 'chatResourceRead', ...binding, chatType: 'group', chatId: `c${'a'.repeat(32)}`,
     requestId: 'resource-1', action: 'downloadAlbumPhoto', albumId: 'album-1', photoId: 'photo-1', oid: 'oid-1',
@@ -149,6 +173,8 @@ it('binds relation commands and results to the exact LINE user MID and current w
   const add = { type: 'addFriendByMid', ...owner, requestId: 'add-1', targetMid: `u${'b'.repeat(32)}` };
   expect(LineWorkerCommandSchema.safeParse(check).success).toBe(true);
   expect(LineWorkerCommandSchema.safeParse(add).success).toBe(true);
+  expect(LineWorkerCommandSchema.safeParse({ ...add, sourceChatMid: `c${'d'.repeat(32)}` }).success).toBe(true);
+  expect(LineWorkerCommandSchema.safeParse({ ...add, sourceChatMid: 'invalid-chat' }).success).toBe(false);
   for (const targetMid of ['u-peer', `c${'a'.repeat(32)}`, `u${'g'.repeat(32)}`, `u${'a'.repeat(31)}`]) {
     expect(LineWorkerCommandSchema.safeParse({ ...check, targetMid }).success).toBe(false);
   }

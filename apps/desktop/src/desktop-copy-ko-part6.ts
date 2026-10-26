@@ -12,8 +12,6 @@ export const KOREAN_DESKTOP_COPY_PART6 = {
   replaceAgentAccountWithArg0Arg1: '“{arg0}”을(를) 스캔한 LINE 계정 “{arg1}”으로 바꾸시겠어요?',
   agentArchiveRemainsSeparate: '이전 계정의 대화와 첨부 파일은 이전 계정에 남습니다. 새 계정은 별도로 시작합니다.',
   differentLineAccount: '다른 LINE 계정',
-  historicalAgentAccounts: '이전 Agent 계정',
-  historicalAgentReadOnly: '이전 보관 기록 · 읽기 전용',
   logInToPrimaryAdminLineAccount: '기본 관리자 LINE 계정 로그인',
   setAdministratorFromLineAndStartExternalMonitoring: 'LINE에서 관리자를 설정하고 외부 모니터링 시작',
   settingPrimaryAdministrator: '기본 관리자 설정 중…',

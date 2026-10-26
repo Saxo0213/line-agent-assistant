@@ -4,6 +4,7 @@ import type { Pool, PoolClient } from 'pg';
 import { normalizeNativePicturePath } from '@line-agent/contracts';
 import { transitionAgentJobStatus, type AgentJobStatusProjection } from './agent-repository.js';
 import { withBoundedTransaction } from './bounded-transaction.js';
+import { normalizeManagedMcpScopes } from './managed-mcp-scopes.js';
 
 export interface AccountState {
   accountId: string;
@@ -62,12 +63,59 @@ async function readControl(client: PoolClient): Promise<ControlState> {
 export class AccountRepository {
   constructor(private readonly pool: Pool) {}
 
+  /** A pairing proof establishes the same role holder used by login and External Monitor. */
+  async bindPrimaryAdministrator(accountId: string, chatId: string, userId: string): Promise<boolean> {
+    if (chatId !== userId || !/^u[0-9a-f]{32}$/.test(userId)) return false;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT singleton FROM account_control WHERE singleton=true FOR UPDATE');
+      await client.query("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN' FOR UPDATE");
+      const agent = (await client.query<{ own_mid: string | null }>(
+        "SELECT own_mid FROM line_accounts WHERE account_id=$1 AND product_role='AGENT' FOR UPDATE", [accountId])).rows[0];
+      if (!agent?.own_mid || agent.own_mid === userId) { await client.query('ROLLBACK'); return false; }
+      const existing = (await client.query<{ chat_id: string; user_id: string }>(
+        "SELECT chat_id,user_id FROM account_administrators WHERE account_id=$1 AND role='PRIMARY_ADMIN' FOR UPDATE", [accountId])).rows[0];
+      if (existing && (existing.chat_id !== chatId || existing.user_id !== userId)) {
+        await client.query('ROLLBACK'); return false;
+      }
+      await this.ensurePrimaryAdminHolder(client, userId);
+      if (!existing) await client.query(
+        `INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
+         VALUES($1,'direct',$2,$3,'PRIMARY_ADMIN')`, [accountId, chatId, userId]);
+      await client.query('COMMIT');
+      return true;
+    } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; }
+    finally { client.release(); }
+  }
+
+  /** Caller holds account_control and the existing Primary Admin row before the Agent row. */
+  private async ensurePrimaryAdminHolder(client: PoolClient, mid: string): Promise<void> {
+    if (!/^u[0-9a-f]{32}$/.test(mid)) throw new Error('PRIMARY_ADMIN_IDENTITY_INVALID');
+    const holder = (await client.query<{ account_id: string; own_mid: string | null }>(
+      "SELECT account_id,own_mid FROM line_accounts WHERE product_role='PRIMARY_ADMIN' FOR UPDATE")).rows[0];
+    if (holder?.own_mid && holder.own_mid !== mid) throw new Error('PRIMARY_ADMIN_IDENTITY_CONFLICT');
+    if (holder) {
+      if (!holder.own_mid) await client.query('UPDATE line_accounts SET own_mid=$2,updated_at=now() WHERE account_id=$1', [holder.account_id, mid]);
+      return;
+    }
+    const accountId = `account-${randomUUID()}`;
+    await client.query(
+      `INSERT INTO line_accounts(account_id,display_name,product_role,own_mid,connection_mode)
+       VALUES($1,'Primary Admin','PRIMARY_ADMIN',$2,'OFFLINE')`, [accountId, mid]);
+    await client.query(
+      `INSERT INTO conversations(account_id,chat_type,chat_id,title,agent_enabled)
+       VALUES($1,'direct',$2,$3,true)`, [accountId, LOCAL_AGENT_ROOM_CHAT_ID, LOCAL_AGENT_ROOM_TITLE]);
+  }
+
   async replaceAgentAccount(accountId: string, expectedControlEpoch: number): Promise<
     { ok: true; account: ReservedAccountState; controlEpoch: number } |
     { ok: false; code: 'AGENT_REPLACEMENT_STALE' | 'AGENT_WORKER_ACTIVE' | 'AGENT_CONTROL_ACTIVE' }> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      // Preserve managed role selection before retiring the old holder or moving its administrator binding.
+      await normalizeManagedMcpScopes(client);
       const state = await readControl(client);
       if (state.controlEpoch !== expectedControlEpoch || state.activeAccountId !== null) {
         await client.query('ROLLBACK');
@@ -79,7 +127,6 @@ export class AccountRepository {
       const verifiedAdmin = await client.query<{ chat_type: 'direct'; chat_id: string; user_id: string }>(
         `SELECT admin_auth.chat_type,admin_auth.chat_id,admin_auth.user_id
          FROM account_administrators admin_auth
-         JOIN line_accounts admin ON admin.product_role='PRIMARY_ADMIN' AND admin.own_mid=admin_auth.user_id
          WHERE admin_auth.account_id=$1 AND admin_auth.role='PRIMARY_ADMIN'
            AND admin_auth.chat_type='direct' AND admin_auth.chat_id=admin_auth.user_id
          FOR UPDATE OF admin_auth`, [accountId]);
@@ -95,6 +142,12 @@ export class AccountRepository {
       if (old.worker_instance_id !== null || old.worker_binding_epoch !== null || old.status !== 'disconnected') {
         await client.query('ROLLBACK');
         return { ok: false, code: 'AGENT_WORKER_ACTIVE' };
+      }
+      const adminBinding = verifiedAdmin.rows[0];
+      if (adminBinding) {
+        if (adminBinding.user_id === old.own_mid) throw new Error('PRIMARY_ADMIN_IDENTITY_CONFLICT');
+        // Pairing-only installations predating the unified role holder are repaired in this transaction.
+        await this.ensurePrimaryAdminHolder(client, adminBinding.user_id);
       }
       await client.query<{ job_id: string }>(
         `SELECT job_id FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND creation_epoch=$2
@@ -127,7 +180,6 @@ export class AccountRepository {
         `INSERT INTO conversations(account_id,chat_type,chat_id,title,agent_enabled)
          VALUES($1,'direct',$2,$3,true) ON CONFLICT(account_id,chat_type,chat_id) DO NOTHING`,
         [nextId, LOCAL_AGENT_ROOM_CHAT_ID, LOCAL_AGENT_ROOM_TITLE]);
-      const adminBinding = verifiedAdmin.rows[0];
       if (adminBinding) {
         await client.query(`DELETE FROM account_administrators WHERE account_id=$1 AND role='PRIMARY_ADMIN'
           AND chat_type=$2 AND chat_id=$3 AND user_id=$4`,
@@ -318,7 +370,7 @@ export class AccountRepository {
   }
 
   async applyWorkerLogin(binding: WorkerBinding, ownMid: string, displayName: string | null, picturePath?: string | null,
-    commitCredentials?: () => Promise<void | boolean>): Promise<boolean> {
+    commitCredentials?: () => Promise<void | boolean>, allowOfflineSystemLogin = false): Promise<boolean> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -370,6 +422,13 @@ export class AccountRepository {
             ON s.account_id=a.account_id AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
          WHERE a.account_id=$1 FOR UPDATE OF a`, [binding.accountId]);
       const selected = sourceMode.rows[0];
+      // Only an explicit QR login may activate a pairing-created offline holder; an existing source is never replaced.
+      if (allowOfflineSystemLogin && selected?.connection_mode === 'OFFLINE'
+        && selected.source_id === null && selected.generation === null) {
+        await client.query(`UPDATE line_accounts SET connection_mode='SYSTEM_LOGIN',mode_revision=mode_revision+1
+          WHERE account_id=$1 AND connection_mode='OFFLINE' AND selected_source_id IS NULL AND selected_source_generation IS NULL`, [binding.accountId]);
+        selected.connection_mode = 'SYSTEM_LOGIN';
+      }
       if (!selected || selected.connection_mode !== 'SYSTEM_LOGIN'
         || (selected.source_id !== null && (selected.source_type !== 'SYSTEM_LOGIN' || selected.source_state !== 'ACTIVE'))) {
         await client.query('ROLLBACK'); return false;

@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { URL as NodeURL } from 'node:url';
-import type { AppSnapshot } from '@line-agent/contracts';
+import { IpcResultSchema, RELATION_ADD_SERVER_ERRORS, TALK_SERVER_ERRORS, type AppSnapshot } from '@line-agent/contracts';
+import { lineServerErrorText } from './line-server-error-copy.js';
 import { App } from './App.js';
 import { WorkRecords } from './pages/WorkRecords.js';
 import { SetupWizard } from './pages/SetupWizard.js';
@@ -18,6 +19,23 @@ import { DESKTOP_ERROR_COPY } from '../desktop-error-copy.js';
 import { describeExternalImportMessage } from './pages/LineLogin.js';
 
 beforeEach(() => { localStorage.clear(); });
+
+it('provides fixed en, zh-TW, ja, and ko copy for all 121 Talk and 8 Relation codes', () => {
+  const codes = [...Object.keys(TALK_SERVER_ERRORS).map((name) => `LINE_TALK_${name}`),
+    ...Object.keys(RELATION_ADD_SERVER_ERRORS).map((name) => `LINE_RELATION_ADD_${name}`)];
+  expect(codes).toHaveLength(129);
+  for (const code of codes) {
+    for (const locale of ['en', 'zh-TW', 'ja', 'ko'] as const) {
+      const copy = lineServerErrorText(locale, code);
+      expect(copy, `${locale}:${code}`).toBeTruthy();
+      expect(copy).not.toContain('token=private');
+    }
+  }
+  for (const locale of ['en', 'zh-TW', 'ja', 'ko'] as const) {
+    expect(lineServerErrorText(locale, 'LINE_TALK_PRIVATE_MESSAGE')).toBeNull();
+    expect(lineServerErrorText(locale, 'LINE_RELATION_ADD_PRIVATE_MESSAGE')).toBeNull();
+  }
+});
 afterEach(() => { cleanup(); });
 const original = '原始聊天：圖片，請勿翻譯';
 const snapshot: AppSnapshot = {
@@ -170,6 +188,23 @@ describe('English desktop source', () => {
     expect(safeErrorText({ code: '__proto__' })).toBe('Unable to complete this action. Try again.');
     expect(describeExternalImportMessage('constructor').text).toBe('External monitoring stopped unexpectedly. Restart external monitoring.');
     expect(describeExternalImportMessage('x'.repeat(121)).code).toBeNull();
+  });
+
+  it.each([
+    ['en', 'LINE requires this message to be encrypted.', 'You can only unsend your own LINE messages.', 'LINE could not find the requested data.'],
+    ['zh-TW', 'LINE 要求以加密方式傳送。', '只能收回自己傳送的 LINE 訊息。', 'LINE 找不到指定資料。'],
+    ['ja', 'LINE はこのメッセージの暗号化を要求しています。', '自分が送信した LINE メッセージのみ送信取消できます。', 'LINE で指定されたデータが見つかりません。'],
+    ['ko', 'LINE에서 이 메시지를 암호화해 보내도록 요구합니다.', '본인이 보낸 LINE 메시지만 전송 취소할 수 있습니다.', 'LINE에서 요청한 데이터를 찾을 수 없습니다.'],
+  ] as const)('renders bounded facade Talk failures in %s without reading prose', (locale, send, unsend, profile) => {
+    const make = (code: string, serverErrorCode: string) => IpcResultSchema.parse({ type: 'error', requestId: 'one',
+      ok: false, code, serverErrorCode, message: 'token=private MID=u12345678901234567890123456789012', retryable: false });
+    expect(safeErrorTextFor(locale, make('LINE_SEND_NOT_STARTED', 'LINE_TALK_E2EE_RETRY_ENCRYPT'))).toBe(send);
+    expect(safeErrorTextFor(locale, make('LINE_UNSEND_NOT_STARTED', 'LINE_TALK_NOT_YOUR_MESSAGE'))).toBe(unsend);
+    expect(safeErrorTextFor(locale, make('LINE_PROFILE_REFRESH_FAILED', 'LINE_TALK_NOT_FOUND'))).toBe(profile);
+    expect(safeErrorTextFor(locale, { code: 'LINE_SEND_OUTCOME_UNKNOWN', message: 'token=private' }))
+      .toBe(extraTextFor(locale, 'operationFailed'));
+    expect(safeErrorTextFor(locale, { code: 'LINE_SEND_NOT_STARTED', serverErrorCode: 'LINE_TALK_PRIVATE_MESSAGE',
+      message: 'token=private' })).toBe(extraTextFor(locale, 'operationFailed'));
   });
 
   it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('localizes unknown rejected UI actions in %s and redacts diagnostics', async (locale) => {
