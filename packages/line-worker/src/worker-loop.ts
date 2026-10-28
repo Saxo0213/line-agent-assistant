@@ -4,7 +4,7 @@ import {
   WORKER_PROTOCOL_VERSION, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue as ContractJsonValue, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto,
   type ChatResourceReadCommand, type ChatResourcePhotoPageShape,
 } from '@line-agent/contracts';
-import { DurableCursorSession, decodeHistoryCursor, encodeHistoryCursor,
+import { DurableCursorSession, cursorsEqual, decodeHistoryCursor, encodeHistoryCursor,
   type HistoryCursorV1, type JsonValue } from './cursor.js';
 import { EffectDeniedError, type ControlLease } from './mutation-gate.js';
 import { normalizeOperation, type DecryptionFailure } from './normalizer.js';
@@ -172,6 +172,7 @@ export class LineWorkerLoop {
   readonly #minFreeBytes: number;
   #binding?: InitCommand;
   #cursor?: DurableCursorSession<JsonValue>;
+  #lastAckedBatch: { batchId: string } | undefined;
   #secrets: SecretState = { token: null, qrCert: null, e2eeStorage: null };
   #loginAttemptId?: string;
   #loginInFlight = false;
@@ -402,9 +403,13 @@ export class LineWorkerLoop {
         await this.#withTransportCall(() => this.#poll());
         return;
       case 'ackBatch':
+        // Main may ack a re-emitted copy of a batch it already acknowledged; that repeat is already done.
+        if (this.#lastAckedBatch?.batchId === command.batchId && this.#cursor!.pendingBatch?.batchId !== command.batchId
+          && cursorsEqual(command.cursorAfter, this.#cursor!.durableCursor)) return;
         this.#cursor!.acknowledge({ accountId: binding.accountId, batchId: command.batchId,
           cursorBefore: this.#cursor!.pendingBatch?.cursorBefore ?? this.#cursor!.durableCursor,
           cursorAfter: command.cursorAfter });
+        this.#lastAckedBatch = { batchId: command.batchId };
         return;
       case 'history':
         await this.#withTransportCall(() => this.#history(command));

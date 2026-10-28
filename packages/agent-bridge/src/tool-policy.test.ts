@@ -20,7 +20,7 @@ function previousClaudeArguments(req:AgentRunRequest) {
   const level=req.tools.level??(req.tools.localTools?'workspace_write':'read_only');
   const fullAccess=level==='full'&&req.tools.localTools;
   const allowed=[...(req.mcp?claudeMcpToolNames():[]),...(req.tools.fileWrite&&['workspace_write','trust','full'].includes(level)?['Write','Edit']:[])];
-  return ['-p','--input-format','text','--output-format','stream-json','--verbose','--include-partial-messages',...(fullAccess?[]:['--restricted']),'--permission-mode','dontAsk','--strict-mcp-config',...[...(req.tools.workspaceRootDir?[req.tools.workspaceRootDir]:[]),...req.tools.linkedReadDirs].flatMap(directory=>['--add-dir',directory]),...(fullAccess?[]:['--tools',claudeBuiltInTools(req.tools).join(',')]),'--disallowedTools','Bash',...(req.mcp?['--mcp-config',claudeMcpConfig(req.mcp)]:[]),...(allowed.length?['--allowedTools',allowed.join(',')]:[]),...(req.resumeSessionId?['--resume',req.resumeSessionId]:[])];
+  return ['-p','--input-format','text','--output-format','stream-json','--verbose','--include-partial-messages','--autocompact','400000',...(fullAccess?[]:['--restricted']),'--permission-mode','dontAsk','--strict-mcp-config',...[...(req.tools.workspaceRootDir?[req.tools.workspaceRootDir]:[]),...req.tools.linkedReadDirs].flatMap(directory=>['--add-dir',directory]),...(fullAccess?[]:['--tools',claudeBuiltInTools(req.tools).join(',')]),'--disallowedTools','Bash',...(req.mcp?['--mcp-config',claudeMcpConfig(req.mcp)]:[]),...(allowed.length?['--allowedTools',allowed.join(',')]:[]),...(req.resumeSessionId?['--resume',req.resumeSessionId]:[])];
 }
 function bridge(provider:'codex'|'claude') {
   return new AgentCliBridge({enabled:true,workspaceRoots:[root],runner:new NodeProcessRunner(),environment:process.env,
@@ -41,7 +41,7 @@ describe('Claude built-in tools come from the Main-resolved policy',()=>{
     const args=claudeArguments({...request('claude',root,{tools:none}),mcp});
     expect(value(args,'--tools')).toBe('');
     expect(args).not.toContain('--add-dir');
-    expect(value(args,'--allowedTools')).toBe('mcp__linejs__list_targets,mcp__linejs__query_target_messages,mcp__linejs__query_target_messages_by_time,mcp__linejs__query_agent_room_history,mcp__linejs__list_send_targets,mcp__linejs__send_to_target');
+    expect(value(args,'--allowedTools')).toBe('mcp__linejs__list_targets,mcp__linejs__query_target_messages,mcp__linejs__query_target_messages_by_time,mcp__linejs__query_agent_room_history,mcp__linejs__list_send_targets,mcp__linejs__send_to_target,mcp__linejs__list_schedules,mcp__linejs__create_schedule,mcp__linejs__update_schedule,mcp__linejs__delete_schedule');
   });
   it('grants read tools for chat_folder.read and adds Write/Edit (explicitly allowed) for chat_folder.write',()=>{
     const read=claudeArguments(request('claude',root,{tools:{...none,fileRead:true,level:'workspace_write'}}));

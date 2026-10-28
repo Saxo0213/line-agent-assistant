@@ -70,3 +70,17 @@ export function diagnosticFailure(operation: SafeDiagnostic['operation'], stage:
     recovery: outcome === 'unknown' ? 'inspect_outcome' : category === 'cancelled' ? 'none'
       : category === 'denied' || category === 'unavailable' ? 'check_configuration' : 'retry' };
 }
+
+/** Numeric timing of one slow live ingest batch. Counters and millisecond spans only; never message text or ids. */
+export const IngestLatencySchema = z.strictObject({
+  lineToMainMs: z.number().int().min(0).max(31_536_000_000),
+  mainIngestMs: z.number().int().min(0).max(31_536_000_000),
+  queueLength: z.number().int().min(0).max(100_000),
+  messageCount: z.number().int().min(0).max(100_000),
+  reemitCount: z.number().int().min(0).max(1_000_000),
+});
+export type IngestLatency = z.infer<typeof IngestLatencySchema>;
+export function parseIngestLatency(value: unknown): IngestLatency | undefined {
+  try { const result = IngestLatencySchema.safeParse(value); return result.success ? result.data : undefined; }
+  catch { return undefined; }
+}

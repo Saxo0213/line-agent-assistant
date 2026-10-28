@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
-import { AGENT_ROOM_KEY, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, AgentProviderSchema, type AgentAttachmentUpload, type AgentEvent, type AgentProvider, type AgentRunRequest, type WritableConversationKey } from '@line-agent/contracts';
+import { AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, isAgentScheduleQueueKey, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, AgentProviderSchema, type AgentAttachmentUpload, type AgentEvent, type AgentProvider, type AgentRunRequest, type WritableConversationKey } from '@line-agent/contracts';
 import { AgentAttachmentError, DEFAULT_ATTACHMENT_PROMPT, attachmentPromptSection, removeJobAttachments, resolveStoredAttachments, storeAttachments, validateUploads, type ResolvedAttachment } from './agent-attachments.js';
-import type { AgentRepository, AgentJobStatusProjection, AgentQueueKey } from '@line-agent/database';
+import type { AgentRepository, AgentJobStatusProjection, AgentQueueKey, SessionKey } from '@line-agent/database';
 import type { WorkspaceAuthority } from './workspace-authority.js';
 import { splitDeliveryText } from './delivery-service.js';
-import { withAgentRoomHistoryHint, withMcpSkill, withOutputChannel } from './mcp-skill.js';
+import { formatIdentityBlock, withAgentRoomHistoryHint, withIdentityBlock, withMcpSkill, withOutputChannel } from './mcp-skill.js';
+import { isScheduledRunRequestId } from './agent-schedule-service.js';
 import type { AgentJobEnvironment, AgentJobPlan } from './agent-job-environment.js';
+const SCHEDULE_CONTEXT_UNAVAILABLE = '（排程資料讀取失敗：請依上列卡片盡力完成，並在回覆說明缺少什麼。）';
+
 /** Main-owned source of per-job LINEJS MCP capabilities for built-in Agents. */
 export interface InternalMcpLauncher {
   /** Mints a per-job capability bound to the live listener, or null when the listener is unavailable. */
@@ -19,6 +22,8 @@ export interface InternalMcpLauncher {
   release(jobId: string): void;
   /** App-owned Skill guidance text, or null when unavailable. */
   skill(): Promise<string | null>;
+  /** Hidden run-time instructions of a schedule-sourced job (request id `schedule:...`), or null when unavailable. */
+  scheduleContext?(sourceRequestId: string): Promise<string | null>;
 }
 
 /** Stable identity of a provider session generation (key order independent). */
@@ -48,6 +53,13 @@ export interface UiSubmission {
   workspacePath?: string;
   /** Files chosen in the composer: bytes only, never paths. Written by Main before the job row exists. */
   attachments?: readonly AgentAttachmentUpload[];
+}
+
+/** A scheduled Agent run; it has no LINE account or chat and runs in a brand-new provider session. */
+export interface ScheduleSubmission {
+  provider: AgentProvider;
+  requestId: string;
+  prompt: string;
 }
 
 export type AgentReaction = 'NICE' | 'AMAZING' | 'FUN' | 'LOVE' | 'SAD' | 'OMG' | 'UNDO';
@@ -81,8 +93,11 @@ const LINE_MESSAGE_ID = /^(?:0|[1-9][0-9]*)$/;
 const HEARTBEAT_REACTIONS: readonly AgentReaction[] = ['NICE', 'AMAZING', 'FUN'];
 
 const identity = (key: AgentQueueKey) => JSON.stringify([key.accountId, key.chatType, key.chatId]);
-/** Concurrency slot: a LINE account's, or the shared Agent room's own (it belongs to no account). */
-const slotOf = (key: AgentQueueKey): string => key.accountId ?? 'agent-room\u0000';
+/** Concurrent scheduled runs. Raising it also needs the one-running index of migration 072 and the claim query changed. */
+export const SCHEDULE_MAX_CONCURRENT_RUNS = 1;
+/** Concurrency slot: a LINE account's, the shared Agent room's own, or the scheduled runs' own (neither belongs to an account). */
+const slotOf = (key: AgentQueueKey): string => key.accountId ?? (isAgentScheduleQueueKey(key) ? 'agent-schedule\u0000' : 'agent-room\u0000');
+const SCHEDULE_IDENTITY = identity(AGENT_SCHEDULE_QUEUE_KEY);
 const jobFence = (key: AgentQueueKey, jobId: string) => JSON.stringify([identity(key), jobId]);
 
 export class AgentService {
@@ -232,23 +247,29 @@ export class AgentService {
     this.pumps.set(id, pump);
   }
 
+  /** Running Agent room / LINE jobs. Scheduled runs have their own slot and never count against the global provider limit. */
+  private providerSlotsInUse(): number {
+    return this.activeJobs.size - (this.activeJobs.has(SCHEDULE_IDENTITY) ? 1 : 0);
+  }
+
   /** Reclaims bounded batches from the durable queue after startup/recovery. */
   recoverQueued(): Promise<void> {
     if (this.shuttingDown || !this.agents.listQueuedConversations) return Promise.resolve();
     return this.agents.listQueuedConversations(256).then((keys) => {
-      let available = this.maxConcurrentExecutions - this.activeJobs.size - this.reservedProviderSlots;
+      let available = this.maxConcurrentExecutions - this.providerSlotsInUse() - this.reservedProviderSlots;
       const selectedByAccount = new Map<string, number>();
       for (const key of keys) {
-        if (available <= 0) break;
+        const scheduled = isAgentScheduleQueueKey(key);
+        if (available <= 0 && !scheduled) continue;
         const id = identity(key);
         if (this.stopping.has(id) || this.pumps.has(id)) continue;
         const accountSlots = (this.activeAccountSlots.get(slotOf(key)) ?? 0)
           + (this.reservedAccountSlots.get(slotOf(key)) ?? 0)
           + (selectedByAccount.get(slotOf(key)) ?? 0);
-        if (accountSlots >= this.maxConcurrentPerAccount) continue;
+        if (accountSlots >= (scheduled ? SCHEDULE_MAX_CONCURRENT_RUNS : this.maxConcurrentPerAccount)) continue;
         this.kick(key);
         selectedByAccount.set(slotOf(key), (selectedByAccount.get(slotOf(key)) ?? 0) + 1);
-        available -= 1;
+        if (!scheduled) available -= 1;
       }
     });
   }
@@ -313,6 +334,17 @@ export class AgentService {
     return result;
   }
 
+  /**
+   * Queues one scheduled run on its own queue (idempotent on the request id). The job is not an Agent room job and never uses a
+   * session: the run starts a brand-new provider session.
+   */
+  async submitScheduled(input: ScheduleSubmission): Promise<{ disposition: 'inserted' | 'duplicate'; jobId: string }> {
+    const workspacePath = await this.workspace.current();
+    const result = await this.agents.enqueueScheduleJob({ provider: input.provider, requestId: input.requestId, prompt: input.prompt, workspacePath });
+    this.kick(AGENT_SCHEDULE_QUEUE_KEY);
+    return result;
+  }
+
   async stopChat(key: AgentQueueKey): Promise<void> {
     const id = identity(key);
     this.holdStarts(id);
@@ -369,12 +401,19 @@ export class AgentService {
     return this.agents.listJobEvents(key, jobId);
   }
 
+  /** Events of a scheduled run (never room events: the room's own lookup excludes schedule jobs). */
+  getScheduleJobEvents(jobId: string): Promise<AgentEvent[]> {
+    return this.agents.listJobEvents(AGENT_SCHEDULE_QUEUE_KEY, jobId);
+  }
+
   /** Agent room events: a room job, or an admin-direct LINE job while that chat is shared; anything else is empty. */
   getRoomJobEvents(jobId: string): Promise<AgentEvent[]> {
     return this.agents.listRoomJobEvents(jobId);
   }
 
   async resetChat(key: AgentQueueKey, commandMessageId?: string): Promise<void> {
+    // Scheduled runs have no session to reset; resetting their queue only stops what is queued or running.
+    if (isAgentScheduleQueueKey(key)) return this.stopChat(key);
     const id = identity(key);
     this.holdStarts(id);
     try {
@@ -398,7 +437,7 @@ export class AgentService {
       const otherIds = new Set<string>();
       const otherCancellations: Promise<void>[] = [];
       for (const projection of committed) {
-        const ownerId = identity(projection.sourceType === 'ui' ? AGENT_ROOM_KEY
+        const ownerId = identity(projection.sourceType === 'ui' ? AGENT_ROOM_KEY : projection.sourceType === 'schedule' ? AGENT_SCHEDULE_QUEUE_KEY
           : { accountId: projection.accountId, chatType: projection.chatType, chatId: projection.chatId });
         const otherActive = ownerId === id ? undefined : this.activeJobs.get(ownerId);
         if (otherActive === projection.jobId) {
@@ -445,33 +484,36 @@ export class AgentService {
 
   private async pump(key: AgentQueueKey): Promise<boolean> {
     const id = identity(key);
+    const scheduledQueue = isAgentScheduleQueueKey(key);
     let madeProgress = false;
     while (true) {
       if (this.shuttingDown || this.stopping.has(id)) return madeProgress;
       const accountSlots = (this.activeAccountSlots.get(slotOf(key)) ?? 0)
         + (this.reservedAccountSlots.get(slotOf(key)) ?? 0);
-      if (accountSlots >= this.maxConcurrentPerAccount) return madeProgress;
-      if (this.activeJobs.size + this.reservedProviderSlots >= this.maxConcurrentExecutions) {
+      if (accountSlots >= (scheduledQueue ? SCHEDULE_MAX_CONCURRENT_RUNS : this.maxConcurrentPerAccount)) return madeProgress;
+      // Scheduled runs use only their own slot: they neither wait for nor take a provider slot of the room or a LINE chat.
+      if (!scheduledQueue && this.providerSlotsInUse() + this.reservedProviderSlots >= this.maxConcurrentExecutions) {
         return madeProgress;
       }
-      this.reservedProviderSlots += 1;
+      const releaseProviderReservation = () => { if (!scheduledQueue) this.reservedProviderSlots -= 1; };
+      if (!scheduledQueue) this.reservedProviderSlots += 1;
       this.reservedAccountSlots.set(slotOf(key), (this.reservedAccountSlots.get(slotOf(key)) ?? 0) + 1);
       let job;
       try { job = await this.agents.claimNext(key); }
       catch (error) {
-        this.reservedProviderSlots -= 1;
+        releaseProviderReservation();
         this.releaseAccountReservation(slotOf(key));
         throw error;
       }
       if (!job) {
-        this.reservedProviderSlots -= 1;
+        releaseProviderReservation();
         this.releaseAccountReservation(slotOf(key));
         return madeProgress;
       }
       madeProgress = true;
       this.activeJobs.set(id, job.jobId);
       this.activeAccountSlots.set(slotOf(key), (this.activeAccountSlots.get(slotOf(key)) ?? 0) + 1);
-      this.reservedProviderSlots -= 1;
+      releaseProviderReservation();
       this.releaseAccountReservation(slotOf(key));
       if (this.shuttingDown) {
         try {
@@ -495,14 +537,14 @@ export class AgentService {
       let timeoutPersisted = false;
       const source: AgentRunRequest['source'] = job.sourceType === 'line'
         ? { type: 'line', accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, messageId: job.sourceMessageId! }
-        : { type: 'ui', requestId: job.sourceRequestId! };
+        : { type: job.sourceType, requestId: job.sourceRequestId! };
       try {
         let effectivePrompt = job.prompt;
         if (this.resolvePromptContext) {
           try {
             const enriched = await this.resolvePromptContext({
               jobId: job.jobId,
-              sourceType: job.sourceType,
+              sourceType: job.sourceType === 'line' ? 'line' : 'ui',
               prompt: job.prompt,
             });
             if (enriched) effectivePrompt = enriched.enrichedPrompt;
@@ -564,9 +606,12 @@ export class AgentService {
         // A room job reads and writes the session the claim fixed for it (the admin-direct session while shared, else its
         // own); every other job uses its chat's session. A room job stamped for another target (the binding changed since
         // it was queued) starts fresh and binds to the target's current generation.
-        const sessionKey = job.sessionKey ?? { ...key, provider: job.provider, sourceType: job.sourceType };
+        // A scheduled run has NO session: no lookup, no resume, no bind. Every run starts a brand-new provider session, and the
+        // approval key below is unique to the job so nothing carries over to or from the room or another run.
+        const scheduledRun = job.sourceType === 'schedule';
+        const sessionKey = scheduledRun ? undefined : job.sessionKey ?? { ...key, provider: job.provider, sourceType: job.sourceType } as SessionKey;
         const sessionGeneration = job.sessionGeneration ?? job.generation;
-        const resume = await this.agents.lookupSession({ ...sessionKey, workspacePath: plan.workspacePath });
+        const resume = sessionKey ? await this.agents.lookupSession({ ...sessionKey, workspacePath: plan.workspacePath }) : null;
         const request: AgentRunRequest = { jobId: job.jobId, provider: job.provider, source, prompt: effectivePrompt,
           workspacePath: plan.workspacePath, tools: plan.tools,
           ...(sessionGeneration === job.generation && resume?.generation === job.generation ? { resumeSessionId: resume.externalSessionId } : {}) };
@@ -583,15 +628,24 @@ export class AgentService {
             const skill = await this.mcpLauncher.skill();
             // Session allowlists are keyed by the provider session plus its generation, so `/new` starts empty.
             const approval = plan.tools.interactiveApproval
-              ? { sessionKey: approvalSessionKey(sessionKey, sessionGeneration), workspaceRoot: plan.workspacePath } : null;
+              ? { sessionKey: approvalSessionKey(sessionKey ?? { schedule: job.jobId }, sessionGeneration), workspaceRoot: plan.workspacePath } : null;
             launch = this.mcpLauncher.mint({ jobId: job.jobId, accountId: job.accountId, generation: job.generation, approval });
             if (launch) {
               // Add history guidance on every eligible run, including provider-resumed sessions. The hint sits after
               // the output-channel line, before the user's text, in the run request only (the stored job prompt is unchanged).
               // Eligible: an Agent room job, or an admin-direct LINE job while the room shares that chat (checked now).
               const historyEligible = job.sourceType === 'ui'
-                || await (async () => this.agents.sharesAgentRoomHistory({ sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId }))().catch(() => false);
-              const userText = historyEligible ? withAgentRoomHistoryHint(request.prompt) : request.prompt;
+                || job.sourceType !== 'schedule' && await (async () => this.agents.sharesAgentRoomHistory({ sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId }))().catch(() => false);
+              // 「身分」 block: who the Agent, the administrator and the current chat are. A failed lookup omits it; it never fails the job.
+              const identityBlock = await (async () => formatIdentityBlock(await this.agents.describeJobIdentity({
+                sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId })))().catch(() => null);
+              // Schedule-sourced jobs get their machine instructions here, in the run request only (the stored prompt stays the short card).
+              const scheduleContext = job.sourceType === 'schedule' || isScheduledRunRequestId(job.sourceRequestId)
+                ? await (async () => await this.mcpLauncher?.scheduleContext?.(job.sourceRequestId!))().catch(() => null) ?? SCHEDULE_CONTEXT_UNAVAILABLE : null;
+              const visible = scheduleContext ? `${request.prompt}
+
+${scheduleContext}` : request.prompt;
+              const userText = withIdentityBlock(historyEligible ? withAgentRoomHistoryHint(visible) : visible, identityBlock);
               runRequest = { ...request, prompt: withMcpSkill(skill, withOutputChannel(userText, job.sourceType)), mcp: launch };
             }
           } catch (error) { this.reportFailure('prepare', error, job.jobId); launch = null; }
@@ -622,7 +676,7 @@ export class AgentService {
           if ((await this.agents.getJob(job.jobId))?.status !== 'running') continue;
           await this.agents.appendEvent(job.jobId, event);
           if (event.type === 'started') {
-            if (event.workspacePath) await this.agents.bindSession({ ...sessionKey,
+            if (event.workspacePath && sessionKey) await this.agents.bindSession({ ...sessionKey,
               externalSessionId: event.externalSessionId, generation: sessionGeneration, workspacePath: event.workspacePath });
             await this.onEvent?.(job.jobId, event);
           } else if (event.type === 'completed') {

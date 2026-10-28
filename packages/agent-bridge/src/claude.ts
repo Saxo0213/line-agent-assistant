@@ -17,6 +17,8 @@ export function claudeBuiltInTools(policy:AgentRunRequest['tools']):string[] {
   if(level==='trust') return ['Read','Glob','Grep','Write','Edit','WebFetch','WebSearch'];
   return [...(policy.fileRead?['Read','Glob','Grep']:[]),...(policy.fileWrite?['Write','Edit']:[])];
 }
+/** `claude --autocompact <auto|tokens>` (documented in `claude --help`, 100k-1M); 400k is the operator-chosen window (CLI range 100k-1M). */
+export const CLAUDE_AUTO_COMPACT_TOKENS=400000;
 export function claudeArguments(request:AgentRunRequest) {
   const level=request.tools.level ?? (request.tools.localTools?'workspace_write':'read_only');
   const fullAccess=level==='full'&&request.tools.localTools;
@@ -26,7 +28,7 @@ export function claudeArguments(request:AgentRunRequest) {
   const disallowBash=!interactive||level==='read_only';
   const tools=claudeBuiltInTools(request.tools);
   if(askBash) tools.push('Bash');
-  return ['-p','--input-format','text','--output-format','stream-json','--verbose','--include-partial-messages',...(fullAccess?[]:['--restricted']),'--permission-mode',interactive?'default':'dontAsk',...(interactive?['--permission-prompt-tool',claudePermissionPromptToolName]:[]),'--strict-mcp-config',...[...(request.tools.workspaceRootDir?[request.tools.workspaceRootDir]:[]),...request.tools.linkedReadDirs].flatMap(directory=>['--add-dir',directory]),...(fullAccess?[]:['--tools',tools.join(',')]),...(askBash?['--settings',JSON.stringify({permissions:{ask:['Bash']}})]:[]),...(disallowBash?['--disallowedTools','Bash']:[]),...(request.mcp?['--mcp-config',claudeMcpConfig(request.mcp)]:[]),...(allowed.length?['--allowedTools',allowed.join(',')]:[]),...(request.resumeSessionId?['--resume',request.resumeSessionId]:[])];
+  return ['-p','--input-format','text','--output-format','stream-json','--verbose','--include-partial-messages','--autocompact',String(CLAUDE_AUTO_COMPACT_TOKENS),...(fullAccess?[]:['--restricted']),'--permission-mode',interactive?'default':'dontAsk',...(interactive?['--permission-prompt-tool',claudePermissionPromptToolName]:[]),'--strict-mcp-config',...[...(request.tools.workspaceRootDir?[request.tools.workspaceRootDir]:[]),...request.tools.linkedReadDirs].flatMap(directory=>['--add-dir',directory]),...(fullAccess?[]:['--tools',tools.join(',')]),...(askBash?['--settings',JSON.stringify({permissions:{ask:['Bash']}})]:[]),...(disallowBash?['--disallowedTools','Bash']:[]),...(request.mcp?['--mcp-config',claudeMcpConfig(request.mcp)]:[]),...(allowed.length?['--allowedTools',allowed.join(',')]:[]),...(request.resumeSessionId?['--resume',request.resumeSessionId]:[])];
 }
 export class ClaudeEvents {
   private terminal=false;

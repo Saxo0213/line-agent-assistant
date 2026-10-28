@@ -181,7 +181,8 @@ export function AgentRoom({ api, conversation, jobs, providers }: {
   const roomJobs = useMemo(() => {
     // Room jobs are the account-less ones; every account sees the same history.
     // LINE jobs appear only when Main stamped them `line_admin_direct` (the shared admin-direct chat); the renderer never decides sharing itself.
-    const matching = jobs.filter((job) => job.accountId === null || job.origin === 'line_admin_direct');
+    // Scheduled runs (origin 'schedule') are also account-less but never belong to the room.
+    const matching = jobs.filter((job) => job.origin !== 'schedule' && (job.accountId === null || job.origin === 'line_admin_direct'));
     const known = new Set(matching.map((job) => job.jobId));
     return [...matching, ...pendingJobs.filter((job) => !known.has(job.jobId))].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }, [jobs, pendingJobs, routeKey]);

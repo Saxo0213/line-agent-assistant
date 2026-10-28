@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, protocol, screen, session, shell, Tray, utilityProcess } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, protocol, screen, session, shell, Tray, utilityProcess } from 'electron';
 import { randomBytes } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { access, mkdir } from 'node:fs/promises';
@@ -49,6 +49,9 @@ import { parseLineMediaUrl } from '@line-agent/contracts';
 import { createLocaleSettings, getEffectiveLocale, setEffectiveLocaleReader } from './locale-settings.js';
 import { nativeDesktopText } from '../desktop-system-copy.js';
 import { createLocaleIpcAdapter } from './locale-ipc.js';
+import { createFileUpdateCheckStore, createUpdateCheckService, type UpdateCheckService } from './services/update-check-service.js';
+import { createUpdateCheckIpcAdapter } from './update-check-ipc.js';
+import { UPDATE_CHECK_CHANNEL, UPDATE_CHECK_STATE_CHANNEL } from '../update-check-protocol.js';
 
 if (process.platform === 'win32') app.setAppUserModelId(APP_USER_MODEL_ID);
 
@@ -118,6 +121,7 @@ async function stopEmbeddedServer(): Promise<void> {
 
 let window: BrowserWindow | null = null;
 let localeSettings: ReturnType<typeof createLocaleSettings> | undefined;
+let updateCheck: UpdateCheckService | undefined;
 async function initializeLocaleSettings(): Promise<void> {
   localeSettings = createLocaleSettings({ filePath: path.join(app.getPath('userData'), 'app-settings.json'), preferredLanguages: app.getPreferredSystemLanguages() });
   setEffectiveLocaleReader(() => localeSettings?.snapshot().effectiveLocale ?? 'en');
@@ -226,6 +230,8 @@ async function initializeServices(): Promise<void> {
   startupCleanup.add(() => bridge.shutdown());
   const workers = createUtilityWorkerGateway({
     onDiagnostic: (diagnostic, accountId) => audit.failure(diagnostic, { ...(accountId ? { accountId } : {}) }),
+    onIngestLatency: (report) => audit.observed(report.kind === 'main' ? 'line_ingest_slow_main' : 'line_ingest_slow_upstream',
+      { initiator: 'worker', accountId: report.accountId, workerInstanceId: report.workerInstanceId, latency: report.latency }),
     spawn(binding) {
       const child = utilityProcess.fork(workerEntry, [], {
         env: { SYSTEMROOT: process.env.SYSTEMROOT, WINDIR: process.env.WINDIR, TEMP: process.env.TEMP, TMP: process.env.TMP,
@@ -396,6 +402,14 @@ async function createWindow(setupOnly = false) {
   ipcMain.handle('line-agent:locale', async (event, payload: unknown) => {
     return localeRequest({ senderId: event.sender.id, url: event.senderFrame?.url ?? '' }, payload);
   });
+  updateCheck ??= createUpdateCheckService({ currentVersion: app.getVersion(), fetch: (url, init) => net.fetch(url, init),
+    store: createFileUpdateCheckStore(path.join(app.getPath('userData'), 'update-check.json')),
+    openExternal: (url) => shell.openExternal(url),
+    onChange: (state) => { if (window && !window.isDestroyed()) window.webContents.send(UPDATE_CHECK_STATE_CHANNEL, state); } });
+  const updateCheckRequest = createUpdateCheckIpcAdapter({ webContentsId: view.id, rendererUrl, service: updateCheck });
+  ipcMain.removeHandler(UPDATE_CHECK_CHANNEL);
+  ipcMain.handle(UPDATE_CHECK_CHANNEL, (event, payload: unknown) => updateCheckRequest({ senderId: event.sender.id, url: event.senderFrame?.url ?? '' }, payload));
+  if (!setupOnly) void updateCheck.start().catch(() => undefined);
   ipcMain.removeHandler('line-agent:request'); ipcMain.removeHandler('line-agent:read'); ipcMain.removeHandler('line-agent:setup');
   ipcMain.handle('line-agent:request', (event, payload: unknown) => request({ senderId: event.sender.id, url: event.senderFrame?.url ?? '' }, payload));
   ipcMain.handle('line-agent:read', (event, payload: unknown) => read({ senderId: event.sender.id, url: event.senderFrame?.url ?? '' }, payload));

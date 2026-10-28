@@ -184,6 +184,29 @@ database('send tools end to end (real database, fake worker)', () => {
   const auditCount = async (toolName: string, action: string) => Number((await pool.query(
     'SELECT count(*)::int AS n FROM mcp_agent_audit WHERE tool_name = $1 AND action = $2', [toolName, action])).rows[0].n);
 
+  it('marks the administrator chat with role primary_admin in both list tools and answers admin aliases first', async () => {
+    await pool.query('UPDATE line_accounts SET own_mid = $2 WHERE account_id = $1', [accountId, `u-own-${accountId}`]);
+    const h = harness();
+    try {
+      const { call } = h.open(await uiJob());
+      const named = (await call('list_send_targets', { query: 'Admin' })).result?.structuredContent?.targets as Array<{ chatId: string; role?: string }>;
+      expect(named).toEqual([expect.objectContaining({ chatId: 'chat-admin', role: 'primary_admin' })]);
+      const alice = (await call('list_send_targets', { query: 'Alice' })).result?.structuredContent?.targets as Array<{ chatId: string; role?: string }>;
+      expect(alice.map((target) => target.role)).toEqual([undefined]);
+      for (const alias of ['管理員', '主要管理者', '管理者', 'admin', 'Administrator', 'me', '我']) {
+        const rows = (await call('list_send_targets', { query: alias })).result?.structuredContent?.targets as Array<{ chatId: string; role?: string; no: number }>;
+        expect(rows[0], alias).toMatchObject({ chatId: 'chat-admin', role: 'primary_admin', no: 1 });
+      }
+      const listed = (await call('list_targets', {})).result?.structuredContent?.targets as Array<{ chatId: string; chatType: string; role?: string }>;
+      expect(listed.filter((target) => target.role).map((target) => target.chatId)).toEqual(['chat-admin']);
+      expect(listed.find((target) => target.chatId === 'u-alice')?.role).toBeUndefined();
+    } finally {
+      await h.close();
+      await pool.query("UPDATE agent_jobs SET status = 'cancelled' WHERE source_type = 'ui' AND status IN ('queued', 'running')");
+      await pool.query('UPDATE line_accounts SET own_mid = NULL WHERE account_id = $1', [accountId]);
+    }
+  });
+
   it('lists the send tools for the desktop operator and the Primary Admin job, and finds targets without communities', async () => {
     const h = harness();
     try {

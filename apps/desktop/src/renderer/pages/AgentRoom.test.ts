@@ -394,6 +394,17 @@ describe('AgentRoom LINE-style bubbles and admin LINE direct turns', () => {
     expect(api.getAgentRoomJobEvents).not.toHaveBeenCalledWith('job-foreign');
   });
 
+  it('never shows a scheduled run in the Agent room, even though it is account-less', async () => {
+    const scheduleJob = { jobId: 'job-schedule', accountId: null, chatType: null, chatId: null, origin: 'schedule' as const, provider: 'claude' as const,
+      prompt: '[排程] 早報\n任務：自訂', status: 'completed' as const, createdAt: '2026-10-21T09:00:00.000Z' };
+    const api = apiFor({ 'job-room': [{ type: 'completed', finalText: '室內回覆' }], 'job-schedule': [{ type: 'completed', finalText: '排程回覆' }] });
+    render(React.createElement(AgentRoom, { api, conversation, jobs: [roomJob, scheduleJob], providers }));
+    expect(await screen.findByText('室內回覆')).toBeTruthy();
+    expect(screen.queryByText('排程回覆')).toBeNull();
+    expect(screen.queryByText(/\[排程\]/)).toBeNull();
+    expect(api.getAgentRoomJobEvents).not.toHaveBeenCalledWith('job-schedule');
+  });
+
   it('uses the LINE own/incoming bubble classes, provider name row, time and a day separator', async () => {
     const api = apiFor({ 'job-room': [{ type: 'completed', finalText: '**粗體** 回覆' }] });
     render(React.createElement(AgentRoom, { api, conversation, jobs: [lineJob, roomJob], providers }));

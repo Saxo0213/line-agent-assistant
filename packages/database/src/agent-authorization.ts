@@ -41,3 +41,23 @@ export async function lockAndCheckAgentAuthorization(
   );
   return room.rowCount === 1;
 }
+
+/**
+ * Room-level half of the predicate above, for a free-mode job: the room's stored Agent grant is still the active one.
+ * A free-mode job has no per-sender friend grant; the room grant alone authorizes it.
+ */
+export async function lockAndCheckRoomAgentGrant(
+  client: PoolClient, accountId: string, chatType: ConversationKey['chatType'], chatId: string,
+  grant: { grantId: string; version: number },
+): Promise<boolean> {
+  if (chatType === 'direct') return false;
+  const room = await client.query(
+    `SELECT 1 FROM room_agent_policies p
+     JOIN room_agent_grants g ON g.account_id = p.account_id AND g.chat_type = p.chat_type AND g.chat_id = p.chat_id
+     WHERE p.account_id = $1 AND p.chat_type = $2 AND p.chat_id = $3 AND p.state = 'ENABLED'
+       AND p.authority_version = $4 AND g.grant_id = $5 AND g.version = $4
+       AND g.capability = 'AGENT_USE_ROOM' AND g.state = 'ACTIVE' FOR SHARE OF p, g`,
+    [accountId, chatType, chatId, grant.version, grant.grantId],
+  );
+  return room.rowCount === 1;
+}

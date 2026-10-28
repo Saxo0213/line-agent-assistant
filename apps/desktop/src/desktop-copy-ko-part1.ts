@@ -20,6 +20,7 @@ export const KOREAN_DESKTOP_COPY_PART1 = {
   assistant: '어시스턴트',
   search: '검색',
   jobs: '작업',
+  schedules: '일정',
   settings: '설정',
   agentRoom: 'Agent 대화방',
   unableToLoadSystemStatusCheckSettingsAndReconnect: '시스템 상태를 불러올 수 없습니다. 설정을 확인하고 다시 연결하세요.',

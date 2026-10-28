@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpMessageRecord, type McpTargetSummary, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
+import { InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpMessageRecord, type McpTargetSummary, type MessageSearchScope, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { parseLineStickerDescriptor, type StickerDescriptor } from './sticker-descriptor.js';
 import { CONVERSATION_TITLE_SQL, MEMBER_NAME_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nameFragments, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, upsertLineContacts, type LineContactInput } from './name-resolution.js';
@@ -7,6 +7,8 @@ import { NativeSourceEnvelopeSchema, type NativeSourceEnvelope } from '@line-age
 import { bridgeLiveMessage, liveChatEventMids, postNotificationSubtypeFromRaw } from './content-bridge/index.js';
 import { loadChatEventNames } from './content-bridge/chat-event-names.js';
 import { nativeReactions, type MessageReaction } from './native-reactions.js';
+import { ensureLineageSessionRow, expandAgentLineage, mergeLineageConversations, resolveAgentLineage } from './agent-lineage.js';
+import { promptWithContactCards } from './agent-contact-cards.js';
 import { stageSystemLoginObservation, type ExternalObservation } from './external-monitor-repository.js';
 
 export type ReadPositionChange = Readonly<{ key: ConversationKey; messageId: string }>;
@@ -66,6 +68,8 @@ export interface IngestResult {
 export interface MessageSearchQuery {
   key?: ConversationKey;
   accountId?: string;
+  /** Takes precedence over accountId; 'agent' spans every account in the Agent lineage. */
+  scope?: MessageSearchScope;
   senderId?: string;
   text?: string;
   from?: string;
@@ -86,6 +90,8 @@ export interface MessageSearchResult {
   conversationTitle?: string | null;
   text: string | null;
   occurredAt: string;
+  /** 'agent' when the source account belongs to the Agent lineage (current or former). */
+  lineage?: 'agent' | null;
 }
 
 export type MessageListResult = MessageSearchResult & {
@@ -587,10 +593,9 @@ export class MessageRepository {
         let job = existing.rows[0];
         if (!job) {
           const provider = decision.eligible ? decision.provider : failure!.provider;
-          const prompt = decision.eligible ? decision.prompt : failure!.prompt;
+          const prompt = decision.eligible ? await promptWithContactCards(client, envelope, decision.prompt, batch.envelopes.slice(0, index)) : failure!.prompt;
           const workspacePath = decision.eligible ? decision.workspacePath : failure!.workspacePath ?? '';
-          await client.query(`INSERT INTO agent_sessions(account_id,chat_type,chat_id,provider,source_type) VALUES($1,$2,$3,$4,'line')
-            ON CONFLICT DO NOTHING`, [batch.accountId,envelope.chatType,envelope.chatId,provider]);
+          await ensureLineageSessionRow(client, { accountId: batch.accountId, chatType: envelope.chatType, chatId: envelope.chatId, provider });
           const session = await client.query<{ generation: number }>(`SELECT generation FROM agent_sessions WHERE account_id=$1
             AND chat_type=$2 AND chat_id=$3 AND provider=$4 AND source_type='line' FOR UPDATE`,
             [batch.accountId,envelope.chatType,envelope.chatId,provider]);
@@ -959,11 +964,7 @@ export class MessageRepository {
             [envelope.accountId],
           );
           if (authority.rows[0]) {
-            await client.query(
-            `INSERT INTO agent_sessions (account_id, chat_type, chat_id, provider, source_type) VALUES ($1, $2, $3, $4, 'line')
-             ON CONFLICT (account_id, chat_type, chat_id, provider, source_type) DO NOTHING`,
-            [envelope.accountId, envelope.chatType, envelope.chatId, routingDecision.provider],
-            );
+            await ensureLineageSessionRow(client, { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId, provider: routingDecision.provider });
             const session = await client.query<{ generation: number }>(
             "SELECT generation FROM agent_sessions WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 AND provider = $4 AND source_type = 'line' FOR UPDATE",
             [envelope.accountId, envelope.chatType, envelope.chatId, routingDecision.provider],
@@ -973,7 +974,7 @@ export class MessageRepository {
             `INSERT INTO agent_jobs (job_id, account_id, chat_type, chat_id, provider, source_type, source_message_id, prompt, workspace_path, generation, creation_epoch)
              VALUES ($1, $2, $3, $4, $5, 'line', $6, $7, $8, $9, $10)
              RETURNING status,((extract(epoch FROM updated_at) * 1000000)::numeric(20,0))::text AS revision`,
-            [jobId, envelope.accountId, envelope.chatType, envelope.chatId, routingDecision.provider, envelope.messageId, routingDecision.prompt, routingDecision.workspacePath, session.rows[0]?.generation, control.rows[0]!.control_epoch],
+            [jobId, envelope.accountId, envelope.chatType, envelope.chatId, routingDecision.provider, envelope.messageId, await promptWithContactCards(client, envelope, routingDecision.prompt), routingDecision.workspacePath, session.rows[0]?.generation, control.rows[0]!.control_epoch],
             );
             const committedJob = insertedJob.rows[0];
             if (committedJob) jobStatus = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId,
@@ -1006,6 +1007,13 @@ export class MessageRepository {
   }
 
   async searchMessages(query: MessageSearchQuery): Promise<MessageSearchResult[]> {
+    const lineage = await resolveAgentLineage(this.pool);
+    const lineageIds = new Set(lineage.accountIds);
+    let accountIds: string[] | null = null;
+    if (query.scope?.kind === 'agent') accountIds = lineage.accountIds;
+    else if (query.scope?.kind === 'account') accountIds = [query.scope.accountId];
+    else if (!query.scope && (query.key?.accountId ?? query.accountId)) accountIds = [(query.key?.accountId ?? query.accountId)!];
+    if (accountIds && accountIds.length === 0) return [];
     const result = await this.pool.query<{
       account_id: string; chat_type: ConversationKey['chatType']; chat_id: string; message_id: string; sender_id: string;
       sender_name: string | null; is_own: boolean; conversation_title: string | null; text_content: string | null; occurred_at: Date;
@@ -1022,7 +1030,7 @@ export class MessageRepository {
        ${SENDER_CONTACT_JOIN}
        ${PEER_CONTACT_JOIN}
        WHERE (m.kind <> 'event' OR m.content IS NOT NULL)
-         AND ($1::text IS NULL OR m.account_id = $1)
+         AND ($1::text[] IS NULL OR m.account_id = ANY($1::text[]))
          AND ($2::text IS NULL OR m.chat_type = $2)
          AND ($3::text IS NULL OR m.chat_id = $3)
          AND ($4::text IS NULL OR m.sender_id = $4)
@@ -1043,13 +1051,14 @@ export class MessageRepository {
            SELECT 1 FROM attachments a WHERE a.account_id = m.account_id AND a.chat_type = m.chat_type
              AND a.chat_id = m.chat_id AND a.message_id = m.message_id AND a.kind = $9))
        ORDER BY m.occurred_at DESC, m.message_id DESC LIMIT $10`,
-      [query.key?.accountId ?? query.accountId ?? null, query.key?.chatType ?? null, query.key?.chatId ?? null,
+      [accountIds, query.key?.chatType ?? null, query.key?.chatId ?? null,
         query.senderId ?? null, query.text ?? null, query.from ?? null, query.to ?? null,
         query.hasAttachment ?? null, query.attachmentKind ?? null, query.limit],
     );
     return result.rows.map((row) => ({ accountId: row.account_id, chatType: row.chat_type, chatId: row.chat_id,
       messageId: row.message_id, senderId: row.sender_id, senderName: row.sender_name, isOwn: row.is_own,
-      conversationTitle: row.conversation_title, text: row.text_content, occurredAt: row.occurred_at.toISOString() }));
+      conversationTitle: row.conversation_title, text: row.text_content, occurredAt: row.occurred_at.toISOString(),
+      lineage: lineageIds.has(row.account_id) ? 'agent' as const : null }));
   }
 
   async listMessages(key: ConversationKey, before: string | null, limit: number, exactMessageId?: string): Promise<{ messages: TimelineMessageRecord[]; nextCursor: string | null }> {
@@ -1648,10 +1657,15 @@ export class MessageRepository {
       limit?: number;
       /** Non-admin principals: member and conversation names ignore the owner's local nicknames. */
       ownLineNamesOnly?: boolean;
+      /** Write-side callers read only the listed accounts and skip the Agent lineage expansion. */
+      currentAccountOnly?: boolean;
     },
     queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'> = this.pool,
   ): Promise<McpTargetSummary[]> {
     if (input.accountIds.length === 0) return [];
+    const lineage = input.currentAccountOnly
+      ? { accountIds: [...input.accountIds], order: [] as string[], scopeAccountIds: input.conversationScope ? [input.conversationScope.accountId] : null }
+      : await expandAgentLineage(queryable, input.accountIds, input.conversationScope?.accountId);
     const names = nameFragments(input.ownLineNamesOnly === true);
     const limit = Math.max(1, Math.min(200, Math.trunc(input.limit ?? 50)));
     const search = input.query?.trim() ? input.query.trim() : null;
@@ -1690,9 +1704,12 @@ export class MessageRepository {
         AND member_contact.mid = cm.member_id
        WHERE c.account_id = ANY($1::text[])
          AND c.chat_id <> '__local_agent_room__'
-         AND ($5::text IS NULL OR (c.account_id = $5 AND c.chat_type = $6 AND c.chat_id = $7)
+         AND ($5::text[] IS NULL OR (c.account_id = ANY($5::text[]) AND c.chat_type = $6 AND c.chat_id = $7)
            OR EXISTS (SELECT 1 FROM jsonb_to_recordset($8::jsonb) AS x(chat_type text, chat_id text)
-                      WHERE c.account_id = $5 AND x.chat_type = c.chat_type AND x.chat_id = c.chat_id))
+                      WHERE c.account_id = ANY($5::text[]) AND x.chat_type = c.chat_type AND x.chat_id = c.chat_id))
+         AND (cardinality($10::text[]) = 0 OR NOT EXISTS (
+           SELECT 1 FROM conversations c2 WHERE c2.account_id = ANY($1::text[]) AND c2.chat_type = c.chat_type AND c2.chat_id = c.chat_id
+             AND array_position($10::text[], c2.account_id) < array_position($10::text[], c.account_id)))
          AND ($2::text IS NULL OR c.chat_type = $2)
          AND ($9::text[] IS NULL OR c.chat_type = ANY($9::text[]))
          AND (
@@ -1723,22 +1740,23 @@ export class MessageRepository {
        ORDER BY c.updated_at DESC, c.account_id ASC, c.chat_type ASC, c.chat_id ASC
        LIMIT $4`,
       [
-        input.accountIds, input.chatType ?? null, search, limit,
-        input.conversationScope?.accountId ?? null,
+        lineage.accountIds, input.chatType ?? null, search, limit,
+        lineage.scopeAccountIds,
         input.conversationScope?.chatType ?? null,
         input.conversationScope?.chatId ?? null,
         JSON.stringify((input.extraConversationScopes ?? []).map((scope) => ({ chat_type: scope.chatType, chat_id: scope.chatId }))),
         input.chatTypes ? [...input.chatTypes] : null,
+        lineage.order,
       ],
     );
-    return result.rows.map((row) => ({
+    return mergeLineageConversations(result.rows.map((row) => ({
       accountId: row.account_id,
       accountDisplayName: row.account_display_name,
       chatType: row.chat_type,
       chatId: row.chat_id,
       conversationTitle: row.conversation_title,
       members: row.members ?? [],
-    }));
+    })), lineage.order);
   }
 
   /** The single Agent account that can write LINE (product_role AGENT, system login), or null. */
@@ -1755,6 +1773,7 @@ export class MessageRepository {
   ): Promise<SendTargetRecord[]> {
     const rows = await this.listConversationTargets({
       accountIds: [input.accountId],
+      currentAccountOnly: true,
       chatTypes: SEND_CHAT_TYPES,
       ...(input.query?.trim() ? { query: input.query } : {}),
       limit: input.limit ?? 20,
@@ -1852,14 +1871,42 @@ export class MessageRepository {
       from?: string;
       to?: string;
       limit?: number;
+      /** Sort direction on (occurred_at, message_id); default newest first. */
+      order?: 'asc' | 'desc';
+      /** Keyset position: only rows strictly after this (occurredAt microsecond ISO, messageId) in `order` are returned. */
+      after?: { occurredAt: string; messageId: string };
       /** Non-admin principals: sender and conversation names ignore the owner's local nicknames. */
       ownLineNamesOnly?: boolean;
     },
     queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'> = this.pool,
   ): Promise<McpMessageRecord[]> {
-    if (input.accountIds.length === 0) return [];
-    const names = nameFragments(input.ownLineNamesOnly === true);
+    return (await this.queryTargetMessagePage(input, queryable)).messages;
+  }
+
+  /** One keyset page: `messages` holds at most `limit` rows; `lastKey` is the cursor position when `hasMore`. */
+  async queryTargetMessagePage(
+    input: Parameters<MessageRepository['queryTargetMessages']>[0],
+    queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'> = this.pool,
+  ): Promise<{ messages: McpMessageRecord[]; hasMore: boolean; lastKey: { occurredAt: string; messageId: string } | null }> {
     const limit = Math.max(1, Math.min(200, Math.trunc(input.limit ?? 50)));
+    const rows = await this.queryTargetMessageRows({ ...input, limit: limit + 1 }, queryable);
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page[page.length - 1];
+    return { messages: page.map((row) => row.record), hasMore, lastKey: hasMore && last ? last.key : null };
+  }
+
+  private async queryTargetMessageRows(
+    input: Parameters<MessageRepository['queryTargetMessages']>[0],
+    queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'>,
+  ): Promise<Array<{ record: McpMessageRecord; key: { occurredAt: string; messageId: string } }>> {
+    if (input.accountIds.length === 0) return [];
+    const lineage = await expandAgentLineage(queryable, input.accountIds, input.conversationScope?.accountId);
+    const names = nameFragments(input.ownLineNamesOnly === true);
+    const limit = Math.max(1, Math.min(201, Math.trunc(input.limit ?? 50)));
+    const ascending = input.order === 'asc';
+    const afterTime = input.after?.occurredAt ?? null;
+    const afterId = input.after?.messageId ?? null;
     const target = input.target?.trim() ? input.target.trim() : null;
     const chatType = input.chatType ?? null;
     const chatId = input.chatId?.trim() ? input.chatId.trim() : null;
@@ -1884,6 +1931,7 @@ export class MessageRepository {
       text_content: string | null;
       recalled: boolean;
       occurred_at: Date;
+      occurred_key: string;
       attachments: McpMessageRecord['attachments'];
     }>(
       `SELECT m.account_id,
@@ -1902,6 +1950,7 @@ export class MessageRepository {
               COALESCE(${AGENT_MASKED_SQL}, false) AS recalled,
               ${AGENT_VISIBLE_TEXT_SQL} AS text_content,
               m.occurred_at,
+              to_char(m.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS occurred_key,
               CASE WHEN ${AGENT_MASKED_SQL} THEN '[]'::jsonb ELSE COALESCE(
                 jsonb_agg(
                   jsonb_build_object(
@@ -1936,9 +1985,13 @@ export class MessageRepository {
        WHERE m.account_id = ANY($1::text[])
          AND (m.kind <> 'event' OR m.content IS NOT NULL)
          AND m.chat_id <> '__local_agent_room__'
-         AND ($12::text IS NULL OR (m.account_id = $12 AND m.chat_type = $13 AND m.chat_id = $14)
+         AND ($12::text[] IS NULL OR (m.account_id = ANY($12::text[]) AND m.chat_type = $13 AND m.chat_id = $14)
            OR EXISTS (SELECT 1 FROM jsonb_to_recordset($15::jsonb) AS x(chat_type text, chat_id text)
-                      WHERE m.account_id = $12 AND x.chat_type = m.chat_type AND x.chat_id = m.chat_id))
+                      WHERE m.account_id = ANY($12::text[]) AND x.chat_type = m.chat_type AND x.chat_id = m.chat_id))
+         AND (cardinality($16::text[]) = 0 OR NOT EXISTS (
+           SELECT 1 FROM messages m2 WHERE m2.account_id = ANY($1::text[]) AND m2.chat_type = m.chat_type AND m2.chat_id = m.chat_id
+             AND m2.message_id = m.message_id
+             AND array_position($16::text[], m2.account_id) < array_position($16::text[], m.account_id)))
          AND ($2::text IS NULL OR m.chat_type = $2)
          AND ($3::text IS NULL OR m.chat_id = $3)
          AND ($4::text IS NULL OR position(lower($4) in lower(coalesce(${names.title}, ''))) > 0)
@@ -1978,12 +2031,13 @@ export class MessageRepository {
          AND ($8::text IS NULL OR position(lower($8) in lower(coalesce(${AGENT_VISIBLE_TEXT_SQL}, ''))) > 0)
          AND ($9::timestamptz IS NULL OR m.occurred_at >= $9::timestamptz)
          AND ($10::timestamptz IS NULL OR m.occurred_at <= $10::timestamptz)
+         AND ($17::timestamptz IS NULL OR (m.occurred_at, m.message_id) ${ascending ? '>' : '<'} ($17::timestamptz, $18::text))
        GROUP BY m.account_id, m.chat_type, m.chat_id, m.message_id, m.sender_id, m.kind, m.content, m.text_content, m.occurred_at, m.raw, la.own_mid,
                 ${NAME_RESOLUTION_GROUP_COLUMNS}
-       ORDER BY m.occurred_at DESC, m.message_id DESC
+       ORDER BY m.occurred_at ${ascending ? 'ASC' : 'DESC'}, m.message_id ${ascending ? 'ASC' : 'DESC'}
        LIMIT $11`,
       [
-        input.accountIds,
+        lineage.accountIds,
         chatType,
         chatId,
         conversationTitle,
@@ -1994,14 +2048,17 @@ export class MessageRepository {
         from,
         to,
         limit,
-        input.conversationScope?.accountId ?? null,
+        lineage.scopeAccountIds,
         input.conversationScope?.chatType ?? null,
         input.conversationScope?.chatId ?? null,
         JSON.stringify((input.extraConversationScopes ?? []).map((scope) => ({ chat_type: scope.chatType, chat_id: scope.chatId }))),
+        lineage.order,
+        afterTime,
+        afterId,
       ],
     );
 
-    return result.rows.map((row) => ({
+    return result.rows.map((row) => ({ key: { occurredAt: row.occurred_key, messageId: row.message_id }, record: {
       accountId: row.account_id,
       accountDisplayName: row.account_display_name,
       chatType: row.chat_type,
@@ -2023,6 +2080,6 @@ export class MessageRepository {
         sizeBytes: att.sizeBytes === null || att.sizeBytes === undefined ? null : Number(att.sizeBytes),
         status: att.status,
       })),
-    }));
+    } }));
   }
 }

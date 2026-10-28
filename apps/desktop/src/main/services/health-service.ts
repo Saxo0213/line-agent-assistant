@@ -1,4 +1,4 @@
-import { CONVERSATION_PICTURE_SQL, CONVERSATION_TITLE_SQL, PEER_CONTACT_JOIN, sharedAdminChatSql } from '@line-agent/database';
+import { CONVERSATION_PICTURE_SQL, CONVERSATION_TITLE_SQL, PEER_CONTACT_JOIN, resolveAgentLineage, sharedAdminChatSql } from '@line-agent/database';
 import type { Pool } from 'pg';
 import { boundedSticonRawSql, previewWithSticons, projectSticons } from '../sticon-projection.js';
 import { isLocalOnlyConversation, type AgentJobSearchQuery, type AgentJobSummary, type AgentProvider, type AppSnapshot, type ComponentHealth, type ControlSnapshot,
@@ -210,6 +210,7 @@ export class HealthService {
   }
 
   async snapshot(): Promise<AppSnapshot> {
+    const lineage = await resolveAgentLineage(this.pool);
     const [control, accounts, conversations, jobs, count, defaultAgentSetting, workerHealth] = await Promise.all([
       this.pool.query<{ control_epoch: string; active_account_id: string | null }>(
         `SELECT c.control_epoch, a.account_id AS active_account_id FROM account_control c
@@ -243,21 +244,25 @@ export class HealthService {
       // While the shared admin-direct chat exists, that chat's LINE jobs are a third group (own limit, no overlap with the
       // generic LINE group) so the room can show them; Main stamps `origin`, the renderer never decides sharing itself.
       this.pool.query<{ job_id: string; account_id: string | null; chat_type: 'direct' | 'group' | 'room' | null; chat_id: string | null; provider: AgentProvider; prompt: string; status: AppSnapshot['jobs'][number]['status']; created_at: Date;
-        attachments?: Array<{ name: string; size: number; kind: 'image' | 'file' }> | null; origin: 'agent_room' | 'line_admin_direct' | null; reply_preview: string | null }>(
+        attachments?: Array<{ name: string; size: number; kind: 'image' | 'file' }> | null; origin: 'agent_room' | 'line_admin_direct' | 'schedule' | null; reply_preview: string | null }>(
         `WITH shared AS (${sharedAdminChatSql} LIMIT 1)
          SELECT recent.job_id, recent.account_id, recent.chat_type, recent.chat_id, recent.provider, recent.prompt, recent.status, recent.created_at, recent.attachments, recent.origin,
            CASE WHEN char_length(output.final_text) > 240 THEN left(output.final_text, 239) || '…' ELSE output.final_text END AS reply_preview
          FROM (
            (SELECT j.*, CASE WHEN j.account_id IS NULL THEN 'agent_room' END AS origin FROM agent_jobs j WHERE j.source_type = 'ui' ORDER BY j.created_at DESC, j.job_id DESC LIMIT 100)
            UNION ALL
+           -- Scheduled runs: listed by the Jobs page (origin 'schedule'), never by the Agent room.
+           (SELECT j.*, 'schedule' AS origin FROM agent_jobs j WHERE j.source_type = 'schedule' ORDER BY j.created_at DESC, j.job_id DESC LIMIT 100)
+           UNION ALL
            (SELECT j.*, NULL::text AS origin FROM agent_jobs j WHERE j.source_type = 'line'
-              AND NOT EXISTS (SELECT 1 FROM shared s WHERE s.account_id = j.account_id AND j.chat_type = 'direct' AND j.chat_id = s.admin_mid)
+              AND NOT EXISTS (SELECT 1 FROM shared s WHERE j.account_id = ANY($1::text[]) AND j.chat_type = 'direct' AND j.chat_id = s.admin_mid)
               ORDER BY j.created_at DESC, j.job_id DESC LIMIT 100)
            UNION ALL
-           (SELECT j.*, 'line_admin_direct' AS origin FROM agent_jobs j JOIN shared s ON s.account_id = j.account_id AND j.chat_type = 'direct' AND j.chat_id = s.admin_mid
+           (SELECT j.*, 'line_admin_direct' AS origin FROM agent_jobs j JOIN shared s ON j.account_id = ANY($1::text[]) AND j.chat_type = 'direct' AND j.chat_id = s.admin_mid
               WHERE j.source_type = 'line' ORDER BY j.created_at DESC, j.job_id DESC LIMIT 100)
          ) recent LEFT JOIN agent_outputs output ON output.job_id = recent.job_id
          ORDER BY recent.created_at DESC, recent.job_id DESC`,
+        [[...new Set(lineage.accountIds)]],
       ),
       this.pool.query<{ count: string }>("SELECT count(*) FROM agent_jobs WHERE status = 'queued'"),
       this.pool.query<{ provider: string }>("SELECT value #>> '{}' AS provider FROM app_settings WHERE key = 'default_provider'"),
@@ -273,7 +278,8 @@ export class HealthService {
       queueDepth: Number(count.rows[0]?.count ?? 0),
       accounts: accounts.rows.map((row) => ({ accountId: row.account_id, displayName: row.display_name ?? row.account_id,
         status: row.status, lastSyncedAt: row.last_synced_at?.toISOString() ?? null, mode: row.mode, hasPrimaryAdmin: row.has_primary_admin, autoLoginOnStartup: row.auto_login_on_startup,
-        productRole: row.product_role, avatarAvailable: Boolean(row.picture_path) })),
+        productRole: row.product_role, avatarAvailable: Boolean(row.picture_path),
+        ...(lineage.accountIds.includes(row.account_id) ? { agentLineage: row.account_id === lineage.currentAccountId ? 'current' as const : 'former' as const } : {}) })),
       conversations: conversations.rows.map(mapConversation),
       jobs: jobs.rows.map((row) => ({ jobId: row.job_id, accountId: row.account_id, chatType: row.chat_type,
         chatId: row.chat_id, provider: row.provider, prompt: row.prompt, status: row.status, createdAt: row.created_at.toISOString(),
@@ -318,13 +324,14 @@ export class HealthService {
     const limit = bind(query.limit + 1);
     const result = await this.pool.query<{ job_id: string; account_id: string | null; chat_type: 'direct' | 'group' | 'room' | null;
       chat_id: string | null; provider: AgentProvider; prompt: string; status: AgentJobSummary['status']; created_at: Date;
-      reply_preview: string | null; origin: 'agent_room' | 'line_admin_direct' | null; cursor_created_at: string;
+      reply_preview: string | null; origin: 'agent_room' | 'line_admin_direct' | 'schedule' | null; cursor_created_at: string;
       attachments: Array<{ name: string; size: number; kind: 'image' | 'file' }> | null }>(
       `WITH shared AS (${sharedAdminChatSql} LIMIT 1)
        SELECT j.job_id, j.account_id, j.chat_type, j.chat_id, j.provider, j.prompt, j.status, j.created_at,
          to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_created_at,
          CASE WHEN char_length(output.final_text) > 240 THEN left(output.final_text, 239) || '…' ELSE output.final_text END AS reply_preview,
-         CASE WHEN j.account_id IS NULL THEN 'agent_room'
+         CASE WHEN j.source_type = 'schedule' THEN 'schedule'
+           WHEN j.account_id IS NULL THEN 'agent_room'
            WHEN EXISTS (SELECT 1 FROM shared s WHERE s.account_id=j.account_id AND j.chat_type='direct' AND j.chat_id=s.admin_mid AND j.source_type='line')
            THEN 'line_admin_direct' END AS origin,
          j.attachments

@@ -4,6 +4,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { isWritableChatType, type AttachmentResult, type LineWorkerCommand, type NativeAttachmentDownloadInput, type WorkerBinding } from '@line-agent/contracts';
 import type { Attachment, AttachmentAttemptMutation, AttachmentPriorState, MessageRepository } from '@line-agent/database';
+import { pickWorkerBinding } from '../worker-binding-fields.js';
 
 type DownloadCommand = Extract<LineWorkerCommand, { type: 'downloadAttachment' }>;
 interface AttachmentWorker {
@@ -160,7 +161,7 @@ export class AttachmentService {
     let dispatched = false;
     let stage: SafeDiagnostic['stage'] = 'prepare';
     try {
-      const { mode: _mode, ...lease } = binding;
+      const lease = pickWorkerBinding(binding);
       let nativeAttachment: NativeAttachmentDownloadInput | null | undefined;
       if (attachment.externalSource) {
         if (this.externalSourceExpired(attachment)) {

@@ -278,7 +278,7 @@ function copyTalkCursor(cursor: TalkCursorV1): TalkCursorV1 {
   return parseTalkCursor(cursor);
 }
 
-function cursorsEqual(left: TalkCursorV1, right: TalkCursorV1): boolean {
+export function cursorsEqual(left: TalkCursorV1, right: TalkCursorV1): boolean {
   return canonicalTalkJson(parseTalkCursor(left)) ===
     canonicalTalkJson(parseTalkCursor(right));
 }

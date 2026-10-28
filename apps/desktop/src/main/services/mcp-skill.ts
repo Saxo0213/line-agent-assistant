@@ -15,10 +15,11 @@ export async function loadLinejsMcpSkill(skillsDirectory: string): Promise<strin
 const OUTPUT_CHANNEL_LINES = {
   ui: '輸出位置：Agent 聊天室（可使用 Markdown）',
   line: '輸出位置：LINE（只能用純文字，不要使用 Markdown）',
+  schedule: '輸出位置：排程紀錄與 LINE（只能用純文字，不要使用 Markdown）',
 } as const;
 
 /** Adds the single 「輸出位置」 line that the Skill's output-format rule refers to. */
-export function withOutputChannel(prompt: string, sourceType: 'ui' | 'line'): string {
+export function withOutputChannel(prompt: string, sourceType: 'ui' | 'line' | 'schedule'): string {
   return `${OUTPUT_CHANNEL_LINES[sourceType]}\n\n${prompt}`;
 }
 
@@ -34,4 +35,30 @@ ${prompt}`;
 /** Prepends the Skill text exactly once to a provider run prompt. */
 export function withMcpSkill(skill: string | null, prompt: string): string {
   return skill ? `${skill}\n\n---\n\n${prompt}` : prompt;
+}
+
+export interface JobIdentityView {
+  agent: { accountId: string; name: string | null } | null;
+  admin: { accountId: string; chatId: string; name: string | null } | null;
+  current: { accountId: string; chatType: string; chatId: string; title: string | null; isAdmin: boolean } | null;
+}
+const clip = (value: string | null, max = 40): string => (value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+/** The Main-generated 「身分」 block (at most 600 characters, no secrets): who the Agent, the administrator and the current chat are. */
+export function formatIdentityBlock(identity: JobIdentityView): string {
+  const lines = ['【身分】'];
+  if (identity.agent) lines.push(`Agent 帳號：${clip(identity.agent.name) || '（未命名）'}（accountId=${identity.agent.accountId}）`);
+  lines.push(identity.admin
+    ? `管理員（主要管理者）：${clip(identity.admin.name) || '（未命名）'}；與 Agent 的私訊 accountId=${identity.admin.accountId}，chatType=direct，chatId=${identity.admin.chatId}`
+    : '管理員（主要管理者）：尚未連結主要管理者');
+  if (identity.current) {
+    lines.push(`目前對話：${clip(identity.current.title) || identity.current.chatId}（accountId=${identity.current.accountId}，chatType=${identity.current.chatType}，chatId=${identity.current.chatId}）${identity.current.isAdmin ? '；目前對話者就是管理員' : ''}`);
+  }
+  lines.push('「我／給我／管理員／主要管理者」都指上述管理員；要傳給他時直接用上述 key。');
+  return lines.join('\n').slice(0, 600);
+}
+
+/** Puts the identity block ahead of the user's turn (run request only; never stored). */
+export function withIdentityBlock(prompt: string, block: string | null): string {
+  return block ? `${block}\n\n${prompt}` : prompt;
 }

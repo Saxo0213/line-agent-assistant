@@ -16,6 +16,7 @@ export const SYSTEM_DISPLAY_COPY = {
   '新增使用者：加入 LINE 好友': 'Add user: add LINE friend', '新增使用者：重新確認好友': 'Add user: recheck friendship',
   '新增使用者：授權預檢': 'Add user: authorization preflight', '新增使用者：寫入白名單': 'Add user: save allowlist',
   '相簿照片下載': 'Album photo download',
+  'LINE 訊息延遲（LINE 至本機）': 'LINE message delay (LINE to app)', 'LINE 訊息延遲（本機佇列／寫入）': 'LINE message delay (app queue / save)',
   '已提出': 'Requested', '已完成': 'Completed', '失敗': 'Failed', '已記錄': 'Recorded',
   '等待下載': 'Waiting to download', '下載中': 'Downloading', '已過期': 'Expired', '重試中': 'Retrying', '下載失敗': 'Download failed',
 } as const;
@@ -29,6 +30,7 @@ export const EXTRA_DESKTOP_COPY = {
   automaticReplyConflict: 'Settings changed elsewhere. The latest version is ready; your edits are preserved. Save again to apply them.',
   queued: 'Queued', running: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled', interrupted: 'Interrupted',
   active: 'Active', revoked: 'Revoked', expired: 'Expired',
+  searchAgentTab: 'Agent', searchPrimaryAdminTab: 'Primary Admin', formerAgentAccount: 'Former Agent account',
 } as const;
 
 export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
@@ -37,6 +39,7 @@ export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, str
   mcpEndpoint: 'MCP 端點：', accounts: '帳號：', toolsAvailable: 'LINE 工具可用', toolsConfigured: 'LINE 工具已設定', toolsNotLoaded: 'LINE 工具未載入',
   operationFailed: '無法完成此操作，請重試。', automaticReplyConflict: '設定已在其他位置變更。最新版本已載入，您的編輯內容已保留。請再次儲存以套用。',
   queued: '已排入佇列', running: '執行中', completed: '已完成', failed: '失敗', cancelled: '已取消', interrupted: '已中斷', active: '啟用', revoked: '已撤銷', expired: '已過期',
+  searchAgentTab: 'Agent', searchPrimaryAdminTab: '主要管理者', formerAgentAccount: '舊 Agent 帳號',
 };
 export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
   optionalLocalAnalysis: '任意のローカル分析', agents: 'Agent', operations: '操作', agentQueue: 'Agent キュー', bytes: 'バイト', lineAccounts: 'LINE アカウント',
@@ -44,6 +47,7 @@ export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string
   mcpEndpoint: 'MCP エンドポイント：', accounts: 'アカウント：', toolsAvailable: 'LINE ツールを利用できます', toolsConfigured: 'LINE ツールを設定済み', toolsNotLoaded: 'LINE ツールを読み込めません',
   operationFailed: '操作を完了できませんでした。もう一度お試しください。', automaticReplyConflict: '設定が別の場所で変更されました。最新の内容を読み込み、編集内容は保持されています。適用するには再度保存してください。',
   queued: '待機中', running: '実行中', completed: '完了', failed: '失敗', cancelled: 'キャンセル済み', interrupted: '中断', active: '有効', revoked: '取り消し済み', expired: '期限切れ',
+  searchAgentTab: 'Agent', searchPrimaryAdminTab: '主管理者', formerAgentAccount: '以前の Agent アカウント',
 };
 export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
   optionalLocalAnalysis: '선택적 로컬 분석', agents: 'Agent', operations: '작업', agentQueue: 'Agent 대기열', bytes: '바이트', lineAccounts: 'LINE 계정',
@@ -51,6 +55,7 @@ export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> 
   mcpEndpoint: 'MCP 엔드포인트:', accounts: '계정:', toolsAvailable: 'LINE 도구 사용 가능', toolsConfigured: 'LINE 도구 구성됨', toolsNotLoaded: 'LINE 도구가 로드되지 않음',
   operationFailed: '작업을 완료할 수 없습니다. 다시 시도하세요.', automaticReplyConflict: '다른 곳에서 설정이 변경되었습니다. 최신 버전이 준비되었으며 편집 내용은 보존되었습니다. 적용하려면 다시 저장하세요.',
   queued: '대기 중', running: '실행 중', completed: '완료', failed: '실패', cancelled: '취소됨', interrupted: '중단됨', active: '활성', revoked: '취소됨', expired: '만료됨',
+  searchAgentTab: 'Agent', searchPrimaryAdminTab: '주 관리자', formerAgentAccount: '이전 Agent 계정',
 };
 
 const JAPANESE_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
@@ -64,6 +69,7 @@ const JAPANESE_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> =
   'LINE 操作失敗': 'LINE 操作失敗', 'LINE 聯絡人／群組清單更新': 'LINE 連絡先／グループ一覧を更新', '新增使用者（好友授權）': 'ユーザー追加（友だち認証）', '新增使用者：確認 LINE 好友關係': 'ユーザー追加：LINE の友だち関係を確認',
   '新增使用者：加入 LINE 好友': 'ユーザー追加：LINE の友だちに追加', '新增使用者：重新確認好友': 'ユーザー追加：友だち関係を再確認', '新增使用者：授權預檢': 'ユーザー追加：認証を事前確認', '新增使用者：寫入白名單': 'ユーザー追加：許可リストに保存',
   '相簿照片下載': 'アルバム写真をダウンロード',
+  'LINE 訊息延遲（LINE 至本機）': 'LINE メッセージ遅延（LINE からアプリ）', 'LINE 訊息延遲（本機佇列／寫入）': 'LINE メッセージ遅延（アプリのキュー／保存）',
   '已提出': 'リクエスト済み', '已完成': '完了', '失敗': '失敗', '已記錄': '記録済み', '等待下載': 'ダウンロード待ち', '下載中': 'ダウンロード中', '已過期': '期限切れ', '重試中': '再試行中', '下載失敗': 'ダウンロード失敗',
 };
 const KOREAN_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
@@ -77,6 +83,7 @@ const KOREAN_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
   'LINE 操作失敗': 'LINE 작업 실패', 'LINE 聯絡人／群組清單更新': 'LINE 연락처／그룹 목록 업데이트', '新增使用者（好友授權）': '사용자 추가(친구 인증)', '新增使用者：確認 LINE 好友關係': '사용자 추가: LINE 친구 관계 확인',
   '新增使用者：加入 LINE 好友': '사용자 추가: LINE 친구 추가', '新增使用者：重新確認好友': '사용자 추가: 친구 관계 재확인', '新增使用者：授權預檢': '사용자 추가: 인증 사전 확인', '新增使用者：寫入白名單': '사용자 추가: 허용 목록 저장',
   '相簿照片下載': '앨범 사진 다운로드',
+  'LINE 訊息延遲（LINE 至本機）': 'LINE 메시지 지연(LINE에서 앱)', 'LINE 訊息延遲（本機佇列／寫入）': 'LINE 메시지 지연(앱 대기열/저장)',
   '已提出': '요청됨', '已完成': '완료', '失敗': '실패', '已記錄': '기록됨', '等待下載': '다운로드 대기', '下載中': '다운로드 중', '已過期': '만료됨', '重試中': '재시도 중', '下載失敗': '다운로드 실패',
 };
 

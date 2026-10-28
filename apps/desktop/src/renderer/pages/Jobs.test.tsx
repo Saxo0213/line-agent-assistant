@@ -57,6 +57,39 @@ describe('Jobs for the account-less Agent room', () => {
   });
 });
 
+describe('Jobs: scheduled runs', () => {
+  const scheduled: AgentJobSummary = { jobId: 'job-schedule', accountId: null, chatType: null, chatId: null, origin: 'schedule', provider: 'claude',
+    prompt: '[排程] 每日晨報\n任務：總結\n輸出：傳給管理員', status: 'completed', createdAt: '2026-10-16T02:00:00.000Z', replyPreview: '晨報重點' };
+
+  it('labels a scheduled run 排程 with the schedule title in every locale and keeps the room job unlabeled', () => {
+    const roomJob: AgentJobSummary = { jobId: 'job-room', accountId: null, chatType: null, chatId: null, origin: 'agent_room', provider: 'codex', prompt: '一般房間提問', status: 'completed', createdAt: '2026-10-16T00:00:00.000Z' };
+    render(<Jobs api={api()} jobs={[scheduled, roomJob]} headingRef={React.createRef()} />);
+    const row = screen.getByRole('row', { name: /每日晨報/ });
+    expect(within(row).getByText('排程')).toBeTruthy();
+    expect(within(row).getAllByText('每日晨報').length).toBeGreaterThan(0);
+    expect(within(screen.getByRole('row', { name: /一般房間提問/ })).queryByText('排程')).toBeNull();
+    cleanup();
+    renderAtLocale(<Jobs api={api()} jobs={[scheduled]} headingRef={React.createRef()} />, 'en');
+    expect(within(screen.getByRole('row', { name: /每日晨報/ })).getByText('Scheduled')).toBeTruthy();
+  });
+
+  it('reads, stops and retries a scheduled run through the account-less calls', async () => {
+    const desktopApi = {
+      getAgentRoomJobEvents: vi.fn(async () => [{ type: 'completed', finalText: '排程完整回覆' }]),
+      stopAgentRoomJob: vi.fn(async () => ({ type: 'accepted', requestId: 's', ok: true } as const)),
+      retryAgentRoomJob: vi.fn(async () => ({ type: 'accepted', requestId: 'r', ok: true } as const)),
+    } as unknown as DesktopApi;
+    render(<Jobs api={desktopApi} jobs={[{ ...scheduled, status: 'failed' }]} headingRef={React.createRef()} />);
+    const row = screen.getByRole('row', { name: /每日晨報/ });
+    fireEvent.click(within(row).getByRole('button', { name: '查看完整回覆：Claude' }));
+    expect(within(await screen.findByRole('dialog', { name: '回覆內容' })).getByText('排程完整回覆')).toBeTruthy();
+    expect(desktopApi.getAgentRoomJobEvents).toHaveBeenCalledWith('job-schedule');
+    fireEvent.click(within(screen.getByRole('dialog', { name: '回覆內容' })).getByRole('button', { name: '關閉閱覽' }));
+    fireEvent.click(within(row).getByRole('button', { name: '重試' }));
+    await waitFor(() => expect(desktopApi.retryAgentRoomJob).toHaveBeenCalledWith('job-schedule'));
+  });
+});
+
 describe('Jobs retry action', () => {
   const make = (status: AgentJobSummary['status']): AgentJobSummary => ({ jobId: `job-${status}`, accountId: 'account-A', chatType: 'group', chatId: 'chat-A',
     provider: 'codex', prompt: `任務-${status}`, status, createdAt: '2026-10-16T00:00:00.000Z' });

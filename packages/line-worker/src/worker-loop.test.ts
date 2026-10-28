@@ -1129,6 +1129,22 @@ describe('one-account worker loop', () => {
     expect(worker.durableCursor).toEqual(next);
   });
 
+  it('treats a repeated ack of the batch just acknowledged as done but still rejects mismatches', async () => {
+    const { worker, transport, events, init } = setup();
+    await init;
+    await authenticate(worker);
+    transport.enqueueSync({ cursorAfter: next, operations: [message] });
+    await worker.handle({ type: 'poll', ...binding });
+    const batch = events.find((event) => event.type === 'batch');
+    await worker.handle({ type: 'ackBatch', ...binding, batchId: batch.batchId, cursorAfter: next });
+    const errorsBefore = events.filter((event) => event.type === 'error').length;
+    await expect(worker.handle({ type: 'ackBatch', ...binding, batchId: batch.batchId, cursorAfter: next })).resolves.toBeUndefined();
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(errorsBefore);
+    expect(worker.durableCursor).toEqual(next);
+    await expect(worker.handle({ type: 'ackBatch', ...binding, batchId: 'other-batch', cursorAfter: next })).rejects.toThrow();
+    await expect(worker.handle({ type: 'ackBatch', ...binding, batchId: batch.batchId, cursorAfter: cursor })).rejects.toThrow();
+  });
+
   it('checkpoints cursor-only sync and resumes from the durable value', async () => {
     const { worker, transport, events, init } = setup();
     await init;

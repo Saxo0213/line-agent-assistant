@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { AccountMode, ConversationKey, InboundEnvelope, WritableConversationKey, LineWorkerCommand, LineWorkerEvent, WorkerBinding } from '@line-agent/contracts';
 import { isWritableChatType, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AccountRepository, AdminRepository, AgentJobStatusProjection, FriendWhitelistRepository, MessageRepository, RoutingDecision, SettingsRepository } from '@line-agent/database';
-import { hasOwnMention, routeTrigger, type TriggerDecision } from './trigger-router.js';
+import { hasOwnMention, isFreeCommandText, routeTrigger, type FreeCommand, type TriggerDecision } from './trigger-router.js';
 import { classifyRoomControl, ownMentionBody, sanitizeRoomControlEnvelope, type RoomActivationCommand } from './room-control.js';
 import { sanitizeInbound } from './sensitive-message-sanitizer.js';
 import type { SecretStore } from './secret-store.js';
@@ -12,6 +12,7 @@ import { claimed as permissionTicketClaimed, type PermissionCommandService, type
 import type { Locale } from '../../locale.js';
 import { linePrompt } from './line-prompts.js';
 
+import { pickWorkerBinding } from '../worker-binding-fields.js';
 export type BoundWorker = WorkerBinding & { mode: AccountMode };
 
 type ConnectionHealthLane = { binding: BoundWorker; generation: number; pending: boolean; running: boolean };
@@ -34,6 +35,16 @@ export interface RoomControlHandler {
   getActiveAuthorization?(key: WritableConversationKey): Promise<{ grantId: string; version: number } | null>;
   respond?(envelope: Extract<LineWorkerEvent, { type: 'batch' }>['envelopes'][number], body: string): Promise<void>;
 }
+
+/** Group free mode (docs/architecture/group-free-mode.md); implemented by FreeModeService. */
+export interface FreeModeControl {
+  isActive(key: WritableConversationKey): boolean;
+  statusText(key: WritableConversationKey): string | null;
+  handleCommand(key: WritableConversationKey & { chatType: 'group' | 'room' }, enabledBy: string, command: FreeCommand): Promise<void>;
+  addMessage(envelope: Extract<LineWorkerEvent, { type: 'batch' }>['envelopes'][number]): void;
+}
+
+type FreeDispatch = { command: FreeCommand } | { message: true };
 
 export class LineService {
   private readonly bindings = new Map<string, BoundWorker>();
@@ -77,6 +88,7 @@ export class LineService {
     private readonly publishReadPositionChanges?: (changes: readonly Readonly<{ key: ConversationKey; messageId: string }>[]) => void,
     private readonly locale: Locale | string = 'en',
     private readonly onDiagnostic?: (diagnostic: SafeDiagnostic) => void,
+    private readonly freeMode?: FreeModeControl,
   ) {}
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown): void {
@@ -148,6 +160,7 @@ export class LineService {
     };
     if (binding.mode !== 'ACTIVE_CONTROL' || !repository.listUnroutedLiveSourceMessages) return;
     let afterObservationId: string | undefined;
+    let replayFailureReported = false;
     for (;;) {
       if (signal?.aborted || this.bindings.get(binding.workerInstanceId) !== binding) return;
       const page = await repository.listUnroutedLiveSourceMessages({ accountId: binding.accountId,
@@ -165,7 +178,10 @@ export class LineService {
         try {
           await this.handleWorkerEventInLane(binding.workerInstanceId, event, { recovered: true,
             receiptCurrent: currentReceipt, sensitive: item.sensitive });
-        } catch { /* leave unmatched provenance for the next bind to retry */ }
+        } catch (error) {
+          // Unmatched provenance stays for the next bind to retry; record one failure per pass, not per item.
+          if (!replayFailureReported) { replayFailureReported = true; this.reportFailure('recover', error); }
+        }
       }
       if (page.length < 100) return;
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -220,7 +236,7 @@ export class LineService {
     if ((await this.accounts.resolveCapabilities?.(key.accountId))?.connectionMode === 'EXTERNAL_MONITOR') return;
     const binding = this.binding(key.accountId);
     if (!binding || binding.mode !== 'ACTIVE_CONTROL') return;
-    const { mode: _mode, ...workerBinding } = binding;
+    const workerBinding = pickWorkerBinding(binding);
     await this.worker.send({ type: 'reactMessage', ...workerBinding, ...key, requestId: randomUUID(), messageId, reaction });
   }
 
@@ -242,8 +258,10 @@ export class LineService {
       else {
         const status = await this.agents.getChatStatus?.(key);
         if (signal?.aborted || this.bindings.get(binding.workerInstanceId) !== binding) return;
-        const text = status?.runningJobId ? linePrompt(this.locale, 'agentRunning', { code: status.runningJobId })
+        const base = status?.runningJobId ? linePrompt(this.locale, 'agentRunning', { code: status.runningJobId })
           : linePrompt(this.locale, 'agentIdle');
+        const freeLine = this.freeMode?.statusText(key) ?? null;
+        const text = freeLine ? `${base}\n${freeLine}` : base;
         await this.worker.send({ type: 'sendText', ...binding, ...key, requestId: randomUUID(),
           text, replyToMessageId: messageId });
       }
@@ -353,7 +371,10 @@ export class LineService {
           : transport === 'disconnected' ? 'disconnected' : 'connected';
         let applied: boolean | undefined;
         try { applied = await this.accounts.applyWorkerConnectionStatus(binding, status); }
-        catch { /* a persistence rejection is not evidence that this binding is stale */ }
+        catch (error) {
+          // A persistence rejection is not evidence that this binding is stale, but the status was not saved.
+          this.reportFailure('persist', error);
+        }
         if (lane.generation !== generation) continue;
         if (applied === false && this.bindings.get(binding.workerInstanceId) === binding) this.unbind(binding.workerInstanceId);
       }
@@ -588,6 +609,7 @@ export class LineService {
     const actions: Array<{ key: WritableConversationKey; decision: TriggerDecision }> = [];
     const decisions: RoutingDecision[] = [];
     const permissionTickets = new Map<object, PermissionTicket>();
+    const freeDispatches = new Map<string, FreeDispatch>();
     const primaryAdminLookupFailedIds = new Set<string>();
     for (const { envelope, ownMid, control, sensitive } of prepared) {
       const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
@@ -600,7 +622,7 @@ export class LineService {
       const permissionClaimed = permissionTicketClaimed(permissionTicket);
       const shouldCheckGroupAuthorization = envelope.chatType !== 'direct' && control.type === 'none'
         && envelope.ingestion.source === 'live' && envelope.kind === 'text' && envelope.senderId !== ownMid
-        && !administrative.has(envelope.messageId) && hasOwnMention(envelope, ownMid);
+        && !administrative.has(envelope.messageId) && (hasOwnMention(envelope, ownMid) || isFreeCommandText(envelope, ownMid));
       let primaryAdminLookupFailed = false;
       const primaryAdmin = envelope.chatType === 'direct'
         ? directAdmin
@@ -624,9 +646,14 @@ export class LineService {
       const senderIsPrimaryAdmin = envelope.chatType === 'direct'
         ? primaryAdmin || friendAuthorization !== null
         : primaryAdmin;
-      const decision = permissionClaimed || primaryAdminLookupFailed ? { type: 'ignore' as const } : routeTrigger(envelope, { ownMid,
+      const routed = permissionClaimed || primaryAdminLookupFailed ? { type: 'ignore' as const } : routeTrigger(envelope, { ownMid,
         agentEnabled: roomAgentEnabled, defaultProvider: conversation?.provider ?? 'codex',
-        senderIsPrimaryAdmin, workspaceConfigured: true });
+        senderIsPrimaryAdmin, workspaceConfigured: true, freeModeActive: this.freeMode?.isActive(key) ?? false });
+      // Free-mode decisions are applied after ingestion; for storage and admission they are plain ignored messages.
+      const freeDispatch: FreeDispatch | null = !this.freeMode ? null : routed.type === 'free' || routed.type === 'free_range' ? { command: routed }
+        : routed.type === 'free_message' ? { message: true } : null;
+      const decision: Exclude<TriggerDecision, FreeCommand | { type: 'free_message' }> = routed.type === 'free' || routed.type === 'free_range'
+        || routed.type === 'free_message' ? { type: 'ignore' } : routed;
       const authorization = !primaryAdmin && friendAuthorization ? {
         directGrantId: friendAuthorization.grantId,
         directGrantVersion: friendAuthorization.version,
@@ -636,6 +663,9 @@ export class LineService {
       } : undefined;
       const routeIsClosed = existingRoutes.has(envelope.messageId) || (recovered && !recovered.receiptCurrent);
       actions.push({ key, decision: routeIsClosed ? { type: 'ignore' } : decision });
+      if (freeDispatch && !routeIsClosed && !permissionClaimed && control.type === 'none' && !administrative.has(envelope.messageId) && !sensitive) {
+        freeDispatches.set(envelope.messageId, freeDispatch);
+      }
       const primaryAdminAdmission = envelope.chatType !== 'direct' && primaryAdmin && decision.type !== 'ignore'
         ? { primaryAdminSenderId: envelope.senderId } : {};
       if (existingRoutes.has(envelope.messageId) || (recovered && !recovered.receiptCurrent)
@@ -699,7 +729,10 @@ export class LineService {
       try {
         await this.messages.recordBatchRoutes(sourceBatch, committedAdmission.routeDecisions,
           new Set(committedAdmission.jobStatuses.map((status) => status.sourceMessageId)));
-      } catch { /* route projection is best effort; source provenance remains available for replay */ }
+      } catch (error) {
+        // Route projection is best effort; source provenance remains available for replay.
+        this.reportFailure('persist', error);
+      }
       result = { ...result, ...committedAdmission };
     } else {
       result = await this.messages.ingestBatchAndRoute(sourceBatch, decisions);
@@ -754,6 +787,14 @@ export class LineService {
       const ticket = permissionTickets.get(envelope);
       if (ticket && this.bindings.get(binding.workerInstanceId) === binding) this.permissionCommands?.enqueue(envelope, ticket);
     }
+    for (const { envelope } of admitted) {
+      const dispatch = freeDispatches.get(envelope.messageId);
+      if (!dispatch || !this.freeMode || primaryAdminLookupFailedIds.has(envelope.messageId)
+        || this.bindings.get(binding.workerInstanceId) !== binding) continue;
+      const freeKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId } as WritableConversationKey & { chatType: 'group' | 'room' };
+      if ('command' in dispatch) this.scheduleRoomEffect(() => this.freeMode?.handleCommand(freeKey, envelope.senderId, dispatch.command));
+      else this.freeMode.addMessage(envelope);
+    }
     for (const attachmentId of attachmentIds) this.queueAttachmentDownload(attachmentId);
     for (const { control, envelope, ownMid } of admitted) {
       if (primaryAdminLookupFailedIds.has(envelope.messageId)) continue;
@@ -804,7 +845,9 @@ export class AccountSupervisor {
     private readonly acknowledgementTimeoutMs = 3000,
     private readonly onPhase?: (phase: 'idle' | 'revoking' | 'granting' | 'failed', targetAccountId: string | null) => void,
     private readonly cancelAgentJob?: (jobId: string) => Promise<void>,
-    private readonly onJobStatus?: (projection: AgentJobStatusProjection) => void) {}
+    private readonly onJobStatus?: (projection: AgentJobStatusProjection) => void,
+    /** First ack after a fresh spawn also covers child boot + init; draining a running worker keeps acknowledgementTimeoutMs. */
+    private readonly bootAcknowledgementTimeoutMs = acknowledgementTimeoutMs) {}
 
   async revokeControlAndCancel(expectedEpoch: number) {
     const revoked = await this.accounts.revokeControl(expectedEpoch);
@@ -877,8 +920,8 @@ export class AccountSupervisor {
       || !await this.accounts.isCurrentActiveWorkerBinding(binding)) return false;
     this.active = { binding, worker };
     try {
-      if (acknowledged || await this.waitBounded(worker.waitModeAck('ACTIVE_CONTROL', this.acknowledgementTimeoutMs))) return true;
-      throw new Error('Restored active worker did not acknowledge control');
+      if (acknowledged || await this.waitBounded(worker.waitModeAck('ACTIVE_CONTROL', this.bootAcknowledgementTimeoutMs), this.bootAcknowledgementTimeoutMs)) return true;
+      throw Object.assign(new Error('Restored active worker did not acknowledge control'), { name: 'TimeoutError' });
     } catch (error) {
       try { await worker.killAndWait(); }
       catch (stopError) { throw stopError; }
@@ -937,7 +980,7 @@ export class AccountSupervisor {
         const monitor = await this.factory.spawn(monitorBinding.accountId, monitorBinding.workerInstanceId,
           monitorBinding.controlEpoch, monitorBinding.mode);
         try {
-          if (!await this.waitBounded(monitor.waitModeAck('MONITOR_ONLY', this.acknowledgementTimeoutMs))) {
+          if (!await this.waitBounded(monitor.waitModeAck('MONITOR_ONLY', this.bootAcknowledgementTimeoutMs), this.bootAcknowledgementTimeoutMs)) {
             throw new Error('Replacement monitor worker did not acknowledge monitoring');
           }
         } catch (error) {
@@ -955,7 +998,7 @@ export class AccountSupervisor {
     let worker: SupervisedWorker | undefined;
     try {
       worker = await this.factory.spawn(accountId, binding.workerInstanceId, binding.controlEpoch, binding.mode);
-      if (!await this.waitBounded(worker.waitModeAck('ACTIVE_CONTROL', this.acknowledgementTimeoutMs))) {
+      if (!await this.waitBounded(worker.waitModeAck('ACTIVE_CONTROL', this.bootAcknowledgementTimeoutMs), this.bootAcknowledgementTimeoutMs)) {
         throw new Error('New worker did not acknowledge control grant');
       }
       this.active = { binding, worker };
@@ -967,11 +1010,11 @@ export class AccountSupervisor {
     }
   }
 
-  private async waitBounded(ack: Promise<boolean>): Promise<boolean> {
+  private async waitBounded(ack: Promise<boolean>, timeoutMs = this.acknowledgementTimeoutMs): Promise<boolean> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([ack, new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => resolve(false), this.acknowledgementTimeoutMs);
+        timer = setTimeout(() => resolve(false), timeoutMs);
       })]);
     } finally { if (timer) clearTimeout(timer); }
   }

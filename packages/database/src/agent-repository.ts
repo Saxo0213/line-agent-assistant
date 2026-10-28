@@ -1,17 +1,29 @@
 import { randomUUID } from 'node:crypto';
-import { AGENT_ROOM_KEY, AgentProviderSchema, type AgentEvent, type AgentStoredAttachment, type AgentProvider, type AgentRoomKey, type AgentRunRequest, type WritableConversationKey, type ResumeSessionValidationResult } from '@line-agent/contracts';
+import { AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, AgentProviderSchema, isAgentScheduleQueueKey, type AgentEvent, type AgentStoredAttachment, type AgentProvider, type AgentRoomKey, type AgentScheduleQueueKey, type AgentRunRequest, type WritableConversationKey, type ResumeSessionValidationResult } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
+import { ensureLineageSessionRow } from './agent-lineage.js';
 
 /**
- * A queue/session key: one LINE chat, or the shared Agent room. The room is operator-owned and has no LINE
- * account, so UI jobs and UI sessions are stored with NULL account/chat columns (migration 040).
+ * A queue key: one LINE chat, the shared Agent room, or the scheduled-run queue. The room is operator-owned and has no LINE
+ * account, so UI jobs and UI sessions are stored with NULL account/chat columns (migration 040); schedule jobs are stored the
+ * same way with source_type 'schedule' (migration 072) and are told apart by their source type, never by the NULL columns.
  */
-export type AgentQueueKey = WritableConversationKey | AgentRoomKey;
+export type AgentQueueKey = WritableConversationKey | AgentRoomKey | AgentScheduleQueueKey;
 
-export type SessionKey = AgentQueueKey & {
+/** A provider session key. Scheduled runs never have one: every run starts a new provider session. */
+export type SessionKey = (WritableConversationKey | AgentRoomKey) & {
   provider: AgentProvider;
   sourceType?: 'line' | 'ui';
 };
+
+export type AgentJobSourceType = 'line' | 'ui' | 'schedule';
+
+/** The job source a queue key addresses; every key-scoped job query filters on it so the room and the schedule queue never mix. */
+/** The stored chat_type column of a key: the schedule key's chatType 'schedule' is virtual (rows store NULL). */
+const keyChatType = (key: { chatType: string | null }): string | null => key.chatType === 'schedule' ? null : key.chatType;
+
+export const queueKeySourceType = (key: { accountId: string | null; chatType?: string | null }): AgentJobSourceType =>
+  key.accountId !== null ? 'line' : isAgentScheduleQueueKey(key) ? 'schedule' : 'ui';
 
 export type SessionBinding = SessionKey & {
   workspacePath: string;
@@ -32,30 +44,31 @@ interface AgentJobBase {
   /** Files attached in the Agent room (UI jobs only; LINE jobs are always empty by CHECK). Absent when none. */
   attachments?: AgentStoredAttachment[];
 }
-export type AgentJob = AgentJobBase & ({ sourceType: 'line' } & WritableConversationKey | { sourceType: 'ui' } & AgentRoomKey);
+export type AgentJob = AgentJobBase & ({ sourceType: 'line' } & WritableConversationKey | { sourceType: 'ui' } & AgentRoomKey | { sourceType: 'schedule' } & AgentScheduleQueueKey);
 
 export type AgentJobStatusProjection = {
   jobId: string;
   sourceMessageId: string | null;
   status: AgentJob['status'];
   revision: string;
-} & ({ sourceType: 'line' } & WritableConversationKey | { sourceType: 'ui' } & AgentRoomKey);
+} & ({ sourceType: 'line' } & WritableConversationKey | { sourceType: 'ui' } & AgentRoomKey | { sourceType: 'schedule' } & AgentScheduleQueueKey);
 
 interface JobRow {
   job_id: string; account_id: string | null; chat_type: WritableConversationKey['chatType'] | null; chat_id: string | null;
   provider: AgentProvider; prompt: string; workspace_path: string; generation: number;
-  status: AgentJob['status']; source_type: AgentJob['sourceType']; source_message_id: string | null;
+  status: AgentJob['status']; source_type: AgentJobSourceType; source_message_id: string | null;
   source_request_id: string | null; creation_epoch: string | null; attachments?: AgentStoredAttachment[] | null;
 }
 
 interface StatusProjectionRow {
   job_id: string; account_id: string | null; chat_type: WritableConversationKey['chatType'] | null; chat_id: string | null;
-  source_type: 'line' | 'ui'; source_message_id: string | null; status: AgentJob['status']; revision: string;
+  source_type: AgentJobSourceType; source_message_id: string | null; status: AgentJob['status']; revision: string;
 }
 
 /** The job's owner key: the chat for LINE jobs, the shared room for UI jobs (migration 040 CHECK keeps these in step). */
-function jobOwner(row: { source_type: 'line' | 'ui'; account_id: string | null; chat_type: WritableConversationKey['chatType'] | null; chat_id: string | null }):
-  { sourceType: 'line' } & WritableConversationKey | { sourceType: 'ui' } & AgentRoomKey {
+function jobOwner(row: { source_type: AgentJobSourceType; account_id: string | null; chat_type: WritableConversationKey['chatType'] | null; chat_id: string | null }):
+  { sourceType: 'line' } & WritableConversationKey | { sourceType: 'ui' } & AgentRoomKey | { sourceType: 'schedule' } & AgentScheduleQueueKey {
+  if (row.source_type === 'schedule') return { sourceType: 'schedule', ...AGENT_SCHEDULE_QUEUE_KEY };
   if (row.source_type === 'ui' || row.account_id === null || row.chat_type === null || row.chat_id === null) {
     return { sourceType: 'ui', ...AGENT_ROOM_KEY };
   }
@@ -97,6 +110,15 @@ function toAgentJob(row: JobRow): AgentJob {
     ...(row.attachments && row.attachments.length > 0 ? { attachments: row.attachments } : {}) };
 }
 
+/** One scheduled run; it has no LINE account or chat and no provider session (docs/architecture/agent-schedules.md). */
+export interface ScheduleJobRequest {
+  provider: AgentProvider;
+  /** `schedule:<scheduleId>:<scheduledFor ISO>`: the idempotency key of the schedule slot. */
+  requestId: string;
+  prompt: string;
+  workspacePath: string;
+}
+
 /** A prompt typed in the shared Agent room; it has no LINE account or chat. */
 export interface UiJobRequest {
   provider: AgentProvider;
@@ -108,11 +130,14 @@ export interface UiJobRequest {
   attachments?: AgentStoredAttachment[];
 }
 
+/** Whole-output marker a free-mode job returns when nothing needs a reply. */
+export const FREE_MODE_NO_REPLY = '[[NO_REPLY]]';
+
 const jobColumns = `job_id, account_id, chat_type, chat_id, provider, prompt, workspace_path, generation, status,
   source_type, source_message_id, source_request_id, creation_epoch, attachments`;
 
 /** Serializes claim/reset work per queue: one lock per LINE chat, one for the whole shared room. */
-const queueLockKey = (key: AgentQueueKey): string => JSON.stringify(key.accountId === null ? ['agent-room'] : [key.accountId, key.chatType, key.chatId]);
+const queueLockKey = (key: AgentQueueKey): string => JSON.stringify(key.accountId === null ? [isAgentScheduleQueueKey(key) ? 'agent-schedule' : 'agent-room'] : [key.accountId, key.chatType, key.chatId]);
 
 type Queryable = Pick<Pool, 'query'> | Pick<PoolClient, 'query'>;
 
@@ -126,6 +151,12 @@ export const sharedAdminChatSql = `SELECT ag.account_id, adm.chat_id AS admin_mi
   JOIN account_administrators adm ON adm.account_id = ag.account_id AND adm.role = 'PRIMARY_ADMIN' AND adm.chat_type = 'direct'
   JOIN conversations conv ON conv.account_id = ag.account_id AND conv.chat_type = 'direct' AND conv.chat_id = adm.chat_id
   WHERE ag.product_role = 'AGENT' AND ag.own_mid IS NOT NULL AND ag.mode <> 'PAUSED'`;
+
+export interface JobIdentity {
+  agent: { accountId: string; name: string | null } | null;
+  admin: { accountId: string; chatId: string; name: string | null } | null;
+  current: { accountId: string; chatType: string; chatId: string; title: string | null; isAdmin: boolean } | null;
+}
 
 export interface SharedAdminChat { accountId: string; adminMid: string }
 
@@ -159,10 +190,7 @@ async function ensureSessionRow(client: Queryable, key: SessionKey): Promise<voi
     await client.query("INSERT INTO agent_sessions (provider, source_type) VALUES ($1, 'ui') ON CONFLICT (provider) WHERE source_type = 'ui' DO NOTHING", [key.provider]);
     return;
   }
-  await client.query(
-    `INSERT INTO agent_sessions (account_id, chat_type, chat_id, provider, source_type) VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT DO NOTHING`,
-    [key.accountId, key.chatType, key.chatId, key.provider, key.sourceType ?? 'line']);
+  await ensureLineageSessionRow(client, { ...key, accountId: key.accountId });
 }
 
 async function readSessionGeneration(client: Queryable, key: SessionKey, lock: boolean): Promise<number> {
@@ -246,6 +274,16 @@ export const queuedConversationDiscoverySql = `SELECT head.account_id, head.chat
       ORDER BY j.queue_position
       LIMIT 1
     ) room
+    UNION ALL
+    -- Scheduled runs have their own queue head: they neither wait for the room or a LINE chat nor block them.
+    SELECT NULL::text, 'schedule'::text, NULL::text, scheduled.queue_position
+    FROM (
+      SELECT j.queue_position FROM agent_jobs j
+      WHERE j.source_type = 'schedule' AND j.status = 'queued'
+        AND NOT EXISTS (SELECT 1 FROM agent_jobs running WHERE running.source_type = 'schedule' AND running.status = 'running')
+      ORDER BY j.queue_position
+      LIMIT 1
+    ) scheduled
   ) head
   ORDER BY head.queue_position, head.account_id NULLS FIRST, head.chat_type, head.chat_id
   LIMIT $1`;
@@ -254,11 +292,37 @@ export class AgentRepository {
   constructor(private readonly pool: Pool) {}
 
   /** True for an Agent room job, or an admin-direct LINE job while the room shares that chat; evaluated per call. */
-  async sharesAgentRoomHistory(job: { sourceType: 'line' | 'ui'; accountId: string | null; chatType: string | null; chatId: string | null }): Promise<boolean> {
+  async sharesAgentRoomHistory(job: { sourceType: AgentJobSourceType; accountId: string | null; chatType: string | null; chatId: string | null }): Promise<boolean> {
     if (job.sourceType === 'ui') return true;
-    if (job.chatType !== 'direct') return false;
+    if (job.sourceType === 'schedule' || job.chatType !== 'direct') return false;
     const shared = await findSharedAdminChat(this.pool);
     return shared !== null && shared.accountId === job.accountId && shared.adminMid === job.chatId;
+  }
+
+  /**
+   * Who is who for one job's prompt: the Agent account, the Primary Admin's direct chat with it, and (LINE jobs) the current
+   * conversation. Read-only; the caller omits the block when this throws.
+   */
+  async describeJobIdentity(job: { sourceType: AgentJobSourceType; accountId: string | null; chatType: string | null; chatId: string | null }): Promise<JobIdentity> {
+    const agentRow = (await this.pool.query<{ account_id: string; display_name: string | null }>(
+      "SELECT account_id, display_name FROM line_accounts WHERE product_role = 'AGENT' AND mode <> 'PAUSED' ORDER BY account_id LIMIT 1")).rows[0];
+    const shared = await findSharedAdminChat(this.pool);
+    let admin: JobIdentity['admin'] = null;
+    if (shared) {
+      const row = (await this.pool.query<{ name: string | null }>(
+        `SELECT COALESCE(NULLIF(lc.display_name, ''), NULLIF(c.title, '')) AS name
+         FROM conversations c LEFT JOIN line_contacts lc ON lc.account_id = c.account_id AND lc.mid = c.chat_id
+         WHERE c.account_id = $1 AND c.chat_type = 'direct' AND c.chat_id = $2`, [shared.accountId, shared.adminMid])).rows[0];
+      admin = { accountId: shared.accountId, chatId: shared.adminMid, name: row?.name ?? null };
+    }
+    let current: JobIdentity['current'] = null;
+    if (job.sourceType === 'line' && job.accountId && job.chatType && job.chatId) {
+      const row = (await this.pool.query<{ title: string | null }>(
+        'SELECT title FROM conversations WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3', [job.accountId, job.chatType, job.chatId])).rows[0];
+      current = { accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, title: row?.title ?? null,
+        isAdmin: admin !== null && admin.accountId === job.accountId && job.chatType === 'direct' && admin.chatId === job.chatId };
+    }
+    return { agent: agentRow ? { accountId: agentRow.account_id, name: agentRow.display_name } : null, admin, current };
   }
 
   async enqueueUiJob(request: UiJobRequest): Promise<{ disposition: 'inserted' | 'duplicate'; jobId: string }> {
@@ -292,7 +356,23 @@ export class AgentRepository {
     }
   }
 
-  async lookupSession(key: AgentQueueKey & { provider: AgentProvider; sourceType?: 'line' | 'ui'; workspacePath: string }): Promise<{ externalSessionId: string; generation: number } | null> {
+  /**
+   * Queues one scheduled run (idempotent on the deterministic request id). It never resolves, creates or reads a session row:
+   * the run starts a brand-new provider session and writes nothing to any room or chat session.
+   */
+  async enqueueScheduleJob(request: ScheduleJobRequest, jobId: string = randomUUID()): Promise<{ disposition: 'inserted' | 'duplicate'; jobId: string }> {
+    const inserted = await this.pool.query<{ job_id: string }>(
+      `INSERT INTO agent_jobs (job_id, provider, source_type, source_request_id, prompt, workspace_path, generation)
+       VALUES ($1, $2, 'schedule', $3, $4, $5, 0)
+       ON CONFLICT DO NOTHING RETURNING job_id`,
+      [jobId, request.provider, request.requestId, request.prompt, request.workspacePath]);
+    const existing = inserted.rows[0] ?? (await this.pool.query<{ job_id: string }>(
+      "SELECT job_id FROM agent_jobs WHERE source_type = 'schedule' AND source_request_id = $1", [request.requestId])).rows[0];
+    if (!existing) throw new Error('Schedule job insertion failed');
+    return { disposition: inserted.rowCount ? 'inserted' : 'duplicate', jobId: existing.job_id };
+  }
+
+  async lookupSession(key: (WritableConversationKey | AgentRoomKey) & { provider: AgentProvider; sourceType?: 'line' | 'ui'; workspacePath: string }): Promise<{ externalSessionId: string; generation: number } | null> {
     const result = key.accountId === null
       ? await this.pool.query<{ external_session_id: string; generation: number }>(
         "SELECT external_session_id, generation FROM agent_sessions WHERE provider = $1 AND source_type = 'ui' AND external_session_id IS NOT NULL AND workspace_path = $2",
@@ -307,7 +387,8 @@ export class AgentRepository {
   }
 
   async validateResumeSession(request: AgentRunRequest): Promise<ResumeSessionValidationResult> {
-    if (!request.resumeSessionId) return { status: 'invalid' };
+    // A scheduled run never resumes: it always starts a brand-new provider session.
+    if (!request.resumeSessionId || request.source.type === 'schedule') return { status: 'invalid' };
     let result: { rows: Array<{ workspace_path: string | null }> };
     if (request.source.type === 'ui') {
       // The shared Agent room: its own session is keyed by provider alone (no account, no chat). While the admin binding
@@ -365,11 +446,7 @@ export class AgentRepository {
       );
       return bound.rowCount === 1;
     }
-    await this.pool.query(
-      `INSERT INTO agent_sessions (account_id, chat_type, chat_id, provider, source_type) VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (account_id, chat_type, chat_id, provider, source_type) DO NOTHING`,
-      [binding.accountId, binding.chatType, binding.chatId, binding.provider, binding.sourceType ?? 'line'],
-    );
+    await ensureLineageSessionRow(this.pool, binding as typeof binding & { accountId: string });
     const result = await this.pool.query(
       `UPDATE agent_sessions SET external_session_id = $5, workspace_path = $8, updated_at = now()
        WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 AND provider = $4 AND generation = $6 AND source_type = $7
@@ -519,7 +596,14 @@ export class AgentRepository {
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [queueLockKey(key)]);
       let shared: SharedAdminChat | null = null;
       let candidate;
-      if (key.accountId === null) {
+      if (isAgentScheduleQueueKey(key)) {
+        // Scheduled runs: their own queue, one running at a time, independent of the room, every LINE chat and every session.
+        candidate = await client.query<JobRow>(
+          `SELECT ${jobColumns}
+           FROM agent_jobs j WHERE j.source_type = 'schedule' AND j.status = 'queued'
+             AND NOT EXISTS (SELECT 1 FROM agent_jobs running WHERE running.source_type = 'schedule' AND running.status = 'running')
+           ORDER BY j.queue_position FOR UPDATE SKIP LOCKED LIMIT 1`);
+      } else if (key.accountId === null) {
         shared = await findSharedAdminChat(client);
         if (shared) await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [queueLockKey(adminChatQueueKey(shared))]);
         // The shared Agent room: account-less UI jobs bypass ACTIVE_CONTROL and the control epoch; one runs at a time,
@@ -576,11 +660,15 @@ export class AgentRepository {
   }
 
   async listQueuedConversations(limit = 256): Promise<AgentQueueKey[]> {
-    const result = await this.pool.query<{ account_id: string | null; chat_type: WritableConversationKey['chatType'] | null; chat_id: string | null }>(
+    const result = await this.pool.query<{ account_id: string | null; chat_type: WritableConversationKey['chatType'] | 'schedule' | null; chat_id: string | null }>(
       queuedConversationDiscoverySql, [Math.max(1, Math.min(256, Math.floor(limit)))],
     );
-    return result.rows.map((row): AgentQueueKey => row.account_id === null || row.chat_type === null || row.chat_id === null
-      ? AGENT_ROOM_KEY : { accountId: row.account_id, chatType: row.chat_type, chatId: row.chat_id });
+    return result.rows.map((row): AgentQueueKey => {
+      if (row.account_id === null || row.chat_type === null || row.chat_id === null) {
+        return row.chat_type === 'schedule' ? AGENT_SCHEDULE_QUEUE_KEY : AGENT_ROOM_KEY;
+      }
+      return { accountId: row.account_id, chatType: row.chat_type === 'schedule' ? 'direct' : row.chat_type, chatId: row.chat_id };
+    });
   }
 
   async appendEvent(jobId: string, event: AgentEvent): Promise<void> {
@@ -594,7 +682,7 @@ export class AgentRepository {
 
   async getJobForKey(key: AgentQueueKey, jobId: string): Promise<AgentJob | null> {
     const job = await this.getJob(jobId);
-    return job?.accountId === key.accountId && job.chatType === key.chatType && job.chatId === key.chatId ? job : null;
+    return job?.sourceType === queueKeySourceType(key) && job.accountId === key.accountId && (job.sourceType === 'schedule' || job.chatType === key.chatType) && job.chatId === key.chatId ? job : null;
   }
 
   async listLineJobStatus(key: WritableConversationKey, messageIds: readonly string[]): Promise<AgentJobStatusProjection[]> {
@@ -639,13 +727,14 @@ export class AgentRepository {
     }
   }
 
-  // Key comparisons use IS NOT DISTINCT FROM so the shared Agent room (NULL account/chat) and LINE chats share one path.
+  // Key comparisons use IS NOT DISTINCT FROM so the shared Agent room (NULL account/chat) and LINE chats share one path; the
+  // source type (room vs schedule queue both store NULL columns) is always part of the match.
   async listJobEvents(key: AgentQueueKey, jobId: string): Promise<AgentEvent[]> {
     const result = await this.pool.query<{ event: AgentEvent }>(
       `SELECT e.event FROM agent_events e JOIN agent_jobs j ON j.job_id = e.job_id
        WHERE e.job_id = $1 AND j.account_id IS NOT DISTINCT FROM $2::text AND j.chat_type IS NOT DISTINCT FROM $3::text
-         AND j.chat_id IS NOT DISTINCT FROM $4::text ORDER BY e.event_id`,
-      [jobId, key.accountId, key.chatType, key.chatId],
+         AND j.chat_id IS NOT DISTINCT FROM $4::text AND j.source_type = $5 ORDER BY e.event_id`,
+      [jobId, key.accountId, keyChatType(key), key.chatId, queueKeySourceType(key)],
     );
     return result.rows.map((row) => row.event);
   }
@@ -663,22 +752,22 @@ export class AgentRepository {
 
   async cancelJobForKey(key: AgentQueueKey, jobId: string): Promise<AgentJobStatusProjection | null> {
     const result = await transitionAgentJobStatus(this.pool, 'cancelled',
-      "job_id = $1 AND account_id IS NOT DISTINCT FROM $2::text AND chat_type IS NOT DISTINCT FROM $3::text AND chat_id IS NOT DISTINCT FROM $4::text AND status IN ('queued', 'running')",
-      [jobId, key.accountId, key.chatType, key.chatId]);
+      "job_id = $1 AND account_id IS NOT DISTINCT FROM $2::text AND chat_type IS NOT DISTINCT FROM $3::text AND chat_id IS NOT DISTINCT FROM $4::text AND source_type = $5 AND status IN ('queued', 'running')",
+      [jobId, key.accountId, keyChatType(key), key.chatId, queueKeySourceType(key)]);
     return result[0] ?? null;
   }
 
   async retryJobForKey(key: AgentQueueKey, jobId: string, workspacePath: string): Promise<AgentJobStatusProjection | null> {
     const result = await transitionAgentJobStatus(this.pool, 'queued',
       `job_id = $1 AND account_id IS NOT DISTINCT FROM $2::text AND chat_type IS NOT DISTINCT FROM $3::text
-       AND chat_id IS NOT DISTINCT FROM $4::text AND status IN ('failed', 'interrupted')
-       AND (source_type = 'ui' OR EXISTS (SELECT 1 FROM agent_sessions s WHERE s.account_id IS NOT DISTINCT FROM agent_jobs.account_id
+       AND chat_id IS NOT DISTINCT FROM $4::text AND source_type = $5 AND status IN ('failed', 'interrupted')
+       AND (source_type IN ('ui', 'schedule') OR EXISTS (SELECT 1 FROM agent_sessions s WHERE s.account_id IS NOT DISTINCT FROM agent_jobs.account_id
          AND s.chat_type IS NOT DISTINCT FROM agent_jobs.chat_type
          AND s.chat_id IS NOT DISTINCT FROM agent_jobs.chat_id AND s.provider=agent_jobs.provider AND s.source_type=agent_jobs.source_type AND s.generation=agent_jobs.generation))
        AND NOT EXISTS (SELECT 1 FROM agent_outputs o WHERE o.job_id=agent_jobs.job_id)
-       AND (source_type = 'ui' OR EXISTS (SELECT 1 FROM line_accounts a CROSS JOIN account_control c
+       AND (source_type IN ('ui', 'schedule') OR EXISTS (SELECT 1 FROM line_accounts a CROSS JOIN account_control c
          WHERE a.account_id=agent_jobs.account_id AND a.mode='ACTIVE_CONTROL' AND c.singleton=true AND c.control_epoch=agent_jobs.creation_epoch))`,
-      [jobId, key.accountId, key.chatType, key.chatId], workspacePath);
+      [jobId, key.accountId, keyChatType(key), key.chatId, queueKeySourceType(key)], workspacePath);
     return result[0] ?? null;
   }
 
@@ -689,8 +778,8 @@ export class AgentRepository {
 
   async cancelConversationJobs(key: AgentQueueKey): Promise<AgentJobStatusProjection[]> {
     return transitionAgentJobStatus(this.pool, 'cancelled',
-      "account_id IS NOT DISTINCT FROM $1::text AND chat_type IS NOT DISTINCT FROM $2::text AND chat_id IS NOT DISTINCT FROM $3::text AND status IN ('queued', 'running')",
-      [key.accountId, key.chatType, key.chatId]);
+      "account_id IS NOT DISTINCT FROM $1::text AND chat_type IS NOT DISTINCT FROM $2::text AND chat_id IS NOT DISTINCT FROM $3::text AND source_type = $4 AND status IN ('queued', 'running')",
+      [key.accountId, keyChatType(key), key.chatId, queueKeySourceType(key)]);
   }
 
   async failJob(jobId: string): Promise<AgentJobStatusProjection | null> {
@@ -702,12 +791,14 @@ export class AgentRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const result = await client.query<JobRow>(
+      const result = await client.query<JobRow & { free_mode: boolean }>(
         `SELECT job_id, account_id, chat_type, chat_id, provider, prompt, workspace_path, generation, status,
-         source_type, source_message_id, source_request_id, creation_epoch FROM agent_jobs WHERE job_id = $1 FOR UPDATE`, [jobId],
+         source_type, source_message_id, source_request_id, creation_epoch, free_mode FROM agent_jobs WHERE job_id = $1 FOR UPDATE`, [jobId],
       );
       const row = result.rows[0];
       if (!row || row.status !== 'running') { await client.query('COMMIT'); return null; }
+      // A free-mode job whose whole output is [[NO_REPLY]] completes and is recorded, but nothing is delivered to LINE.
+      const silent = row.free_mode && output.trim() === FREE_MODE_NO_REPLY;
       if (row.source_type === 'line') {
         const control = await client.query<{ mode: string; control_epoch: string }>(
           `SELECT a.mode, c.control_epoch FROM line_accounts a CROSS JOIN account_control c
@@ -718,7 +809,7 @@ export class AgentRepository {
       }
       await client.query('INSERT INTO agent_outputs (job_id, final_text) VALUES ($1,$2)', [jobId, output]);
       const completed = await transitionAgentJobStatus(client, 'completed', 'job_id = $1 AND status = \'running\'', [jobId]);
-      if (row.source_type === 'line') {
+      if (row.source_type === 'line' && !silent) {
         for (const [index, text] of parts.entries()) {
           await client.query(
             `INSERT INTO agent_deliveries (delivery_id, job_id, part_index, text_content, idempotency_key,

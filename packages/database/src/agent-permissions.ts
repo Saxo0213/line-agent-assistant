@@ -21,6 +21,7 @@ import {
   type SetAgentExecutionPolicyInput,
 } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
+import { resolveAgentLineage } from './agent-lineage.js';
 import { withBoundedTransaction } from './bounded-transaction.js';
 
 type Queryable = Pick<Pool, 'query'> | Pick<PoolClient, 'query'>;
@@ -130,18 +131,22 @@ export interface JobPolicy {
 }
 
 /** Job-start resolution used by agent-service; unresolvable state is all-DENY, never ALLOW. */
+/** Stand-in sender of a group free-mode job: resolves to the default room-member rules (user rows never exist for it). */
+export const FREE_MODE_MEMBER_ID = 'free-mode:member';
+
 export async function resolveJobPolicy(queryable: Queryable, jobId: string): Promise<JobPolicy | null> {
   const job = (await queryable.query<{ account_id: string | null; chat_type: ConversationKey['chatType'] | null; chat_id: string | null; source_type: string;
-    source_message_id: string | null; source_sender_id: string | null }>(
-    'SELECT account_id, chat_type, chat_id, source_type, source_message_id, source_sender_id FROM agent_jobs WHERE job_id = $1', [jobId])).rows[0];
+    source_message_id: string | null; source_sender_id: string | null; free_mode: boolean }>(
+    'SELECT account_id, chat_type, chat_id, source_type, source_message_id, source_sender_id, free_mode FROM agent_jobs WHERE job_id = $1', [jobId])).rows[0];
   if (!job) return null;
-  // The shared Agent room is the operator's own: account-less, full permissions, no chat folders.
-  if (job.source_type === 'ui') {
+  // The shared Agent room and scheduled runs are the operator's own: account-less, full permissions, no chat folders.
+  if (job.source_type === 'ui' || job.source_type === 'schedule') {
     return { principal: { kind: 'operator' }, accountId: null, chatType: null, chatId: null, permissions: allPermissions('ALLOW'), linkedChats: [] };
   }
   if (job.account_id === null || job.chat_type === null || job.chat_id === null) return null;
   let principal: JobPrincipal = { kind: 'unresolved' };
-  if (job.source_type === 'line' && job.source_sender_id) {
+  if (job.source_type === 'line' && job.free_mode) principal = { kind: 'user', senderMid: FREE_MODE_MEMBER_ID };
+  else if (job.source_type === 'line' && job.source_sender_id) {
     const admin = await findPrimaryAdminSender(queryable, job.account_id, job.source_sender_id);
     if (admin) principal = { kind: 'admin', userId: admin };
     else principal = { kind: 'user', senderMid: job.source_sender_id };
@@ -530,10 +535,31 @@ export class AgentPermissionRepository {
     }
   }
 
+  /**
+   * The folder an account uses for a chat: its own row, or for the current Agent account the most recent predecessor
+   * folder of the same chat (the directory is named by folder_id and stays where it is; memory files carry over).
+   */
+  private async lineageFolder(accountId: string, chatType: string, chatId: string): Promise<ChatFolderRow | null> {
+    const lineage = await resolveAgentLineage(this.pool);
+    if (lineage.currentAccountId !== accountId) return null;
+    const row = (await this.pool.query<{ folder_id: string; account_id: string; title: string }>(
+      `SELECT f.folder_id, f.account_id, ${CHAT_TITLE_SQL} AS title FROM chat_folders f
+       JOIN conversations c ON c.account_id = f.account_id AND c.chat_type = f.chat_type AND c.chat_id = f.chat_id
+       ${CHAT_CONTACT_JOIN}
+       WHERE f.account_id = ANY($1::text[]) AND f.chat_type = $2 AND f.chat_id = $3
+       ORDER BY array_position($1::text[], f.account_id) LIMIT 1`,
+      [lineage.accountIds.filter((id) => id !== accountId), chatType, chatId])).rows[0];
+    return row ? { folderId: row.folder_id, accountId: row.account_id, chatType: chatType as ChatFolderChatType, chatId, title: row.title } : null;
+  }
+
   /** Idempotent: returns the existing row or creates one for an existing conversation. */
   async ensureChatFolder(accountId: string, chatType: string, chatId: string, createdBy: string): Promise<ChatFolderRow> {
     if (chatType !== 'direct' && chatType !== 'group' && chatType !== 'room') {
       throw new AgentPermissionError('INVALID_CHAT', 'Only direct, group and room chats have folders.');
+    }
+    if (!await this.ownChatFolder(accountId, chatType, chatId)) {
+      const inherited = await this.lineageFolder(accountId, chatType, chatId);
+      if (inherited) return inherited;
     }
     await this.pool.query(
       `INSERT INTO chat_folders (folder_id, account_id, chat_type, chat_id, created_by)
@@ -552,6 +578,10 @@ export class AgentPermissionRepository {
 
   /** Read-only lookup; archive queries must not create a folder row as a side effect. */
   async getChatFolderForConversation(accountId: string, chatType: string, chatId: string): Promise<ChatFolderRow | null> {
+    return await this.ownChatFolder(accountId, chatType, chatId) ?? (chatType === 'direct' || chatType === 'group' || chatType === 'room' ? await this.lineageFolder(accountId, chatType, chatId) : null);
+  }
+
+  private async ownChatFolder(accountId: string, chatType: string, chatId: string): Promise<ChatFolderRow | null> {
     if (chatType !== 'direct' && chatType !== 'group' && chatType !== 'room') return null;
     const row = (await this.pool.query<{ folder_id: string; title: string }>(
       `SELECT f.folder_id, ${CHAT_TITLE_SQL} AS title FROM chat_folders f

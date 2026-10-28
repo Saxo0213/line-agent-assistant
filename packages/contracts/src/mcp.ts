@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ChatTypeSchema } from './account.js';
+import { SCHEDULE_TOOL_NAMES } from './agent-schedule.js';
 
 export const McpToolNameSchema = z.enum([
   'list_targets',
@@ -84,6 +85,8 @@ export const McpTargetSummarySchema = z.strictObject({
   chatId: z.string().min(1),
   conversationTitle: z.string().nullable(),
   members: z.array(McpTargetMemberSchema),
+  /** Present only on the administrator's (Primary Admin) direct chat with the Agent account. */
+  role: z.literal('primary_admin').optional(),
 });
 export type McpTargetSummary = z.infer<typeof McpTargetSummarySchema>;
 
@@ -162,6 +165,54 @@ export const McpListTargetsInputSchema = z.strictObject({
 });
 export type McpListTargetsInput = z.infer<typeof McpListTargetsInputSchema>;
 
+export const MCP_MESSAGE_PAGE_MAX = 200;
+const MCP_MESSAGE_CURSOR_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+const MCP_MESSAGE_CURSOR_HASH_PATTERN = /^[0-9a-f]{16}$/;
+
+export interface McpMessageCursor {
+  /** Microsecond UTC `occurred_at` of the last returned message: `YYYY-MM-DDTHH:MM:SS.ffffffZ`. */
+  occurredAt: string;
+  messageId: string;
+  /** Short hash of the query shape (tool, selectors, text, time range) the cursor was issued for. */
+  queryHash: string;
+}
+
+export function encodeMcpMessageCursor(cursor: McpMessageCursor): string {
+  return btoa(JSON.stringify({ t: cursor.occurredAt, i: cursor.messageId, h: cursor.queryHash })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/** Strict decode: any malformed, non-canonical or out-of-format cursor returns null. */
+export function decodeMcpMessageCursor(value: string): McpMessageCursor | null {
+  if (value.length < 1 || value.length > 512 || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  let parsed: unknown;
+  try {
+    const padded = value.replace(/-/g, '+').replace(/_/g, '/');
+    parsed = JSON.parse(atob(padded + '='.repeat((4 - (padded.length % 4)) % 4)));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.length !== 3 || keys[0] !== 'h' || keys[1] !== 'i' || keys[2] !== 't') return null;
+  const { t, i, h } = record;
+  if (typeof t !== 'string' || typeof i !== 'string' || typeof h !== 'string') return null;
+  if (!MCP_MESSAGE_CURSOR_TIME_PATTERN.test(t) || !MCP_MESSAGE_CURSOR_HASH_PATTERN.test(h) || i.length < 1 || i.length > 256) return null;
+  const millis = Date.parse(`${t.slice(0, 23)}Z`);
+  if (!Number.isFinite(millis) || new Date(millis).toISOString() !== `${t.slice(0, 23)}Z`) return null;
+  const cursor = { occurredAt: t, messageId: i, queryHash: h };
+  return encodeMcpMessageCursor(cursor) === value ? cursor : null;
+}
+
+const McpMessageCursorSchema = z.string().min(1).max(512).refine((value) => decodeMcpMessageCursor(value) !== null, { message: 'Invalid cursor.' });
+
+export const McpMessagePageSchema = z.strictObject({
+  returned: z.number().int().min(0).max(MCP_MESSAGE_PAGE_MAX),
+  limit: z.number().int().min(1).max(MCP_MESSAGE_PAGE_MAX),
+  hasMore: z.boolean(),
+  nextCursor: z.string().min(1).max(512).nullable(),
+});
+
 const TargetSelectorBaseSchema = z.strictObject({
   accountId: z.string().trim().min(1).optional(),
   target: z.string().trim().min(1).max(256).optional(),
@@ -171,7 +222,9 @@ const TargetSelectorBaseSchema = z.strictObject({
   senderId: z.string().trim().min(1).max(256).optional(),
   senderName: z.string().trim().min(1).max(256).optional(),
   text: z.string().trim().max(512).optional(),
-  limit: z.number().int().min(1).max(200).optional(),
+  /** Values above the page size are clamped to MCP_MESSAGE_PAGE_MAX instead of rejected; use cursor to read further. */
+  limit: z.number().int().min(1).transform((value) => Math.min(value, MCP_MESSAGE_PAGE_MAX)).optional(),
+  cursor: McpMessageCursorSchema.optional(),
 });
 
 export const McpQueryTargetMessagesInputSchema = TargetSelectorBaseSchema.superRefine((value, ctx) => {
@@ -268,10 +321,16 @@ export const McpToolOutputUnionSchema = z.discriminatedUnion('toolName', [
   z.strictObject({
     toolName: z.literal('query_target_messages'),
     messages: z.array(McpMessageRecordSchema),
+    hasMore: z.boolean(),
+    nextCursor: z.string().min(1).max(512).nullable(),
+    page: McpMessagePageSchema,
   }),
   z.strictObject({
     toolName: z.literal('query_target_messages_by_time'),
     messages: z.array(McpMessageRecordSchema),
+    hasMore: z.boolean(),
+    nextCursor: z.string().min(1).max(512).nullable(),
+    page: McpMessagePageSchema,
     from: z.iso.datetime({ offset: true }).nullable(),
     to: z.iso.datetime({ offset: true }).nullable(),
   }),
@@ -290,7 +349,7 @@ export const AGENT_ROOM_HISTORY_TOOL_NAME = 'query_agent_room_history' as const;
 export const LIST_SEND_TARGETS_TOOL_NAME = 'list_send_targets' as const;
 export const SEND_TO_TARGET_TOOL_NAME = 'send_to_target' as const;
 export const McpInternalToolNameSchema = z.enum([
-  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME,
+  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, ...SCHEDULE_TOOL_NAMES,
 ]);
 export type McpInternalToolName = z.infer<typeof McpInternalToolNameSchema>;
 /** The principal of an Agent room job or the local console UI; an admin-direct LINE job is also allowed while the room shares that chat. */
@@ -414,6 +473,8 @@ export const McpSendTargetSchema = z.strictObject({
   title: z.string().nullable(),
   members: z.array(z.string()).max(5),
   memberCount: z.number().int().nonnegative(),
+  /** Present only on the administrator's (Primary Admin) direct chat with the Agent account. */
+  role: z.literal('primary_admin').optional(),
 });
 export type McpSendTarget = z.infer<typeof McpSendTargetSchema>;
 

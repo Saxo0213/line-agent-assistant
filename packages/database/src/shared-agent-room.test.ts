@@ -23,7 +23,8 @@ database('migration 040: one shared Agent room', () => {
     let close: (() => Promise<void>) | undefined;
     try {
       for (const name of await readdir(sourceDirectory)) {
-        if (name !== migrationName && /^\d+_.*\.sql$/.test(name)) await copyFile(join(sourceDirectory, name), join(directory, name));
+        // 072 extends the constraints 040 creates, so it can only run after 040.
+        if (name !== migrationName && !name.startsWith('072_') && /^\d+_.*\.sql$/.test(name)) await copyFile(join(sourceDirectory, name), join(directory, name));
       }
       const created = await createTestDatabase(directory);
       close = created.close;

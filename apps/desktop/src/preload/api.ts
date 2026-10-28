@@ -3,6 +3,11 @@ import {
   AgentApprovalDecisionSchema,
   PendingAgentApprovalSchema,
   type AgentApprovalDecision,
+  type AgentSchedule,
+  type AgentScheduleCreateInput,
+  type AgentScheduleRun,
+  type AgentScheduleTargetOption,
+  type AgentScheduleUpdatePatch,
   type PendingAgentApproval,
   type AgentPermissionsView,
   AgentPermissionDefaultsViewSchema,
@@ -48,6 +53,7 @@ import {
   type McpToolName,
   type McpToolOutputUnion,
   type MessageSearchResult,
+  type MessageSearchScope,
   type ChatResourceNote,
   type ChatResourceAlbum,
   type ChatResourcePhoto,
@@ -57,11 +63,18 @@ import { DatabaseSetupResultSchema, SETUP_PROGRESS_CHANNEL, SetupProgressEventSc
   type EmbeddedConnectionInfo, type SetupProgressEvent } from '../setup-protocol.js';
 import type { FriendRow, MessagePage, MessageReader, WorkRecord } from '../main/service-facade.js';
 import { LocaleSnapshotSchema, type LocalePreference, type LocaleSnapshot } from '../locale.js';
+import { UPDATE_CHECK_CHANNEL, UPDATE_CHECK_STATE_CHANNEL, UpdateCheckStateSchema, type UpdateCheckRequest, type UpdateCheckState } from '../update-check-protocol.js';
 
 export type DesktopApi = {
   reportRendererFailure?(): Promise<IpcResult>;
   getLocale(): Promise<LocaleSnapshot>;
   setLocale(preference: LocalePreference): Promise<LocaleSnapshot>;
+  /** Update check against the public repository (Settings → About). Optional so older test doubles stay valid. */
+  getUpdateCheckState?(): Promise<UpdateCheckState>;
+  setUpdateCheckEnabled?(enabled: boolean): Promise<UpdateCheckState>;
+  checkForUpdateNow?(): Promise<UpdateCheckState>;
+  openUpdateReleasePage?(): Promise<UpdateCheckState>;
+  onUpdateCheckState?(callback: (state: UpdateCheckState) => void): () => void;
   getSnapshot(): Promise<AppSnapshot>;
   listMessages(key: ConversationKey, cursor: string | null, limit?: number, messageId?: string): Promise<MessagePage>;
   listChatNotes(key: ConversationKey, cursor: string | null, requestId?: string): Promise<{ notes: ChatResourceNote[]; nextCursor: string | null }>;
@@ -82,7 +95,7 @@ export type DesktopApi = {
   listSystemErrors(): Promise<ReturnType<typeof SystemErrorsResultSchema.parse>>;
   getControlState(): Promise<{ activeAccountId: string | null; epoch: number; pendingOutbound: number }>;
   getJobEvents(key: WritableConversationKey, jobId: string): Promise<AgentEvent[]>;
-  searchMessages(query: { key?: ConversationKey; accountId?: string; senderId?: string; text?: string; limit: number }): Promise<MessageSearchResult[]>;
+  searchMessages(query: { key?: ConversationKey; accountId?: string; scope?: MessageSearchScope; senderId?: string; text?: string; limit: number }): Promise<MessageSearchResult[]>;
   searchAgentJobs(query: AgentJobSearchQuery): Promise<{ jobs: AgentJobSummary[]; nextCursor: NonNullable<AgentJobSearchQuery['cursor']> | null }>;
   sendText(key: WritableConversationKey, text: string): Promise<IpcResult>;
   replyText(key: WritableConversationKey, replyToMessageId: string, text: string): Promise<IpcResult>;
@@ -161,6 +174,17 @@ export type DesktopApi = {
   setAgentFolderLink(input: SetAgentFolderLinkInput): Promise<IpcResult>;
   createChatFolder(input: { accountId: string; chatType: 'direct' | 'group' | 'room'; chatId: string }): Promise<IpcResult>;
   openChatFolder(folderId: string): Promise<IpcResult>;
+  /** Scheduled Agent triggers. Live updates arrive as an `agentSchedulesChanged` event on onEvent; re-read with listAgentSchedules. */
+  listAgentSchedules(): Promise<AgentSchedule[]>;
+  /** Resolves to `{ type: 'createAgentSchedule', schedule }` or an error result (`SCHEDULE_LIMIT`, `SCHEDULE_NO_FUTURE_TIME`). */
+  createAgentSchedule(schedule: AgentScheduleCreateInput): Promise<IpcResult>;
+  /** Resolves to `{ type: 'updateAgentSchedule', schedule }` or an error result (`SCHEDULE_NOT_FOUND`, `SCHEDULE_LIMIT`, `SCHEDULE_NO_FUTURE_TIME`). */
+  updateAgentSchedule(scheduleId: string, patch: AgentScheduleUpdatePatch): Promise<IpcResult>;
+  /** Resolves to `{ type: 'deleteAgentSchedule' }` or an error result (`SCHEDULE_NOT_FOUND`). */
+  deleteAgentSchedule(scheduleId: string): Promise<IpcResult>;
+  listAgentScheduleRuns(scheduleId: string, limit?: number): Promise<AgentScheduleRun[]>;
+  /** Chats a schedule can use. read (default): any chat the Agent can read, communities included; delivery: the Agent account's direct, group and room chats. */
+  listAgentScheduleTargets(query?: string, limit?: number, purpose?: 'read' | 'delivery'): Promise<AgentScheduleTargetOption[]>;
   getDatabaseSetupStatus(): Promise<DatabaseSetupStatus>;
   listDatabases(connection: DatabaseConnectionInput): Promise<string[]>;
   createDatabase(connection: DatabaseConnectionInput, database: string): Promise<string[]>;
@@ -214,9 +238,19 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     if (!result.ok) throw Object.assign(new Error(result.message), { ...(result.errorCode ? { errorCode: result.errorCode } : {}), ...(result.restartRequired ? { restartRequired: true } : {}) });
     return result;
   };
+  const updateCheck = async (body: UpdateCheckRequest) => UpdateCheckStateSchema.parse(await transport.invoke(UPDATE_CHECK_CHANNEL, body));
   return Object.freeze({
     async getLocale() { return LocaleSnapshotSchema.parse(await transport.invoke('line-agent:locale', { type: 'getLocale' })); },
     async setLocale(preference) { return LocaleSnapshotSchema.parse(await transport.invoke('line-agent:locale', { type: 'setLocale', preference })); },
+    getUpdateCheckState: () => updateCheck({ type: 'getState' }),
+    setUpdateCheckEnabled: (enabled) => updateCheck({ type: 'setEnabled', enabled }),
+    checkForUpdateNow: () => updateCheck({ type: 'checkNow' }),
+    openUpdateReleasePage: () => updateCheck({ type: 'openReleasePage' }),
+    onUpdateCheckState(callback) {
+      const listener = (_event: unknown, payload: unknown) => { const parsed = UpdateCheckStateSchema.safeParse(payload); if (parsed.success) callback(parsed.data); };
+      transport.on(UPDATE_CHECK_STATE_CHANNEL, listener);
+      return () => transport.removeListener(UPDATE_CHECK_STATE_CHANNEL, listener);
+    },
     reportRendererFailure: () => request({ type: 'reportRendererFailure' }),
     async getSnapshot() { const result = await request({ type: 'getSnapshot' }); if (result.type !== 'getSnapshot') throw new Error(result.type === 'error' ? result.message : 'Unexpected snapshot response'); return AppSnapshotSchema.parse(result.snapshot); },
     async listMessages(key, cursor, limit = 75, messageId) { const result = await read({ type: 'listMessages', key, cursor, limit, ...(messageId ? { messageId } : {}) }); return MessagePageSchema.parse(result.page); },
@@ -373,6 +407,24 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     setAgentFolderLink: (input) => request({ type: 'setAgentFolderLink', ...input }),
     createChatFolder: (input) => request({ type: 'createChatFolder', ...input }),
     openChatFolder: (folderId) => request({ type: 'openChatFolder', folderId }),
+    async listAgentSchedules() {
+      const result = await request({ type: 'listAgentSchedules' });
+      if (result.type !== 'listAgentSchedules') throw new Error(result.type === 'error' ? result.message : 'Unexpected schedules response');
+      return result.schedules;
+    },
+    createAgentSchedule: (schedule) => request({ type: 'createAgentSchedule', schedule }),
+    updateAgentSchedule: (scheduleId, patch) => request({ type: 'updateAgentSchedule', scheduleId, patch }),
+    deleteAgentSchedule: (scheduleId) => request({ type: 'deleteAgentSchedule', scheduleId }),
+    async listAgentScheduleTargets(query, limit = 20, purpose = 'read') {
+      const result = await request({ type: 'listAgentScheduleTargets', ...(query ? { query } : {}), limit, purpose });
+      if (result.type !== 'listAgentScheduleTargets') throw new Error(result.type === 'error' ? result.message : 'Unexpected schedule targets response');
+      return result.targets;
+    },
+    async listAgentScheduleRuns(scheduleId, limit = 20) {
+      const result = await request({ type: 'listAgentScheduleRuns', scheduleId, limit });
+      if (result.type !== 'listAgentScheduleRuns') throw new Error(result.type === 'error' ? result.message : 'Unexpected schedule runs response');
+      return result.runs;
+    },
     async getDatabaseSetupStatus() { const result = await setup({ type: 'getDatabaseSetupStatus' }); if (result.type !== 'getDatabaseSetupStatus') throw new Error('Unexpected setup response'); return result.status; },
     async listDatabases(connection) { const result = await setup({ type: 'listDatabases', connection }); if (result.type !== 'listDatabases') throw new Error('Unexpected setup response'); return result.databases; },
     async createDatabase(connection, database) { const result = await setup({ type: 'createDatabase', connection, database }); if (result.type !== 'createDatabase') throw new Error('Unexpected setup response'); return result.databases; },

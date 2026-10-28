@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { normalizeNativePicturePath } from '@line-agent/contracts';
 import { transitionAgentJobStatus, type AgentJobStatusProjection } from './agent-repository.js';
+import { appendAgentLineage, retireAgentLineage } from './agent-lineage.js';
 import { withBoundedTransaction } from './bounded-transaction.js';
 import { normalizeManagedMcpScopes } from './managed-mcp-scopes.js';
 
@@ -167,6 +168,7 @@ export class AccountRepository {
         `UPDATE line_accounts SET product_role=NULL,mode='MONITOR_ONLY',role_revision=role_revision+1,status='disconnected',
            worker_instance_id=NULL,worker_binding_epoch=NULL,auto_login_on_startup=false,connection_mode='OFFLINE',
            selected_source_id=NULL,selected_source_generation=NULL,updated_at=now() WHERE account_id=$1`, [accountId]);
+      await retireAgentLineage(client, accountId);
       await client.query(
         `UPDATE line_account_sources SET state='RETIRED',retired_at=now()
          WHERE account_id=$1 AND state<>'RETIRED'`, [accountId]);
@@ -176,6 +178,7 @@ export class AccountRepository {
       const inserted = await client.query<{ account_id: string; mode: AccountMode; own_mid: string | null }>(
         `INSERT INTO line_accounts(account_id,display_name,product_role) VALUES($1,'LINE Agent','AGENT')
          RETURNING account_id,mode,own_mid`, [nextId]);
+      await appendAgentLineage(client, nextId);
       await client.query(
         `INSERT INTO conversations(account_id,chat_type,chat_id,title,agent_enabled)
          VALUES($1,'direct',$2,$3,true) ON CONFLICT(account_id,chat_type,chat_id) DO NOTHING`,
@@ -236,6 +239,7 @@ export class AccountRepository {
         `INSERT INTO line_accounts (account_id,display_name,product_role)
          VALUES ($1,$2,$3) RETURNING account_id,mode,own_mid`,
         [accountId, role === 'AGENT' ? 'LINE Agent' : 'Primary Admin', role]);
+      if (role === 'AGENT') await appendAgentLineage(client, accountId);
       await client.query(
         `INSERT INTO conversations (account_id,chat_type,chat_id,title,agent_enabled)
          VALUES ($1,'direct',$2,$3,true) ON CONFLICT (account_id,chat_type,chat_id) DO NOTHING`,

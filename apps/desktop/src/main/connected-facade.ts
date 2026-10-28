@@ -8,9 +8,9 @@ import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
+import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
 import {
-  AccountRepository, AdminRepository, AgentPermissionError, AgentPermissionRepository, AgentRepository, resolveJobPolicy, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, RoomActivationRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
+  AccountRepository, AdminRepository, AgentPermissionError, AgentPermissionRepository, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
 import type { Attachment, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
@@ -22,6 +22,9 @@ import type { Locale } from '../locale.js';
 import { boundedSticonRawSql, projectSticons } from './sticon-projection.js';
 import { AccountSupervisor, LineService } from './services/line-service.js';
 import { AgentService, type AgentRunner, type InternalMcpLauncher } from './services/agent-service.js';
+import { AgentScheduleService } from './services/agent-schedule-service.js';
+import { FreeModeService } from './services/free-mode-service.js';
+import { createAgentScheduleTargetResolver } from './services/agent-schedule-targets.js';
 import { AgentAttachmentError } from './services/agent-attachments.js';
 import { loadLinejsMcpSkill } from './services/mcp-skill.js';
 import { AgentJobEnvironmentService } from './services/agent-job-environment.js';
@@ -71,6 +74,7 @@ import { createOwnAvatarRefreshScheduler, runOwnAvatarRefreshes } from './servic
 import { cleanupStaleManualMedia, ManualMediaError, stageManualMedia } from './services/manual-media-staging.js';
 import { createManualMediaAdmission } from './services/manual-media-admission.js';
 import { ManualSendNotStartedError } from './services/manual-send-errors.js';
+import { pickWorkerBinding } from './worker-binding-fields.js';
 
 const REPLY_SENDER_NAME_SQL = senderNameSql({ m: 'qm', la: 'qla', c: 'qc', cm: 'qcm',
   senderContact: 'quoted_sender_contact', peerContact: 'quoted_peer_contact' });
@@ -133,6 +137,8 @@ export interface IntegratedWorkerGateway {
   readChatResource?(command: ChatResourceRequest, signal?: AbortSignal): Promise<ChatResourceReadResult>;
   adoptDownloadAuth?(command: Extract<LineWorkerCommand, { type: 'adoptDownloadAuth' }>, signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'downloadAuthResult' }>>;
   isDownloadReady?(binding: WorkerBinding): boolean;
+  /** Effective per-operation bound of the gateway (child boot/protocol guard and in-flight sends). */
+  readonly responseTimeoutMs?: number;
   waitModeAck(accountId: string, mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY', timeoutMs: number): Promise<boolean>;
   /** Resolves on the child protocol ack, before restart adoption finishes. */
   waitRawModeAck?(accountId: string, mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY', timeoutMs: number): Promise<boolean>;
@@ -409,6 +415,20 @@ export async function createConnectedFacade(options: ConnectedFacadeOptions): Pr
   }
 }
 
+/** Startup auto-login failure tagged with the failing step. Carries only platform discriminants, never token or message data. */
+class StartupStageError extends Error {
+  readonly code?: unknown;
+  constructor(readonly stage: 'admission' | 'spawn' | 'dispatch' | 'response', readonly retryable: boolean, cause: unknown) {
+    super(cause instanceof Error ? cause.message : 'Startup failed');
+    this.name = cause instanceof Error && cause.name === 'TimeoutError' ? 'TimeoutError' : 'StartupStageError';
+    this.code = cause && typeof cause === 'object' ? (cause as { code?: unknown }).code : undefined;
+  }
+}
+/** Fallback when the gateway does not expose its effective bound; equals the gateway default. */
+const DEFAULT_WORKER_RESPONSE_TIMEOUT_MS = 30_000;
+/** Single delayed retry for a failed startup auto-login. */
+const STARTUP_AUTOLOGIN_RETRY_DELAY_MS = 5_000;
+
 async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, startupCleanup: StartupCleanup): Promise<DesktopServiceFacade> {
   async function recordExternalMonitorDiagnostic(...args: Parameters<typeof persistExternalMonitorDiagnostic>): Promise<void> {
     const correlationId = options.audit?.failure({ operation: 'external_monitor', stage: args[4] ?? (args[1] === 'startup' ? 'bootstrap' : 'execute'),
@@ -447,6 +467,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let stopMcpHttpServer: () => Promise<void> = async () => undefined;
   let agentService!: AgentService;
   let stopAgentService: () => Promise<void> = async () => undefined;
+  let stopAgentSchedules: () => Promise<void> = async () => undefined;
+  let freeMode: FreeModeService | undefined;
   let delivery!: DeliveryService;
   let stopDelivery: () => Promise<void> = async () => undefined;
   let stopLineSend: () => Promise<void> = async () => undefined;
@@ -724,7 +746,22 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     } });
   stopLineSend = onceCleanup(() => agentLineSend.shutdown());
   startupCleanup.add(stopLineSend);
-  mcpService = new McpService({ pool: options.pool, tokens: mcpTokens, messages, approvalBroker, lineSend: agentLineSend,
+  const freeModeStore = new RoomFreeModeRepository(options.pool);
+  const scheduleTargets = createAgentScheduleTargetResolver({ messages, pool: options.pool });
+  // Scheduled Agent triggers (list/create/update/delete_schedule and the schedules IPC). The Agent room job is submitted through
+  // agentService, which is built later; the service only calls it from its tick, which starts after both exist.
+  const agentSchedules = new AgentScheduleService({ store: new AgentScheduleRepository(options.pool), targets: scheduleTargets, agentLineage: () => resolveAgentLineage(options.pool),
+    primaryAdminChat: async () => {
+      const identity = await agents.describeJobIdentity({ sourceType: 'ui', accountId: null, chatType: null, chatId: null });
+      return identity.admin ? { accountId: identity.admin.accountId, chatId: identity.admin.chatId, title: identity.admin.name ?? '' } : null;
+    },
+    submit: (input) => agentService.submitScheduled(input),
+    sendSystemText: (input) => agentLineSend.sendSystemText({ runId: input.runId, target: input.target, text: input.text }),
+    publish: () => { options.publish?.({ type: 'agentSchedulesChanged' }); },
+    onError: (error) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); } });
+  stopAgentSchedules = onceCleanup(() => agentSchedules.stop());
+  startupCleanup.add(stopAgentSchedules);
+  mcpService = new McpService({ pool: options.pool, tokens: mcpTokens, messages, approvalBroker, lineSend: agentLineSend, schedules: agentSchedules,
     onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
     ...(chatResourceStore ? { chatResources: createMcpChatResourceArchiveReader(chatResources, diagnostics ? (record) => diagnostics.record(record) : undefined) } : {}),
     getLiveLoginBinding: getMcpLiveLoginBinding,
@@ -864,6 +901,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return { endpoint: transport.endpoint, token };
     },
     release: (jobId) => mcpService.internalCapabilities.release(jobId),
+    scheduleContext: (sourceRequestId) => agentSchedules.runContext(sourceRequestId),
     skill: async () => {
       if (!options.skillsDirectory) return null;
       if (skillText) return skillText;
@@ -885,7 +923,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     },
     async (jobId) => delivery.deliverCompletedJob(jobId),
     2, 30 * 60 * 1000, 5000, 1,
-    async (_jobId, key, messageId, reaction) => lineService.reactToMessage(key, messageId, reaction),
+    async (jobId, key, messageId, reaction) => {
+      // A free-mode job is not a reply to its last batch message: no reaction on a member's message.
+      if (await freeModeStore.isFreeModeJob(jobId).catch(() => false)) return;
+      return lineService.reactToMessage(key, messageId, reaction);
+    },
     (job) => mcpService.resolvePromptContext(job),
     (projection) => publishAgentJobStatus(projection),
     internalMcpLauncher, agentJobEnvironment,
@@ -950,7 +992,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return false;
       }
       try { acquired = await access.access.acquireAuthCandidates(probeSignal); }
-      catch {
+      catch (error) {
+        if (!probeSignal.aborted) {
+          options.audit?.failure(diagnosticFailure('adoptDownloadAuth', 'prepare', error),
+            { accountId, initiator: 'system', background: true }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED');
+        }
         await options.workers.stopBinding(current).catch(() => undefined);
         return false;
       }
@@ -964,7 +1010,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           if (result.accepted) return true;
         } catch { /* A failed candidate is followed by the next bounded native candidate. */ }
       }
-      if (!signal?.aborted && !access.signal.aborted) await options.workers.stopBinding(current).catch(() => undefined);
+      if (!signal?.aborted && !access.signal.aborted) {
+        options.audit?.failure(diagnosticFailure('adoptDownloadAuth', 'authenticate'),
+          { accountId, initiator: 'system', background: true }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED');
+        await options.workers.stopBinding(current).catch(() => undefined);
+      }
       return false;
     })().finally(() => { if (downloadAuthFlights.get(accountId) === task) downloadAuthFlights.delete(accountId); });
     downloadAuthFlights.set(accountId, task);
@@ -1015,7 +1065,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       const account = await accounts.getAccount(accountId);
       if (!account?.ownMid) return null;
       try { return await ensureDownloadOnlyWorker(accountId, account.ownMid); }
-      catch { return null; }
+      catch (error) {
+        options.audit?.failure(diagnosticFailure('downloadAttachment', 'spawn', error),
+          { accountId, initiator: 'system', background: true }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED');
+        return null;
+      }
     },
     isReady: async (binding, canAcquireAuth): Promise<boolean> => {
       const current = await options.workers.binding(binding.accountId);
@@ -1095,47 +1149,15 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     const lifetimeSignal = AbortSignal.any([abort.signal, primaryFriendshipLifetime.signal]);
     let consumedTrigger = trigger;
     const task = track(async () => {
-      // The worker ACK can be delayed. Recheck the captured binding while that
-      // bounded ACK wait is pending so teardown does not depend on ACK arrival.
-      while (!lifetimeSignal.aborted && !closing) {
-        const acknowledgement = options.workers.waitModeAck(binding.accountId, 'ACTIVE_CONTROL', 100);
-        let ready = false;
-        while (!lifetimeSignal.aborted && !closing) {
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          let cancel: (() => void) | undefined;
-          const tick = new Promise<{ type: 'tick' }>((resolve) => {
-            timer = setTimeout(() => resolve({ type: 'tick' }), 100);
-            cancel = () => resolve({ type: 'tick' });
-            lifetimeSignal.addEventListener('abort', cancel, { once: true });
-          });
-          const outcome = await Promise.race([
-            acknowledgement.then((acknowledged) => ({ type: 'ack' as const, acknowledged })),
-            tick,
-          ]);
-          if (timer !== undefined) clearTimeout(timer);
-          if (cancel) lifetimeSignal.removeEventListener('abort', cancel);
-          if (outcome.type === 'ack') { ready = outcome.acknowledged; break; }
-          if (lifetimeSignal.aborted || closing) return;
-          const current = await options.workers.binding(binding.accountId);
-          if (lifetimeSignal.aborted || !samePrimaryFriendshipBinding(current, binding)) return;
-        }
-        if (!ready) {
-          await new Promise<void>((resolve) => {
-            let timer: ReturnType<typeof setTimeout> | undefined;
-            const finish = () => {
-              if (timer !== undefined) clearTimeout(timer);
-              lifetimeSignal.removeEventListener('abort', finish);
-              resolve();
-            };
-            timer = setTimeout(finish, 100);
-            lifetimeSignal.addEventListener('abort', finish, { once: true });
-          });
-          const current = await options.workers.binding(binding.accountId);
-          if (lifetimeSignal.aborted || !samePrimaryFriendshipBinding(current, binding)) return;
-          continue;
-        }
-        break;
-      }
+      // One bounded wait for the worker ACK; teardown ends it immediately through lifetimeSignal.
+      let cancel: (() => void) | undefined;
+      const aborted = new Promise<false>((resolve) => {
+        cancel = () => resolve(false);
+        if (lifetimeSignal.aborted) cancel(); else lifetimeSignal.addEventListener('abort', cancel, { once: true });
+      });
+      const ready = await Promise.race([options.workers.waitModeAck(binding.accountId, 'ACTIVE_CONTROL', workerBoundMs), aborted])
+        .finally(() => { if (cancel) lifetimeSignal.removeEventListener('abort', cancel); });
+      if (!ready || lifetimeSignal.aborted || closing) return;
       if (lifetimeSignal.aborted || closing) return;
       const current = await options.workers.binding(binding.accountId);
       if (lifetimeSignal.aborted || !samePrimaryFriendshipBinding(current, binding)
@@ -1194,6 +1216,15 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     await options.secretStore?.loadOrCreateRoomActivationDigestKey() ?? randomBytes(32), 1, lineReplyTransport, options.locale ?? 'en');
   const permissionCommands = createPermissionCommandService(permissionRepository, lineReplyTransport,
     publishExecutionPolicyChanged, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic));
+  // Group free mode: durable window per chat, debounced member messages, one room-member Agent job per batch.
+  freeMode = new FreeModeService({ store: freeModeStore,
+    roomGrant: (key) => roomActivation.getActiveRoomAuthorization(key).then((grant) => grant ? { grantId: grant.grantId, version: grant.version } : null),
+    sendSystemText: (input) => agentLineSend.sendSystemText(input),
+    provider: async (key) => (await settings.getConversationAgent(key))?.provider ?? 'codex',
+    workspacePath: async () => { const inspection = await workspace.inspect(); return inspection.status === 'available' ? inspection.path : null; },
+    kick: (key) => agentService.kick(key),
+    onError: (error) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); } });
+  startupCleanup.add(() => freeMode?.stop());
   lineService = new LineService(accounts, messages, settings,
     { send: async (command) => { await sendLineCommand(command); } }, agentService, options.secretStore, attachmentService,
     async (envelope, secretCandidate, ownMid, capturedBinding) => {
@@ -1237,7 +1268,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
               requestId: randomUUID(), chatType: 'direct', chatId: envelope.chatId,
               text: linePrompt(options.locale ?? 'en', 'adminWelcome'), replyToMessageId: null });
             if (result.status !== 'sent') console.warn('[admin-pairing] welcome send did not report sent');
-          } catch {
+          } catch (error) {
+            options.audit?.failure(diagnosticFailure('sendText', 'execute', error),
+              { accountId: envelope.accountId, initiator: 'system', background: true }, 'MESSAGE_SEND_FAILED');
             console.warn('[admin-pairing] welcome send failed');
           }
         }, { operation: 'line_ingest', identity: { accountId: envelope.accountId, background: true } })
@@ -1265,7 +1298,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           if (conversation) options.publish?.({ type: 'messageStored', key: change.key, messageId: change.messageId, conversation });
         }
       }, { operation: 'line_ingest', identity: { ...(changes[0] ? { accountId: changes[0].key.accountId } : {}), background: true } }).catch(() => undefined);
-    }, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic));
+    }, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic), freeMode);
   lineServiceReady = true;
   delivery = new DeliveryService(agents, {
     binding: (accountId) => options.workers.binding(accountId),
@@ -1275,6 +1308,20 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   stopDelivery = onceCleanup(() => delivery.shutdown());
   startupCleanup.add(stopDelivery);
   // Queued jobs are reclaimed only after the MCP listener is bound (see below) so their capability can be minted.
+  /** One bound for child boot/first ack and for draining in-flight sends: the gateway's own response bound. */
+  const workerBoundMs = options.workers.responseTimeoutMs ?? DEFAULT_WORKER_RESPONSE_TIMEOUT_MS;
+  /** Waits for the mode ack within the boot bound; records one System Errors failure on a real timeout. */
+  const waitModeAckReportingTimeout = async (binding: Bound, mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY',
+    signal: AbortSignal | undefined, operation: 'line_ingest' | 'delivery'): Promise<boolean> => {
+    if (await options.workers.waitModeAck(binding.accountId, mode, workerBoundMs)) return !signal?.aborted;
+    if (signal?.aborted || closing) return false;
+    const current = await options.workers.binding(binding.accountId);
+    if (signal?.aborted || closing || !current || current.workerInstanceId !== binding.workerInstanceId
+      || current.controlEpoch !== binding.controlEpoch || current.mode !== mode) return false;
+    options.audit?.failure(diagnosticFailure(operation, 'response', Object.assign(new Error('Worker mode acknowledgement timed out'), { name: 'TimeoutError' })),
+      { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, initiator: 'system', background: true });
+    return false;
+  };
   const supervisedWorker = (binding: Bound) => ({
     send: async (command: LineWorkerCommand) => { await options.workers.send(command); },
     waitModeAck: (mode: Bound['mode'], timeoutMs: number) => mode === 'PAUSED' ? Promise.resolve(false)
@@ -1294,8 +1341,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       return supervisedWorker(binding);
     },
-  }, 3000, (phase, target) => health.setSwitchPhase(phase, target), (jobId) => options.agent.cancel(jobId),
-    (projection) => agentService.publishCommittedStatus(projection));
+  }, workerBoundMs, (phase, target) => health.setSwitchPhase(phase, target), (jobId) => options.agent.cancel(jobId),
+    (projection) => agentService.publishCommittedStatus(projection), workerBoundMs);
 
   function schedulePendingDeliveryRecovery(accountId: string): void {
     if (closing) return;
@@ -1546,7 +1593,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       const mode = binding.mode;
       schedulePrimaryAdministratorFriendship(binding, signal);
       if (mode !== 'PAUSED') void track(async () => {
-        if (signal.aborted || !await options.workers.waitModeAck(binding.accountId, mode, 3000) || signal.aborted) return;
+        if (signal.aborted || !await waitModeAckReportingTimeout(binding, mode, signal, 'line_ingest')) return;
         const current = await options.workers.binding(binding.accountId);
         if (signal.aborted || !current || current.workerInstanceId !== binding.workerInstanceId
           || current.controlEpoch !== binding.controlEpoch || current.mode !== mode) return;
@@ -1567,7 +1614,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   async function recoverPendingAfterReady(binding: Bound, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted || closing || binding.mode !== 'ACTIVE_CONTROL'
       || !lineService.isAuthenticatedReady(binding) || !options.workers.isCurrentActiveControlBinding(binding)) return;
-    if (!await options.workers.waitModeAck(binding.accountId, 'ACTIVE_CONTROL', 3000)) return;
+    if (!await waitModeAckReportingTimeout(binding, 'ACTIVE_CONTROL', signal, 'delivery')) return;
     if (signal?.aborted) return;
     const current = await options.workers.binding(binding.accountId);
     if (!current || current.mode !== 'ACTIVE_CONTROL' || current.accountId !== binding.accountId
@@ -1584,35 +1631,91 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   async function startStoredAccount(account: Awaited<ReturnType<AccountRepository['getAccount']>> & {}): Promise<Bound> {
     await stopExternalImportForAccount(account.accountId);
     if (!account.productRole) throw new Error('LINE account role is unclassified; worker start is blocked');
-    let control = await accounts.getControlState();
-    if (account.productRole === 'PRIMARY_ADMIN' && control.activeAccountId === account.accountId) {
-      throw new Error('Primary Admin account cannot own Agent control');
-    }
-    if (account.productRole === 'AGENT' && control.activeAccountId && control.activeAccountId !== account.accountId) {
-      throw new Error('Agent control is owned by a different account; refusing automatic transfer');
-    }
+    let control: Awaited<ReturnType<AccountRepository['getControlState']>>;
     let mode: Bound['mode'] = account.mode === 'ACTIVE_CONTROL' ? 'ACTIVE_CONTROL' : 'MONITOR_ONLY';
-    if (account.productRole === 'AGENT' && !control.activeAccountId) {
-      const activation = await accounts.activateControl(account.accountId, control.controlEpoch);
+    try {
       control = await accounts.getControlState();
-      if (!activation.activated && control.activeAccountId !== account.accountId) throw new Error('Agent could not obtain vacant control');
-      mode = 'ACTIVE_CONTROL';
-    }
+      if (account.productRole === 'PRIMARY_ADMIN' && control.activeAccountId === account.accountId) {
+        throw new StartupStageError('admission', false, new Error('Primary Admin account cannot own Agent control'));
+      }
+      if (account.productRole === 'AGENT' && control.activeAccountId && control.activeAccountId !== account.accountId) {
+        throw new StartupStageError('admission', false, new Error('Agent control is owned by a different account; refusing automatic transfer'));
+      }
+      if (account.productRole === 'AGENT' && !control.activeAccountId) {
+        const activation = await accounts.activateControl(account.accountId, control.controlEpoch);
+        control = await accounts.getControlState();
+        if (!activation.activated && control.activeAccountId !== account.accountId) {
+          throw new StartupStageError('admission', false, new Error('Agent could not obtain vacant control'));
+        }
+        mode = 'ACTIVE_CONTROL';
+      }
+    } catch (error) { throw error instanceof StartupStageError ? error : new StartupStageError('admission', true, error); }
     const binding: Bound = { accountId: account.accountId, workerInstanceId: randomUUID(), controlEpoch: control.controlEpoch,
       mode };
-    await options.workers.start(account.accountId, binding);
-    if (!bindsOnStart) await lineService.bind(binding);
+    try {
+      await options.workers.start(account.accountId, binding);
+      if (!bindsOnStart) await lineService.bind(binding);
+    } catch (error) { throw new StartupStageError('spawn', true, error); }
     try { await restoreTokenForBinding(binding); }
     catch (error) {
       await auditWorkerStop(binding, () => options.workers.stopBinding(binding)).catch(() => undefined);
       lineService.unbind(binding.workerInstanceId);
-      throw error;
+      throw new StartupStageError('dispatch', !(error instanceof Error && error.message === 'No saved LINE token for this account'), error);
     }
-    if (binding.mode === 'ACTIVE_CONTROL' && !await supervisor.adoptWithinLifecycle(binding, supervisedWorker(binding))) {
-      await auditWorkerStop(binding, () => options.workers.stopBinding(binding));
-      throw new Error('無法恢復主操作帳號控制權。');
+    if (binding.mode === 'ACTIVE_CONTROL') {
+      let adopted = false;
+      try { adopted = await supervisor.adoptWithinLifecycle(binding, supervisedWorker(binding)); }
+      catch (error) { throw new StartupStageError('response', true, error); }
+      if (!adopted) {
+        await auditWorkerStop(binding, () => options.workers.stopBinding(binding));
+        throw new StartupStageError('response', false, new Error('無法恢復主操作帳號控制權。'));
+      }
     }
     return binding;
+  }
+
+  async function attemptStartupAutoLogin(account: Parameters<typeof startStoredAccount>[0]): Promise<{ retryable: boolean } | undefined> {
+    const correlationId = options.audit?.request('worker_start', { initiator: 'system', accountId: account.accountId, reasonCode: 'startup' });
+    try {
+      await supervisor.runLifecycle(async () => {
+        await accounts.setConnectionStatus(account.accountId, 'disconnected');
+        const binding = await startStoredAccount(account);
+        if (correlationId) options.audit?.complete(correlationId, 'succeeded', { workerInstanceId: binding.workerInstanceId });
+      });
+      return undefined;
+    } catch (error) {
+      const stage = error instanceof StartupStageError ? error.stage : 'unknown';
+      const errorCode: AuditErrorCode = stage === 'dispatch' ? 'CREDENTIAL_RESTORE_FAILED' : 'WORKER_OPERATION_FAILED';
+      try {
+        if (correlationId) {
+          options.audit?.complete(correlationId, 'failed', { errorCode, diagnostic: diagnosticFailure('startup', stage, error) });
+        }
+      } catch { /* Diagnostics cannot change the degraded outcome. */ }
+      await options.workers.stop(account.accountId).catch((stopError: unknown) => {
+        options.audit?.failure(diagnosticFailure('startup', 'cleanup', stopError), { accountId: account.accountId, initiator: 'system' }, 'WORKER_STOP_FAILED');
+      });
+      await accounts.setConnectionStatus(account.accountId, 'degraded').catch((statusError: unknown) => {
+        options.audit?.failure(diagnosticFailure('database', 'persist', statusError), { accountId: account.accountId, initiator: 'system' }, 'DATABASE_WRITE_FAILED');
+      });
+      return { retryable: !(error instanceof StartupStageError) || error.retryable };
+    }
+  }
+
+  /** One non-blocking retry; the timer is tracked in recoveryTimers so shutdown cancels it. A failed retry stays degraded. */
+  function scheduleStartupAutoLoginRetry(account: Parameters<typeof startStoredAccount>[0]): void {
+    if (closing) return;
+    const timer = setTimeout(() => {
+      recoveryTimers.delete(timer);
+      if (closing) return;
+      void track(async () => {
+        // No retry once the token is gone (authentication invalidated) or the account was paused/removed.
+        const saved = await options.secretStore?.load(account.accountId);
+        const current = await accounts.getAccount(account.accountId);
+        if (closing || !saved?.token || !current || current.mode === 'PAUSED') return;
+        await attemptStartupAutoLogin(current);
+      }, { operation: 'startup', identity: { accountId: account.accountId, background: true } }).catch(() => undefined);
+    }, STARTUP_AUTOLOGIN_RETRY_DELAY_MS);
+    recoveryTimers.add(timer);
   }
 
   async function reloginAccountWithQr(accountId: string, requestId: string): Promise<IpcResult> {
@@ -2272,7 +2375,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       const capturedBinding = { ...binding };
       try {
-        const profile = await options.workers.refreshOwnProfile({ ...capturedBinding, type: 'refreshOwnProfile', requestId, timeoutMs: 15_000 });
+        const profile = await options.workers.refreshOwnProfile({ ...pickWorkerBinding(capturedBinding), type: 'refreshOwnProfile', requestId, timeoutMs: 15_000 });
         if (!profile.ok || profile.ownMid !== account.ownMid) return failure(requestId,
           'LINE_PROFILE_REFRESH_FAILED', profile.error === 'PROFILE_MISMATCH' ? 'The LINE account identity changed. Refresh was discarded.' : 'LINE profile could not be refreshed.', true,
           isLineServerErrorCode(profile.error) ? profile.error : undefined);
@@ -2296,7 +2399,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         await publishSnapshot();
         options.publish?.({ type: 'lineAvatarRefreshed', accountId, ownMid: profile.ownMid });
         return { type: 'accepted', requestId, ok: true, ownMid: profile.ownMid };
-      } catch {
+      } catch (error) {
+        options.audit?.failure(diagnosticFailure('refreshOwnProfile', 'execute', error),
+          { accountId, requestId, initiator: 'user' }, 'PROFILE_REFRESH_FAILED');
         return failure(requestId, 'LINE_PROFILE_REFRESH_FAILED', 'LINE profile could not be refreshed.', true);
       }
     })();
@@ -2599,12 +2704,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         await publishSnapshot();
         return { type: request.type, requestId: request.requestId, ok: true, jobId: result.jobId };
       }
-      if (request.type === 'stopAgentRoomJob') { await agentService.stopJob(AGENT_ROOM_KEY, request.jobId); await publishSnapshot(); return accepted(request.requestId); }
+      // The Jobs page and the schedule run history address any account-less job by id: a scheduled run lives on its own queue,
+      // everything else is a room job. Only the job's stored source type decides; the room's lookups never see schedule jobs.
+      const accountLessKey = async (jobId: string) => (await agents.getJob(jobId))?.sourceType === 'schedule' ? AGENT_SCHEDULE_QUEUE_KEY : AGENT_ROOM_KEY;
+      if (request.type === 'stopAgentRoomJob') { await agentService.stopJob(await accountLessKey(request.jobId), request.jobId); await publishSnapshot(); return accepted(request.requestId); }
       if (request.type === 'retryAgentRoomJob') {
-        if (!await agentService.retryJob(AGENT_ROOM_KEY, request.jobId)) return failure(request.requestId, JOB_NOT_RETRYABLE, JOB_NOT_RETRYABLE_MESSAGE);
+        if (!await agentService.retryJob(await accountLessKey(request.jobId), request.jobId)) return failure(request.requestId, JOB_NOT_RETRYABLE, JOB_NOT_RETRYABLE_MESSAGE);
         await publishSnapshot(); return accepted(request.requestId);
       }
-      if (request.type === 'getAgentRoomJobEvents') return { type: request.type, requestId: request.requestId, ok: true, events: await agentService.getRoomJobEvents(request.jobId) };
+      if (request.type === 'getAgentRoomJobEvents') {
+        const events = await accountLessKey(request.jobId) === AGENT_SCHEDULE_QUEUE_KEY ? await agentService.getScheduleJobEvents(request.jobId) : await agentService.getRoomJobEvents(request.jobId);
+        return { type: request.type, requestId: request.requestId, ok: true, events };
+      }
       if (request.type === 'stopJob') { await agentService.stopJob(request, request.jobId); await publishSnapshot(); return accepted(request.requestId); }
       if (request.type === 'retryJob') {
         if (!await agentService.retryJob(request, request.jobId)) return failure(request.requestId, JOB_NOT_RETRYABLE, JOB_NOT_RETRYABLE_MESSAGE);
@@ -2615,7 +2726,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (request.type === 'searchMessages') {
         const input = request.query;
         const query: Parameters<MessageRepository['searchMessages']>[0] = { limit: input.limit,
-          ...(input.key ? { key: input.key } : {}), ...(input.accountId ? { accountId: input.accountId } : {}),
+          ...(input.key ? { key: input.key } : {}), ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.scope ? { scope: input.scope } : {}),
           ...(input.senderId ? { senderId: input.senderId } : {}), ...(input.text !== undefined ? { text: input.text } : {}),
           ...(input.from ? { from: input.from } : {}), ...(input.to ? { to: input.to } : {}),
           ...(input.hasAttachment !== undefined ? { hasAttachment: input.hasAttachment } : {}),
@@ -2883,6 +2994,25 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const open = options.openFolderPath ?? options.openAttachmentPath;
         return { type: request.type, requestId, ok: true, opened: open ? (await open(path)) === '' : false };
       }
+      if (request.type === 'listAgentSchedules') {
+        return { type: request.type, requestId, ok: true, schedules: await agentSchedules.list() };
+      }
+      if (request.type === 'createAgentSchedule') {
+        return { type: request.type, requestId, ok: true, schedule: await agentSchedules.create(request.schedule) };
+      }
+      if (request.type === 'updateAgentSchedule') {
+        return { type: request.type, requestId, ok: true, schedule: await agentSchedules.update(request.scheduleId, request.patch) };
+      }
+      if (request.type === 'deleteAgentSchedule') {
+        if (!await agentSchedules.delete(request.scheduleId)) return failure(requestId, 'SCHEDULE_NOT_FOUND', '找不到這個排程。');
+        return { type: request.type, requestId, ok: true };
+      }
+      if (request.type === 'listAgentScheduleRuns') {
+        return { type: request.type, requestId, ok: true, runs: await agentSchedules.listRuns(request.scheduleId, request.limit) };
+      }
+      if (request.type === 'listAgentScheduleTargets') {
+        return { type: request.type, requestId, ok: true, targets: await agentSchedules.listTargets(request.query || undefined, request.limit, request.purpose) };
+      }
       return failure(requestId, 'UNSUPPORTED_REQUEST', '此操作尚未支援。');
     } catch (error) {
       if (error instanceof AgentPermissionError) return failure(requestId, error.code, error.message);
@@ -2890,6 +3020,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return failure(requestId, error.code, error.code === 'APPROVAL_NOT_PENDING' ? '這項核可已結束或不存在。' : '這個命令太長，無法記住，只能允許一次或拒絕。');
       }
       if (error instanceof ChatFolderError) return failure(requestId, error.code, error.message);
+      if (error instanceof AgentScheduleError) {
+        return failure(requestId, error.code, error.code === 'SCHEDULE_NOT_FOUND' ? '找不到這個排程。'
+          : error.code === 'SCHEDULE_LIMIT' ? '啟用中的排程最多 50 個。'
+          : error.code === 'SCHEDULE_INVALID_TARGET' ? '找不到指定的聊天室，或這個聊天室不能使用。'
+          : error.code === 'SCHEDULE_INVALID' ? error.message : '這個排程沒有未來的觸發時間。');
+      }
       if (error instanceof InvalidWorkspaceError) return failure(requestId, error.code, error.message);
       if (error instanceof McpDomainError) return failure(requestId, error.code, error.message);
       if (error instanceof LocalMcpConfigError) return failure(requestId, error.code, error.message);
@@ -2915,15 +3051,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         await accounts.setConnectionStatus(account.accountId, 'disconnected');
         continue;
       }
-      try {
-        await supervisor.runLifecycle(async () => {
-          await accounts.setConnectionStatus(account.accountId, 'disconnected');
-          await startStoredAccount(account);
-        });
-      } catch {
-        await options.workers.stop(account.accountId).catch(() => undefined);
-        await accounts.setConnectionStatus(account.accountId, 'degraded');
-      }
+      const failed = await attemptStartupAutoLogin(account);
+      if (failed?.retryable) scheduleStartupAutoLoginRetry(account);
     }
   }
   await attachmentService.recover();
@@ -3233,6 +3362,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           () => chatResources.shutdown(),
           () => ownAvatarRefreshScheduler?.shutdown(),
           () => { for (const timer of recoveryTimers) clearTimeout(timer); recoveryTimers.clear(); },
+          // Before AgentService shuts down: no schedule may submit a job into a closing Agent service.
+          stopAgentSchedules,
           () => unsubscribeAuth?.(), () => unsubscribeWorkerExit?.(), () => unsubscribeEvent?.(),
           () => unsubscribeBinding?.(), () => unsubscribeRestartBinding?.(), () => unsubscribeModeChange?.(),
           stopPublishSnapshot, stopLineMedia, stopPreview, stopContentReprojection,
@@ -3261,6 +3392,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   await options.beforeMcpListen?.();
   await mcpHttpServer.start();
   await agentService.recoverQueued();
+  await freeMode.start().catch((error: unknown) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); });
+  await agentSchedules.start().catch((error: unknown) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); });
   void track(() => resumeExternalMonitorOnStartup(), { operation: 'external_monitor', identity: { background: true }, reportFailure: false })
     .catch((error: unknown) => {
     const stage = error instanceof ExternalMonitorDiagnosticFailure ? error.stage : 'startup';

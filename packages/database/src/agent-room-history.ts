@@ -12,6 +12,7 @@ import {
 import type { Pool, PoolClient } from 'pg';
 import { McpDomainError } from './mcp-token-repository.js';
 import type { SharedAdminChat } from './agent-repository.js';
+import { resolveAgentLineage } from './agent-lineage.js';
 
 interface HistoryRow {
   job_id: string;
@@ -52,8 +53,10 @@ export async function queryAgentRoomHistory(
 
   const params: unknown[] = [];
   const bind = (value: unknown): string => { params.push(value); return `$${params.length}`; };
+  // The admin-direct chat history spans every account of the Agent lineage (same admin MID before and after a swap).
+  const lineageIds = shared ? [...new Set([shared.accountId, ...(await resolveAgentLineage(queryable)).accountIds])] : [];
   const conditions = [shared
-    ? `((j.source_type = 'ui' AND j.account_id IS NULL) OR (j.source_type = 'line' AND j.account_id = ${bind(shared.accountId)} AND j.chat_type = 'direct' AND j.chat_id = ${bind(shared.adminMid)}))`
+    ? `((j.source_type = 'ui' AND j.account_id IS NULL) OR (j.source_type = 'line' AND j.account_id = ANY(${bind(lineageIds)}::text[]) AND j.chat_type = 'direct' AND j.chat_id = ${bind(shared.adminMid)}))`
     : "(j.source_type = 'ui' AND j.account_id IS NULL)"];
   if (input.provider) conditions.push(`j.provider = ${bind(input.provider)}`);
   if (input.from) conditions.push(`j.created_at >= ${bind(new Date(input.from).toISOString())}::timestamptz`);

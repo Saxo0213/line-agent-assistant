@@ -145,3 +145,7 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .message-row.agent-room-row .message-text.agent-failure { color: #ff938a; }
 }
+:root[data-theme="dark"] .nav-update-badge { background: #e5bc69; color: #2b1d00; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .nav-update-badge { background: #e5bc69; color: #2b1d00; }
+}

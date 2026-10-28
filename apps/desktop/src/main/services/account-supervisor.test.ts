@@ -138,6 +138,20 @@ database('AccountSupervisor with PostgreSQL', () => {
     expect(supervisor.isCurrent(first)).toBe(false);
   });
 
+  it('adopts a freshly spawned worker whose first ack arrives after the drain bound but within the boot bound', async () => {
+    let killed = false;
+    const supervisor = new AccountSupervisor(accounts, { async spawn() {
+      return { async send() { /* fake */ },
+        async waitModeAck() { await new Promise((resolve) => setTimeout(resolve, 150)); return true; },
+        async killAndWait() { killed = true; } };
+    } }, 50, undefined, undefined, undefined, 1000);
+    const current = await accounts.getControlState();
+    if (current.activeAccountId) await accounts.revokeControl(current.controlEpoch);
+    const binding = await supervisor.switchTo('a');
+    expect(killed).toBe(false);
+    expect(supervisor.binding('a')).toMatchObject({ workerInstanceId: binding.workerInstanceId });
+  });
+
   it('kills and waits for an unresponsive old worker before granting the next account', async () => {
     const steps: string[] = [];
     const supervisor = new AccountSupervisor(accounts, { async spawn(accountId, _instance, _epoch, mode) {

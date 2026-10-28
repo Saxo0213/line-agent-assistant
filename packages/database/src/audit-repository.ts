@@ -1,5 +1,5 @@
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
-import { parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
+import { parseIngestLatency, parseSafeDiagnostic, type IngestLatency, type SafeDiagnostic } from '@line-agent/contracts';
 
 const activeAuditPools = new WeakSet<Pool>();
 
@@ -18,6 +18,7 @@ export interface SafeAuditRecord {
   resultCode?: string;
   errorCode?: string;
   droppedCount?: number;
+  latency?: IngestLatency;
   createdAt: string;
 }
 
@@ -91,6 +92,7 @@ export class AuditRepository {
       ...(event.resultCode ? { result_code: event.resultCode } : {}),
       ...(event.errorCode ? { error_code: event.errorCode } : {}),
       ...(event.droppedCount !== undefined ? { dropped_count: event.droppedCount } : {}),
+      ...(parseIngestLatency(event.latency) ? { latency: parseIngestLatency(event.latency) } : {}),
       ...(parseSafeDiagnostic(event.diagnostic) ? { diagnostic: parseSafeDiagnostic(event.diagnostic) } : {}),
     };
     let timedOut = false;
@@ -166,6 +168,7 @@ export class AuditRepository {
       ...(typeof row.details.result_code === 'string' ? { resultCode: row.details.result_code } : {}),
       ...(typeof row.details.error_code === 'string' ? { errorCode: row.details.error_code } : {}),
       ...(typeof row.details.dropped_count === 'number' ? { droppedCount: row.details.dropped_count } : {}),
+      ...(parseIngestLatency(row.details.latency) ? { latency: parseIngestLatency(row.details.latency)! } : {}),
       ...(parseSafeDiagnostic(row.details.diagnostic) ? { diagnostic: parseSafeDiagnostic(row.details.diagnostic)! } : {}),
       createdAt: row.created_at.toISOString(),
     }));

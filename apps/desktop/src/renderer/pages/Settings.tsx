@@ -11,6 +11,7 @@ import { WorkRecords } from './WorkRecords.js';
 import { AGENT_STATUS_MARKERS, AgentStatusMarker } from '../AgentStatusMarker.js';
 import { translateSettings } from '../../locale.js';
 import { localeFromState, useLocale } from '../locale-context.js';
+import { UpdateCheckSettings } from './UpdateCheckSettings.js';
 
 const SHOW_MANUAL_MCP_TOKENS = false;
 const EMPTY_PROVIDERS: ProviderStatus[] = [];
@@ -734,6 +735,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
     </section> : <section role="tabpanel" className="panel about-settings">
       <h2>LINE Agent Assistant</h2>
       <p>{desktopText('version')}{__APP_VERSION__}</p>
+      <UpdateCheckSettings api={api} />
       <div>
         <h3>{desktopText('unofficialApplication')}</h3>
         <p>{desktopText('lineAgentAssistantIsAnIndependentlyDevelopedThirdParty')}</p>

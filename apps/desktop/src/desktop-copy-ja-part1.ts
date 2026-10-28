@@ -19,6 +19,7 @@ export const JAPANESE_DESKTOP_COPY_PART1: Partial<Record<keyof typeof ENGLISH_DE
   assistant: 'アシスタント',
   search: '検索',
   jobs: 'ジョブ',
+  schedules: 'スケジュール',
   settings: '設定',
   agentRoom: 'Agent ルーム',
   unableToLoadSystemStatusCheckSettingsAndReconnect: 'システム状態を読み込めません。設定を確認して再接続してください。',

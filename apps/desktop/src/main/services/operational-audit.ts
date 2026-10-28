@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { LINE_SERVER_ERROR_CODES, parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
+import { LINE_SERVER_ERROR_CODES, parseIngestLatency, parseSafeDiagnostic, type IngestLatency, type SafeDiagnostic } from '@line-agent/contracts';
 
 export const AUDIT_ACTIONS = [
   'app_start', 'app_stop', 'service_start', 'service_stop', 'worker_start', 'worker_stop', 'worker_restart',
@@ -11,7 +11,7 @@ export const AUDIT_ACTIONS = [
   'friend_enrollment', 'friend_relation_initial', 'friend_add_attempt', 'friend_relation_recheck',
   'friend_authorization_precheck', 'friend_grant_commit',
   'worker_operation_error', 'line_catalog_refresh', 'runtime_error',
-  'album_photo_download',
+  'album_photo_download', 'line_ingest_slow_upstream', 'line_ingest_slow_main',
 ] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
 export const AUDIT_INITIATORS = ['user', 'system', 'worker'] as const;
@@ -60,11 +60,12 @@ export interface AuditEvent {
   resultCode?: AuditResultCode;
   errorCode?: AuditErrorCode;
   droppedCount?: number;
+  latency?: IngestLatency;
   createdAt: string;
 }
 
 export type AuditFields = Pick<AuditEvent, 'initiator'> & Partial<Pick<AuditEvent,
-  'accountId' | 'workerInstanceId' | 'loginAttemptId' | 'requestId' | 'jobId' | 'reasonCode' | 'diagnostic'>>;
+  'accountId' | 'workerInstanceId' | 'loginAttemptId' | 'requestId' | 'jobId' | 'reasonCode' | 'diagnostic' | 'latency'>>;
 export interface OperationalAuditDependencies {
   append(event: AuditEvent): Promise<void>;
   appendFallback(event: AuditEvent): Promise<void>;
@@ -122,6 +123,11 @@ export function parseOperationalAuditEvent(value: unknown): AuditEvent | null {
   if (input.droppedCount !== undefined) {
     if (typeof input.droppedCount !== 'number' || !Number.isSafeInteger(input.droppedCount) || input.droppedCount < 0) return null;
     event.droppedCount = input.droppedCount;
+  }
+  if (input.latency !== undefined) {
+    const latency = parseIngestLatency(input.latency);
+    if (!latency) return null;
+    event.latency = latency;
   }
   return event;
 }
@@ -227,6 +233,8 @@ export function createOperationalAudit(dependencies: OperationalAuditDependencie
     const diagnostic = parseSafeDiagnostic(fields.diagnostic);
     if (diagnostic) event.diagnostic = diagnostic;
     if (fields.droppedCount !== undefined) event.droppedCount = Math.max(0, Math.trunc(fields.droppedCount));
+    const latency = parseIngestLatency(fields.latency);
+    if (latency) event.latency = latency;
     return event;
   };
 

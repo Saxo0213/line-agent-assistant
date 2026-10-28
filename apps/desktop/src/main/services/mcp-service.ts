@@ -2,6 +2,18 @@ import {
   AGENT_ROOM_HISTORY_TOOL_NAME,
   LIST_SEND_TARGETS_TOOL_NAME,
   SEND_TO_TARGET_TOOL_NAME,
+  LIST_SCHEDULES_TOOL_NAME,
+  CREATE_SCHEDULE_TOOL_NAME,
+  UPDATE_SCHEDULE_TOOL_NAME,
+  DELETE_SCHEDULE_TOOL_NAME,
+  CreateScheduleToolInputSchema,
+  UpdateScheduleToolInputSchema,
+  DeleteScheduleToolInputSchema,
+  ListSchedulesToolInputSchema,
+  isScheduleToolName,
+  type AgentScheduleRecurrence,
+  type ScheduleToolRecurrence,
+  type ScheduleToolName,
   ChatTypeSchema,
   McpAgentRoomHistoryOutputSchema,
   MCP_TOOL_PERMISSIONS,
@@ -10,6 +22,8 @@ import {
   type EffectivePermissions,
   McpToolNameSchema,
   normalizeMcpTimeBound,
+  decodeMcpMessageCursor,
+  encodeMcpMessageCursor,
   type ConversationKey,
   type WorkerBinding,
   type McpMessageRecord,
@@ -22,12 +36,15 @@ import {
   type McpAgentRoomHistoryOutput,
 } from '@line-agent/contracts';
 import {
+  AgentScheduleError,
+  findSharedAdminChat,
   McpDomainError,
   type InternalAgentExecutionContext,
   type McpTokenRepository,
   type MessageRepository,
   queryAgentRoomHistory,
 } from '@line-agent/database';
+import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import {
   InternalMcpCapabilityRegistry,
@@ -37,6 +54,8 @@ import {
 } from './internal-mcp-capabilities.js';
 import type { AgentApprovalBroker } from './agent-approval-broker.js';
 import type { AgentLineSendHandler } from './agent-line-send-service.js';
+import { isScheduledRunRequestId, type AgentScheduleService } from './agent-schedule-service.js';
+import { formatTaipei } from './agent-schedule-prompt.js';
 import type { McpChatResourceReader } from './mcp-chat-resource-reader.js';
 import type { SafeDiagnostic } from '@line-agent/contracts';
 
@@ -69,6 +88,38 @@ function redactMessages(messages: readonly McpMessageRecord[]): McpMessageRecord
   }));
 }
 
+function pickMessageShape(args: { accountId?: string | undefined; target?: string | undefined; chatType?: string | undefined; chatId?: string | undefined; conversationTitle?: string | undefined; senderId?: string | undefined; senderName?: string | undefined; text?: string | undefined }): Record<string, unknown> {
+  return { a: args.accountId ?? null, t: args.target ?? null, ct: args.chatType ?? null, c: args.chatId ?? null, ti: args.conversationTitle ?? null, si: args.senderId ?? null, sn: args.senderName ?? null, x: args.text ?? null };
+}
+
+type MessageQueryBase = Parameters<MessageRepository['queryTargetMessagePage']>[0];
+
+/** One keyset page of archived messages; the cursor is bound to the query shape so it cannot be replayed on another query. */
+async function queryMessagePage(
+  repo: MessageRepository,
+  base: MessageQueryBase,
+  args: { cursor?: string | undefined; limit?: number | undefined },
+  shape: Record<string, unknown>,
+  order: 'asc' | 'desc',
+  client: PoolClient,
+): Promise<{ messages: McpMessageRecord[]; hasMore: boolean; nextCursor: string | null; page: { returned: number; limit: number; hasMore: boolean; nextCursor: string | null } }> {
+  const queryHash = createHash('sha256').update(JSON.stringify(shape)).digest('hex').slice(0, 16);
+  let after: { occurredAt: string; messageId: string } | undefined;
+  if (args.cursor !== undefined) {
+    const decoded = decodeMcpMessageCursor(args.cursor);
+    if (!decoded) throw new McpDomainError('INVALID_INPUT', 'Invalid cursor.');
+    if (decoded.queryHash !== queryHash) {
+      throw new McpDomainError('INVALID_INPUT', 'This cursor was issued for a different query. Pass nextCursor only to a call with the same target, text, sender and time range filters.');
+    }
+    after = { occurredAt: decoded.occurredAt, messageId: decoded.messageId };
+  }
+  const limit = Math.max(1, Math.min(200, args.limit ?? 50));
+  const result = await repo.queryTargetMessagePage({ ...base, limit, order, ...(after ? { after } : {}) }, client);
+  const messages = redactMessages(result.messages);
+  const nextCursor = result.hasMore && result.lastKey ? encodeMcpMessageCursor({ ...result.lastKey, queryHash }) : null;
+  return { messages, hasMore: nextCursor !== null, nextCursor, page: { returned: messages.length, limit, hasMore: nextCursor !== null, nextCursor } };
+}
+
 export interface McpToolDefinition {
   name: McpToolName;
   description: string;
@@ -79,7 +130,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: 'list_targets',
     description:
-      'List authorized LINE conversations and participants grouped by (accountId, chatType, chatId). Present results as a numbered list using no. If the user later answers with a number, use that no from the most recent list_targets result and pass its exact accountId, chatType, and chatId to the query tool.',
+      'List authorized LINE conversations and participants grouped by (accountId, chatType, chatId). Rows with role primary_admin are the administrator\'s (Primary Admin) direct chat with the Agent account. Present results as a numbered list using no. If the user later answers with a number, use that no from the most recent list_targets result and pass its exact accountId, chatType, and chatId to the query tool.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -94,7 +145,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: 'query_target_messages',
     description:
-      'Query archived LINE messages for a specified target (conversation title, chatId, sender displayName, or senderId) within authorized account scopes. A number refers to the no in the most recent list_targets result.',
+      'Query archived LINE messages for a specified target (conversation title, chatId, sender displayName, or senderId) within authorized account scopes. A number refers to the no in the most recent list_targets result. Messages are returned newest first. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -107,14 +158,15 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         senderId: { type: 'string' },
         senderName: { type: 'string' },
         text: { type: 'string' },
-        limit: { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+        limit: { type: 'integer', minimum: 1, default: 50, description: 'Page size; values above 200 are clamped to 200.' },
+        cursor: { type: 'string', maxLength: 512, description: 'nextCursor from the previous page of the same query.' },
       },
     },
   },
   {
     name: 'query_target_messages_by_time',
     description:
-      'Query archived LINE messages for a specified target within an explicit [from, to] time window (ISO-8601 datetime or YYYY-MM-DD). A number refers to the no in the most recent list_targets result.',
+      'Query archived LINE messages for a specified target within an explicit [from, to] time window (ISO-8601 datetime or YYYY-MM-DD). A number refers to the no in the most recent list_targets result. Messages are returned oldest first (chronological) within the window. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -129,7 +181,8 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         text: { type: 'string' },
         from: { type: 'string', description: 'Start timestamp (ISO-8601 with offset or YYYY-MM-DD).' },
         to: { type: 'string', description: 'End timestamp (ISO-8601 with offset or YYYY-MM-DD).' },
-        limit: { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+        limit: { type: 'integer', minimum: 1, default: 50, description: 'Page size; values above 200 are clamped to 200.' },
+        cursor: { type: 'string', maxLength: 512, description: 'nextCursor from the previous page of the same query.' },
       },
     },
   },
@@ -180,7 +233,7 @@ export const AGENT_ROOM_HISTORY_TOOL_DEFINITION = {
 export const LIST_SEND_TARGETS_TOOL_DEFINITION = {
   name: LIST_SEND_TARGETS_TOOL_NAME,
   description:
-    'List the LINE chats the Agent account can send to (direct chats, groups and rooms; communities are never included) whose title, member name or nickname contains the query. Call this first with the name the admin gave. If exactly one target matches, send to it. If more than one matches, reply to the admin with the numbered list (use no), wait for the admin\'s choice in the next message, then send to the chosen target. If none matches, tell the admin. Pass the chosen chatType and chatId to send_to_target.',
+    'Rows with role primary_admin are the administrator (Primary Admin); a query such as 管理員, 主要管理者, admin or me returns that row first. List the LINE chats the Agent account can send to (direct chats, groups and rooms; communities are never included) whose title, member name or nickname contains the query. Call this first with the name the admin gave. If exactly one target matches, send to it. If more than one matches, reply to the admin with the numbered list (use no), wait for the admin\'s choice in the next message, then send to the chosen target. If none matches, tell the admin. Pass the chosen chatType and chatId to send_to_target.',
   inputSchema: {
     type: 'object',
     additionalProperties: false,
@@ -220,6 +273,105 @@ export const SEND_TO_TARGET_TOOL_DEFINITION = {
 } as const;
 const SEND_TOOLS = [LIST_SEND_TARGETS_TOOL_DEFINITION, SEND_TO_TARGET_TOOL_DEFINITION] as const;
 
+/**
+ * Internal-only schedule tools (docs/architecture/agent-schedules.md). Same principals as the send tools (Primary Admin and
+ * the desktop operator); never in MCP_TOOL_DEFINITIONS or a token scope. A job started by a schedule cannot mutate schedules.
+ */
+const RECURRENCE_JSON_SCHEMA = {
+  description: 'When to fire. once {at} or once {inMinutes: 1..10080} (a one-time run that many minutes from now; use it for "in 5 minutes" / 5 分鐘後); daily {time}; weekly {days (0=Sunday..6=Saturday), time}; interval {everyMinutes (5..10080), anchorAt}; cron {expression: 5 fields minute hour day-of-month month day-of-week}. time is HH:mm in the schedule timezone; at and anchorAt are ISO-8601 datetimes with offset.',
+  oneOf: [
+    { type: 'object', additionalProperties: false, required: ['kind', 'at'], properties: { kind: { const: 'once' }, at: { type: 'string' } } },
+    { type: 'object', additionalProperties: false, required: ['kind', 'inMinutes'], properties: { kind: { const: 'once' }, inMinutes: { type: 'integer', minimum: 1, maximum: 10080 } } },
+    { type: 'object', additionalProperties: false, required: ['kind', 'time'], properties: { kind: { const: 'daily' }, time: { type: 'string', pattern: '^([01]\\d|2[0-3]):[0-5]\\d$' } } },
+    { type: 'object', additionalProperties: false, required: ['kind', 'days', 'time'],
+      properties: { kind: { const: 'weekly' }, days: { type: 'array', minItems: 1, maxItems: 7, uniqueItems: true, items: { type: 'integer', minimum: 0, maximum: 6 } }, time: { type: 'string', pattern: '^([01]\\d|2[0-3]):[0-5]\\d$' } } },
+    { type: 'object', additionalProperties: false, required: ['kind', 'everyMinutes', 'anchorAt'],
+      properties: { kind: { const: 'interval' }, everyMinutes: { type: 'integer', minimum: 5, maximum: 10080 }, anchorAt: { type: 'string' } } },
+    { type: 'object', additionalProperties: false, required: ['kind', 'expression'], properties: { kind: { const: 'cron' }, expression: { type: 'string', maxLength: 256 } } },
+  ],
+} as const;
+export const LIST_SCHEDULES_TOOL_DEFINITION = {
+  name: LIST_SCHEDULES_TOOL_NAME,
+  description: 'List scheduled Agent triggers with their next fire time and last outcome. By default it returns only active (enabled) schedules. Pass status "all" (or "disabled") when the user asks about disabled or all schedules. Before updating, deleting or re-enabling a schedule that may be disabled, call it with status "all" to get its scheduleId.',
+  inputSchema: {
+    type: 'object', additionalProperties: false,
+    properties: { status: { type: 'string', enum: ['active', 'disabled', 'all'], default: 'active', description: 'active = enabled schedules only (default); disabled = disabled schedules only; all = both.' } },
+  },
+} as const;
+const READ_TARGET_JSON_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['accountId', 'chatType', 'chatId'],
+  properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room', 'community', 'thread'] }, chatId: { type: 'string' }, title: { type: 'string', maxLength: 200 } },
+} as const;
+const SEND_TARGET_JSON_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['accountId', 'chatType', 'chatId'],
+  properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, title: { type: 'string', maxLength: 200 } },
+} as const;
+const SCHEDULE_TASK_PROPERTIES = {
+  jitterMinutes: { type: 'integer', minimum: 0, maximum: 5, description: 'Random start delay: each run starts a random 0..N minutes (whole seconds) after its scheduled time, never before it, and never past the next occurrence. 0 (default when omitted on create) means no delay. Set it only when the user asks for a random or irregular start time.' },
+  targets: { type: 'array', maxItems: 20, items: READ_TARGET_JSON_SCHEMA,
+    description: 'Chats the run reads (groups, rooms, direct chats and communities), up to 20 and without duplicates. Only chats the user names in the current request; never one carried over from earlier conversation; leave empty when none is named. Resolve each with list_targets (use its exact accountId, chatType and chatId) and refer to it by title when talking to the user. The local Agent room is not allowed.' },
+  task: { description: 'What the run does. custom (default): run the prompt as written. summary {focus?}: per-target summary of the window (topics, decisions, action items, mentions of the admin, unanswered questions); needs targets. keyword_digest {keywords: 1..20}: list messages that match any keyword; needs targets. For summary and keyword_digest the prompt is optional extra instructions. message {text}: a fixed system message (alarm / reminder / fixed notice) that Main sends by itself at fire time, with NO Agent run; use it for every 提醒我… / 鬧鐘 / 定時通知 request; text is the user\'s wording as-is (1..5000 chars) and may contain {{date}} (YYYY-MM-DD), {{time}} (HH:mm) and {{weekday}} (星期一…星期日), filled in Asia/Taipei; targets, window and prompt are not used and delivery must not be record_only.',
+    oneOf: [
+      { type: 'object', additionalProperties: false, required: ['type'], properties: { type: { const: 'custom' } } },
+      { type: 'object', additionalProperties: false, required: ['type', 'text'], properties: { type: { const: 'message' }, text: { type: 'string', minLength: 1, maxLength: 5000 } } },
+      { type: 'object', additionalProperties: false, required: ['type'], properties: { type: { const: 'summary' }, focus: { type: 'string', maxLength: 500 } } },
+      { type: 'object', additionalProperties: false, required: ['type', 'keywords'],
+        properties: { type: { const: 'keyword_digest' }, keywords: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string', minLength: 1, maxLength: 50 } } } },
+    ] },
+  window: { description: 'Which messages the run covers, ending at the fire time. since_last_run (default): from the last submitted run (or one recurrence period). lookback {minutes: 5..10080}. Never longer than 7 days.',
+    oneOf: [
+      { type: 'object', additionalProperties: false, required: ['mode'], properties: { mode: { const: 'since_last_run' } } },
+      { type: 'object', additionalProperties: false, required: ['mode', 'minutes'], properties: { mode: { const: 'lookback' }, minutes: { type: 'integer', minimum: 5, maximum: 10080 } } },
+    ] },
+  delivery: { description: 'Where the result goes. primary_admin (default; omit delivery): the job sends the final result to the administrator (Primary Admin) by LINE; 我 / 給我 / 傳給我 means the administrator. record_only: nothing is sent, the job reply stays in the schedule run history (Agent tasks only; never for message). line_target {target}: use only when the user names another chat; resolve target with list_send_targets (direct, group or room of the Agent account; never a community).',
+    oneOf: [
+      { type: 'object', additionalProperties: false, required: ['mode'], properties: { mode: { const: 'primary_admin' } } },
+      { type: 'object', additionalProperties: false, required: ['mode'], properties: { mode: { const: 'record_only' } } },
+      { type: 'object', additionalProperties: false, required: ['mode', 'target'], properties: { mode: { const: 'line_target' }, target: SEND_TARGET_JSON_SCHEMA } },
+    ] },
+} as const;
+export const CREATE_SCHEDULE_TOOL_DEFINITION = {
+  name: CREATE_SCHEDULE_TOOL_NAME,
+  description: 'Create a scheduled Agent trigger now, without asking the user to confirm fields they did not mention. Defaults: results go to the administrator (Primary Admin) by LINE (我 / 給我 means the administrator, so omit delivery); task summary when the user names chats (targets), else custom with the request as prompt and empty targets; window since the last run (pass window {mode: "lookback", minutes} when the user states a range, e.g. 過去 6 小時 = 360); timezone Asia/Taipei; provider of the current job; enabled. For "in 5 minutes" / 5 分鐘後 use recurrence {kind: "once", inMinutes: 5}. Resolve chats yourself with list_targets (communities included) and refer to them by title. Ask a question only when a chat name matches several conversations or the user gave no time at all. After creating, reply with a short summary (target, next run time, range, task, delivery) using nextFireAtTaipei and deliveryLabel from the result, and say the user can ask to change it. For summary and keyword_digest leave prompt empty unless the user gave extra requirements, and never restate source, time, range, output or rules in prompt (the system adds them); a custom prompt is one or two sentences of what to do. At each fire time an unattended job runs in its own new session (never the Agent room). A reminder, alarm or fixed notice (提醒我…) is a message task: pass task {type: "message", text} with the user\'s reminder text as written and no prompt; Main sends it directly with no Agent run. Up to 50 schedules can be enabled. Use targets (and summary or keyword_digest) only for chats the user names in the current request; never carry a chat over from earlier conversation. When the request names no chat, create a custom task whose prompt restates the request and leave targets empty: at each run the Agent chooses the chats to read.',
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['title', 'recurrence'],
+    properties: {
+      title: { type: 'string', minLength: 1, maxLength: 80 },
+      prompt: { type: 'string', maxLength: 4000, description: 'Required for the custom task: one or two sentences of what to do. For summary and keyword_digest leave it empty unless the user gave extra requirements. Never restate source, time, range, output or rules.' },
+      ...SCHEDULE_TASK_PROPERTIES,
+      recurrence: RECURRENCE_JSON_SCHEMA,
+      timezone: { type: 'string', maxLength: 64, description: 'IANA timezone. Default Asia/Taipei.' },
+      provider: { type: 'string', enum: ['codex', 'claude'], description: 'Default: the provider of the current job.' },
+      enabled: { type: 'boolean', description: 'Default true.' },
+    },
+  },
+} as const;
+export const UPDATE_SCHEDULE_TOOL_DEFINITION = {
+  name: UPDATE_SCHEDULE_TOOL_NAME,
+  description: 'Change a scheduled Agent trigger: any of title, prompt, recurrence, timezone, provider, targets, task, window, delivery, jitterMinutes, or enabled (false pauses it, true resumes it). Returns the updated schedule with nextFireAt.' + ' Set targets only to chats the user names in the current request, never from earlier conversation; a request that names no chat is a custom task with the request as prompt and empty targets.',
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['scheduleId'],
+    properties: {
+      scheduleId: { type: 'string' },
+      title: { type: 'string', minLength: 1, maxLength: 80 },
+      prompt: { type: 'string', maxLength: 4000 },
+      ...SCHEDULE_TASK_PROPERTIES,
+      recurrence: RECURRENCE_JSON_SCHEMA,
+      timezone: { type: 'string', maxLength: 64 },
+      provider: { type: 'string', enum: ['codex', 'claude'] },
+      enabled: { type: 'boolean' },
+    },
+  },
+} as const;
+export const DELETE_SCHEDULE_TOOL_DEFINITION = {
+  name: DELETE_SCHEDULE_TOOL_NAME,
+  description: 'Permanently delete a scheduled Agent trigger and its run history. Confirm with the user first.',
+  inputSchema: { type: 'object', additionalProperties: false, required: ['scheduleId'], properties: { scheduleId: { type: 'string' } } },
+} as const;
+const SCHEDULE_TOOLS = [LIST_SCHEDULES_TOOL_DEFINITION, CREATE_SCHEDULE_TOOL_DEFINITION, UPDATE_SCHEDULE_TOOL_DEFINITION, DELETE_SCHEDULE_TOOL_DEFINITION] as const;
+/** The schedule operations McpService needs; AgentScheduleService provides them. */
+export type AgentScheduleToolHandler = Pick<AgentScheduleService, 'list' | 'create' | 'update' | 'delete' | 'primaryAdminChat'>;
+
 export function numberMcpTargets<T extends {
   accountId: string;
   chatType: string;
@@ -253,6 +405,10 @@ export interface McpServiceOptions {
   approvalBroker?: Pick<AgentApprovalBroker, 'request'>;
   /** Agent LINE send behind list_send_targets / send_to_target; absent means the tools are never offered. */
   lineSend?: AgentLineSendHandler;
+  /** Scheduled Agent triggers behind list/create/update/delete_schedule; absent means the tools are never offered. */
+  schedules?: AgentScheduleToolHandler;
+  /** Clock for schedule conveniences such as once.inMinutes (tests). */
+  now?: () => Date;
   chatResources?: McpChatResourceReader;
   /** Returns the current authenticated LOGIN binding; archive queries fail closed when absent. */
   getLiveLoginBinding?: (accountId: string) => Promise<WorkerBinding | null>;
@@ -442,7 +598,11 @@ export class McpService {
         },
         client,
       );
-      const targets = numberMcpTargets(listedTargets);
+      // Full-scope principals see which direct chat is the administrator's; chat-scoped ones never do.
+      const admin = ownLineNamesOnly ? null : await findSharedAdminChat(client).catch(() => null);
+      const targets = numberMcpTargets(listedTargets).map((target) =>
+        admin !== null && target.accountId === admin.accountId && target.chatType === 'direct' && target.chatId === admin.adminMid
+          ? { ...target, role: 'primary_admin' as const } : target);
       return {
         output: { toolName: 'list_targets', targets },
         resultCount: targets.length,
@@ -450,7 +610,8 @@ export class McpService {
     }
 
     if (tool.name === 'query_target_messages') {
-      const rows = await this.options.messages.queryTargetMessages(
+      const paged = await queryMessagePage(
+        this.options.messages,
         {
           accountIds: authorizedAccountIds,
           ...scopeFilter,
@@ -461,14 +622,15 @@ export class McpService {
           ...(tool.arguments.senderId ? { senderId: tool.arguments.senderId } : {}),
           ...(tool.arguments.senderName ? { senderName: tool.arguments.senderName } : {}),
           ...(tool.arguments.text ? { text: tool.arguments.text } : {}),
-          ...(tool.arguments.limit ? { limit: tool.arguments.limit } : {}),
         },
+        tool.arguments,
+        { tool: tool.name, ...pickMessageShape(tool.arguments) },
+        'desc',
         client,
       );
-      const messages = redactMessages(rows);
       return {
-        output: { toolName: 'query_target_messages', messages },
-        resultCount: messages.length,
+        output: { toolName: 'query_target_messages', ...paged },
+        resultCount: paged.messages.length,
       };
     }
 
@@ -545,7 +707,8 @@ export class McpService {
 
     const normalizedFrom = tool.arguments.from ? normalizeMcpTimeBound(tool.arguments.from, 'from') : null;
     const normalizedTo = tool.arguments.to ? normalizeMcpTimeBound(tool.arguments.to, 'to') : null;
-    const rows = await this.options.messages.queryTargetMessages(
+    const paged = await queryMessagePage(
+      this.options.messages,
       {
         accountIds: authorizedAccountIds,
         ...scopeFilter,
@@ -558,19 +721,20 @@ export class McpService {
         ...(tool.arguments.text ? { text: tool.arguments.text } : {}),
         ...(normalizedFrom ? { from: normalizedFrom } : {}),
         ...(normalizedTo ? { to: normalizedTo } : {}),
-        ...(tool.arguments.limit ? { limit: tool.arguments.limit } : {}),
       },
+      tool.arguments,
+      { tool: tool.name, ...pickMessageShape(tool.arguments), from: normalizedFrom, to: normalizedTo },
+      'asc',
       client,
     );
-    const messages = redactMessages(rows);
     return {
       output: {
         toolName: 'query_target_messages_by_time',
-        messages,
+        ...paged,
         from: normalizedFrom,
         to: normalizedTo,
       },
-      resultCount: messages.length,
+      resultCount: paged.messages.length,
     };
   }
 
@@ -660,6 +824,83 @@ export class McpService {
       return { data: await handler.run(outcome.plan, { signal, isLive: () => this.internalCapabilities.isLive(capability) }) };
     } catch (error) {
       if (error instanceof McpDomainError && (error.code === 'PERMISSION_DENIED' || error.code === 'SCOPE_DENIED')) return notPermitted;
+      throw error;
+    }
+  }
+
+  /** Converts the tool-only { kind: 'once', inMinutes } into the stored { kind: 'once', at }. */
+  private scheduleRecurrence(recurrence: ScheduleToolRecurrence): AgentScheduleRecurrence {
+    if ('inMinutes' in recurrence) return { kind: 'once', at: new Date((this.options.now?.() ?? new Date()).getTime() + recurrence.inMinutes * 60_000).toISOString() };
+    return recurrence;
+  }
+
+  /**
+   * Schedule tools. The principal is re-resolved and audited inside the short authorization transaction (the same
+   * principals as the send tools); the schedule work runs after it commits. A job started by a schedule (source type
+   * `schedule`, request id `schedule:...`) may list but never create, update or delete schedules.
+   */
+  private async callScheduleTool(
+    toolName: ScheduleToolName,
+    rawArguments: Record<string, unknown>,
+    context: Extract<InternalAgentExecutionContext, { sourceType: 'job' }>,
+    signal: AbortSignal,
+  ): Promise<{ data: unknown } | { error: { code: string; message?: string } }> {
+    const handler = this.options.schedules;
+    const notPermitted = { error: { code: 'schedule_not_permitted' } } as const;
+    if (!handler) return notPermitted;
+    try {
+      const job = await this.track(() => this.options.tokens.executeForInternalAgent({
+        context, toolName, signal,
+        execute: async ({ client }) => {
+          const row = (await client.query<{ source_type: string; source_request_id: string | null; provider: 'codex' | 'claude' }>(
+            'SELECT source_type, source_request_id, provider FROM agent_jobs WHERE job_id = $1', [context.jobId])).rows[0];
+          return { data: { scheduledRun: row?.source_type === 'schedule' || isScheduledRunRequestId(row?.source_request_id), provider: row?.provider ?? 'claude' as const }, resultCount: 0 };
+        },
+      }), signal);
+      if (toolName !== LIST_SCHEDULES_TOOL_NAME && job.scheduledRun) {
+        return { error: { code: 'SCHEDULE_RUN_FORBIDDEN', message: 'A job started by a schedule cannot create, update or delete schedules.' } };
+      }
+      const invalid = (error: { issues: ReadonlyArray<{ message: string }> }) =>
+        ({ error: { code: 'INVALID_INPUT', message: error.issues[0]?.message ?? 'Invalid input.' } }) as const;
+      if (toolName === LIST_SCHEDULES_TOOL_NAME) {
+        const parsed = ListSchedulesToolInputSchema.safeParse(rawArguments);
+        if (!parsed.success) return invalid(parsed.error);
+        const { status } = parsed.data;
+        const schedules = (await handler.list()).filter((schedule) => status === 'all' || schedule.enabled === (status === 'active'));
+        return { data: { toolName, schedules } };
+      }
+      if (toolName === CREATE_SCHEDULE_TOOL_NAME) {
+        const parsed = CreateScheduleToolInputSchema.safeParse(rawArguments);
+        if (!parsed.success) return invalid(parsed.error);
+        const input = parsed.data;
+        const targets = input.targets ?? [];
+        const schedule = await handler.create({
+          title: input.title, prompt: input.prompt ?? '', recurrence: this.scheduleRecurrence(input.recurrence), provider: input.provider ?? job.provider,
+          timezone: input.timezone ?? 'Asia/Taipei', targets, task: input.task ?? (targets.length > 0 ? { type: 'summary' } : { type: 'custom' }),
+          window: input.window ?? { mode: 'since_last_run' }, delivery: input.delivery ?? { mode: 'primary_admin' }, enabled: input.enabled ?? true,
+          jitterMinutes: input.jitterMinutes ?? 0,
+        });
+        let deliveryLabel: string;
+        if (schedule.delivery.mode === 'primary_admin') {
+          const adminTitle = (await handler.primaryAdminChat())?.title.trim();
+          deliveryLabel = adminTitle ? `管理員（${adminTitle}）` : '管理員';
+        } else deliveryLabel = schedule.delivery.mode === 'line_target' ? schedule.delivery.target.title.trim() || schedule.delivery.target.chatId : '只保存在排程紀錄';
+        return { data: { toolName, schedule, nextFireAtTaipei: schedule.nextFireAt ? formatTaipei(new Date(schedule.nextFireAt)) : null, deliveryLabel } };
+      }
+      if (toolName === UPDATE_SCHEDULE_TOOL_NAME) {
+        const parsed = UpdateScheduleToolInputSchema.safeParse(rawArguments);
+        if (!parsed.success) return invalid(parsed.error);
+        const { scheduleId, recurrence, ...rest } = parsed.data;
+        const patch = { ...rest, ...(recurrence ? { recurrence: this.scheduleRecurrence(recurrence) } : {}) };
+        return { data: { toolName, schedule: await handler.update(scheduleId, patch) } };
+      }
+      const parsed = DeleteScheduleToolInputSchema.safeParse(rawArguments);
+      if (!parsed.success) return invalid(parsed.error);
+      if (!await handler.delete(parsed.data.scheduleId)) return { error: { code: 'SCHEDULE_NOT_FOUND', message: 'Schedule not found.' } };
+      return { data: { toolName, deleted: true, scheduleId: parsed.data.scheduleId } };
+    } catch (error) {
+      if (error instanceof McpDomainError && (error.code === 'PERMISSION_DENIED' || error.code === 'SCOPE_DENIED')) return notPermitted;
+      if (error instanceof AgentScheduleError) return { error: { code: error.code, message: error.message } };
       throw error;
     }
   }
@@ -1095,9 +1336,10 @@ export class McpService {
         this.internalCapabilities.observe(capability, 'tools_listed');
         // Listing is only a hint of the current permissions; tools/call re-resolves them and is the authority.
         const tools: Array<McpToolDefinition | typeof AGENT_ROOM_HISTORY_TOOL_DEFINITION | typeof REQUEST_PERMISSION_TOOL_DEFINITION
-          | (typeof SEND_TOOLS)[number]> = allowedTools(permissions);
+          | (typeof SEND_TOOLS)[number] | (typeof SCHEDULE_TOOLS)[number]> = allowedTools(permissions);
         if (roomHistory) tools.push(AGENT_ROOM_HISTORY_TOOL_DEFINITION);
         if (lineSend && this.options.lineSend) tools.push(...SEND_TOOLS);
+        if (lineSend && this.options.schedules) tools.push(...SCHEDULE_TOOLS);
         if (capability.approval && this.options.approvalBroker) tools.push(REQUEST_PERMISSION_TOOL_DEFINITION);
         return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: { tools } } };
       }
@@ -1149,6 +1391,17 @@ export class McpService {
           }
           return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
             content: [{ type: 'text', text: JSON.stringify(sent.data) }], structuredContent: sent.data, isError: false } } };
+        }
+        if (isScheduleToolName(params.name)) {
+          const scheduled = await this.callScheduleTool(params.name, rawCallArgs, context, signal);
+          // Like send_to_target, a mutation that already committed is reported, not turned into an error by a late release.
+          if (params.name === LIST_SCHEDULES_TOOL_NAME) await finalCheck(params.name);
+          if ('error' in scheduled) {
+            return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
+              content: [{ type: 'text', text: JSON.stringify({ error: scheduled.error }) }], isError: true } } };
+          }
+          return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
+            content: [{ type: 'text', text: JSON.stringify(scheduled.data) }], structuredContent: scheduled.data, isError: false } } };
         }
         const toolNameCheck = McpToolNameSchema.safeParse(params.name);
         if (!toolNameCheck.success) {

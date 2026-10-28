@@ -476,3 +476,85 @@ describe('plan shape', () => {
     expect(plan).toMatchObject({ accountId: ACCOUNT, chatType: 'direct', chatId: 'u-friend', principalId: PRINCIPAL });
   });
 });
+
+describe('system text (system message schedules)', () => {
+  const RUN = 'run-0001';
+  const direct = { accountId: ACCOUNT, chatType: 'direct' as const, chatId: 'u-friend' };
+  const send = (text: string, over: { runId?: string; target?: typeof direct; signal?: AbortSignal } = {}) =>
+    service.sendSystemText({ runId: over.runId ?? RUN, target: over.target ?? direct, text, ...(over.signal ? { signal: over.signal } : {}) });
+
+  it('sends through the same queue and writes a system:schedule audit row keyed by the run id', async () => {
+    expect(await send('早安')).toEqual({ status: 'sent' });
+    expect(worker.sent).toEqual([expect.objectContaining({ kind: 'text', text: '早安', chatType: 'direct' })]);
+    expect(worker.binding).toHaveBeenCalled();
+    expect(worker.waitModeAck).toHaveBeenCalled();
+    expect(repo.audit).toEqual([expect.objectContaining({ jobId: RUN, accountId: ACCOUNT, principalId: 'system:schedule', chatType: 'direct',
+      chatId: 'u-friend', itemIndex: 0, itemKind: 'text', byteSize: Buffer.byteLength('早安'), status: 'sent' })]);
+    expect(JSON.stringify(repo.audit)).not.toContain('早安');
+  });
+
+  it('shares the single FIFO queue with send_to_target calls: one send at a time, in order', async () => {
+    const gate = deferred();
+    worker.gates.push(gate.promise);
+    const tool = submit([{ type: 'text', text: 'from the Agent' }], { jobId: 'job-tool' });
+    await vi.waitFor(() => expect(worker.sent).toHaveLength(1));
+    const system = send('from the system');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(worker.sent).toHaveLength(1);
+    expect(worker.maxActive).toBe(1);
+    gate.resolve();
+    expect(statuses(await tool)).toEqual(['sent']);
+    expect(await system).toEqual({ status: 'sent' });
+    expect(worker.sent.map((entry) => entry.text)).toEqual(['from the Agent', 'from the system']);
+    expect(worker.maxActive).toBe(1);
+  });
+
+  it('splits text over the per-message limit and sends the parts in order', async () => {
+    expect(await send('a'.repeat(4900) + 'b'.repeat(100))).toEqual({ status: 'sent' });
+    expect(worker.sent.map((entry) => entry.text!.length)).toEqual([4900, 100]);
+    expect(repo.audit).toHaveLength(1);
+  });
+
+  it('checks the write gate, binding, mode acknowledgement, account and target like the tool does, auditing a denial', async () => {
+    canWrite = false;
+    expect(await send('x')).toEqual({ status: 'failed', code: 'send_line_unavailable' });
+    canWrite = true;
+    worker.mode = 'MONITOR_ONLY';
+    expect(await send('x')).toEqual({ status: 'failed', code: 'send_line_unavailable' });
+    worker.mode = 'ACTIVE_CONTROL';
+    worker.acknowledged = false;
+    expect(await send('x')).toEqual({ status: 'failed', code: 'send_line_unavailable' });
+    worker.acknowledged = true;
+    expect(await send('x', { target: { ...direct, accountId: 'acct-other' } })).toEqual({ status: 'failed', code: 'send_line_unavailable' });
+    expect(await send('x', { target: { ...direct, chatId: 'u-stranger' } })).toEqual({ status: 'failed', code: 'send_target_invalid' });
+    repo.account = null;
+    expect(await send('x')).toEqual({ status: 'failed', code: 'send_line_unavailable' });
+    expect(worker.sent).toHaveLength(0);
+    expect(repo.audit.length).toBeGreaterThan(0);
+    expect(repo.audit.every((row) => row.principalId === 'system:schedule' && row.status === 'denied' && row.jobId === RUN)).toBe(true);
+  });
+
+  it('reports a failed send and never retries an unknown one, including a gateway exception', async () => {
+    worker.outcomes.set(1, 'failed');
+    expect(await send('one')).toEqual({ status: 'failed', code: 'send_failed' });
+    worker.outcomes.set(2, 'unknown');
+    expect(await send('two', { runId: 'run-2' })).toEqual({ status: 'unknown', code: 'send_unknown' });
+    worker.outcomes.set(3, 'throw');
+    expect(await send('three', { runId: 'run-3' })).toEqual({ status: 'unknown', code: 'send_unknown' });
+    expect(worker.sent).toHaveLength(3);
+    expect(repo.audit.map((row) => row.status)).toEqual(['failed', 'unknown', 'unknown']);
+    expect(repo.audit.every((row) => row.principalId === 'system:schedule')).toBe(true);
+  });
+
+  it('does not send after shutdown or an aborted signal and never touches a database transaction', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    expect(await send('late', { signal: controller.signal })).toEqual({ status: 'failed', code: 'send_line_unavailable' });
+    await service.shutdown();
+    expect(await send('after shutdown')).toEqual({ status: 'failed', code: 'send_line_unavailable' });
+    expect(worker.sent).toHaveLength(0);
+    // The repository is only ever called without a transaction client (the default pool queryable).
+    for (const call of repo.getSendTarget.mock.calls) expect(call).toHaveLength(3);
+    for (const call of repo.findAgentSendAccount.mock.calls) expect(call).toHaveLength(0);
+  });
+});

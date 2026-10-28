@@ -122,6 +122,41 @@ describe('utility worker gateway', () => {
     }
   });
 
+  it('posts a strict refreshOwnProfile command even when the binding carries mode and purpose', async () => {
+    const child = new FakeChild();
+    const gateway = createUtilityWorkerGateway({ spawn: () => child, pollIntervalMs: 60_000 });
+    try {
+      const current = await gateway.start('profile-strict', {
+        accountId: 'profile-strict', workerInstanceId: 'profile-strict-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL',
+      });
+      child.emit({ type: 'modeAck', ...current, drained: true });
+      const { mode: _mode, ...binding } = current;
+      void gateway.refreshOwnProfile!({ type: 'refreshOwnProfile', ...binding, mode: 'ACTIVE_CONTROL', purpose: 'LIVE', expectedMid: 'u1',
+        requestId: 'profile-strict-1', timeoutMs: 5_000 } as never).catch(() => undefined);
+      const posted = child.posted.find((item) => (item as { type?: string }).type === 'refreshOwnProfile');
+      expect(LineWorkerCommandSchema.safeParse(posted).success).toBe(true);
+      expect(posted).not.toHaveProperty('mode');
+      expect(posted).not.toHaveProperty('purpose');
+    } finally { await gateway.shutdown(); }
+  });
+
+  it('rejects a pending own profile request immediately when the worker reports an error for it', async () => {
+    vi.useFakeTimers();
+    const child = new FakeChild();
+    const gateway = createUtilityWorkerGateway({ spawn: () => child, pollIntervalMs: 60_000 });
+    try {
+      const current = await gateway.start('profile-error', {
+        accountId: 'profile-error', workerInstanceId: 'profile-error-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL',
+      });
+      child.emit({ type: 'modeAck', ...current, drained: true });
+      const { mode: _mode, ...binding } = current;
+      const outcome = gateway.refreshOwnProfile!({ type: 'refreshOwnProfile', ...binding, requestId: 'profile-error-1', timeoutMs: 15_000 });
+      const settled = outcome.then(() => 'resolved', (error: Error) => error.message);
+      child.emit({ type: 'error', ...binding, code: 'INVALID_COMMAND', message: 'Worker command rejected', retryable: false, requestId: 'profile-error-1' });
+      await expect(settled).resolves.toContain('INVALID_COMMAND');
+    } finally { vi.useRealTimers(); await gateway.shutdown(); }
+  });
+
   it('reopens archive admission only after the gateway mode acknowledgement and fresh authentication', async () => {
     const children: FakeChild[] = [];
     const gateway = createUtilityWorkerGateway({ spawn: () => { const child = new FakeChild(); children.push(child); return child; }, pollIntervalMs: 60_000 });

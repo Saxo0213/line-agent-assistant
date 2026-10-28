@@ -9,15 +9,18 @@ import { Conversations } from './pages/Conversations.js';
 import { AgentRoom } from './pages/AgentRoom.js';
 import { Search } from './pages/Search.js';
 import { Jobs } from './pages/Jobs.js';
+import { Schedules } from './pages/Schedules.js';
 import { Settings } from './pages/Settings.js';
 import { SetupWizard } from './pages/SetupWizard.js';
 import { accountAvatarRefreshed, LineMediaImage } from './LineMediaImage.js';
 import type { DatabaseSetupStatus } from '../setup-protocol.js';
 import { readStoredSettingsTab, storeSettingsTab, type SettingsTabId } from './settings-tab-storage.js';
 import { LocaleProvider, type LocaleState } from './locale-context.js';
+import { updateTextFor } from '../desktop-update-copy.js';
+import { useUpdateCheck } from './useUpdateCheck.js';
 import { LocalePreferenceSchema, type LocalePreference, type LocaleSnapshot } from '../locale.js';
 
-export type Page = 'conversations' | 'assistant' | 'search' | 'jobs' | 'settings';
+export type Page = 'conversations' | 'assistant' | 'schedules' | 'search' | 'jobs' | 'settings';
 const LAST_PAGE_KEY = 'linejs.lastPage';
 const readStoredPage = (): string | null => {
   try { return window.localStorage.getItem(LAST_PAGE_KEY); } catch { return null; }
@@ -34,8 +37,8 @@ const readInitialSettingsTab = (): SettingsTabId => {
 };
 // An explicit open of a specific tab (a redirect, not a user click inside Settings) also becomes the remembered tab.
 const openedTab = (tab: SettingsTabId): SettingsTabId => { storeSettingsTab(tab); return tab; };
-const links: { id: Page; key: 'chats' | 'assistant' | 'agentNavigation' | 'search' | 'jobs' | 'settings' }[] = [
-  { id: 'conversations', key: 'chats' }, { id: 'assistant', key: 'agentNavigation' }, { id: 'search', key: 'search' },
+const links: { id: Page; key: 'chats' | 'assistant' | 'agentNavigation' | 'schedules' | 'search' | 'jobs' | 'settings' }[] = [
+  { id: 'conversations', key: 'chats' }, { id: 'assistant', key: 'agentNavigation' }, { id: 'schedules', key: 'schedules' }, { id: 'search', key: 'search' },
   { id: 'jobs', key: 'jobs' }, { id: 'settings', key: 'settings' },
 ];
 const empty: AppSnapshot = { control: { epoch: 0, activeAccountId: null, phase: 'idle', targetAccountId: null }, defaultProvider: 'claude', components: [], queueDepth: 0, accounts: [], conversations: [], jobs: [], providers: [] };
@@ -64,6 +67,7 @@ export function firstDisplayedConversation(conversations: readonly ConversationS
 export function App({ api = window.lineAgent }: { api?: DesktopApi }) {
   const [localeData, setLocaleData] = useState<Omit<LocaleState, 'retry' | 'retryRestart' | 'restartNow' | 'restartLater' | 'setPreference'>>({ status: 'loading', effectiveLocale: null, preference: null, busy: false, error: null, restartChoice: false, restartPending: false });
   const locale = localeData.effectiveLocale ?? 'en';
+  const updateAvailable = useUpdateCheck(api).state?.available === true;
   const localizedText = desktopTextFor as (locale: Locale, key: DesktopCopyKey, ...args: [Record<string, unknown>?]) => string;
   const t = (key: DesktopCopyKey, values?: Record<string, unknown>) => values ? localizedText(locale, key, values) : localizedText(locale, key);
   const localeRequest = useRef(0);
@@ -280,13 +284,14 @@ export function App({ api = window.lineAgent }: { api?: DesktopApi }) {
         <div className="accounts">{railAccounts.map((account) => <div className={`account-item route-${account.mode}${viewedAccountId === account.accountId ? ' selected' : ''}`} key={account.accountId}>
           <button className="account-view" data-account-id={account.accountId} aria-label={t('viewArg0Arg1', { arg0: account.displayName, arg1: account.hasPrimaryAdmin === true ? t('administratorLinked') : '' })} aria-pressed={viewedAccountId === account.accountId} onClick={() => { const first = firstDisplayedConversation(snapshot.conversations, account.accountId); setAllAccountsSearchScope(false); setSearchAccountId(account.accountId); setConversationAccountOverrideId(null); setViewAccountId(account.accountId); setSelected(first ? keyOf(first) : null); setPage(page === 'assistant' ? 'assistant' : 'conversations'); }}><span className="account-avatar-wrap" aria-hidden="true"><LineMediaImage api={api} enabled={account.avatarAvailable === true} target={{ type: 'account', accountId: account.accountId }} fallbackKind="person" className="account-avatar" />{account.hasPrimaryAdmin === true && <span className="admin-crown">♛</span>}</span></button>
         </div>)}</div>
-      <nav aria-label={t('mainNavigation')}>{links.map((link) => { const label = t(link.key); return <React.Fragment key={link.id}>{link.id === 'search' && <div className="nav-divider" aria-hidden="true" />}<button className={page === link.id ? 'nav-item selected' : 'nav-item'} onClick={() => { if (link.id === 'settings' && page !== 'settings') setSettingsInitialTab(readStoredSettingsTab() ?? settingsInitialTab); if (link.id === 'search' && !allAccountsSearchScope && searchAccountId === null) setSearchAccountId(viewedAccountId); if (link.id === 'conversations') setConversationAccountOverrideId(null); setPage(link.id); }} title={label} aria-label={label} aria-current={page === link.id ? 'page' : undefined}><span className="nav-short" aria-hidden="true">{label}</span></button></React.Fragment>; })}</nav>
+      <nav aria-label={t('mainNavigation')}>{links.map((link) => { const label = t(link.key) + (link.id === 'settings' && updateAvailable ? updateTextFor(locale, 'navUpdateSuffix') : ''); return <React.Fragment key={link.id}>{link.id === 'schedules' && <div className="nav-divider" aria-hidden="true" />}<button className={page === link.id ? 'nav-item selected' : 'nav-item'} onClick={() => { if (link.id === 'settings' && page !== 'settings') setSettingsInitialTab(readStoredSettingsTab() ?? settingsInitialTab); if (link.id === 'search' && !allAccountsSearchScope && searchAccountId === null) setSearchAccountId(viewedAccountId); if (link.id === 'conversations') setConversationAccountOverrideId(null); setPage(link.id); }} title={label} aria-label={label} aria-current={page === link.id ? 'page' : undefined}>{link.id === 'settings' && updateAvailable && <span className="nav-update-badge" aria-hidden="true">!</span>}<span className="nav-short" aria-hidden="true">{t(link.key)}</span></button></React.Fragment>; })}</nav>
       </aside>
       <main className="main-region">
         {error && <div className="error-banner" role="alert">{generatedMessageText(error)}<button onClick={() => setError('')}>{t('close')}</button></div>}
         {page === 'conversations' && <Conversations api={api} snapshot={viewedSnapshot} conversation={chosen ?? null} selected={selected} onSelect={setSelected} account={snapshot.accounts.find((entry) => entry.accountId === conversationAccountId) ?? null} coreReady={coreReady} showCoreWarning={!coreReady && !awaitingLineLogin} messageRevisions={messageRevisions} sendFeedback={sendFeedback} sendFeedbackRef={sendFeedbackRef} setSendFeedback={setSendFeedback} pendingSubmitRoutes={pendingSubmitRoutes} snapshotToken={snapshot} />}
         {page === 'assistant' && <section className="chat-panel assistant-page" id="active-chat-panel" aria-label={t('assistant')}><AgentRoom api={api} conversation={agentRoom} jobs={snapshot.jobs} providers={snapshot.providers} /></section>}
         {page === 'search' && <Search api={api} accounts={snapshot.accounts} conversations={snapshot.conversations} accountScopeId={searchScopeAccountId} onAccountScopeChange={(accountId) => { setAllAccountsSearchScope(accountId === null); setSearchAccountId(accountId); if (accountId !== null && railAccounts.some((account) => account.accountId === accountId)) setViewAccountId(accountId); }} onOpen={(key) => { setAllAccountsSearchScope(false); setConversationAccountOverrideId(key.accountId); setSelected(keyOf(key)); setPage('conversations'); }} headingRef={heading} />}
+        {page === 'schedules' && <Schedules api={api} defaultProvider={snapshot.defaultProvider} providers={snapshot.providers} headingRef={heading} onNotice={setToast} />}
         {page === 'jobs' && <Jobs api={api} jobs={snapshot.jobs} headingRef={heading} onNotice={setToast} />}
         {page === 'settings' && <Settings api={api} defaultProvider={snapshot.defaultProvider} providers={snapshot.providers} accounts={snapshot.accounts} components={snapshot.components} initialTab={settingsInitialTab} live={lineLogin} headingRef={heading} onNotice={setToast} onOpenWorkConversation={(key) => { setAllAccountsSearchScope(false); setConversationAccountOverrideId(null); setViewAccountId(key.accountId); setSelected(keyOf(key)); setPage('conversations'); }} />}
       </main>

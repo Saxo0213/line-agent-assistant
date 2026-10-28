@@ -16,4 +16,5 @@ export const IPC_ACTION_CODES = [
   'setAgentPermissionDefault', 'revokeAgentWhitelistUser', 'setAgentPermission', 'getAgentExecutionPolicy',
   'setAgentExecutionPolicy', 'listAgentToolAllowlist', 'removeAgentToolAllowlistEntry', 'clearAgentToolAllowlist',
   'decideAgentApproval', 'listPendingAgentApprovals', 'setAgentFolderLink', 'createChatFolder', 'openChatFolder',
+  'listAgentSchedules', 'createAgentSchedule', 'updateAgentSchedule', 'deleteAgentSchedule', 'listAgentScheduleRuns', 'listAgentScheduleTargets',
 ] as const;

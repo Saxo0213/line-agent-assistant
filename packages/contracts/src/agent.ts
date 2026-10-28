@@ -12,6 +12,8 @@ export const AgentSourceSchema = z.discriminatedUnion('type', [
   WritableConversationKeySchema.extend({ type: z.literal('line'), messageId: IdSchema }),
   /** UI work belongs to the one shared Agent room, which has no LINE account. */
   z.strictObject({ type: z.literal('ui'), requestId: IdSchema }),
+  /** A scheduled run: its own queue and a brand-new provider session; it never touches the room's or a chat's session. */
+  z.strictObject({ type: z.literal('schedule'), requestId: IdSchema }),
 ]);
 export type AgentSource = z.infer<typeof AgentSourceSchema>;
 

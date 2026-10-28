@@ -102,6 +102,7 @@ describe('snapshot hot path', () => {
   it('projects bounded optional reply previews in the single jobs query', async () => {
     const longPreview = '🟢'.repeat(240);
     const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [] }) // Agent lineage
       .mockResolvedValueOnce({ rows: [{ control_epoch: '0', active_account_id: null }] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
@@ -117,19 +118,20 @@ describe('snapshot hot path', () => {
     const snapshot = await new HealthService({ query } as unknown as Pool).snapshot();
     const withReply = snapshot.jobs.find((job) => job.jobId === 'job-with-reply')!;
     const withoutReply = snapshot.jobs.find((job) => job.jobId === 'job-without-reply')!;
-    const jobQuery = String(query.mock.calls[3]?.[0]);
+    const jobQuery = String(query.mock.calls[4]?.[0]);
 
     expect(withReply.replyPreview).toBe(longPreview);
     expect(Array.from(withReply.replyPreview ?? '')).toHaveLength(240);
     expect(withoutReply).not.toHaveProperty('replyPreview');
     expect(jobQuery).toContain('LEFT JOIN agent_outputs output ON output.job_id = recent.job_id');
     expect(jobQuery).toContain('char_length(output.final_text) > 240');
-    expect(query).toHaveBeenCalledTimes(6);
+    expect(query).toHaveBeenCalledTimes(7);
     expect(AppSnapshotSchema.parse(snapshot).jobs.find((job) => job.jobId === 'job-with-reply')?.replyPreview).toBe(longPreview);
   });
 
   it('returns the persisted global default Agent provider', async () => {
     const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [] }) // Agent lineage
       .mockResolvedValueOnce({ rows: [{ control_epoch: '0', active_account_id: null }] })
       .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [{ count: '0' }] })
@@ -142,6 +144,7 @@ describe('snapshot hot path', () => {
 
   it('does not inspect provider login state', async () => {
     const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [] }) // Agent lineage
       .mockResolvedValueOnce({ rows: [{ control_epoch: '0', active_account_id: null }] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ account_id: 'a', chat_type: 'group', chat_id: 'g', title: '工程群組',
@@ -159,7 +162,7 @@ describe('snapshot hot path', () => {
     const snapshot = await health.snapshot();
 
     expect(status).not.toHaveBeenCalled();
-    const conversationSql = String(query.mock.calls[2]?.[0]);
+    const conversationSql = String(query.mock.calls[3]?.[0]);
     expect(conversationSql).toContain("m.content->>'nativeContentType'='16'");
     expect(conversationSql).toContain("THEN jsonb_build_object('serviceType', m.raw#>>'{message,contentMetadata,serviceType}')");
     expect(conversationSql).toContain('latest.notification_projection latest_notification_projection');
@@ -175,6 +178,7 @@ describe('snapshot hot path', () => {
       latest_occurred_at: new Date('2026-10-16T00:00:00.000Z'), latest_attachment_name: null, latest_attachment_kind: null,
       latest_attachment_status: null });
     const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [] }) // Agent lineage
       .mockResolvedValueOnce({ rows: [{ control_epoch: '0', active_account_id: null }] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [conversation('g-sticker', 'sticker'), conversation('g-image', 'image'), conversation('g-text', 'text')] })
@@ -195,6 +199,7 @@ describe('snapshot hot path', () => {
       latest_kind: 'text', latest_occurred_at: new Date('2026-10-22T00:00:00.000Z'), latest_attachment_name: null, latest_attachment_kind: null,
       latest_attachment_status: null });
     const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [] }) // Agent lineage
       .mockResolvedValueOnce({ rows: [{ control_epoch: '0', active_account_id: null }] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [conversation('g-deleted', null, true), conversation('g-recalled', { format: 1, type: 'unsent' }, false),
@@ -216,6 +221,7 @@ describe('snapshot hot path', () => {
       latest_occurred_at: new Date('2026-10-22T00:00:00.000Z'), latest_attachment_name: null, latest_attachment_kind: null,
       latest_attachment_status: null });
     const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [] }) // Agent lineage
       .mockResolvedValueOnce({ rows: [{ control_epoch: '0', active_account_id: null }] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [
@@ -239,7 +245,7 @@ describe('snapshot hot path', () => {
   });
   it('reflects provider auth health after an explicit check without probing during snapshots', async () => {
     const query = vi.fn()
-      .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ count: '0' }] });
     query.mockResolvedValueOnce({ rows: [{ provider: 'claude' }] });
@@ -269,6 +275,7 @@ describe('chat-list preview sticons', () => {
     latest_attachment_status: null });
   const snapshotFor = async (rows: unknown[]) => {
     const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [] }) // Agent lineage
       .mockResolvedValueOnce({ rows: [{ control_epoch: '0', active_account_id: null }] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows })

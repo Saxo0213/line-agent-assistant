@@ -157,7 +157,7 @@ describe('provider CLI invocation and observed auth events',()=>{
     expect(specifications.map(spec=>spec.args.slice(3))).toEqual([
       provider==='codex'
         ? ['exec','--ignore-user-config','--json','--sandbox','workspace-write','--skip-git-repo-check','-C',root,'-']
-        : ['-p','--input-format','text','--output-format','stream-json','--verbose','--include-partial-messages','--restricted','--permission-mode','dontAsk','--strict-mcp-config','--tools','Read,Glob,Grep,Write,Edit','--disallowedTools','Bash','--allowedTools','Write,Edit'],
+        : ['-p','--input-format','text','--output-format','stream-json','--verbose','--include-partial-messages','--autocompact','400000','--restricted','--permission-mode','dontAsk','--strict-mcp-config','--tools','Read,Glob,Grep,Write,Edit','--disallowedTools','Bash','--allowedTools','Write,Edit'],
     ]);
     if (provider==='claude') expect(specifications[0]?.args[specifications[0]!.args.indexOf('--allowedTools')+1]).not.toContain('Bash');
   });
@@ -178,7 +178,7 @@ describe('provider CLI invocation and observed auth events',()=>{
     expect(payload.cwd.toLowerCase()).toBe(root.toLowerCase());
     expect(payload.args).toEqual(provider==='codex'
       ? ['exec','--ignore-user-config','--json','--sandbox','workspace-write','--skip-git-repo-check','-C',root,'-']
-      : ['-p','--input-format','text','--output-format','stream-json','--verbose','--include-partial-messages','--restricted','--permission-mode','dontAsk','--strict-mcp-config','--tools','Read,Glob,Grep,Write,Edit','--disallowedTools','Bash','--allowedTools','Write,Edit']);
+      : ['-p','--input-format','text','--output-format','stream-json','--verbose','--include-partial-messages','--autocompact','400000','--restricted','--permission-mode','dontAsk','--strict-mcp-config','--tools','Read,Glob,Grep,Write,Edit','--disallowedTools','Bash','--allowedTools','Write,Edit']);
     if (provider==='claude') expect(payload.args[payload.args.indexOf('--allowedTools')+1]).not.toContain('Bash');
     expect(JSON.stringify(payload.env)).not.toMatch(/openai-secret|anthropic-secret|line-secret|pg-secret|NODE_OPTIONS/);
   });

@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { isLineServerErrorCode } from './line-server-error.js';
 import { AgentAttachmentSummarySchema, AgentAttachmentUploadsSchema, AgentEventSchema, AgentProviderSchema } from './agent.js';
 import { AgentStatusIconsSchema } from './agent-status-icons.js';
+import { AgentScheduleCreateInputSchema, AgentScheduleListRunsInputSchema, AgentScheduleListTargetsInputSchema, AgentScheduleRunSchema, AgentScheduleSchema, AgentScheduleTargetOptionSchema, AgentScheduleUpdatePatchSchema } from './agent-schedule.js';
 import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN } from './agent-status-rotation.js';
 import { AutoResponderRuleSchema, AutoResponderSettingsSchema, validateAutoresponderConfig } from './autoresponder.js';
 import { AccountModeSchema, ChatTypeSchema, ConversationKeySchema, WritableConversationKeySchema } from './account.js';
@@ -32,6 +33,13 @@ import {
 } from './mcp.js';
 
 const IdSchema = z.string().min(1);
+export const MessageSearchScopeSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('agent') }),
+  z.strictObject({ kind: z.literal('account'), accountId: IdSchema }),
+  z.strictObject({ kind: z.literal('all') }),
+]);
+export type MessageSearchScope = z.infer<typeof MessageSearchScopeSchema>;
+
 const TimestampSchema = z.iso.datetime({ offset: true });
 const RequestIdSchema = z.strictObject({ requestId: IdSchema });
 const PageSchema = z.strictObject({ before: IdSchema.nullable(), limit: z.number().int().min(1).max(100) });
@@ -156,7 +164,7 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('retryJob'), jobId: IdSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('newSession'), provider: AgentProviderSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('getJobEvents'), jobId: IdSchema }),
-  RequestIdSchema.extend({ type: z.literal('searchMessages'), query: z.strictObject({ key: ConversationKeySchema.optional(), accountId: IdSchema.optional(), senderId: IdSchema.optional(), text: z.string().optional(), from: TimestampSchema.optional(), to: TimestampSchema.optional(), hasAttachment: z.boolean().optional(), attachmentKind: z.enum(['image', 'video', 'audio', 'file']).optional(), limit: z.number().int().positive().max(500) }) }),
+  RequestIdSchema.extend({ type: z.literal('searchMessages'), query: z.strictObject({ key: ConversationKeySchema.optional(), accountId: IdSchema.optional(), scope: MessageSearchScopeSchema.optional(), senderId: IdSchema.optional(), text: z.string().optional(), from: TimestampSchema.optional(), to: TimestampSchema.optional(), hasAttachment: z.boolean().optional(), attachmentKind: z.enum(['image', 'video', 'audio', 'file']).optional(), limit: z.number().int().positive().max(500) }) }),
   RequestIdSchema.extend({ type: z.literal('openExternalUrl'), url: z.string().min(1).max(8192) }),
   RequestIdSchema.extend({ type: z.literal('openAttachment'), attachmentId: IdSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('downloadAttachment'), attachmentId: IdSchema }),
@@ -212,6 +220,12 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.merge(SetAgentFolderLinkInputSchema).extend({ type: z.literal('setAgentFolderLink') }),
   RequestIdSchema.extend({ type: z.literal('createChatFolder'), accountId: IdSchema, chatType: ChatFolderChatTypeSchema, chatId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('openChatFolder'), folderId: z.uuid() }),
+  RequestIdSchema.extend({ type: z.literal('listAgentSchedules') }),
+  RequestIdSchema.extend({ type: z.literal('createAgentSchedule'), schedule: AgentScheduleCreateInputSchema }),
+  RequestIdSchema.extend({ type: z.literal('updateAgentSchedule'), scheduleId: z.uuid(), patch: AgentScheduleUpdatePatchSchema }),
+  RequestIdSchema.extend({ type: z.literal('deleteAgentSchedule'), scheduleId: z.uuid() }),
+  RequestIdSchema.merge(AgentScheduleListRunsInputSchema).extend({ type: z.literal('listAgentScheduleRuns') }),
+  RequestIdSchema.merge(AgentScheduleListTargetsInputSchema).extend({ type: z.literal('listAgentScheduleTargets') }),
 ]).superRefine((request, context) => {
   if (request.type === 'switchControl') context.addIssue({ code: 'custom', message: 'Account control is managed internally.' });
 });
@@ -233,6 +247,8 @@ export const LineAccountSummarySchema = z.strictObject({
   lastSyncedAt: TimestampSchema.nullable(),
   mode: AccountModeSchema,
   productRole: z.enum(['AGENT', 'PRIMARY_ADMIN']).nullable().optional(),
+  /** Agent lineage membership: the current Agent account or a former Agent account; absent for every other account. */
+  agentLineage: z.enum(['current', 'former']).optional(),
   hasPrimaryAdmin: z.boolean().optional(),
   autoLoginOnStartup: z.boolean().optional(),
   hasVerifiedLineIdentity: z.boolean().optional(),
@@ -295,8 +311,11 @@ export const AgentJobSummarySchema = z.strictObject({
   createdAt: TimestampSchema,
   /** At most 240 Unicode code points from a stored completed reply, projected by Main for the Tasks list. */
   replyPreview: z.string().max(480).refine((value) => Array.from(value).length <= 240).optional(),
-  /** Stamped by Main for jobs the Agent room shows: its own, or the admin's direct LINE chat while that chat is shared. */
-  origin: z.enum(['agent_room', 'line_admin_direct']).optional(),
+  /**
+   * Stamped by Main for jobs the Agent room shows (its own, or the admin's direct LINE chat while that chat is shared), and
+   * 'schedule' for scheduled runs, which the Jobs page lists but the Agent room never shows.
+   */
+  origin: z.enum(['agent_room', 'line_admin_direct', 'schedule']).optional(),
   /** Files attached in the Agent room, for display only (no paths). Absent when there are none. */
   attachments: z.array(AgentAttachmentSummarySchema).max(10).optional(),
 });
@@ -355,6 +374,8 @@ export const IpcEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('agentApprovalResolved'), approvalId: IdSchema, jobId: IdSchema, outcome: AgentApprovalOutcomeSchema }),
   /** The execution policy changed (operator UI or LINE /權限); subscribers re-read it. Carries no policy data. */
   z.strictObject({ type: z.literal('agentExecutionPolicyChanged') }),
+  /** A schedule or a schedule run changed (UI, Agent tool or the trigger tick); subscribers re-read. Carries no schedule data. */
+  z.strictObject({ type: z.literal('agentSchedulesChanged') }),
 ]);
 export type IpcEvent = z.infer<typeof IpcEventSchema>;
 
@@ -370,6 +391,8 @@ export const MessageSearchResultSchema = z.strictObject({
   conversationTitle: z.string().nullable().optional(),
   text: z.string().nullable(),
   occurredAt: TimestampSchema,
+  /** 'agent' when the source account belongs to the Agent lineage (current or former Agent account). */
+  lineage: z.literal('agent').nullable().optional(),
 });
 export type MessageSearchResult = z.infer<typeof MessageSearchResultSchema>;
 
@@ -467,6 +490,12 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('setAgentFolderLink'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().nonnegative() }),
     z.strictObject({ type: z.literal('createChatFolder'), requestId: IdSchema, ok: z.literal(true), folder: ChatFolderSummarySchema }),
     z.strictObject({ type: z.literal('openChatFolder'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
+    z.strictObject({ type: z.literal('listAgentSchedules'), requestId: IdSchema, ok: z.literal(true), schedules: z.array(AgentScheduleSchema).max(200) }),
+    z.strictObject({ type: z.literal('createAgentSchedule'), requestId: IdSchema, ok: z.literal(true), schedule: AgentScheduleSchema }),
+    z.strictObject({ type: z.literal('updateAgentSchedule'), requestId: IdSchema, ok: z.literal(true), schedule: AgentScheduleSchema }),
+    z.strictObject({ type: z.literal('deleteAgentSchedule'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('listAgentScheduleRuns'), requestId: IdSchema, ok: z.literal(true), runs: z.array(AgentScheduleRunSchema).max(50) }),
+    z.strictObject({ type: z.literal('listAgentScheduleTargets'), requestId: IdSchema, ok: z.literal(true), targets: z.array(AgentScheduleTargetOptionSchema).max(50) }),
   ]),
   z.strictObject({ type: z.literal('error'), requestId: IdSchema, ok: z.literal(false), code: z.string().min(1),
     message: z.string().min(1), retryable: z.boolean(),

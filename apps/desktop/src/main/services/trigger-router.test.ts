@@ -68,3 +68,57 @@ describe('routeTrigger', () => {
       mentionRanges: [{ start: 0, end: 4, userId: '@all' }] }), context)).toEqual({ type: 'ignore' });
   });
 });
+
+describe('routeTrigger group free mode', () => {
+  const admin = { ...context, senderIsPrimaryAdmin: true };
+  const plain = (text: string) => envelope({ text, mentionIds: [], mentionRanges: [] });
+
+  it('parses /free, /free N and /free off, with or without an Agent mention', () => {
+    expect(routeTrigger(plain('/free'), admin)).toEqual({ type: 'free', action: 'on', minutes: 5 });
+    expect(routeTrigger(plain('/free 30'), admin)).toEqual({ type: 'free', action: 'on', minutes: 30 });
+    expect(routeTrigger(plain('/FREE   120'), admin)).toEqual({ type: 'free', action: 'on', minutes: 120 });
+    expect(routeTrigger(plain('/free off'), admin)).toEqual({ type: 'free', action: 'off' });
+    expect(routeTrigger(envelope({ text: '@Agent /free 7' }), admin)).toEqual({ type: 'free', action: 'on', minutes: 7 });
+    expect(routeTrigger(envelope({ text: '@Agent /free off' }), { ...admin, agentEnabled: false })).toEqual({ type: 'free', action: 'off' });
+  });
+  it('a bare /free never turns free mode off, even while it is on', () => {
+    expect(routeTrigger(plain('/free'), { ...admin, freeModeActive: true })).toEqual({ type: 'free', action: 'on', minutes: 5 });
+    expect(routeTrigger(plain('/free 9'), { ...admin, freeModeActive: true })).toEqual({ type: 'free', action: 'on', minutes: 9 });
+  });
+  it('rejects out-of-range and malformed arguments with the range reply', () => {
+    for (const text of ['/free 0', '/free 121', '/free -3', '/free 1.5', '/free abc', '/free 5 6', '/free 99999999']) {
+      expect(routeTrigger(plain(text), admin)).toEqual({ type: 'free_range' });
+    }
+  });
+  it('is Primary Administrator only; a member /free is never forwarded to the Agent', () => {
+    expect(routeTrigger(plain('/free'), context)).toEqual({ type: 'ignore' });
+    expect(routeTrigger(envelope({ text: '@Agent /free' }), context)).toEqual({ type: 'ignore' });
+    expect(routeTrigger(plain('/free'), { ...context, freeModeActive: true })).toEqual({ type: 'free_message' });
+    expect(routeTrigger({ ...plain('/free'), chatType: 'direct' }, admin)).not.toMatchObject({ type: 'free' });
+  });
+  it('does not treat /freedom or text after a different word as the command', () => {
+    expect(routeTrigger(plain('/freedom'), admin)).toEqual({ type: 'ignore' });
+    expect(routeTrigger(plain('please /free'), admin)).toEqual({ type: 'ignore' });
+  });
+  it('keeps the live/own/decrypt_failed gates for free commands and messages', () => {
+    const on = { ...admin, freeModeActive: true };
+    expect(routeTrigger({ ...plain('/free'), ingestion: { source: 'history', cursor: null } }, on)).toEqual({ type: 'ignore' });
+    expect(routeTrigger({ ...plain('/free'), senderId: 'agent-mid' }, on)).toEqual({ type: 'ignore' });
+    expect(routeTrigger({ ...plain('hi'), senderId: 'agent-mid' }, on)).toEqual({ type: 'ignore' });
+    expect(routeTrigger({ ...plain('hi'), raw: { contentState: 'decrypt_failed' } }, on)).toEqual({ type: 'ignore' });
+    expect(routeTrigger({ ...plain('hi'), kind: 'image', text: null }, on)).toEqual({ type: 'ignore' });
+  });
+  it('treats any member text as addressed to the Agent only while free mode is on', () => {
+    expect(routeTrigger(plain('hello everyone'), context)).toEqual({ type: 'ignore' });
+    expect(routeTrigger(plain('hello everyone'), { ...context, freeModeActive: true })).toEqual({ type: 'free_message' });
+    expect(routeTrigger(plain('hello'), { ...context, agentEnabled: false, freeModeActive: true })).toEqual({ type: 'free_message' });
+    expect(routeTrigger(plain('hello'), { ...admin, freeModeActive: true })).toEqual({ type: 'free_message' });
+  });
+  it('keeps an explicit mention on the normal path while on (admin prompt, /stop, /new, /status)', () => {
+    const on = { ...admin, freeModeActive: true };
+    expect(routeTrigger(envelope({ text: '@Agent fix this' }), on)).toEqual({ type: 'prompt', provider: 'codex', prompt: 'fix this' });
+    expect(routeTrigger(envelope({ text: '@Agent /stop' }), on)).toEqual({ type: 'stop' });
+    expect(routeTrigger(envelope({ text: '@Agent /status' }), on)).toEqual({ type: 'status' });
+    expect(routeTrigger(envelope({ text: '@Agent /new' }), on)).toEqual({ type: 'new' });
+  });
+});

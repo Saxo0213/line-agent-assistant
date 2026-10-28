@@ -3,6 +3,8 @@ import {
   IpcRequestSchema,
   IpcResultSchema,
   McpMessageRecordSchema,
+  decodeMcpMessageCursor,
+  encodeMcpMessageCursor,
   McpServerStatusSchema,
   McpTargetSummarySchema,
   McpTokenSummarySchema,
@@ -39,6 +41,27 @@ describe('MCP contracts and IPC schemas', () => {
   it('classifies every MCP tool as read or effect', () => {
     expect(Object.keys(MCP_TOOL_EFFECTS).sort()).toEqual([...MCP_TOOL_NAMES].sort());
     for (const tool of MCP_TOOL_NAMES) expect(MCP_TOOL_EFFECTS[tool]).toBe('read');
+  });
+
+  it('clamps message query limits above 200 and validates paging cursors', () => {
+    const base = { accountId: 'acc', chatType: 'group' as const, chatId: 'chat' };
+    const byTime = { ...base, from: '2026-10-28' };
+    for (const [name, args] of [['query_target_messages', base], ['query_target_messages_by_time', byTime]] as const) {
+      const big = McpToolInputUnionSchema.parse({ name, arguments: { ...args, limit: 500 } });
+      expect((big.arguments as { limit?: number }).limit).toBe(200);
+      expect((McpToolInputUnionSchema.parse({ name, arguments: { ...args, limit: 50 } }).arguments as { limit?: number }).limit).toBe(50);
+      expect((McpToolInputUnionSchema.parse({ name, arguments: args }).arguments as { limit?: number }).limit).toBeUndefined();
+      expect(McpToolInputUnionSchema.safeParse({ name, arguments: { ...args, limit: 0 } }).success).toBe(false);
+      const good = encodeMcpMessageCursor({ occurredAt: '2026-10-28T01:02:03.123456Z', messageId: 'm-1', queryHash: '0123456789abcdef' });
+      expect(McpToolInputUnionSchema.safeParse({ name, arguments: { ...args, cursor: good } }).success).toBe(true);
+      for (const cursor of ['', 'not a cursor', 'e30', good + 'A', btoa('{"t":"x","i":"m","h":"0123456789abcdef"}')]) {
+        expect(McpToolInputUnionSchema.safeParse({ name, arguments: { ...args, cursor } }).success).toBe(false);
+      }
+    }
+    const cursor = { occurredAt: '2026-10-28T01:02:03.123456Z', messageId: 'm-1', queryHash: '0123456789abcdef' };
+    expect(decodeMcpMessageCursor(encodeMcpMessageCursor(cursor))).toEqual(cursor);
+    expect(decodeMcpMessageCursor(encodeMcpMessageCursor({ ...cursor, queryHash: 'XYZ' }))).toBeNull();
+    expect(decodeMcpMessageCursor(encodeMcpMessageCursor({ ...cursor, occurredAt: '2026-02-31T00:00:00.000000Z' }))).toBeNull();
   });
 
   it('requires explicit account and stable conversation selectors for archived Note and Album tools', () => {
@@ -208,6 +231,9 @@ describe('MCP contracts and IPC schemas', () => {
       McpToolOutputUnionSchema.parse({
         toolName: 'query_target_messages',
         messages: [message],
+        hasMore: false,
+        nextCursor: null,
+        page: { returned: 1, limit: 50, hasMore: false, nextCursor: null },
       }).toolName,
     ).toBe('query_target_messages');
 

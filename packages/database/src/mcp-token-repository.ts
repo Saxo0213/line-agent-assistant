@@ -1,9 +1,9 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MAX_MCP_TOOL_SCOPES, McpTokenExpirationSchema, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpTokenExpiration, type McpTokenSummary, type McpToolName } from '@line-agent/contracts';
+import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MAX_MCP_TOOL_SCOPES, McpTokenExpirationSchema, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpTokenExpiration, type McpTokenSummary, type McpToolName } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
-import { lockAndCheckAgentAuthorization } from './agent-authorization.js';
+import { lockAndCheckAgentAuthorization, lockAndCheckRoomAgentGrant } from './agent-authorization.js';
 import { findSharedAdminChat, type SharedAdminChat } from './agent-repository.js';
-import { allPermissions, findPrimaryAdminUser, resolveLinkedChats, resolveUserPermissions } from './agent-permissions.js';
+import { FREE_MODE_MEMBER_ID, allPermissions, findPrimaryAdminUser, resolveLinkedChats, resolveUserPermissions } from './agent-permissions.js';
 import { LOCAL_CLIENT_PRINCIPALS, parseRoleScope, normalizeManagedMcpScopes, type ProductRole } from './managed-mcp-scopes.js';
 
 export type McpErrorCode =
@@ -28,9 +28,19 @@ export class McpDomainError extends Error {
   }
 }
 
-/** Only the Primary Admin's LINE jobs and the desktop operator's Agent room jobs may send to LINE; never a friend, room-grant user or external token. */
+/**
+ * Only the Primary Admin's LINE jobs, the desktop operator's Agent room jobs and the operator's scheduled runs may send to LINE;
+ * never a friend, room-grant user or external token.
+ */
 export const mayLineSend = (principalId: string): boolean =>
-  principalId === 'internal:ui' || principalId.startsWith('internal:primary_admin:');
+  principalId === 'internal:ui' || principalId === SCHEDULE_PRINCIPAL_ID || principalId.startsWith('internal:primary_admin:');
+
+/**
+ * Principal of a scheduled Agent run. Same data scope and permissions as the room operator (internal:ui), but a distinct audit
+ * identity, and it is not an Agent room job: it has no room history. It is accepted by exactly the tools `mayLineSend` gates
+ * (list_send_targets, send_to_target and the schedule tools; create/update/delete_schedule are refused for schedule jobs by McpService).
+ */
+export const SCHEDULE_PRINCIPAL_ID = 'internal:schedule';
 
 /** Data scope derived server-side from the job row; never from tool arguments. */
 export type InternalDataScope =
@@ -724,7 +734,7 @@ export class McpTokenRepository {
     toolName: McpInternalToolName | null,
     includeHistory = toolName === AGENT_ROOM_HISTORY_TOOL_NAME,
   ): Promise<{ principalId: string; scope: InternalDataScope; permissions: EffectivePermissions; history: { allowed: boolean; shared: SharedAdminChat | null } }> {
-    let context: { sourceType: 'ui' } | { sourceType: 'line'; jobId: string };
+    let context: { sourceType: 'ui' } | { sourceType: 'schedule' } | { sourceType: 'line'; jobId: string };
     if (initial.sourceType === 'job') {
       const row = (await client.query<{ account_id: string | null; generation: string | number; status: string; source_type: string }>(
         `SELECT account_id, generation, status, source_type FROM agent_jobs WHERE job_id = $1`,
@@ -733,11 +743,15 @@ export class McpTokenRepository {
       // A UI job of the shared Agent room has no account (NULL === NULL); a LINE job must match its account exactly,
       // and the DB CHECK guarantees a LINE job is never account-less.
       if (!row || row.status !== 'running' || Number(row.generation) !== initial.generation || row.account_id !== initial.accountId
-        || (row.source_type !== 'ui' && row.source_type !== 'line') || (row.source_type === 'line' && row.account_id === null)) {
+        || (row.source_type !== 'ui' && row.source_type !== 'line' && row.source_type !== 'schedule') || (row.source_type === 'line' && row.account_id === null)) {
         return this.rejectInternal(client, toolName, row?.account_id ? [row.account_id] : [], 'The Agent job is no longer authorized to use LINEJS MCP tools.');
       }
-      context = row.source_type === 'ui' ? { sourceType: 'ui' } : { sourceType: 'line', jobId: initial.jobId };
+      context = row.source_type === 'ui' ? { sourceType: 'ui' } : row.source_type === 'schedule' ? { sourceType: 'schedule' } : { sourceType: 'line', jobId: initial.jobId };
     } else context = initial;
+    if (context.sourceType === 'schedule') {
+      // A scheduled run reads like the operator but has no Agent room history.
+      return { principalId: SCHEDULE_PRINCIPAL_ID, scope: { kind: 'full' }, permissions: allPermissions('ALLOW'), history: { allowed: false, shared: null } };
+    }
     if (context.sourceType === 'ui') {
       return { principalId: 'internal:ui', scope: { kind: 'full' }, permissions: allPermissions('ALLOW'),
         history: { allowed: true, shared: includeHistory ? await findSharedAdminChat(client) : null } };
@@ -753,9 +767,10 @@ export class McpTokenRepository {
       direct_friend_grant_version: string | number | null;
       room_agent_grant_id: string | null;
       room_agent_grant_version: string | number | null;
+      free_mode: boolean;
     }>(
       `SELECT job_id, account_id, chat_type, chat_id, source_type, source_message_id, direct_friend_grant_id, direct_friend_grant_version,
-              room_agent_grant_id, room_agent_grant_version
+              room_agent_grant_id, room_agent_grant_version, free_mode
        FROM agent_jobs
        WHERE job_id = $1`,
       [context.jobId],
@@ -763,6 +778,25 @@ export class McpTokenRepository {
     const job = jobResult.rows[0];
     if (!job || job.source_type !== 'line' || !job.source_message_id) {
       return this.rejectInternal(client, toolName, [], 'Internal MCP archive queries are restricted to authorized LINE-origin Agent jobs and the local console UI.');
+    }
+    if (job.free_mode) {
+      // Group free mode: always the room-member principal, even when the batch contains the administrator's messages.
+      // Only the stored room grant is rechecked (there is no per-sender friend grant); permissions are the default member rules.
+      const roomStillAuthorized = job.chat_type !== 'direct' && job.room_agent_grant_id !== null && job.room_agent_grant_version !== null
+        && await lockAndCheckRoomAgentGrant(client, job.account_id, job.chat_type, job.chat_id,
+          { grantId: job.room_agent_grant_id, version: Number(job.room_agent_grant_version) });
+      if (!roomStillAuthorized) return this.rejectInternal(client, toolName, [job.account_id], 'The Agent job grant is no longer active.');
+      const memberPermissions = await resolveUserPermissions(client, job.account_id, FREE_MODE_MEMBER_ID,
+        { chatType: job.chat_type, chatId: job.chat_id });
+      const memberAccountWide = memberPermissions['records.query_all_chats'] === 'ALLOW';
+      return {
+        principalId: (memberAccountWide ? `internal:account_scoped:${job.account_id}` : `internal:chat_scoped:${job.chat_type}:${job.chat_id}`).slice(0, 128),
+        scope: memberAccountWide
+          ? { kind: 'account', accountId: job.account_id }
+          : { kind: 'chat', accountId: job.account_id, chatType: job.chat_type, chatId: job.chat_id, linkedChats: [] },
+        permissions: memberPermissions,
+        history: { allowed: false, shared: null },
+      };
     }
     const adminUserId = await findPrimaryAdminUser(client, job.account_id, job.source_message_id);
     if (adminUserId) {
@@ -870,7 +904,8 @@ export class McpTokenRepository {
 
       // Agent LINE send tools: only the Primary Admin and the desktop operator, re-derived on every call. The tool body
       // authorizes inside this transaction; any LINE effect happens after it commits, outside any transaction.
-      if (input.toolName === LIST_SEND_TARGETS_TOOL_NAME || input.toolName === SEND_TO_TARGET_TOOL_NAME) {
+      // Schedule tools share the send tools' principals (Primary Admin and desktop operator only).
+      if (input.toolName === LIST_SEND_TARGETS_TOOL_NAME || input.toolName === SEND_TO_TARGET_TOOL_NAME || isScheduleToolName(input.toolName)) {
         if (!mayLineSend(principalId)) {
           await this.insertAudit(client, {
             tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,

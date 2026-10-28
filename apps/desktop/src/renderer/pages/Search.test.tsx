@@ -236,3 +236,79 @@ describe('Search page header', () => {
     expect(row.closest('header')!.className).toContain('compact');
   });
 });
+
+describe('Search page Agent lineage', () => {
+  const lineageAccounts = [
+    { accountId: 'agent-old', displayName: 'Old Agent', status: 'disconnected' as const, lastSyncedAt: null, mode: 'MONITOR_ONLY' as const, productRole: null, agentLineage: 'former' as const },
+    { accountId: 'agent-new', displayName: 'New Agent', status: 'connected' as const, lastSyncedAt: null, mode: 'ACTIVE_CONTROL' as const, productRole: 'AGENT' as const, agentLineage: 'current' as const },
+    { accountId: 'admin', displayName: 'Boss', status: 'connected' as const, lastSyncedAt: null, mode: 'MONITOR_ONLY' as const, productRole: 'PRIMARY_ADMIN' as const },
+    { accountId: 'plain', displayName: 'Plain', status: 'connected' as const, lastSyncedAt: null, mode: 'MONITOR_ONLY' as const, productRole: null },
+  ];
+  const hit = (accountId: string, messageId: string, title: string) => ({ ...message(accountId, title, messageId), chatId: 'shared-chat', lineage: 'agent' as const });
+  const setup = (api: DesktopApi, initial: string | null, conversations: Parameters<typeof Search>[0]['conversations'] = []) => {
+    const onOpen = vi.fn();
+    function Page() {
+      const [scope, setScope] = useState<string | null>(initial);
+      return <Search api={api} accounts={lineageAccounts} conversations={conversations} accountScopeId={scope} onAccountScopeChange={setScope}
+        onOpen={onOpen} headingRef={createRef<HTMLHeadingElement>()} />;
+    }
+    return { onOpen, view: render(<Page />) };
+  };
+
+  it('shows Agent, 主要管理者 and unclassified tabs, with no tab for a former Agent account', () => {
+    setup({ searchMessages: vi.fn(async () => []) } as unknown as DesktopApi, null);
+    const tabs = within(screen.getByRole('tablist', { name: '帳號篩選' })).getAllByRole('tab');
+    expect(tabs.map((tab) => tab.textContent)).toEqual(['全部帳號', 'Agent', '主要管理者', 'Plain']);
+  });
+
+  it('queries the whole lineage for the Agent tab and merges the same chat from both accounts into one group', async () => {
+    const api = { searchMessages: vi.fn(async () => [hit('agent-new', 'm2', 'Shared'), hit('agent-old', 'm1', 'Shared'), hit('agent-old', 'm2', 'Shared')]) } as unknown as DesktopApi;
+    setup(api, 'agent-new');
+    fireEvent.click(searchButton());
+    expect(await screen.findAllByRole('heading', { name: 'Shared' })).toHaveLength(1);
+    expect(api.searchMessages).toHaveBeenLastCalledWith({ scope: { kind: 'agent' }, text: '', limit: 100 });
+    expect(screen.getByRole('heading', { level: 2, name: 'Agent' })).toBeTruthy();
+    // m2 exists in both accounts and counts once.
+    fireEvent.click(screen.getByRole('button', { name: /Shared.*2 則/ }));
+    const rows = document.querySelectorAll('.search-row');
+    expect(rows).toHaveLength(2);
+    const former = Array.from(rows).filter((row) => row.textContent?.includes('舊 Agent 帳號'));
+    expect(former).toHaveLength(1);
+  });
+
+  it('shows Agent-lineage results as one Agent group in the all-accounts view', async () => {
+    const api = { searchMessages: vi.fn(async () => [hit('agent-new', 'a', 'Agent chat'), { ...message('plain', 'Plain chat', 'p'), lineage: null }]) } as unknown as DesktopApi;
+    setup(api, null);
+    fireEvent.click(searchButton());
+    expect(await screen.findByRole('heading', { level: 2, name: 'Agent' })).toBeTruthy();
+    expect(screen.getByRole('heading', { level: 2, name: 'Plain' })).toBeTruthy();
+    expect(api.searchMessages).toHaveBeenLastCalledWith({ text: '', limit: 100 });
+  });
+
+  it('opens the current Agent conversation when it exists, otherwise the original account conversation', async () => {
+    const api = { searchMessages: vi.fn(async () => [hit('agent-old', 'm1', 'Shared'), { ...hit('agent-old', 'm9', 'Old only'), chatId: 'old-only-chat' }]) } as unknown as DesktopApi;
+    const { onOpen } = setup(api, 'agent-new', [
+      { accountId: 'agent-new', chatType: 'direct', chatId: 'shared-chat', title: 'Shared', unreadCount: 0, agentEnabled: false, defaultProvider: 'claude' },
+      { accountId: 'agent-old', chatType: 'direct', chatId: 'old-only-chat', title: 'Old only', unreadCount: 0, agentEnabled: false, defaultProvider: 'claude' },
+    ]);
+    fireEvent.click(searchButton());
+    fireEvent.click(await screen.findByRole('button', { name: /Shared.*1 則/ }));
+    fireEvent.click(screen.getByRole('button', { name: /S.*hit/ }));
+    expect(onOpen).toHaveBeenLastCalledWith({ accountId: 'agent-new', chatType: 'direct', chatId: 'shared-chat' });
+    fireEvent.click(screen.getByRole('button', { name: /Old only.*1 則/ }));
+    fireEvent.click(screen.getAllByRole('button', { name: /S.*hit/ }).at(-1)!);
+    expect(onOpen).toHaveBeenLastCalledWith({ accountId: 'agent-old', chatType: 'direct', chatId: 'old-only-chat' });
+  });
+
+  it.each([['en', 'Former Agent account'], ['zh-TW', '舊 Agent 帳號'], ['ja', '以前の Agent アカウント'], ['ko', '이전 Agent 계정']] as const)(
+    'localizes the former Agent hint in %s', async (locale, hint) => {
+      const api = { searchMessages: vi.fn(async () => [hit('agent-old', 'm1', 'Shared')]) } as unknown as DesktopApi;
+      renderPage(<LocaleProvider value={{ status: 'loaded', effectiveLocale: locale, preference: locale, busy: false, error: null, retry() {}, retryRestart() {}, setPreference() {} }}>
+        <Search api={api} accounts={lineageAccounts} conversations={[]} accountScopeId="agent-new" onAccountScopeChange={vi.fn()} onOpen={vi.fn()} headingRef={createRef<HTMLHeadingElement>()} />
+      </LocaleProvider>);
+      fireEvent.click(searchButton(locale));
+      await waitFor(() => expect(document.querySelectorAll('.search-group-heading')).toHaveLength(1));
+      fireEvent.click(document.querySelector('.search-group-heading')!);
+      expect(document.querySelector('.search-former-agent')?.textContent).toContain(hint);
+    });
+});

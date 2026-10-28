@@ -1,28 +1,29 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentEvent, AgentRunRequest, WritableConversationKey } from '@line-agent/contracts';
-import type { AgentRepository } from '@line-agent/database';
+import type { AgentRepository, JobIdentity } from '@line-agent/database';
 import { AgentService, MCP_OBSERVATION_TIMEOUT_MS, approvalSessionKey, type InternalMcpLauncher } from './agent-service.js';
 import type { AgentJobEnvironment } from './agent-job-environment.js';
 import { newAgentService } from './agent-service-test-support.js';
-import { AGENT_ROOM_HISTORY_HINT, withAgentRoomHistoryHint, withMcpSkill, withOutputChannel } from './mcp-skill.js';
+import { AGENT_ROOM_HISTORY_HINT, formatIdentityBlock, withAgentRoomHistoryHint, withIdentityBlock, withMcpSkill, withOutputChannel } from './mcp-skill.js';
 import { InternalMcpCapabilityRegistry } from './internal-mcp-capabilities.js';
 
 const key: WritableConversationKey = { accountId: 'a', chatType: 'direct', chatId: 'c' };
 const TOKEN = `li_job_${'x'.repeat(43)}`;
 const SKILL = '# linejs-mcp skill';
 
-function fixture(options: { resume?: boolean; mint?: InternalMcpLauncher['mint']; skill?: string | null; line?: boolean; shares?: boolean } = {}) {
+function fixture(options: { resume?: boolean; mint?: InternalMcpLauncher['mint']; skill?: string | null; line?: boolean; shares?: boolean; requestId?: string; scheduleContext?: InternalMcpLauncher['scheduleContext']; identity?: JobIdentity } = {}) {
   const job = { jobId: 'job-mcp', accountId: 'a', chatType: 'direct' as const, chatId: 'c', provider: 'codex' as const,
     prompt: 'summarise', workspacePath: 'C:\\trusted', generation: 3, status: 'running' as const,
     ...(options.line
       ? { sourceType: 'line' as const, sourceMessageId: 'msg-1', sourceRequestId: null, creationEpoch: 1 }
-      : { sourceType: 'ui' as const, sourceMessageId: null, sourceRequestId: 'req', creationEpoch: null }), revision: '1' };
+      : { sourceType: 'ui' as const, sourceMessageId: null, sourceRequestId: options.requestId ?? 'req', creationEpoch: null }), revision: '1' };
   let claimed = false;
   const appended: AgentEvent[] = [];
   const repository = {
     async claimNext() { if (claimed) return null; claimed = true; return job; },
     async getJob() { return job; },
     async sharesAgentRoomHistory() { return options.shares ?? false; },
+    ...(options.identity ? { async describeJobIdentity() { return options.identity!; } } : {}),
     async lookupSession() { return options.resume ? { externalSessionId: 'sess-1', generation: 3 } : null; },
     async appendEvent(_id: string, event: AgentEvent) { appended.push(event); },
     async bindSession() {},
@@ -37,6 +38,7 @@ function fixture(options: { resume?: boolean; mint?: InternalMcpLauncher['mint']
     mint: options.mint ?? ((input) => { minted.push(`${input.jobId}:${input.generation}:${input.accountId}`); return { endpoint: 'http://127.0.0.1:1/mcp', token: TOKEN }; }),
     release: (id) => { released.push(id); },
     skill: async () => options.skill === undefined ? SKILL : options.skill,
+    ...(options.scheduleContext ? { scheduleContext: options.scheduleContext } : {}),
   };
   return { job, repository, requests, minted, released, launcher, appended };
 }
@@ -65,6 +67,49 @@ describe('built-in Agent MCP launch', () => {
     expect(f.released).toContain('job-mcp');
     expect(JSON.stringify(f.appended)).not.toContain(TOKEN);
     expect(JSON.stringify(published)).not.toContain(TOKEN);
+  });
+
+  const runWith = async (f: ReturnType<typeof fixture>) => {
+    const service = newAgentService(f.repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' }, {
+      async *run(request) { f.requests.push(request); yield { type: 'started', externalSessionId: 's' }; yield { type: 'completed', finalText: 'ok' }; },
+      async cancel() {},
+    }, undefined, undefined, 1, 30_000, 5_000, 1, undefined, undefined, undefined, f.launcher);
+    service.kick(key);
+    await service.idle();
+    return f.requests[0]!;
+  };
+
+  it('puts the main-generated identity block into the run prompt only, and omits it when the lookup fails', async () => {
+    const identity: JobIdentity = { agent: { accountId: 'a', name: 'Agentsaxo' }, admin: { accountId: 'a', chatId: 'uadmin', name: '徐佳誠' }, current: null };
+    const f = fixture({ identity });
+    const request = await runWith(f);
+    expect(request.prompt).toBe(withMcpSkill(SKILL, withOutputChannel(withIdentityBlock(withAgentRoomHistoryHint('summarise'), formatIdentityBlock(identity)), 'ui')));
+    expect(f.job.prompt).toBe('summarise');
+    const broken = fixture();
+    (broken.repository as unknown as { describeJobIdentity: () => Promise<never> }).describeJobIdentity = async () => { throw new Error('db down'); };
+    expect((await runWith(broken)).prompt).toBe(withMcpSkill(SKILL, withOutputChannel(withAgentRoomHistoryHint('summarise'), 'ui')));
+  });
+
+  it('injects the hidden schedule context only for schedule-sourced jobs and never into the stored prompt', async () => {
+    const scheduleContext = vi.fn(async () => '【排程規則】CTX');
+    const scheduled = fixture({ requestId: 'schedule:11111111-1111-4111-8111-111111111111:2026-10-01T01:00:00.000Z', scheduleContext });
+    const request = await runWith(scheduled);
+    expect(scheduleContext).toHaveBeenCalledWith('schedule:11111111-1111-4111-8111-111111111111:2026-10-01T01:00:00.000Z');
+    expect(request.prompt).toBe(withMcpSkill(SKILL, withOutputChannel(withAgentRoomHistoryHint('summarise\n\n【排程規則】CTX'), 'ui')));
+    expect(scheduled.job.prompt).toBe('summarise');
+    const plain = fixture({ scheduleContext });
+    scheduleContext.mockClear();
+    expect((await runWith(plain)).prompt).not.toContain('CTX');
+    expect(scheduleContext).not.toHaveBeenCalled();
+  });
+
+  it('still runs a schedule-sourced job with a one-line note when the context lookup fails', async () => {
+    for (const scheduleContext of [async () => null, async () => { throw new Error('gone'); }]) {
+      const f = fixture({ requestId: 'schedule:11111111-1111-4111-8111-111111111111:2026-10-01T01:00:00.000Z', scheduleContext });
+      const request = await runWith(f);
+      expect(request.prompt).toContain('summarise\n\n（排程資料讀取失敗');
+      expect(request.prompt).toContain(SKILL);
+    }
   });
 
   it('tells a LINE-sourced job to answer in plain text exactly once', async () => {

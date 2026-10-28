@@ -580,7 +580,7 @@ describe('global Agent execution capacity', () => {
     const started = new Set<string>();
     const service = newAgentService(repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' }, {
       async *run(request: AgentRunRequest) {
-        const sourceId = request.source.type === 'ui' ? request.source.requestId : request.source.messageId;
+        const sourceId = request.source.type === 'line' ? request.source.messageId : request.source.requestId;
         started.add(sourceId);
         await new Promise<void>((resolve) => releases.set(sourceId, resolve));
         yield { type: 'completed' as const, finalText: 'done' };
@@ -629,7 +629,7 @@ describe('global Agent execution capacity', () => {
     const started = new Set<string>();
     const service = newAgentService(repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' }, {
       async *run(request: AgentRunRequest) {
-        started.add(request.source.type === 'ui' ? request.source.requestId : request.source.messageId);
+        started.add(request.source.type === 'line' ? request.source.messageId : request.source.requestId);
         await new Promise<void>((resolve) => releases.set(request.jobId, resolve));
         yield { type: 'completed' as const, finalText: 'done' };
     }, async cancel(jobId) { releases.get(jobId)?.(); },
@@ -816,7 +816,7 @@ describe('global Agent execution capacity', () => {
     const started: string[] = [];
     const service = newAgentService(repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' }, {
       async *run(request: AgentRunRequest) {
-        started.push(request.source.type === 'ui' ? request.source.requestId : request.source.messageId);
+        started.push(request.source.type === 'line' ? request.source.messageId : request.source.requestId);
         await new Promise<void>((resolve) => releases.set(request.jobId, resolve));
         yield { type: 'completed' as const, finalText: 'done' };
       }, async cancel(jobId) { releases.get(jobId)?.(); },
@@ -861,7 +861,7 @@ describe('global Agent execution capacity', () => {
     const started = new Set<string>();
     const service = newAgentService(repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' }, {
       async *run(request: AgentRunRequest) {
-        started.add(request.source.type === 'ui' ? request.source.requestId : request.source.messageId);
+        started.add(request.source.type === 'line' ? request.source.messageId : request.source.requestId);
         await new Promise<void>((resolve) => releases.set(request.jobId, resolve));
         yield { type: 'completed' as const, finalText: 'done' };
     }, async cancel(jobId) { releases.get(jobId)?.(); },

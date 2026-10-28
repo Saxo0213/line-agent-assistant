@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+import { diagnosticFailure, type IngestLatency, type SafeDiagnostic } from '@line-agent/contracts';
 import { isLocalAgentRoom, LineWorkerCommandSchema, LineWorkerEventSchema, WORKER_PROTOCOL_VERSION, type ComponentHealth, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto, type WorkerBinding } from '@line-agent/contracts';
 import type { IntegratedWorkerGateway, SendMediaRequest } from './connected-facade.js';
 import { ManualSendNotStartedError } from './services/manual-send-errors.js';
@@ -34,6 +34,8 @@ type State = { binding: Bound; child: Child; poll: ReturnType<typeof setInterval
   restartTask: { mode: Bound['mode']; revision: number; controller: AbortController; task: Promise<void> } | undefined;
   acknowledgedMode: Bound['mode'] | null; modeAckReady: boolean; bindingReady: boolean;
   domainEvents: LineWorkerEvent[]; processingDomainEvents: boolean;
+  /** Live batches this binding is ingesting or has just acked; a worker re-emission of the same batchId is dropped. */
+  batches: Map<string, BatchTrack>;
   catalogEvents: Map<'conversationCatalog' | 'catalogRefreshStatus', Extract<LineWorkerEvent, { type: 'conversationCatalog' | 'catalogRefreshStatus' }>>;
   processingCatalogEvents: boolean; retired: boolean;
   protocolVerified: boolean; protocolTimer: ReturnType<typeof setTimeout>;
@@ -50,6 +52,16 @@ type State = { binding: Bound; child: Child; poll: ReturnType<typeof setInterval
   usedRelationRequests: Map<string, { type: 'check' | 'add'; targetMid: string }>;
   modeWaiters: Map<string, Set<(value: boolean) => void>>;
   rawModeWaiters: Map<string, Set<(value: boolean) => void>>; exited: Promise<void>; resolveExited(): void };
+type BatchTrack = { recvAt: number; queueLength: number; minOccurredAt: number | undefined; messageCount: number;
+  reemitCount: number; ackedAt: number | undefined };
+/** A live batch that was stored late; timings are spans in ms and carry no message content. */
+export type IngestLatencyReport = { accountId: string; workerInstanceId: string; kind: 'upstream' | 'main'; latency: IngestLatency };
+export const INGEST_SLOW_TOTAL_MS = 10_000;
+export const INGEST_SLOW_MAIN_MS = 2_000;
+/** Older than this at receive means a catch-up batch (restart/reconnect), never a slow LINE upstream. */
+export const INGEST_BACKLOG_MS = 300_000;
+const BATCH_TRACK_ACKED_TTL_MS = 30_000;
+const BATCH_TRACK_LIMIT = 256;
 type Intent = { generation: number; binding: Bound };
 type ManualSendCommand = Extract<LineWorkerCommand, { type: 'sendText' | 'manualSendText' | 'sendMedia' }>;
 export const SEND_GAP_MIN_MS = 1_000;
@@ -73,6 +85,8 @@ export const MAX_UTILITY_WORKERS = 4;
 
 export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Child;
   onDiagnostic?: (diagnostic: SafeDiagnostic, accountId?: string) => void;
+  /** Called only for slow live batches (stored > 10 s after LINE's occurredAt, or > 2 s after Main received it). */
+  onIngestLatency?: (report: IngestLatencyReport) => void;
   durableCursor?(accountId: string, signal: AbortSignal): Promise<TalkCursorV1Dto | null>;
   pollIntervalMs?: number; responseTimeoutMs?: number; restartDelayMs?: number; maxRestarts?: number; stopTimeoutMs?: number;
   lifecycleTimeoutMs?: number; maxWorkers?: number; maxSendsGlobal?: number;
@@ -348,7 +362,10 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     try { state.child.postMessage({ type: 'cancelAttachmentDownload', ...ownerFields(state.binding), accountId: state.binding.accountId,
       workerInstanceId: state.binding.workerInstanceId, controlEpoch: state.binding.controlEpoch,
       attachmentId: pending.attachmentId, attemptToken: token }); }
-    catch { state.child.kill(); void state.exited.then(() => pending.reject(new Error('Worker exited before confirming attachment cancellation'))); }
+    catch (error) {
+      try { options.onDiagnostic?.(diagnosticFailure('cancelAttachmentDownload', 'dispatch', error), state.binding.accountId); } catch { /* observer only */ }
+      state.child.kill(); void state.exited.then(() => pending.reject(new Error('Worker exited before confirming attachment cancellation')));
+    }
   };
   const currentFor = (command: WorkerBinding) => {
     const state = stateFor(command.accountId);
@@ -412,6 +429,45 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       if (!state.retired && !state.stopping && state.catalogEvents.size > 0) void drainCatalogEvents(accountId, state);
     }
   };
+  /** Exactly one ingest per batchId: true when this binding already tracks it (queued, ingesting or just acked). */
+  const trackBatch = (state: State, event: Extract<LineWorkerEvent, { type: 'batch' }>): boolean => {
+    const existing = state.batches.get(event.batchId);
+    if (existing) {
+      if (existing.ackedAt !== undefined && now() - existing.ackedAt > BATCH_TRACK_ACKED_TTL_MS) state.batches.delete(event.batchId);
+      else { existing.reemitCount++; return true; }
+    }
+    if (state.batches.size >= BATCH_TRACK_LIMIT) {
+      const oldest = state.batches.keys().next().value; if (oldest !== undefined) state.batches.delete(oldest);
+    }
+    const times = event.envelopes.map((envelope) => Date.parse(envelope.occurredAt)).filter(Number.isFinite);
+    state.batches.set(event.batchId, { recvAt: now(), queueLength: state.domainEvents.length + Number(state.processingDomainEvents),
+      minOccurredAt: times.length ? Math.min(...times) : undefined, messageCount: event.envelopes.length, reemitCount: 0, ackedAt: undefined });
+    return false;
+  };
+  /** Ingest committed: Main is about to ack the worker. Reports the batch when it was slow. */
+  const ackedBatch = (state: State, batchId: string) => {
+    const track = state.batches.get(batchId);
+    if (!track || track.ackedAt !== undefined) return;
+    const storedAt = track.ackedAt = now();
+    if (track.minOccurredAt === undefined || !options.onIngestLatency) return;
+    const lineToMainMs = Math.max(0, track.recvAt - track.minOccurredAt);
+    const mainIngestMs = Math.max(0, storedAt - track.recvAt);
+    const backlog = lineToMainMs > INGEST_BACKLOG_MS;
+    const totalSlow = !backlog && lineToMainMs + mainIngestMs > INGEST_SLOW_TOTAL_MS;
+    const mainSlow = mainIngestMs > INGEST_SLOW_MAIN_MS;
+    if (!totalSlow && !mainSlow) return;
+    const kind = mainSlow && (!totalSlow || mainIngestMs >= lineToMainMs) ? 'main' : 'upstream';
+    try {
+      options.onIngestLatency({ accountId: state.binding.accountId, workerInstanceId: state.binding.workerInstanceId, kind,
+        latency: { lineToMainMs: Math.round(lineToMainMs), mainIngestMs: Math.round(mainIngestMs), queueLength: track.queueLength,
+          messageCount: track.messageCount, reemitCount: track.reemitCount } });
+    } catch { /* observer only */ }
+  };
+  /** Processing ended: an unacked batch is forgotten so the worker's next re-emission is ingested again. */
+  const settleBatch = (state: State, event: LineWorkerEvent) => {
+    if (event.type !== 'batch') return;
+    if (state.batches.get(event.batchId)?.ackedAt === undefined) state.batches.delete(event.batchId);
+  };
   const drainDomainEvents = async (accountId: string, state: State) => {
     if (state.processingDomainEvents) return;
     state.processingDomainEvents = true;
@@ -419,7 +475,8 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       while (state.domainEvents.length > 0) {
         const event = state.domainEvents.shift()!;
         if (!isCurrentEventState(state, accountId, state.child, event)) continue;
-        await listener?.(event.workerInstanceId, event);
+        try { await listener?.(event.workerInstanceId, event); }
+        finally { settleBatch(state, event); }
       }
     } catch (error) {
       try { options.onDiagnostic?.(diagnosticFailure('line_ingest', 'persist', error), accountId); } catch { /* observer only */ }
@@ -448,12 +505,27 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       void drainCatalogEvents(accountId, state);
       return;
     }
+    if (event.type === 'error' && event.requestId) {
+      // A worker-side error for a read-only request settles it now instead of waiting for its timeout.
+      // Sends, unsends and Relation mutations keep their own outcome-unknown handling.
+      const failure = new Error(`Worker rejected request: ${event.code}`);
+      state.ownProfiles.get(event.requestId)?.reject(failure);
+      state.chatResources.get(event.requestId)?.reject(chatResourceGatewayError(failure.message, 'pending_request', 'unknown'));
+      const relation = state.relations.get(event.requestId);
+      if (relation && (relation.command as { type?: string } | undefined)?.type === 'checkFriendRelation') {
+        state.relations.delete(event.requestId); if (relation.timer) clearTimeout(relation.timer); relation.reject(failure);
+      }
+    }
     if (event.type !== 'sendResult' && event.type !== 'unsendResult' && event.type !== 'attachmentResult' && event.type !== 'attachmentCancelAck'
       && event.type !== 'friendRelationResult' && event.type !== 'addFriendResult'
       && event.type !== 'chatResourceResult' && event.type !== 'ownProfileResult'
       && event.type !== 'downloadAuthResult' && event.type !== 'downloadReady' && event.type !== 'downloadAuthInvalidated'
       && event.type !== 'modeAck' && event.type !== 'workerProtocolAck') {
-      if (state.domainEvents.length + Number(state.processingDomainEvents) >= maxQueuedDomainEvents) throw new Error('Worker domain event queue limit exceeded');
+      if (event.type === 'batch' && trackBatch(state, event)) return;
+      if (state.domainEvents.length + Number(state.processingDomainEvents) >= maxQueuedDomainEvents) {
+        if (event.type === 'batch') state.batches.delete(event.batchId);
+        throw new Error('Worker domain event queue limit exceeded');
+      }
       state.domainEvents.push(event);
       void drainDomainEvents(accountId, state);
       return;
@@ -736,7 +808,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
         state = { binding: effective, child, generation: intent.generation, bindingComplete: false, bindingCompletePromise, resolveBindingComplete,
           exitConfirmed: false, stopping: false, modeRevision: 0, modeTask: undefined, restartTask: undefined,
           acknowledgedMode: null, modeAckReady: false, bindingReady: !restarting, downloadReady: false, downloadAuthRequests: new Map(),
-          domainEvents: [], processingDomainEvents: false, catalogEvents: new Map(), processingCatalogEvents: false,
+          domainEvents: [], processingDomainEvents: false, batches: new Map(), catalogEvents: new Map(), processingCatalogEvents: false,
           retired: false, protocolVerified: false,
           protocolTimer: setTimeout(() => {
             if (state!.protocolVerified || state!.stopping || stateFor(effective.accountId) !== state) return;
@@ -747,7 +819,10 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
             workerInstanceId: state!.binding.workerInstanceId, controlEpoch: state!.binding.controlEpoch }); }, options.pollIntervalMs ?? 1500) };
         lifecycle.child = state;
         child.on('message', (value) => {
-          void consume(effective.accountId, child, value).catch(() => failEventProcessing(effective.accountId, state!));
+          void consume(effective.accountId, child, value).catch((error: unknown) => {
+            try { options.onDiagnostic?.(diagnosticFailure('line_ingest', 'execute', error), effective.accountId); } catch { /* observer only */ }
+            failEventProcessing(effective.accountId, state!);
+          });
         });
         child.on('exit', () => {
           resolveExited(); state!.exitConfirmed = true; state!.retired = true; state!.domainEvents.length = 0; state!.catalogEvents.clear();
@@ -932,6 +1007,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     return () => { if (!removed && get() === next) { removed = true; set(previous); } };
   };
   return {
+    responseTimeoutMs,
     onEvent(next) { return installListener(() => listener, (value) => { listener = value; }, next); },
     onBinding(next) { return installListener(() => bindingListener, (value) => { bindingListener = value; }, next); },
     onWorkerExit(next) { return installListener(() => workerExitListener, (value) => { workerExitListener = value; }, next); },
@@ -1039,6 +1115,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       }
       if (command.type === 'revokeControl') fenceWriteAuthority(state);
       state.child.postMessage({ ...command, ...ownerFields(state.binding) });
+      if (command.type === 'ackBatch') ackedBatch(state, command.batchId);
       return { type: 'sendResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
         requestId: 'requestId' in command ? command.requestId : 'control', status: 'unknown', messageId: null, error: null };
     },
@@ -1213,7 +1290,10 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
         };
         pending.timer = setTimeout(() => pending.reject(new Error('LINE profile response timed out')), command.timeoutMs);
         state.ownProfiles.set(command.requestId, pending);
-        try { state.child.postMessage({ ...command, ...ownerFields(state.binding) }); }
+        try {
+          state.child.postMessage({ ...workerBindingFields(command), type: 'refreshOwnProfile', requestId: command.requestId,
+            timeoutMs: command.timeoutMs, ...ownerFields(state.binding) });
+        }
         catch (error) { pending.reject(error instanceof Error ? error : new Error('LINE profile read failed')); }
       });
     },

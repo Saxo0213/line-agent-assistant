@@ -79,6 +79,8 @@ describe('English desktop source', () => {
     expect(systemLabelFor('en', '相簿照片下載')).toBe('Album photo download');
     expect(systemLabelFor('ja', '相簿照片下載')).toBe('アルバム写真をダウンロード');
     expect(systemLabelFor('ko', '相簿照片下載')).toBe('앨범 사진 다운로드');
+    expect(systemLabelFor('en', 'LINE 訊息延遲（LINE 至本機）')).toBe('LINE message delay (LINE to app)');
+    expect(systemLabelFor('ko', 'LINE 訊息延遲（本機佇列／寫入）')).toBe('LINE 메시지 지연(앱 대기열/저장)');
   });
   it('has a complete English source and matching interpolation slots in the retained catalog', () => {
     expect(desktopTextFor('en', 'chats')).toBe('Chats');

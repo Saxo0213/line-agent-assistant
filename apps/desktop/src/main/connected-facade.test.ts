@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
 import { request as httpRequest } from 'node:http';
-import { IpcResultSchema, lineMediaUrl, parseLineMediaUrl,type AgentExecutionLevel, type AgentRunRequest, type InboundEnvelope, type IpcEvent, type LineWorkerCommand, type LineWorkerEvent, type LineMediaTarget } from '@line-agent/contracts';
+import { IpcResultSchema, LineWorkerCommandSchema, lineMediaUrl, parseLineMediaUrl,type AgentExecutionLevel, type AgentRunRequest, type InboundEnvelope, type IpcEvent, type LineWorkerCommand, type LineWorkerEvent, type LineMediaTarget } from '@line-agent/contracts';
 import { AccountRepository, AdminRepository, AgentPermissionRepository, AgentRepository, ExternalMonitorRepository, MessageRepository, SettingsRepository } from '@line-agent/database';
 import { createTestDatabase } from '../../../../packages/database/src/test-database.js';
 import { plainEnvelope } from '../../../../packages/database/src/content-bridge/test-support.js';
@@ -2167,6 +2167,7 @@ database('connected facade account login semantics', () => {
 
     expect(result).toMatchObject({ type: 'accepted', ok: true, requestId: 'avatar-refresh-flow-request' });
     expect(commands.at(-1)).toMatchObject({ type: 'refreshOwnProfile', accountId, workerInstanceId: binding.workerInstanceId });
+    expect(LineWorkerCommandSchema.safeParse(commands.at(-1)).success).toBe(true);
     expect(await pool.query('SELECT display_name,picture_path FROM line_accounts WHERE account_id=$1', [accountId])).toMatchObject({
       rows: [{ display_name: 'Refreshed account', picture_path: picturePath }],
     });

@@ -23,6 +23,7 @@ import {
 import {
   ATTACHMENT_STORED_STATUS,
   McpDomainError,
+  findSharedAdminChat,
   type LineSendAuditRow,
   type MessageRepository,
   type SendChatType,
@@ -31,6 +32,9 @@ import type { PoolClient } from 'pg';
 import type { SendMediaRequest } from '../connected-facade.js';
 import { resolveManagedAttachment } from '../security.js';
 import { splitDeliveryText } from './delivery-service.js';
+
+/** list_send_targets queries that mean the administrator (compared lower-cased). */
+export const ADMIN_QUERY_ALIASES: ReadonlySet<string> = new Set(['管理員', '主要管理者', '管理者', 'admin', 'administrator', 'me', '我']);
 
 /** Items waiting in the queue across all jobs; a call that would exceed it is refused before anything is queued. */
 export const SEND_PENDING_MAX = 30;
@@ -65,6 +69,23 @@ export interface AgentLineSendOptions {
   /** Test hook: per-call budget. */
   callBudgetMs?: number;
 }
+
+/** Audit principal of a message sent by Main itself for a system message schedule (no Agent job, no provider). */
+export const SYSTEM_SCHEDULE_PRINCIPAL = 'system:schedule';
+/** Audit principal of a group free-mode notice (docs/architecture/group-free-mode.md). */
+export const FREE_MODE_PRINCIPAL = 'system:free_mode';
+
+export interface SystemTextInput {
+  /** Audit `job_id`: the schedule run id (a system message has no Agent job). */
+  runId: string;
+  target: { accountId: string; chatType: SendChatType; chatId: string };
+  text: string;
+  /** Audit principal; defaults to the schedule principal. */
+  principalId?: typeof SYSTEM_SCHEDULE_PRINCIPAL | typeof FREE_MODE_PRINCIPAL;
+  signal?: AbortSignal;
+}
+/** `unknown` means the message may have reached LINE; the caller must never retry it. */
+export type SystemTextResult = { status: 'sent' } | { status: 'failed'; code: SendErrorCode } | { status: 'unknown'; code: SendErrorCode };
 
 type ItemKind = LineSendAuditRow['itemKind'];
 type PlannedItem =
@@ -169,8 +190,17 @@ export class AgentLineSendService implements AgentLineSendHandler {
     if (!parsed.success) throw new McpDomainError('INVALID_INPUT', parsed.error.issues[0]?.message ?? 'Invalid list_send_targets arguments.');
     const accountId = await this.options.messages.findAgentSendAccount(client);
     if (!accountId) return { targets: [] };
-    const rows = await this.options.messages.listSendTargets({ accountId, query: parsed.data.query, limit: 20 }, client);
-    const targets = rows.filter((row) => row.chatId !== LOCAL_AGENT_ROOM_CHAT_ID).map((row, index) => ({ ...row, no: index + 1 }));
+    const admin = await findSharedAdminChat(client).catch(() => null);
+    const adminId = admin !== null && admin.accountId === accountId ? admin.adminMid : null;
+    let rows = await this.options.messages.listSendTargets({ accountId, query: parsed.data.query, limit: 20 }, client);
+    // An alias for the administrator returns the administrator's chat first, even when no title matches the query.
+    if (adminId !== null && ADMIN_QUERY_ALIASES.has(parsed.data.query.trim().toLowerCase())) {
+      const adminRow = (await this.options.messages.listSendTargets({ accountId, query: adminId, limit: 20 }, client))
+        .find((row) => row.chatType === 'direct' && row.chatId === adminId);
+      if (adminRow) rows = [adminRow, ...rows.filter((row) => !(row.chatType === 'direct' && row.chatId === adminId))];
+    }
+    const targets = rows.filter((row) => row.chatId !== LOCAL_AGENT_ROOM_CHAT_ID).slice(0, 20)
+      .map((row, index) => ({ ...row, no: index + 1, ...(adminId !== null && row.chatType === 'direct' && row.chatId === adminId ? { role: 'primary_admin' as const } : {}) }));
     return McpListSendTargetsOutputSchema.parse({ targets });
   }
 
@@ -294,6 +324,39 @@ export class AgentLineSendService implements AgentLineSendHandler {
 
   private async audit(row: LineSendAuditRow): Promise<void> {
     try { await this.options.messages.recordLineSend(row); } catch { /* the audit never blocks or reveals a send */ }
+  }
+
+  /**
+   * Sends one text that Main itself owns (a system message schedule) through the SAME queue, per-account pacing, write gate,
+   * binding / mode-ack checks and audit as send_to_target; only the principal ('system:schedule') and the audit job id (the run id)
+   * differ. Text over the per-message limit is split by splitDeliveryText. It never runs inside a database transaction and is never
+   * retried: `unknown` is final.
+   */
+  async sendSystemText(input: SystemTextInput): Promise<SystemTextResult> {
+    const principalId = input.principalId ?? SYSTEM_SCHEDULE_PRINCIPAL;
+    const unavailable: SystemTextResult = { status: 'failed', code: 'send_line_unavailable' };
+    const parts = splitDeliveryText(input.text);
+    if (this.stopping || parts.length === 0) return unavailable;
+    const messages = this.options.messages;
+    const byteSize = utf8Length(input.text);
+    let accountId: string | null;
+    try { accountId = await messages.findAgentSendAccount(); } catch { return unavailable; }
+    if (!accountId) return unavailable;
+    const deny = async (code: SendErrorCode): Promise<SystemTextResult> => {
+      await this.audit({ jobId: input.runId, accountId: accountId!, principalId, chatType: input.target.chatType,
+        chatId: input.target.chatId, itemIndex: 0, itemKind: 'text', byteSize, status: 'denied', errorCode: code });
+      return { status: 'failed', code };
+    };
+    if (accountId !== input.target.accountId || !await this.options.canWriteLine(accountId)) return deny('send_line_unavailable');
+    const target = await messages.getSendTarget(accountId, input.target.chatType, input.target.chatId).catch(() => null);
+    if (!target) return deny('send_target_invalid');
+    const plan: SendPlan = { jobId: input.runId, principalId, accountId, chatType: target.chatType,
+      chatId: target.chatId, workspacePath: null, items: [{ index: 0, auditKind: 'text', kind: 'text', parts, byteSize }] };
+    const output = await this.run(plan, { signal: input.signal ?? new AbortController().signal, isLive: () => !this.stopping });
+    const result = output.results[0];
+    if (result?.status === 'sent') return { status: 'sent' };
+    if (result?.status === 'unknown') return { status: 'unknown', code: 'send_unknown' };
+    return { status: 'failed', code: result?.status === 'failed' ? result.code ?? 'send_failed' : 'send_line_unavailable' };
   }
 
   private async currentBinding(accountId: string): Promise<ActiveBinding | null> {

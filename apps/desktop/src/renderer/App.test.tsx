@@ -267,6 +267,12 @@ function fakeApi(): DesktopApi {
     setAgentFolderLink: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
     createChatFolder: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
     openChatFolder: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
+    listAgentSchedules: vi.fn(async () => []),
+    createAgentSchedule: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
+    updateAgentSchedule: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
+    deleteAgentSchedule: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
+    listAgentScheduleRuns: vi.fn(async () => []),
+    listAgentScheduleTargets: vi.fn(async () => []),
     getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: 'D:\\attachments', agentWorkspace: 'D:\\workspace', connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
     listDatabases: vi.fn(async () => []),
     createDatabase: vi.fn(async () => []),
@@ -517,7 +523,7 @@ describe('last visited page', () => {
     render(<App api={fakeApi()} />);
     const navigation = await screen.findByRole('navigation', { name: '主要導覽' });
     expect(within(navigation).queryByRole('button', { name: '系統' })).toBeNull();
-    expect(within(navigation).getByRole('button', { name: '搜尋' }).previousElementSibling?.classList.contains('nav-divider')).toBe(true);
+    expect(within(navigation).getByRole('button', { name: '排程' }).previousElementSibling?.classList.contains('nav-divider')).toBe(true);
     fireEvent.click(within(navigation).getByRole('button', { name: '設定' }));
     await screen.findByRole('tablist', { name: '設定分類' });
     expect(settingsTabs().slice(0, 2)).toEqual(['系統', '對話']);
@@ -1347,11 +1353,20 @@ describe('operator console', () => {
     fireEvent.click(open);
     expect(await within(screen.getByTestId('composer-status')).findByText('無法開啟附件，請確認檔案仍可用且已設定 Windows 預設應用程式。')).toBeTruthy();
   });
+  it('opens the schedules page from the sidebar and remembers it as the last page', async () => {
+    const api = fakeApi();
+    render(<App api={api} />);
+    fireEvent.click(await screen.findByRole('button', { name: '排程' }));
+    expect(await screen.findByRole('heading', { name: '排程' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '新增排程' })).toBeTruthy();
+    await waitFor(() => expect(api.listAgentSchedules).toHaveBeenCalled());
+    expect(localStorage.getItem('linejs.lastPage')).toBe('schedules');
+  });
   it('shows the requested full labels in the feature rail', async () => {
     render(<App api={fakeApi()} />);
     const navigation = await screen.findByRole('navigation', { name: '主要導覽' });
     expect(Array.from(navigation.querySelectorAll('.nav-short'), (item) => item.textContent)).toEqual([
-      '聊天', '助理', '搜尋', '任務', '設定',
+      '聊天', '助理', '排程', '搜尋', '任務', '設定',
     ]);
     fireEvent.click(screen.getByRole('button', { name: '設定' }));
     expect(await screen.findByRole('tab', { name: '紀錄' })).toBeTruthy();
@@ -1365,14 +1380,14 @@ describe('operator console', () => {
 
     const scopeTab = async (name: string) => within(await screen.findByRole('tablist', { name: '帳號篩選' })).getByRole('tab', { name });
     expect(screen.queryByRole('combobox', { name: '帳號' })).toBeNull();
-    expect((await scopeTab('工作')).getAttribute('aria-selected')).toBe('true');
-    fireEvent.click(await scopeTab('觀察'));
-    expect((await scopeTab('觀察')).getAttribute('aria-selected')).toBe('true');
+    expect((await scopeTab('Agent')).getAttribute('aria-selected')).toBe('true');
+    fireEvent.click(await scopeTab('主要管理者'));
+    expect((await scopeTab('主要管理者')).getAttribute('aria-selected')).toBe('true');
     expect(screen.getByRole('button', { name: '查看觀察' }).getAttribute('aria-pressed')).toBe('true');
 
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
     fireEvent.click(screen.getByRole('button', { name: '搜尋' }));
-    expect((await scopeTab('觀察')).getAttribute('aria-selected')).toBe('true');
+    expect((await scopeTab('主要管理者')).getAttribute('aria-selected')).toBe('true');
 
     fireEvent.click(await scopeTab('全部帳號'));
     await waitFor(() => expect(screen.getByRole('tab', { name: '全部帳號' }).getAttribute('aria-selected')).toBe('true'));
@@ -1381,20 +1396,20 @@ describe('operator console', () => {
     expect(screen.getByRole('button', { name: '查看觀察' }).getAttribute('aria-pressed')).toBe('true');
   });
 
-  it('shows every account in search and scopes historical and current accounts by their account IDs', async () => {
+  it('merges former Agent accounts into one Agent tab and scopes the other tabs by account ID', async () => {
     const api = fakeApi();
     const currentAgentId = 'account-agent-replacement';
-    api.searchMessages = vi.fn(async (query: Parameters<DesktopApi['searchMessages']>[0]) => query.accountId === 'account-retired-agent' ? [{
+    api.searchMessages = vi.fn(async (query: Parameters<DesktopApi['searchMessages']>[0]) => query.scope?.kind === 'agent' || query.scope === undefined && query.accountId === undefined ? [{
       accountId: 'account-retired-agent', chatType: 'group' as const, chatId: 'retired-chat', messageId: 'retired-message',
-      senderId: 'sender', senderName: 'Sender', text: 'historical result', occurredAt: '2026-10-16T05:39:00.000Z',
+      senderId: 'sender', senderName: 'Sender', text: 'historical result', occurredAt: '2026-10-16T05:39:00.000Z', lineage: 'agent' as const,
     }] : []);
     api.getSnapshot = vi.fn(async () => ({
       ...snapshot,
       control: { ...snapshot.control, activeAccountId: currentAgentId },
       accounts: [
-        { ...snapshot.accounts[0]!, accountId: 'account-retired-agent', displayName: 'saxoAgent', mode: 'MONITOR_ONLY' as const, productRole: null },
+        { ...snapshot.accounts[0]!, accountId: 'account-retired-agent', displayName: 'saxoAgent', mode: 'MONITOR_ONLY' as const, productRole: null, agentLineage: 'former' as const },
         { ...snapshot.accounts[1]!, accountId: 'account-admin', displayName: '徐佳誠', productRole: 'PRIMARY_ADMIN' as const },
-        { ...snapshot.accounts[0]!, accountId: currentAgentId, displayName: 'Agentsaxo', mode: 'ACTIVE_CONTROL' as const, productRole: 'AGENT' as const },
+        { ...snapshot.accounts[0]!, accountId: currentAgentId, displayName: 'Agentsaxo', mode: 'ACTIVE_CONTROL' as const, productRole: 'AGENT' as const, agentLineage: 'current' as const },
       ],
       conversations: [
         { ...snapshot.conversations[0]!, accountId: 'account-retired-agent', chatId: 'retired-chat', title: '舊 Agent 聊天' },
@@ -1406,39 +1421,33 @@ describe('operator console', () => {
     fireEvent.click(await screen.findByRole('button', { name: '搜尋' }));
 
     const tabs = within(await screen.findByRole('tablist', { name: '帳號篩選' }));
-    const agentTab = await tabs.findByRole('tab', { name: 'Agentsaxo' });
-    const adminTab = await tabs.findByRole('tab', { name: '徐佳誠' });
-    const retiredAgentTab = await tabs.findByRole('tab', { name: 'saxoAgent' });
+    const agentTab = await tabs.findByRole('tab', { name: 'Agent' });
+    const adminTab = await tabs.findByRole('tab', { name: '主要管理者' });
+    expect(tabs.getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['全部帳號', 'Agent', '主要管理者']);
+    expect(tabs.queryByRole('tab', { name: 'saxoAgent' })).toBeNull();
     expect(document.querySelector('[data-account-id="account-retired-agent"]')).toBeNull();
-
-    fireEvent.click(retiredAgentTab);
-    expect(retiredAgentTab.getAttribute('aria-selected')).toBe('true');
-    fireEvent.submit(document.querySelector('form.filter-grid')!);
-    await waitFor(() => expect(api.searchMessages).toHaveBeenLastCalledWith({ accountId: 'account-retired-agent', text: '', limit: 100 }));
 
     fireEvent.click(adminTab);
     expect(adminTab.getAttribute('aria-selected')).toBe('true');
-    expect(retiredAgentTab.getAttribute('aria-selected')).toBe('false');
     fireEvent.submit(document.querySelector('form.filter-grid')!);
     await waitFor(() => expect(api.searchMessages).toHaveBeenLastCalledWith({ accountId: 'account-admin', text: '', limit: 100 }));
 
     fireEvent.click(agentTab);
     expect(agentTab.getAttribute('aria-selected')).toBe('true');
     expect(adminTab.getAttribute('aria-selected')).toBe('false');
-    expect(retiredAgentTab.getAttribute('aria-selected')).toBe('false');
     fireEvent.submit(document.querySelector('form.filter-grid')!);
-    await waitFor(() => expect(api.searchMessages).toHaveBeenLastCalledWith({ accountId: currentAgentId, text: '', limit: 100 }));
+    await waitFor(() => expect(api.searchMessages).toHaveBeenLastCalledWith({ scope: { kind: 'agent' }, text: '', limit: 100 }));
 
     fireEvent.click(tabs.getByRole('tab', { name: '全部帳號' }));
     expect(tabs.getByRole('tab', { name: '全部帳號' }).getAttribute('aria-selected')).toBe('true');
-    expect(retiredAgentTab.getAttribute('aria-selected')).toBe('false');
     fireEvent.submit(document.querySelector('form.filter-grid')!);
     await waitFor(() => expect(api.searchMessages).toHaveBeenLastCalledWith({ text: '', limit: 100 }));
 
-    fireEvent.click(retiredAgentTab);
+    fireEvent.click(agentTab);
     fireEvent.submit(document.querySelector('form.filter-grid')!);
     const historicalGroup = await screen.findByRole('button', { name: /舊 Agent 聊天.*1 則/ });
     fireEvent.click(historicalGroup);
+    expect(screen.getByRole('button', { name: /Sender.*historical result/ }).textContent).toContain('舊 Agent 帳號');
     fireEvent.click(screen.getByRole('button', { name: /Sender.*historical result/ }));
 
     expect(await screen.findByRole('heading', { name: '舊 Agent 聊天' })).toBeTruthy();
@@ -4143,5 +4152,33 @@ describe('conversation list view toggle and sorting', () => {
     await screen.findByText('Amy');
     act(() => { emit({ type: 'snapshotChanged', snapshot: { ...friendSnapshot } }); });
     await waitFor(() => expect(api.listFriends).toHaveBeenCalledTimes(3));
+  });
+});
+
+describe('update check navigation badge', () => {
+  const updateState = (patch: Record<string, unknown> = {}) => ({ enabled: true, checking: false, lastCheckedAt: '2026-10-28T02:00:00.000Z', lastCheckFailed: false,
+    latestVersion: '1.0.280', releaseUrl: 'https://github.com/Saxo0213/line-agent-assistant/releases/tag/v1.0.280', available: true, ...patch });
+
+  it('marks the settings nav item only while an update is available', async () => {
+    let push: ((state: ReturnType<typeof updateState>) => void) | undefined;
+    const api = fakeApi();
+    api.getUpdateCheckState = vi.fn(async () => updateState());
+    api.onUpdateCheckState = vi.fn((callback) => { push = callback; return () => undefined; });
+    const { container } = render(<App api={api} />);
+    const button = await screen.findByRole('button', { name: '設定（有可用更新）' });
+    expect(button.getAttribute('title')).toBe('設定（有可用更新）');
+    expect(button.querySelector('.nav-update-badge')?.textContent).toBe('!');
+    expect(container.querySelectorAll('.nav-update-badge')).toHaveLength(1);
+    act(() => { push?.(updateState({ available: false, enabled: false })); });
+    await waitFor(() => expect(container.querySelector('.nav-update-badge')).toBeNull());
+    expect(screen.getByRole('button', { name: '設定' })).toBeTruthy();
+  });
+
+  it('shows no badge when the bridge reports nothing new', async () => {
+    const api = fakeApi();
+    api.getUpdateCheckState = vi.fn(async () => updateState({ available: false }));
+    const { container } = render(<App api={api} />);
+    await screen.findByRole('button', { name: '設定' });
+    expect(container.querySelector('.nav-update-badge')).toBeNull();
   });
 });
