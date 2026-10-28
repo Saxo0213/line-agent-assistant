@@ -434,7 +434,7 @@ describe('AgentPermissions tab', () => {
   it('shows the empty whitelist state', async () => {
     await renderTab(makeApi(makeView({ subjects: [], eligibleChats: [] })));
     expect(screen.getByRole('option', { name: '沒有群組' })).toBeTruthy();
-    expect(screen.getByRole('list', { name: '白名單權限' }).querySelectorAll('.perm-row')).toHaveLength(5);
+    expect(screen.getByRole('list', { name: '白名單權限' }).querySelectorAll('.perm-row')).toHaveLength(7);
     expect(screen.queryByText('此範圍沒有可設定的白名單使用者。')).toBeNull();
     expect(screen.queryByText('尚無已啟用的 Agent 群組。')).toBeNull();
   });

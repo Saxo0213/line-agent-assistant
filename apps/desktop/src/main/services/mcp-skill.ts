@@ -40,8 +40,11 @@ export function withMcpSkill(skill: string | null, prompt: string): string {
 export interface JobIdentityView {
   agent: { accountId: string; name: string | null } | null;
   admin: { accountId: string; chatId: string; name: string | null } | null;
-  current: { accountId: string; chatType: string; chatId: string; title: string | null; isAdmin: boolean } | null;
+  current: { accountId: string; chatType: string; chatId: string; title: string | null; isAdmin: boolean; askerName?: string | null } | null;
 }
+
+/** Tells a group or room job how to name a member in its reply; the system converts a matching `@name` into a LINE mention. */
+export const GROUP_MENTION_LINE = '要指名回覆某位成員時，請寫 @成員名稱（名稱需與聊天紀錄顯示的一致），系統會轉成 LINE 標註；沒有對應成員時維持原文。';
 const clip = (value: string | null, max = 40): string => (value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 
 /** The Main-generated 「身分」 block (at most 600 characters, no secrets): who the Agent, the administrator and the current chat are. */
@@ -53,9 +56,14 @@ export function formatIdentityBlock(identity: JobIdentityView): string {
     : '管理員（主要管理者）：尚未連結主要管理者');
   if (identity.current) {
     lines.push(`目前對話：${clip(identity.current.title) || identity.current.chatId}（accountId=${identity.current.accountId}，chatType=${identity.current.chatType}，chatId=${identity.current.chatId}）${identity.current.isAdmin ? '；目前對話者就是管理員' : ''}`);
+    if (identity.current.chatType === 'group' || identity.current.chatType === 'room') {
+      const asker = clip(identity.current.askerName ?? null);
+      if (asker) lines.push(`提問者：${asker}`);
+      lines.push(GROUP_MENTION_LINE);
+    }
   }
   lines.push('「我／給我／管理員／主要管理者」都指上述管理員；要傳給他時直接用上述 key。');
-  return lines.join('\n').slice(0, 600);
+  return lines.join('\n').slice(0, 800);
 }
 
 /** Puts the identity block ahead of the user's turn (run request only; never stored). */

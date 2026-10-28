@@ -1,4 +1,5 @@
-import type { AgentProvider, InboundEnvelope } from '@line-agent/contracts';
+import type { AgentLiveliness, AgentProvider, InboundEnvelope } from '@line-agent/contracts';
+import { parseLivelinessWord } from './agent-persona.js';
 
 export function findOwnMentionRange(
   envelope: InboundEnvelope,
@@ -55,31 +56,134 @@ export function isFreeCommandText(envelope: InboundEnvelope, ownMid: string | nu
   return envelope.chatType !== 'direct' && envelope.text !== null && parseFreeCommand(textWithoutOwnMention(envelope, ownMid)) !== null;
 }
 
+/** `/persona` (docs/architecture/agent-persona.md): a group/room override of the Agent persona description and reply liveliness. */
+export type PersonaCommand =
+  | { type: 'persona'; action: 'show' }
+  | { type: 'persona'; action: 'default' }
+  | { type: 'persona'; action: 'liveliness'; liveliness: AgentLiveliness }
+  | { type: 'persona'; action: 'description'; description: string };
+
+/**
+ * Parses `/persona`, `/persona default`, `/persona 安靜|一般|活潑` (also quiet|normal|lively) and `/persona <description>`
+ * (already trimmed, mention removed). Anything else is not a persona command.
+ */
+export function parsePersonaCommand(text: string): PersonaCommand | null {
+  const match = /^\/persona(?:\s+([\s\S]*))?$/i.exec(text.trim());
+  if (!match) return null;
+  const argument = (match[1] ?? '').trim();
+  if (argument === '') return { type: 'persona', action: 'show' };
+  if (argument.toLowerCase() === 'default') return { type: 'persona', action: 'default' };
+  const liveliness = parseLivelinessWord(argument);
+  return liveliness ? { type: 'persona', action: 'liveliness', liveliness } : { type: 'persona', action: 'description', description: argument };
+}
+
+/** True for a group/room text that is a `/persona` command, with or without an Agent mention. */
+export function isPersonaCommandText(envelope: InboundEnvelope, ownMid: string | null): boolean {
+  return envelope.chatType !== 'direct' && envelope.text !== null && parsePersonaCommand(textWithoutOwnMention(envelope, ownMid)) !== null;
+}
+
+export type FolderMode = 'READ' | 'READ_WRITE';
+/** `usage` is a malformed `/folder` (for example `/folder rw` without a path). */
+export type FolderCommand =
+  | { type: 'folder'; action: 'bind'; path: string; mode: FolderMode }
+  | { type: 'folder'; action: 'list' }
+  | { type: 'folder'; action: 'off'; path: string | null }
+  | { type: 'folder'; action: 'usage' };
+
+const QUOTE_PAIRS: Record<string, string> = { '"': '"', "'": "'", '“': '”', '‘': '’' };
+/** Removes one pair of surrounding quotes (straight or typographic) from a path argument. */
+function unquotePath(argument: string): string {
+  const value = argument.trim();
+  const close = QUOTE_PAIRS[value[0] ?? ''];
+  return close !== undefined && value.length >= 2 && value.endsWith(close) ? value.slice(1, -1).trim() : value;
+}
+
+/**
+ * Parses `/folder`, `/folder <path>`, `/folder rw <path>`, `/folder off` and `/folder off <path>` (already trimmed, mention removed).
+ * The path may contain spaces and may be quoted. Anything that does not start with the `/folder` word is not a folder command.
+ */
+export function parseFolderCommand(text: string): FolderCommand | null {
+  const match = /^\/folder(?:\s+([\s\S]*))?$/i.exec(text.trim());
+  if (!match) return null;
+  const argument = (match[1] ?? '').trim();
+  if (argument === '') return { type: 'folder', action: 'list' };
+  if (/^off$/i.test(argument)) return { type: 'folder', action: 'off', path: null };
+  const off = /^off\s+([\s\S]+)$/i.exec(argument);
+  if (off) { const path = unquotePath(off[1]!); return path ? { type: 'folder', action: 'off', path } : { type: 'folder', action: 'usage' }; }
+  if (/^rw$/i.test(argument)) return { type: 'folder', action: 'usage' };
+  const readWrite = /^rw\s+([\s\S]+)$/i.exec(argument);
+  const path = unquotePath(readWrite ? readWrite[1]! : argument);
+  if (!path) return { type: 'folder', action: 'usage' };
+  return { type: 'folder', action: 'bind', path, mode: readWrite ? 'READ_WRITE' : 'READ' };
+}
+
+/** True for a text (group, room or direct) that is a `/folder` command, with or without an Agent mention. */
+export function isFolderCommandText(envelope: InboundEnvelope, ownMid: string | null): boolean {
+  return envelope.text !== null && parseFolderCommand(textWithoutOwnMention(envelope, ownMid)) !== null;
+}
+
+/** True for a group/room text that is a bare `/agent claude|codex|default` (with or without an Agent mention). */
+export function isAgentSwitchText(envelope: InboundEnvelope, ownMid: string | null): boolean {
+  return envelope.chatType !== 'direct' && envelope.text !== null && parseAgentSwitch(textWithoutOwnMention(envelope, ownMid)) !== null;
+}
+
 export interface TriggerContext {
   ownMid: string | null;
   agentEnabled: boolean;
   senderIsPrimaryAdmin: boolean;
   workspaceConfigured: boolean;
   defaultProvider: AgentProvider;
+  /** The sender is the Primary Administrator (senderIsPrimaryAdmin also covers whitelisted users who may address the Agent). Defaults to senderIsPrimaryAdmin. */
+  primaryAdmin?: boolean;
   /** Group free mode is on for this chat: any member's text counts as addressed to the Agent. */
   freeModeActive?: boolean;
+  /** The sender is the account's Primary Administrator (strictly: in a 1:1 chat a whitelisted friend is not). Only they can use `/folder`. */
+  senderIsFolderAdmin?: boolean;
 }
 
 export type TriggerDecision =
   | { type: 'ignore' }
   | { type: 'prompt'; provider: AgentProvider; prompt: string }
   | { type: 'stop' | 'new' | 'status' }
+  /** Primary Administrator's bare `/agent claude|codex|default`: set or clear this chat's Agent override. */
+  | { type: 'agent_provider'; provider: AgentProvider | 'default' }
+  /** A served non-administrator sent a bare `/agent claude|codex`: reply with the usage hint, change nothing. */
+  | { type: 'agent_usage'; provider: AgentProvider }
   | FreeCommand
+  | FolderCommand
+  | PersonaCommand
   | { type: 'free_message' };
+
+/** Bare `/agent claude|codex|default` (already trimmed, mention removed); anything with content is a prompt instead. */
+export function parseAgentSwitch(text: string): { provider: AgentProvider | 'default' } | null {
+  const match = /^\/agent\s+(codex|claude|default)\s*$/i.exec(text.trim());
+  return match ? { provider: match[1]!.toLowerCase() as AgentProvider | 'default' } : null;
+}
 
 export function routeTrigger(envelope: InboundEnvelope, context: TriggerContext): TriggerDecision {
   // Group free mode (docs/architecture/group-free-mode.md): `/free` is a Primary Administrator command, mention optional.
   // The sender gates of routeNormalTrigger (live, text, not own, decrypt_failed) hold for every free decision too.
+  // `/folder` (docs/architecture/project-folders.md) is a Primary Administrator command in every chat type, mention optional.
+  // Anyone else's `/folder` is never executed: it falls through and is an ordinary message.
+  if (!isNormallyIgnored(envelope, context)) {
+    const folder = parseFolderCommand(textWithoutOwnMention(envelope, context.ownMid));
+    if (folder && context.senderIsFolderAdmin) return folder;
+  }
   const group = envelope.chatType !== 'direct' && !isNormallyIgnored(envelope, context);
+  // `/persona` is a Primary Administrator command in groups and rooms, mention optional; anyone else's is an ordinary message.
+  if (group) {
+    const persona = parsePersonaCommand(textWithoutOwnMention(envelope, context.ownMid));
+    if (persona && (context.primaryAdmin ?? context.senderIsPrimaryAdmin)) return persona;
+  }
   const free = group ? parseFreeCommand(textWithoutOwnMention(envelope, context.ownMid)) : null;
   if (free) {
     if (context.senderIsPrimaryAdmin) return free;
     return context.freeModeActive ? { type: 'free_message' } : { type: 'ignore' };
+  }
+  // In free mode the Primary Administrator may switch the chat's Agent without the mention, like /free.
+  if (group && context.freeModeActive && (context.primaryAdmin ?? context.senderIsPrimaryAdmin)) {
+    const switchCommand = parseAgentSwitch(textWithoutOwnMention(envelope, context.ownMid));
+    if (switchCommand) return { type: 'agent_provider', provider: switchCommand.provider };
   }
   const decision = routeNormalTrigger(envelope, context);
   return group && decision.type === 'ignore' && context.freeModeActive ? { type: 'free_message' } : decision;
@@ -109,6 +213,12 @@ function routeNormalTrigger(envelope: InboundEnvelope, context: TriggerContext):
   if (text === '/stop') return { type: 'stop' };
   if (text === '/new') return { type: 'new' };
   if (text === '/status') return { type: 'status' };
+  const switchCommand = parseAgentSwitch(text);
+  if (switchCommand) {
+    if (context.primaryAdmin ?? context.senderIsPrimaryAdmin) return { type: 'agent_provider', provider: switchCommand.provider };
+    // `default` from anyone else is ordinary text; bare codex/claude gets the usage hint.
+    if (switchCommand.provider !== 'default') return { type: 'agent_usage', provider: switchCommand.provider };
+  }
   const command = /^\/agent\s+(codex|claude)(?:\s+([\s\S]*))?$/i.exec(text);
   const provider = command ? command[1]!.toLowerCase() as AgentProvider : context.defaultProvider;
   const prompt = (command ? command[2] ?? '' : text).trim();

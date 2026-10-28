@@ -17,3 +17,8 @@ export function buildChildEnvironment(source: NodeJS.ProcessEnv) {
   }
   return {env, isolatedOverrideNames: isolatedOverrideNames.sort()};
 }
+
+/** Names the child environment already owns (system variables and provider credentials/overrides); extension env may not reuse them. */
+export function isReservedEnvironmentName(name:string):boolean {
+  return ALLOWED.has(name.toUpperCase()) || OVERRIDE.test(name) || /^LINEJS_/i.test(name) || /^MCP_/i.test(name);
+}

@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import type { LineWorkerCommand, LineWorkerEvent, WorkerBinding } from '@line-agent/contracts';
+import type { LineWorkerCommand, LineWorkerEvent, OutgoingMention, WorkerBinding } from '@line-agent/contracts';
 import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
-import type { AgentJob, ClaimedLineDelivery, DeliverySegment } from '@line-agent/database';
+import type { AgentJob, ChatMentionCandidates, ClaimedLineDelivery, DeliverySegment } from '@line-agent/database';
+import { resolveAgentMentions } from './agent-mentions.js';
 
 const DEFAULT_LIMIT = 4900;
 const RECOVERY_PAGE_SIZE = 32;
@@ -54,6 +55,8 @@ interface DeliveryRepository {
   claimLineDelivery(jobId: string, partIndex: number, expectedEpoch: number): Promise<ClaimedLineDelivery | null>;
   markDeliverySent(jobId: string, partIndex: number, lineMessageId: string): Promise<boolean>;
   markDeliveryUnknown(jobId: string, partIndex: number): Promise<boolean>;
+  /** Group members the Agent may mention (names as shown in the chat history) and the Agent's own MID. */
+  listMentionCandidates?(accountId: string, chatType: string, chatId: string): Promise<ChatMentionCandidates>;
   listPendingLineDeliveryJobs?(accountId: string | undefined, afterJobId: string | undefined, limit: number): Promise<string[]>;
 }
 
@@ -204,10 +207,12 @@ export class DeliveryService {
           continue;
         }
         const requestId = randomUUID();
+        const mentions = await this.mentionsFor(claimed.accountId, claimed.chatType, claimed.chatId, claimed.text);
         try {
           const result = await this.worker.send({ type: 'sendText', accountId: claimed.accountId,
             chatType: claimed.chatType, chatId: claimed.chatId, workerInstanceId: fresh.workerInstanceId,
-            controlEpoch: fresh.controlEpoch, requestId, text: claimed.text, replyToMessageId: null }, this.controller.signal);
+            controlEpoch: fresh.controlEpoch, requestId, text: claimed.text, replyToMessageId: null,
+            ...(mentions.length > 0 ? { mentions } : {}) }, this.controller.signal);
           if (result.requestId === requestId && result.accountId === claimed.accountId
             && result.workerInstanceId === fresh.workerInstanceId && result.controlEpoch === fresh.controlEpoch
             && result.status === 'sent' && result.messageId) {
@@ -224,6 +229,22 @@ export class DeliveryService {
     } finally {
       this.activeSendAccounts.delete(job.accountId);
       this.drainDeferredAccounts();
+    }
+  }
+
+  /**
+   * LINE mentions for the `@name` text of one group or room segment. A lookup failure only means the text goes out unmentioned;
+   * it never blocks or fails the delivery. One-to-one chats never mention. The mentions are derived from the segment text at
+   * send time, so a segment is claimed and sent at most once and needs no stored copy.
+   */
+  private async mentionsFor(accountId: string, chatType: string, chatId: string, text: string): Promise<OutgoingMention[]> {
+    if ((chatType !== 'group' && chatType !== 'room') || !text.includes('@') || !this.repository.listMentionCandidates) return [];
+    try {
+      const { members, selfMid } = await this.repository.listMentionCandidates(accountId, chatType, chatId);
+      return resolveAgentMentions(text, members, selfMid);
+    } catch (error) {
+      this.reportFailure('execute', error, 'failed', { accountId });
+      return [];
     }
   }
 

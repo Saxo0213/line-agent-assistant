@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import type { AccountMode, ConversationKey, InboundEnvelope, WritableConversationKey, LineWorkerCommand, LineWorkerEvent, WorkerBinding } from '@line-agent/contracts';
 import { isWritableChatType, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AccountRepository, AdminRepository, AgentJobStatusProjection, FriendWhitelistRepository, MessageRepository, RoutingDecision, SettingsRepository } from '@line-agent/database';
-import { hasOwnMention, isFreeCommandText, routeTrigger, type FreeCommand, type TriggerDecision } from './trigger-router.js';
+import { hasOwnMention, isAgentSwitchText, isFolderCommandText, isFreeCommandText, isPersonaCommandText, routeTrigger, type FolderCommand, type FreeCommand, type PersonaCommand, type TriggerDecision } from './trigger-router.js';
+import { executePersonaCommand } from './agent-persona.js';
 import { classifyRoomControl, ownMentionBody, sanitizeRoomControlEnvelope, type RoomActivationCommand } from './room-control.js';
 import { sanitizeInbound } from './sensitive-message-sanitizer.js';
 import type { SecretStore } from './secret-store.js';
@@ -11,6 +12,7 @@ import type { AgentReaction } from './agent-service.js';
 import { claimed as permissionTicketClaimed, type PermissionCommandService, type PermissionTicket } from './permission-command.js';
 import type { Locale } from '../../locale.js';
 import { linePrompt } from './line-prompts.js';
+import { resolveChatProvider, resolveDefaultProvider } from './default-provider.js';
 
 import { pickWorkerBinding } from '../worker-binding-fields.js';
 export type BoundWorker = WorkerBinding & { mode: AccountMode };
@@ -23,7 +25,8 @@ export interface WorkerCommandSink {
 
 export interface AgentControl {
   kick(key: WritableConversationKey): void;
-  stopChat(key: WritableConversationKey): Promise<void>;
+  /** Resolves true when it cancelled a running or queued job. */
+  stopChat(key: WritableConversationKey): Promise<boolean | void>;
   resetChat(key: WritableConversationKey, commandMessageId?: string): Promise<void>;
   getChatStatus?(key: WritableConversationKey): Promise<{ runningJobId: string | null }>;
 }
@@ -40,11 +43,17 @@ export interface RoomControlHandler {
 export interface FreeModeControl {
   isActive(key: WritableConversationKey): boolean;
   statusText(key: WritableConversationKey): string | null;
-  handleCommand(key: WritableConversationKey & { chatType: 'group' | 'room' }, enabledBy: string, command: FreeCommand): Promise<void>;
+  handleCommand(key: WritableConversationKey & { chatType: 'group' | 'room' }, enabledBy: string, command: FreeCommand, sourceMessageId?: string): Promise<void>;
   addMessage(envelope: Extract<LineWorkerEvent, { type: 'batch' }>['envelopes'][number]): void;
 }
 
+/** `/folder` (docs/architecture/project-folders.md); implemented by ProjectFolderService. */
+export interface ProjectFolderControl {
+  handleCommand(key: WritableConversationKey, actor: string, command: FolderCommand): Promise<void>;
+}
+
 type FreeDispatch = { command: FreeCommand } | { message: true };
+type AgentDispatch = Extract<TriggerDecision, { type: 'agent_provider' | 'agent_usage' }>;
 
 export class LineService {
   private readonly bindings = new Map<string, BoundWorker>();
@@ -89,6 +98,7 @@ export class LineService {
     private readonly locale: Locale | string = 'en',
     private readonly onDiagnostic?: (diagnostic: SafeDiagnostic) => void,
     private readonly freeMode?: FreeModeControl,
+    private readonly projectFolders?: ProjectFolderControl,
   ) {}
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown): void {
@@ -253,8 +263,13 @@ export class LineService {
     if (signal?.aborted || binding.mode !== 'ACTIVE_CONTROL' || this.bindings.get(binding.workerInstanceId) !== binding) return;
     await this.messages.applyPendingRouteAction(key, messageId, binding.workerInstanceId, async (action) => {
       if (signal?.aborted || this.bindings.get(binding.workerInstanceId) !== binding) return;
-      if (action === 'stop') await this.agents.stopChat(key);
-      else if (action === 'new') await this.agents.resetChat(key, messageId);
+      if (action === 'stop') {
+        const stopped = await this.agents.stopChat(key) === true;
+        await this.sendChatText(binding, key, linePrompt(this.locale, stopped ? 'agentStopped' : 'agentNothingToStop'), messageId);
+      } else if (action === 'new') {
+        await this.agents.resetChat(key, messageId);
+        await this.sendChatText(binding, key, linePrompt(this.locale, 'agentNewStarted'), messageId);
+      }
       else {
         const status = await this.agents.getChatStatus?.(key);
         if (signal?.aborted || this.bindings.get(binding.workerInstanceId) !== binding) return;
@@ -266,6 +281,32 @@ export class LineService {
           text, replyToMessageId: messageId });
       }
     });
+  }
+
+  private async sendChatText(binding: BoundWorker, key: WritableConversationKey, text: string, replyToMessageId: string): Promise<void> {
+    await this.worker.send({ type: 'sendText', ...binding, ...key, requestId: randomUUID(), text, replyToMessageId });
+  }
+
+  /** Primary Administrator's `/agent claude|codex|default`, or the usage hint for a served non-administrator. */
+  private async applyAgentCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string, dispatch: AgentDispatch): Promise<void> {
+    const name = (provider: 'claude' | 'codex') => provider === 'codex' ? 'Codex' : 'Claude';
+    if (dispatch.type === 'agent_usage') {
+      await this.sendChatText(binding, key, linePrompt(this.locale, 'agentSwitchUsage', { name: dispatch.provider }), messageId);
+      return;
+    }
+    if (!await this.settings.setConversationProvider(key, dispatch.provider === 'default' ? null : dispatch.provider)) return;
+    const text = dispatch.provider === 'default'
+      ? linePrompt(this.locale, 'agentSwitchedDefault', { name: name(await resolveDefaultProvider(this.settings)) })
+      : linePrompt(this.locale, 'agentSwitched', { name: name(dispatch.provider) });
+    await this.sendChatText(binding, key, text, messageId);
+  }
+
+  /** Primary Administrator's `/persona` in a group/room: executes it and answers with the confirmation text. */
+  private async applyPersonaCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string, command: PersonaCommand): Promise<void> {
+    let text: string;
+    try { text = await executePersonaCommand(this.settings, key, command, this.locale); }
+    catch (error) { this.reportFailure('execute', error); text = linePrompt(this.locale, 'personaFailed'); }
+    await this.sendChatText(binding, key, text, messageId);
   }
 
   private queueAttachmentDownload(attachmentId: string): void {
@@ -610,6 +651,12 @@ export class LineService {
     const decisions: RoutingDecision[] = [];
     const permissionTickets = new Map<object, PermissionTicket>();
     const freeDispatches = new Map<string, FreeDispatch>();
+    const agentDispatches = new Map<string, AgentDispatch>();
+    const primaryAdminMessageIds = new Set<string>();
+    const folderDispatches = new Map<string, FolderCommand>();
+    const folderAdminCommandIds = new Set<string>();
+    const personaAdminCommandIds = new Set<string>();
+    const personaDispatches = new Map<string, PersonaCommand>();
     const primaryAdminLookupFailedIds = new Set<string>();
     for (const { envelope, ownMid, control, sensitive } of prepared) {
       const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
@@ -622,7 +669,8 @@ export class LineService {
       const permissionClaimed = permissionTicketClaimed(permissionTicket);
       const shouldCheckGroupAuthorization = envelope.chatType !== 'direct' && control.type === 'none'
         && envelope.ingestion.source === 'live' && envelope.kind === 'text' && envelope.senderId !== ownMid
-        && !administrative.has(envelope.messageId) && (hasOwnMention(envelope, ownMid) || isFreeCommandText(envelope, ownMid));
+        && !administrative.has(envelope.messageId) && (hasOwnMention(envelope, ownMid) || isFreeCommandText(envelope, ownMid) || isFolderCommandText(envelope, ownMid) || isPersonaCommandText(envelope, ownMid)
+          || (this.freeMode?.isActive(key) === true && isAgentSwitchText(envelope, ownMid)));
       let primaryAdminLookupFailed = false;
       const primaryAdmin = envelope.chatType === 'direct'
         ? directAdmin
@@ -647,13 +695,15 @@ export class LineService {
         ? primaryAdmin || friendAuthorization !== null
         : primaryAdmin;
       const routed = permissionClaimed || primaryAdminLookupFailed ? { type: 'ignore' as const } : routeTrigger(envelope, { ownMid,
-        agentEnabled: roomAgentEnabled, defaultProvider: conversation?.provider ?? 'codex',
-        senderIsPrimaryAdmin, workspaceConfigured: true, freeModeActive: this.freeMode?.isActive(key) ?? false });
+        agentEnabled: roomAgentEnabled, defaultProvider: await resolveChatProvider(this.settings, conversation?.provider),
+        senderIsPrimaryAdmin, primaryAdmin: primaryAdmin === true, senderIsFolderAdmin: primaryAdmin, workspaceConfigured: true, freeModeActive: this.freeMode?.isActive(key) ?? false });
       // Free-mode decisions are applied after ingestion; for storage and admission they are plain ignored messages.
       const freeDispatch: FreeDispatch | null = !this.freeMode ? null : routed.type === 'free' || routed.type === 'free_range' ? { command: routed }
         : routed.type === 'free_message' ? { message: true } : null;
-      const decision: Exclude<TriggerDecision, FreeCommand | { type: 'free_message' }> = routed.type === 'free' || routed.type === 'free_range'
-        || routed.type === 'free_message' ? { type: 'ignore' } : routed;
+      if (primaryAdmin === true) primaryAdminMessageIds.add(envelope.messageId);
+      const agentDispatch = routed.type === 'agent_provider' || routed.type === 'agent_usage' ? routed : null;
+      const decision: Exclude<TriggerDecision, FreeCommand | FolderCommand | PersonaCommand | { type: 'free_message' } | AgentDispatch> = routed.type === 'free' || routed.type === 'free_range' || routed.type === 'folder'
+        || routed.type === 'persona' || routed.type === 'free_message' || routed.type === 'agent_provider' || routed.type === 'agent_usage' ? { type: 'ignore' } : routed;
       const authorization = !primaryAdmin && friendAuthorization ? {
         directGrantId: friendAuthorization.grantId,
         directGrantVersion: friendAuthorization.version,
@@ -662,9 +712,20 @@ export class LineService {
         }),
       } : undefined;
       const routeIsClosed = existingRoutes.has(envelope.messageId) || (recovered && !recovered.receiptCurrent);
+      // `/folder` is applied after ingestion like free mode; for storage and admission it is a plain ignored message.
+      if (routed.type === 'folder') folderAdminCommandIds.add(envelope.messageId);
+      if (routed.type === 'folder' && this.projectFolders && !routeIsClosed && !permissionClaimed && control.type === 'none'
+        && !administrative.has(envelope.messageId) && !sensitive) folderDispatches.set(envelope.messageId, routed);
+      // `/persona` is applied after ingestion like `/agent`; for storage and admission it is a plain ignored message.
+      if (routed.type === 'persona') personaAdminCommandIds.add(envelope.messageId);
+      if (routed.type === 'persona' && !routeIsClosed && !permissionClaimed && control.type === 'none'
+        && !administrative.has(envelope.messageId) && !sensitive) personaDispatches.set(envelope.messageId, routed);
       actions.push({ key, decision: routeIsClosed ? { type: 'ignore' } : decision });
       if (freeDispatch && !routeIsClosed && !permissionClaimed && control.type === 'none' && !administrative.has(envelope.messageId) && !sensitive) {
         freeDispatches.set(envelope.messageId, freeDispatch);
+      }
+      if (agentDispatch && !routeIsClosed && !permissionClaimed && control.type === 'none' && !administrative.has(envelope.messageId) && !sensitive) {
+        agentDispatches.set(envelope.messageId, agentDispatch);
       }
       const primaryAdminAdmission = envelope.chatType !== 'direct' && primaryAdmin && decision.type !== 'ignore'
         ? { primaryAdminSenderId: envelope.senderId } : {};
@@ -696,7 +757,9 @@ export class LineService {
         if (envelope.ingestion.source !== 'live' || control.type !== 'none'
           || (recovered && !recovered.receiptCurrent) || existingRoutes.has(envelope.messageId)
           || administrative.has(envelope.messageId) || sensitive || primaryAdminAction || promptAdmitted
-          || primaryAdminLookupFailedIds.has(envelope.messageId)) continue;
+          || primaryAdminLookupFailedIds.has(envelope.messageId) || agentDispatches.has(envelope.messageId)
+          || (isFreeCommandText(envelope, ownMid) && primaryAdminMessageIds.has(envelope.messageId))
+          || folderAdminCommandIds.has(envelope.messageId) || personaAdminCommandIds.has(envelope.messageId)) continue;
         const body = ownMentionBody(envelope, ownMid);
         if (body !== null) this.scheduleRoomEffect(async () => {
           const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
@@ -792,8 +855,27 @@ export class LineService {
       if (!dispatch || !this.freeMode || primaryAdminLookupFailedIds.has(envelope.messageId)
         || this.bindings.get(binding.workerInstanceId) !== binding) continue;
       const freeKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId } as WritableConversationKey & { chatType: 'group' | 'room' };
-      if ('command' in dispatch) this.scheduleRoomEffect(() => this.freeMode?.handleCommand(freeKey, envelope.senderId, dispatch.command));
+      if ('command' in dispatch) this.scheduleRoomEffect(() => this.freeMode?.handleCommand(freeKey, envelope.senderId, dispatch.command, envelope.messageId));
       else this.freeMode.addMessage(envelope);
+    }
+    for (const { envelope } of admitted) {
+      const folder = folderDispatches.get(envelope.messageId);
+      if (!folder || !this.projectFolders || primaryAdminLookupFailedIds.has(envelope.messageId)
+        || this.bindings.get(binding.workerInstanceId) !== binding) continue;
+      const folderKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
+      this.scheduleRoomEffect(() => this.projectFolders?.handleCommand(folderKey, envelope.senderId, folder));
+    }
+    for (const { envelope } of admitted) {
+      const persona = personaDispatches.get(envelope.messageId);
+      if (!persona || primaryAdminLookupFailedIds.has(envelope.messageId) || this.bindings.get(binding.workerInstanceId) !== binding) continue;
+      const personaKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
+      this.scheduleRoomEffect(() => this.applyPersonaCommand(binding, personaKey, envelope.messageId, persona));
+    }
+    for (const { envelope } of admitted) {
+      const dispatch = agentDispatches.get(envelope.messageId);
+      if (!dispatch || primaryAdminLookupFailedIds.has(envelope.messageId) || this.bindings.get(binding.workerInstanceId) !== binding) continue;
+      const agentKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
+      this.scheduleRoomEffect(() => this.applyAgentCommand(binding, agentKey, envelope.messageId, dispatch));
     }
     for (const attachmentId of attachmentIds) this.queueAttachmentDownload(attachmentId);
     for (const { control, envelope, ownMid } of admitted) {
@@ -802,7 +884,8 @@ export class LineService {
         this.scheduleRoomEffect(() => this.roomControl?.handle(control.command));
       } else if (!useIndependentIngest && control.type === 'none' && !administrative.has(envelope.messageId)
         && !primaryAdminActions.has(envelope.messageId) && !committedAgentActions.has(envelope.messageId)
-        && this.roomControl?.respond) {
+        && !agentDispatches.has(envelope.messageId) && !(isFreeCommandText(envelope, ownMid) && primaryAdminMessageIds.has(envelope.messageId))
+        && !folderAdminCommandIds.has(envelope.messageId) && !personaAdminCommandIds.has(envelope.messageId) && this.roomControl?.respond) {
         const body = ownMentionBody(envelope, ownMid);
         if (body !== null) this.scheduleRoomEffect(async () => {
           const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };

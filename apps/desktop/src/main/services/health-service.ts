@@ -1,6 +1,7 @@
 import { CONVERSATION_PICTURE_SQL, CONVERSATION_TITLE_SQL, PEER_CONTACT_JOIN, resolveAgentLineage, sharedAdminChatSql } from '@line-agent/database';
 import type { Pool } from 'pg';
 import { boundedSticonRawSql, previewWithSticons, projectSticons } from '../sticon-projection.js';
+import { normalizeDefaultProvider } from './default-provider.js';
 import { isLocalOnlyConversation, type AgentJobSearchQuery, type AgentJobSummary, type AgentProvider, type AppSnapshot, type ComponentHealth, type ControlSnapshot,
   type ConversationKey, type ConversationSummary, type GeneratedPreview, type MessageContent, type ProviderStatus } from '@line-agent/contracts';
 
@@ -161,7 +162,7 @@ latestMessageAt: row.latest_occurred_at?.toISOString() ?? null,
 
 const conversationSelect = `SELECT c.account_id, c.chat_type, c.chat_id, COALESCE(${CONVERSATION_TITLE_SQL}, '') AS title,
     CASE WHEN c.chat_type IN ('group','room') THEN COALESCE(room_policy.state = 'ENABLED', false) ELSE c.agent_enabled END AS agent_enabled,
-    c.default_provider,
+    COALESCE(c.default_provider, CASE WHEN (SELECT value #>> '{}' FROM app_settings WHERE key = 'default_provider') = 'codex' THEN 'codex' ELSE 'claude' END) AS default_provider,
     c.unread_count, ${CONVERSATION_PICTURE_SQL} picture_path, latest.message_id latest_message_id, latest.sticon_raw latest_sticon_raw, latest.text_content latest_text, latest.content latest_content, latest.source_deleted latest_source_deleted, latest.kind latest_kind, latest.notification_projection latest_notification_projection, latest.occurred_at latest_occurred_at,
     latest.attachment_name latest_attachment_name, latest.attachment_kind latest_attachment_kind,
     latest.attachment_status latest_attachment_status
@@ -274,7 +275,7 @@ export class HealthService {
     return {
       control: { epoch: Number(control.rows[0]?.control_epoch ?? 0), activeAccountId: control.rows[0]?.active_account_id ?? null,
         phase: this.phase, targetAccountId: this.targetAccountId },
-      defaultProvider: defaultAgentSetting.rows[0]?.provider === 'codex' ? 'codex' : 'claude',
+      defaultProvider: normalizeDefaultProvider(defaultAgentSetting.rows[0]?.provider),
       queueDepth: Number(count.rows[0]?.count ?? 0),
       accounts: accounts.rows.map((row) => ({ accountId: row.account_id, displayName: row.display_name ?? row.account_id,
         status: row.status, lastSyncedAt: row.last_synced_at?.toISOString() ?? null, mode: row.mode, hasPrimaryAdmin: row.has_primary_admin, autoLoginOnStartup: row.auto_login_on_startup,

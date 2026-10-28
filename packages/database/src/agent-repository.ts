@@ -152,11 +152,19 @@ export const sharedAdminChatSql = `SELECT ag.account_id, adm.chat_id AS admin_mi
   JOIN conversations conv ON conv.account_id = ag.account_id AND conv.chat_type = 'direct' AND conv.chat_id = adm.chat_id
   WHERE ag.product_role = 'AGENT' AND ag.own_mid IS NOT NULL AND ag.mode <> 'PAUSED'`;
 
+/** Member display name in the free-mode history and in mentions: contact nickname, contact name, then the member row name. Aliases: cm, lc. */
+const MEMBER_DISPLAY_NAME_SQL = "COALESCE(NULLIF(lc.nickname, ''), NULLIF(lc.display_name, ''), NULLIF(cm.display_name, ''))";
+
 export interface JobIdentity {
   agent: { accountId: string; name: string | null } | null;
   admin: { accountId: string; chatId: string; name: string | null } | null;
-  current: { accountId: string; chatType: string; chatId: string; title: string | null; isAdmin: boolean } | null;
+  current: { accountId: string; chatType: string; chatId: string; title: string | null; isAdmin: boolean;
+    /** Display name of the member who asked, as the chat history shows it; null or absent when unknown. */
+    askerName?: string | null } | null;
 }
+
+/** Members of one conversation the Agent may mention, and the Agent account's own MID (never mentioned). */
+export interface ChatMentionCandidates { members: Array<{ mid: string; name: string }>; selfMid: string | null }
 
 export interface SharedAdminChat { accountId: string; adminMid: string }
 
@@ -303,7 +311,7 @@ export class AgentRepository {
    * Who is who for one job's prompt: the Agent account, the Primary Admin's direct chat with it, and (LINE jobs) the current
    * conversation. Read-only; the caller omits the block when this throws.
    */
-  async describeJobIdentity(job: { sourceType: AgentJobSourceType; accountId: string | null; chatType: string | null; chatId: string | null }): Promise<JobIdentity> {
+  async describeJobIdentity(job: { sourceType: AgentJobSourceType; accountId: string | null; chatType: string | null; chatId: string | null; jobId?: string }): Promise<JobIdentity> {
     const agentRow = (await this.pool.query<{ account_id: string; display_name: string | null }>(
       "SELECT account_id, display_name FROM line_accounts WHERE product_role = 'AGENT' AND mode <> 'PAUSED' ORDER BY account_id LIMIT 1")).rows[0];
     const shared = await findSharedAdminChat(this.pool);
@@ -319,10 +327,36 @@ export class AgentRepository {
     if (job.sourceType === 'line' && job.accountId && job.chatType && job.chatId) {
       const row = (await this.pool.query<{ title: string | null }>(
         'SELECT title FROM conversations WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3', [job.accountId, job.chatType, job.chatId])).rows[0];
+      // The asker's name is for group and room jobs only, where the Agent may need it to @-mention the person.
+      const askerName = job.jobId && (job.chatType === 'group' || job.chatType === 'room')
+        ? (await this.pool.query<{ name: string | null }>(
+          `SELECT ${MEMBER_DISPLAY_NAME_SQL} AS name
+           FROM agent_jobs j JOIN conversation_members cm ON cm.account_id = j.account_id AND cm.chat_type = j.chat_type
+             AND cm.chat_id = j.chat_id AND cm.member_id = j.source_sender_id
+           LEFT JOIN line_contacts lc ON lc.account_id = cm.account_id AND lc.mid = cm.member_id
+           WHERE j.job_id = $1`, [job.jobId])).rows[0]?.name ?? null : null;
       current = { accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, title: row?.title ?? null,
-        isAdmin: admin !== null && admin.accountId === job.accountId && job.chatType === 'direct' && admin.chatId === job.chatId };
+        isAdmin: admin !== null && admin.accountId === job.accountId && job.chatType === 'direct' && admin.chatId === job.chatId,
+        ...(askerName ? { askerName } : {}) };
     }
     return { agent: agentRow ? { accountId: agentRow.account_id, name: agentRow.display_name } : null, admin, current };
+  }
+
+  /**
+   * Group or room members the Agent may mention, named exactly as the free-mode history shows them (contact nickname, contact
+   * name, then the member row name), and the Agent account's own MID. Members without any name are left out.
+   */
+  async listMentionCandidates(accountId: string, chatType: string, chatId: string): Promise<ChatMentionCandidates> {
+    const result = await this.pool.query<{ mid: string; name: string | null; own_mid: string | null }>(
+      `SELECT cm.member_id AS mid, ${MEMBER_DISPLAY_NAME_SQL} AS name, la.own_mid
+       FROM line_accounts la
+       LEFT JOIN conversation_members cm ON cm.account_id = la.account_id AND cm.chat_type = $2 AND cm.chat_id = $3
+       LEFT JOIN line_contacts lc ON lc.account_id = cm.account_id AND lc.mid = cm.member_id
+       WHERE la.account_id = $1`, [accountId, chatType, chatId]);
+    return {
+      members: result.rows.flatMap((row) => row.mid && row.name ? [{ mid: row.mid, name: row.name }] : []),
+      selfMid: result.rows[0]?.own_mid ?? null,
+    };
   }
 
   async enqueueUiJob(request: UiJobRequest): Promise<{ disposition: 'inserted' | 'duplicate'; jobId: string }> {

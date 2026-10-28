@@ -35,6 +35,10 @@ export const AGENT_PERMISSIONS = [
     defaultEffect: 'ALLOW', contextRule: 'CURRENT_CHAT_FOLDER' },
   { id: 'agent.local_tools', label: '使用本機工作區（讀檔／執行指令）', description: '允許 Agent 使用 CLI 內建的檔案與指令工具（不受聊天室資料夾限制）。',
     defaultEffect: 'DENY', contextRule: 'PROVIDER_WORKSPACE' },
+  { id: 'project_folder.read', label: '讀取專案資料夾', description: '允許 Agent 讀取管理者以 /folder 綁定到本聊天室的公司專案資料夾。',
+    defaultEffect: 'DENY', contextRule: 'CURRENT_CHAT' },
+  { id: 'project_folder.write', label: '寫入專案資料夾', description: '允許 Agent 在管理者以 /folder rw 綁定為可讀寫的專案資料夾內建立與修改檔案。',
+    defaultEffect: 'DENY', contextRule: 'CURRENT_CHAT' },
 ] as const satisfies readonly AgentPermissionDefinition[];
 
 export type AgentPermissionId = (typeof AGENT_PERMISSIONS)[number]['id'];
@@ -100,10 +104,16 @@ export const AgentToolPolicySchema = z.strictObject({
   fileWrite: z.boolean(),
   /** Canonical absolute paths of linked group folders, mounted read-only (one `--add-dir` each). */
   linkedReadDirs: z.array(z.string().min(1)).max(32),
+  /** Canonical project folders bound to the job's chat with /folder; `writable` only when this job may modify that folder. */
+  projectDirs: z.array(z.strictObject({ path: z.string().min(1), writable: z.boolean() })).max(8).default([]),
+  /** True when file writes are enabled only for writable project folders: the job's own chat folder must stay read-only. */
+  ownFolderReadOnly: z.boolean().optional(),
   /** Canonical workspace root mounted (one `--add-dir`) for admin/operator jobs whose cwd is below it; null otherwise. */
   workspaceRootDir: z.string().min(1).nullable(),
   /** Snapshotted global ceiling used by provider adapters. */
   level: AgentExecutionLevelSchema,
+  /** WebSearch/WebFetch (Claude) and live web search (Codex); granted to every resolved principal, never to unresolved. */
+  webTools: z.boolean().default(false),
   /** True only for Agent room UI jobs acting as the operator. */
   interactiveApproval: z.boolean(),
 });

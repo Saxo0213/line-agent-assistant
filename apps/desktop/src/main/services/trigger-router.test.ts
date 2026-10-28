@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { InboundEnvelope } from '@line-agent/contracts';
-import { hasOwnMention, routeTrigger } from './trigger-router.js';
+import { hasOwnMention, isFolderCommandText, parseAgentSwitch, parseFolderCommand, routeTrigger } from './trigger-router.js';
 
 const envelope = (overrides: Partial<InboundEnvelope> = {}): InboundEnvelope => ({
   eventId: 'e1', accountId: 'a', chatType: 'group', chatId: 'g', senderId: 'user', messageId: 'm1',
@@ -120,5 +120,87 @@ describe('routeTrigger group free mode', () => {
     expect(routeTrigger(envelope({ text: '@Agent /stop' }), on)).toEqual({ type: 'stop' });
     expect(routeTrigger(envelope({ text: '@Agent /status' }), on)).toEqual({ type: 'status' });
     expect(routeTrigger(envelope({ text: '@Agent /new' }), on)).toEqual({ type: 'new' });
+  });
+});
+
+describe('/folder command parsing', () => {
+  it.each([
+    ['/folder D:\\Projects\\Alpha', { type: 'folder', action: 'bind', path: 'D:\\Projects\\Alpha', mode: 'READ' }],
+    ['/folder rw D:\\Projects\\Alpha', { type: 'folder', action: 'bind', path: 'D:\\Projects\\Alpha', mode: 'READ_WRITE' }],
+    ['/FOLDER RW D:\\Projects\\Alpha', { type: 'folder', action: 'bind', path: 'D:\\Projects\\Alpha', mode: 'READ_WRITE' }],
+    ['/folder D:\\公司 專案\\第一季 報告', { type: 'folder', action: 'bind', path: 'D:\\公司 專案\\第一季 報告', mode: 'READ' }],
+    ['/folder "D:\\My Projects\\Alpha"', { type: 'folder', action: 'bind', path: 'D:\\My Projects\\Alpha', mode: 'READ' }],
+    ['/folder rw \'D:\\My Projects\\Alpha\'', { type: 'folder', action: 'bind', path: 'D:\\My Projects\\Alpha', mode: 'READ_WRITE' }],
+    ['/folder rw \u201CD:\\My Projects\\Alpha\u201D', { type: 'folder', action: 'bind', path: 'D:\\My Projects\\Alpha', mode: 'READ_WRITE' }],
+    ['/folder \\\\server\\share\\Alpha', { type: 'folder', action: 'bind', path: '\\\\server\\share\\Alpha', mode: 'READ' }],
+    ['/folder', { type: 'folder', action: 'list' }],
+    ['/folder   ', { type: 'folder', action: 'list' }],
+    ['/folder off', { type: 'folder', action: 'off', path: null }],
+    ['/folder OFF', { type: 'folder', action: 'off', path: null }],
+    ['/folder off D:\\Projects\\Alpha', { type: 'folder', action: 'off', path: 'D:\\Projects\\Alpha' }],
+    ['/folder off "D:\\My Projects\\Alpha"', { type: 'folder', action: 'off', path: 'D:\\My Projects\\Alpha' }],
+    ['/folder rw', { type: 'folder', action: 'usage' }],
+    ['/folder ""', { type: 'folder', action: 'usage' }],
+  ])('parses %s', (text, expected) => {
+    expect(parseFolderCommand(text)).toEqual(expected);
+  });
+
+  it('does not treat other words or sentences as the command', () => {
+    for (const text of ['/folders D:\\x', '/folderD:\\x', 'please /folder D:\\x', 'folder D:\\x', '/free', '']) expect(parseFolderCommand(text)).toBeNull();
+  });
+
+  it('sees the command with or without an Agent mention, in every chat type', () => {
+    expect(isFolderCommandText(envelope({ text: '@Agent /folder rw D:\\x' }), 'agent-mid')).toBe(true);
+    expect(isFolderCommandText(envelope({ text: '/folder D:\\x', mentionIds: [], mentionRanges: [] }), 'agent-mid')).toBe(true);
+    expect(isFolderCommandText(envelope({ chatType: 'direct', text: '/folder', mentionIds: [], mentionRanges: [] }), 'agent-mid')).toBe(true);
+    expect(isFolderCommandText(envelope({ text: '@Agent hello' }), 'agent-mid')).toBe(false);
+  });
+
+  it('executes the command only for the Primary Admin; anyone else is an ordinary message', () => {
+    const admin = { ...context, senderIsFolderAdmin: true, senderIsPrimaryAdmin: true };
+    const bind = { type: 'folder', action: 'bind', path: 'D:\\x', mode: 'READ_WRITE' };
+    expect(routeTrigger(envelope({ text: '@Agent /folder rw D:\\x' }), admin)).toEqual(bind);
+    expect(routeTrigger(envelope({ text: '/folder rw D:\\x', mentionIds: [], mentionRanges: [] }), admin)).toEqual(bind);
+    expect(routeTrigger(envelope({ chatType: 'direct', text: '/folder rw D:\\x', mentionIds: [], mentionRanges: [] }), admin)).toEqual(bind);
+    const ordinary = { type: 'prompt', provider: 'codex', prompt: '/folder rw D:\\x' };
+    expect(routeTrigger(envelope({ text: '@Agent /folder rw D:\\x' }), context)).toEqual(ordinary);
+    expect(routeTrigger(envelope({ text: '@Agent /folder rw D:\\x' }), { ...context, senderIsPrimaryAdmin: true })).toEqual(ordinary);
+    expect(routeTrigger(envelope({ text: '@Agent /folder rw D:\\x' }), { ...context, agentEnabled: false })).toEqual({ type: 'ignore' });
+    expect(routeTrigger(envelope({ text: '/folder rw D:\\x', mentionIds: [], mentionRanges: [] }), context)).toEqual({ type: 'ignore' });
+    expect(routeTrigger(envelope({ chatType: 'direct', text: '/folder', mentionIds: [], mentionRanges: [] }), context)).toEqual({ type: 'ignore' });
+    expect(routeTrigger(envelope({ text: '/folder D:\\x', mentionIds: [], mentionRanges: [] }), { ...admin, freeModeActive: true })).toEqual({ type: 'folder', action: 'bind', path: 'D:\\x', mode: 'READ' });
+    expect(routeTrigger(envelope({ text: '/folder D:\\x', mentionIds: [], mentionRanges: [] }), { ...context, freeModeActive: true })).toEqual({ type: 'free_message' });
+  });
+});
+
+describe('bare /agent switch commands', () => {
+  const mention = { mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] };
+  const admin = { ...context, senderIsPrimaryAdmin: true, primaryAdmin: true };
+  it('parses claude, codex and default case-insensitively, and nothing with content', () => {
+    expect(parseAgentSwitch('/agent claude')).toEqual({ provider: 'claude' });
+    expect(parseAgentSwitch(' /AGENT Codex ')).toEqual({ provider: 'codex' });
+    expect(parseAgentSwitch('/agent default')).toEqual({ provider: 'default' });
+    expect(parseAgentSwitch('/agent claude fix this')).toBeNull();
+    expect(parseAgentSwitch('/agent')).toBeNull();
+  });
+  it('lets only the Primary Administrator switch; a served member gets the usage hint; default from others is ordinary text', () => {
+    expect(routeTrigger(envelope({ text: '@Agent /agent codex', ...mention }), admin)).toEqual({ type: 'agent_provider', provider: 'codex' });
+    expect(routeTrigger(envelope({ text: '@Agent /agent default', ...mention }), admin)).toEqual({ type: 'agent_provider', provider: 'default' });
+    expect(routeTrigger(envelope({ text: '@Agent /agent claude', ...mention }), context)).toEqual({ type: 'agent_usage', provider: 'claude' });
+    expect(routeTrigger(envelope({ text: '@Agent /agent default', ...mention }), context))
+      .toEqual({ type: 'prompt', provider: 'codex', prompt: '/agent default' });
+    expect(routeTrigger(envelope({ text: '@Agent /agent claude fix this', ...mention }), context)).toEqual({ type: 'prompt', provider: 'claude', prompt: 'fix this' });
+  });
+  it('direct chats: only a Primary Administrator switches, a whitelisted friend gets the hint', () => {
+    const direct = envelope({ chatType: 'direct', text: '/agent claude', mentionIds: [], mentionRanges: [] });
+    expect(routeTrigger(direct, { ...context, senderIsPrimaryAdmin: true, primaryAdmin: true })).toEqual({ type: 'agent_provider', provider: 'claude' });
+    expect(routeTrigger(direct, { ...context, senderIsPrimaryAdmin: true, primaryAdmin: false })).toEqual({ type: 'agent_usage', provider: 'claude' });
+    expect(routeTrigger(direct, { ...context, senderIsPrimaryAdmin: false })).toEqual({ type: 'ignore' });
+  });
+  it('free mode: the Primary Administrator may omit the mention, a member text stays a free-mode message', () => {
+    const bare = envelope({ text: '/agent claude', mentionIds: [], mentionRanges: [] });
+    expect(routeTrigger(bare, { ...admin, freeModeActive: true })).toEqual({ type: 'agent_provider', provider: 'claude' });
+    expect(routeTrigger(bare, admin)).toEqual({ type: 'ignore' });
+    expect(routeTrigger(bare, { ...context, freeModeActive: true })).toEqual({ type: 'free_message' });
   });
 });

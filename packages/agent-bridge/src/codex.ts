@@ -2,16 +2,20 @@ import type {AgentEvent, AgentRunRequest} from '@line-agent/contracts';
 import {identifier, object, ProtocolError, text, usage} from './jsonl.js';
 import {classifyProviderFailure,providerMessage} from './failure.js';
 import {codexMcpOverrides} from './mcp.js';
+import {codexExtensionPlan,codexWebSearchOverrides} from './extensions.js';
 
 export function codexArguments(request:AgentRunRequest,workspace:string) {
   // Codex has no approval broker, so its sandbox is the enforcement boundary.
   if(!request.tools.localTools) throw new Error('Codex requires the local tools permission');
   const level=request.tools.level ?? 'workspace_write';
-  const sandbox=!request.tools.fileWrite||level==='read_only'?'read-only':level==='full'?'danger-full-access':'workspace-write';
+  // A read-only project folder cannot be protected inside danger-full-access, so such a job runs in workspace-write instead.
+  const sandbox=!request.tools.fileWrite||request.tools.ownFolderReadOnly||level==='read_only'?'read-only':level==='full'&&!(request.tools.projectDirs??[]).some(dir=>!dir.writable)?'danger-full-access':'workspace-write';
+  // `--add-dir` (an exec-level option, so it also precedes `resume`) adds writable roots to the workspace-write sandbox only; reading is never limited by directory.
+  const writableDirs=sandbox==='workspace-write'?(request.tools.projectDirs??[]).filter(dir=>dir.writable).flatMap(dir=>['--add-dir',dir.path]):[];
   const images=codexImageArguments(request);
   // Fresh `exec --image` is variadic: the `--image=<path>` form binds exactly one value, and `-C` follows so the
   // trailing `-` is never swallowed. On `resume` the flag is a plain single-value option after the session id.
-  return ['exec','--ignore-user-config',...(request.mcp?codexMcpOverrides(request.mcp):[]),'--json','--sandbox',sandbox,'--skip-git-repo-check',...(request.resumeSessionId?[]:images),'-C',workspace,...(request.resumeSessionId?['resume',request.resumeSessionId,...images]:[]),'-'];
+  return ['exec','--ignore-user-config',...(request.mcp?codexMcpOverrides(request.mcp):[]),...codexExtensionPlan(request.extensions).overrides,...codexWebSearchOverrides(request.extensions,request.tools.webTools),'--json','--sandbox',sandbox,...writableDirs,'--skip-git-repo-check',...(request.resumeSessionId?[]:images),'-C',workspace,...(request.resumeSessionId?['resume',request.resumeSessionId,...images]:[]),'-'];
 }
 /**
  * One `--image=<abs path>` per validated image. Codex splits an image value on commas, so a path containing one

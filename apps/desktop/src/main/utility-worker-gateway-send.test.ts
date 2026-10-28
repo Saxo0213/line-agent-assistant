@@ -331,3 +331,20 @@ describe('send pacing', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 });
+
+describe('mention send gateway', () => {
+  const mid = `u${'1'.repeat(32)}`;
+  it('forwards sendText mentions to the worker wire command and drops them for an invalid range', async () => {
+    const h = await harness();
+    await h.add('a1');
+    const sent = h.gateway.send({ type: 'sendText', ...h.accounts.get('a1')!, requestId: 'mention-1', chatType: 'group', chatId: `c${'a'.repeat(32)}`,
+      text: 'hi @小明', replyToMessageId: null, mentions: [{ start: 3, end: 6, userId: mid }] } as never);
+    await vi.waitFor(() => expect(h.children.get('a1')!.sends).toHaveLength(1));
+    expect(h.children.get('a1')!.sends[0]).toMatchObject({ type: 'sendText', text: 'hi @小明', mentions: [{ start: 3, end: 6, userId: mid }],
+      operationId: 'mention-1', attemptId: expect.any(String), effectPermit: expect.any(String) });
+    h.children.get('a1')!.sent(h.accounts.get('a1')!, 'mention-1');
+    await expect(sent).resolves.toMatchObject({ status: 'sent' });
+    await expect(Promise.resolve().then(() => h.gateway.send({ type: 'sendText', ...h.accounts.get('a1')!, requestId: 'mention-2', chatType: 'group', chatId: `c${'a'.repeat(32)}`,
+      text: 'hi', replyToMessageId: null, mentions: [{ start: 0, end: 9, userId: mid }] } as never))).rejects.toThrow();
+  });
+});

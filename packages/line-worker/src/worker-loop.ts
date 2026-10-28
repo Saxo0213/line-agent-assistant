@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   isLineServerErrorCode, isLocalAgentRoom, talkServerError, MEDIA_FILE_MAX_BYTES, MEDIA_IMAGE_MAX_BYTES, LineWorkerCommandSchema, LineWorkerEventSchema,
   WORKER_PROTOCOL_VERSION, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue as ContractJsonValue, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto,
-  type ChatResourceReadCommand, type ChatResourcePhotoPageShape,
+  type ChatResourceReadCommand, type OutgoingMention, type ChatResourcePhotoPageShape,
 } from '@line-agent/contracts';
 import { DurableCursorSession, cursorsEqual, decodeHistoryCursor, encodeHistoryCursor,
   type HistoryCursorV1, type JsonValue } from './cursor.js';
@@ -61,7 +61,7 @@ export interface LineTransport {
       name: string | null; source: AsyncIterable<Uint8Array>;
     }>;
   send(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string }, text: string,
-    replyToMessageId: string | null, lease: ControlLease, manual?: boolean): Promise<{ messageId: string }>;
+    replyToMessageId: string | null, lease: ControlLease, manual?: boolean, mentions?: readonly OutgoingMention[]): Promise<{ messageId: string }>;
   /** Optional: transports without media support leave it undefined and the loop denies the command. */
   sendMedia?(conversation: { chatType: 'direct' | 'group'; chatId: string },
     media: Readonly<{ kind: 'image' | 'file'; bytes: Buffer; fileName: string }>, lease: ControlLease, manual?: boolean): Promise<{ messageId: string }>;
@@ -967,7 +967,7 @@ export class LineWorkerLoop {
       }
       if (owned && permit) this.#usedEffectPermits.add(permit);
       const result = await this.#withTransportCall(() => this.#transport.send({ chatType: command.chatType, chatId: command.chatId },
-        command.text, command.replyToMessageId, identity, manual));
+        command.text, command.replyToMessageId, identity, manual, ...('mentions' in command && command.mentions?.length ? [command.mentions] as const : [])));
       await this.#emit({ type: 'sendResult', ...identity, requestId: command.requestId,
         operationId: command.operationId, attemptId: command.attemptId,
         status: 'sent', messageId: result.messageId, error: null });

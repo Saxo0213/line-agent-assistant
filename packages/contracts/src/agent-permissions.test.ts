@@ -18,13 +18,15 @@ describe('Agent permission registry', () => {
     expect(AgentToolAllowlistEntrySchema.safeParse({ id:folderId, kind:'bash_command', value:' git status ', createdAt:new Date().toISOString() }).success).toBe(true);
     expect(AgentToolAllowlistEntrySchema.safeParse({ id:folderId, kind:'bash_head', value:'git status', createdAt:new Date().toISOString() }).success).toBe(false);
   });
-  it('holds the five initial entries with the specified defaults and context rules', () => {
+  it('holds the initial entries with the specified defaults and context rules', () => {
     expect(AGENT_PERMISSIONS.map((entry) => [entry.id, entry.defaultEffect, entry.contextRule])).toEqual([
       ['records.query_current_chat', 'ALLOW', 'CURRENT_CHAT'],
       ['records.query_all_chats', 'DENY', 'ACCOUNT'],
       ['chat_folder.read', 'ALLOW', 'CURRENT_CHAT_FOLDER'],
       ['chat_folder.write', 'ALLOW', 'CURRENT_CHAT_FOLDER'],
       ['agent.local_tools', 'DENY', 'PROVIDER_WORKSPACE'],
+      ['project_folder.read', 'DENY', 'CURRENT_CHAT'],
+      ['project_folder.write', 'DENY', 'CURRENT_CHAT'],
     ]);
     expect(AGENT_PERMISSIONS.find((entry) => entry.id === 'chat_folder.read')?.label).toBe('讀取本聊天室資料夾');
     expect(AGENT_PERMISSIONS.find((entry) => entry.id === 'chat_folder.write')?.label).toBe('寫入本聊天室資料夾');

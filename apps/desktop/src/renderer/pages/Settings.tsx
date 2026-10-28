@@ -12,6 +12,8 @@ import { AGENT_STATUS_MARKERS, AgentStatusMarker } from '../AgentStatusMarker.js
 import { translateSettings } from '../../locale.js';
 import { localeFromState, useLocale } from '../locale-context.js';
 import { UpdateCheckSettings } from './UpdateCheckSettings.js';
+import { AgentExtensionsSettings } from './AgentExtensionsSettings.js';
+import { AgentPersonaSettings } from './AgentPersonaSettings.js';
 
 const SHOW_MANUAL_MCP_TOKENS = false;
 const EMPTY_PROVIDERS: ProviderStatus[] = [];
@@ -638,6 +640,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
       : tab === 'agent' ? <div role="tabpanel" className="agent-settings">
       <div className="cards secondary-settings"><section className="panel agent-basics"><div className="panel-top"><h2>{desktopText('agentSettings')}</h2><div className="agent-basics-actions"><label>{desktopText('defaultAgent')}<select aria-label={desktopText('defaultAgent')} value={provider} onChange={(event) => { setProvider(event.target.value as 'codex' | 'claude'); setProviderDirty(true); }}><option value="claude">Claude</option><option value="codex">Codex</option></select></label><button className="primary" disabled={!workspace.trim() || agentSaving} onClick={() => void saveAgentSettings()}>{agentSaving ? desktopText('saving') : desktopText('save')}</button></div></div><div className="agent-login-row">{[...providers].sort((a, b) => (a.provider === b.provider ? 0 : a.provider === 'codex' ? -1 : 1)).map((item) => <section className="agent-login-panel" key={item.provider}><div className="panel-top"><h3>{item.provider === 'codex' ? 'Codex' : 'Claude'}</h3><span className="badge">{agentStatusLabel[item.status]}</span></div><AgentProviderAuthControl api={api} providerStatus={item} onStatus={setStatus} /></section>)}</div><div className="agent-setting-section agent-workspace-row"><label htmlFor="agent-workspace-path">{desktopText('workspace')}</label><div className="path-picker"><input id="agent-workspace-path" aria-label={desktopText('agentWorkspace')} value={workspace} onChange={(event) => setWorkspace(event.target.value)} placeholder={desktopText('forExampleDProjectsWorkspace')} /><button onClick={() => void chooseAgentWorkspace()}>{desktopText('chooseFolder')}</button></div></div>
         </section></div>
+      <AgentPersonaSettings api={api} />
       {typeof api.mcpListTokens === 'function' && <section className="panel mcp-settings">
         <div className="panel-top"><h2>{desktopText('mcpServerAndExternalAgentAuthorization')}</h2>
           {mcpStatus && <span className="badge">{mcpStatus.running ? desktopText('runningArg0ActiveTokens', { arg0: mcpStatus.activeTokenCount }) : desktopText('notStarted')}</span>}</div>
@@ -718,18 +721,53 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
         </div>)}</div>}
         </>}
       </section>}
+      <AgentExtensionsSettings api={api} />
       <AgentPermissions api={api} accounts={accounts} />
     </div> : tab === 'help' ? <section role="tabpanel" className="panel conversation-help">
       <div className="panel-top"><div><h2>{desktopText('conversationCommands')}</h2><p>{desktopText('viewAgentPromptsAndLineUserAuthorizationCommands')}</p></div></div>
       <div className="conversation-help-table-wrap"><table aria-label={desktopText('conversationCommandList')}>
         <thead><tr><th scope="col">{desktopText('commandPrompt')}</th><th scope="col">{desktopText('purpose')}</th><th scope="col">{desktopText('description')}</th></tr></thead>
         <tbody>
+          <tr className="conversation-help-group"><th scope="rowgroup" colSpan={3}>{desktopText('cmdHelpGroupGeneral')}</th></tr>
+          <tr><th scope="row">{desktopText('cmdHelpAskLabel')}</th><td>{desktopText('cmdHelpAskPurpose')}</td><td>{desktopText('cmdHelpAskDescription')}</td></tr>
           <tr><th scope="row"><code>{desktopText('agentCodexPrompt')}</code></th><td>{desktopText('useCodex')}</td><td>{desktopText('useCodexForThisPromptOnlyFollowTheCommand')}</td></tr>
           <tr><th scope="row"><code>{desktopText('agentClaudePrompt')}</code></th><td>{desktopText('useClaude')}</td><td>{desktopText('useClaudeForThisPromptOnlyFollowTheCommand')}</td></tr>
           <tr><th scope="row"><code>/stop</code></th><td>{desktopText('stopJob')}</td><td>{desktopText('stopTheCurrentAgentJob')}</td></tr>
           <tr><th scope="row"><code>/new</code></th><td>{desktopText('newConversation')}</td><td>{desktopText('startANewAgentConversation')}</td></tr>
+          <tr><th scope="row"><code>/agent claude</code>、<code>/agent codex</code></th><td>{desktopText('cmdHelpAgentSwitchPurpose')}</td><td>{desktopText('cmdHelpAgentSwitchDescription')}</td></tr>
+          <tr><th scope="row"><code>/agent default</code></th><td>{desktopText('cmdHelpAgentDefaultPurpose')}</td><td>{desktopText('cmdHelpAgentDefaultDescription')}</td></tr>
           <tr><th scope="row"><code>/status</code></th><td>{desktopText('viewStatus')}</td><td>{desktopText('checkTheCurrentAgentJobStatus')}</td></tr>
-          <tr><th scope="row"><code>/adduser</code>{locale === 'zh-TW' && <>、<code>/新增使用者</code></>}</th><td>{desktopText('userAuthorization')}</td><td>{desktopText('addUsersToTheAgentAccessAllowlistInDirect')}</td></tr>
+          <tr className="conversation-help-note"><td colSpan={3}>{desktopText('cmdHelpExactNote')}</td></tr>
+        </tbody>
+        <tbody>
+          <tr className="conversation-help-group"><th scope="rowgroup" colSpan={3}>{desktopText('cmdHelpGroupAdmin')}</th></tr>
+          <tr><th scope="row"><code>@Agent 監控</code>、<code>@Agent monitor</code></th><td>{desktopText('cmdHelpEnableGroupPurpose')}</td><td>{desktopText('cmdHelpEnableGroupDescription')}</td></tr>
+          <tr><th scope="row"><code>@Agent RA-…</code></th><td>{desktopText('cmdHelpConfirmCodePurpose')}</td><td>{desktopText('cmdHelpConfirmCodeDescription')}</td></tr>
+          <tr><th scope="row"><code>/free</code>、<code>/free N</code>、<code>/free off</code></th><td>{desktopText('cmdHelpFreePurpose')}</td><td>{desktopText('cmdHelpFreeDescription')}</td></tr>
+          <tr><th scope="row"><code>/persona &lt;描述&gt;</code></th><td>{desktopText('cmdHelpPersonaSetPurpose')}</td><td>{desktopText('cmdHelpPersonaSetDescription')}</td></tr>
+          <tr><th scope="row"><code>/persona 安靜</code>、<code>/persona 一般</code>、<code>/persona 活潑</code></th><td>{desktopText('cmdHelpPersonaLivelinessPurpose')}</td><td>{desktopText('cmdHelpPersonaLivelinessDescription')}</td></tr>
+          <tr><th scope="row"><code>/persona</code></th><td>{desktopText('cmdHelpPersonaShowPurpose')}</td><td>{desktopText('cmdHelpPersonaShowDescription')}</td></tr>
+          <tr><th scope="row"><code>/persona default</code></th><td>{desktopText('cmdHelpPersonaDefaultPurpose')}</td><td>{desktopText('cmdHelpPersonaDefaultDescription')}</td></tr>
+        </tbody>
+        <tbody>
+          <tr className="conversation-help-group"><th scope="rowgroup" colSpan={3}>{desktopText('cmdHelpGroupProject')}</th></tr>
+          <tr><th scope="row"><code>/folder &lt;路徑&gt;</code></th><td>{desktopText('cmdHelpFolderBindPurpose')}</td><td>{desktopText('cmdHelpFolderBindDescription')}</td></tr>
+          <tr><th scope="row"><code>/folder rw &lt;路徑&gt;</code></th><td>{desktopText('cmdHelpFolderRwPurpose')}</td><td>{desktopText('cmdHelpFolderRwDescription')}</td></tr>
+          <tr><th scope="row"><code>/folder</code></th><td>{desktopText('cmdHelpFolderListPurpose')}</td><td>{desktopText('cmdHelpFolderListDescription')}</td></tr>
+          <tr><th scope="row"><code>/folder off [路徑]</code></th><td>{desktopText('cmdHelpFolderOffPurpose')}</td><td>{desktopText('cmdHelpFolderOffDescription')}</td></tr>
+        </tbody>
+        <tbody>
+          <tr className="conversation-help-group"><th scope="rowgroup" colSpan={3}>{desktopText('cmdHelpGroupAuth')}</th></tr>
+          <tr><th scope="row"><code>/adduser</code>、<code>/新增使用者</code></th><td>{desktopText('userAuthorization')}</td><td><p>{desktopText('addUsersToTheAgentAccessAllowlistInDirect')}</p><p>{desktopText('cmdHelpAdduserDirect')}</p><p>{desktopText('cmdHelpAdduserGroup')}</p><p>{desktopText('cmdHelpAdduserCode')}</p></td></tr>
+          <tr><th scope="row"><code>/權限</code>、<code>/permissions</code></th><td>{desktopText('cmdHelpPermissionsPurpose')}</td><td>{desktopText('cmdHelpPermissionsDescription')}</td></tr>
+        </tbody>
+        <tbody>
+          <tr className="conversation-help-group"><th scope="rowgroup" colSpan={3}>{desktopText('cmdHelpGroupSetup')}</th></tr>
+          <tr><th scope="row">{desktopText('cmdHelpPairingLabel')}</th><td>{desktopText('cmdHelpPairingPurpose')}</td><td>{desktopText('cmdHelpPairingDescription')}</td></tr>
+        </tbody>
+        <tbody>
+          <tr className="conversation-help-group"><th scope="rowgroup" colSpan={3}>{desktopText('cmdHelpGroupAutoReply')}</th></tr>
+          <tr><th scope="row"><code>{desktopText('cmdHelpAutoReplyLabel')}</code></th><td>{desktopText('cmdHelpAutoReplyPurpose')}</td><td>{desktopText('cmdHelpAutoReplyDescription')}</td></tr>
         </tbody>
       </table></div>
     </section> : <section role="tabpanel" className="panel about-settings">

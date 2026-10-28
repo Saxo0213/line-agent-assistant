@@ -27,7 +27,7 @@ export async function installFixture(directory:string, kind:'native'|'shim') {
   return file;
 }
 export const request = (provider:'codex'|'claude', workspacePath:string, extra:Partial<AgentRunRequest>={}):AgentRunRequest => ({
-  jobId:'job-1',provider,prompt:'Hello',workspacePath,tools:{localTools:true,fileRead:true,fileWrite:true,linkedReadDirs:[],workspaceRootDir:null,level:'workspace_write',interactiveApproval:false},source:{type:'ui',requestId:'req-1'},...extra,
+  jobId:'job-1',provider,prompt:'Hello',workspacePath,tools:{localTools:true,fileRead:true,fileWrite:true,linkedReadDirs:[],projectDirs:[],workspaceRootDir:null,level:'workspace_write',webTools:false,interactiveApproval:false},source:{type:'ui',requestId:'req-1'},...extra,
 });
 export async function readPids(file:string, expected:number):Promise<number[]> {
   const deadline=Date.now()+8000;

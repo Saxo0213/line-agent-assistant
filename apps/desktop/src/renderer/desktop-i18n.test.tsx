@@ -79,6 +79,10 @@ describe('English desktop source', () => {
     expect(systemLabelFor('en', '相簿照片下載')).toBe('Album photo download');
     expect(systemLabelFor('ja', '相簿照片下載')).toBe('アルバム写真をダウンロード');
     expect(systemLabelFor('ko', '相簿照片下載')).toBe('앨범 사진 다운로드');
+    expect(systemLabelFor('en', '自由模式回覆判斷')).toBe('Free mode reply decision');
+    expect(systemLabelFor('ja', '自由模式中斷回覆')).toBe('フリーモード返信の中断');
+    expect(systemLabelFor('ko', '自由模式回覆判斷')).toBe('자유 모드 답장 판단');
+    expect(systemLabelFor('zh-TW', '自由模式中斷回覆')).toBe('自由模式中斷回覆');
     expect(systemLabelFor('en', 'LINE 訊息延遲（LINE 至本機）')).toBe('LINE message delay (LINE to app)');
     expect(systemLabelFor('ko', 'LINE 訊息延遲（本機佇列／寫入）')).toBe('LINE 메시지 지연(앱 대기열/저장)');
   });
@@ -110,7 +114,7 @@ describe('English desktop source', () => {
       const code = readFileSync(`${root}/${path}`, 'utf8');
       // The only retained literals are language endonyms, accepted command aliases, and legacy wire-enum comparisons.
       const content = code.split('\n').filter((line) => !/^\s*(\/\/|\/\*|\*|\*\/)/.test(line)).join('\n');
-      expect(content.replace(/繁體中文|日本語|新增使用者|重試中|下載失敗|上午|下午|確定/g, ''), path).not.toMatch(/\p{Script=Han}/u);
+      expect(content.replace(/繁體中文|日本語|新增使用者|監控|權限|重試中|下載失敗|上午|下午|確定/g, ''), path).not.toMatch(/\p{Script=Han}/u);
     }
   });
 

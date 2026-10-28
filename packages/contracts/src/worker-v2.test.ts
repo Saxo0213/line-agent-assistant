@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { LineWorkerCommandSchema, LineWorkerEventSchema } from './worker-v2.js';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
@@ -269,4 +269,34 @@ it('rejects oversize or malformed read receipts', () => {
     { extra: true }]) {
     expect(LineWorkerEventSchema.safeParse({ ...receiptBatch, readReceipts: [{ ...validReceipt, ...bad }] }).success).toBe(false);
   }
+});
+
+describe('sendText mentions', () => {
+  const user = `u${'a'.repeat(32)}`;
+  const other = `u${'b'.repeat(32)}`;
+  const command = { type: 'sendText', ...binding, chatType: 'group', chatId: `c${'c'.repeat(32)}`, requestId: 'send-1',
+    text: 'hi @Amy and @Bob', replyToMessageId: null };
+  const parse = (mentions: unknown) => LineWorkerCommandSchema.safeParse({ ...command, mentions });
+  it('accepts valid, ordered or unordered, non-overlapping ranges inside the text', () => {
+    expect(LineWorkerCommandSchema.safeParse(command).success).toBe(true);
+    expect(parse([{ start: 3, end: 7, userId: user }, { start: 12, end: 16, userId: other }]).success).toBe(true);
+    expect(parse([{ start: 12, end: 16, userId: other }, { start: 3, end: 7, userId: user }]).success).toBe(true);
+    expect(parse([]).success).toBe(true);
+  });
+  it('rejects ranges that are empty, outside the text, overlapping, not user MIDs, extra-keyed or too many', () => {
+    expect(parse([{ start: 3, end: 3, userId: user }]).success).toBe(false);
+    expect(parse([{ start: 3, end: 99, userId: user }]).success).toBe(false);
+    expect(parse([{ start: 3, end: 8, userId: user }, { start: 7, end: 10, userId: other }]).success).toBe(false);
+    expect(parse([{ start: 3, end: 7, userId: 'c-group' }]).success).toBe(false);
+    expect(parse([{ start: 3, end: 7, userId: user, extra: 1 }]).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...command, text: 'x'.repeat(40),
+      mentions: Array.from({ length: 21 }, (_, index) => ({ start: index, end: index + 1, userId: user })) }).success).toBe(false);
+  });
+  it('rejects a range that splits a surrogate pair', () => {
+    expect(LineWorkerCommandSchema.safeParse({ ...command, text: '😀@Amy', mentions: [{ start: 1, end: 6, userId: user }] }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...command, text: '😀@Amy', mentions: [{ start: 2, end: 6, userId: user }] }).success).toBe(true);
+  });
+  it('does not allow mentions on manualSendText', () => {
+    expect(LineWorkerCommandSchema.safeParse({ ...command, type: 'manualSendText', mentions: [{ start: 3, end: 7, userId: user }] }).success).toBe(false);
+  });
 });

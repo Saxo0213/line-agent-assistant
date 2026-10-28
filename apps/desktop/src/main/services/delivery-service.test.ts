@@ -508,3 +508,78 @@ describe('delivery composition', () => {
     expect(accountAScans).toBeGreaterThan(0);
   });
 });
+
+describe('delivery mentions', () => {
+  const memberMid = `u${'1'.repeat(32)}`;
+  const selfMid = `u${'f'.repeat(32)}`;
+  async function run(chatType: 'direct' | 'group' | 'room', text: string, options: {
+    members?: Array<{ mid: string; name: string }>; lookupFails?: boolean; withLookup?: boolean } = {}) {
+    const claimed: ClaimedLineDelivery = { deliveryId: 'd', jobId: 'j', partIndex: 0, text, idempotencyKey: 'j:0',
+      status: 'sending', lineMessageId: null, accountId: 'account', chatType, chatId: 'real-chat', controlEpoch: 4 };
+    const lookups: unknown[][] = [];
+    const repository = {
+      async getJob() { return { jobId: 'j', accountId: 'account', chatType, chatId: 'real-chat',
+        provider: 'codex' as const, prompt: 'work', workspacePath: 'C:\trusted', generation: 0, status: 'completed' as const,
+        sourceType: 'line' as const, sourceMessageId: 'm', sourceRequestId: null, creationEpoch: 4 }; },
+      async listDeliveries() { return [{ ...claimed, status: 'pending' as const }]; },
+      async claimLineDelivery() { return claimed; },
+      async markDeliveryUnknown() { return true; }, async markDeliverySent() { return true; },
+      ...(options.withLookup === false ? {} : {
+        async listMentionCandidates(...args: unknown[]) {
+          lookups.push(args);
+          if (options.lookupFails) throw new Error('db down');
+          return { members: options.members ?? [{ mid: memberMid, name: '小明' }, { mid: selfMid, name: 'Agent' }], selfMid };
+        } }),
+    };
+    const commands: any[] = [];
+    const service = new DeliveryService(repository, {
+      async binding() { return { accountId: 'account', workerInstanceId: 'instance', controlEpoch: 4, mode: 'ACTIVE_CONTROL' as const }; },
+      async send(command) { commands.push(command); return { type: 'sendResult' as const, accountId: 'account', workerInstanceId: 'instance', controlEpoch: 4,
+        requestId: command.requestId, status: 'sent' as const, messageId: 'line-1', error: null }; },
+    });
+    await service.deliverCompletedJob('j');
+    await service.shutdown();
+    return { commands, lookups };
+  }
+
+  it('sends a group reply with LINE mentions for matching members and keeps the text', async () => {
+    const { commands, lookups } = await run('group', '好的 @小明 完成了，@Agent 也同意');
+    expect(lookups).toEqual([['account', 'group', 'real-chat']]);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ type: 'sendText', text: '好的 @小明 完成了，@Agent 也同意', mentions: [{ start: 3, end: 6, userId: memberMid }] });
+    expect(commands[0].mentions).toHaveLength(1);
+  });
+
+  it('mentions in a multi-person room too', async () => {
+    const { commands } = await run('room', '@小明 hi');
+    expect(commands[0].mentions).toEqual([{ start: 0, end: 3, userId: memberMid }]);
+  });
+
+  it('never mentions in a one-to-one chat and does not even look members up', async () => {
+    const { commands, lookups } = await run('direct', '@小明 hi');
+    expect(lookups).toEqual([]);
+    expect(commands[0]).not.toHaveProperty('mentions');
+  });
+
+  it('sends plain text when nothing matches, the text has no @, or the lookup fails or is unavailable', async () => {
+    expect((await run('group', '@不存在 hi')).commands[0]).not.toHaveProperty('mentions');
+    const noAt = await run('group', 'hi');
+    expect(noAt.lookups).toEqual([]);
+    expect(noAt.commands[0]).not.toHaveProperty('mentions');
+    const failed = await run('group', '@小明 hi', { lookupFails: true });
+    expect(failed.commands).toHaveLength(1);
+    expect(failed.commands[0]).not.toHaveProperty('mentions');
+    expect((await run('group', '@小明 hi', { withLookup: false })).commands[0]).not.toHaveProperty('mentions');
+  });
+
+  it('does not mention when two members share a name', async () => {
+    const { commands } = await run('group', '@小明 hi', { members: [{ mid: memberMid, name: '小明' }, { mid: `u${'2'.repeat(32)}`, name: '小明' }] });
+    expect(commands[0]).not.toHaveProperty('mentions');
+  });
+
+  it('derives mentions from each segment text, so a retried segment carries the same mentions', async () => {
+    const first = await run('group', '@小明 hi');
+    const second = await run('group', '@小明 hi');
+    expect(second.commands[0].mentions).toEqual(first.commands[0].mentions);
+  });
+});

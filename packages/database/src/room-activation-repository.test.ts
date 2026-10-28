@@ -261,4 +261,84 @@ database('durable room activation authorization state machine', () => {
     expect(await repository.recoverExpiredLeases()).toBe(0);
     expect(await repository.claimWaitingToSend(created.requestId, 'worker-third', 30_000)).toBeNull();
   });
+
+  describe('enableByPrimaryAdmin', () => {
+    it('enables the room with an ACTIVE grant that every reader sees, and audits it', async () => {
+      const f = await fixture();
+      const message = randomUUID();
+      expect(await repository.enableByPrimaryAdmin(f.scope, { sourceMessageId: message, adminUserId: f.adminUserId }))
+        .toEqual({ disposition: 'enabled' });
+      expect(await repository.hasActiveRoomGrant(f.scope)).toBe(true);
+      const policy = await repository.getPolicy(f.scope);
+      expect(policy).toMatchObject({ state: 'ENABLED', authorityVersion: 2 });
+      expect(await repository.getActiveRoomAuthorization(f.scope)).toMatchObject({ version: 2 });
+      const stored = await pool.query(
+        'SELECT authorizing_admin_user_id, authorizing_admin_version, confirmed_request_id FROM room_agent_policies WHERE account_id = $1 AND chat_id = $2',
+        [f.scope.accountId, f.scope.chatId]);
+      expect(stored.rows[0]).toMatchObject({ authorizing_admin_user_id: f.adminUserId, authorizing_admin_version: '1' });
+      expect(stored.rows[0].confirmed_request_id).toEqual(expect.any(String));
+      const audit = await pool.query('SELECT event, actor_id, authority_version FROM room_activation_audit WHERE account_id = $1', [f.scope.accountId]);
+      expect(audit.rows).toEqual([{ event: 'ADMIN_DIRECT_ENABLED', actor_id: f.adminUserId, authority_version: '2' }]);
+    });
+
+    it('rejects a sender who is not the Primary Admin without changing anything', async () => {
+      const f = await fixture();
+      expect(await repository.enableByPrimaryAdmin(f.scope, { sourceMessageId: randomUUID(), adminUserId: `member-${suffix}` }))
+        .toEqual({ disposition: 'not_primary_admin' });
+      expect(await repository.hasActiveRoomGrant(f.scope)).toBe(false);
+      expect((await pool.query('SELECT count(*) FROM room_agent_policies WHERE account_id = $1', [f.scope.accountId])).rows[0].count).toBe('0');
+      expect((await pool.query('SELECT count(*) FROM room_activation_requests WHERE account_id = $1', [f.scope.accountId])).rows[0].count).toBe('0');
+    });
+
+    it('reports a missing room', async () => {
+      const f = await fixture();
+      expect(await repository.enableByPrimaryAdmin({ ...f.scope, chatId: 'no-such-room' }, { sourceMessageId: randomUUID(), adminUserId: f.adminUserId }))
+        .toEqual({ disposition: 'room_missing' });
+    });
+
+    it('is a no-op for an already enabled room', async () => {
+      const f = await fixture();
+      await repository.enableByPrimaryAdmin(f.scope, { sourceMessageId: randomUUID(), adminUserId: f.adminUserId });
+      expect(await repository.enableByPrimaryAdmin(f.scope, { sourceMessageId: randomUUID(), adminUserId: f.adminUserId }))
+        .toEqual({ disposition: 'already_enabled' });
+      expect(await repository.getPolicy(f.scope)).toMatchObject({ authorityVersion: 2 });
+      expect((await pool.query("SELECT count(*) FROM room_agent_grants WHERE account_id = $1 AND state = 'ACTIVE'", [f.scope.accountId])).rows[0].count).toBe('1');
+    });
+
+    it('cancels a pending token request and invalidates its challenge', async () => {
+      const f = await fixture();
+      const created = await request(f.scope);
+      await issue(created.requestId!);
+      expect(await repository.enableByPrimaryAdmin(f.scope, { sourceMessageId: randomUUID(), adminUserId: f.adminUserId }))
+        .toEqual({ disposition: 'enabled' });
+      expect((await pool.query('SELECT state FROM room_activation_requests WHERE request_id = $1', [created.requestId])).rows[0].state).toBe('CANCELLED');
+      expect((await pool.query('SELECT invalidated_at FROM room_activation_challenges WHERE request_id = $1', [created.requestId])).rows[0].invalidated_at).not.toBeNull();
+      expect(await repository.hasActiveRoomGrant(f.scope)).toBe(true);
+      const events = await pool.query('SELECT event FROM room_activation_audit WHERE account_id = $1 ORDER BY audit_id', [f.scope.accountId]);
+      expect(events.rows.map((row) => row.event)).toEqual(['REQUESTED', 'CHALLENGE_MAY_HAVE_STARTED', 'CANCELLED', 'ADMIN_DIRECT_ENABLED']);
+      const confirm = await repository.confirmActivation({ ...f.scope, sourceMessageId: randomUUID(), senderUserId: f.adminUserId,
+        token, digestKey, digestKeyVersion: 1 });
+      expect(confirm.disposition).not.toBe('enabled');
+    });
+
+    it('replays the same source message without anything new', async () => {
+      const f = await fixture();
+      const message = randomUUID();
+      await repository.enableByPrimaryAdmin(f.scope, { sourceMessageId: message, adminUserId: f.adminUserId });
+      expect(await repository.enableByPrimaryAdmin(f.scope, { sourceMessageId: message, adminUserId: f.adminUserId }))
+        .toEqual({ disposition: 'duplicate' });
+      expect(await repository.getPolicy(f.scope)).toMatchObject({ authorityVersion: 2 });
+      expect((await pool.query('SELECT count(*) FROM room_activation_audit WHERE account_id = $1', [f.scope.accountId])).rows[0].count).toBe('1');
+    });
+
+    it('enables again after a revoke with a fresh grant version', async () => {
+      const f = await fixture();
+      await repository.enableByPrimaryAdmin(f.scope, { sourceMessageId: randomUUID(), adminUserId: f.adminUserId });
+      await repository.revokeRoom(f.scope, f.adminUserId);
+      expect(await repository.hasActiveRoomGrant(f.scope)).toBe(false);
+      expect(await repository.enableByPrimaryAdmin(f.scope, { sourceMessageId: randomUUID(), adminUserId: f.adminUserId }))
+        .toEqual({ disposition: 'enabled' });
+      expect(await repository.getActiveRoomAuthorization(f.scope)).toMatchObject({ version: 4 });
+    });
+  });
 });

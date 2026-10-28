@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { describe, expect, it } from 'vitest';
+import { buildMentionContentMetadata, normalizeMentionRanges, outgoingMentionsIssue } from '@line-agent/contracts';
 import { normalizeOperation, safeRaw } from './normalizer.js';
 
 const context = { accountId: 'account-A', ownMid: 'u-self', source: 'live' as const, cursor: 'cursor-1' };
@@ -30,6 +31,20 @@ describe('LINE operation normalization', () => {
     expect(envelope.mentionIds).toEqual(['u-agent', '@all']);
     expect(envelope.replyToMessageId).toBeNull();
     expect(normalizeOperation({ ...operation, message: { ...operation.message, messageRelationType: 'REPLY' } }, context).replyToMessageId).toBe('previous');
+  });
+
+  it.each(['@小明 你好', '😀 @小明😀 和 @Amy', '👨‍👩‍👧 @Bob'])('reads back the mentions an outgoing MENTION metadata describes (%s)', (text) => {
+    const mentions = [...text.matchAll(/@[^s]+/g)].map((match, index) => ({ start: match.index!, end: match.index! + match[0].length,
+      userId: `u${String(index + 1).repeat(32)}` }));
+    expect(mentions.length).toBeGreaterThan(0);
+    expect(outgoingMentionsIssue(text, mentions)).toBeNull();
+    const envelope = normalizeOperation({ revision: 8n, type: 26, message: {
+      id: '8', from: 'u-peer', to: 'c-group', toType: 2, contentType: 'NONE', text, createdTime: 1760522400000,
+      contentMetadata: { MENTION: buildMentionContentMetadata(mentions) },
+    } }, context);
+    expect(envelope.mentionRanges).toEqual(mentions);
+    expect(normalizeMentionRanges(text, envelope.mentionRanges)).toEqual(mentions);
+    expect(envelope.mentionIds).toEqual(mentions.map((mention) => mention.userId));
   });
 
   it('serializes nested bigint and bytes with stable decimal/base64 tags', () => {

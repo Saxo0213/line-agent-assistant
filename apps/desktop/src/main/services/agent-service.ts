@@ -2,9 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, isAgentScheduleQueueKey, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, AgentProviderSchema, type AgentAttachmentUpload, type AgentEvent, type AgentProvider, type AgentRunRequest, type WritableConversationKey } from '@line-agent/contracts';
 import { AgentAttachmentError, DEFAULT_ATTACHMENT_PROMPT, attachmentPromptSection, removeJobAttachments, resolveStoredAttachments, storeAttachments, validateUploads, type ResolvedAttachment } from './agent-attachments.js';
+import { projectFolderPromptSection } from './project-folder-prompt.js';
 import type { AgentRepository, AgentJobStatusProjection, AgentQueueKey, SessionKey } from '@line-agent/database';
 import type { WorkspaceAuthority } from './workspace-authority.js';
 import { splitDeliveryText } from './delivery-service.js';
+import { personaPromptSection } from './agent-persona.js';
 import { formatIdentityBlock, withAgentRoomHistoryHint, withIdentityBlock, withMcpSkill, withOutputChannel } from './mcp-skill.js';
 import { isScheduledRunRequestId } from './agent-schedule-service.js';
 import type { AgentJobEnvironment, AgentJobPlan } from './agent-job-environment.js';
@@ -140,6 +142,8 @@ export class AgentService {
     /** Required: where a job runs and which provider tools it gets. There is no default, so nothing fails open. */
     private readonly environment: AgentJobEnvironment,
     private readonly onDiagnostic?: (diagnostic: SafeDiagnostic, jobId?: string) => void,
+    /** The persona description in force for a LINE chat (docs/architecture/agent-persona.md); blank adds nothing to the prompt. */
+    private readonly resolvePersonaDescription?: (chat: { accountId: string; chatType: string; chatId: string }) => Promise<string>,
   ) {}
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown, jobId?: string): void {
@@ -345,7 +349,8 @@ export class AgentService {
     return result;
   }
 
-  async stopChat(key: AgentQueueKey): Promise<void> {
+  /** Resolves true when a queued or running job was cancelled. */
+  async stopChat(key: AgentQueueKey): Promise<boolean> {
     const id = identity(key);
     this.holdStarts(id);
     try {
@@ -356,6 +361,7 @@ export class AgentService {
       for (const projection of cancelled) { this.publishLifecycle(projection); this.reactCancelledQueued(projection); }
       if (physicalCancellation) await physicalCancellation;
       await this.pumps.get(id);
+      return cancelled.length > 0 || active !== undefined;
     } finally { this.releaseStarts(id, key); }
   }
 
@@ -413,7 +419,7 @@ export class AgentService {
 
   async resetChat(key: AgentQueueKey, commandMessageId?: string): Promise<void> {
     // Scheduled runs have no session to reset; resetting their queue only stops what is queued or running.
-    if (isAgentScheduleQueueKey(key)) return this.stopChat(key);
+    if (isAgentScheduleQueueKey(key)) { await this.stopChat(key); return; }
     const id = identity(key);
     this.holdStarts(id);
     try {
@@ -613,7 +619,7 @@ export class AgentService {
         const sessionGeneration = job.sessionGeneration ?? job.generation;
         const resume = sessionKey ? await this.agents.lookupSession({ ...sessionKey, workspacePath: plan.workspacePath }) : null;
         const request: AgentRunRequest = { jobId: job.jobId, provider: job.provider, source, prompt: effectivePrompt,
-          workspacePath: plan.workspacePath, tools: plan.tools,
+          workspacePath: plan.workspacePath, tools: plan.tools, ...(plan.extensions ? { extensions: plan.extensions } : {}),
           ...(sessionGeneration === job.generation && resume?.generation === job.generation ? { resumeSessionId: resume.externalSessionId } : {}) };
 
         const current = await this.agents.getJob(job.jobId);
@@ -638,7 +644,7 @@ export class AgentService {
                 || job.sourceType !== 'schedule' && await (async () => this.agents.sharesAgentRoomHistory({ sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId }))().catch(() => false);
               // 「身分」 block: who the Agent, the administrator and the current chat are. A failed lookup omits it; it never fails the job.
               const identityBlock = await (async () => formatIdentityBlock(await this.agents.describeJobIdentity({
-                sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId })))().catch(() => null);
+                sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, jobId: job.jobId })))().catch(() => null);
               // Schedule-sourced jobs get their machine instructions here, in the run request only (the stored prompt stays the short card).
               const scheduleContext = job.sourceType === 'schedule' || isScheduledRunRequestId(job.sourceRequestId)
                 ? await (async () => await this.mcpLauncher?.scheduleContext?.(job.sourceRequestId!))().catch(() => null) ?? SCHEDULE_CONTEXT_UNAVAILABLE : null;
@@ -658,6 +664,15 @@ ${scheduleContext}` : request.prompt;
           }
           await this.agents.appendEvent(job.jobId, initial).catch((error: unknown) => this.reportFailure('persist', error, job.jobId));
           await this.onEvent?.(job.jobId, initial);
+        }
+        // The project folders are named in the run request only, after the MCP skill block (a resumed session is told again).
+        const projectFolderSection = projectFolderPromptSection(plan.tools.projectDirs, job.provider === 'codex' && plan.tools.ownFolderReadOnly === true);
+        if (projectFolderSection) runRequest = { ...runRequest, prompt: `${runRequest.prompt}${projectFolderSection}` };
+        // The persona (語氣與風格設定) of a LINE reply: run request only. The Agent room and schedules never get it.
+        if (job.sourceType === 'line' && job.accountId && job.chatType && job.chatId && this.resolvePersonaDescription) {
+          const personaSection = await this.resolvePersonaDescription({ accountId: job.accountId, chatType: job.chatType, chatId: job.chatId })
+            .then(personaPromptSection).catch(() => '');
+          if (personaSection) runRequest = { ...runRequest, prompt: `${runRequest.prompt}${personaSection}` };
         }
         if (attachmentFiles.length > 0) {
           // Added last and to the run request only: the stored job prompt never carries the section or any path.

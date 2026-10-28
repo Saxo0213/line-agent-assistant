@@ -4,13 +4,13 @@ import type {
   AgentEvent, AgentProvider, AgentRunRequest, ConversationKey, DiagnosticIdentity, DownloadAuthProbe, IpcEvent, IpcRequest, IpcResult, LineWorkerCommand,
   LineWorkerEvent, WorkerBinding, ComponentHealth, LineServerErrorCode,
 } from '@line-agent/contracts';
-import { realpath } from 'node:fs/promises';
+import { mkdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
 import {
-  AccountRepository, AdminRepository, AgentPermissionError, AgentPermissionRepository, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
+  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
 import type { Attachment, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
@@ -24,10 +24,15 @@ import { AccountSupervisor, LineService } from './services/line-service.js';
 import { AgentService, type AgentRunner, type InternalMcpLauncher } from './services/agent-service.js';
 import { AgentScheduleService } from './services/agent-schedule-service.js';
 import { FreeModeService } from './services/free-mode-service.js';
+import { PERSONA_DESCRIPTION_SETTING, PERSONA_LIVELINESS_SETTING, readGlobalPersona, resolveEffectivePersona } from './services/agent-persona.js';
+import { defaultProjectPathPolicy } from './services/project-folder-path.js';
+import { ProjectFolderService } from './services/project-folder-service.js';
 import { createAgentScheduleTargetResolver } from './services/agent-schedule-targets.js';
 import { AgentAttachmentError } from './services/agent-attachments.js';
 import { loadLinejsMcpSkill } from './services/mcp-skill.js';
 import { AgentJobEnvironmentService } from './services/agent-job-environment.js';
+import { AgentExtensionsService, AgentExtensionsServiceError, BackendSecretCodec } from './services/agent-extensions-service.js';
+import { defaultImportLocations, type AgentExtensionImportLocations } from './services/agent-extension-import.js';
 import { ChatFolderError, ChatFolderService } from './services/chat-folders.js';
 import { AlbumArchiveFailure, albumFailureContextFrom, albumTaskFailureStage, ChatResourceArchiveService, nativePostNotificationSubtype,
   type ChatResourceBinding, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
@@ -52,7 +57,7 @@ import { AgentApprovalBroker, AgentApprovalBrokerError } from './services/agent-
 import { resolveWritePathEvidence } from './services/write-path-evidence.js';
 import { McpHttpServer } from './services/mcp-http-server.js';
 import { LocalMcpConfigError, McpLocalClients, type LocalClientKind } from './services/mcp-local-clients.js';
-import type { SecretStore } from './services/secret-store.js';
+import { DpapiUserSecretBackend, type SecretBackend, type SecretStore } from './services/secret-store.js';
 import { AttachmentPreviewService, createRepositoryPreviewAuthority, type PreviewPresenter } from './attachment-preview.js';
 import { AttachmentOpenService } from './attachment-open.js';
 import { LineMediaService } from './line-media.js';
@@ -61,6 +66,7 @@ import { createCoalescedSnapshotPublisher } from './domain-event-publisher.js';
 import type { OfficialBuildTrustService } from './services/official-build-trust.js';
 import {probeInitialProviderAuth} from './provider-auth.js';
 import { AUDIT_ERROR_CODES, type AuditErrorCode, type OperationalAudit } from './services/operational-audit.js';
+import { resolveChatProvider } from './services/default-provider.js';
 import { diagnosticFailure, parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AuditEventsReadResult } from './services/operational-audit-runtime.js';
 import { systemActivityResult, systemErrorsResult } from './services/system-records.js';
@@ -154,6 +160,9 @@ export interface IntegratedAgent extends AgentRunner {
     detail?: string }) => void): (() => void) | void;
   openLogin(provider: AgentProvider): Promise<{ ok: boolean; detail?: string }>;
   logout(provider: AgentProvider): Promise<{ ok: boolean; detail?: string }>;
+  /** One tool-less, read-only fast-model turn (group free-mode judge). */
+  judge?(request: { provider: AgentProvider; prompt: string; systemPrompt: string; workspacePath: string; resumeSessionId?: string;
+    timeoutMs?: number }): Promise<{ text: string; sessionId: string }>;
   shutdown(): Promise<void>;
 }
 
@@ -167,11 +176,15 @@ export interface ConnectedFacadeOptions {
   /** Shelved: borrowing official LINE tokens for external downloads. Production never passes true. */
   externalDownloadTokenLookup?: boolean;
   attachmentRoot: string;
+  /** App-managed empty directory used as the working directory of the free-mode judge. */
+  freeModeJudgeDirectory?: string;
   previewCacheRoot?: string;
   mediaCacheRoot?: string;
   /** Handle-anchored Main archive store; absent adapters fail closed. */
   chatResourceStore?: ChatResourceStore;
   chatResourceDiagnosticsDirectory?: string;
+  /** App-owned locations (data, installation) that a /folder project folder may never be, contain or sit inside. */
+  projectFolderProtectedPaths?: readonly string[];
   openAttachmentPath?: (file: string) => Promise<string>;
   /** Opens a chat folder in Explorer (shell.openPath); falls back to openAttachmentPath. Resolves to '' on success. */
   openFolderPath?: (folder: string) => Promise<string>;
@@ -188,6 +201,9 @@ export interface ConnectedFacadeOptions {
   mcpHttpPort?: number;
   /** Injectable local MCP client config paths; production defaults use APPDATA/CODEX_HOME/USERPROFILE. */
   mcpLocalClientPaths?: { claudeDesktop?: string; codex?: string };
+  /** Injectable sources of the Agent extension import and the seal for their secrets; production uses the user's config files and DPAPI. */
+  agentExtensionImport?: Partial<AgentExtensionImportLocations>;
+  agentExtensionSecretBackend?: SecretBackend;
   mcpLocalClientExecPath?: string;
   mcpLocalClientBridgePath?: string;
   mcpLocalClientAppPath?: string;
@@ -469,6 +485,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let stopAgentService: () => Promise<void> = async () => undefined;
   let stopAgentSchedules: () => Promise<void> = async () => undefined;
   let freeMode: FreeModeService | undefined;
+  let projectFolders: ProjectFolderService | undefined;
   let delivery!: DeliveryService;
   let stopDelivery: () => Promise<void> = async () => undefined;
   let stopLineSend: () => Promise<void> = async () => undefined;
@@ -717,9 +734,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const chatResourceAdmission = new ChatResourceAccountAdmission(chatResources,
     (binding) => lineService.isAuthenticatedReady(binding) && options.workers.isCurrentActiveControlBinding(binding));
   startupCleanup.add(() => chatResources.shutdown());
+  const agentExtensions = new AgentExtensionsService(
+    new AgentExtensionsRepository(options.pool, new BackendSecretCodec(options.agentExtensionSecretBackend ?? new DpapiUserSecretBackend())),
+    () => ({ ...defaultImportLocations(), ...options.agentExtensionImport }));
   const agentJobEnvironment = new AgentJobEnvironmentService({
     resolvePolicy: (jobId) => resolveJobPolicy(options.pool, jobId),
+    resolveExtensions: () => agentExtensions.resolveForRun(),
     getExecutionLevel: async () => (await permissionRepository.getExecutionPolicy()).level,
+    resolveProjectFolders: async (key) => await projectFolders?.resolveMounts(key) ?? [],
     folders: chatFolders, workspace });
   const mcpTokens = new McpTokenRepository(options.pool);
   await mcpTokens.normalizeManagedLocalClientScopes();
@@ -916,6 +938,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         stage: event.code === 'BRIDGE_ERROR' ? 'spawn' : event.code === 'INVALID_JSONL' ? 'parse' : 'execute',
         category: event.code === 'AUTH_REQUIRED' ? 'authentication_required' : event.code === 'TIMEOUT' ? 'timeout' : 'unknown',
         recovery: event.code === 'AUTH_REQUIRED' ? 'check_configuration' : 'retry' }, { jobId });
+      if (event.type === 'failed') freeMode?.noteJobFailed(jobId, event.message);
       options.publish?.({ type: 'agentEvent', jobId, event });
       if (event.type === 'started' || event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
         await publishSnapshot().catch(() => undefined);
@@ -931,7 +954,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     (job) => mcpService.resolvePromptContext(job),
     (projection) => publishAgentJobStatus(projection),
     internalMcpLauncher, agentJobEnvironment,
-    (diagnostic, jobId) => options.audit?.failure(diagnostic, { ...(jobId ? { jobId } : {}) }));
+    (diagnostic, jobId) => options.audit?.failure(diagnostic, { ...(jobId ? { jobId } : {}) }),
+    (chat) => resolveEffectivePersona(settings, chat).then((persona) => persona.description));
   agentService.setStatusRotationIntervalSeconds(conversationSettings.agentStatusRotationIntervalSeconds);
   stopAgentService = onceCleanup(() => agentService.shutdown());
   startupCleanup.add(stopAgentService);
@@ -1219,12 +1243,40 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   // Group free mode: durable window per chat, debounced member messages, one room-member Agent job per batch.
   freeMode = new FreeModeService({ store: freeModeStore,
     roomGrant: (key) => roomActivation.getActiveRoomAuthorization(key).then((grant) => grant ? { grantId: grant.grantId, version: grant.version } : null),
+    enableRoom: (key, adminUserId, sourceMessageId) => roomAutomation.enableByPrimaryAdmin(
+      { accountId: key.accountId, chatType: key.chatType as 'group' | 'room', chatId: key.chatId }, adminUserId, sourceMessageId),
     sendSystemText: (input) => agentLineSend.sendSystemText(input),
-    provider: async (key) => (await settings.getConversationAgent(key))?.provider ?? 'codex',
+    provider: async (key) => resolveChatProvider(settings, (await settings.getConversationAgent(key))?.provider),
     workspacePath: async () => { const inspection = await workspace.inspect(); return inspection.status === 'available' ? inspection.path : null; },
     kick: (key) => agentService.kick(key),
+    persona: (key) => resolveEffectivePersona(settings, key),
+    ...(options.agent.judge && options.freeModeJudgeDirectory ? { judge: async (input) => {
+      await mkdir(options.freeModeJudgeDirectory!, { recursive: true });
+      return options.agent.judge!({ provider: input.provider, prompt: input.prompt, systemPrompt: input.systemPrompt,
+        workspacePath: options.freeModeJudgeDirectory!, timeoutMs: input.timeoutMs, ...(input.resumeSessionId ? { resumeSessionId: input.resumeSessionId } : {}) });
+    } } : {}),
+    // Codex needs the local-tools permission; the room-member principal usually lacks it, so free mode then runs on Claude.
+    canUseProvider: async (key, provider) => provider !== 'codex' || deriveToolPolicy({ principal: { kind: 'user', senderMid: FREE_MODE_MEMBER_ID },
+      permissions: await resolveUserPermissions(options.pool, key.accountId, FREE_MODE_MEMBER_ID, { chatType: key.chatType, chatId: key.chatId }) }).localTools,
+    interruptJob: (key, jobId) => agentService.stopJob(key, jobId),
+    audit: (event) => {
+      const identity = { initiator: 'system' as const, accountId: event.key.accountId };
+      if (event.type === 'judge_failed') options.audit?.failure(diagnosticFailure('agent', 'execute', event.error));
+      else if (event.type === 'judge') options.audit?.observed('free_mode_judge', { ...identity,
+        resultCode: event.verdict.reply ? 'free_mode_judge_reply' : 'free_mode_judge_no_reply' });
+      else if (event.type === 'interrupt') options.audit?.observed('free_mode_interrupt', { ...identity, jobId: event.jobId, resultCode: 'free_mode_interrupted' });
+      else options.audit?.observed('free_mode_interrupt', { ...identity, jobId: event.jobId,
+        resultCode: `free_mode_interrupt_refused_${event.reason}` as const });
+    },
     onError: (error) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); } });
   startupCleanup.add(() => freeMode?.stop());
+  // /folder: company project folders bound to a chat by the Primary Administrator (docs/architecture/project-folders.md).
+  projectFolders = new ProjectFolderService({ store: new ProjectFolderRepository(options.pool),
+    sendSystemText: (input) => agentLineSend.sendSystemText(input),
+    policy: defaultProjectPathPolicy({ homeDirectory: process.env.USERPROFILE ?? homedir(),
+      protectedPaths: options.projectFolderProtectedPaths ?? [],
+      workspace: async () => { const inspection = await workspace.inspect(); return inspection.status === 'available' ? inspection.path : inspection.configuredPath; } }),
+    onError: (error) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); } });
   lineService = new LineService(accounts, messages, settings,
     { send: async (command) => { await sendLineCommand(command); } }, agentService, options.secretStore, attachmentService,
     async (envelope, secretCandidate, ownMid, capturedBinding) => {
@@ -1298,7 +1350,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           if (conversation) options.publish?.({ type: 'messageStored', key: change.key, messageId: change.messageId, conversation });
         }
       }, { operation: 'line_ingest', identity: { ...(changes[0] ? { accountId: changes[0].key.accountId } : {}), background: true } }).catch(() => undefined);
-    }, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic), freeMode);
+    }, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic), freeMode, projectFolders);
   lineServiceReady = true;
   delivery = new DeliveryService(agents, {
     binding: (accountId) => options.workers.binding(accountId),
@@ -2440,6 +2492,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         await settings.setAppSetting('manual_unsend_window', request.window);
         return { type: request.type, requestId, ok: true, window: request.window };
       }
+      if (request.type === 'getAgentPersona') return { type: request.type, requestId, ok: true, persona: await readGlobalPersona(settings) };
+      if (request.type === 'setAgentPersona') {
+        const description = request.persona.description.trim();
+        await settings.setAppSetting(PERSONA_DESCRIPTION_SETTING, description);
+        await settings.setAppSetting(PERSONA_LIVELINESS_SETTING, request.persona.liveliness);
+        return { type: request.type, requestId, ok: true, persona: { description, liveliness: request.persona.liveliness } };
+      }
       if (request.type === 'setConversationSettings') {
         let resolve!: (value: IpcResult) => void;
         const result = new Promise<IpcResult>((done) => { resolve = done; });
@@ -2993,6 +3052,23 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const { path } = await chatFolders.resolve(row.accountId, row.chatType, row.chatId, 'operator');
         const open = options.openFolderPath ?? options.openAttachmentPath;
         return { type: request.type, requestId, ok: true, opened: open ? (await open(path)) === '' : false };
+      }
+      if (request.type === 'getAgentExtensions') {
+        return { type: request.type, requestId, ok: true, extensions: await agentExtensions.state() };
+      }
+      if (request.type === 'saveAgentMcpServer' || request.type === 'deleteAgentMcpServer' || request.type === 'setAgentMcpServerEnabled'
+        || request.type === 'setAgentExtensionTools' || request.type === 'listAgentMcpImportCandidates' || request.type === 'importAgentMcpServers') {
+        try {
+          if (request.type === 'saveAgentMcpServer') return { type: request.type, requestId, ok: true, server: await agentExtensions.save(request.server) };
+          if (request.type === 'deleteAgentMcpServer') { await agentExtensions.delete(request.serverId); return { type: request.type, requestId, ok: true }; }
+          if (request.type === 'setAgentMcpServerEnabled') return { type: request.type, requestId, ok: true, server: await agentExtensions.setEnabled(request.serverId, request.enabled) };
+          if (request.type === 'setAgentExtensionTools') return { type: request.type, requestId, ok: true, tools: await agentExtensions.setTools(request.tools) };
+          if (request.type === 'listAgentMcpImportCandidates') return { type: request.type, requestId, ok: true, listing: await agentExtensions.listImportCandidates() };
+          return { type: request.type, requestId, ok: true, result: await agentExtensions.importSelected(request.items) };
+        } catch (error) {
+          if (error instanceof AgentExtensionsServiceError) return failure(requestId, `AGENT_EXTENSION_${error.code}`, error.message);
+          throw error;
+        }
       }
       if (request.type === 'listAgentSchedules') {
         return { type: request.type, requestId, ok: true, schedules: await agentSchedules.list() };

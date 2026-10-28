@@ -16,6 +16,7 @@ export const SYSTEM_DISPLAY_COPY = {
   '新增使用者：加入 LINE 好友': 'Add user: add LINE friend', '新增使用者：重新確認好友': 'Add user: recheck friendship',
   '新增使用者：授權預檢': 'Add user: authorization preflight', '新增使用者：寫入白名單': 'Add user: save allowlist',
   '相簿照片下載': 'Album photo download',
+  '自由模式回覆判斷': 'Free mode reply decision', '自由模式中斷回覆': 'Free mode reply interrupted',
   'LINE 訊息延遲（LINE 至本機）': 'LINE message delay (LINE to app)', 'LINE 訊息延遲（本機佇列／寫入）': 'LINE message delay (app queue / save)',
   '已提出': 'Requested', '已完成': 'Completed', '失敗': 'Failed', '已記錄': 'Recorded',
   '等待下載': 'Waiting to download', '下載中': 'Downloading', '已過期': 'Expired', '重試中': 'Retrying', '下載失敗': 'Download failed',
@@ -69,6 +70,7 @@ const JAPANESE_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> =
   'LINE 操作失敗': 'LINE 操作失敗', 'LINE 聯絡人／群組清單更新': 'LINE 連絡先／グループ一覧を更新', '新增使用者（好友授權）': 'ユーザー追加（友だち認証）', '新增使用者：確認 LINE 好友關係': 'ユーザー追加：LINE の友だち関係を確認',
   '新增使用者：加入 LINE 好友': 'ユーザー追加：LINE の友だちに追加', '新增使用者：重新確認好友': 'ユーザー追加：友だち関係を再確認', '新增使用者：授權預檢': 'ユーザー追加：認証を事前確認', '新增使用者：寫入白名單': 'ユーザー追加：許可リストに保存',
   '相簿照片下載': 'アルバム写真をダウンロード',
+  '自由模式回覆判斷': 'フリーモード返信の判定', '自由模式中斷回覆': 'フリーモード返信の中断',
   'LINE 訊息延遲（LINE 至本機）': 'LINE メッセージ遅延（LINE からアプリ）', 'LINE 訊息延遲（本機佇列／寫入）': 'LINE メッセージ遅延（アプリのキュー／保存）',
   '已提出': 'リクエスト済み', '已完成': '完了', '失敗': '失敗', '已記錄': '記録済み', '等待下載': 'ダウンロード待ち', '下載中': 'ダウンロード中', '已過期': '期限切れ', '重試中': '再試行中', '下載失敗': 'ダウンロード失敗',
 };
@@ -83,6 +85,7 @@ const KOREAN_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
   'LINE 操作失敗': 'LINE 작업 실패', 'LINE 聯絡人／群組清單更新': 'LINE 연락처／그룹 목록 업데이트', '新增使用者（好友授權）': '사용자 추가(친구 인증)', '新增使用者：確認 LINE 好友關係': '사용자 추가: LINE 친구 관계 확인',
   '新增使用者：加入 LINE 好友': '사용자 추가: LINE 친구 추가', '新增使用者：重新確認好友': '사용자 추가: 친구 관계 재확인', '新增使用者：授權預檢': '사용자 추가: 인증 사전 확인', '新增使用者：寫入白名單': '사용자 추가: 허용 목록 저장',
   '相簿照片下載': '앨범 사진 다운로드',
+  '自由模式回覆判斷': '자유 모드 답장 판단', '自由模式中斷回覆': '자유 모드 답장 중단',
   'LINE 訊息延遲（LINE 至本機）': 'LINE 메시지 지연(LINE에서 앱)', 'LINE 訊息延遲（本機佇列／寫入）': 'LINE 메시지 지연(앱 대기열/저장)',
   '已提出': '요청됨', '已完成': '완료', '失敗': '실패', '已記錄': '기록됨', '等待下載': '다운로드 대기', '下載中': '다운로드 중', '已過期': '만료됨', '重試中': '재시도 중', '下載失敗': '다운로드 실패',
 };

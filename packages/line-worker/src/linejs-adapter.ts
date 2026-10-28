@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { BaseClient, InternalError } from '@evex/linejs/base';
 import { MemoryStorage } from '@evex/linejs/storage';
 import { Protocols } from '@evex/linejs/thrift';
-import { normalizeNativePicturePath, relationAddServerError, TALK_SERVER_ERRORS, type AccountMode, type ChatResourceReadCommand, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue, type NativeAttachmentDownloadInput, type RelationAddServerErrorCode, type TalkCursorV1Dto } from '@line-agent/contracts';
+import { buildMentionContentMetadata, normalizeNativePicturePath, type OutgoingMention, relationAddServerError, TALK_SERVER_ERRORS, type AccountMode, type ChatResourceReadCommand, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue, type NativeAttachmentDownloadInput, type RelationAddServerErrorCode, type TalkCursorV1Dto } from '@line-agent/contracts';
 import {
   createMutationGate, EffectDeniedError, isReadOnlyRpc,
   type ControlLease, type ControlLeasePhase, type DirectFetchEffect, type MediaUploadScope, type RpcCallContext, type RpcTransportState, type ServerLogoutPermit,
@@ -570,11 +570,13 @@ export async function decryptLinejsHistoryMessages(
   return result;
 }
 
-export function linejsEncryptedTextMessageOptions(to: string, chunks: Buffer[], replyToMessageId: string | null): {
+export function linejsEncryptedTextMessageOptions(to: string, chunks: Buffer[], replyToMessageId: string | null,
+  mentions: readonly OutgoingMention[] = []): {
   to: string; contentType: 'NONE'; contentMetadata: Record<string, string>;
   relatedMessageId?: string; e2ee: true; chunks: Buffer[];
 } {
-  return { to, contentType: 'NONE', contentMetadata: { e2eeVersion: '2', contentType: '0', e2eeMark: '2' },
+  return { to, contentType: 'NONE', contentMetadata: { e2eeVersion: '2', contentType: '0', e2eeMark: '2',
+      ...(mentions.length > 0 ? { MENTION: buildMentionContentMetadata(mentions) } : {}) },
     ...(replyToMessageId === null ? {} : { relatedMessageId: replyToMessageId }), e2ee: true, chunks };
 }
 
@@ -1409,14 +1411,14 @@ export class LinejsAdapter implements LineTransport {
     }
   }
   async send(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string }, text: string,
-    replyToMessageId: string | null, lease: ControlLease, manual = false): Promise<{ messageId: string }> {
+    replyToMessageId: string | null, lease: ControlLease, manual = false, mentions: readonly OutgoingMention[] = []): Promise<{ messageId: string }> {
     if ((this.#options.mode !== 'ACTIVE_CONTROL' && !(manual && this.#options.mode === 'MONITOR_ONLY')) || this.#revoked) throw new EffectDeniedError('worker mode is read-only');
     const prefix = { direct: 'u', group: 'c', room: 'r' }[conversation.chatType];
     if (!conversation.chatId.startsWith(prefix)) throw new EffectDeniedError('conversation type/MID mismatch');
     const chunks = await this.#gate.invokeRpc(manual ? { phase: 'MONITOR_READ' } : { phase: 'CONTROL_READ', lease },
       () => this.#base.e2ee.encryptE2EEMessage(conversation.chatId, text, 'NONE')) as Buffer[];
     const result = await this.#gate.invokeRpc(manual ? { phase: 'MANUAL_SEND', lease } : { phase: 'CONTROL_SEND', lease },
-      () => this.#base.talk.sendMessage(linejsEncryptedTextMessageOptions(conversation.chatId, chunks, replyToMessageId))) as
+      () => this.#base.talk.sendMessage(linejsEncryptedTextMessageOptions(conversation.chatId, chunks, replyToMessageId, mentions))) as
       Awaited<ReturnType<BaseClient['talk']['sendMessage']>>;
     return { messageId: String(result.id) };
   }

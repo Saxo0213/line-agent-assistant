@@ -14,6 +14,8 @@ export interface ProcessSpec {
   interactive?: boolean;
   /** Per-run internal MCP capability; injected into the child environment only, never into args. */
   mcpToken?: string;
+  /** Extension-server secrets (generated variable names, or the stdio key names Codex forwards); merged into the child environment only. */
+  extraEnv?: Record<string,string>;
 }
 export interface ExitResult { code: number | null; signal: NodeJS.Signals | null }
 export interface RunningProcess {
@@ -37,6 +39,10 @@ export class NodeProcessRunner implements ProcessRunner {
     // app-issued, well-formed per-run value reaches the provider child.
     const env=buildChildEnvironment(spec.env).env;
     const childEnv:NodeJS.ProcessEnv=spec.mcpToken&&/^li_job_[A-Za-z0-9_-]{43}$/.test(spec.mcpToken)?{...env,[INTERNAL_MCP_TOKEN_ENV]:spec.mcpToken,[CLAUDE_MCP_TOOL_TIMEOUT_ENV]:String(LINEJS_MCP_TOOL_TIMEOUT_SEC*1000)}:env;
+    // Extension secrets: only well-formed names, never the capability variable, and never over a variable the runner already set.
+    for(const [name,value] of Object.entries(spec.extraEnv ?? {})) {
+      if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)&&name!==INTERNAL_MCP_TOKEN_ENV&&childEnv[name]===undefined) childEnv[name]=value;
+    }
     const child = spawn(this.hostFile,[jobId,String(process.pid),spec.interactive?'interactive':'pipe',spec.file,spec.cwd ?? process.cwd(),...spec.args], {
       cwd: spec.cwd, env:childEnv, shell: false,
       windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],

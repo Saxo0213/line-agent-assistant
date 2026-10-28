@@ -75,7 +75,45 @@ export function normalizeMentionRanges(text: string | null, value: unknown): Men
   return normalized;
 }
 
-export const SticonRangeSchema = z.strictObject({ start: z.number().int().nonnegative(), end: z.number().int().positive(),
+/** Most mentions one outgoing text may carry. */
+export const OUTGOING_MENTIONS_MAX = 20;
+/** One outgoing mention: UTF-16 code-unit offsets [start, end) of the `@name` text, and the mentioned member's user MID. */
+export const OutgoingMentionSchema = z.strictObject({
+  start: z.number().int().nonnegative(),
+  end: z.number().int().positive(),
+  userId: z.string().regex(/^u[0-9a-fA-F]{32}$/),
+});
+export type OutgoingMention = z.infer<typeof OutgoingMentionSchema>;
+
+/**
+ * Returns the reason an outgoing mention list is invalid for `text`, or null. Ranges must lie inside the text, must not split a
+ * surrogate pair, must not overlap and are limited to OUTGOING_MENTIONS_MAX. Offsets are UTF-16 code units, the same unit
+ * normalizeMentionRanges and the inbound MENTION parser use.
+ */
+export function outgoingMentionsIssue(text: string, mentions: readonly OutgoingMention[]): string | null {
+  if (mentions.length > OUTGOING_MENTIONS_MAX) return 'Too many mentions';
+  const sorted = [...mentions].sort((left, right) => left.start - right.start || left.end - right.end);
+  const splits = (offset: number) => offset > 0 && offset < text.length
+    && text.charCodeAt(offset - 1) >= 0xd800 && text.charCodeAt(offset - 1) <= 0xdbff
+    && text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff;
+  let previousEnd = 0;
+  for (const mention of sorted) {
+    if (mention.end <= mention.start) return 'Mention end must follow start';
+    if (mention.end > text.length) return 'Mention range exceeds text';
+    if (splits(mention.start) || splits(mention.end)) return 'Mention range splits a surrogate pair';
+    if (mention.start < previousEnd) return 'Mention ranges overlap';
+    previousEnd = mention.end;
+  }
+  return null;
+}
+
+/** Builds the LINE `contentMetadata.MENTION` value (a JSON string) for an outgoing text; the inverse of the inbound MENTION parser. */
+export function buildMentionContentMetadata(mentions: readonly OutgoingMention[]): string {
+  const sorted = [...mentions].sort((left, right) => left.start - right.start);
+  return JSON.stringify({ MENTIONEES: sorted.map((mention) => ({ S: String(mention.start), E: String(mention.end), M: mention.userId })) });
+}
+
+export const SticonRangeSchema =z.strictObject({ start: z.number().int().nonnegative(), end: z.number().int().positive(),
   productId: z.string().regex(/^[0-9a-f]{24}$/), sticonId: z.string().regex(/^[0-9]{1,6}$/), animated: z.boolean() });
 export type SticonRange = z.infer<typeof SticonRangeSchema>;
 export const STICON_REPLACE_MAX_BYTES = 16_384;

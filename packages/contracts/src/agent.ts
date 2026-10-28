@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { WritableConversationKeySchema } from './account.js';
 import { AgentToolPolicySchema } from './agent-permissions.js';
+import { AgentRunExtensionsSchema } from './agent-extensions.js';
 
 const IdSchema = z.string().min(1);
 const TimestampSchema = z.iso.datetime({ offset: true });
@@ -74,6 +75,8 @@ export const AgentRunRequestSchema = z.strictObject({
   tools: AgentToolPolicySchema,
   resumeSessionId: IdSchema.optional(),
   mcp: AgentMcpLaunchSchema.optional(),
+  /** Main-resolved extra MCP servers and built-in tool additions; present only for jobs whose durable principal is eligible. */
+  extensions: AgentRunExtensionsSchema.optional(),
 });
 export type AgentRunRequest = z.infer<typeof AgentRunRequestSchema>;
 

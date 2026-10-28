@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.280 新增 App 內更新：右下角提示「更新」或「忽略」，選擇更新後會自動下載、驗證並安裝新版。請參閱 [v1.0.280 版本說明](docs/releases/v1.0.280.md)；先前更新請見 [v1.0.279](docs/releases/v1.0.279.md) 與 [v1.0.270](docs/releases/v1.0.270.md)。
+v1.0.288 新增兩階段群組自由模式、Agent 個性與回覆積極度、`/folder` 專案資料夾、所有 Agent 工作可用網路搜尋，以及群組回覆的 LINE 標註。請參閱 [v1.0.288 版本說明](docs/releases/v1.0.288.md)；先前更新請見 [v1.0.280](docs/releases/v1.0.280.md)、[v1.0.279](docs/releases/v1.0.279.md) 與 [v1.0.270](docs/releases/v1.0.270.md)。
 
 ## 安裝
 

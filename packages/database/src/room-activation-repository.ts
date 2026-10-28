@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import type { ConversationKey } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
+import { conversationTitleSql, PEER_CONTACT_JOIN } from './name-resolution.js';
 
 export interface RoomActivationScope extends ConversationKey {
   chatType: 'group' | 'room';
@@ -21,6 +22,10 @@ export interface WaitingChallengeClaim {
 export type ConfirmationResult =
   | { disposition: 'enabled' }
   | { disposition: 'wrong_token' | 'duplicate_attempt' | 'out_of_scope' | 'already_consumed' | 'expired' | 'cancelled' | 'exhausted' };
+
+export type PrimaryAdminEnableResult = {
+  disposition: 'enabled' | 'already_enabled' | 'duplicate' | 'not_primary_admin' | 'room_missing';
+};
 
 export interface RoomAgentPolicy {
   accountId: string;
@@ -427,6 +432,96 @@ export class RoomActivationRepository {
     } finally { client.release(); }
   }
 
+  /**
+   * Enables a room on the word of the account's PRIMARY_ADMIN: a message whose sender is that administrator is already
+   * the consent a token round-trip would collect. One transaction creates the ENABLED policy and the ACTIVE grant
+   * (bound to a CONSUMED request row that also makes the source message idempotent) and cancels any pending request.
+   */
+  async enableByPrimaryAdmin(scope: RoomActivationScope, input: { sourceMessageId: string; adminUserId: string }): Promise<PrimaryAdminEnableResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await lock(client, `room-activation:account-capacity:${scope.accountId}`);
+      const room = await client.query(
+        'SELECT 1 FROM conversations WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 FOR SHARE',
+        [scope.accountId, scope.chatType, scope.chatId],
+      );
+      if (!room.rowCount) { await client.query('COMMIT'); return { disposition: 'room_missing' }; }
+      const admin = await client.query<{ chat_id: string; version: string }>(
+        `SELECT a.chat_id, v.version FROM account_administrators a
+         JOIN account_administrator_versions v USING (account_id)
+         WHERE a.account_id = $1 AND a.role = 'PRIMARY_ADMIN' AND a.user_id = $2 FOR SHARE OF a, v`,
+        [scope.accountId, input.adminUserId],
+      );
+      if (!admin.rows[0]) { await client.query('COMMIT'); return { disposition: 'not_primary_admin' }; }
+      const prior = await client.query(
+        `SELECT 1 FROM room_activation_requests WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 AND source_message_id = $4`,
+        [scope.accountId, scope.chatType, scope.chatId, input.sourceMessageId],
+      );
+      if (prior.rowCount) { await client.query('COMMIT'); return { disposition: 'duplicate' }; }
+      const pending = await client.query<ActivationRequestRow>(
+        `SELECT request_id, account_id, chat_type, chat_id, admin_chat_id, admin_user_id, admin_version,
+          room_authority_version, state, wait_expires_at, confirm_expires_at, request_version
+         FROM room_activation_requests WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3
+          AND state IN ('WAITING_TO_SEND', 'PENDING_CONFIRMATION', 'DELIVERY_UNKNOWN') ORDER BY request_id FOR UPDATE`,
+        [scope.accountId, scope.chatType, scope.chatId],
+      );
+      await client.query(
+        `INSERT INTO room_agent_policies(account_id, chat_type, chat_id) VALUES ($1, $2, $3)
+         ON CONFLICT (account_id, chat_type, chat_id) DO NOTHING`, [scope.accountId, scope.chatType, scope.chatId],
+      );
+      const policy = await client.query<{ state: string; authority_version: string }>(
+        'SELECT state, authority_version FROM room_agent_policies WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 FOR UPDATE',
+        [scope.accountId, scope.chatType, scope.chatId],
+      );
+      if (policy.rows[0]?.state === 'ENABLED') { await client.query('COMMIT'); return { disposition: 'already_enabled' }; }
+      for (const request of pending.rows) {
+        await client.query(
+          `UPDATE room_activation_requests SET state = 'CANCELLED', request_version = request_version + 1, updated_at = clock_timestamp()
+           WHERE request_id = $1`, [request.request_id],
+        );
+        await client.query('UPDATE room_activation_challenges SET invalidated_at = clock_timestamp() WHERE request_id = $1 AND consumed_at IS NULL', [request.request_id]);
+        await client.query(
+          `INSERT INTO room_activation_audit(account_id, chat_type, chat_id, request_id, event, actor_id, authority_version)
+           VALUES ($1,$2,$3,$4,'CANCELLED',$5,$6)`,
+          [scope.accountId, scope.chatType, scope.chatId, request.request_id, input.adminUserId, policy.rows[0]!.authority_version],
+        );
+      }
+      const requestId = randomUUID();
+      await client.query(
+        `INSERT INTO room_activation_requests(request_id, account_id, chat_type, chat_id, source_message_id, requester_id,
+          admin_chat_id, admin_user_id, admin_version, room_authority_version, state, wait_expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'CONSUMED',clock_timestamp())`,
+        [requestId, scope.accountId, scope.chatType, scope.chatId, input.sourceMessageId, input.adminUserId,
+          admin.rows[0].chat_id, input.adminUserId, admin.rows[0].version, policy.rows[0]!.authority_version],
+      );
+      const updated = await client.query<{ authority_version: string }>(
+        `UPDATE room_agent_policies SET state = 'ENABLED', authority_version = authority_version + 1,
+          confirmed_request_id = $4, authorizing_admin_user_id = $5, authorizing_admin_version = $6, updated_at = clock_timestamp()
+         WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 AND authority_version = $7
+         RETURNING authority_version`,
+        [scope.accountId, scope.chatType, scope.chatId, requestId, input.adminUserId, admin.rows[0].version, policy.rows[0]!.authority_version],
+      );
+      if (!updated.rowCount) throw new Error('Room authority changed while enabling the room');
+      const grantVersion = Number(updated.rows[0]!.authority_version);
+      await client.query(
+        `INSERT INTO room_agent_grants(grant_id, account_id, chat_type, chat_id, capability, version, state, request_id)
+         VALUES ($1,$2,$3,$4,'AGENT_USE_ROOM',$5,'ACTIVE',$6)`,
+        [randomUUID(), scope.accountId, scope.chatType, scope.chatId, grantVersion, requestId],
+      );
+      await client.query(
+        `INSERT INTO room_activation_audit(account_id, chat_type, chat_id, request_id, event, actor_id, authority_version)
+         VALUES ($1,$2,$3,$4,'ADMIN_DIRECT_ENABLED',$5,$6)`,
+        [scope.accountId, scope.chatType, scope.chatId, requestId, input.adminUserId, grantVersion],
+      );
+      await client.query('COMMIT');
+      return { disposition: 'enabled' };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
+  }
+
   async revokeRoom(scope: RoomActivationScope, actorId: string): Promise<boolean> {
     const client = await this.pool.connect();
     try {
@@ -520,6 +615,16 @@ export class RoomActivationRepository {
     const row = result.rows[0];
     return row ? { accountId: row.account_id, chatType: row.chat_type, chatId: row.chat_id, state: row.state, authorityVersion: Number(row.authority_version) }
       : { ...scope, state: 'DISABLED', authorityVersion: 1 };
+  }
+
+  /** The room's display name by the app-wide conversation title rule (name-resolution.ts), or null when it has none. */
+  async getRoomTitle(scope: RoomActivationScope): Promise<string | null> {
+    const result = await this.pool.query<{ title: string | null }>(
+      `SELECT ${conversationTitleSql()} AS title FROM conversations c ${PEER_CONTACT_JOIN}
+       WHERE c.account_id = $1 AND c.chat_type = $2 AND c.chat_id = $3`, [scope.accountId, scope.chatType, scope.chatId],
+    );
+    const title = result.rows[0]?.title?.trim();
+    return title ? title : null;
   }
 
   async hasActiveRoomGrant(scope: RoomActivationScope): Promise<boolean> {

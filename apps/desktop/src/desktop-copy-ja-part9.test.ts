@@ -16,11 +16,15 @@ const expectedKeys = [
   'permissionFolderWriteDescription',
   'permissionLocalTools',
   'permissionLocalToolsDescription',
+  'permissionProjectFolderRead', 'permissionProjectFolderReadDescription', 'permissionProjectFolderWrite', 'permissionProjectFolderWriteDescription',
   'unsendMessage', 'unsendConfirm', 'unsendTimeWindow', 'unsendOneHour', 'unsendSevenDays', 'unsendWindowSaved', 'unsendFailed',
   'historyReadFailed', 'chatResourceReadFailed', 'profileRefreshFailed', 'messageSendFailed', 'messageUnsendFailed',
   'messageReactionFailed', 'friendRelationCheckFailed', 'friendAddFailed', 'primaryAdminNotFriend', 'attachmentDownloadOperationFailed',
   'credentialRestoreFailed', 'lineSyncFailed',
   'mediaWasNotSentTryAgain', 'mediaSendingRequiresDirectOrGroupChat',
+  'cmdHelpGroupGeneral', 'cmdHelpGroupAdmin', 'cmdHelpGroupAuth', 'cmdHelpGroupSetup', 'cmdHelpGroupAutoReply', 'cmdHelpAskLabel', 'cmdHelpAskPurpose', 'cmdHelpAskDescription', 'cmdHelpExactNote', 'cmdHelpEnableGroupPurpose', 'cmdHelpEnableGroupDescription', 'cmdHelpConfirmCodePurpose', 'cmdHelpConfirmCodeDescription', 'cmdHelpFreePurpose', 'cmdHelpFreeDescription', 'cmdHelpAdduserDirect', 'cmdHelpAdduserGroup', 'cmdHelpAdduserCode', 'cmdHelpPermissionsPurpose', 'cmdHelpPermissionsDescription', 'cmdHelpPairingLabel', 'cmdHelpPairingPurpose', 'cmdHelpPairingDescription', 'cmdHelpAutoReplyLabel', 'cmdHelpAutoReplyPurpose', 'cmdHelpAutoReplyDescription',
+  'cmdHelpGroupProject', 'cmdHelpFolderBindPurpose', 'cmdHelpFolderBindDescription', 'cmdHelpFolderRwPurpose', 'cmdHelpFolderRwDescription', 'cmdHelpFolderListPurpose', 'cmdHelpFolderListDescription', 'cmdHelpFolderOffPurpose', 'cmdHelpFolderOffDescription', 'cmdHelpAgentSwitchPurpose', 'cmdHelpAgentSwitchDescription', 'cmdHelpAgentDefaultPurpose', 'cmdHelpAgentDefaultDescription',
+  'personaTitle', 'personaIntro', 'personaDescriptionLabel', 'personaDescriptionPlaceholder', 'personaCount', 'personaLivelinessLabel', 'personaLivelinessQuiet', 'personaLivelinessNormal', 'personaLivelinessLively', 'personaLivelinessHelp', 'personaSave', 'personaSaved', 'personaSaveFailed', 'personaLoadFailed', 'cmdHelpPersonaSetPurpose', 'cmdHelpPersonaSetDescription', 'cmdHelpPersonaLivelinessPurpose', 'cmdHelpPersonaLivelinessDescription', 'cmdHelpPersonaShowPurpose', 'cmdHelpPersonaShowDescription', 'cmdHelpPersonaDefaultPurpose', 'cmdHelpPersonaDefaultDescription',
 ] as const;
 const slots = (text: string): string[] => [...text.matchAll(/\{arg\d+\}/g)].map(([slot]) => slot).sort();
 

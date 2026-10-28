@@ -1,4 +1,4 @@
-import type { ChatResourceReadCommand, ChatResourcePhotoPageShape, ConversationCatalogItem } from '@line-agent/contracts';
+import type { ChatResourceReadCommand, ChatResourcePhotoPageShape, ConversationCatalogItem, OutgoingMention } from '@line-agent/contracts';
 import type { HistoryCursorV1 } from './cursor.js';
 import type { FriendAddResult, FriendRelation, LineTransport, SyncResult, TransportIdentity } from './worker-loop.js';
 
@@ -109,8 +109,8 @@ export class FakeLineTransport implements LineTransport {
     return { name: result.name, source: (async function* () { yield result.bytes; })() };
   }
   async send(conversation: { chatType: string; chatId: string }, text: string, replyToMessageId: string | null, lease: unknown,
-    manual = false): Promise<{ messageId: string }> {
-    this.sendCalls.push({ ...conversation, text, replyToMessageId, lease, manual });
+    manual = false, mentions: readonly OutgoingMention[] = []): Promise<{ messageId: string }> {
+    this.sendCalls.push({ ...conversation, text, replyToMessageId, lease, manual, ...(mentions.length > 0 ? { mentions } : {}) });
     this.#signalSendStarted?.();
     if (this.#sendWait) await this.#sendWait;
     if (this.sendError) throw this.sendError;

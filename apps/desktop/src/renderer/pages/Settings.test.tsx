@@ -982,16 +982,21 @@ describe('database settings', () => {
     fireEvent.click(screen.getByRole('tab', { name: '指令' }));
 
     const table = screen.getByRole('table', { name: '對話指令清單' });
-    for (const command of ['/stop', '/new', '/status', '/agent codex <提示內容>', '/agent claude <提示內容>', '/adduser', '/新增使用者']) {
+    for (const command of ['/stop', '/new', '/status', '/agent codex <提示內容>', '/agent claude <提示內容>', '/adduser', '/新增使用者', '/free off', '/agent claude', '/agent default', '/folder rw <路徑>', '/folder off [路徑]', '/persona default', '/權限', '/permissions', '@Agent 監控', '@Agent monitor', '@Agent RA-…']) {
       expect(table.textContent).toContain(command);
     }
+    for (const group of ['一般使用', '群組管理（主要管理者）', '專案資料夾（主要管理者）', '使用者授權（主要管理者）', '初始設定', '自動回覆']) expect(table.textContent).toContain(group);
+    expect(table.querySelectorAll('tbody')).toHaveLength(6);
+    expect(table.textContent).toContain('6 位數配對碼');
+    expect(table.textContent).toContain('LW-XXXXXXXX');
     expect(table.textContent).not.toContain('一般文字提示');
     expect(table.textContent).toContain('使用者授權');
     expect(table.textContent).not.toContain('LINE 使用者授權');
-    expect(table.textContent).toContain('在 1:1／群組中，可新增 Agent 使用權限名單。');
-    expect(table.textContent).toContain('停止目前的 Agent 工作');
+    expect(table.textContent).toContain('主要管理者專用。在 1:1 或群組中，將使用者加入 Agent 白名單。');
+    expect(table.textContent).toContain('取消此聊天室執行中與排隊中的 Agent 工作');
     expect(table.textContent).toContain('開始新的 Agent 對話');
-    expect(table.textContent).toContain('查詢目前 Agent 工作狀態');
+    expect(table.textContent).toContain('Agent 會回覆確認');
+    expect(table.textContent).toContain('查看 Agent 執行狀態');
   });
 
   it('separates database and Agent settings into tabs and includes provider login controls', async () => {
@@ -1517,5 +1522,48 @@ describe('database settings', () => {
     view.rerender(<Settings api={api} headingRef={React.createRef()} accounts={[{ ...a }]} />);
     fireEvent.click(within(findCard('Claude Desktop')).getAllByRole('button')[0]!);
     await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['role:AGENT']));
+  });
+});
+
+describe('Settings Agent persona', () => {
+  it('loads the global persona, saves description and liveliness, and keeps the 500 character limit', async () => {
+    const api = {
+      getDatabaseSetupStatus: vi.fn(async () => ({ configured: false, attachmentRoot: null, agentWorkspace: null, connection: null })),
+      getAgentPersona: vi.fn(async () => ({ description: '親切簡潔', liveliness: 'quiet' as const })),
+      setAgentPersona: vi.fn(async (persona: { description: string; liveliness: 'quiet' | 'normal' | 'lively' }) => persona),
+      onEvent: vi.fn(() => () => undefined),
+    } as unknown as DesktopApi;
+    render(<Settings api={api} headingRef={React.createRef()} />);
+    fireEvent.click(screen.getByRole('tab', { name: '助理' }));
+    const description = await screen.findByRole('textbox', { name: '個性描述' }) as HTMLTextAreaElement;
+    await waitFor(() => expect(description.value).toBe('親切簡潔'));
+    expect(description.maxLength).toBe(500);
+    expect(screen.getByText('4 / 500')).toBeTruthy();
+    expect((screen.getByRole('radio', { name: '安靜' }) as HTMLInputElement).checked).toBe(true);
+    fireEvent.change(description, { target: { value: '  愛開玩笑  ' } });
+    fireEvent.click(screen.getByRole('radio', { name: '活潑' }));
+    fireEvent.click(screen.getByRole('button', { name: '儲存個性' }));
+    await waitFor(() => expect(api.setAgentPersona).toHaveBeenCalledWith({ description: '愛開玩笑', liveliness: 'lively' }));
+    expect(await screen.findByText('已儲存 Agent 個性。')).toBeTruthy();
+  });
+
+  it('shows the save error and lists the /persona rows in the group management commands', async () => {
+    const api = {
+      getDatabaseSetupStatus: vi.fn(async () => ({ configured: false, attachmentRoot: null, agentWorkspace: null, connection: null })),
+      getAgentPersona: vi.fn(async () => ({ description: '', liveliness: 'normal' as const })),
+      setAgentPersona: vi.fn(async () => { throw new Error('boom'); }),
+      onEvent: vi.fn(() => () => undefined),
+    } as unknown as DesktopApi;
+    render(<Settings api={api} headingRef={React.createRef()} />);
+    fireEvent.click(screen.getByRole('tab', { name: '助理' }));
+    await waitFor(() => expect((screen.getByRole('button', { name: '儲存個性' }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: '儲存個性' }));
+    await waitFor(() => expect(api.setAgentPersona).toHaveBeenCalled());
+    expect(await screen.findByRole('status')).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: '指令' }));
+    const table = screen.getByRole('table', { name: '對話指令清單' });
+    const adminGroup = table.querySelectorAll('tbody')[1]!;
+    for (const command of ['/persona <描述>', '/persona 安靜', '/persona 活潑', '/persona default']) expect(adminGroup.textContent).toContain(command);
+    expect(adminGroup.textContent).toContain('/persona');
   });
 });

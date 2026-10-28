@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.280 adds in-app updates: a bottom-right prompt offers Update or Ignore, and Update downloads, verifies, and installs the new version. See the [v1.0.280 release notes](docs/releases/v1.0.280.md). Earlier changes are listed in [v1.0.279](docs/releases/v1.0.279.md) and [v1.0.270](docs/releases/v1.0.270.md).
+v1.0.288 adds a two-stage group free mode, Agent persona and reply liveliness, `/folder` project folders, web search for every Agent job, and real LINE mentions in group replies. See the [v1.0.288 release notes](docs/releases/v1.0.288.md). Earlier changes are listed in [v1.0.280](docs/releases/v1.0.280.md), [v1.0.279](docs/releases/v1.0.279.md), and [v1.0.270](docs/releases/v1.0.270.md).
 
 ## Installation
 

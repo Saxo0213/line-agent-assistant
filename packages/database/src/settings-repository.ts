@@ -1,7 +1,7 @@
-import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, AgentStatusIconsSchema, DEFAULT_AGENT_STATUS_ICONS, type AgentProvider, type AgentStatusIcons, type ConversationKey } from '@line-agent/contracts';
+import { AGENT_PERSONA_MAX_LENGTH, AgentLivelinessSchema, type AgentLiveliness, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX,AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, AgentStatusIconsSchema, DEFAULT_AGENT_STATUS_ICONS, type AgentProvider, type AgentStatusIcons, type ConversationKey } from '@line-agent/contracts';
 import type { Pool } from 'pg';
 
-const appSettingKeys = new Set(['default_provider', 'workspace_path', 'attachment_root', 'attachment_auto_attempt_limit', 'show_agent_status_markers', 'agent_status_icons', 'agent_status_rotation_interval_seconds', 'manual_unsend_window']);
+const appSettingKeys = new Set(['default_provider', 'workspace_path', 'attachment_root', 'attachment_auto_attempt_limit', 'show_agent_status_markers', 'agent_status_icons', 'agent_status_rotation_interval_seconds', 'manual_unsend_window', 'agent_persona_description', 'agent_persona_liveliness']);
 
 export type ConversationSettings = { attachmentAutoAttemptLimit: number; showAgentStatusMarkers: boolean; agentStatusIcons: AgentStatusIcons; agentStatusRotationIntervalSeconds: number };
 
@@ -71,8 +71,9 @@ export class SettingsRepository {
     } finally { client.release(); }
   }
 
-  async getConversationAgent(key: ConversationKey): Promise<{ enabled: boolean; provider: AgentProvider } | null> {
-    const result = await this.pool.query<{ agent_enabled: boolean; default_provider: AgentProvider }>(
+  /** `provider` is the chat's override set by the Primary Administrator's /agent command; null follows the global default. */
+  async getConversationAgent(key: ConversationKey): Promise<{ enabled: boolean; provider: AgentProvider | null } | null> {
+    const result = await this.pool.query<{ agent_enabled: boolean; default_provider: AgentProvider | null }>(
       'SELECT agent_enabled, default_provider FROM conversations WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3',
       [key.accountId, key.chatType, key.chatId],
     );
@@ -80,12 +81,47 @@ export class SettingsRepository {
     return row ? { enabled: row.agent_enabled, provider: row.default_provider } : null;
   }
 
-  async setConversationAgent(settings: ConversationKey & { enabled: boolean; provider: AgentProvider }): Promise<void> {
+  async setConversationAgent(settings: ConversationKey & { enabled: boolean; provider: AgentProvider | null }): Promise<void> {
     const result = await this.pool.query(
       'UPDATE conversations SET agent_enabled = $4, default_provider = $5, updated_at = now() WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3',
       [settings.accountId, settings.chatType, settings.chatId, settings.enabled, settings.provider],
     );
     if (result.rowCount !== 1) throw new Error(`Conversation not found: ${settings.accountId}/${settings.chatId}`);
+  }
+
+  /** Sets (or with null clears) the chat's Agent override. Resolves false when the conversation row does not exist. */
+  async setConversationProvider(key: ConversationKey, provider: AgentProvider | null): Promise<boolean> {
+    const result = await this.pool.query(
+      'UPDATE conversations SET default_provider = $4, updated_at = now() WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3',
+      [key.accountId, key.chatType, key.chatId, provider]);
+    return result.rowCount === 1;
+  }
+
+  /** The chat's persona overrides set by the Primary Administrator's /persona; a null field follows the global value. Null when the conversation is unknown. */
+  async getConversationPersona(key: ConversationKey): Promise<{ description: string | null; liveliness: AgentLiveliness | null } | null> {
+    const result = await this.pool.query<{ persona_description: string | null; persona_liveliness: AgentLiveliness | null }>(
+      'SELECT persona_description, persona_liveliness FROM conversations WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3',
+      [key.accountId, key.chatType, key.chatId]);
+    const row = result.rows[0];
+    return row ? { description: row.persona_description, liveliness: row.persona_liveliness } : null;
+  }
+
+  /** Sets (or with null clears) the given override fields only. Resolves false when the conversation row does not exist. */
+  async setConversationPersona(key: ConversationKey, override: { description?: string | null; liveliness?: AgentLiveliness | null }): Promise<boolean> {
+    const sets: string[] = [];
+    const values: unknown[] = [key.accountId, key.chatType, key.chatId];
+    if (override.description !== undefined) {
+      if (override.description !== null && override.description.length > AGENT_PERSONA_MAX_LENGTH) throw new Error('Persona description is too long');
+      values.push(override.description); sets.push(`persona_description = $${values.length}`);
+    }
+    if (override.liveliness !== undefined) {
+      if (override.liveliness !== null) AgentLivelinessSchema.parse(override.liveliness);
+      values.push(override.liveliness); sets.push(`persona_liveliness = $${values.length}`);
+    }
+    if (sets.length === 0) return (await this.getConversationPersona(key)) !== null;
+    const result = await this.pool.query(
+      `UPDATE conversations SET ${sets.join(', ')}, updated_at = now() WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3`, values);
+    return result.rowCount === 1;
   }
 
   async getAppSetting(key: string): Promise<unknown | null> {

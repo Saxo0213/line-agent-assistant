@@ -76,7 +76,7 @@ describe('internal MCP tools/list and tools/call follow the effective permission
     const admin = harness(allPermissions('ALLOW'));
     expect(((await admin.rpc('tools/list')).body as { result: { tools: unknown[] } }).result.tools).toHaveLength(7);
     await admin.service.shutdown();
-    expect(AGENT_PERMISSION_IDS).toHaveLength(5);
+    expect(AGENT_PERMISSION_IDS).toHaveLength(7);
   });
 
   it('maps a denied call to PERMISSION_DENIED (HTTP 403) rather than a generic scope error', async () => {

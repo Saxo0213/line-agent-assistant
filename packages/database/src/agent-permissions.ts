@@ -170,15 +170,17 @@ export async function resolveJobPolicy(queryable: Queryable, jobId: string): Pro
  */
 export function deriveToolPolicy(policy: Pick<JobPolicy, 'principal' | 'permissions'>, level: AgentExecutionLevel = 'workspace_write'): AgentToolPolicy {
   const { principal, permissions } = policy;
-  if (principal.kind === 'operator' || principal.kind === 'admin') return { localTools: true, fileRead: true, fileWrite: level !== 'read_only', linkedReadDirs: [], workspaceRootDir: null, level, interactiveApproval: principal.kind === 'operator' };
-  if (principal.kind === 'unresolved') return { localTools: false, fileRead: false, fileWrite: false, linkedReadDirs: [], workspaceRootDir: null, level: 'read_only', interactiveApproval: false };
+  if (principal.kind === 'operator' || principal.kind === 'admin') return { localTools: true, fileRead: true, fileWrite: level !== 'read_only', linkedReadDirs: [], projectDirs: [], workspaceRootDir: null, level, webTools: true, interactiveApproval: principal.kind === 'operator' };
+  if (principal.kind === 'unresolved') return { localTools: false, fileRead: false, fileWrite: false, linkedReadDirs: [], projectDirs: [], workspaceRootDir: null, level: 'read_only', webTools: false, interactiveApproval: false };
   return {
     localTools: permissions['agent.local_tools'] === 'ALLOW',
     fileRead: permissions['chat_folder.read'] === 'ALLOW',
     fileWrite: permissions['chat_folder.write'] === 'ALLOW' && level !== 'read_only',
     linkedReadDirs: [],
+    projectDirs: [],
     workspaceRootDir: null,
     level,
+    webTools: true,
     interactiveApproval: false,
   };
 }

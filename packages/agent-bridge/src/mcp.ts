@@ -17,8 +17,10 @@ export const LINEJS_MCP_TOOLS=['list_targets','query_target_messages','query_tar
 export const claudeMcpToolNames=()=>LINEJS_MCP_TOOLS.map(tool=>`mcp__${LINEJS_MCP_SERVER}__${tool}`);
 
 /** Launch-only Claude MCP config. The bearer value is a variable reference resolved from the child environment. */
-export function claudeMcpConfig(mcp:AgentMcpLaunch):string {
-  return JSON.stringify({mcpServers:{[LINEJS_MCP_SERVER]:{type:'http',url:mcp.endpoint,headers:{Authorization:`Bearer \${${INTERNAL_MCP_TOKEN_ENV}}`}}}});
+export function claudeMcpConfig(mcp:AgentMcpLaunch|undefined,extensionServers:Record<string,Record<string,unknown>>={}):string {
+  const linejs=mcp?{[LINEJS_MCP_SERVER]:{type:'http',url:mcp.endpoint,headers:{Authorization:`Bearer \${${INTERNAL_MCP_TOKEN_ENV}}`}}}:{};
+  // linejs is listed first and an extension of the same name can never replace it.
+  return JSON.stringify({mcpServers:{...linejs,...Object.fromEntries(Object.entries(extensionServers).filter(([name])=>name!==LINEJS_MCP_SERVER))}});
 }
 /** Launch-only Codex `-c` overrides; they reference the token env var by name only. */
 export function codexMcpOverrides(mcp:AgentMcpLaunch):string[] {

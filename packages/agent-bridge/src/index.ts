@@ -5,6 +5,8 @@ import {AuthController,type AuthStatus} from './auth.js';
 import {buildChildEnvironment} from './child-environment.js';
 import {claudeArguments,ClaudeEvents} from './claude.js';
 import {codexArguments,CodexEvents} from './codex.js';
+import {extensionEnvironment} from './extensions.js';
+import {claudeJudgeArguments,codexJudgeArguments,judgeInput,JUDGE_DEFAULT_TIMEOUT_MS,type JudgeRequest,type JudgeResult} from './judge.js';
 import {isAuthenticationDiagnostic} from './failure.js';
 import {isWithin,protocolCompatibility,WindowsExecutableResolver,type ExecutableResolver} from './executable-resolver.js';
 import {parseJsonl,ProtocolError} from './jsonl.js';
@@ -89,6 +91,50 @@ export class AgentCliBridge {
     try {await job.child?.cancel();}
     catch {job.cancellationFailed=true;throw new Error('Unable to confirm job termination.');}
   }
+  /**
+   * One tool-less, read-only fast-model turn for the group free-mode judge. Reuses the trusted executable resolver, child environment
+   * and process runner of normal jobs. Resolves with the final text and the provider session id; every failure (disabled, closing,
+   * not installed, timeout, non-zero exit, bad output) rejects so the caller can treat it as "do not reply".
+   */
+  async judge(input:JudgeRequest):Promise<JudgeResult> {
+    if(this.closing) throw new Error('Agent bridge is closing');
+    if(this.options.enabled===false) throw new Error('Agent support is disabled');
+    if(input.resumeSessionId!==undefined && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,199}$/.test(input.resumeSessionId)) throw new Error('Invalid judge session');
+    const workspace=await realpath(input.workspacePath);
+    if(!(await stat(workspace)).isDirectory()) throw new Error('Judge workspace is not a directory');
+    const executable=await this.resolver.resolve(input.provider);
+    if(!executable) throw new Error('The official CLI is unavailable');
+    if(protocolCompatibility(input.provider,executable.version)==='incompatible') throw new Error('The CLI version is not compatible');
+    const {env}=buildChildEnvironment(this.options.environment ?? process.env);
+    const child=this.runner.start({file:executable.file,
+      args:[...executable.prefixArgs,...(input.provider==='codex'?codexJudgeArguments(input,workspace):claudeJudgeArguments(input))],
+      cwd:workspace,input:judgeInput(input),env});
+    let timedOut=false;
+    const timer=setTimeout(()=>{timedOut=true;void child.cancel().catch(()=>{});},input.timeoutMs ?? JUDGE_DEFAULT_TIMEOUT_MS);
+    const stderr=(async()=>{let length=0;for await(const chunk of child.stderr) length+=chunk.byteLength;})().catch(()=>undefined);
+    const parser=input.provider==='codex'?new CodexEvents():new ClaudeEvents();
+    let sessionId:string|undefined,finalText:string|undefined,failure:string|undefined;
+    try {
+      for await(const value of parseJsonl(child.stdout)) {
+        for(const event of parser.accept(value)) {
+          if(event.type==='started') sessionId=event.externalSessionId;
+          else if(event.type==='completed') finalText=event.finalText;
+          else if(event.type==='failed') failure=event.message;
+        }
+      }
+      const exit=await child.exited;
+      await stderr;
+      if(timedOut) throw new Error('Judge timed out');
+      if(failure!==undefined) throw new Error(`Judge failed: ${failure}`);
+      if(exit.code!==0) throw new Error('Judge CLI exited unsuccessfully');
+      if(finalText===undefined || sessionId===undefined) throw new Error('Judge produced no answer');
+      return {text:finalText,sessionId};
+    } finally {
+      clearTimeout(timer);
+      await child.cancel().catch(()=>{});
+      await child.exited.catch(()=>undefined);
+    }
+  }
   shutdown():Promise<void> {
     this.closing=true;
     return this.shutdownPromise ??= (async()=>{
@@ -158,6 +204,7 @@ export class AgentCliBridge {
       const child=this.runner.start({
         file:executable.file, args:[...executable.prefixArgs,...(executionRequest.provider==='codex'?codexArguments(executionRequest,workspace):claudeArguments(executionRequest))],
         cwd:workspace, input:request.prompt, env, ...(executionRequest.mcp?{mcpToken:executionRequest.mcp.token}:{}),
+        ...(executionRequest.extensions?{extraEnv:extensionEnvironment(executionRequest)}:{}),
       }); job.child=child;job.finishLaunch();
       // Drain bounded diagnostics concurrently so stderr cannot deadlock stdout.
       const diagnostics=(async()=>{
@@ -229,9 +276,12 @@ export class AgentCliBridge {
 }
 
 export {AuthController} from './auth.js';
+export {EXTENSION_ENV_PREFIX,claudeExtensionPlan,codexExtensionPlan,extensionEnvironment} from './extensions.js';
 export {INTERNAL_MCP_TOKEN_ENV,LINEJS_MCP_TOOLS,LINEJS_MCP_SERVER,claudeMcpToolNames,claudePermissionPromptToolName} from './mcp.js';
 export type {AuthStatus} from './auth.js';
 export {WindowsExecutableResolver} from './executable-resolver.js';
 export type {ExecutableResolver,ResolvedExecutable} from './executable-resolver.js';
 export {NodeProcessRunner} from './process-runner.js';
 export type {ProcessRunner,ProcessSpec,RunningProcess} from './process-runner.js';
+export {CLAUDE_JUDGE_MODEL,CODEX_JUDGE_REASONING_OVERRIDE,JUDGE_DEFAULT_TIMEOUT_MS,claudeJudgeArguments,codexJudgeArguments} from './judge.js';
+export type {JudgeRequest,JudgeResult} from './judge.js';

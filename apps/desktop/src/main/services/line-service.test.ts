@@ -54,6 +54,25 @@ describe('Agent status reply localization', () => {
   });
 });
 
+describe('stop and new acknowledgements', () => {
+  it.each([
+    ['stop', true, 'zh-TW', '已停止 Agent 工作'], ['stop', false, 'zh-TW', '目前沒有進行中的 Agent 工作'],
+    ['stop', true, 'en', 'Agent work stopped'], ['stop', false, 'ja', '実行中の Agent 作業はありません'],
+    ['new', false, 'zh-TW', '已開始新的 Agent 對話'], ['new', false, 'ko', '새 Agent 대화를 시작했습니다'],
+  ] as const)('acknowledges /%s (cancelled %s, %s) without exposing ids', async (action, cancelled, locale, expected) => {
+    const commands: LineWorkerCommand[] = [];
+    const binding = { accountId: 'a', workerInstanceId: 'w', controlEpoch: 1, mode: 'ACTIVE_CONTROL' as const };
+    const service = new BaseLineService({ async bindWorker() {} } as never,
+      { async applyPendingRouteAction(_key: unknown, _messageId: string, _worker: string, apply: (action: string) => Promise<void>) { await apply(action); } } as never,
+      {} as never, { async send(command) { commands.push(command); } },
+      { kick() {}, async stopChat() { return cancelled; }, async resetChat() {} },
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, locale);
+    await service.bind(binding);
+    await (service as any).applyPendingAction(binding, { accountId: 'a', chatType: 'direct', chatId: 'chat' }, 'message');
+    expect(commands[0]).toMatchObject({ type: 'sendText', chatId: 'chat', replyToMessageId: 'message', text: expected });
+  });
+});
+
 it('correlates bounded logout results to the current binding and rejects them on unbind', async () => {
   const commands: LineWorkerCommand[] = [];
   const service = new BaseLineService({ async bindWorker() {} } as never,
@@ -154,7 +173,7 @@ describe('administrative archive admission', () => {
           });
           return { insertedMessageIds, jobMessageIds: [] };
         } } as never,
-      { async getConversationAgent() { return null; } } as never,
+      { async getAppSetting() { return undefined; }, async getConversationAgent() { return null; } } as never,
       { async send() { order.push('ack'); } },
       { kick() {}, async stopChat() {}, async resetChat() {} }, undefined, undefined,
       async (e) => { effects.push(e.messageId); order.push('effect'); await effectHook?.(); return true; },
@@ -207,13 +226,21 @@ describe('administrative archive admission', () => {
 });
 
 describe('LineService group mention authorization fast path', () => {
-  function setup(options: { primary?: boolean; primaryError?: boolean; friend?: boolean; room?: boolean; responder?: boolean; handledMessageId?: string } = {}) {
+  function setup(options: { primary?: boolean; primaryError?: boolean; friend?: boolean; room?: boolean; responder?: boolean; handledMessageId?: string;
+    freeMode?: never; freeActive?: boolean } = {}) {
+    const providerChanges: Array<string | null> = [];
+    const personaChanges: unknown[] = [];
     const calls: string[] = [];
     const friendScopes: unknown[] = [];
     const archived: Array<{ envelopes: InboundEnvelope[]; decisions: unknown[] }> = [];
     const kicked: string[] = [];
     const replies: string[] = [];
     const commands: LineWorkerCommand[] = [];
+    const freeCommands: Array<{ enabledBy: string; command: unknown; sourceMessageId: string | undefined }> = [];
+    const freeMode = { isActive: () => options.freeActive ?? false, statusText: () => null, addMessage() {},
+      async handleCommand(_key: unknown, enabledBy: string, command: unknown, sourceMessageId?: string) { freeCommands.push({ enabledBy, command, sourceMessageId }); } };
+    const folderCommands: Array<{ actor: string; chatType: string; command: unknown }> = [];
+    const projectFolders = { async handleCommand(key: { chatType: string }, actor: string, command: unknown) { folderCommands.push({ actor, chatType: key.chatType, command }); } };
     const enrollmentInputs: Array<{ candidate: unknown; ownMid: string | null | undefined }> = [];
     const service = new BaseLineService(
       { async bindWorker() {}, async getAccount() { return { ownMid: 'agent-mid' }; } } as never,
@@ -226,7 +253,10 @@ describe('LineService group mention authorization fast path', () => {
             && (decision.eligible || decision.action === 'stop' || decision.action === 'new' || decision.action === 'status'
               || decision.workspaceFailure) ? [input.envelopes[index]!.messageId] : []) };
       } } as never,
-      { async getAppSetting() { return undefined; }, async getConversationAgent() { return { enabled: true, provider: 'codex' }; } } as never,
+      { async getAppSetting() { return undefined; }, async getConversationAgent() { return { enabled: true, provider: 'codex' }; },
+        async setConversationProvider(_key: unknown, provider: string | null) { providerChanges.push(provider); return true; },
+        async getConversationPersona() { return { description: null, liveliness: null }; },
+        async setConversationPersona(_key: unknown, patch: unknown) { personaChanges.push(patch); return true; } } as never,
       { async send(command: LineWorkerCommand) { commands.push(command); } },
       { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {} },
       undefined, undefined, async (envelope, candidate, ownMid) => {
@@ -235,7 +265,7 @@ describe('LineService group mention authorization fast path', () => {
         calls.push(`enrollment:${ownMid}`);
         return true;
       },
-      { async isPrimaryUser() { calls.push('primary'); if (options.primaryError) throw new Error('admin lookup unavailable'); return options.primary ?? false; } } as never,
+      { async isPrimaryAdministrator() { return options.primary ?? false; }, async isPrimaryUser() { calls.push('primary'); if (options.primaryError) throw new Error('admin lookup unavailable'); return options.primary ?? false; } } as never,
       { async inspect() { return { status: 'available', version: 1, path: 'C:\\trusted' }; } },
       { async handle() { calls.push('control'); }, async isEnabled() { return options.responder ?? true; },
         async getActiveAuthorization() { calls.push('room'); return options.room === false ? null : { grantId: 'room-grant', version: 1 }; },
@@ -245,13 +275,112 @@ describe('LineService group mention authorization fast path', () => {
         return options.friend === false ? null : { grantId: 'friend-grant', version: 1, scopeKind: 'ACCOUNT' };
       } } as never,
       async (envelope) => envelope.messageId === options.handledMessageId,
+      undefined, undefined, undefined, 'en', undefined, freeMode, projectFolders,
     );
-    return { service, calls, archived, kicked, replies, enrollmentInputs, friendScopes, commands };
+    return { service, freeCommands, folderCommands, calls, archived, kicked, replies, enrollmentInputs, friendScopes, commands, providerChanges, personaChanges };
   }
 
   const groupMessage = (overrides: Partial<InboundEnvelope> = {}): InboundEnvelope => ({
     ...batch().envelopes[0]!, chatType: 'group', chatId: 'g', messageId: 'group-message',
     text: 'hello everyone', mentionIds: [], mentionRanges: [], ...overrides,
+  });
+
+  describe('/persona chat override', () => {
+    const sentTexts = (commands: LineWorkerCommand[]) => commands.flatMap((command) => command.type === 'sendText' ? [command.text] : []);
+    async function run(options: Parameters<typeof setup>[0], envelope: InboundEnvelope) {
+      const harness = setup(options);
+      await harness.service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+      await harness.service.handleWorkerEvent('w1', { ...batch(), envelopes: [envelope] });
+      await harness.service.idleRoomEffects();
+      return harness;
+    }
+
+    it('lets the Primary Administrator set the description without a mention and confirms it', async () => {
+      const h = await run({ primary: true }, groupMessage({ messageId: 'persona-1', text: '/persona 溫柔簡短' }));
+      expect(h.personaChanges).toEqual([{ description: '溫柔簡短' }]);
+      expect(sentTexts(h.commands)).toEqual(["This chat's Agent persona is now: 溫柔簡短"]);
+      expect(h.replies).toEqual([]);
+    });
+    it('sets the liveliness, with an English alias and a mention', async () => {
+      const h = await run({ primary: true }, groupMessage({ messageId: 'persona-2', text: '@Agent /persona Lively',
+        mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] }));
+      expect(h.personaChanges).toEqual([{ liveliness: 'lively' }]);
+      expect(sentTexts(h.commands)).toEqual(["This chat's reply liveliness is now: Lively"]);
+    });
+    it('clears both overrides on default', async () => {
+      const h = await run({ primary: true }, groupMessage({ messageId: 'persona-3', text: '/persona default' }));
+      expect(h.personaChanges).toEqual([{ description: null, liveliness: null }]);
+    });
+    it('answers a bare /persona with the effective values and changes nothing', async () => {
+      const h = await run({ primary: true }, groupMessage({ messageId: 'persona-4', text: '/persona' }));
+      expect(h.personaChanges).toEqual([]);
+      expect(sentTexts(h.commands)[0]).toMatch(/^Agent persona \(default\): \(none, neutral tone\)\nReply liveliness \(default\): Normal$/);
+    });
+    it('does not execute for a non-administrator: no change, no confirmation', async () => {
+      const h = await run({ primary: false }, groupMessage({ messageId: 'persona-5', text: '/persona 活潑' }));
+      expect(h.personaChanges).toEqual([]);
+      expect(sentTexts(h.commands)).toEqual([]);
+      expect(h.replies).toEqual([]);
+    });
+    it('lets a non-administrator mention of /persona take the ordinary auto-reply path', async () => {
+      const h = await run({ primary: false, friend: false, responder: false }, groupMessage({ messageId: 'persona-6', text: '@Agent /persona 活潑',
+        mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] }));
+      expect(h.personaChanges).toEqual([]);
+      expect(h.replies).toEqual(['/persona 活潑']);
+    });
+  });
+
+  describe('/agent chat override', () => {
+    const mentioned = (text: string, messageId = 'agent-command') => groupMessage({ messageId, text,
+      mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] });
+    const sentTexts = (commands: LineWorkerCommand[]) => commands.flatMap((command) => command.type === 'sendText' ? [command.text] : []);
+    async function run(options: Parameters<typeof setup>[0], envelope: InboundEnvelope) {
+      const harness = setup(options);
+      await harness.service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+      await harness.service.handleWorkerEvent('w1', { ...batch(), envelopes: [envelope] });
+      await harness.service.idleRoomEffects();
+      return harness;
+    }
+
+    it('lets the Primary Administrator set the chat override with a bare /agent claude|codex and confirms it', async () => {
+      const h = await run({ primary: true }, mentioned('@Agent /AGENT Codex'.replace('/AGENT Codex', '/agent codex')));
+      expect(h.providerChanges).toEqual(['codex']);
+      expect(sentTexts(h.commands)).toContain('This chat now uses Codex');
+      expect(h.kicked).toEqual([]);
+      expect(h.replies).toEqual([]);
+      expect(h.archived[0]!.decisions).toEqual([{ eligible: false, action: 'ignore' }]);
+    });
+
+    it('clears the override with /agent default and names the global default', async () => {
+      const h = await run({ primary: true }, mentioned('@Agent /agent default'));
+      expect(h.providerChanges).toEqual([null]);
+      expect(sentTexts(h.commands)).toContain('This chat is back to the default Agent (Claude)');
+    });
+
+    it('lets the Primary Administrator switch without a mention while free mode is on', async () => {
+      const h = await run({ primary: true, freeActive: true }, groupMessage({ messageId: 'free-switch', text: '/agent claude' }));
+      expect(h.providerChanges).toEqual(['claude']);
+      expect(sentTexts(h.commands)).toContain('This chat now uses Claude');
+    });
+
+    it('does not let a served non-administrator switch: bare /agent claude gets the usage hint', async () => {
+      const h = await run({ primary: false }, mentioned('@Agent /agent claude'));
+      expect(h.providerChanges).toEqual([]);
+      expect(sentTexts(h.commands)).toContain('Add what you want done after /agent claude');
+    });
+
+    it('treats /agent default from a non-administrator in an unserved room as ordinary text for the responder', async () => {
+      const h = await run({ primary: false, room: false, friend: false, responder: false }, mentioned('@Agent /agent default'));
+      expect(h.providerChanges).toEqual([]);
+      expect(sentTexts(h.commands)).toEqual([]);
+      expect(h.replies).toEqual(['/agent default']);
+    });
+
+    it('treats an administrator-less /agent claude from a free-mode member as a free-mode message', async () => {
+      const h = await run({ primary: false, freeActive: true }, groupMessage({ messageId: 'member-switch', text: '/agent claude' }));
+      expect(h.providerChanges).toEqual([]);
+      expect(sentTexts(h.commands)).toEqual([]);
+    });
   });
 
   it('archives an untagged group text without authorization lookups or a job', async () => {
@@ -323,6 +452,79 @@ describe('LineService group mention authorization fast path', () => {
     await service.idleRoomEffects();
     expect(kicked).toEqual(['g']);
     expect(replies).toEqual([]);
+  });
+
+  it.each([
+    ['/free', false, true], ['@Agent /free', true, true], ['/free 10', false, true],
+  ])('never lets the disabled-room responder answer the Primary Administrator command %s (mention %s, Primary Admin %s)', async (text, mention, primary) => {
+    const { service, replies, freeCommands } = setup({ primary, responder: false });
+    await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'free-command', text,
+      ...(mention ? { mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] } : {}) })] });
+    await service.idleRoomEffects();
+    expect(replies).toEqual([]);
+    expect(freeCommands.map((item) => item.sourceMessageId)).toEqual(primary ? ['free-command'] : []);
+  });
+
+  it.each([
+    ['/folder D:/Projects/Alpha', false, true, 'bind'], ['@Agent /folder rw "D:/My Projects/Alpha"', true, true, 'bind'], ['/folder', false, true, 'list'],
+    ['/folder off', false, true, 'off'], ['@Agent /folder off D:/Projects/Alpha', true, true, 'off'],
+    ['/folder D:/Projects/Alpha', false, false, null], ['@Agent /folder rw D:/Projects/Alpha', true, false, null], ['@Agent /folder', true, false, null],
+  ])('executes the group command %s (mention %s, Primary Admin %s) only for the Primary Admin', async (text, mention, primary, action) => {
+    const { service, replies, folderCommands, kicked, archived } = setup({ primary, responder: false });
+    await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'folder-command', senderId: 'u-sender', text,
+      ...(mention ? { mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] } : {}) })] });
+    await service.idleRoomEffects();
+    if (primary) {
+      expect(replies).toEqual([]);
+      expect(kicked).toEqual([]);
+      expect(archived[0]!.decisions).toEqual([{ eligible: false, action: 'ignore' }]);
+    }
+    expect(folderCommands.map((item) => [item.actor, item.chatType, (item.command as { action: string }).action])).toEqual(action ? [['u-sender', 'group', action]] : []);
+  });
+
+  it('lets a non-admin /folder with a mention reach the disabled-room responder like any other text, never the admin one', async () => {
+    for (const primary of [false, true]) {
+      const { service, replies, folderCommands } = setup({ primary, friend: false, responder: false });
+      await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+      await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'folder-resp', text: '@Agent /folder D:/x',
+        mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
+      await service.idleRoomEffects();
+      expect(replies).toHaveLength(primary ? 0 : 1);
+      expect(folderCommands).toHaveLength(primary ? 1 : 0);
+    }
+  });
+
+  it('executes /folder in the Primary Admin 1:1 chat and never for anyone else there', async () => {
+    for (const primary of [true, false]) {
+      const { service, folderCommands, kicked } = setup({ primary });
+      await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+      await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ chatType: 'direct', chatId: 'admin-1', messageId: 'direct-folder', text: '/folder rw D:/Projects/Alpha' })] });
+      await service.idleRoomEffects();
+      if (primary) expect(kicked).toEqual([]); // a non-admin message is ordinary (a whitelisted friend's goes the normal prompt path)
+      expect(folderCommands).toHaveLength(primary ? 1 : 0);
+      if (primary) expect(folderCommands[0]).toMatchObject({ chatType: 'direct', command: { action: 'bind', mode: 'READ_WRITE', path: 'D:/Projects/Alpha' } });
+    }
+  });
+
+  it('treats /free from a non-Primary-Administrator as ordinary text: the responder answers a mention and nothing runs', async () => {
+    const { service, replies, freeCommands } = setup({ primary: false, responder: false });
+    await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'free-command', text: '@Agent /free',
+      mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
+    await service.idleRoomEffects();
+    expect(replies).toEqual(['/free']);
+    expect(freeCommands).toEqual([]);
+  });
+
+  it('still answers ordinary mentioned text in a room that is not enabled', async () => {
+    const { service, replies } = setup({ responder: false });
+    await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ text: '@Agent hello there',
+      mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
+    await service.idleRoomEffects();
+    expect(replies).toEqual(['hello there']);
   });
 
   it('archives and acknowledges a mixed batch when primary-admin lookup fails for one mention', async () => {
@@ -404,7 +606,7 @@ describe('LineService unavailable workspace routing', () => {
         persisted.push(...decisions);
         return { inserted: 2, duplicate: 0, insertedMessageIds: ['ordinary', 'trigger'], jobIds: [], jobMessageIds: [] };
       } } as never,
-      { async getAppSetting() { throw new Error('LINE must not read the workspace setting'); },
+      { async getAppSetting(key: string) { if (key === 'default_provider') return 'codex'; throw new Error('LINE must not read the workspace setting'); },
         async getConversationAgent() { return { enabled: true, provider: 'codex' }; } } as never,
       { async send(command) { commands.push(command); } },
       { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {} },
@@ -1292,6 +1494,15 @@ database('LineService transaction and worker identity', () => {
     expect(replies).toEqual(['hello there']);
     expect(kicked).toEqual([]);
     expect(jobs.rows[0].count).toBe('0');
+    // Recognised commands never also produce the fallback reply (independent-ingest path).
+    replies.length = 0;
+    const command = (messageId: string, text: string, mentioned: boolean) => ({ ...source, eventId: `${messageId}-event`, messageId, text,
+      ...(mentioned ? {} : { mentionIds: [], mentionRanges: [] }) });
+    await service.handleWorkerEvent('responder-room-worker', { ...batch(), workerInstanceId: 'responder-room-worker',
+      batchId: 'responder-room-commands', cursorBefore: cursor('952'), cursorAfter: cursor('953'),
+      envelopes: [command('cmd-free', '/free', false), command('cmd-mention-free', '@Agent /free', true), command('cmd-ordinary', '@Agent ordinary text', true)] });
+    await service.idleRoomEffects();
+    expect(replies).toEqual(['/free', 'ordinary text']);
   });
 
   it('keeps room Agent jobs closed even after Worker readiness until member grants are wired', async () => {
@@ -2070,7 +2281,7 @@ describe('read position change publication', () => {
         async ingestBatchAndRoute() {
           return { insertedMessageIds: [], jobMessageIds: [], jobIds: [], jobStatuses: [], primaryAdminActionMessageIds: [], ...result };
         } } as never,
-      { async getConversationAgent() { return null; } } as never,
+      { async getAppSetting() { return undefined; }, async getConversationAgent() { return null; } } as never,
       { async send() { order.push('ack'); } },
       { kick() {}, async stopChat() {}, async resetChat() {} },
       undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,

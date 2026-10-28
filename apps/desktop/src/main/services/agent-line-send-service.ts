@@ -74,6 +74,8 @@ export interface AgentLineSendOptions {
 export const SYSTEM_SCHEDULE_PRINCIPAL = 'system:schedule';
 /** Audit principal of a group free-mode notice (docs/architecture/group-free-mode.md). */
 export const FREE_MODE_PRINCIPAL = 'system:free_mode';
+/** Audit principal of a /folder reply (docs/architecture/project-folders.md). */
+export const PROJECT_FOLDER_PRINCIPAL = 'system:project_folder';
 
 export interface SystemTextInput {
   /** Audit `job_id`: the schedule run id (a system message has no Agent job). */
@@ -81,7 +83,7 @@ export interface SystemTextInput {
   target: { accountId: string; chatType: SendChatType; chatId: string };
   text: string;
   /** Audit principal; defaults to the schedule principal. */
-  principalId?: typeof SYSTEM_SCHEDULE_PRINCIPAL | typeof FREE_MODE_PRINCIPAL;
+  principalId?: typeof SYSTEM_SCHEDULE_PRINCIPAL | typeof FREE_MODE_PRINCIPAL | typeof PROJECT_FOLDER_PRINCIPAL;
   signal?: AbortSignal;
 }
 /** `unknown` means the message may have reached LINE; the caller must never retry it. */

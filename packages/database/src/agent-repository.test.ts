@@ -370,6 +370,23 @@ database('AgentRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () =>
     const key = { accountId: input.accountId, chatType: input.chatType, chatId: input.chatId };
     await settings.setConversationAgent({ ...key, enabled: true, provider: 'claude' });
     expect(await settings.getConversationAgent(key)).toEqual({ enabled: true, provider: 'claude' });
+    // The override is optional: null follows the global default.
+    expect(await settings.setConversationProvider(key, null)).toBe(true);
+    expect(await settings.getConversationAgent(key)).toEqual({ enabled: true, provider: null });
+    expect(await settings.setConversationProvider(key, 'codex')).toBe(true);
+    expect(await settings.getConversationAgent(key)).toEqual({ enabled: true, provider: 'codex' });
+    expect(await settings.setConversationProvider({ ...key, chatId: 'missing-chat' }, 'codex')).toBe(false);
+    // Persona overrides: null follows the global value; each field is set and cleared on its own.
+    expect(await settings.getConversationPersona(key)).toEqual({ description: null, liveliness: null });
+    expect(await settings.setConversationPersona(key, { description: '溫柔簡短' })).toBe(true);
+    expect(await settings.setConversationPersona(key, { liveliness: 'lively' })).toBe(true);
+    expect(await settings.getConversationPersona(key)).toEqual({ description: '溫柔簡短', liveliness: 'lively' });
+    expect(await settings.setConversationPersona(key, { description: null, liveliness: null })).toBe(true);
+    expect(await settings.getConversationPersona(key)).toEqual({ description: null, liveliness: null });
+    expect(await settings.setConversationPersona({ ...key, chatId: 'missing-chat' }, { liveliness: 'quiet' })).toBe(false);
+    await expect(settings.setConversationPersona(key, { description: 'x'.repeat(501) })).rejects.toThrow();
+    await settings.setAppSetting('agent_persona_description', '活潑');
+    expect(await settings.getAppSetting('agent_persona_description')).toBe('活潑');
     await settings.setAppSetting('workspace_path', 'C:\\work');
     expect(await settings.getAppSetting('workspace_path')).toBe('C:\\work');
     await expect(settings.setAppSetting('line_token', 'secret')).rejects.toThrow('not allowed');

@@ -33,13 +33,24 @@ function fixture(environment: AgentJobEnvironment) {
 
 describe('agent-service hands the workspace and tool decision to the runner as data', () => {
   it('uses the environment plan for cwd, session lookup and the tool policy (row 4b)', async () => {
-    const tools = { localTools: false, fileRead: true, fileWrite: false, linkedReadDirs: ['C:\\ws\\groups\\x'], workspaceRootDir: null, level: 'workspace_write' as const, interactiveApproval:false };
+    const tools = { localTools: false, fileRead: true, fileWrite: false, linkedReadDirs: ['C:\\ws\\groups\\x'], projectDirs: [], workspaceRootDir: null, level: 'workspace_write' as const, webTools: false, interactiveApproval:false };
     const f = fixture({ prepare: async () => ({ ok: true, workspacePath: 'C:\\ws\\groups\\own', tools }) });
     f.service.kick(key);
     await f.service.idle();
     expect(f.requests).toHaveLength(1);
     expect(f.requests[0]).toMatchObject({ workspacePath: 'C:\\ws\\groups\\own', tools });
     expect(f.lookups).toEqual(['C:\\ws\\groups\\own']);
+  });
+
+  it('passes the plan extensions to the runner and sends none when the plan has none', async () => {
+    const tools = { localTools: true, fileRead: true, fileWrite: true, linkedReadDirs: [], projectDirs: [], workspaceRootDir: null, level: 'workspace_write' as const, webTools: false, interactiveApproval: false };
+    const extensions = { servers: [], tools: { webSearch: true, webFetch: false, bash: false, fileRead: false, fileWrite: false } };
+    const withExtensions = fixture({ prepare: async () => ({ ok: true, workspacePath: 'C:\ws', tools, extensions }) });
+    withExtensions.service.kick(key); await withExtensions.service.idle();
+    expect(withExtensions.requests[0]).toMatchObject({ extensions });
+    const without = fixture({ prepare: async () => ({ ok: true, workspacePath: 'C:\ws', tools }) });
+    without.service.kick(key); await without.service.idle();
+    expect('extensions' in without.requests[0]!).toBe(false);
   });
 
   it('fails the job closed before the runner starts when the environment refuses (row 8 / 15)', async () => {

@@ -475,6 +475,20 @@ describe('one-account worker loop', () => {
     expect(state.events).toContainEqual(expect.objectContaining({ type: 'unsendResult', requestId: 'unsend-unknown', status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' }));
   });
 
+  it('passes sendText mentions to the transport, and omits them when there are none', async () => {
+    const state = setup('ACTIVE_CONTROL');
+    await state.init;
+    await authenticate(state.worker);
+    const mention = { start: 3, end: 6, userId: `u${'a'.repeat(32)}` };
+    await state.worker.handle({ type: 'sendText', ...binding, chatType: 'group', chatId: `c${'b'.repeat(32)}`,
+      requestId: 'mention-send', text: 'hi @小明', replyToMessageId: null, mentions: [mention] });
+    await state.worker.handle({ type: 'sendText', ...binding, chatType: 'group', chatId: `c${'b'.repeat(32)}`,
+      requestId: 'plain-send', text: 'hi', replyToMessageId: null });
+    expect(state.transport.sendCalls).toMatchObject([{ text: 'hi @小明', manual: false, mentions: [mention] }, { text: 'hi' }]);
+    expect(state.transport.sendCalls[1]).not.toHaveProperty('mentions');
+    expect(state.events.filter((event) => event.type === 'sendResult')).toMatchObject([{ status: 'sent' }, { status: 'sent' }]);
+  });
+
   it('emits fixed Talk codes for rejected sends and unsends without retrying or exposing server text', async () => {
     const state = setup('ACTIVE_CONTROL');
     await state.init;

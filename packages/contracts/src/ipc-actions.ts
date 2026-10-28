@@ -6,7 +6,7 @@ export const IPC_ACTION_CODES = [
   'lineSyncHistory', 'submitAgentRoomPrompt', 'stopAgentRoomJob', 'retryAgentRoomJob', 'getAgentRoomJobEvents',
   'listMessages', 'listAttachments', 'listChatNotes', 'getChatNote', 'listChatAlbums', 'listChatAlbumPhotos',
   'downloadChatAlbumPhoto', 'openChatAlbum', 'openReadableChatAlbumFolder', 'cancelChatResourceRequest',
-  'sendText', 'replyText', 'sendManualMedia', 'unsendMessage', 'getManualUnsendWindow', 'setManualUnsendWindow',
+  'sendText', 'replyText', 'sendManualMedia', 'unsendMessage', 'getManualUnsendWindow', 'setManualUnsendWindow', 'getAgentPersona', 'setAgentPersona',
   'stopJob', 'retryJob', 'newSession', 'getJobEvents', 'searchMessages', 'openExternalUrl', 'openAttachment',
   'downloadAttachment', 'revealAttachment', 'resolveFileTypeIcon', 'subscribeEvents', 'setConversationAgent',
   'switchControl', 'setDefaultAgent', 'setWorkspace', 'getConversationSettings', 'setConversationSettings',
@@ -17,4 +17,6 @@ export const IPC_ACTION_CODES = [
   'setAgentExecutionPolicy', 'listAgentToolAllowlist', 'removeAgentToolAllowlistEntry', 'clearAgentToolAllowlist',
   'decideAgentApproval', 'listPendingAgentApprovals', 'setAgentFolderLink', 'createChatFolder', 'openChatFolder',
   'listAgentSchedules', 'createAgentSchedule', 'updateAgentSchedule', 'deleteAgentSchedule', 'listAgentScheduleRuns', 'listAgentScheduleTargets',
+  'getAgentExtensions', 'saveAgentMcpServer', 'deleteAgentMcpServer', 'setAgentMcpServerEnabled', 'setAgentExtensionTools',
+  'listAgentMcpImportCandidates', 'importAgentMcpServers',
 ] as const;

@@ -4,7 +4,7 @@ import { KOREAN_DESKTOP_COPY_PART8 } from './desktop-copy-ko-part8.js';
 
 describe('Korean desktop copy part 8', () => {
   it('contains exactly the final 92 English source keys', () => {
-    const newPermissionKeys = ['permissionCurrentChat', 'permissionCurrentChatDescription', 'permissionAllChats', 'permissionAllChatsDescription', 'permissionFolderRead', 'permissionFolderReadDescription', 'permissionFolderWrite', 'permissionFolderWriteDescription', 'permissionLocalTools', 'permissionLocalToolsDescription'];
+    const newPermissionKeys = ['permissionCurrentChat', 'permissionCurrentChatDescription', 'permissionAllChats', 'permissionAllChatsDescription', 'permissionFolderRead', 'permissionFolderReadDescription', 'permissionFolderWrite', 'permissionFolderWriteDescription', 'permissionLocalTools', 'permissionLocalToolsDescription', 'permissionProjectFolderRead', 'permissionProjectFolderReadDescription', 'permissionProjectFolderWrite', 'permissionProjectFolderWriteDescription'];
     const expected = Object.keys(ENGLISH_DESKTOP_COPY).filter((key) => !newPermissionKeys.includes(key)).slice(644, 736).sort();
     expect(expected).toHaveLength(92);
     expect(Object.keys(KOREAN_DESKTOP_COPY_PART8).sort()).toEqual(expected);

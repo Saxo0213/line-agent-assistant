@@ -3,6 +3,10 @@ import {
   AgentApprovalDecisionSchema,
   PendingAgentApprovalSchema,
   type AgentApprovalDecision,
+  type AgentExtensionTools,
+  type AgentExtensionsState,
+  type AgentMcpImportListing,
+  type AgentMcpServerInput,
   type AgentSchedule,
   type AgentScheduleCreateInput,
   type AgentScheduleRun,
@@ -35,6 +39,7 @@ import {
   type AgentJobSummary,
   type AgentAttachmentUpload,
   type AgentEvent,
+  type AgentPersona,
   type AgentProvider,
   type AppSnapshot,
   type AlbumFailureContextDto,
@@ -105,6 +110,9 @@ export type DesktopApi = {
   unsendMessage(key: ConversationKey, messageId: string): Promise<IpcResult>;
   getManualUnsendWindow(): Promise<'1h' | '7d'>;
   setManualUnsendWindow(window: '1h' | '7d'): Promise<'1h' | '7d'>;
+  /** The global Agent persona (Settings > Assistant). */
+  getAgentPersona(): Promise<AgentPersona>;
+  setAgentPersona(persona: AgentPersona): Promise<AgentPersona>;
   /** The shared Agent room: operator-owned, independent of every LINE account. */
   submitAgentRoomPrompt(input: { provider: AgentProvider; prompt: string; attachments?: AgentAttachmentUpload[] }): Promise<IpcResult>;
   getAgentRoomJobEvents(jobId: string): Promise<AgentEvent[]>;
@@ -176,6 +184,14 @@ export type DesktopApi = {
   setAgentFolderLink(input: SetAgentFolderLinkInput): Promise<IpcResult>;
   createChatFolder(input: { accountId: string; chatType: 'direct' | 'group' | 'room'; chatId: string }): Promise<IpcResult>;
   openChatFolder(folderId: string): Promise<IpcResult>;
+  /** Extra Agent tools (Settings → 助理). Secrets are masked on the way out and never come back. Mutations resolve to the result or an `AGENT_EXTENSION_*` error. */
+  getAgentExtensions(): Promise<AgentExtensionsState>;
+  saveAgentMcpServer(server: AgentMcpServerInput): Promise<IpcResult>;
+  deleteAgentMcpServer(serverId: string): Promise<IpcResult>;
+  setAgentMcpServerEnabled(serverId: string, enabled: boolean): Promise<IpcResult>;
+  setAgentExtensionTools(tools: AgentExtensionTools): Promise<IpcResult>;
+  listAgentMcpImportCandidates(): Promise<AgentMcpImportListing>;
+  importAgentMcpServers(items: Array<{ source: 'claude-code' | 'claude-desktop' | 'codex'; sourceName: string }>): Promise<IpcResult>;
   /** Scheduled Agent triggers. Live updates arrive as an `agentSchedulesChanged` event on onEvent; re-read with listAgentSchedules. */
   listAgentSchedules(): Promise<AgentSchedule[]>;
   /** Resolves to `{ type: 'createAgentSchedule', schedule }` or an error result (`SCHEDULE_LIMIT`, `SCHEDULE_NO_FUTURE_TIME`). */
@@ -285,6 +301,8 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     unsendMessage: (key, messageId) => request({ type: 'unsendMessage', ...key, messageId }),
     async getManualUnsendWindow() { const result = await request({ type: 'getManualUnsendWindow' }); if (result.type !== 'getManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },
     async setManualUnsendWindow(window) { const result = await request({ type: 'setManualUnsendWindow', window }); if (result.type !== 'setManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },
+    async getAgentPersona() { const result = await request({ type: 'getAgentPersona' }); if (result.type !== 'getAgentPersona') throwIpcErrorOrUnexpected(result, 'Unexpected persona response'); return result.persona; },
+    async setAgentPersona(persona) { const result = await request({ type: 'setAgentPersona', persona }); if (result.type !== 'setAgentPersona') throwIpcErrorOrUnexpected(result, 'Unexpected persona response'); return result.persona; },
     submitAgentRoomPrompt: (input) => request({ type: 'submitAgentRoomPrompt', provider: input.provider, prompt: input.prompt,
       ...(input.attachments?.length ? { attachments: input.attachments } : {}) }),
     async getAgentRoomJobEvents(jobId) { const result = await request({ type: 'getAgentRoomJobEvents', jobId }); if (result.type !== 'getAgentRoomJobEvents') throw new Error(result.type === 'error' ? result.message : 'Unexpected job events response'); return result.events; },
@@ -411,6 +429,21 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     setAgentFolderLink: (input) => request({ type: 'setAgentFolderLink', ...input }),
     createChatFolder: (input) => request({ type: 'createChatFolder', ...input }),
     openChatFolder: (folderId) => request({ type: 'openChatFolder', folderId }),
+    async getAgentExtensions() {
+      const result = await request({ type: 'getAgentExtensions' });
+      if (result.type !== 'getAgentExtensions') throw new Error(result.type === 'error' ? result.message : 'Unexpected extensions response');
+      return result.extensions;
+    },
+    saveAgentMcpServer: (server) => request({ type: 'saveAgentMcpServer', server }),
+    deleteAgentMcpServer: (serverId) => request({ type: 'deleteAgentMcpServer', serverId }),
+    setAgentMcpServerEnabled: (serverId, enabled) => request({ type: 'setAgentMcpServerEnabled', serverId, enabled }),
+    setAgentExtensionTools: (tools) => request({ type: 'setAgentExtensionTools', tools }),
+    async listAgentMcpImportCandidates() {
+      const result = await request({ type: 'listAgentMcpImportCandidates' });
+      if (result.type !== 'listAgentMcpImportCandidates') throw new Error(result.type === 'error' ? result.message : 'Unexpected import response');
+      return result.listing;
+    },
+    importAgentMcpServers: (items) => request({ type: 'importAgentMcpServers', items }),
     async listAgentSchedules() {
       const result = await request({ type: 'listAgentSchedules' });
       if (result.type !== 'listAgentSchedules') throw new Error(result.type === 'error' ? result.message : 'Unexpected schedules response');

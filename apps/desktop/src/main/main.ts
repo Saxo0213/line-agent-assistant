@@ -251,7 +251,11 @@ async function initializeServices(): Promise<void> {
   });
   const publish = createDomainEventPublisher((channel, event) => window?.webContents.send(channel, event));
   const connected = await createConnectedFacade({ pool, workers, agent: bridge, workspaceAuthority, attachmentRoot: bootstrap.attachmentRoot,
+    freeModeJudgeDirectory: path.join(app.getPath('userData'), 'free-mode-judge'),
     chatResourceDiagnosticsDirectory: app.getPath('userData'),
+    projectFolderProtectedPaths: [app.getPath('userData'), app.getAppPath(), path.dirname(process.execPath), process.resourcesPath,
+      ...(process.env.LOCALAPPDATA ? [path.join(process.env.LOCALAPPDATA, 'LineAgentAssistant'), path.join(process.env.LOCALAPPDATA, 'LINEJS')] : [])]
+      .filter((entry): entry is string => typeof entry === 'string' && entry !== ''),
     locale: getEffectiveLocale(),
     mcpLocalClientAppPath: app.getAppPath(), mcpLocalClientPackaged: app.isPackaged,
     previewCacheRoot: path.join(app.getPath('userData'), 'cache', 'line-image-previews'),

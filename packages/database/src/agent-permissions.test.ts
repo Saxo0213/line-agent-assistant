@@ -133,7 +133,7 @@ database('Agent permissions, chat folders and folder links', () => {
     await clearRules();
     const defaults = await resolveUserPermissions(pool, ACCOUNT, 'user-a');
     expect(defaults).toEqual({ 'records.query_current_chat': 'ALLOW', 'records.query_all_chats': 'DENY', 'chat_folder.read': 'ALLOW',
-      'chat_folder.write': 'ALLOW', 'agent.local_tools': 'DENY' });
+      'chat_folder.write': 'ALLOW', 'agent.local_tools': 'DENY', 'project_folder.read': 'DENY', 'project_folder.write': 'DENY' });
     await seedLegacy('EVERYONE', null, 'records.query_current_chat', 'DENY');
     expect((await resolveUserPermissions(pool, ACCOUNT, 'user-a', { chatType: 'group', chatId: 'g1' }))['records.query_current_chat']).toBe('DENY');
     await seedLegacy('USER', 'user-a', 'records.query_current_chat', 'ALLOW');
@@ -291,19 +291,20 @@ database('Agent permissions, chat folders and folder links', () => {
     const userJob = await seedJob('group', 'g1', 'user-a');
     const policy = (await resolveJobPolicy(pool, userJob))!;
     expect(policy.principal).toEqual({ kind: 'user', senderMid: 'user-a' });
-    expect(deriveToolPolicy(policy)).toEqual({ localTools: false, fileRead: true, fileWrite: true, linkedReadDirs: [], workspaceRootDir: null, level: 'workspace_write', interactiveApproval:false });
+    expect(deriveToolPolicy(policy)).toEqual({ localTools: false, fileRead: true, fileWrite: true, linkedReadDirs: [], projectDirs: [], workspaceRootDir: null, level: 'workspace_write', webTools: true, interactiveApproval:false });
     await set({ kind: 'USER', mid: 'user-a' }, 'chat_folder.write', 'ALLOW', 0);
     await set({ kind: 'USER', mid: 'user-a' }, 'chat_folder.read', 'DENY', 0);
-    expect(deriveToolPolicy((await resolveJobPolicy(pool, userJob))!)).toEqual({ localTools: false, fileRead: false, fileWrite: true, linkedReadDirs: [], workspaceRootDir: null, level: 'workspace_write', interactiveApproval:false });
+    expect(deriveToolPolicy((await resolveJobPolicy(pool, userJob))!)).toEqual({ localTools: false, fileRead: false, fileWrite: true, linkedReadDirs: [], projectDirs: [], workspaceRootDir: null, level: 'workspace_write', webTools: true, interactiveApproval:false });
     await set({ kind: 'USER', mid: 'user-a' }, 'agent.local_tools', 'ALLOW', 0);
     expect(deriveToolPolicy((await resolveJobPolicy(pool, userJob))!).localTools).toBe(true);
     const adminPolicy = (await resolveJobPolicy(pool, await seedJob('group', 'g1', 'mid-admin')))!;
     expect(adminPolicy.principal.kind).toBe('admin');
-    expect(deriveToolPolicy(adminPolicy)).toMatchObject({ localTools: true, interactiveApproval:false });
+    expect(deriveToolPolicy(adminPolicy)).toMatchObject({ localTools: true, webTools: true, interactiveApproval:false });
     const uiPolicy = (await resolveJobPolicy(pool, await seedJob('direct', 'admin-direct', 'x', 'ui')))!;
     expect(uiPolicy.principal.kind).toBe('operator');
     expect(uiPolicy).toMatchObject({ accountId: null, chatType: null, chatId: null, linkedChats: [] });
-    expect(deriveToolPolicy(uiPolicy)).toMatchObject({ localTools: true, fileRead: true, fileWrite: true, interactiveApproval:true });
+    expect(deriveToolPolicy(uiPolicy)).toMatchObject({ localTools: true, fileRead: true, fileWrite: true, webTools: true, interactiveApproval:true });
+    expect(deriveToolPolicy({ principal: { kind: 'unresolved' }, permissions: policy.permissions }).webTools).toBe(false);
     expect(await resolveJobPolicy(pool, randomUUID())).toBeNull();
     await clearRules();
   });

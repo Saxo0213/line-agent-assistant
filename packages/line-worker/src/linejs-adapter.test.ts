@@ -2761,6 +2761,16 @@ it('decrypts E2EE history messages using the same marker as LINEJS TalkMessage.f
   expect(result).toEqual([plain, { ...encrypted, text: 'decrypted' }]);
 });
 
+it('adds the MENTION metadata to an encrypted text message only when mentions are given', async () => {
+  const { linejsEncryptedTextMessageOptions } = await import('./linejs-adapter.js');
+  const chunks = [Buffer.from([1])];
+  const user = `u${'a'.repeat(32)}`;
+  const withMention = linejsEncryptedTextMessageOptions('c-group', chunks, null, [{ start: 3, end: 6, userId: user }]);
+  expect(withMention.contentMetadata).toEqual({ e2eeVersion: '2', contentType: '0', e2eeMark: '2',
+    MENTION: JSON.stringify({ MENTIONEES: [{ S: '3', E: '6', M: user }] }) });
+  expect(linejsEncryptedTextMessageOptions('c-group', chunks, null, []).contentMetadata).toEqual({ e2eeVersion: '2', contentType: '0', e2eeMark: '2' });
+});
+
 it('builds an explicitly encrypted LINEJS text message without retaining plaintext', async () => {
   const module = await import('./linejs-adapter.js') as unknown as {
     linejsEncryptedTextMessageOptions?: (to: string, chunks: Buffer[], replyToMessageId: string | null) => Record<string, unknown>;

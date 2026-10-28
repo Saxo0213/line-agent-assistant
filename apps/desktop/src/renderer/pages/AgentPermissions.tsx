@@ -15,6 +15,8 @@ const PERMISSION_COPY = {
   'chat_folder.read': 'permissionFolderRead',
   'chat_folder.write': 'permissionFolderWrite',
   'agent.local_tools': 'permissionLocalTools',
+  'project_folder.read': 'permissionProjectFolderRead',
+  'project_folder.write': 'permissionProjectFolderWrite',
 } as const satisfies Record<AgentPermissionId, string>;
 
 const levelOrder: AgentExecutionLevel[] = ['read_only', 'workspace_write', 'trust', 'full'];

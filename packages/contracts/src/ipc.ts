@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { isLineServerErrorCode } from './line-server-error.js';
 import { AgentAttachmentSummarySchema, AgentAttachmentUploadsSchema, AgentEventSchema, AgentProviderSchema } from './agent.js';
 import { AgentStatusIconsSchema } from './agent-status-icons.js';
+import { AgentPersonaSchema } from './agent-persona.js';
+import { AgentExtensionToolsSchema, AgentExtensionsStateSchema, AgentMcpImportListingSchema, AgentMcpImportResultSchema, AgentMcpImportSelectionSchema, AgentMcpServerInputSchema, AgentMcpServerSummarySchema } from './agent-extensions.js';
 import { AgentScheduleCreateInputSchema, AgentScheduleListRunsInputSchema, AgentScheduleListTargetsInputSchema, AgentScheduleRunSchema, AgentScheduleSchema, AgentScheduleTargetOptionSchema, AgentScheduleUpdatePatchSchema } from './agent-schedule.js';
 import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN } from './agent-status-rotation.js';
 import { AutoResponderRuleSchema, AutoResponderSettingsSchema, validateAutoresponderConfig } from './autoresponder.js';
@@ -160,6 +162,8 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('unsendMessage'), messageId: z.string().regex(/^(?:0|[1-9][0-9]*)$/) }),
   RequestIdSchema.extend({ type: z.literal('getManualUnsendWindow') }),
   RequestIdSchema.extend({ type: z.literal('setManualUnsendWindow'), window: z.enum(['1h', '7d']) }),
+  RequestIdSchema.extend({ type: z.literal('getAgentPersona') }),
+  RequestIdSchema.extend({ type: z.literal('setAgentPersona'), persona: AgentPersonaSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('stopJob'), jobId: IdSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('retryJob'), jobId: IdSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('newSession'), provider: AgentProviderSchema }),
@@ -226,6 +230,13 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('deleteAgentSchedule'), scheduleId: z.uuid() }),
   RequestIdSchema.merge(AgentScheduleListRunsInputSchema).extend({ type: z.literal('listAgentScheduleRuns') }),
   RequestIdSchema.merge(AgentScheduleListTargetsInputSchema).extend({ type: z.literal('listAgentScheduleTargets') }),
+  RequestIdSchema.extend({ type: z.literal('getAgentExtensions') }),
+  RequestIdSchema.extend({ type: z.literal('saveAgentMcpServer'), server: AgentMcpServerInputSchema }),
+  RequestIdSchema.extend({ type: z.literal('deleteAgentMcpServer'), serverId: z.uuid() }),
+  RequestIdSchema.extend({ type: z.literal('setAgentMcpServerEnabled'), serverId: z.uuid(), enabled: z.boolean() }),
+  RequestIdSchema.extend({ type: z.literal('setAgentExtensionTools'), tools: AgentExtensionToolsSchema }),
+  RequestIdSchema.extend({ type: z.literal('listAgentMcpImportCandidates') }),
+  RequestIdSchema.extend({ type: z.literal('importAgentMcpServers'), items: z.array(AgentMcpImportSelectionSchema).min(1).max(64) }),
 ]).superRefine((request, context) => {
   if (request.type === 'switchControl') context.addIssue({ code: 'custom', message: 'Account control is managed internally.' });
 });
@@ -435,6 +446,8 @@ export const IpcResultSchema = z.union([
     }) }),
     z.strictObject({ type: z.literal('getManualUnsendWindow'), requestId: IdSchema, ok: z.literal(true), window: z.enum(['1h', '7d']) }),
     z.strictObject({ type: z.literal('setManualUnsendWindow'), requestId: IdSchema, ok: z.literal(true), window: z.enum(['1h', '7d']) }),
+    z.strictObject({ type: z.literal('getAgentPersona'), requestId: IdSchema, ok: z.literal(true), persona: AgentPersonaSchema }),
+    z.strictObject({ type: z.literal('setAgentPersona'), requestId: IdSchema, ok: z.literal(true), persona: AgentPersonaSchema }),
     z.strictObject({ type: z.literal('setAutoResponderSettings'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().positive() }),
     z.strictObject({ type: z.literal('accepted'), requestId: IdSchema, ok: z.literal(true), ownMid: z.string().regex(/^u[0-9a-fA-F]{32}$/).optional() }),
     z.strictObject({ type: z.literal('lineAdminPairing'), requestId: IdSchema, ok: z.literal(true), token: z.string().regex(/^\d{6}$/), expiresAt: TimestampSchema }),
@@ -496,6 +509,13 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('deleteAgentSchedule'), requestId: IdSchema, ok: z.literal(true) }),
     z.strictObject({ type: z.literal('listAgentScheduleRuns'), requestId: IdSchema, ok: z.literal(true), runs: z.array(AgentScheduleRunSchema).max(50) }),
     z.strictObject({ type: z.literal('listAgentScheduleTargets'), requestId: IdSchema, ok: z.literal(true), targets: z.array(AgentScheduleTargetOptionSchema).max(50) }),
+    z.strictObject({ type: z.literal('getAgentExtensions'), requestId: IdSchema, ok: z.literal(true), extensions: AgentExtensionsStateSchema }),
+    z.strictObject({ type: z.literal('saveAgentMcpServer'), requestId: IdSchema, ok: z.literal(true), server: AgentMcpServerSummarySchema }),
+    z.strictObject({ type: z.literal('deleteAgentMcpServer'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('setAgentMcpServerEnabled'), requestId: IdSchema, ok: z.literal(true), server: AgentMcpServerSummarySchema }),
+    z.strictObject({ type: z.literal('setAgentExtensionTools'), requestId: IdSchema, ok: z.literal(true), tools: AgentExtensionToolsSchema }),
+    z.strictObject({ type: z.literal('listAgentMcpImportCandidates'), requestId: IdSchema, ok: z.literal(true), listing: AgentMcpImportListingSchema }),
+    z.strictObject({ type: z.literal('importAgentMcpServers'), requestId: IdSchema, ok: z.literal(true), result: AgentMcpImportResultSchema }),
   ]),
   z.strictObject({ type: z.literal('error'), requestId: IdSchema, ok: z.literal(false), code: z.string().min(1),
     message: z.string().min(1), retryable: z.boolean(),

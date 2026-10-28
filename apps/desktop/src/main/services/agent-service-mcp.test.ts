@@ -268,7 +268,7 @@ describe('interactive approval binding at launch', () => {
     const f = fixture({ mint: (input) => { approvals.push(input.approval); return { endpoint: 'http://127.0.0.1:1/mcp', token: TOKEN }; } });
     Object.assign(f.job, jobExtra);
     const environment: AgentJobEnvironment = { prepare: async () => ({ ok: true, workspacePath: 'C:\trusted\room',
-      tools: { localTools: true, fileRead: true, fileWrite: true, linkedReadDirs: [], workspaceRootDir: null, level: 'workspace_write', interactiveApproval } }) };
+      tools: { localTools: true, fileRead: true, fileWrite: true, linkedReadDirs: [], projectDirs: [], workspaceRootDir: null, level: 'workspace_write', webTools: false, interactiveApproval } }) };
     const runner = {
       async *run(request: AgentRunRequest): AsyncIterable<AgentEvent> { f.requests.push(request); yield { type: 'started', externalSessionId: 's' }; yield { type: 'completed', finalText: 'ok' }; },
       async cancel() {},

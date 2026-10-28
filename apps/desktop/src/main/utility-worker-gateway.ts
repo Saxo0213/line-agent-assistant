@@ -917,6 +917,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
       chatType: command.chatType, chatId: command.chatId, requestId: command.requestId,
       text: command.text, replyToMessageId: command.replyToMessageId,
+      ...(!manual && command.mentions?.length ? { mentions: command.mentions } : {}),
       ...ownerFields(state.binding), operationId: command.requestId, attemptId: randomUUID(), effectPermit: randomUUID(),
     }) as ManualSendCommand;
     return queueWire(state, command.requestId, wireCommand, signal);

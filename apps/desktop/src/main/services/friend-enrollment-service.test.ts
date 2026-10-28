@@ -572,7 +572,7 @@ describe('FriendEnrollmentService', () => {
             if (admitted.has(e.messageId)) return []; admitted.add(e.messageId); return [e.messageId];
           }), jobMessageIds: [] };
         } } as never,
-      { async getConversationAgent() { return null; } } as never, { async send() {} },
+      { async getAppSetting() { return undefined; }, async getConversationAgent() { return null; } } as never, { async send() {} },
       { kick() { throw new Error('enrollment must not route'); }, async stopChat() {}, async resetChat() {} },
       undefined, undefined, (e, candidate, own, captured) => ctx.service.handle(e, candidate, own, captured), ctx.admins as never,
       undefined, undefined, undefined, (e, candidate, own) => ctx.service.classify(e, candidate, own));

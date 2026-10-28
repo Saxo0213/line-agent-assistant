@@ -63,7 +63,34 @@ export class RoomAutomationService implements RoomControlHandler {
     await this.autoresponders.finishReplyEffect(key, envelope.messageId, sent ? 'SENT' : 'UNKNOWN');
   }
 
+  /**
+   * Enables a group/room on the word of the account's Primary Administrator (no token round-trip) and returns the
+   * room's active grant. `announce` is true only when this call enabled the room. Null for any other sender or a non-Agent account.
+   */
+  async enableByPrimaryAdmin(scope: RoomActivationScope, adminUserId: string, sourceMessageId: string)
+    : Promise<{ grant: { grantId: string; version: number }; announce: boolean } | null> {
+    if (!await this.transport.isAgentAccount(scope.accountId)) return null;
+    const result = await this.rooms.enableByPrimaryAdmin(scope, { sourceMessageId, adminUserId });
+    if (result.disposition === 'not_primary_admin' || result.disposition === 'room_missing') return null;
+    const grant = await this.rooms.getActiveRoomAuthorization(scope);
+    return grant ? { grant, announce: result.disposition === 'enabled' } : null;
+  }
+
+  /** The room's name by the app-wide title rule, else a localized placeholder; the chat id is never shown. */
+  private async roomLabel(scope: RoomActivationScope): Promise<{ level: string; name: string }> {
+    const group = scope.chatType === 'group';
+    const title = await this.rooms.getRoomTitle(scope).catch(() => null);
+    return { level: linePrompt(this.locale, group ? 'roomTypeGroup' : 'roomTypeRoom'),
+      name: title ?? linePrompt(this.locale, group ? 'roomUnnamedGroup' : 'roomUnnamedRoom') };
+  }
+
   private async request(command: Extract<Parameters<RoomControlHandler['handle']>[0], { type: 'request' }>, binding: WorkerBinding): Promise<void> {
+    const scope: RoomActivationScope = { accountId: command.accountId, chatType: command.chatType, chatId: command.chatId };
+    const direct = await this.enableByPrimaryAdmin(scope, command.senderId, command.messageId);
+    if (direct) {
+      if (direct.announce) await this.sendOnce(scope, linePrompt(this.locale, 'roomActivated'), command.messageId, binding);
+      return;
+    }
     const created = await this.rooms.requestActivation({ accountId: command.accountId, chatType: command.chatType,
       chatId: command.chatId, sourceMessageId: command.messageId, requesterId: command.senderId });
     if (created.disposition !== 'created') return;
@@ -74,7 +101,7 @@ export class RoomAutomationService implements RoomControlHandler {
       token, digestKey: this.digestKey, digestKeyVersion: this.digestKeyVersion });
     if (!prepared) return;
     const adminSent = await this.sendOnce({ accountId: command.accountId, chatType: 'direct', chatId: claim.adminChatId },
-      linePrompt(this.locale, 'roomActivationAdmin', { level: command.chatType, code: command.chatId, token }),
+      linePrompt(this.locale, 'roomActivationAdmin', { ...await this.roomLabel(scope), token }),
       command.messageId, binding);
     if (!adminSent) await this.rooms.markChallengeDeliveryUnknown(created.requestId);
     await this.sendOnce({ accountId: command.accountId, chatType: command.chatType, chatId: command.chatId },

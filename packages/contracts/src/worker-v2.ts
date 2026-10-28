@@ -3,7 +3,7 @@ import { SafeDiagnosticSchema } from './diagnostics.js';
 import { AccountModeSchema, WritableConversationKeySchema, WorkerBindingSchema } from './account.js';
 import { NativeAttachmentDownloadInputSchema } from './native-source.js';
 import { JsonValueSchema } from './json.js';
-import { AttachmentResultSchema, InboundEnvelopeSchema } from './line.js';
+import { AttachmentResultSchema, InboundEnvelopeSchema, OutgoingMentionSchema, OUTGOING_MENTIONS_MAX, outgoingMentionsIssue } from './line.js';
 import { lineServerErrorMessage, type LineServerErrorCode } from './line-server-error.js';
 
 const Id = z.string().min(1);
@@ -159,7 +159,11 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Bound.extend({ type: z.literal('logout'), requestId: Id.max(128) }),
   Conversation.extend({ type: z.literal('cancelChatResourceRead'), requestId: Id.max(128) }),
   Conversation.extend({ type: z.literal('sendText'), requestId: Id, text: Id, replyToMessageId: Id.nullable(),
-    operationId: Id.optional(), attemptId: Id.optional(), effectPermit: Id.optional() }),
+    mentions: z.array(OutgoingMentionSchema).max(OUTGOING_MENTIONS_MAX).optional(),
+    operationId: Id.optional(), attemptId: Id.optional(), effectPermit: Id.optional() }).superRefine((command, context) => {
+    const issue = command.mentions && command.mentions.length > 0 ? outgoingMentionsIssue(command.text, command.mentions) : null;
+    if (issue) context.addIssue({ code: 'custom', path: ['mentions'], message: issue });
+  }),
   Conversation.extend({ type: z.literal('manualSendText'), requestId: Id, text: Id, replyToMessageId: Id.nullable(),
     operationId: Id.optional(), attemptId: Id.optional(), effectPermit: Id.optional() }),
   Conversation.extend({ type: z.literal('sendMedia'), chatType: z.enum(['direct', 'group']), requestId: Id,
