@@ -11,6 +11,15 @@ export const ENGLISH_UPDATE_COPY = {
   goDownload: 'Go to download',
   checkNow: 'Check now',
   navUpdateSuffix: ' (update available)',
+  promptTitle: 'New version v{arg0}',
+  update: 'Update',
+  ignore: 'Ignore',
+  updateNow: 'Update now',
+  downloading: 'Downloading…',
+  restarting: 'Restarting to finish the update…',
+  updateFailed: 'Update failed',
+  openDownloadPage: 'Open download page',
+  devNote: 'Auto install is unavailable in development; the download page opens instead.',
 } as const;
 export type UpdateCopyKey = keyof typeof ENGLISH_UPDATE_COPY;
 type UpdateCopy = Record<UpdateCopyKey, string>;
@@ -25,6 +34,15 @@ export const TRADITIONAL_CHINESE_UPDATE_COPY: UpdateCopy = {
   goDownload: '前往下載',
   checkNow: '立即檢查',
   navUpdateSuffix: '（有可用更新）',
+  promptTitle: '有新版本 v{arg0}',
+  update: '更新',
+  ignore: '忽略',
+  updateNow: '立即更新',
+  downloading: '下載中…',
+  restarting: '正在重新啟動以完成更新…',
+  updateFailed: '更新失敗',
+  openDownloadPage: '開啟下載頁',
+  devNote: '開發模式無法自動安裝，將改為開啟下載頁。',
 };
 
 export const JAPANESE_UPDATE_COPY: UpdateCopy = {
@@ -37,6 +55,15 @@ export const JAPANESE_UPDATE_COPY: UpdateCopy = {
   goDownload: 'ダウンロードへ',
   checkNow: '今すぐ確認',
   navUpdateSuffix: '（更新あり）',
+  promptTitle: '新しいバージョン v{arg0}',
+  update: '更新',
+  ignore: '無視',
+  updateNow: '今すぐ更新',
+  downloading: 'ダウンロード中…',
+  restarting: '更新を完了するため再起動しています…',
+  updateFailed: '更新に失敗しました',
+  openDownloadPage: 'ダウンロードページを開く',
+  devNote: '開発モードでは自動インストールできないため、ダウンロードページを開きます。',
 };
 
 export const KOREAN_UPDATE_COPY: UpdateCopy = {
@@ -49,6 +76,15 @@ export const KOREAN_UPDATE_COPY: UpdateCopy = {
   goDownload: '다운로드로 이동',
   checkNow: '지금 확인',
   navUpdateSuffix: ' (업데이트 있음)',
+  promptTitle: '새 버전 v{arg0}',
+  update: '업데이트',
+  ignore: '무시',
+  updateNow: '지금 업데이트',
+  downloading: '다운로드 중…',
+  restarting: '업데이트를 마치기 위해 다시 시작하는 중…',
+  updateFailed: '업데이트 실패',
+  openDownloadPage: '다운로드 페이지 열기',
+  devNote: '개발 모드에서는 자동 설치를 할 수 없어 다운로드 페이지를 엽니다.',
 };
 
 export function updateTextFor(locale: Locale, key: UpdateCopyKey, values?: Record<string, unknown>): string {

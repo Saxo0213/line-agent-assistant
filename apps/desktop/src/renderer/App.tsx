@@ -18,6 +18,7 @@ import { readStoredSettingsTab, storeSettingsTab, type SettingsTabId } from './s
 import { LocaleProvider, type LocaleState } from './locale-context.js';
 import { updateTextFor } from '../desktop-update-copy.js';
 import { useUpdateCheck } from './useUpdateCheck.js';
+import { UpdatePrompt } from './UpdatePrompt.js';
 import { LocalePreferenceSchema, type LocalePreference, type LocaleSnapshot } from '../locale.js';
 
 export type Page = 'conversations' | 'assistant' | 'schedules' | 'search' | 'jobs' | 'settings';
@@ -297,5 +298,6 @@ export function App({ api = window.lineAgent }: { api?: DesktopApi }) {
       </main>
     </div>
     {toast && <div role="status" className="system-toast">{generatedMessageText(toast)}</div>}
+    <UpdatePrompt api={api} />
   </div></LocaleProvider>;
 }

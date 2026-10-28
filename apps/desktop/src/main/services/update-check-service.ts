@@ -1,8 +1,8 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { isTrustedReleaseUrl, UPDATE_RELEASES_FALLBACK_URL, type UpdateCheckState } from '../../update-check-protocol.js';
+import { isTrustedReleaseUrl, UPDATE_RELEASES_FALLBACK_URL, UPDATE_REPO_NAME, UPDATE_REPO_OWNER, type UpdateCheckState } from '../../update-check-protocol.js';
 
-export const UPDATE_CHECK_API_URL = 'https://api.github.com/repos/Saxo0213/line-agent-assistant/releases/latest';
+export const UPDATE_CHECK_API_URL = `https://api.github.com/repos/${UPDATE_REPO_OWNER}/${UPDATE_REPO_NAME}/releases/latest`;
 export const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 export const UPDATE_CHECK_STARTUP_DELAY_MS = 60 * 1000;
 export const UPDATE_CHECK_ENABLE_DELAY_MS = 3 * 1000;
@@ -33,8 +33,19 @@ export type UpdateCheckPersisted = {
   latestVersion: string | null;
   releaseUrl: string | null;
   available: boolean;
+  ignoredVersion: string | null;
 };
-export const DEFAULT_PERSISTED: UpdateCheckPersisted = { enabled: true, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false };
+export const DEFAULT_PERSISTED: UpdateCheckPersisted = { enabled: true, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, ignoredVersion: null };
+
+/** The slice of electron-updater's AppUpdater that the service drives; injected so tests never touch the real updater. */
+export type AppUpdaterLike = {
+  autoDownload: boolean;
+  autoInstallOnAppQuit: boolean;
+  checkForUpdates(): Promise<{ isUpdateAvailable?: boolean; updateInfo?: { version?: string } } | null>;
+  downloadUpdate(): Promise<unknown>;
+  quitAndInstall(isSilent?: boolean, isForceRunAfter?: boolean): void;
+  on(event: string, listener: (...args: any[]) => void): unknown;
+};
 
 export type UpdateCheckStore = { load(): Promise<Partial<UpdateCheckPersisted> | null>; save(value: UpdateCheckPersisted): Promise<void> };
 
@@ -64,6 +75,12 @@ type Options = {
   onChange?: (state: UpdateCheckState) => void;
   now?: () => number;
   userAgent?: string;
+  /** False when not packaged: 「更新」 opens the release page instead of installing. */
+  canAutoInstall?: boolean;
+  /** Lazily creates the updater (electron-updater is only loaded when an install starts). */
+  getUpdater?: () => AppUpdaterLike;
+  /** Runs the normal service shutdown (PostgreSQL, workers, agents) and resolves true when it is safe to hand over to the installer. */
+  prepareInstall?: () => Promise<boolean>;
 };
 
 async function readCappedText(response: Response): Promise<string> {
@@ -95,6 +112,10 @@ export function createUpdateCheckService(options: Options) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let started = false;
   let saves: Promise<void> = Promise.resolve();
+  let download: UpdateCheckState['download'] = { status: 'idle', percent: 0 };
+  let installing = false;
+  let updater: AppUpdaterLike | undefined;
+  const canAutoInstall = options.canAutoInstall === true && options.getUpdater !== undefined;
 
   const state = (): UpdateCheckState => ({
     enabled: persisted.enabled,
@@ -104,6 +125,9 @@ export function createUpdateCheckService(options: Options) {
     latestVersion: persisted.enabled ? persisted.latestVersion : null,
     releaseUrl: persisted.enabled ? persisted.releaseUrl : null,
     available: persisted.enabled && persisted.available,
+    ignoredVersion: persisted.ignoredVersion,
+    download: { ...download },
+    canAutoInstall,
   });
   const publish = () => { try { options.onChange?.(state()); } catch { /* A broken listener must not break checks. */ } };
   const save = (): Promise<void> => {
@@ -123,6 +147,29 @@ export function createUpdateCheckService(options: Options) {
     const elapsed = now() - last;
     schedule(Number.isFinite(last) && elapsed >= 0 && elapsed < UPDATE_CHECK_INTERVAL_MS ? UPDATE_CHECK_INTERVAL_MS - elapsed : UPDATE_CHECK_STARTUP_DELAY_MS);
   };
+
+  async function openReleasePage(): Promise<boolean> {
+    const url = state().available ? persisted.releaseUrl : null;
+    if (!isTrustedReleaseUrl(url)) return false;
+    try { await options.openExternal(url); return true; } catch { return false; }
+  }
+
+  function ensureUpdater(): AppUpdaterLike {
+    if (updater) return updater;
+    const created = options.getUpdater!();
+    created.autoDownload = false;
+    created.autoInstallOnAppQuit = false;
+    // electron-updater emits 'error' besides rejecting; an emitter without a listener would throw.
+    created.on('error', () => undefined);
+    created.on('download-progress', (progress: { percent?: number }) => {
+      const percent = Math.min(100, Math.max(0, Math.floor(Number(progress?.percent) || 0)));
+      if (download.status !== 'downloading' || percent === download.percent) return;
+      download = { status: 'downloading', percent };
+      publish();
+    });
+    updater = created;
+    return created;
+  }
 
   async function fetchLatest(): Promise<{ version: string; url: string; available: boolean }> {
     if (!current) throw new Error('invalid current version');
@@ -157,6 +204,7 @@ export function createUpdateCheckService(options: Options) {
       const result = await fetchLatest();
       persisted = { ...persisted, lastCheckedAt: new Date(now()).toISOString(), lastCheckFailed: false,
         latestVersion: result.version, releaseUrl: result.url, available: result.available };
+      if (download.status === 'error' && !installing) download = { status: 'idle', percent: 0 };
     } catch {
       persisted = { ...persisted, lastCheckedAt: new Date(now()).toISOString(), lastCheckFailed: true };
     }
@@ -181,6 +229,7 @@ export function createUpdateCheckService(options: Options) {
           latestVersion: typeof saved.latestVersion === 'string' && parseReleaseVersion(saved.latestVersion) ? saved.latestVersion : null,
           releaseUrl: isTrustedReleaseUrl(saved.releaseUrl) ? saved.releaseUrl : null,
           available: saved.available === true,
+          ignoredVersion: typeof saved.ignoredVersion === 'string' && parseReleaseVersion(saved.ignoredVersion) ? saved.ignoredVersion : null,
         };
         if (!persisted.latestVersion) persisted.available = false;
       }
@@ -198,10 +247,47 @@ export function createUpdateCheckService(options: Options) {
       return state();
     },
     checkNow: check,
-    async openReleasePage(): Promise<boolean> {
-      const url = state().available ? persisted.releaseUrl : null;
-      if (!isTrustedReleaseUrl(url)) return false;
-      try { await options.openExternal(url); return true; } catch { return false; }
+    openReleasePage,
+    async ignore(version: string): Promise<UpdateCheckState> {
+      const parsed = parseReleaseVersion(version);
+      if (!parsed) return state();
+      persisted = { ...persisted, ignoredVersion: parsed.join('.') };
+      await save();
+      publish();
+      return state();
+    },
+    /** 「更新」: download with electron-updater, run the normal shutdown, then hand over to the silent installer. Falls back to the release page. */
+    async install(): Promise<UpdateCheckState> {
+      if (installing || !state().available) return state();
+      if (!canAutoInstall) { await openReleasePage(); return state(); }
+      installing = true;
+      download = { status: 'downloading', percent: 0 };
+      publish();
+      let target: AppUpdaterLike;
+      try {
+        target = ensureUpdater();
+        const result = await target.checkForUpdates();
+        // Releases without latest.yml reject here (404); an updater that sees no newer build resolves without an update.
+        if (!result || result.isUpdateAvailable === false) throw new Error('no updater metadata');
+      } catch {
+        installing = false;
+        download = { status: 'idle', percent: 0 };
+        publish();
+        await openReleasePage();
+        return state();
+      }
+      try {
+        await target.downloadUpdate();
+        download = { status: 'ready', percent: 100 };
+        publish();
+        if (!options.prepareInstall || !(await options.prepareInstall())) throw new Error('shutdown failed');
+        target.quitAndInstall(true, true);
+      } catch {
+        installing = false;
+        download = { status: 'error', percent: 0 };
+        publish();
+      }
+      return state();
     },
     stop() { clearTimer(); },
   };

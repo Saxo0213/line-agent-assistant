@@ -418,3 +418,9 @@ span.avatar-placeholder{background:#e6ecea;color:#6c817d}
 .nav-update-badge{position:absolute;top:2px;left:4px;display:grid;place-items:center;width:16px;height:16px;border-radius:50%;background:#805500;color:#fff;font-size:11px;font-weight:700;line-height:1;pointer-events:none}
 .update-check-settings{display:grid;gap:8px;max-width:420px;margin:12px 0}
 .update-check-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:var(--control-height)}
+.update-prompt{align-self:flex-end;flex:none;display:grid;gap:8px;width:min(360px,calc(100% - 32px));margin:0 16px 12px;padding:12px 14px;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 6px 20px #17232633}
+.update-prompt-actions{display:flex;justify-content:flex-end;gap:8px}
+.update-prompt-note{font-size:12px}
+.update-prompt-progress{display:grid;gap:4px;font-size:12px}
+.update-prompt-progress progress{width:100%;accent-color:var(--primary)}
+.update-prompt-error{color:var(--danger)}

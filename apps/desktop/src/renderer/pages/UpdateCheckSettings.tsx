@@ -14,7 +14,7 @@ export function formatCheckedAt(iso: string): string {
 export function UpdateCheckSettings({ api }: { api: DesktopApi }) {
   const locale = useDesktopLocale();
   const text = (key: UpdateCopyKey, values?: Record<string, unknown>) => updateTextFor(locale, key, values);
-  const { state, setEnabled, checkNow, openReleasePage } = useUpdateCheck(api);
+  const { state, setEnabled, checkNow, openReleasePage, install } = useUpdateCheck(api);
   if (!state) return null;
   const status = state.checking ? text('checking')
     : state.lastCheckFailed ? text('checkFailed')
@@ -31,7 +31,13 @@ export function UpdateCheckSettings({ api }: { api: DesktopApi }) {
     </div>
     {state.available && state.latestVersion && <div className="update-check-row">
       <strong>{text('latestVersion', { arg0: state.latestVersion })}</strong>
-      <button type="button" className="primary" onClick={openReleasePage}>{text('goDownload')}</button>
+      <span className="button-row">
+        <button type="button" className="primary" disabled={state.download.status === 'downloading' || state.download.status === 'ready'} onClick={install}>{text('updateNow')}</button>
+        <button type="button" onClick={openReleasePage}>{text('goDownload')}</button>
+      </span>
     </div>}
+    {state.available && state.download.status === 'downloading' && <span className="muted" role="status">{text('downloading')} {state.download.percent}%</span>}
+    {state.available && state.download.status === 'ready' && <span className="muted" role="status">{text('restarting')}</span>}
+    {state.available && state.download.status === 'error' && <span className="update-prompt-error" role="status">{text('updateFailed')}</span>}
   </div>;
 }

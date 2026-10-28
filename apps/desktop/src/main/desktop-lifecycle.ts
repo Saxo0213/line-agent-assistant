@@ -87,5 +87,25 @@ export function createDesktopLifecycle(options: {
     onBeforeQuit(): boolean { if (state === 'readyToExit') return true; void request('quit'); return false; },
     onClose(): boolean { if (state === 'readyToExit') return true; if (state === 'running') options.hide(); return false; },
     quit(): Promise<void> { return request('quit'); },
+    /** Drains services like `quit` but leaves the exit to the caller (the updater's quit-and-install); true when it is safe to quit. */
+    async prepareExit(): Promise<boolean> {
+      if (state === 'readyToExit') return true;
+      if (state !== 'running') return false;
+      state = 'draining';
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const completed = await Promise.race([options.closeServices().then(() => true),
+          new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), options.timeoutMs ?? 45_000); })]);
+        if (!completed) throw new Error('lifecycle_failure');
+        options.reportEvent?.('drain-completed', 'quit');
+        state = 'readyToExit';
+        return true;
+      } catch {
+        state = 'failed';
+        options.reportEvent?.('failed', 'quit');
+        try { await options.reportFailure?.('shutdown_failed'); } catch { /* reporting must not change the outcome */ }
+        return false;
+      } finally { if (timer) clearTimeout(timer); }
+    },
   };
 }

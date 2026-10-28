@@ -4157,19 +4157,21 @@ describe('conversation list view toggle and sorting', () => {
 
 describe('update check navigation badge', () => {
   const updateState = (patch: Record<string, unknown> = {}) => ({ enabled: true, checking: false, lastCheckedAt: '2026-10-28T02:00:00.000Z', lastCheckFailed: false,
-    latestVersion: '1.0.280', releaseUrl: 'https://github.com/Saxo0213/line-agent-assistant/releases/tag/v1.0.280', available: true, ...patch });
+    latestVersion: '1.0.280', releaseUrl: 'https://github.com/Saxo0213/line-agent-assistant/releases/tag/v1.0.280', available: true,
+    ignoredVersion: null, download: { status: 'idle' as const, percent: 0 }, canAutoInstall: true, ...patch });
 
   it('marks the settings nav item only while an update is available', async () => {
-    let push: ((state: ReturnType<typeof updateState>) => void) | undefined;
+    const listeners: Array<(state: ReturnType<typeof updateState>) => void> = [];
+    const push = (state: ReturnType<typeof updateState>) => listeners.forEach((listener) => listener(state));
     const api = fakeApi();
     api.getUpdateCheckState = vi.fn(async () => updateState());
-    api.onUpdateCheckState = vi.fn((callback) => { push = callback; return () => undefined; });
+    api.onUpdateCheckState = vi.fn((callback) => { listeners.push(callback); return () => undefined; });
     const { container } = render(<App api={api} />);
     const button = await screen.findByRole('button', { name: '設定（有可用更新）' });
     expect(button.getAttribute('title')).toBe('設定（有可用更新）');
     expect(button.querySelector('.nav-update-badge')?.textContent).toBe('!');
     expect(container.querySelectorAll('.nav-update-badge')).toHaveLength(1);
-    act(() => { push?.(updateState({ available: false, enabled: false })); });
+    act(() => { push(updateState({ available: false, enabled: false })); });
     await waitFor(() => expect(container.querySelector('.nav-update-badge')).toBeNull());
     expect(screen.getByRole('button', { name: '設定' })).toBeTruthy();
   });

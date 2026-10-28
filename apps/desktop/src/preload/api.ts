@@ -74,6 +74,8 @@ export type DesktopApi = {
   setUpdateCheckEnabled?(enabled: boolean): Promise<UpdateCheckState>;
   checkForUpdateNow?(): Promise<UpdateCheckState>;
   openUpdateReleasePage?(): Promise<UpdateCheckState>;
+  ignoreUpdateVersion?(version: string): Promise<UpdateCheckState>;
+  installUpdate?(): Promise<UpdateCheckState>;
   onUpdateCheckState?(callback: (state: UpdateCheckState) => void): () => void;
   getSnapshot(): Promise<AppSnapshot>;
   listMessages(key: ConversationKey, cursor: string | null, limit?: number, messageId?: string): Promise<MessagePage>;
@@ -246,6 +248,8 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     setUpdateCheckEnabled: (enabled) => updateCheck({ type: 'setEnabled', enabled }),
     checkForUpdateNow: () => updateCheck({ type: 'checkNow' }),
     openUpdateReleasePage: () => updateCheck({ type: 'openReleasePage' }),
+    ignoreUpdateVersion: (version) => updateCheck({ type: 'ignore', version }),
+    installUpdate: () => updateCheck({ type: 'install' }),
     onUpdateCheckState(callback) {
       const listener = (_event: unknown, payload: unknown) => { const parsed = UpdateCheckStateSchema.safeParse(payload); if (parsed.success) callback(parsed.data); };
       transport.on(UPDATE_CHECK_STATE_CHANNEL, listener);

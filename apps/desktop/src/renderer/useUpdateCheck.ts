@@ -19,5 +19,7 @@ export function useUpdateCheck(api: DesktopApi) {
     setEnabled: (enabled: boolean) => run(api.setUpdateCheckEnabled ? () => api.setUpdateCheckEnabled!(enabled) : undefined),
     checkNow: () => run(api.checkForUpdateNow),
     openReleasePage: () => run(api.openUpdateReleasePage),
+    ignore: (version: string) => run(api.ignoreUpdateVersion ? () => api.ignoreUpdateVersion!(version) : undefined),
+    install: () => run(api.installUpdate),
   };
 }

@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.279 adds the Schedules page with random start offsets, group free mode (`/free N`), Agent account lineage, shared contact cards, paged message queries, and an automatic update check. See the [v1.0.279 release notes](docs/releases/v1.0.279.md). Earlier changes are listed in [v1.0.270](docs/releases/v1.0.270.md) and [v1.0.261](docs/releases/v1.0.261.md).
+v1.0.280 adds in-app updates: a bottom-right prompt offers Update or Ignore, and Update downloads, verifies, and installs the new version. See the [v1.0.280 release notes](docs/releases/v1.0.280.md). Earlier changes are listed in [v1.0.279](docs/releases/v1.0.279.md) and [v1.0.270](docs/releases/v1.0.270.md).
 
 ## Installation
 

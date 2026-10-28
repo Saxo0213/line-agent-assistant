@@ -13,6 +13,11 @@ electronLanguages:
   - zh-CN
   - ja
   - ko
+publish:
+  - provider: github
+    owner: Saxo0213
+    repo: line-agent-assistant
+    releaseType: release
 directories:
   app: apps/desktop
   output: release

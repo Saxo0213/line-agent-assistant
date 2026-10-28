@@ -50,6 +50,7 @@ import { createLocaleSettings, getEffectiveLocale, setEffectiveLocaleReader } fr
 import { nativeDesktopText } from '../desktop-system-copy.js';
 import { createLocaleIpcAdapter } from './locale-ipc.js';
 import { createFileUpdateCheckStore, createUpdateCheckService, type UpdateCheckService } from './services/update-check-service.js';
+import { loadAppUpdater } from './services/app-updater.js';
 import { createUpdateCheckIpcAdapter } from './update-check-ipc.js';
 import { UPDATE_CHECK_CHANNEL, UPDATE_CHECK_STATE_CHANNEL } from '../update-check-protocol.js';
 
@@ -403,6 +404,7 @@ async function createWindow(setupOnly = false) {
     return localeRequest({ senderId: event.sender.id, url: event.senderFrame?.url ?? '' }, payload);
   });
   updateCheck ??= createUpdateCheckService({ currentVersion: app.getVersion(), fetch: (url, init) => net.fetch(url, init),
+    canAutoInstall: app.isPackaged, getUpdater: loadAppUpdater, prepareInstall: () => lifecycle.prepareExit(),
     store: createFileUpdateCheckStore(path.join(app.getPath('userData'), 'update-check.json')),
     openExternal: (url) => shell.openExternal(url),
     onChange: (state) => { if (window && !window.isDestroyed()) window.webContents.send(UPDATE_CHECK_STATE_CHANNEL, state); } });

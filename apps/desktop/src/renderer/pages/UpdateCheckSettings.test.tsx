@@ -10,7 +10,7 @@ import { formatCheckedAt, UpdateCheckSettings } from './UpdateCheckSettings.js';
 
 afterEach(cleanup);
 
-const base: UpdateCheckState = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false };
+const base: UpdateCheckState = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, ignoredVersion: null, download: { status: 'idle', percent: 0 }, canAutoInstall: true };
 function setup(initial: Partial<UpdateCheckState> = {}, locale: 'zh-TW' | 'en' = 'zh-TW') {
   let state: UpdateCheckState = { ...base, ...initial };
   const api = {
@@ -18,6 +18,7 @@ function setup(initial: Partial<UpdateCheckState> = {}, locale: 'zh-TW' | 'en' =
     setUpdateCheckEnabled: vi.fn(async (enabled: boolean) => (state = { ...state, enabled, ...(enabled ? {} : { available: false, latestVersion: null }) })),
     checkForUpdateNow: vi.fn(async () => (state = { ...state, lastCheckedAt: '2026-10-28T02:00:00.000Z' })),
     openUpdateReleasePage: vi.fn(async () => state),
+    installUpdate: vi.fn(async () => state),
     onUpdateCheckState: vi.fn(() => () => undefined),
   } as unknown as DesktopApi;
   const value: LocaleState = { status: 'loaded', effectiveLocale: locale, preference: locale, busy: false, error: null, retry() {}, retryRestart() {}, setPreference() {} };
@@ -50,6 +51,8 @@ describe('UpdateCheckSettings', () => {
     await screen.findByText('最新版本 1.0.280');
     fireEvent.click(screen.getByRole('button', { name: '前往下載' }));
     expect(api.openUpdateReleasePage).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: '立即更新' }));
+    expect(api.installUpdate).toHaveBeenCalledTimes(1);
   });
 
   it('toggles the switch and checks on demand, also while the switch is off', async () => {
