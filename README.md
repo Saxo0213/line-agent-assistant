@@ -11,7 +11,7 @@
 <ul>
 <li><strong>Agent account:</strong> Signs in to LINE, receives instructions from the administrator, and runs tasks through a locally installed Codex or Claude agent.</li>
 <li><strong>Administrator account:</strong> Supports sign-in or monitoring mode. Monitoring reads message records stored locally by LINE.</li>
-- Give local MCP clients read-only access to stored LINE conversations through `list_targets`, `query_target_messages`, and `query_target_messages_by_time`. The external endpoint does **not** offer internal Agent send tools or direct database, filesystem, or credential access.
+<li><strong>Message assistant:</strong> Shows conversations and attachments from both accounts in one place, searches message history, and lets the administrator ask the Agent to summarize conversations.</li>
 <li><strong>Conversation assistant:</strong> Lets the Agent participate in conversations, help download files and images, and set up automatic reply rules.</li>
 </ul>
 </td>
