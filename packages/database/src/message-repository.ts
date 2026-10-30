@@ -4,6 +4,7 @@ import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { parseLineStickerDescriptor, type StickerDescriptor } from './sticker-descriptor.js';
 import { CONVERSATION_TITLE_SQL, MEMBER_NAME_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nameFragments, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, upsertLineContacts, type LineContactInput } from './name-resolution.js';
 import { NativeSourceEnvelopeSchema, type NativeSourceEnvelope } from '@line-agent/contracts';
+import { ATTACHMENT_BLOCK_REASONS, isAttachmentBlockReason, type AttachmentBlockReason } from '@line-agent/contracts';
 import { bridgeLiveMessage, liveChatEventMids, postNotificationSubtypeFromRaw } from './content-bridge/index.js';
 import { loadChatEventNames } from './content-bridge/chat-event-names.js';
 import { nativeReactions, type MessageReaction } from './native-reactions.js';
@@ -156,6 +157,8 @@ export type AttachmentActivityRecord = {
 export type AttachmentStateRecord = {
   attachmentId: string; messageId: string; kind: Attachment['kind']; name: string; mimeType: string;
   sizeBytes: number; status: Attachment['status']; canRetryManually: boolean;
+  /** Why a queued attachment cannot download now. It is absent when the row has no block reason. */
+  blockReason?: AttachmentBlockReason;
 };
 export type TerminalAttachmentErrorRecord = Pick<AttachmentActivityRecord, 'accountId' | 'chatType' | 'chatId' | 'kind' | 'status' | 'retryCount' | 'updatedAt'>;
 
@@ -1150,7 +1153,7 @@ export class MessageRepository {
     if (attachmentIds.length === 0) return [];
     const result = await this.boundedRead<{
       attachment_id: string; message_id: string; kind: Attachment['kind']; name: string; mime_type: string;
-      size_bytes: string | number; status: Attachment['status']; can_retry_manually: boolean;
+      size_bytes: string | number; status: Attachment['status']; can_retry_manually: boolean; block_reason: string | null;
     }>(
       `SELECT a.attachment_id, a.message_id, a.kind, COALESCE(NULLIF(BTRIM(a.name), ''), '') AS name,
          COALESCE(a.mime_type,'application/octet-stream') AS mime_type, COALESCE(a.size_bytes,0) AS size_bytes,
@@ -1167,17 +1170,19 @@ export class MessageRepository {
              OR EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
                AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR')))
            OR (a.status='queued' AND EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
-             AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR'))), FALSE) AS can_retry_manually
+             AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR'))), FALSE) AS can_retry_manually,
+         CASE WHEN a.status='queued' AND a.error = ANY($6::text[]) THEN a.error END AS block_reason
        FROM attachments a JOIN messages m ON m.account_id=a.account_id AND m.chat_type=a.chat_type
          AND m.chat_id=a.chat_id AND m.message_id=a.message_id
        JOIN line_accounts la ON la.account_id=a.account_id
        WHERE a.account_id=$1 AND a.chat_type=$2 AND a.chat_id=$3 AND a.attachment_id=ANY($4::uuid[])
        LIMIT 225`,
-      [key.accountId, key.chatType, key.chatId, [...new Set(attachmentIds)], automaticAttemptLimit],
+      [key.accountId, key.chatType, key.chatId, [...new Set(attachmentIds)], automaticAttemptLimit, [...ATTACHMENT_BLOCK_REASONS]],
     );
     return result.rows.map((row) => ({ attachmentId: row.attachment_id, messageId: row.message_id, kind: row.kind,
       name: row.name, mimeType: row.mime_type, sizeBytes: Number(row.size_bytes), status: row.status,
-      canRetryManually: row.can_retry_manually }));
+      canRetryManually: row.can_retry_manually,
+      ...(row.status === 'queued' && isAttachmentBlockReason(row.block_reason) ? { blockReason: row.block_reason } : {}) }));
   }
 
   async listAttachmentActivity(limit = 100): Promise<AttachmentActivityRecord[]> {
@@ -1374,11 +1379,18 @@ export class MessageRepository {
   private async recoverAttachmentRows(client: PoolClient, accountId?: string, automaticAttemptLimit = 3): Promise<void> {
     await client.query(
       `UPDATE attachments SET status = 'expired', download_attempt_token = NULL, download_owner_id = NULL,
-         download_worker_instance_id = NULL, download_worker_binding_epoch = NULL, download_lease_expires_at = NULL, error = 'Attachment retry expired', updated_at = now()
+         download_worker_instance_id = NULL, download_worker_binding_epoch = NULL, download_lease_expires_at = NULL,
+         error = COALESCE(NULLIF(error, ''), 'Attachment retry expired'), updated_at = now()
        WHERE ($1::text IS NULL OR account_id = $1) AND status IN ('queued','failed')
          AND ((expires_at IS NOT NULL AND expires_at <= now()) OR (NOT EXISTS (SELECT 1 FROM message_source_provenance p
            WHERE p.account_id=attachments.account_id AND p.message_id=attachments.message_id AND p.origin='EXTERNAL_MONITOR')
-           AND created_at + interval '7 days' <= now()))`, [accountId ?? null],
+           AND created_at + interval '7 days' <= now())
+           -- An External Monitor row expires 7 days after the message time. The UI already projects this state.
+           OR (EXISTS (SELECT 1 FROM message_source_provenance p
+             WHERE p.account_id=attachments.account_id AND p.message_id=attachments.message_id AND p.origin='EXTERNAL_MONITOR')
+           AND EXISTS (SELECT 1 FROM messages m WHERE m.account_id=attachments.account_id AND m.chat_type=attachments.chat_type
+             AND m.chat_id=attachments.chat_id AND m.message_id=attachments.message_id
+             AND m.occurred_at < now() - interval '7 days')))`, [accountId ?? null],
     );
     await client.query(
       `UPDATE attachments a SET status = CASE WHEN a.expires_at <= now() THEN 'expired' ELSE 'failed' END,
@@ -1457,6 +1469,34 @@ export class MessageRepository {
       [automaticAttemptLimit],
     );
     return result.rows[0]?.wake_at?.getTime() ?? null;
+  }
+
+  /**
+   * Keep the reason why a queued attachment cannot download now in `error`.
+   * It writes only when the value changes, and only on a queued row with no error or with a block reason.
+   * It does not claim the row and does not change the retry count or the download order.
+   */
+  async setAttachmentBlockReason(attachmentId: string, reason: AttachmentBlockReason): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE attachments SET error = $2 WHERE attachment_id = $1 AND status = 'queued'
+         AND error IS DISTINCT FROM $2 AND (error IS NULL OR error = ANY($3::text[]))`,
+      [attachmentId, reason, [...ATTACHMENT_BLOCK_REASONS]]);
+    return result.rowCount === 1;
+  }
+
+  /**
+   * One bounded backfill for old External Monitor rows. No scan selects them, so they keep no reason.
+   * It returns the number of rows changed. The caller repeats it while the count equals the limit.
+   */
+  async backfillExternalAttachmentBlockReasons(limit = 1000): Promise<number> {
+    const bounded = Math.max(1, Math.min(5000, Math.trunc(limit)));
+    const result = await this.pool.query(
+      `UPDATE attachments SET error = 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' WHERE attachment_id IN (
+         SELECT a.attachment_id FROM attachments a WHERE a.status = 'queued' AND a.error IS NULL
+           AND EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
+             AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR')
+         ORDER BY a.attachment_id LIMIT $1)`, [bounded]);
+    return result.rowCount ?? 0;
   }
 
   async getAttachmentBySource(key: ConversationKey, messageId: string, externalAttachmentId: string): Promise<Attachment | null> {

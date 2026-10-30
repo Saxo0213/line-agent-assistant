@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { SafeDiagnosticSchema } from './diagnostics.js';
-import { AccountModeSchema, WritableConversationKeySchema, WorkerBindingSchema } from './account.js';
+import { DIAGNOSTIC_DETAIL_PATTERN, SafeDiagnosticSchema, SendDetailSchema } from './diagnostics.js';
+import { AccountModeSchema, CHROMEOS_APPLICATION, resolveLineTransport, WritableConversationKeySchema, WorkerBindingSchema } from './account.js';
 import { NativeAttachmentDownloadInputSchema } from './native-source.js';
 import { JsonValueSchema } from './json.js';
 import { AttachmentResultSchema, InboundEnvelopeSchema, OutgoingMentionSchema, OUTGOING_MENTIONS_MAX, outgoingMentionsIssue } from './line.js';
@@ -28,7 +28,7 @@ export const WORKER_PROTOCOL_VERSION = 4 as const;
 export const WORKER_ERROR_CODES = ['INVALID_COMMAND', 'QUEUE_FULL', 'CATALOG_REFRESH_FAILED', 'WORKER_OPERATION_FAILED',
   'HISTORY_READ_FAILED', 'CHAT_RESOURCE_READ_FAILED', 'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED',
   'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED', 'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED',
-  'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED'] as const;
+  'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED', 'CHROME_LTSM_UNAVAILABLE'] as const;
 export type WorkerErrorCode = typeof WORKER_ERROR_CODES[number] | LineServerErrorCode;
 const WorkerErrorCodeSchema = z.union([z.enum(WORKER_ERROR_CODES),
   z.custom<LineServerErrorCode>((value) => lineServerErrorMessage(value) !== null)]);
@@ -48,7 +48,8 @@ const LoginFailure = z.union([
   LoginAttempt.extend({ type: z.literal('loginFailure'), code: z.literal('LOGIN_TIMEOUT'), message: z.literal(LOGIN_FAILURES.LOGIN_TIMEOUT) }),
   LoginAttempt.extend({ type: z.literal('loginFailure'), code: z.literal('LOGIN_IN_PROGRESS'), message: z.literal(LOGIN_FAILURES.LOGIN_IN_PROGRESS) }),
   LoginAttempt.extend({ type: z.literal('loginFailure'), code: z.literal('LOGIN_ATTEMPT_REPLACED'), message: z.literal(LOGIN_FAILURES.LOGIN_ATTEMPT_REPLACED) }),
-  LoginAttempt.extend({ type: z.literal('loginFailure'), code: z.literal('LOGIN_FAILED'), message: z.literal(LOGIN_FAILURES.LOGIN_FAILED) }),
+  LoginAttempt.extend({ type: z.literal('loginFailure'), code: z.literal('LOGIN_FAILED'), message: z.literal(LOGIN_FAILURES.LOGIN_FAILED),
+    detail: z.string().regex(DIAGNOSTIC_DETAIL_PATTERN).optional() }),
 ]);
 const Secrets = z.strictObject({ token: Id.nullable(), qrCert: Id.nullable(), e2eeStorage: JsonValueSchema.nullable() });
 export const ConversationCatalogMemberSchema = z.strictObject({
@@ -145,7 +146,22 @@ export const ChatResourceReadResultSchema = Conversation.extend({ type: z.litera
 
 export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Bound.extend({ type: z.literal('init'), protocolVersion: z.literal(WORKER_PROTOCOL_VERSION), mode: AccountModeSchema, durableCursor: TalkCursorV1Schema,
-    purpose: WorkerPurposeSchema.optional(), expectedMid: Id.optional(), application: z.string().min(1).max(512).optional() }),
+    purpose: WorkerPurposeSchema.optional(), expectedMid: Id.optional(), application: z.string().min(1).max(512).optional(),
+    /** Absolute path of the ltsm store root under app userData. Only meaningful (and only allowed) for CHROMEOS. */
+    chromeLtsmDir: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/).optional(),
+    /** Absolute path of the LINE traffic log directory under app userData. A worker without it does not log. */
+    trafficLogDir: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/).optional() }).superRefine((command, context) => {
+    if (resolveLineTransport(command.lineTransport) === 'DESKTOPWIN') {
+      if (command.chromeLtsmDir !== undefined) context.addIssue({ code: 'custom', path: ['chromeLtsmDir'], message: 'chromeLtsmDir requires lineTransport CHROMEOS' });
+      return;
+    }
+    if (command.application !== undefined && command.application !== CHROMEOS_APPLICATION) {
+      context.addIssue({ code: 'custom', path: ['application'], message: 'CHROMEOS application must be absent or the pinned CHROMEOS value' });
+    }
+    if (command.purpose === 'DOWNLOAD_ONLY') {
+      context.addIssue({ code: 'custom', path: ['purpose'], message: 'CHROMEOS has no download-only auth' });
+    }
+  }),
   Bound.extend({ type: z.literal('adoptDownloadAuth'), requestId: Id, token: z.string().min(1).max(1024),
     application: z.string().min(1).max(512), expectedMid: Id, probe: DownloadAuthProbeSchema.optional() }),
   LoginAttempt.extend({ type: z.literal('loginQr') }),
@@ -217,6 +233,8 @@ export const LineWorkerEventSchema = z.union([
   Conversation.extend({ type: z.literal('historyResult'), requestId: Id, nextCursor: Id.nullable(), envelopes: z.array(InboundEnvelopeSchema) }),
   ChatResourceReadResultSchema,
   Bound.extend({ type: z.literal('sendResult'), requestId: Id, status: z.enum(['sent', 'failed', 'unknown']), messageId: Id.nullable(), error: z.string().nullable(),
+    /** Bounded failure detail (for example the media upload stage); see SendDetailSchema. */
+    detail: SendDetailSchema.optional(),
     operationId: Id.optional(), attemptId: Id.optional() }),
   Conversation.extend({ type: z.literal('unsendResult'), requestId: Id, messageId: Decimal, status: z.enum(['unsent', 'failed', 'unknown']), error: z.string().nullable() }),
   Bound.extend({ type: z.literal('friendRelationResult'), requestId: Id, targetMid: UserMid,
@@ -233,7 +251,9 @@ export const LineWorkerEventSchema = z.union([
   Bound.extend({ type: z.literal('addFriendResult'), requestId: Id, targetMid: UserMid,
     status: z.enum(['added', 'failed', 'unknown']), error: z.string().nullable() }),
   Bound.extend({ type: z.literal('error'), code: WorkerErrorCodeSchema, message: Id, retryable: z.boolean(),
-    diagnostic: SafeDiagnosticSchema.optional(), requestId: Id.max(128).optional() }),
+    diagnostic: SafeDiagnosticSchema.optional(), requestId: Id.max(128).optional(),
+    /** Status of the CHROMEOS ltsm store; present only with code CHROME_LTSM_UNAVAILABLE. */
+    chromeLtsmStatus: z.enum(['missing', 'wrong-version', 'corrupt']).optional() }),
   AttachmentResultSchema,
   Bound.extend({ type: z.literal('attachmentCancelAck'), attachmentId: z.uuid(), attemptToken: z.uuid(), cancelled: z.boolean() }),
 ]);

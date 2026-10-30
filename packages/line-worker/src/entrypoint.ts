@@ -1,10 +1,14 @@
 import { LineWorkerCommandSchema, LineWorkerEventSchema, LOGIN_FAILURES,
   type LineWorkerCommand, type LineWorkerEvent, type WorkerErrorCode } from '@line-agent/contracts';
+import { resolveLineTransport } from '@line-agent/contracts';
 import { createLinejsAdapter } from './linejs-adapter.js';
+import { createChromeAdapter, isChromeLtsmUnavailable } from './chrome-adapter.js';
 import { LineWorkerLoop, type LineTransport, type LineWorkerOptions } from './worker-loop.js';
 import { createWindowsAttachmentBroker } from './windows-attachment-broker.js';
 import { DIAGNOSTIC_OPERATIONS, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { isLineServerRejection } from './line-server-error.js';
+import { buildLoginFailureDetail } from './login-failure-detail.js';
+import { startTrafficLog } from './traffic-log.js';
 
 const COMMAND_TYPES: ReadonlySet<string> = new Set(LineWorkerCommandSchema.options.map((option) => option.shape.type.value));
 const DIAGNOSTIC_OPERATION_SET: ReadonlySet<string> = new Set(DIAGNOSTIC_OPERATIONS);
@@ -191,10 +195,17 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
           : localMessage === 'login in progress' || localMessage === 'secret restore in progress' ? 'LOGIN_IN_PROGRESS'
             : localMessage === 'login attempt mismatch' || localMessage === 'LINE credential operation is stale'
               ? 'LOGIN_ATTEMPT_REPLACED' : 'LOGIN_FAILED';
+        const detail = code === 'LOGIN_FAILED' ? buildLoginFailureDetail(error) : undefined;
         await emit({ type: 'loginFailure', ...identity, loginAttemptId: command.loginAttemptId, code,
-          message: LOGIN_FAILURES[code] } as Extract<LineWorkerEvent, { type: 'loginFailure' }>);
+          message: LOGIN_FAILURES[code], ...(detail === undefined ? {} : { detail }) } as Extract<LineWorkerEvent, { type: 'loginFailure' }>);
       } else if (error instanceof Error && 'code' in error && error.code === 'PROTOCOL_UNVERIFIED') {
         await emit({ type: 'status', ...identity, state: 'PROTOCOL_UNVERIFIED', message: null });
+      } else if (isChromeLtsmUnavailable(error)) {
+        // CHROMEOS without usable ltsm assets: a typed, path-free report with the store status; the process stays up.
+        await emit({ type: 'error', ...identity, code: 'CHROME_LTSM_UNAVAILABLE', message: error.message, retryable: false,
+          chromeLtsmStatus: error.status,
+          diagnostic: { operation: command?.type === 'init' ? 'init' : 'unknown', stage: 'bootstrap', category: 'unavailable',
+            recovery: 'check_configuration', outcome: 'failed' } });
       } else {
         const diagnostic = commandExecutionStarted ? operationError(command)
           : { code: 'INVALID_COMMAND' as const, message: 'Worker command rejected' };
@@ -321,14 +332,47 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
   });
 }
 
+export type TransportFactoryDeps = Readonly<{
+  createLinejs?: typeof createLinejsAdapter;
+  createChrome?: typeof createChromeAdapter;
+  /** CHROMEOS HTTP client (Node global fetch / undici by default; never Electron net). */
+  chromeFetch?: (input: string, init: RequestInit) => Promise<Response>;
+}>;
+
+/**
+ * Selects the transport by `init.lineTransport` (absent means DESKTOPWIN). DESKTOPWIN is constructed exactly as before;
+ * CHROMEOS gets its own factory and a store root from `init.chromeLtsmDir`.
+ */
+export function createTransportFactory(deps: TransportFactoryDeps = {}): (init: Init) => Promise<LineTransport> {
+  return (init) => {
+    // Observation only. The log never changes a request, and a log failure never fails the factory.
+    if (init.trafficLogDir !== undefined) {
+      try {
+        startTrafficLog({ directory: init.trafficLogDir, processKind: 'worker', accountId: init.accountId,
+          transport: resolveLineTransport(init.lineTransport) });
+      } catch { /* The traffic log is optional. */ }
+    }
+    if (resolveLineTransport(init.lineTransport) === 'CHROMEOS') {
+      return (deps.createChrome ?? createChromeAdapter)({
+        accountId: init.accountId, workerInstanceId: init.workerInstanceId,
+        controlEpoch: init.controlEpoch, mode: init.mode,
+        validateLease: () => true,
+        fetch: deps.chromeFetch ?? ((input, requestInit) => fetch(input, requestInit)),
+        ...(init.chromeLtsmDir === undefined ? {} : { ltsmRoot: init.chromeLtsmDir }),
+      });
+    }
+    return (deps.createLinejs ?? createLinejsAdapter)({
+      accountId: init.accountId, workerInstanceId: init.workerInstanceId,
+      controlEpoch: init.controlEpoch, mode: init.mode,
+      ...(init.purpose === 'DOWNLOAD_ONLY' && init.application ? { application: init.application } : {}),
+      validateLease: () => true,
+      physicalTransport: fetchLineRequest,
+    });
+  };
+}
+
 /** Production bootstrap: no renderer-supplied method names or physical transport state. */
 export function startLineWorkerProcess(port: WorkerPort, options: Readonly<{ attachmentRoot: string }>): void {
-  runWorkerLoopOnPort(port, (init) => createLinejsAdapter({
-    accountId: init.accountId, workerInstanceId: init.workerInstanceId,
-    controlEpoch: init.controlEpoch, mode: init.mode,
-    ...(init.purpose === 'DOWNLOAD_ONLY' && init.application ? { application: init.application } : {}),
-    validateLease: () => true,
-    physicalTransport: fetchLineRequest,
-  }), { attachmentRoot: options.attachmentRoot,
+  runWorkerLoopOnPort(port, createTransportFactory(), { attachmentRoot: options.attachmentRoot,
     attachmentRuntime: { windowsSafetyBroker: createWindowsAttachmentBroker() } });
 }

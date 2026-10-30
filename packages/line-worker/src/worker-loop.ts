@@ -12,8 +12,9 @@ import { mkdir, open, statfs } from 'node:fs/promises';
 import { sanitizeAttachmentFilename, storeAttachment, type AttachmentStoreRuntime } from './attachment-store.js';
 import { SafeAttachmentError } from './attachment-error.js';
 import { validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
-import { isChatResourceFailure, safeChatResourceFailureDetails, type ChatResourceFailureKind, type ChatResourceResponseCode } from './chat-resource-error.js';
+import { isChatResourceFailure, isChatResourceUnsupported, safeChatResourceFailureDetails, type ChatResourceFailureKind, type ChatResourceResponseCode } from './chat-resource-error.js';
 import { isLineServerRejection } from './line-server-error.js';
+import { tagLoginStage } from './login-failure-detail.js';
 
 export type TransportIdentity = Readonly<{ ownMid: string; displayName: string | null; picturePath?: string | null }>;
 export type SyncItem = unknown | Readonly<{
@@ -75,10 +76,67 @@ export interface LineTransport {
   revoke?(): void;
 }
 
-/** Thrown by a transport when a media send failed before `sendMessage` started: nothing was sent. */
+/** Step of a media send that failed before `sendMessage` started. The set is closed; it never holds free text. */
+export type MediaUploadStage = 'media_size' | 'e2ee_flow' | 'encrypt' | 'obs_upload' | 'obs_preview' | 'e2ee_message';
+
+/** Error class name reduced to letters only (at most 40 characters). Undefined when the value has no usable class. */
+export function boundedErrorClass(error: unknown): string | undefined {
+  try {
+    if (error === null || (typeof error !== 'object' && typeof error !== 'function')) return undefined;
+    const name = (error as { constructor?: { name?: unknown } }).constructor?.name;
+    if (typeof name !== 'string') return undefined;
+    return name.replace(/[^A-Za-z]/g, '').slice(0, 40) || undefined;
+  } catch { return undefined; }
+}
+
+/** One numeric LINE code or HTTP status of an error, if it has one. LINE codes come first because they are more exact. */
+export function boundedErrorNumber(error: unknown): number | undefined {
+  try {
+    if (error === null || typeof error !== 'object') return undefined;
+    const record = error as { innerCode?: unknown; code?: unknown; status?: unknown };
+    for (const value of [record.innerCode, record.code, record.status]) {
+      if (typeof value === 'number' && Number.isSafeInteger(value) && Math.abs(value) <= 1_000_000_000) return value;
+    }
+  } catch { /* A hostile getter is not evidence. */ }
+  return undefined;
+}
+
+/**
+ * Thrown by a transport when a media send failed before `sendMessage` started: nothing was sent.
+ * `stage`, `causeClass` and `causeNumber` are bounded evidence; the error keeps no message text, path, key or token.
+ */
 export class MediaUploadFailedError extends Error {
   readonly code = 'UPLOAD_FAILED';
-  constructor() { super('LINE media upload failed'); this.name = 'MediaUploadFailedError'; }
+  readonly stage: MediaUploadStage | undefined;
+  readonly causeClass: string | undefined;
+  readonly causeNumber: number | undefined;
+  constructor(stage?: MediaUploadStage, cause?: unknown) {
+    super('LINE media upload failed');
+    this.name = 'MediaUploadFailedError';
+    this.stage = stage;
+    this.causeClass = boundedErrorClass(cause);
+    this.causeNumber = boundedErrorNumber(cause);
+  }
+  /** Safe detail text for the sendResult event: stage, cause class and number joined by a colon. */
+  get detail(): string | undefined {
+    const parts = [this.stage, this.causeClass, this.causeNumber === undefined ? undefined : String(this.causeNumber)]
+      .filter((part): part is string => part !== undefined);
+    return parts.length > 0 ? parts.join(':') : undefined;
+  }
+}
+
+const taggedStages = new WeakMap<object, MediaUploadStage>();
+/** Remembers the media step in which a gate denial or a LINE rejection happened. Returns the same error. */
+export function tagMediaStage<T>(error: T, stage: MediaUploadStage): T {
+  if (error !== null && typeof error === 'object') taggedStages.set(error, stage);
+  return error;
+}
+/** Safe detail of a media send failure: upload failures and tagged gate denials or LINE rejections. */
+export function mediaFailureDetail(error: unknown): string | undefined {
+  if (error instanceof MediaUploadFailedError) return error.detail;
+  const stage = error !== null && typeof error === 'object' ? taggedStages.get(error) : undefined;
+  if (stage === undefined) return undefined;
+  return [stage, boundedErrorClass(error), boundedErrorNumber(error)].filter((part) => part !== undefined).join(':');
 }
 
 class MediaFileError extends Error {
@@ -294,6 +352,7 @@ export class LineWorkerLoop {
       if (command.type === 'stop') this.#receiveGeneration += 1;
     }
     if (this.#eventFailure && ['setSecretState', 'loginQr', 'loginToken', 'poll', 'history', 'chatResourceRead', 'sendText', 'manualSendText', 'sendMedia', 'downloadAttachment', 'checkFriendRelation', 'addFriendByMid', 'unsendMessage'].includes(command.type)) {
+      if (command.type === 'loginQr' || command.type === 'loginToken') tagLoginStage(this.#eventFailure, 'event_failure');
       throw this.#eventFailure;
     }
     if (command.type === 'init') {
@@ -384,16 +443,24 @@ export class LineWorkerLoop {
         this.#loginInFlight = true;
         try {
           await this.#emit({ type: 'status', ...this.#identity(), state: 'connecting', message: null });
-          const result = await this.#withCredentialSwap(() => command.type === 'loginQr'
-            ? this.#transport.loginQr()
-            : this.#transport.loginToken(this.#requireToken()), null);
-          if (this.#stopped) return;
-          this.#ownMid = result.ownMid;
-          this.#resetCatalogRefresh();
-          await this.#emit({ type: 'login', ...this.#identity(), loginAttemptId: command.loginAttemptId,
-            ownMid: result.ownMid, displayName: result.displayName, ...(result.picturePath === undefined ? {} : { picturePath: result.picturePath }) });
-          await this.#emit({ type: 'status', ...this.#identity(), state: 'ready', message: null });
-          this.#startCatalogRefresh();
+          let loginStage = 'credential_swap';
+          try {
+            const result = await this.#withCredentialSwap(() => command.type === 'loginQr'
+              ? this.#transport.loginQr()
+              : this.#transport.loginToken(this.#requireToken()), null);
+            if (this.#stopped) return;
+            loginStage = 'login_event';
+            this.#ownMid = result.ownMid;
+            this.#resetCatalogRefresh();
+            await this.#emit({ type: 'login', ...this.#identity(), loginAttemptId: command.loginAttemptId,
+              ownMid: result.ownMid, displayName: result.displayName, ...(result.picturePath === undefined ? {} : { picturePath: result.picturePath }) });
+            await this.#emit({ type: 'status', ...this.#identity(), state: 'ready', message: null });
+            this.#startCatalogRefresh();
+          } catch (error) {
+            // A diagnostic tag only; the first tag (from the transport) stays.
+            tagLoginStage(error, loginStage);
+            throw error;
+          }
         } finally { this.#loginInFlight = false; }
         return;
       }
@@ -685,14 +752,14 @@ export class LineWorkerLoop {
   #emitLoginEvent(type: 'qr' | 'pin', value: { code: string } | { pin: string }): void {
     if (!this.#loginAttemptId || !this.#binding) return;
     try { this.#queueEvent({ type, ...this.#identity(), loginAttemptId: this.#loginAttemptId, ...value }); }
-    catch (error) { this.#eventFailure = error instanceof Error ? error : new Error('private event queue failed'); }
+    catch (error) { tagLoginStage(error, 'login_event_queue'); this.#eventFailure = error instanceof Error ? error : new Error('private event queue failed'); }
   }
   #emitSecretRotation(): void {
     if (!this.#loginAttemptId || !this.#binding) return;
     try {
       this.#queueEvent({ type: 'secretRotation', ...this.#identity(), loginAttemptId: this.#loginAttemptId,
         secrets: structuredClone(this.#secrets) });
-    } catch (error) { this.#eventFailure = error instanceof Error ? error : new Error('private event queue failed'); }
+    } catch (error) { tagLoginStage(error, 'secret_export'); this.#eventFailure = error instanceof Error ? error : new Error('private event queue failed'); }
   }
   async #poll(): Promise<void> {
     if (this.#polling || this.#authInvalidated) return;
@@ -803,6 +870,7 @@ export class LineWorkerLoop {
       const reason = controller.signal.aborted ? controller.signal.reason as { code?: unknown } | undefined : undefined;
       if (reason?.code === 'TIMEOUT') await fail('TIMEOUT');
       else if (controller.signal.aborted) await fail('CANCELLED');
+      else if (isChatResourceUnsupported(error)) await fail('UNSUPPORTED');
       else if (isChatResourceFailure(error)) await fail(error.category,
         error.category === 'response_code_invalid' ? error.responseCode : undefined,
         error.failureKind ?? safeChatResourceFailureDetails(error).failureKind, error.upstreamStatus, error.upstreamCode);
@@ -1011,9 +1079,10 @@ export class LineWorkerLoop {
 
   async #sendMedia(command: Extract<LineWorkerCommand, { type: 'sendMedia' }>): Promise<void> {
     const identity = this.#identity();
-    const result = (status: 'sent' | 'failed' | 'unknown', messageId: string | null, error: string | null) =>
+    const result = (status: 'sent' | 'failed' | 'unknown', messageId: string | null, error: string | null, detail?: string) =>
       this.#emit({ type: 'sendResult', ...identity, requestId: command.requestId,
-        operationId: command.operationId, attemptId: command.attemptId, status, messageId, error });
+        operationId: command.operationId, attemptId: command.attemptId, status, messageId, error,
+        ...(detail === undefined ? {} : { detail }) });
     const owned = this.#binding!.transportOwnerId !== undefined;
     const permit = command.effectPermit;
     const validEffectPermit = !owned || (command.transportOwnerId === identity.transportOwnerId &&
@@ -1063,9 +1132,9 @@ export class LineWorkerLoop {
           new Promise<{ timeout: true }>((resolve) => { timer = setTimeout(() => resolve({ timeout: true }), command.timeoutMs); })]);
         if ('value' in outcome) await result('sent', outcome.value.messageId, null);
         else if ('timeout' in outcome) await result('unknown', null, 'TRANSPORT_OUTCOME_UNKNOWN');
-        else if (outcome.error instanceof EffectDeniedError) await result('failed', null, 'SIDE_EFFECT_DENIED');
-        else if (outcome.error instanceof MediaUploadFailedError) await result('failed', null, 'UPLOAD_FAILED');
-        else if (isLineServerRejection(outcome.error)) await result('failed', null, outcome.error.code);
+        else if (outcome.error instanceof EffectDeniedError) await result('failed', null, 'SIDE_EFFECT_DENIED', mediaFailureDetail(outcome.error));
+        else if (outcome.error instanceof MediaUploadFailedError) await result('failed', null, 'UPLOAD_FAILED', outcome.error.detail);
+        else if (isLineServerRejection(outcome.error)) await result('failed', null, outcome.error.code, mediaFailureDetail(outcome.error));
         else await result('unknown', null, 'TRANSPORT_OUTCOME_UNKNOWN');
       } finally {
         if (timer !== undefined) clearTimeout(timer);

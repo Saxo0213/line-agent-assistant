@@ -1,6 +1,8 @@
 import { useDesktopText } from './desktop-i18n.js';
 import { useEffect, useState } from 'react';
 import type { DesktopApi } from '../preload/api.js';
+import type { AttachmentBlockReason } from '@line-agent/contracts';
+import { attachmentBlockReasonKey } from './desktop-i18n.js';
 
 export type FileAttachmentCardData = {
   id: string;
@@ -9,6 +11,8 @@ export type FileAttachmentCardData = {
   sizeBytes: number;
   status: string;
   canRetryManually?: boolean | undefined;
+  /** Why a queued attachment cannot download now. It replaces the plain queued text. */
+  blockReason?: AttachmentBlockReason | undefined;
   durationMs?: number | null | undefined;
 };
 
@@ -39,7 +43,7 @@ export function FileAttachmentCard({ attachment, api, onDownload, onOpen, showOp
   }, [api, extension]);
 
   const retryable = attachment.canRetryManually === true && accountConnected;
-  const statusLabel: Record<string, string> = { queued: desktopText('notDownloaded'), downloading: desktopText('downloading'), ready: desktopText('readyToOpen'), failed: desktopText('downloadFailed'), expired: desktopText('downloadRetryPeriodExpired') };
+  const statusLabel: Record<string, string> = { queued: desktopText(attachment.blockReason ? attachmentBlockReasonKey(attachment.blockReason) : 'notDownloaded'), downloading: desktopText('downloading'), ready: desktopText('readyToOpen'), failed: desktopText('downloadFailed'), expired: desktopText('downloadRetryPeriodExpired') };
   return <div className="file-attachment-card">
     <span className="file-attachment-icon" aria-hidden="true">{icon ? <img src={icon} alt="" width="32" height="32" /> : <svg className="file-attachment-glyph" viewBox="0 0 24 24" width="28" height="28" focusable="false"><path fill="currentColor" d="M6 2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm7 1.5V9h5.5L13 3.5z" /></svg>}</span>
     <span className="file-attachment-details">

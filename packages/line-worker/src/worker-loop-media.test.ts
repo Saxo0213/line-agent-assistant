@@ -7,7 +7,7 @@ import { LineWorkerEventSchema } from '@line-agent/contracts';
 import { FakeLineTransport } from './fake-transport.js';
 import { LineServerRejection } from './line-server-error.js';
 import { EffectDeniedError } from './mutation-gate.js';
-import { LineWorkerLoop, MediaUploadFailedError } from './worker-loop.js';
+import { LineWorkerLoop, MediaUploadFailedError, tagMediaStage } from './worker-loop.js';
 
 const owner = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7,
   transportOwnerId: 'owner-1', transportGeneration: 4, writeGrantVersion: 9 };
@@ -93,6 +93,55 @@ describe('worker sendMedia', () => {
     transport.sendMediaError = new EffectDeniedError('denied');
     await worker.handle({ ...command, requestId: 'm3', effectPermit: 'permit-3' });
     expect(events.at(-1)).toMatchObject({ status: 'failed', error: 'SIDE_EFFECT_DENIED' });
+  });
+
+  it('sends the upload stage, error class and number as a bounded detail', async () => {
+    const { worker, transport, events, command } = await setup();
+    class ObsHttpError extends Error { constructor(readonly status: number) { super('OBS /private/path token=abc'); } }
+    transport.sendMediaError = new MediaUploadFailedError('obs_upload', new ObsHttpError(403));
+    await worker.handle(command);
+    expect(events.at(-1)).toMatchObject({ status: 'failed', error: 'UPLOAD_FAILED', detail: 'obs_upload:ObsHttpError:403' });
+    expect(LineWorkerEventSchema.safeParse(events.at(-1)).success).toBe(true);
+    expect(JSON.stringify(events)).not.toMatch(/private|token=abc/);
+    // Only a LINE code (innerCode / code) comes before an HTTP status; a class name keeps letters only.
+    const lineError = Object.assign(new (class Chrome_Api$Error extends Error {})('x'), { innerCode: 10051, code: 5, status: 200 });
+    transport.sendMediaError = new MediaUploadFailedError('e2ee_message', lineError);
+    await worker.handle({ ...command, requestId: 'm2', effectPermit: 'permit-2' });
+    expect(events.at(-1)).toMatchObject({ status: 'failed', error: 'UPLOAD_FAILED', detail: 'e2ee_message:ChromeApiError:10051' });
+    transport.sendMediaError = new MediaUploadFailedError('e2ee_flow');
+    await worker.handle({ ...command, requestId: 'm3', effectPermit: 'permit-3' });
+    expect(events.at(-1)).toMatchObject({ error: 'UPLOAD_FAILED', detail: 'e2ee_flow' });
+    transport.sendMediaError = new MediaUploadFailedError();
+    await worker.handle({ ...command, requestId: 'm4', effectPermit: 'permit-4' });
+    expect(events.at(-1)).toMatchObject({ error: 'UPLOAD_FAILED' });
+    expect(events.at(-1)).not.toHaveProperty('detail');
+  });
+
+  it('bounds the class name and ignores unusable numbers', async () => {
+    const huge = new (class extends Error {})('x');
+    Object.defineProperty(huge.constructor, 'name', { value: 'A1_b'.repeat(30) });
+    Object.assign(huge, { status: 2 ** 40, code: 'E_STRING' });
+    const error = new MediaUploadFailedError('encrypt', huge);
+    expect(error.causeClass).toBe('Ab'.repeat(30).slice(0, 40));
+    expect(error.causeNumber).toBeUndefined();
+    expect(error.detail).toMatch(/^encrypt:[A-Za-z]{1,40}$/);
+    expect(new MediaUploadFailedError('encrypt', 'a string').detail).toBe('encrypt');
+    expect(new MediaUploadFailedError('encrypt', null).detail).toBe('encrypt');
+  });
+
+  it('tags a gate denial or LINE rejection with the media step in which it happened', async () => {
+    const { worker, transport, events, command } = await setup();
+    transport.sendMediaError = tagMediaStage(new EffectDeniedError('media upload path is not allowlisted'), 'obs_preview');
+    await worker.handle(command);
+    expect(events.at(-1)).toMatchObject({ status: 'failed', error: 'SIDE_EFFECT_DENIED', detail: 'obs_preview:EffectDeniedError' });
+    expect(JSON.stringify(events.at(-1))).not.toContain('allowlisted');
+    transport.sendMediaError = tagMediaStage(new LineServerRejection('LINE_TALK_E2EE_UPDATE_RECEIVER_KEY', 84), 'e2ee_message');
+    await worker.handle({ ...command, requestId: 'm2', effectPermit: 'permit-2' });
+    expect(events.at(-1)).toMatchObject({ status: 'failed', error: 'LINE_TALK_E2EE_UPDATE_RECEIVER_KEY', detail: expect.stringMatching(/^e2ee_message:/) });
+    expect(LineWorkerEventSchema.safeParse(events.at(-1)).success).toBe(true);
+    transport.sendMediaError = new EffectDeniedError('untagged');
+    await worker.handle({ ...command, requestId: 'm3', effectPermit: 'permit-3' });
+    expect(events.at(-1)).not.toHaveProperty('detail');
   });
 
   it('keeps a media preparation server rejection as a fixed code without leaking server text', async () => {

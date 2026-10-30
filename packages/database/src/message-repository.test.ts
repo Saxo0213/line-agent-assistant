@@ -55,14 +55,16 @@ describe('bounded exact attachment state reads', () => {
       { attachmentId: id, messageId: 'older-visible', kind: 'file', name: 'report.pdf', mimeType: 'application/pdf', sizeBytes: 2048, status: 'ready', canRetryManually: false },
       { attachmentId: retryableId, messageId: 'retryable-failed', kind: 'file', name: 'retry.pdf', mimeType: 'application/pdf', sizeBytes: 1024, status: 'queued', canRetryManually: false },
     ]);
-    expect(values).toEqual(['account-A', 'group', 'chat-A', [id, retryableId], 3]);
+    expect(values).toEqual(['account-A', 'group', 'chat-A', [id, retryableId], 3, expect.any(Array)]);
     const select = statements.find((sql) => sql.startsWith('SELECT a.attachment_id')) ?? '';
     expect(select).toContain('a.account_id=$1 AND a.chat_type=$2 AND a.chat_id=$3 AND a.attachment_id=ANY($4::uuid[])');
     expect(select).toContain('LIMIT 225');
     expect(select).toMatch(/a\.status='expired'.*AS can_retry_manually/s);
     expect(select).toContain("m.occurred_at < now() - interval '7 days'");
     expect(select).toContain("FROM attachments a JOIN messages m");
-    expect(select).not.toMatch(/relative_path|sha256|error|secret/i);
+    const projection = "CASE WHEN a.status='queued' AND a.error = ANY($6::text[]) THEN a.error END AS block_reason";
+    expect(select).toContain(projection);
+    expect(select.replace(projection, '')).not.toMatch(/relative_path|sha256|error|secret/i);
     expect(statements).toEqual(['BEGIN READ ONLY', "SET LOCAL statement_timeout = '2000ms'", select, 'COMMIT']);
     await expect(repository.listAttachmentStates({ accountId: 'account-A', chatType: 'group', chatId: 'chat-A' }, Array(226).fill(id))).rejects.toThrow(/225/);
     expect(statements).toHaveLength(4);

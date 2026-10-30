@@ -37,6 +37,11 @@ export type AlbumTaskFailureStage = 'archive_scan' | 'album_list' | 'album_list_
   | 'photo_download' | 'photo_pagination' | 'archive_contains' | 'archive_write' | 'source_validation' | 'unknown';
 export type AlbumTaskFailureCode = 'ALBUM_RECONCILIATION_FAILED' | 'ALBUM_ARCHIVE_INCOMPLETE' | 'ALBUM_PHOTO_CURSOR_LOOP';
 export type AlbumFailureContext = AlbumFailureContextDto;
+/** The worker reported that this login method has no Notes or Albums. Main sends the IPC error code UNSUPPORTED. */
+export class ChatResourceUnsupportedError extends Error {
+  readonly code = 'UNSUPPORTED';
+  constructor() { super('UNSUPPORTED'); this.name = 'ChatResourceUnsupportedError'; }
+}
 export class AlbumArchiveFailure extends Error {
   constructor(readonly failureContext: AlbumFailureContext) { super(failureContext.code); this.name = 'AlbumArchiveFailure'; }
 }
@@ -1106,7 +1111,8 @@ export class ChatResourceArchiveService {
       || response.accountId !== key.accountId || response.workerInstanceId !== binding.workerInstanceId || response.controlEpoch !== binding.controlEpoch
       || response.chatType !== key.chatType || response.chatId !== key.chatId) throw new Error('Invalid LINE resource response.');
     if (!response.ok) {
-      const error = new Error(isChatResourceFailureCode(response.error) ? 'LINE_READ_FAILED' : response.error ?? 'LINE resource read failed.');
+      const error = response.error === 'UNSUPPORTED' ? new ChatResourceUnsupportedError()
+        : new Error(isChatResourceFailureCode(response.error) ? 'LINE_READ_FAILED' : response.error ?? 'LINE resource read failed.');
       markChatResourceDiagnosticLogged(error);
       throw error;
     }

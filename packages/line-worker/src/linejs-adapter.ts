@@ -12,11 +12,12 @@ import {
   type ChatResourceFetchEffect,
   type TrustedInvocationDispatch, type TrustedRequestClient,
 } from './mutation-gate.js';
-import { MediaUploadFailedError } from './worker-loop.js';
+import { MediaUploadFailedError, tagMediaStage, type MediaUploadStage } from './worker-loop.js';
 import type { FriendAddResult, FriendRelation, FriendRelationDiagnostic, LineTransport, RelationCancellation, SyncResult, TransportIdentity } from './worker-loop.js';
 import type { HistoryCursorV1 } from './cursor.js';
 import { safeRaw } from './normalizer.js';
 import { verifyLinejsPackage } from './version.js';
+import { trafficLabel } from './traffic-log.js';
 import { SafeAttachmentError } from './attachment-error.js';
 import { parseEncryptedAccessToken, validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { boundedChatResourceResponseCode, ChatResourceFailure, safeChatResourceFailureDetails,
@@ -61,14 +62,14 @@ const FRIEND_ADD_RESULT_ERRORS = [
 ] as const;
 const FRIEND_ADD_REJECTION_NAMES = new Set<string>(FRIEND_ADD_RESULT_ERRORS);
 
-function friendAddResultCode(value: unknown): RelationAddServerErrorCode | null {
+export function friendAddResultCode(value: unknown): RelationAddServerErrorCode | null {
   if (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < FRIEND_ADD_RESULT_ERRORS.length) {
     return relationAddServerError(FRIEND_ADD_RESULT_ERRORS[value])?.code ?? null;
   }
   return null;
 }
 
-function friendAddRejectionReason(value: unknown): RelationAddServerErrorCode | null {
+export function friendAddRejectionReason(value: unknown): RelationAddServerErrorCode | null {
   return friendAddResultCode(value) ?? (typeof value === 'string' && FRIEND_ADD_REJECTION_NAMES.has(value)
     ? relationAddServerError(value)?.code ?? null : null);
 }
@@ -106,6 +107,11 @@ export type LinejsAdapterOptions = Readonly<ControlLease & {
   physicalTransport: (request: Request) => Promise<Response>;
   packageRoot?: string;
 }>;
+
+/** An OBS upload answered with a non-2xx status. The number is a property, so the media failure detail keeps it. */
+export class ObsUploadHttpError extends Error {
+  constructor(readonly status: number) { super(`OBS upload HTTP ${status}`); this.name = 'ObsUploadHttpError'; }
+}
 
 export class ProtocolUnverifiedError extends Error {
   readonly code = 'PROTOCOL_UNVERIFIED';
@@ -674,10 +680,13 @@ export class LinejsAdapter implements LineTransport {
             // linejs appends "/r/..." to a prefix that already ends in "/", so the path arrives as "//r/...".
             const url = new URL(request.url);
             url.pathname = url.pathname.replace(/^\/{2,}/, '/');
+            // Read the body first. A stream body makes fetch use chunked Transfer-Encoding without
+            // Content-Length, and the OBS server then answers HTTP 411. A buffered body gives Content-Length.
+            const body = await request.arrayBuffer();
             const bounded = new Request(url, { method: request.method, headers: request.headers,
-              body: request.body, duplex: 'half', redirect: 'error', signal: request.signal } as RequestInit);
+              body, redirect: 'error', signal: request.signal });
             const response = await this.#gate.runMediaUpload(upload, bounded);
-            if (!response.ok) throw new Error(`OBS upload HTTP ${response.status}`);
+            if (!response.ok) throw new ObsUploadHttpError(response.status);
             return response;
           }
           const direct = this.#directFetchContext.getStore();
@@ -762,7 +771,8 @@ export class LinejsAdapter implements LineTransport {
     base.request.request = (async (...args: Parameters<typeof original>) => {
       const [value, methodName, protocolType = 3, _parse = true, path = '/S3', headers = {}] = args;
       if (!dispatchContext.getStore()) throw new EffectDeniedError('RequestClient call is outside effect phase');
-      return sourceContext.run({ value, methodName, path, protocolType, headers }, async () => {
+      // The traffic log reads this label when undici creates the request. It only observes.
+      return trafficLabel.run(methodName, () => sourceContext.run({ value, methodName, path, protocolType, headers }, async () => {
         try { return await original(...args); }
         catch (error) {
           if (error !== null && (typeof error === 'object' || typeof error === 'function')) {
@@ -780,7 +790,7 @@ export class LinejsAdapter implements LineTransport {
           }
           throw error;
         }
-      });
+      }));
     }) as typeof base.request.request;
     this.#gate = createMutationGate({ accountId: options.accountId, workerInstanceId: options.workerInstanceId, controlEpoch: options.controlEpoch,
       requestClient, physicalTransport: async (request) => {
@@ -1433,29 +1443,34 @@ export class LinejsAdapter implements LineTransport {
     const scope = this.#gate.openMediaUploadScope(lease, media.kind, manual);
     try {
       let prepared: { objId: string; size: number; chunks: Buffer[] };
+      // The step that is running; a failure keeps it so the cause of an upload failure is known. The order of the steps is unchanged.
+      let stage: MediaUploadStage = 'encrypt';
       try {
         const { keyMaterial, encryptedData } = await this.#base.e2ee.encryptByKeyMaterial(media.bytes);
         const encrypted = new Blob([new Uint8Array(encryptedData.buffer, encryptedData.byteOffset, encryptedData.byteLength) as never]);
         const params = { type: 'file' };
         const objId = await this.#mediaUploadContext.run(scope, async () => {
+          stage = 'obs_upload';
           const first = await this.#base.obs.uploadObjectForService({ data: encrypted, oType: 'file',
             obsPath: `talk/${namespace}/reqid-${randomUUID()}`, params });
           if (first.objId === '') throw new Error('OBS object id missing');
           if (media.kind === 'image') {
             // No separate thumbnail: the preview is the same encrypted data, as linejs does without one.
+            stage = 'obs_preview';
             const preview = await this.#base.obs.uploadObjectForService({ data: encrypted, oType: 'file',
               obsPath: `talk/${namespace}/${first.objId}__ud-preview`, params });
             if (preview.objId !== first.objId) throw new Error('OBS preview object id mismatch');
           }
           return first.objId;
         });
+        stage = 'e2ee_message';
       const chunks = await this.#gate.invokeRpc({ phase: manual ? 'MONITOR_READ' : 'CONTROL_READ', lease }, () =>
           this.#base.e2ee.encryptE2EEMessage(conversation.chatId, { keyMaterial, fileName: media.fileName },
             contentType as never)) as Buffer[];
         prepared = { objId, size: encrypted.size, chunks };
       } catch (error) {
-        if (error instanceof EffectDeniedError || isLineServerRejection(error)) throw error;
-        throw new MediaUploadFailedError();
+        if (error instanceof EffectDeniedError || isLineServerRejection(error)) throw tagMediaStage(error, stage);
+        throw new MediaUploadFailedError(stage, error);
       }
       const extension = media.fileName.split('.').at(-1);
       const result = await this.#gate.invokeRpc({ phase: manual ? 'MANUAL_SEND' : 'CONTROL_SEND', lease }, () => this.#base.talk.sendMessage({

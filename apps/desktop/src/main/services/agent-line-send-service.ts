@@ -32,6 +32,8 @@ import type { PoolClient } from 'pg';
 import type { SendMediaRequest } from '../connected-facade.js';
 import { resolveManagedAttachment } from '../security.js';
 import { splitDeliveryText } from './delivery-service.js';
+import type { OperationalAudit } from './operational-audit.js';
+import { gatewayFault, recordSendFault, sendFaultDbCode, sendFaultDetail, workerFault, type SendFault } from './send-failure.js';
 
 /** list_send_targets queries that mean the administrator (compared lower-cased). */
 export const ADMIN_QUERY_ALIASES: ReadonlySet<string> = new Set(['管理員', '主要管理者', '管理者', 'admin', 'administrator', 'me', '我']);
@@ -66,6 +68,8 @@ export interface AgentLineSendOptions {
   canWriteLine(accountId: string): Promise<boolean>;
   /** Root of the stored attachments (resolved with the same safe resolver the open/preview path uses). */
   attachmentRoot: string;
+  /** Operational audit: one row for each failed or unknown item, with the real cause as bounded enums and numbers. */
+  audit?: Pick<OperationalAudit, 'observed'>;
   /** Test hook: per-call budget. */
   callBudgetMs?: number;
 }
@@ -431,7 +435,12 @@ export class AgentLineSendService implements AgentLineSendHandler {
       this.active = entry;
       let result: McpSendResult;
       try { result = await this.process(entry); }
-      catch { result = { index: entry.item.index, status: 'unknown', code: 'send_unknown' }; }
+      catch {
+        const fault: SendFault = { source: 'local', outcome: 'unknown', code: 'process_error' };
+        result = { index: entry.item.index, status: 'unknown', code: 'send_unknown', detail: sendFaultDetail(fault) };
+        recordSendFault(this.options.audit, { accountId: entry.call.plan.accountId, jobId: entry.call.plan.jobId, requestId: randomUUID(),
+          operation: entry.item.kind === 'text' ? 'sendText' : 'sendMedia' }, fault);
+      }
       finally { this.active = undefined; }
       if (result.status === 'failed' || result.status === 'unknown') this.haltQueued(entry.call);
       entry.resolve(result);
@@ -444,7 +453,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     const index = item.index;
     if (call.halted || this.stopping || !call.isLive()) return skipped(index);
     const byteSize = item.kind === 'text' ? item.byteSize : item.sizeBytes;
-    const record = (status: LineSendAuditRow['status'], code: SendErrorCode | null) => this.audit({
+    const record = (status: LineSendAuditRow['status'], code: string | null) => this.audit({
       jobId: plan.jobId, accountId: plan.accountId, principalId: plan.principalId, chatType: plan.chatType, chatId: plan.chatId,
       itemIndex: index, itemKind: item.auditKind, byteSize, status, errorCode: code });
     const unavailable = async (sent: boolean): Promise<McpSendResult> => {
@@ -460,16 +469,20 @@ export class AgentLineSendService implements AgentLineSendHandler {
       return binding && binding.controlEpoch === call.baseline.controlEpoch
         && binding.workerInstanceId === call.baseline.workerInstanceId ? binding : null;
     };
-    const finish = (result: SendResult, requestId: string, binding: ActiveBinding): 'sent' | 'failed' | 'unknown' => {
+    /** The worker result is the truth only when it matches this request and binding; the worker error code and detail are kept. */
+    const finish = (result: SendResult, requestId: string, binding: ActiveBinding): 'sent' | SendFault => {
       const matches = result.requestId === requestId && result.accountId === plan.accountId
         && result.workerInstanceId === binding.workerInstanceId && result.controlEpoch === binding.controlEpoch;
-      if (matches && result.status === 'sent' && result.messageId) return 'sent';
-      return matches && result.status === 'failed' ? 'failed' : 'unknown';
+      if (!matches) return { source: 'local', outcome: 'unknown', code: 'result_mismatch' };
+      if (result.status === 'sent') return result.messageId ? 'sent' : { source: 'local', outcome: 'unknown', code: 'no_message_id' };
+      return workerFault(result, result.status === 'failed' ? 'failed' : 'unknown');
     };
-    const outcomeResult = async (outcome: 'failed' | 'unknown'): Promise<McpSendResult> => {
-      const code: SendErrorCode = outcome === 'failed' ? 'send_failed' : 'send_unknown';
-      await record(outcome, code);
-      return { index, status: outcome, code };
+    const operation = item.kind === 'text' ? 'sendText' as const : 'sendMedia' as const;
+    const outcomeResult = async (fault: SendFault, requestId: string): Promise<McpSendResult> => {
+      const code: SendErrorCode = fault.outcome === 'failed' ? 'send_failed' : 'send_unknown';
+      await record(fault.outcome, sendFaultDbCode(fault));
+      recordSendFault(this.options.audit, { accountId: plan.accountId, jobId: plan.jobId, requestId, operation }, fault);
+      return { index, status: fault.outcome, code, detail: sendFaultDetail(fault) };
     };
 
     if (item.kind === 'text') {
@@ -478,14 +491,14 @@ export class AgentLineSendService implements AgentLineSendHandler {
         const binding = await fresh();
         if (!binding) return unavailable(sentParts > 0);
         const requestId = randomUUID();
-        let outcome: 'sent' | 'failed' | 'unknown';
+        let outcome: 'sent' | SendFault;
         try {
           const result = await this.options.worker.send({ type: 'sendText', accountId: plan.accountId, chatType: plan.chatType,
             chatId: plan.chatId, workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch, requestId,
             text: part, replyToMessageId: null }, this.controller.signal);
           outcome = finish(result, requestId, binding);
-        } catch { outcome = 'unknown'; }
-        if (outcome !== 'sent') return outcomeResult(outcome);
+        } catch (error) { outcome = gatewayFault(error); }
+        if (outcome !== 'sent') return outcomeResult(outcome, requestId);
         sentParts += 1;
       }
       await record('sent', null);
@@ -508,15 +521,15 @@ export class AgentLineSendService implements AgentLineSendHandler {
     const binding = await fresh();
     if (!binding) return unavailable(false);
     const requestId = randomUUID();
-    let outcome: 'sent' | 'failed' | 'unknown';
+    let outcome: 'sent' | SendFault;
     try {
       const result = await sendMedia.call(this.options.worker, { accountId: plan.accountId, workerInstanceId: binding.workerInstanceId,
         controlEpoch: binding.controlEpoch, chatType: plan.chatType, chatId: plan.chatId, requestId, kind: item.mediaKind,
         filePath: item.absolutePath, fileName: item.name, sizeBytes: item.sizeBytes, sha256: hashed.sha256 } as SendMediaRequest,
       this.controller.signal);
       outcome = finish(result, requestId, binding);
-    } catch { outcome = 'unknown'; }
-    if (outcome !== 'sent') return outcomeResult(outcome);
+    } catch (error) { outcome = gatewayFault(error); }
+    if (outcome !== 'sent') return outcomeResult(outcome, requestId);
     await record('sent', null);
     return { index, status: 'sent' };
   }

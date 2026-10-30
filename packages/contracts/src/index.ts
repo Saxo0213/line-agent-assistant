@@ -20,3 +20,5 @@ export * from './content-type.js';
 export * from './redaction.js';
 export * from './worker-v2.js';
 export * from './diagnostics.js';
+export * from './chrome-login.js';
+export * from './attachment-block.js';

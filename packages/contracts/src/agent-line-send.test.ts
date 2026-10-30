@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MCP_TOOL_NAMES, McpInternalToolNameSchema, McpListSendTargetsInputSchema, McpListSendTargetsOutputSchema, McpSendToTargetInputSchema,
-  McpSendToTargetOutputSchema, McpToolNameSchema, SendErrorCodeSchema,
+  McpSendToTargetOutputSchema, McpToolNameSchema, SendErrorCodeSchema, LineWorkerEventSchema, lineResultErrorMessage,
 } from './index.js';
 
 const text = { type: 'text', text: 'hi' };
@@ -56,5 +56,36 @@ describe('Agent LINE send contract', () => {
     expect(McpSendToTargetOutputSchema.safeParse({ results: [{ index: 0, status: 'denied' }] }).success).toBe(false);
     expect(McpSendToTargetOutputSchema.safeParse({ results: [{ index: 0, status: 'failed', code: 'nope' }] }).success).toBe(false);
     expect(SendErrorCodeSchema.options).toHaveLength(12);
+  });
+
+  it('accepts an optional bounded detail on a result and refuses an unsafe or long one', () => {
+    const output = (detail: unknown) => McpSendToTargetOutputSchema.safeParse({ results: [{ index: 0, status: 'failed', code: 'send_failed', detail }] }).success;
+    expect(output('UPLOAD_FAILED:obs_upload:ObsHttpError:403')).toBe(true);
+    expect(output('gateway:queue_full')).toBe(true);
+    expect(output('LINE_TALK_ABUSE_BLOCK')).toBe(true);
+    expect(output('a'.repeat(120))).toBe(true);
+    expect(output('a'.repeat(121))).toBe(false);
+    expect(output('')).toBe(false);
+    for (const unsafe of ['has space', '/etc/passwd', 'C:\\Users\\x', 'u0123456789abcdef', 'token=abc', 'line\nbreak', '日本語']) {
+      if (/^[A-Za-z0-9_:.-]+$/.test(unsafe)) continue;
+      expect(output(unsafe)).toBe(false);
+    }
+    expect(McpSendToTargetOutputSchema.safeParse({ results: [{ index: 0, status: 'sent' }] }).success).toBe(true);
+  });
+
+  it('carries the bounded detail on the worker sendResult event and refuses an unsafe one', () => {
+    const base = { type: 'sendResult', accountId: 'a', workerInstanceId: 'w', controlEpoch: 1, requestId: 'r', status: 'failed', messageId: null, error: 'UPLOAD_FAILED' };
+    expect(LineWorkerEventSchema.safeParse({ ...base, detail: 'obs_upload:ObsHttpError:403' }).success).toBe(true);
+    expect(LineWorkerEventSchema.safeParse(base).success).toBe(true);
+    expect(LineWorkerEventSchema.safeParse({ ...base, detail: '/private/path' }).success).toBe(false);
+    expect(LineWorkerEventSchema.safeParse({ ...base, detail: 'x'.repeat(121) }).success).toBe(false);
+  });
+
+  it('appends a safe detail to a local result failure text and keeps the old text without one', () => {
+    expect(lineResultErrorMessage('UPLOAD_FAILED', 'fallback')).toBe('UPLOAD_FAILED');
+    expect(lineResultErrorMessage('UPLOAD_FAILED', 'fallback', 'obs_upload:ObsHttpError:403')).toBe('UPLOAD_FAILED:obs_upload:ObsHttpError:403');
+    expect(lineResultErrorMessage('UPLOAD_FAILED', 'fallback', '/private/path')).toBe('UPLOAD_FAILED');
+    expect(lineResultErrorMessage('SOMETHING_ELSE', 'fallback', 'obs_upload')).toBe('fallback');
+    expect(lineResultErrorMessage(null, 'fallback', 'obs_upload')).toBe('fallback');
   });
 });

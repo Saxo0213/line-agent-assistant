@@ -1,3 +1,5 @@
+import { SendDetailSchema } from './diagnostics.js';
+
 /** Fixed TalkException projections shared by the adapter, worker, and desktop. */
 export const TALK_SERVER_ERRORS = {
   ILLEGAL_ARGUMENT: [0, 'LINE 請求參數無效。'],
@@ -174,6 +176,8 @@ export function isLineServerErrorCode(code: unknown): code is LineServerErrorCod
 const LOCAL_RESULT_FAILURES = ['SIDE_EFFECT_DENIED', 'LOCAL_ROUTE_DENIED', 'FILE_CHANGED', 'FILE_UNREADABLE', 'UPLOAD_FAILED'] as const;
 
 /** Keep only stable machine codes when projecting a worker failure into UI text. */
-export function lineResultErrorMessage(code: unknown, fallback: string): string {
-  return typeof code === 'string' && LOCAL_RESULT_FAILURES.includes(code as typeof LOCAL_RESULT_FAILURES[number]) ? code : fallback;
+export function lineResultErrorMessage(code: unknown, fallback: string, detail?: unknown): string {
+  if (typeof code !== 'string' || !LOCAL_RESULT_FAILURES.includes(code as typeof LOCAL_RESULT_FAILURES[number])) return fallback;
+  // The optional detail is the bounded worker detail (for example the media upload stage); it is appended only when it is safe.
+  return typeof detail === 'string' && SendDetailSchema.safeParse(detail).success ? `${code}:${detail}` : code;
 }

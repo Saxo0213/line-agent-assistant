@@ -65,6 +65,8 @@ const MAX_QUEUED_CONTROL_FRAMES = 2;
 const MAX_QUEUED_CONTROL_BYTES = FRAME_LIMITS.controlBytes * MAX_QUEUED_CONTROL_FRAMES;
 const MAX_QUEUED_INVENTORY_RESPONSE_FRAMES = 512;
 const FIXTURE_SESSION_MAX_MS = 45_000;
+// Safety net for a missed change signal: the bridge answers wait_change after this time at the latest.
+const CHANGE_WAIT_TIMEOUT_MS = 30_000;
 const IMPORT_SESSION_DEADLINE = Date.UTC(9999, 11, 31, 23, 59, 59);
 const FIXTURE_CONSUMER_CLEANUP_MS = 1_000;
 const SAFE_INVENTORY_ERROR_CODES = new Set([
@@ -647,7 +649,9 @@ export class JsExternalReaderController {
     onProgress(progress: ImportProgress, signal?: AbortSignal): Promise<void> | void;
     onDirectoryPage?(page: ImportDirectoryPage, signal?: AbortSignal): Promise<void> | void;
     onPage(page: DirectMonitorPage, signal?: AbortSignal): Promise<ImportCursor | null> | ImportCursor | null;
-    signal?: AbortSignal; pollIntervalMs?: number;
+    signal?: AbortSignal;
+    // Validated only (1000..60000). It is no longer the idle delay: the bridge wakes the loop on a database change.
+    pollIntervalMs?: number;
     onReady?(access: NativeMonitorAccess, signal?: AbortSignal): Promise<void> | void;
     onPhase?(phase: ExternalMonitorFailurePhase): void;
   }): Promise<void> {
@@ -772,10 +776,12 @@ export class JsExternalReaderController {
             throw new Error('reader_monitor_ready_invalid');
           }
           await trustSession.validated();
-          const pollInterval = input.pollIntervalMs ?? 5_000;
           type AuxiliaryRequest = { type: 'auth_candidates' | 'attachment_metadata'; fields: Record<string, unknown>;
             resolve(value: any): void; reject(error: Error): void; active: boolean };
           const auxiliary: AuxiliaryRequest[] = [];
+          // True while a wait_change request is open. Auxiliary work that arrives then sends a wake frame,
+          // so the bridge ends the wait at once and the loop serves the request before the next poll.
+          let waitingForChange = false;
           const enqueueAuxiliary = <T>(type: AuxiliaryRequest['type'], fields: Record<string, unknown>, requestSignal?: AbortSignal): Promise<T> => {
             if (signal.aborted || requestSignal?.aborted) return Promise.reject(new Error('reader_cancelled'));
             if (auxiliary.length >= 2) return Promise.reject(new Error('reader_auxiliary_queue_full'));
@@ -794,6 +800,9 @@ export class JsExternalReaderController {
               item.resolve = (value) => settle(() => resolve(value));
               item.reject = (error) => settle(() => reject(error));
               auxiliary.push(item);
+              if (waitingForChange && child) {
+                void writeFrame(child, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'wake' }).catch(() => undefined);
+              }
             });
           };
           const access: NativeMonitorAccess = Object.freeze({
@@ -913,7 +922,20 @@ export class JsExternalReaderController {
             await writeFrame(child!, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'ack',
               pageNumber: page.pageNumber, batchDigest: page.batchDigest, lastCursor });
             pageNumber++; cursor = committedCursor;
-            if (!page.hasMore) await abortableDelay(pollInterval, signal);
+            if (!page.hasMore) {
+              // Idle: the bridge answers when the official database changes, or after the safety timeout.
+              // Either answer leads to the next poll, so a missed signal costs at most CHANGE_WAIT_TIMEOUT_MS.
+              await writeFrame(child!, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'wait_change',
+                timeoutMs: CHANGE_WAIT_TIMEOUT_MS });
+              waitingForChange = auxiliary.length === 0;
+              if (!waitingForChange) await writeFrame(child!, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'wake' });
+              let changeFrame: ProtocolFrame;
+              try { changeFrame = await stream.next(Date.now() + 120_000, signal); } finally { waitingForChange = false; }
+              if (!validateFrameEnvelope(changeFrame, { requestId: input.requestId, expectedSequence: outSeq++,
+                    allowedKeys: ['changed'] }) || changeFrame.type !== 'change' || typeof changeFrame.changed !== 'boolean') {
+                throw new Error('reader_change_invalid');
+              }
+            }
           }
         },
       });
@@ -1339,21 +1361,6 @@ function waitUntil<T>(promise: Promise<T>, deadlineUnixMs: number, signal?: Abor
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) onAbort();
     promise.then((value) => finish(() => resolve(value)), (error: unknown) => finish(() => reject(error)));
-  });
-}
-
-function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.reject(new Error('reader_cancelled'));
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => finish(resolve), delayMs);
-    const onAbort = () => finish(() => reject(new Error('reader_cancelled')));
-    const finish = (action: () => void) => {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', onAbort);
-      action();
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-    if (signal.aborted) onAbort();
   });
 }
 

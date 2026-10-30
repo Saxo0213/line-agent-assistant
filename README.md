@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.288 adds a two-stage group free mode, Agent persona and reply liveliness, `/folder` project folders, web search for every Agent job, and real LINE mentions in group replies. See the [v1.0.288 release notes](docs/releases/v1.0.288.md). Earlier changes are listed in [v1.0.280](docs/releases/v1.0.280.md), [v1.0.279](docs/releases/v1.0.279.md), and [v1.0.270](docs/releases/v1.0.270.md).
+v1.0.302 fixes Agent image and file sends (HTTP 411), keeps the real cause of failed sends, makes External Monitor read the official database as soon as it changes, and lets `/adduser` work without a LINE friendship. See the [v1.0.302 release notes](docs/releases/v1.0.302.md). Earlier changes are listed in [v1.0.288](docs/releases/v1.0.288.md), [v1.0.280](docs/releases/v1.0.280.md), and [v1.0.279](docs/releases/v1.0.279.md).
 
 ## Installation
 

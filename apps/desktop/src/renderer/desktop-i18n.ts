@@ -19,7 +19,7 @@ import { KOREAN_DESKTOP_COPY_PART7 } from '../desktop-copy-ko-part7.js';
 import { KOREAN_DESKTOP_COPY_PART8 } from '../desktop-copy-ko-part8.js';
 import { KOREAN_DESKTOP_COPY_PART9 } from '../desktop-copy-ko-part9.js';
 import type { Locale } from '../locale.js';
-import type { GeneratedPreview } from '@line-agent/contracts';
+import type { AttachmentBlockReason, GeneratedPreview } from '@line-agent/contracts';
 import { EXTRA_DESKTOP_COPY, EXTRA_TRADITIONAL_COPY, EXTRA_JAPANESE_COPY, EXTRA_KOREAN_COPY, SYSTEM_DISPLAY_COPY, SYSTEM_LABELS } from '../desktop-system-copy.js';
 import { DESKTOP_ERROR_COPY, desktopErrorText } from '../desktop-error-copy.js';
 import { lineServerErrorText } from './line-server-error-copy.js';
@@ -127,13 +127,37 @@ const PREVIEW_KEYS: Record<GeneratedPreview['kind'], PlainCopyKey> = {
   sticker: 'sticker', contact: 'lineContact', location: 'location', rich: 'richMessage', unsupported: 'messageContent',
   call: 'call', gift: 'gift', post: 'postNotification', post_note: 'postNoteNotification', post_album: 'postAlbumNotification', chat_event: 'chatEvent', system: 'systemMessage', message: 'messageContent',
 };
+/** Copy key of the cause text for a queued attachment that cannot download now. */
+export function attachmentBlockReasonKey(reason: AttachmentBlockReason): PlainCopyKey {
+  return reason === 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' ? 'attachmentBlockExternalSource'
+    : reason === 'ATTACHMENT_WORKER_UNAVAILABLE' ? 'attachmentBlockWorkerUnavailable' : 'attachmentBlockWorkerNotReady';
+}
+
+/** Call text shared by the chat timeline and the chat-list preview: same wording and duration format in every locale. */
+export function callSummaryFor(locale: Locale, call: { media: 'audio' | 'video' | null; result: string | null; durationMs: number | null },
+  direction: 'inbound' | 'outbound'): string {
+  if (call.result === 'CANCELED') return direction === 'outbound' ? desktopTextFor(locale, 'cancelledCall') : desktopTextFor(locale, 'missedCall');
+  if (call.result === 'NORMAL' && call.durationMs !== null) {
+    const totalSeconds = Math.floor(call.durationMs / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const duration = hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+      : `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    return desktopTextFor(locale, 'arg0DurationArg1', { arg0: call.media === 'video' ? desktopTextFor(locale, 'videoCall') : desktopTextFor(locale, 'voiceCall'), arg1: duration });
+  }
+  return direction === 'outbound' ? desktopTextFor(locale, 'noAnswer') : desktopTextFor(locale, 'missedCall');
+}
+
 export function generatedPreviewFor(locale: Locale, display: GeneratedPreview | undefined, original: string | null | undefined): string {
   if (!display) return original ?? '';
+  if (display.kind === 'call' && display.call) return callSummaryFor(locale, display.call, display.call.direction);
   const label = display.name || desktopTextFor(locale, PREVIEW_KEYS[display.kind]);
   const statuses: Record<NonNullable<GeneratedPreview['status']>, PlainCopyKey | null> = {
     queued: 'notDownloaded', downloading: 'downloading', ready: null, failed: 'downloadFailed', expired: 'attachmentExpired',
   };
-  const status = display.status ? statuses[display.status] : null;
+  const status = display.status === 'queued' && display.blockReason ? attachmentBlockReasonKey(display.blockReason)
+    : display.status ? statuses[display.status] : null;
   return status ? `${label} (${desktopTextFor(locale, status)})` : label;
 }
 export function useGeneratedPreview() {

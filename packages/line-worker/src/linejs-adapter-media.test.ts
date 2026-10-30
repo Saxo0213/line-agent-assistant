@@ -1,6 +1,7 @@
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createLinejsAdapter } from './linejs-adapter.js';
-import { MediaUploadFailedError } from './worker-loop.js';
+import { EffectDeniedError } from './mutation-gate.js';
+import { MediaUploadFailedError, mediaFailureDetail } from './worker-loop.js';
 
 const jwt = [Buffer.from('{"alg":"HS256"}').toString('base64url'), Buffer.from('{"sub":"u-self"}').toString('base64url'), 'signature'].join('.');
 const lease = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
@@ -34,7 +35,7 @@ async function fixture(options: { objIds?: string[]; status?: number; valid?: ()
   const adapter = await createLinejsAdapter({ ...lease, mode: options.mode ?? 'ACTIVE_CONTROL',
     validateLease: options.valid ?? (() => true), physicalTransport });
   await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
-  return { adapter, order, requests, encrypt, send, physicalTransport };
+  return { adapter, order, requests, encrypt, send, physicalTransport, E2EE };
 }
 
 it('uploads an image, its preview, then sends the E2EE message with the linejs metadata', async () => {
@@ -112,4 +113,64 @@ it('denies room, mismatched MID, monitor mode and a stale lease before any POST'
     expect(item.physicalTransport).not.toHaveBeenCalled();
     expect(item.send).not.toHaveBeenCalled();
   }
+});
+
+const caught = async (promise: Promise<unknown>): Promise<unknown> => promise.then(() => { throw new Error('expected a rejection'); }, (error: unknown) => error);
+const image = { kind: 'image' as const, bytes: Buffer.from('x'), fileName: 'a.png' };
+const file = { kind: 'file' as const, bytes: Buffer.from('x'), fileName: 'a.bin' };
+
+describe('upload failure stage', () => {
+  it('names obs_upload for an HTTP error and a missing object id, with the error class', async () => {
+    const http = await fixture({ status: 500 });
+    const httpError = await caught(http.adapter.sendMedia({ chatType: 'direct', chatId: peer }, file, lease));
+    expect(httpError).toBeInstanceOf(MediaUploadFailedError);
+    expect((httpError as MediaUploadFailedError).stage).toBe('obs_upload');
+    expect((httpError as MediaUploadFailedError).detail).toBe('obs_upload:ObsUploadHttpError:500');
+    expect(httpError).toMatchObject({ causeClass: 'ObsUploadHttpError', causeNumber: 500 });
+    const denied = await fixture({ status: 403 });
+    expect(await caught(denied.adapter.sendMedia({ chatType: 'direct', chatId: peer }, file, lease))).toMatchObject({ detail: 'obs_upload:ObsUploadHttpError:403' });
+    const missing = await fixture({ objIds: [''] });
+    const missingError = await caught(missing.adapter.sendMedia({ chatType: 'direct', chatId: peer }, file, lease));
+    expect(missingError).toMatchObject({ stage: 'obs_upload', causeClass: 'Error' });
+    expect((missingError as MediaUploadFailedError).detail).toBe('obs_upload:Error');
+    expect(JSON.stringify((missingError as MediaUploadFailedError).detail)).not.toContain('OBS object id');
+  });
+
+  it('names obs_preview when the preview object id does not match', async () => {
+    const { adapter, send } = await fixture({ objIds: ['OID_1', 'OID_2'] });
+    const error = await caught(adapter.sendMedia({ chatType: 'direct', chatId: peer }, image, lease));
+    expect(error).toMatchObject({ stage: 'obs_preview', causeClass: 'Error' });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('names encrypt when the key material step fails', async () => {
+    const { adapter, E2EE, order, send } = await fixture();
+    const spy = vi.spyOn(E2EE.prototype as any, 'encryptByKeyMaterial').mockRejectedValueOnce(new RangeError('bad key'));
+    spies.push(spy);
+    const error = await caught(adapter.sendMedia({ chatType: 'direct', chatId: peer }, image, lease));
+    expect(error).toMatchObject({ stage: 'encrypt', causeClass: 'RangeError' });
+    expect((error as MediaUploadFailedError).detail).toBe('encrypt:RangeError');
+    expect(order).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('names e2ee_message when the message cannot be encrypted after the upload, with a numeric code', async () => {
+    const { adapter, encrypt, send, order } = await fixture({ objIds: ['OID_F'] });
+    encrypt.mockRejectedValueOnce(Object.assign(new TypeError('no keys'), { code: 17 }));
+    const error = await caught(adapter.sendMedia({ chatType: 'direct', chatId: peer }, file, lease));
+    expect(error).toMatchObject({ stage: 'e2ee_message', causeClass: 'TypeError', causeNumber: 17 });
+    expect((error as MediaUploadFailedError).detail).toBe('e2ee_message:TypeError:17');
+    // The order of the steps is unchanged: one upload POST, then the failed message encryption, and no send.
+    expect(order).toEqual([expect.stringMatching(/^POST \/r\/talk\/emf\/reqid-/)]);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('keeps the stage of a gate denial in the upload so the worker can report it', async () => {
+    // An object id without a digit is refused by the gate for the preview POST.
+    const { adapter, send } = await fixture({ objIds: ['OIDX', 'OIDX'] });
+    const error = await caught(adapter.sendMedia({ chatType: 'direct', chatId: peer }, image, lease));
+    expect(error).toBeInstanceOf(EffectDeniedError);
+    expect(mediaFailureDetail(error)).toBe('obs_preview:EffectDeniedError');
+    expect(send).not.toHaveBeenCalled();
+  });
 });

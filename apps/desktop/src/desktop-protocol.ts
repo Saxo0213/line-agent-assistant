@@ -1,8 +1,9 @@
 import { z } from 'zod';
-import { SafeDiagnosticSchema, isLineServerErrorCode, type LineServerErrorCode } from '@line-agent/contracts';
+import { ATTACHMENT_BLOCK_REASONS, SafeDiagnosticSchema, isLineServerErrorCode, type LineServerErrorCode } from '@line-agent/contracts';
 import { ConversationKeySchema, GeneratedPreviewSchema, MentionRangeSchema, MessageContentSchema, normalizeMentionRanges, SticonRangeSchema, StickerDescriptorSchema } from '@line-agent/contracts';
 
-const AttachmentSchema = z.strictObject({ id: z.uuid(), kind: z.enum(['image', 'video', 'audio', 'file']), name: z.string(), mimeType: z.string(), sizeBytes: z.number().int().nonnegative(), status: z.string(), canRetryManually: z.boolean().optional() });
+const AttachmentBlockReasonSchema = z.enum(ATTACHMENT_BLOCK_REASONS);
+const AttachmentSchema = z.strictObject({ id: z.uuid(), kind: z.enum(['image', 'video', 'audio', 'file']), name: z.string(), mimeType: z.string(), sizeBytes: z.number().int().nonnegative(), status: z.string(), canRetryManually: z.boolean().optional(), blockReason: AttachmentBlockReasonSchema.optional() });
 export const MessageReactionSchema = z.strictObject({
   kind: z.enum(['NICE', 'LOVE', 'FUN', 'AMAZING', 'SAD', 'OMG', 'PAID']),
   productId: z.string().regex(/^[0-9a-f]{24}$/).optional(),
@@ -38,7 +39,7 @@ export const TimelineMessageSchema = z.preprocess((value) => {
 export const MessagePageSchema = z.strictObject({ messages: z.array(TimelineMessageSchema).max(100), olderCursor: z.string().nullable() });
 export const AttachmentStateSchema = z.strictObject({ attachmentId: z.uuid(), messageId: z.string().min(1),
   kind: z.enum(['image', 'video', 'audio', 'file']), name: z.string(), mimeType: z.string(), sizeBytes: z.number().int().nonnegative(),
-  status: z.string(), canRetryManually: z.boolean() });
+  status: z.string(), canRetryManually: z.boolean(), blockReason: AttachmentBlockReasonSchema.nullable().optional() });
 export const AttachmentStateListSchema = z.array(AttachmentStateSchema).max(225);
 export const WorkRecordSchema = z.strictObject({
   id: z.string().min(1), title: z.string(), status: z.enum(['todo', 'doing', 'waiting', 'done']), key: ConversationKeySchema,

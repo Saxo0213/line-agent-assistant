@@ -1439,6 +1439,24 @@ database('connected facade account login semantics', () => {
       expect(commands.some((command) => command.type === 'loginToken' && command.accountId === 'auto-on-agent')).toBe(true);
     });
 
+    it('keeps the degraded state and the worker when a token login reports LOGIN_FAILED', async () => {
+      await addStoredAccounts('auto-failure-event-agent');
+      await storeToken('auto-failure-event-agent');
+      await new AccountRepository(pool).setAutoLoginOnStartup('auto-failure-event-agent', true);
+      await restartFacade();
+      const attempt = (commands.filter((command) => command.type === 'loginToken' && command.accountId === 'auto-failure-event-agent')
+        .at(-1)! as { loginAttemptId: string }).loginAttemptId;
+      const binding = bindings.get('auto-failure-event-agent')!;
+      published = [];
+      await workerEventHandler?.(binding.workerInstanceId, { type: 'loginFailure', ...binding, loginAttemptId: attempt,
+        code: 'LOGIN_FAILED', message: 'LINE login failed. Try again.', detail: 'fetch_identity:TypeError' });
+      expect(bindings.has('auto-failure-event-agent')).toBe(true);
+      expect(published.filter((event) => event.type === 'lineLoginState')).toEqual([
+        { type: 'lineLoginState', accountId: 'auto-failure-event-agent', loginAttemptId: attempt, state: 'degraded', message: 'LINE login failed. Try again.' }]);
+      expect(auditEvents.find((event) => event.diagnostic?.reason === 'LOGIN_FAILED')?.diagnostic).toMatchObject({ detail: 'fetch_identity:TypeError' });
+      expect((await secretStore.load('auto-failure-event-agent'))?.token).toBe('token-auto-failure-event-agent');
+    });
+
     it('makes one opted-in startup restore attempt and preserves the secret after failure', async () => {
       await addStoredAccounts('auto-fail-agent');
       await storeToken('auto-fail-agent');
@@ -2478,6 +2496,29 @@ database('connected facade account login semantics', () => {
     expect(archiveCommits).toBe(1);
   });
 
+  it('returns the IPC error code UNSUPPORTED for a worker UNSUPPORTED result and keeps other codes', async () => {
+    await addStoredAccounts('account-a');
+    await loginReady('account-a');
+    await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES ('account-a','group','archive-chat','Archive test') ON CONFLICT DO NOTHING");
+    Object.assign(bindings.get('account-a')!, { transportOwnerId: 'archive-owner', transportGeneration: 1, writeGrantVersion: 1 });
+    const workerError = (command: ChatResourceRequest, error: string) => ({
+      type: 'chatResourceResult' as const, requestId: command.requestId, action: command.action, ok: false as const, error,
+      accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
+      chatType: command.chatType, chatId: command.chatId });
+    const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', onDiagnostic: vi.fn(),
+      service: { dispatch: (request, signal) => facade.dispatch(request, signal) } });
+    const sender = { senderId: 7, url: 'file:///app/index.html' };
+    const route = { accountId: 'account-a', chatType: 'group', chatId: 'archive-chat' };
+    workers.readChatResource = async (command) => workerError(command, 'UNSUPPORTED');
+    await expect(adapter(sender, { type: 'listChatNotes', requestId: 'notes-unsupported', ...route, cursor: null }))
+      .resolves.toMatchObject({ type: 'error', ok: false, code: 'UNSUPPORTED' });
+    await expect(adapter(sender, { type: 'listChatAlbums', requestId: 'albums-unsupported', ...route, cursor: null }))
+      .resolves.toMatchObject({ type: 'error', ok: false, code: 'UNSUPPORTED' });
+    workers.readChatResource = async (command) => workerError(command, 'response_shape_invalid');
+    await expect(adapter(sender, { type: 'listChatNotes', requestId: 'notes-other-error', ...route, cursor: null }))
+      .resolves.toMatchObject({ type: 'error', code: 'SERVICE_ERROR' });
+  });
+
   it('cancels a pending album open without diagnostics or late publication, then accepts the next request', async () => {
     await addStoredAccounts('account-a');
     await loginReady('account-a');
@@ -3418,6 +3459,37 @@ database('connected facade account login semantics', () => {
         .toBe(before.rows[0]?.status);
       expect(admissionClose.mock.calls.some(([accountId]) => accountId === 'logout-failure-account')).toBe(false);
     } finally { admissionClose.mockRestore(); }
+  });
+
+  it('cancels a pending QR login of an account with an own MID without a server logout', async () => {
+    await addStoredAccounts('cancel-pending-account');
+    await activate('cancel-pending-account');
+    expect((await facade.dispatch({ type: 'lineLoginQr', requestId: 'qr-cancel-pending', accountId: 'cancel-pending-account' })).ok).toBe(true);
+    const attempt = latestLoginAttempt('cancel-pending-account');
+    const closeLogin = vi.spyOn(secretStore, 'closeLogin');
+    commands.length = 0;
+    published = [];
+
+    try {
+      const result = await facade.dispatch({ type: 'lineLogout', requestId: 'cancel-pending', accountId: 'cancel-pending-account' });
+
+      expect(result).toMatchObject({ type: 'accepted', ok: true });
+      expect(commands.filter((command) => command.type === 'logout')).toEqual([]);
+      expect(closeLogin.mock.calls.some(([accountId, , attemptId]) => accountId === 'cancel-pending-account' && attemptId === attempt)).toBe(true);
+      expect(published).toContainEqual(expect.objectContaining({ type: 'lineLoginState', accountId: 'cancel-pending-account', state: 'disconnected' }));
+    } finally { closeLogin.mockRestore(); }
+  });
+
+  it('sends the logout command for a connected account and fails when the worker rejects it', async () => {
+    await addStoredAccounts('connected-logout-account');
+    await loginReady('connected-logout-account');
+    lineLogoutFailure = true;
+    commands.length = 0;
+
+    const result = await facade.dispatch({ type: 'lineLogout', requestId: 'connected-logout-failure', accountId: 'connected-logout-account' });
+
+    expect(commands.filter((command) => command.type === 'logout')).toHaveLength(1);
+    expect(result).toMatchObject({ ok: false, code: 'LINE_LOGOUT_FAILED' });
   });
 
   it('starts with an invalid saved workspace and repairs it live with stable validation errors', async () => {
@@ -4480,236 +4552,23 @@ database('connected facade account login semantics', () => {
       });
     });
 
-    it('checks the active Agent binding after external admin binding even when the slot account ID differs', async () => {
-      await addAgentOnly();
-      // External binding writes account_administrators only when the Agent has
-      // completed login. A role-only row keeps the admin pending in the slot.
-      await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
-      await restartFacadeWithImporter(importer(() => supported()));
-      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
-      activeControlAckFailures.add('bind-agent');
-      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-ready', accountId: 'bind-agent' })).ok).toBe(true);
-      // The worker gateway returns its transport/write authority binding after
-      // startup. Model that activation callback before releasing its delayed ACK.
-      const startedBinding = bindings.get('bind-agent')!;
-      const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
-      bindings.set('bind-agent', readyBinding);
-      await workerBindingHandler?.(readyBinding, new AbortController().signal);
-      await signalLoggedInReady('bind-agent');
-      let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
-      const relation = new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; });
-      pendingFriendRelation = { started() {}, wait: relation };
-      expect(await facade.dispatch({ type: 'startExternalMonitorAsAdmin', requestId: 'bind-agent-external', mid: MID }))
-        .toMatchObject({ ok: true, bound: true });
-      const slot = await pool.query("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN'");
-      expect(slot.rows).toHaveLength(1);
-      expect(slot.rows[0]!.account_id).not.toBe('bind-agent');
-      expect(await new AdminRepository(pool).getPrimaryAdministrator('bind-agent')).toEqual({ chatId: MID, userId: MID });
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(0);
-      activeControlAckFailures.delete('bind-agent');
-      await vi.waitFor(() => expect(friendRelationCommands.some((command) => command.accountId === 'bind-agent')).toBe(true));
-      expect(friendRelationCommands.filter((command) => command.accountId === slot.rows[0]!.account_id)).toEqual([]);
-      expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(1);
-      expect(friendRelationCommands.find((command) => command.accountId === 'bind-agent')?.targetMid).toBe(MID);
-      const relationCommand = friendRelationCommands.find((command) => command.accountId === 'bind-agent')!;
-      resolveRelation({ ...relationCommand, type: 'friendRelationResult', status: 'friend', error: null });
-      await facade.shutdown();
-      expect(friendAddCommands.filter((command) => command.accountId === 'bind-agent')).toEqual([]);
-    });
-
-    it('sends no friend relation check on the mode ACK alone and exactly one after the worker login and ready events', async () => {
+    it('sends no friend relation check or add after worker login, ready and external admin binding', async () => {
       await addAgentOnly();
       await new AdminRepository(pool).bindPrimary('bind-agent', MID, MID);
       await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
       await restartFacadeWithImporter(importer(() => supported()));
       expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
-      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-ack-only', accountId: 'bind-agent' })).ok).toBe(true);
+      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-no-relation', accountId: 'bind-agent' })).ok).toBe(true);
       const startedBinding = bindings.get('bind-agent')!;
       const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
       bindings.set('bind-agent', readyBinding);
       await workerBindingHandler?.(readyBinding, new AbortController().signal);
+      await signalLoggedInReady('bind-agent');
       await new Promise((resolve) => setTimeout(resolve, 300));
-      expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(0);
-      await signalLoggedInReady('bind-agent');
-      await vi.waitFor(() => expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(1));
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(friendRelationCommands.filter((command) => command.accountId === 'bind-agent')).toHaveLength(1);
+      expect(friendRelationCommands).toEqual([]);
+      expect(friendAddCommands).toEqual([]);
+      expect(friendRemoteCalls).toBe(0);
       await facade.shutdown();
-    });
-
-    it.each(['stopped', 'paused', 'replaced'] as const)('ends delayed friendship readiness polling when the binding is %s before ACK', async (change) => {
-      await addAgentOnly();
-      await restartFacadeWithImporter(importer(() => supported()));
-      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
-      activeControlAckDelays.add('bind-agent');
-      activeControlAckFailures.add('bind-agent');
-      expect((await facade.dispatch({ type: 'lineStart', requestId: `bind-agent-${change}`, accountId: 'bind-agent' })).ok).toBe(true);
-      await vi.waitFor(() => expect(activeControlAckChecks).toBeGreaterThan(0));
-      const original = bindings.get('bind-agent')!;
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      const checksBeforeChange = activeControlAckChecks;
-      if (change === 'stopped') bindings.delete('bind-agent');
-      if (change === 'paused') bindings.set('bind-agent', { ...original, mode: 'PAUSED' });
-      if (change === 'replaced') bindings.set('bind-agent', { ...original, workerInstanceId: 'replacement-before-ack' });
-      await new Promise((resolve) => setTimeout(resolve, 400));
-      expect(activeControlAckChecks - checksBeforeChange).toBeLessThanOrEqual(1);
-      expect(friendRemoteCalls).toBe(0);
-      const shutdown = facade.shutdown();
-      await expect(Promise.race([shutdown.then(() => 'drained'), new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 500))]))
-        .resolves.toBe('drained');
-      expect(friendRemoteCalls).toBe(0);
-    });
-
-    it('keeps one readiness waiter across repeated binding callbacks and drains it at shutdown', async () => {
-      await addAgentOnly();
-      await restartFacadeWithImporter(importer(() => supported()));
-      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
-      activeControlAckDelays.add('bind-agent');
-      activeControlAckFailures.add('bind-agent');
-      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-readiness-burst', accountId: 'bind-agent' })).ok).toBe(true);
-      const binding = bindings.get('bind-agent')!;
-      for (let index = 0; index < 12; index++) await workerBindingHandler?.(binding, new AbortController().signal);
-      const checksAtStart = activeControlAckChecks;
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      expect(activeControlAckChecks - checksAtStart).toBeLessThanOrEqual(4);
-      expect(friendRemoteCalls).toBe(0);
-      const shutdown = facade.shutdown();
-      await expect(Promise.race([shutdown.then(() => 'drained'), new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 500))]))
-        .resolves.toBe('drained');
-    });
-
-    it.each(['shutdown', 'replacement'] as const)('fences a deferred primary relation result during %s before it can add', async (fence) => {
-      await addAgentOnly();
-      await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
-      await restartFacadeWithImporter(importer(() => supported()));
-      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
-      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-shutdown-ready', accountId: 'bind-agent' })).ok).toBe(true);
-      const startedBinding = bindings.get('bind-agent')!;
-      const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
-      bindings.set('bind-agent', readyBinding);
-      await workerBindingHandler?.(readyBinding, new AbortController().signal);
-      await signalLoggedInReady('bind-agent');
-      let relationStarted!: () => void;
-      const started = new Promise<void>((resolve) => { relationStarted = resolve; });
-      let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
-      const relation = new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; });
-      pendingFriendRelation = { started: relationStarted, wait: relation };
-      await facade.dispatch({ type: 'startExternalMonitorAsAdmin', requestId: 'bind-agent-shutdown', mid: MID });
-      await started;
-      const command = friendRelationCommands.at(-1)!;
-      if (fence === 'replacement') {
-        bindings.set('bind-agent', { ...readyBinding, workerInstanceId: 'replacement-after-relation-check' });
-      }
-      resolveRelation({ ...command, type: 'friendRelationResult', status: 'not_friend', error: null });
-      if (fence === 'replacement') await new Promise((resolve) => setTimeout(resolve, 50));
-      await facade.shutdown();
-      expect(friendRelationCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
-      expect(friendAddCommands.filter((item) => item.accountId === 'bind-agent')).toEqual([]);
-      expect(friendRemoteCalls).toBe(1);
-    });
-
-    it('consumes a late admin-bound notification on the existing friendship job without duplicate relation or add', async () => {
-      await addAgentOnly();
-      await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
-      activeControlAckDelays.add('bind-agent');
-      activeControlAckFailures.add('bind-agent');
-      await restartFacadeWithImporter(importer(() => supported()));
-      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
-      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-overlap-ready', accountId: 'bind-agent' })).ok).toBe(true);
-      const startedBinding = bindings.get('bind-agent')!;
-      const readyBinding = { ...startedBinding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
-      bindings.set('bind-agent', readyBinding);
-      await workerBindingHandler?.(readyBinding, new AbortController().signal);
-      await signalLoggedInReady('bind-agent');
-      activeControlAckFailures.delete('bind-agent');
-      await vi.waitFor(() => expect(activeControlAckChecks).toBeGreaterThan(0));
-      let relationStarted!: () => void;
-      const started = new Promise<void>((resolve) => { relationStarted = resolve; });
-      let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
-      const relation = new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; });
-      pendingFriendRelation = { started: relationStarted, wait: relation };
-      const bindingResult = facade.dispatch({ type: 'startExternalMonitorAsAdmin', requestId: 'bind-agent-overlap-external', mid: MID });
-      await started;
-      // External admin binding emits admin-bound while the worker-ready job
-      // already owns this binding's single-flight slot.
-      const command = friendRelationCommands.at(-1)!;
-      resolveRelation({ ...command, type: 'friendRelationResult', status: 'not_friend', error: null });
-      await bindingResult;
-      await vi.waitFor(() => expect(friendAddCommands).toHaveLength(1));
-      expect(friendRelationCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
-      expect(friendAddCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
-    });
-
-    it('does not lose admin-bound delivered in completion microtasks after the initial no-admin check', async () => {
-      await addAgentOnly();
-      friendAddStatus = 'added';
-      await new AdminRepository(pool).bindPrimary('bind-agent', MID, MID);
-      await pool.query("UPDATE line_accounts SET own_mid='own-bind-agent', status='connected' WHERE account_id='bind-agent'");
-      await restartFacadeWithImporter(importer(() => supported()));
-      expect((await new AccountRepository(pool).activateControl('bind-agent', 1)).activated).toBe(true);
-      expect((await facade.dispatch({ type: 'lineStart', requestId: 'bind-agent-completion-ready', accountId: 'bind-agent' })).ok).toBe(true);
-      const binding = bindings.get('bind-agent')!;
-      const readyBinding = { ...binding, transportOwnerId: 'test-owner', transportGeneration: 1, writeGrantVersion: 1 };
-      bindings.set('bind-agent', readyBinding);
-      let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
-      let relationStarted!: () => void;
-      const started = new Promise<void>((resolve) => { relationStarted = resolve; });
-      pendingFriendRelation = {
-        started: relationStarted,
-        wait: new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; }),
-      };
-
-      // Model the admin-bound notification landing after the no-admin loop's
-      // final trigger read but before its promise finalizer. The initial query
-      // is deliberately stale; the follow-up query sees the persisted row.
-      const originalAdminRead = AdminRepository.prototype.getPrimaryAdministrator;
-      let staleNoAdminReadUsed = false;
-      const adminReadSpy = vi.spyOn(AdminRepository.prototype, 'getPrimaryAdministrator').mockImplementation(function (this: AdminRepository, accountId) {
-        if (accountId === 'bind-agent' && !staleNoAdminReadUsed) {
-          staleNoAdminReadUsed = true;
-          return Promise.resolve(null);
-        }
-        return originalAdminRead.call(this, accountId);
-      });
-      const originalMapGet = Map.prototype.get;
-      let injectedCompletionTrigger = false;
-      const mapGetSpy = vi.spyOn(Map.prototype, 'get').mockImplementation(function (this: Map<any, any>, key: any): any {
-        const value = originalMapGet.call(this, key);
-        if (key === 'bind-agent' && value && typeof value === 'object' && 'abort' in value && 'promise' in value && 'trigger' in value
-          && !Object.getOwnPropertyDescriptor(value, 'trigger')?.get) {
-          let trigger = value.trigger;
-          let triggerReads = 0;
-          Object.defineProperty(value, 'trigger', { configurable: true, get() {
-            triggerReads++;
-            if (triggerReads === 2 && !injectedCompletionTrigger) {
-              injectedCompletionTrigger = true;
-              queueMicrotask(() => { trigger = 'admin-bound'; });
-            }
-            return trigger;
-          }, set(next: 'worker-ready' | 'admin-bound') { trigger = next; } });
-        }
-        return value;
-      });
-      try {
-        await signalLoggedInReady('bind-agent');
-        await workerBindingHandler?.(readyBinding, new AbortController().signal);
-        await started;
-        expect(staleNoAdminReadUsed).toBe(true);
-        expect(injectedCompletionTrigger).toBe(true);
-        expect(friendRelationCommands).toHaveLength(1);
-        const command = friendRelationCommands[0]!;
-        expect(command.accountId).toBe('bind-agent');
-        expect(command.targetMid).toBe(MID);
-        resolveRelation({ ...command, type: 'friendRelationResult', status: 'not_friend', error: null });
-        await vi.waitFor(() => expect(friendAddCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1));
-        expect(friendRelationCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
-        expect(friendAddCommands.filter((item) => item.accountId === 'bind-agent')).toHaveLength(1);
-        expect(friendAddCommands.find((item) => item.accountId === 'bind-agent')?.targetMid).toBe(MID);
-      } finally {
-        mapGetSpy.mockRestore();
-        adminReadSpy.mockRestore();
-      }
     });
 
     it('refuses when the primary admin is already bound and leaves existing flows alone', async () => {
@@ -5018,9 +4877,9 @@ database('connected facade account login semantics', () => {
 
     expect(published.filter((event) => event.type === 'lineLoginState')).toEqual([
       { type: 'lineLoginState', accountId: 'account-a', loginAttemptId: attempt,
-        state: 'degraded', message: 'LINE login timed out. Try again.' },
+        state: 'disconnected', message: 'LINE login timed out. Try again.' },
     ]);
-    expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='account-a'")).rows[0].status).toBe('degraded');
+    expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='account-a'")).rows[0].status).toBe('disconnected');
     expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='account-b'")).rows[0].status).toBe('disconnected');
   });
 
@@ -5190,5 +5049,304 @@ database('connected facade account login semantics', () => {
     const capability = await new AccountRepository(pool).resolveCapabilities(adminAccountId);
     await expect(new ExternalMonitorRepository(pool).readBatchFence({ accountId: adminAccountId,
       sourceId: capability!.selectedSourceId!, generation: capability!.selectedSourceGeneration! })).resolves.toBeTruthy();
+  });
+
+  describe('CHROMEOS login transport', () => {
+    type LtsmStatus = Parameters<NonNullable<ConnectedFacadeOptions['chromeLogin']>['ltsm']['status']> extends [] ? Awaited<ReturnType<NonNullable<ConnectedFacadeOptions['chromeLogin']>['ltsm']['status']>> : never;
+    const AVAILABLE: LtsmStatus = { kind: 'available', version: '3.7.2' };
+    const desktopSecrets = { token: 'desktop-token', qrCert: 'desktop-cert', e2eeStorage: { key: 'linejs' } };
+    const chromeSecrets = { token: 'chrome-token', qrCert: 'chrome-cert', e2eeStorage: { transport: 'CHROMEOS-3.7.2', 'chrome:reqSeq': 3 } };
+    let ltsmStatus: LtsmStatus;
+    let pickedFolder: string | null;
+    let installedFrom: string[];
+    let openedUrls: string[];
+
+    beforeEach(async () => {
+      ltsmStatus = AVAILABLE;
+      pickedFolder = null;
+      installedFrom = [];
+      openedUrls = [];
+      await facade.shutdown();
+      facade = await createConnectedFacade({ pool, workers, agent, attachmentRoot: 'C:\\attachments', mediaCacheRoot: join(secretRoot, 'line-media-cache'),
+        previewPresenter: { async present() { return false; }, closeAll() {} }, secretStore, audit, runMigrations: false,
+        chatResourceStore: archiveStore,
+        chromeLogin: {
+          ltsm: {
+            rootDir: 'C:\\userData\\line-chrome\\ltsm',
+            async status() { return ltsmStatus; },
+            async detectAndInstall() { return { kind: 'not-found', required: '3.7.2' }; },
+            async installFromFolder(folder) { installedFrom.push(folder); return { kind: 'installed', status: { kind: 'available', version: '3.7.2' }, source: { browser: 'manual', profile: '' } }; },
+          },
+          async chooseFolder() { return pickedFolder; },
+          async openStore(url) { openedUrls.push(url); },
+        },
+        publish(event) { published.push(event); } });
+    });
+
+    const storeSecrets = async (accountId: string, transport: 'DESKTOPWIN' | 'CHROMEOS', secrets: typeof desktopSecrets | typeof chromeSecrets) => {
+      secretStore.beginLogin(accountId, `seed-${transport}`, `seed-${transport}`, transport);
+      expect(await secretStore.saveRotation(accountId, `seed-${transport}`, `seed-${transport}`, secrets)).toBe(true);
+      await secretStore.closeLogin(accountId, `seed-${transport}`, `seed-${transport}`);
+    };
+    // The transport of an account is a marker file in the secret store, not a database value.
+    const setTransport = (accountId: string, lineTransport: 'DESKTOPWIN' | 'CHROMEOS') => secretStore.setTransport(accountId, lineTransport);
+    const statusOf = async (accountId: string) =>
+      (await pool.query<{ status: string }>('SELECT status FROM line_accounts WHERE account_id=$1', [accountId])).rows[0]?.status;
+    const secretStates = () => commands.filter((command): command is Extract<LineWorkerCommand, { type: 'setSecretState' }> => command.type === 'setSecretState');
+
+    it('leaves DESKTOPWIN bindings exactly as before and restores only DESKTOPWIN secrets', async () => {
+      await addStoredAccounts('d1');
+      await storeSecrets('d1', 'DESKTOPWIN', desktopSecrets);
+      await storeSecrets('d1', 'CHROMEOS', chromeSecrets);
+      // Saving a secret sets the marker. Set the intended start state last: DESKTOPWIN with both stored sessions.
+      await setTransport('d1', 'DESKTOPWIN');
+      await activate('d1');
+      expect(Object.hasOwn(bindings.get('d1')!, 'lineTransport')).toBe(false);
+      expect(secretStates().map((command) => command.secrets.token)).toEqual(['desktop-token']);
+    });
+
+    it('starts a CHROMEOS account with lineTransport and only its own stored session', async () => {
+      await addStoredAccounts('c1');
+      await setTransport('c1', 'CHROMEOS');
+      await storeSecrets('c1', 'DESKTOPWIN', desktopSecrets);
+      await storeSecrets('c1', 'CHROMEOS', chromeSecrets);
+      await activate('c1');
+      expect(bindings.get('c1')).toMatchObject({ accountId: 'c1', lineTransport: 'CHROMEOS' });
+      expect(secretStates().map((command) => command.secrets.token)).toEqual(['chrome-token']);
+      const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'snap' });
+      expect(snapshot).toMatchObject({ ok: true });
+      expect((snapshot as { snapshot: { accounts: Array<{ accountId: string; lineTransport?: string }> } }).snapshot.accounts
+        .find((account) => account.accountId === 'c1')?.lineTransport).toBe('CHROMEOS');
+    });
+
+    it('does not hand a DESKTOPWIN session to a CHROMEOS worker when only DESKTOPWIN secrets exist', async () => {
+      await addStoredAccounts('c1');
+      await storeSecrets('c1', 'DESKTOPWIN', desktopSecrets);
+      // Set the marker last: CHROMEOS with only a DESKTOPWIN stored session.
+      await setTransport('c1', 'CHROMEOS');
+      await activate('c1');
+      expect(secretStates()).toEqual([]);
+      expect(commands.some((command) => command.type === 'loginToken')).toBe(false);
+    });
+
+    it.each(['lineStart', 'lineLoginQr'] as const)('fails %s fast with the typed ltsm error and spawns no worker', async (type) => {
+      await addStoredAccounts('c1');
+      await setTransport('c1', 'CHROMEOS');
+      ltsmStatus = { kind: 'wrong-version', required: '3.7.2', detected: ['3.8.0'] };
+      const result = await facade.dispatch({ type, requestId: `fast-${type}`, accountId: 'c1' });
+      expect(result).toMatchObject({ ok: false, code: 'CHROME_LTSM_UNAVAILABLE', retryable: false,
+        chromeLtsmStatus: { kind: 'wrong-version', required: '3.7.2', detected: ['3.8.0'] } });
+      expect(IpcResultSchema.safeParse(result).success).toBe(true);
+      expect(starts).toEqual([]);
+      expect(commands).toEqual([]);
+    });
+
+    it('starts the QR login of a new slot with the chosen transport, and reserves no slot when ltsm is unavailable', async () => {
+      ltsmStatus = { kind: 'missing', required: '3.7.2' };
+      const refused = await facade.dispatch({ type: 'lineAddAccountQr', requestId: 'add-chrome-refused', lineTransport: 'CHROMEOS' });
+      expect(refused).toMatchObject({ ok: false, code: 'CHROME_LTSM_UNAVAILABLE', chromeLtsmStatus: { kind: 'missing' } });
+      expect((await pool.query('SELECT count(*)::int AS n FROM line_accounts')).rows[0].n).toBe(0);
+      expect(starts).toEqual([]);
+
+      ltsmStatus = AVAILABLE;
+      const accepted = await facade.dispatch({ type: 'lineAddAccountQr', requestId: 'add-chrome', lineTransport: 'CHROMEOS' });
+      expect(accepted.ok, JSON.stringify(accepted)).toBe(true);
+      const row = (await pool.query<{ account_id: string }>('SELECT account_id FROM line_accounts')).rows[0]!;
+      expect(await secretStore.getTransport(row.account_id)).toBe('CHROMEOS');
+      expect(bindings.get(row.account_id)).toMatchObject({ lineTransport: 'CHROMEOS' });
+      expect(commands.some((command) => command.type === 'loginQr' && command.accountId === row.account_id)).toBe(true);
+    });
+
+    it('a login request without a transport creates a DESKTOPWIN slot', async () => {
+      const accepted = await facade.dispatch({ type: 'lineAddAccountQr', requestId: 'add-default' });
+      expect(accepted.ok, JSON.stringify(accepted)).toBe(true);
+      const row = (await pool.query<{ account_id: string }>('SELECT account_id FROM line_accounts')).rows[0]!;
+      expect(await secretStore.getTransport(row.account_id)).toBe('DESKTOPWIN');
+      expect(Object.hasOwn(bindings.get(row.account_id)!, 'lineTransport')).toBe(false);
+    });
+
+    it('moves an account whose worker reports CHROME_LTSM_UNAVAILABLE to reauth_required without clearing its session', async () => {
+      await addStoredAccounts('c1');
+      await setTransport('c1', 'CHROMEOS');
+      await storeSecrets('c1', 'CHROMEOS', chromeSecrets);
+      await activate('c1');
+      const binding = bindings.get('c1')!;
+      stops.length = 0;
+      await workerEventHandler?.(binding.workerInstanceId, { type: 'error', ...binding, code: 'CHROME_LTSM_UNAVAILABLE', message: 'LINE Chrome assets are not installed',
+        retryable: false, chromeLtsmStatus: 'missing',
+        diagnostic: { operation: 'init', stage: 'bootstrap', category: 'unavailable', recovery: 'check_configuration', outcome: 'failed' } } as LineWorkerEvent);
+      await waitForState(async () => expect(await statusOf('c1')).toBe('reauth_required'));
+      expect(stops).toEqual(['c1']);
+      expect(await secretStore.load('c1', 'CHROMEOS')).toEqual(chromeSecrets);
+      expect(auditEvents.some((event) => event.action === 'worker_operation_error' && event.accountId === 'c1')).toBe(true);
+      expect(JSON.stringify(auditEvents)).not.toContain('C:\\userData');
+    });
+
+    it('serves availability, detection, folder choice and the Web Store through typed IPCs', async () => {
+      expect(await facade.dispatch({ type: 'getChromeLoginAvailability', requestId: 'avail' }))
+        .toEqual({ type: 'getChromeLoginAvailability', requestId: 'avail', ok: true, status: AVAILABLE });
+      expect(await facade.dispatch({ type: 'detectChromeLtsm', requestId: 'detect' }))
+        .toEqual({ type: 'detectChromeLtsm', requestId: 'detect', ok: true, result: { kind: 'not-found', required: '3.7.2' } });
+      expect(await facade.dispatch({ type: 'chooseChromeLtsmFolder', requestId: 'cancel' }))
+        .toEqual({ type: 'chooseChromeLtsmFolder', requestId: 'cancel', ok: true, result: { kind: 'cancelled' } });
+      pickedFolder = 'D:\\picked';
+      expect(await facade.dispatch({ type: 'chooseChromeLtsmFolder', requestId: 'pick' }))
+        .toMatchObject({ ok: true, result: { kind: 'installed' } });
+      expect(installedFrom).toEqual(['D:\\picked']);
+      expect(await facade.dispatch({ type: 'openChromeExtensionStore', requestId: 'store' })).toEqual({ type: 'openChromeExtensionStore', requestId: 'store', ok: true });
+      expect(openedUrls).toEqual(['https://chromewebstore.google.com/detail/ophjlpahpchlmihnnnihgmmeilfjmjjc']);
+    });
+
+    describe('login method switch of an existing account', () => {
+      const startDesktopAccount = async (accountId: string) => {
+        await addStoredAccounts(accountId);
+        await storeSecrets(accountId, 'DESKTOPWIN', desktopSecrets);
+        await activate(accountId);
+        commands.length = 0;
+        starts.length = 0;
+        stops.length = 0;
+      };
+      const rotate = async (accountId: string, secrets: typeof chromeSecrets) => {
+        const binding = bindings.get(accountId)!;
+        const attempt = latestLoginAttempt(accountId);
+        await workerEventHandler?.(binding.workerInstanceId, { type: 'secretRotation', ...binding, loginAttemptId: attempt, secrets });
+        return { binding, attempt };
+      };
+
+      it('starts a CHROMEOS worker without a server logout and keeps the DESKTOPWIN secrets', async () => {
+        await startDesktopAccount('s1');
+        const result = await facade.dispatch({ type: 'lineLoginQr', requestId: 'switch-chrome', accountId: 's1', lineTransport: 'CHROMEOS' });
+        expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+        expect(bindings.get('s1')).toMatchObject({ accountId: 's1', lineTransport: 'CHROMEOS' });
+        expect(commands.some((command) => command.type === 'logout')).toBe(false);
+        expect(commands.some((command) => command.type === 'loginQr' && command.accountId === 's1')).toBe(true);
+        expect(await secretStore.load('s1', 'DESKTOPWIN')).toEqual(desktopSecrets);
+        // The marker changes only after the login succeeds.
+        expect(await secretStore.getTransport('s1')).toBe('DESKTOPWIN');
+      });
+
+      it('returns CHROME_LTSM_UNAVAILABLE and starts no worker when the Chrome files are not usable', async () => {
+        await startDesktopAccount('s1');
+        ltsmStatus = { kind: 'wrong-version', required: '3.7.2', detected: ['3.8.0'] };
+        const result = await facade.dispatch({ type: 'lineLoginQr', requestId: 'switch-refused', accountId: 's1', lineTransport: 'CHROMEOS' });
+        expect(result).toMatchObject({ ok: false, code: 'CHROME_LTSM_UNAVAILABLE' });
+        expect(starts).toEqual([]);
+        expect(commands).toEqual([]);
+        expect(await secretStore.getTransport('s1')).toBe('DESKTOPWIN');
+      });
+
+      it('makes CHROMEOS the login method of the account after the QR login succeeds', async () => {
+        await startDesktopAccount('s1');
+        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'switch-ok', accountId: 's1', lineTransport: 'CHROMEOS' })).toMatchObject({ ok: true });
+        const { binding, attempt } = await rotate('s1', chromeSecrets);
+        await workerEventHandler?.(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: attempt, ownMid: 'own-s1', displayName: 'Agent' });
+        expect(await secretStore.getTransport('s1')).toBe('CHROMEOS');
+        expect(await secretStore.load('s1', 'CHROMEOS')).toEqual(chromeSecrets);
+        expect(await secretStore.load('s1', 'DESKTOPWIN')).toEqual(desktopSecrets);
+        const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'snap-switch' });
+        expect((snapshot as { snapshot: { accounts: Array<{ accountId: string; lineTransport?: string }> } }).snapshot.accounts
+          .find((account) => account.accountId === 's1')?.lineTransport).toBe('CHROMEOS');
+      });
+
+      it('keeps the old method when the QR login fails', async () => {
+        await startDesktopAccount('s1');
+        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'switch-fail', accountId: 's1', lineTransport: 'CHROMEOS' })).toMatchObject({ ok: true });
+        const { binding, attempt } = await rotate('s1', chromeSecrets);
+        await workerEventHandler?.(binding.workerInstanceId, { type: 'loginFailure', ...binding, loginAttemptId: attempt,
+          code: 'LOGIN_TIMEOUT', message: 'LINE login timed out. Try again.' });
+        expect(await secretStore.getTransport('s1')).toBe('DESKTOPWIN');
+        expect(await secretStore.load('s1', 'CHROMEOS')).toBeNull();
+        expect(await secretStore.load('s1', 'DESKTOPWIN')).toEqual(desktopSecrets);
+      });
+
+      const failureMessages = { LOGIN_FAILED: 'LINE login failed. Try again.', LOGIN_TIMEOUT: 'LINE login timed out. Try again.',
+        LOGIN_ATTEMPT_REPLACED: 'This LINE login attempt was replaced. Try again.' } as const;
+
+      it.each(['LOGIN_FAILED', 'LOGIN_TIMEOUT'] as const)('ends a failed QR relogin (%s) logged out with no worker, no control and unchanged secrets', async (code) => {
+        await startDesktopAccount('s1');
+        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: `end-${code}`, accountId: 's1', lineTransport: 'CHROMEOS' })).toMatchObject({ ok: true });
+        const { binding, attempt } = await rotate('s1', chromeSecrets);
+        published = [];
+        stops.length = 0;
+        const detail = 'qr_login_v2:ChromeApiError:qrCodeLoginV2:8';
+        await workerEventHandler?.(binding.workerInstanceId, { type: 'loginFailure', ...binding, loginAttemptId: attempt, code,
+          message: failureMessages[code], ...(code === 'LOGIN_FAILED' ? { detail } : {}) } as LineWorkerEvent);
+
+        expect(bindings.has('s1')).toBe(false);
+        expect(stops).toContain('s1');
+        expect(await statusOf('s1')).toBe('disconnected');
+        expect(published.filter((event) => event.type === 'lineLoginState')).toEqual([
+          { type: 'lineLoginState', accountId: 's1', loginAttemptId: attempt, state: 'disconnected', message: failureMessages[code] }]);
+        expect(await secretStore.getTransport('s1')).toBe('DESKTOPWIN');
+        expect(await secretStore.load('s1', 'DESKTOPWIN')).toEqual(desktopSecrets);
+        expect(await secretStore.load('s1', 'CHROMEOS')).toBeNull();
+        expect(auditEvents.some((event) => event.action === 'secret_clear')).toBe(false);
+        const row = auditEvents.find((event) => event.action === 'runtime_error' && event.diagnostic?.reason === code);
+        if (code === 'LOGIN_FAILED') expect(row?.diagnostic).toMatchObject({ operation: 'loginQr', stage: 'authenticate', detail });
+        else expect(row?.diagnostic).not.toHaveProperty('detail');
+      });
+
+      it('keeps the worker and the degraded state when the failed QR attempt was replaced', async () => {
+        await startDesktopAccount('s1');
+        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'end-replaced', accountId: 's1', lineTransport: 'CHROMEOS' })).toMatchObject({ ok: true });
+        const { binding, attempt } = await rotate('s1', chromeSecrets);
+        published = [];
+        await workerEventHandler?.(binding.workerInstanceId, { type: 'loginFailure', ...binding, loginAttemptId: attempt,
+          code: 'LOGIN_ATTEMPT_REPLACED', message: failureMessages.LOGIN_ATTEMPT_REPLACED });
+        expect(bindings.has('s1')).toBe(true);
+        expect(await statusOf('s1')).toBe('degraded');
+        expect(published.filter((event) => event.type === 'lineLoginState')).toEqual([
+          { type: 'lineLoginState', accountId: 's1', loginAttemptId: attempt, state: 'degraded', message: failureMessages.LOGIN_ATTEMPT_REPLACED }]);
+      });
+
+      it('keeps the DESKTOPWIN secrets and the marker when a pending CHROMEOS relogin is cancelled', async () => {
+        await startDesktopAccount('s1');
+        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'cancel-switch', accountId: 's1', lineTransport: 'CHROMEOS' })).toMatchObject({ ok: true });
+        await rotate('s1', chromeSecrets);
+        auditEvents.length = 0;
+        expect(await facade.dispatch({ type: 'lineLogout', requestId: 'cancel-switch-logout', accountId: 's1' })).toMatchObject({ ok: true });
+        expect(bindings.has('s1')).toBe(false);
+        expect(await secretStore.getTransport('s1')).toBe('DESKTOPWIN');
+        expect(await secretStore.load('s1', 'DESKTOPWIN')).toEqual(desktopSecrets);
+        expect(auditEvents.some((event) => event.action === 'secret_clear')).toBe(false);
+      });
+
+      it('clears only the CHROMEOS secrets when a connected CHROMEOS account logs out', async () => {
+        await startDesktopAccount('s1');
+        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'logout-chrome', accountId: 's1', lineTransport: 'CHROMEOS' })).toMatchObject({ ok: true });
+        const { binding, attempt } = await rotate('s1', chromeSecrets);
+        await workerEventHandler?.(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: attempt, ownMid: 'own-s1', displayName: 'Agent' });
+        expect(await secretStore.load('s1', 'CHROMEOS')).toEqual(chromeSecrets);
+        auditEvents.length = 0;
+        expect(await facade.dispatch({ type: 'lineLogout', requestId: 'logout-chrome-now', accountId: 's1' })).toMatchObject({ ok: true });
+        expect(await secretStore.load('s1', 'CHROMEOS')).toBeNull();
+        expect(await secretStore.load('s1', 'DESKTOPWIN')).toEqual(desktopSecrets);
+        expect(auditEvents.filter((event) => event.action === 'secret_clear').length).toBeGreaterThan(0);
+      });
+
+      it('keeps the old method when the scan belongs to a different LINE account', async () => {
+        await startDesktopAccount('s1');
+        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'switch-other', accountId: 's1', lineTransport: 'CHROMEOS' })).toMatchObject({ ok: true });
+        const { binding, attempt } = await rotate('s1', chromeSecrets);
+        await workerEventHandler?.(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: attempt, ownMid: 'other-mid', displayName: 'Other' });
+        expect(await secretStore.getTransport('s1')).toBe('DESKTOPWIN');
+        expect(await secretStore.load('s1', 'CHROMEOS')).toBeNull();
+        expect((await pool.query('SELECT own_mid FROM line_accounts WHERE account_id=$1', ['s1'])).rows).toEqual([{ own_mid: 'own-s1' }]);
+      });
+
+      it('keeps the current method when the request has no lineTransport', async () => {
+        await startDesktopAccount('s1');
+        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'same-desktop', accountId: 's1' })).toMatchObject({ ok: true });
+        expect(Object.hasOwn(bindings.get('s1')!, 'lineTransport')).toBe(false);
+      });
+
+      it('keeps CHROMEOS when the request has no lineTransport', async () => {
+        await addStoredAccounts('s3');
+        await setTransport('s3', 'CHROMEOS');
+        await activate('s3');
+        expect(await facade.dispatch({ type: 'lineLoginQr', requestId: 'same-chrome', accountId: 's3' })).toMatchObject({ ok: true });
+        expect(bindings.get('s3')).toMatchObject({ lineTransport: 'CHROMEOS' });
+      });
+    });
   });
 });

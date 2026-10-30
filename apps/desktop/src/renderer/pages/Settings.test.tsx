@@ -1114,7 +1114,7 @@ describe('database settings', () => {
     expect(accountCard.textContent).toContain('Primary AdminNot logged in');
     const monitorCard = screen.getByRole('region', { name: 'External monitoring' });
     expect(accountCard.compareDocumentPosition(monitorCard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(within(screen.getByLabelText('Primary Admin account slot')).getByText('Set administrator from LINE and start external monitoring')).toBeTruthy();
+    expect(within(screen.getByLabelText('Primary Admin account slot')).getByText('Administrator account (LINE monitor mode)')).toBeTruthy();
     expect(api.getEmbeddedConnectionInfo).not.toHaveBeenCalled();
     expect(document.body.textContent).not.toContain('s3cret');
     fireEvent.click(show);
@@ -1160,7 +1160,7 @@ describe('database settings', () => {
     expect(countRow.querySelector('.external-monitor-indicator')).toBeTruthy();
     const countRowRule = readFileSync(new NodeURL('../styles.css', import.meta.url), 'utf8').match(/\.external-monitor-count-row\{([^}]*)\}/)?.[1] ?? '';
     expect(countRowRule).toContain('justify-content:space-between');
-    expect(within(screen.getByLabelText('Primary Admin account slot')).queryByText('Set administrator from LINE and start external monitoring')).toBeNull();
+    expect(within(screen.getByLabelText('Primary Admin account slot')).queryByText('Administrator account (LINE monitor mode)')).toBeNull();
   });
 
   it('shows the external monitoring connection label while the admin is syncing', () => {

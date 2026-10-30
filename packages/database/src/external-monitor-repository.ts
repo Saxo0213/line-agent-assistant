@@ -1740,8 +1740,9 @@ async function upsertExternalAttachments(client: PoolClient, accountId: string, 
       chat_id: row.chatId, external_attachment_id: attachment.id, kind: attachment.kind,
       name: attachment.name, mime_type: attachment.mimeType, size_bytes: attachment.sizeBytes })) : []);
   if (rows.length === 0) return;
-  await client.query(`INSERT INTO attachments(external_attachment_id,account_id,chat_type,chat_id,message_id,kind,name,mime_type,size_bytes)
-    SELECT row.external_attachment_id,$1,row.chat_type,row.chat_id,row.message_id,row.kind,row.name,row.mime_type,row.size_bytes
+  await client.query(`INSERT INTO attachments(external_attachment_id,account_id,chat_type,chat_id,message_id,kind,name,mime_type,size_bytes,error)
+    SELECT row.external_attachment_id,$1,row.chat_type,row.chat_id,row.message_id,row.kind,row.name,row.mime_type,row.size_bytes,
+      'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE'
       FROM jsonb_to_recordset($2::jsonb) AS row(external_attachment_id text,chat_type text,chat_id text,message_id text,
         kind text,name text,mime_type text,size_bytes bigint)
     ON CONFLICT(account_id,chat_type,chat_id,message_id,external_attachment_id) DO UPDATE SET

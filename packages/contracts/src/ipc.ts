@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { isLineServerErrorCode } from './line-server-error.js';
+import { ATTACHMENT_BLOCK_REASONS } from './attachment-block.js';
 import { AgentAttachmentSummarySchema, AgentAttachmentUploadsSchema, AgentEventSchema, AgentProviderSchema } from './agent.js';
 import { AgentStatusIconsSchema } from './agent-status-icons.js';
 import { AgentPersonaSchema } from './agent-persona.js';
@@ -7,7 +8,8 @@ import { AgentExtensionToolsSchema, AgentExtensionsStateSchema, AgentMcpImportLi
 import { AgentScheduleCreateInputSchema, AgentScheduleListRunsInputSchema, AgentScheduleListTargetsInputSchema, AgentScheduleRunSchema, AgentScheduleSchema, AgentScheduleTargetOptionSchema, AgentScheduleUpdatePatchSchema } from './agent-schedule.js';
 import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN } from './agent-status-rotation.js';
 import { AutoResponderRuleSchema, AutoResponderSettingsSchema, validateAutoresponderConfig } from './autoresponder.js';
-import { AccountModeSchema, ChatTypeSchema, ConversationKeySchema, WritableConversationKeySchema } from './account.js';
+import { AccountModeSchema, ChatTypeSchema, ConversationKeySchema, LineTransportKindSchema, WritableConversationKeySchema } from './account.js';
+import { ChromeLtsmInstallResultSchema, ChromeLtsmStatusSchema, ChromeLtsmUnavailableStatusSchema } from './chrome-login.js';
 import { MentionRangeSchema, MessageContentSchema, MessageKindSchema, SticonRangeSchema } from './line.js';
 import {
   AgentPermissionsViewSchema,
@@ -121,14 +123,20 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('getSnapshot') }),
   RequestIdSchema.extend({ type: z.literal('reportRendererFailure') }),
   RequestIdSchema.extend({ type: z.literal('searchAgentJobs'), query: AgentJobSearchQuerySchema }),
-  RequestIdSchema.extend({ type: z.literal('lineAddAccountQr') }),
-  RequestIdSchema.extend({ type: z.literal('lineLoginQr'), accountId: IdSchema }),
-  RequestIdSchema.extend({ type: z.literal('lineReplaceAgentQr'), accountId: IdSchema }),
+  /** `lineTransport` selects the login method of the slot that this login reserves. If absent, the slot keeps its method (DESKTOPWIN for a new slot). */
+  RequestIdSchema.extend({ type: z.literal('lineAddAccountQr'), lineTransport: LineTransportKindSchema.optional() }),
+  RequestIdSchema.extend({ type: z.literal('lineLoginQr'), accountId: IdSchema, lineTransport: LineTransportKindSchema.optional() }),
+  RequestIdSchema.extend({ type: z.literal('lineReplaceAgentQr'), accountId: IdSchema, lineTransport: LineTransportKindSchema.optional() }),
   RequestIdSchema.extend({ type: z.literal('lineLogout'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('refreshLineAvatar'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('lineSetAutoLogin'), accountId: IdSchema, enabled: z.boolean() }),
   RequestIdSchema.extend({ type: z.literal('lineBeginAdminPairing'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('lineStart'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('getChromeLoginAvailability') }),
+  RequestIdSchema.extend({ type: z.literal('detectChromeLtsm') }),
+  /** Main opens the native folder picker. The renderer does not give a path. */
+  RequestIdSchema.extend({ type: z.literal('chooseChromeLtsmFolder') }),
+  RequestIdSchema.extend({ type: z.literal('openChromeExtensionStore') }),
   RequestIdSchema.extend({ type: z.literal('externalImportStart'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('externalImportStop'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('previewExternalAdminBinding') }),
@@ -262,6 +270,8 @@ export const LineAccountSummarySchema = z.strictObject({
   agentLineage: z.enum(['current', 'former']).optional(),
   hasPrimaryAdmin: z.boolean().optional(),
   autoLoginOnStartup: z.boolean().optional(),
+  /** Login method of this account. If absent (older payloads), it means DESKTOPWIN. */
+  lineTransport: LineTransportKindSchema.optional(),
   hasVerifiedLineIdentity: z.boolean().optional(),
   avatarAvailable: z.boolean().optional(),
   canSendManually: z.boolean().optional(),
@@ -287,6 +297,11 @@ export const GeneratedPreviewSchema = z.strictObject({
   kind: z.enum(['deleted', 'unsent', 'image', 'video', 'audio', 'file', 'sticker', 'contact', 'location', 'rich', 'unsupported', 'call', 'gift', 'post', 'post_note', 'post_album', 'chat_event', 'system', 'message']),
   name: z.string().optional(),
   status: z.enum(['queued', 'downloading', 'ready', 'failed', 'expired']).optional(),
+  /** Why a queued attachment cannot download now. The renderer shows it in place of the plain queued text. */
+  blockReason: z.enum(ATTACHMENT_BLOCK_REASONS).optional(),
+  /** Call event facts. The renderer builds the localized call text from them, as the chat timeline does. */
+  call: z.strictObject({ media: z.enum(['audio', 'video']).nullable(), result: z.string().nullable(),
+    durationMs: z.number().int().nonnegative().nullable(), direction: z.enum(['inbound', 'outbound']) }).optional(),
 });
 export type GeneratedPreview = z.infer<typeof GeneratedPreviewSchema>;
 export const ConversationSummarySchema = z.strictObject({
@@ -477,6 +492,11 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('getJobEvents'), requestId: IdSchema, ok: z.literal(true), events: z.array(AgentEventSchema) }),
     z.strictObject({ type: z.literal('openAttachment'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
     z.strictObject({ type: z.literal('openExternalUrl'), requestId: IdSchema, ok: z.literal(true) }),
+    z.strictObject({ type: z.literal('getChromeLoginAvailability'), requestId: IdSchema, ok: z.literal(true), status: ChromeLtsmStatusSchema }),
+    z.strictObject({ type: z.literal('detectChromeLtsm'), requestId: IdSchema, ok: z.literal(true), result: ChromeLtsmInstallResultSchema }),
+    z.strictObject({ type: z.literal('chooseChromeLtsmFolder'), requestId: IdSchema, ok: z.literal(true),
+      result: z.union([ChromeLtsmInstallResultSchema, z.strictObject({ kind: z.literal('cancelled') })]) }),
+    z.strictObject({ type: z.literal('openChromeExtensionStore'), requestId: IdSchema, ok: z.literal(true) }),
     z.strictObject({ type: z.literal('revealAttachment'), requestId: IdSchema, ok: z.literal(true), revealed: z.boolean() }),
     z.strictObject({ type: z.literal('resolveFileTypeIcon'), requestId: IdSchema, ok: z.literal(true), dataUrl: z.string().nullable() }),
     z.strictObject({ type: z.literal('mcpGetStatus'), requestId: IdSchema, ok: z.literal(true), status: McpServerStatusSchema }),
@@ -519,6 +539,8 @@ export const IpcResultSchema = z.union([
   ]),
   z.strictObject({ type: z.literal('error'), requestId: IdSchema, ok: z.literal(false), code: z.string().min(1),
     message: z.string().min(1), retryable: z.boolean(),
-    serverErrorCode: z.string().max(80).refine(isLineServerErrorCode).optional() }),
+    serverErrorCode: z.string().max(80).refine(isLineServerErrorCode).optional(),
+    /** Present with code CHROME_LTSM_UNAVAILABLE. It gives the reason why CHROMEOS login cannot start. */
+    chromeLtsmStatus: ChromeLtsmUnavailableStatusSchema.optional() }),
 ]);
 export type IpcResult = z.infer<typeof IpcResultSchema>;

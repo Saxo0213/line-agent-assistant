@@ -8,6 +8,7 @@ export default defineConfig({
       '@line-agent/database': fileURLToPath(new URL('./packages/database/src/index.ts', import.meta.url)),
       '@line-agent/agent-bridge': fileURLToPath(new URL('./packages/agent-bridge/src/index.ts', import.meta.url)),
       '@line-agent/line-worker': fileURLToPath(new URL('./packages/line-worker/src/index.ts', import.meta.url)),
+      '@line-agent/line-chrome': fileURLToPath(new URL('./packages/line-chrome/src/index.ts', import.meta.url)),
     },
   },
   test: {

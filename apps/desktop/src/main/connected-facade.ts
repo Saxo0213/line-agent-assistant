@@ -2,8 +2,12 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 import type {
   AgentEvent, AgentProvider, AgentRunRequest, ConversationKey, DiagnosticIdentity, DownloadAuthProbe, IpcEvent, IpcRequest, IpcResult, LineWorkerCommand,
-  LineWorkerEvent, WorkerBinding, ComponentHealth, LineServerErrorCode,
+  LineWorkerEvent, WorkerBinding, ComponentHealth, LineServerErrorCode, LineTransportKind, ChromeLtsmUnavailableStatus,
 } from '@line-agent/contracts';
+import { CHROME_EXTENSION_STORE_URL, CHROME_LTSM_UNAVAILABLE_CODE, resolveLineTransport } from '@line-agent/contracts';
+import { ATTACHMENT_BLOCK_REASONS, isAttachmentBlockReason } from '@line-agent/contracts';
+import { CHROME_EXTENSION_VERSION } from '@line-agent/line-chrome';
+import type { ChromeLtsmControl } from './services/chrome-ltsm-service.js';
 import { mkdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { homedir } from 'node:os';
@@ -35,7 +39,7 @@ import { AgentExtensionsService, AgentExtensionsServiceError, BackendSecretCodec
 import { defaultImportLocations, type AgentExtensionImportLocations } from './services/agent-extension-import.js';
 import { ChatFolderError, ChatFolderService } from './services/chat-folders.js';
 import { AlbumArchiveFailure, albumFailureContextFrom, albumTaskFailureStage, ChatResourceArchiveService, nativePostNotificationSubtype,
-  type ChatResourceBinding, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
+  ChatResourceUnsupportedError, type ChatResourceBinding, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
 import { AlbumNotificationDispatcher, archiveAlbumContinuations } from './services/album-notification-dispatcher.js';
 import { ChatResourceAccountAdmission } from './services/chat-resource-admission.js';
 import { ChatResourceArchive, createChatResourceStoreAdapter } from './services/chat-resource-archive.js';
@@ -80,6 +84,7 @@ import { createOwnAvatarRefreshScheduler, runOwnAvatarRefreshes } from './servic
 import { cleanupStaleManualMedia, ManualMediaError, stageManualMedia } from './services/manual-media-staging.js';
 import { createManualMediaAdmission } from './services/manual-media-admission.js';
 import { ManualSendNotStartedError } from './services/manual-send-errors.js';
+import { gatewayFault, recordSendFault, workerFault } from './services/send-failure.js';
 import { pickWorkerBinding } from './worker-binding-fields.js';
 
 const REPLY_SENDER_NAME_SQL = senderNameSql({ m: 'qm', la: 'qla', c: 'qc', cm: 'qcm',
@@ -189,6 +194,8 @@ export interface ConnectedFacadeOptions {
   /** Opens a chat folder in Explorer (shell.openPath); falls back to openAttachmentPath. Resolves to '' on success. */
   openFolderPath?: (folder: string) => Promise<string>;
   secretStore?: SecretStore;
+  /** Support for CHROMEOS login: the ltsm asset service, the native folder picker and the Chrome Web Store opener. If absent, CHROMEOS is not available. */
+  chromeLogin?: { ltsm: ChromeLtsmControl; chooseFolder(): Promise<string | null>; openStore(url: string): Promise<void> };
   audit?: OperationalAudit & { listEvents?: (limit?: number, onUpdate?: (result: AuditEventsReadResult) => void) => Promise<AuditEventsReadResult>; waitForReadDrain?: () => Promise<void> };
   publish?: (event: IpcEvent) => void;
   migrationDirectory?: string;
@@ -265,6 +272,19 @@ const failure = (requestId: string, code: string, message: string, retryable = f
   serverErrorCode?: LineServerErrorCode): IpcResult =>
   ({ type: 'error', requestId, ok: false, code, message, retryable,
     ...(serverErrorCode ? { serverErrorCode } : {}) });
+/** Main refused a CHROMEOS login or start because the ltsm assets are not usable. It has the status and no path. */
+class ChromeLtsmUnavailableError extends Error {
+  readonly code = CHROME_LTSM_UNAVAILABLE_CODE;
+  constructor(readonly status: ChromeLtsmUnavailableStatus) { super('LINE Chrome assets are unavailable'); this.name = 'ChromeLtsmUnavailableError'; }
+}
+function chromeLtsmMessage(status: ChromeLtsmUnavailableStatus): string {
+  if (status.kind === 'wrong-version') return `偵測到的 LINE Chrome 擴充功能版本（${status.detected.join('、') || '未知'}）與所需的 ${status.required} 不符，無法使用 Chrome 登入。`;
+  if (status.kind === 'corrupt') return 'LINE Chrome 安全模組檔案驗證失敗，請重新偵測或重新選擇檔案。';
+  return `尚未安裝 LINE Chrome 擴充功能 ${status.required} 的安全模組檔案，請先偵測或選擇檔案。`;
+}
+const chromeLtsmUnavailable = (requestId: string, status: ChromeLtsmUnavailableStatus): IpcResult =>
+  ({ type: 'error', requestId, ok: false, code: CHROME_LTSM_UNAVAILABLE_CODE, message: chromeLtsmMessage(status), retryable: false,
+    chromeLtsmStatus: status });
 const JOB_NOT_RETRYABLE = 'AGENT_JOB_NOT_RETRYABLE';
 const JOB_NOT_RETRYABLE_MESSAGE = '此任務目前無法重試（可能已取消、已產生輸出，或所屬 Agent 會話已變更）。';
 
@@ -765,7 +785,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       waitModeAck: (accountId, mode, timeoutMs) => options.workers.waitModeAck(accountId, mode, timeoutMs),
       send: sendLineCommand,
       ...(options.workers.sendMedia ? { sendMedia: (command, signal) => options.workers.sendMedia!(command, signal) } : {}),
-    } });
+    },
+    ...(options.audit ? { audit: options.audit } : {}) });
   stopLineSend = onceCleanup(() => agentLineSend.shutdown());
   startupCleanup.add(stopLineSend);
   const freeModeStore = new RoomFreeModeRepository(options.pool);
@@ -823,14 +844,15 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       throw error;
     }
   };
-  const auditSecretClear = async (accountId: string, initiator: 'user' | 'system', correlation?: { requestId?: string; loginAttemptId?: string }): Promise<void> => {
+  const auditSecretClear = async (accountId: string, initiator: 'user' | 'system', correlation?: { requestId?: string; loginAttemptId?: string },
+    lineTransport?: LineTransportKind): Promise<void> => {
     if (!options.secretStore) return;
     const correlationId = options.audit?.request('secret_clear', { initiator, accountId,
       ...(correlation?.requestId ? { requestId: correlation.requestId } : {}),
       ...(correlation?.loginAttemptId ? { loginAttemptId: correlation.loginAttemptId } : {}),
       reasonCode: initiator === 'user' ? 'operator_action' : 'auth_invalidated' });
     try {
-      await options.secretStore.clear(accountId);
+      await options.secretStore.clear(accountId, lineTransport);
       if (correlationId) options.audit?.complete(correlationId, 'succeeded', { resultCode: 'secret_removed' });
     } catch (error) {
       if (correlationId) options.audit?.complete(correlationId, 'failed', { errorCode: 'SECRET_CLEAR_FAILED' });
@@ -884,7 +906,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return { ...account, canSendManually, canStartExternalImport: false, hasVerifiedLineIdentity: !!stored?.ownMid,
         externalImportProgress: externalImportProgress.get(account.accountId) ?? null, ...officialBuildFor(account) };
     }));
-    return { ...snapshot, accounts: accountsWithManualSend };
+    const accountsWithTransport = await Promise.all(accountsWithManualSend.map(async (account) =>
+      await transportOf(account.accountId) === 'CHROMEOS' ? { ...account, lineTransport: 'CHROMEOS' as const } : account));
+    return { ...snapshot, accounts: accountsWithTransport };
   }, (event) => options.publish?.(event));
   stopPublishSnapshot = onceCleanup(() => publishSnapshot.shutdown());
   startupCleanup.add(stopPublishSnapshot);
@@ -1112,10 +1136,16 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     void publishSnapshot().catch(() => undefined);
   }, (error, identity) => options.audit?.failure(parseSafeDiagnostic(error) ?? diagnosticFailure('attachment', 'execute', error), identity), resolveNativeAttachment, async (accountId) =>
     (await options.pool.query<{ status: string }>('SELECT status FROM line_accounts WHERE account_id=$1', [accountId])).rows[0]?.status === 'connected',
-  Math.random, (result) => recordAttachmentServerResult(options, result));
+  Math.random, (result) => recordAttachmentServerResult(options, result),
+  // One audit row for each reason change of one account. The detail field holds the bounded reason code.
+  (accountId, reason) => options.audit?.failure({ operation: 'attachment', stage: 'queue', outcome: 'not_started', detail: reason,
+    category: reason === 'ATTACHMENT_WORKER_UNAVAILABLE' ? 'authentication_required' : 'unavailable',
+    recovery: reason === 'ATTACHMENT_WORKER_UNAVAILABLE' ? 'relogin' : reason === 'ATTACHMENT_WORKER_NOT_READY' ? 'wait' : 'none' },
+  { accountId, initiator: 'system' }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED'));
   stopAttachmentService = onceCleanup(() => attachmentService.shutdown());
   startupCleanup.add(stopAttachmentService);
   attachmentService.setAutomaticAttemptLimit(conversationSettings.attachmentAutoAttemptLimit);
+  void attachmentService.backfillBlockReasons();
   previewService = options.previewPresenter ? new AttachmentPreviewService({ root: options.attachmentRoot,
     onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
     ...(options.previewCacheRoot ? { cacheRoot: options.previewCacheRoot } : {}),
@@ -1138,6 +1168,46 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   stopLineMedia = onceCleanup(() => lineMedia.shutdown());
   startupCleanup.add(stopLineMedia);
   const loginAttempts = new Map<string, string>();
+  // Login attempt that the worker finished with a 'login' event. The loginAttempts entry stays after login success.
+  const completedLoginAttempts = new Map<string, string>();
+  /**
+   * Local teardown of an account session that has no server session to end (a pending or failed login), or whose server
+   * session is already ended. It stops the worker, releases control and clears the stopped binding. It clears no secrets.
+   * Run it inside `supervisor.runLifecycle`.
+   */
+  const releaseAccountSession = async (accountId: string, binding: WorkerBinding | null | undefined, loginAttemptId: string | undefined,
+    initiator: 'user' | 'system'): Promise<void> => {
+    chatResourceAdmission.close(accountId, 'LINE logout was confirmed.');
+    await stopExternalImportForAccount(accountId);
+    if (binding) await auditWorkerStop(binding, () => options.workers.stopBinding(binding), initiator);
+    const control = await accounts.getControlState();
+    if (control.activeAccountId === accountId) {
+      if (binding && supervisor.isCurrent(binding)) supervisor.retireWithinLifecycle(binding);
+      else await supervisor.revokeControlAndCancel(control.controlEpoch);
+    }
+    loginAttempts.delete(accountId);
+    completedLoginAttempts.delete(accountId);
+    if (binding) lineService.unbind(binding.workerInstanceId);
+    const durableBinding = binding ?? await accounts.getWorkerBinding(accountId);
+    if (loginAttemptId && durableBinding) await lineService.cancelLoginAttempt(accountId, durableBinding.workerInstanceId, loginAttemptId);
+    if (durableBinding && !await accounts.clearStoppedWorkerBinding(durableBinding)) {
+      throw new Error('Stopped LINE worker binding changed before compare-clear');
+    }
+  };
+  /** Binding fields that depend on the login method. DESKTOPWIN adds no field, so its bindings do not change. */
+  const transportFields = (lineTransport: LineTransportKind | undefined) =>
+    resolveLineTransport(lineTransport) === 'CHROMEOS' ? { lineTransport: 'CHROMEOS' as const } : {};
+  /** Login method of the account. The marker file in the secret store holds it. If there is no marker, it is DESKTOPWIN. */
+  function transportOf(accountId: string): Promise<LineTransportKind> {
+    return options.secretStore?.getTransport(accountId) ?? Promise.resolve('DESKTOPWIN' as const);
+  }
+  /** Null when the login method can start. Otherwise, the reason why CHROMEOS cannot start. Main starts no worker in that case. */
+  async function chromeLtsmBlock(lineTransport: LineTransportKind | undefined): Promise<ChromeLtsmUnavailableStatus | null> {
+    if (resolveLineTransport(lineTransport) !== 'CHROMEOS') return null;
+    const status = await options.chromeLogin?.ltsm.status().catch(() => null);
+    if (status?.kind === 'available') return null;
+    return status ?? { kind: 'missing', required: CHROME_EXTENSION_VERSION };
+  }
   const adminPairings = new AdminPairingService({
     hasPrimary: (accountId) => admins.hasPrimary(accountId),
     bindPrimary: (accountId, chatId, userId) => accounts.bindPrimaryAdministrator(accountId, chatId, userId),
@@ -1146,77 +1216,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     binding: (accountId) => options.workers.binding(accountId),
     isCurrentActiveControlBinding: (binding) => options.workers.isCurrentActiveControlBinding(binding),
     async send(command) { await assertLineWriteAllowed(command.accountId); return options.workers.send(command); },
-    async checkFriendRelation(command) { await assertLineWriteAllowed(command.accountId); return options.workers.checkFriendRelation(command); },
   }, audit: options.audit, locale: options.locale ?? 'en' });
-  const primaryFriendshipLifetime = new AbortController();
-  const primaryFriendshipReadiness = new Map<string, { key: string; abort: AbortController; promise: Promise<void>;
-    trigger: 'worker-ready' | 'admin-bound' }>();
-  startupCleanup.add(() => primaryFriendshipLifetime.abort());
-  const samePrimaryFriendshipBinding = (left: Bound | null, right: Bound): boolean => !!left
-    && left.accountId === right.accountId && left.workerInstanceId === right.workerInstanceId
-    && left.controlEpoch === right.controlEpoch && left.mode === right.mode
-    && left.transportOwnerId === right.transportOwnerId && left.transportGeneration === right.transportGeneration
-    && left.writeGrantVersion === right.writeGrantVersion;
-  const schedulePrimaryAdministratorFriendship = (binding: Bound, _signal: AbortSignal,
-    trigger: 'worker-ready' | 'admin-bound' = 'worker-ready') => {
-    const key = JSON.stringify([binding.accountId, binding.workerInstanceId, binding.controlEpoch, binding.mode,
-      binding.transportOwnerId, binding.transportGeneration, binding.writeGrantVersion, binding.purpose]);
-    const existing = primaryFriendshipReadiness.get(binding.accountId);
-    if (existing?.key === key) {
-      if (trigger === 'admin-bound') existing.trigger = trigger;
-      return;
-    }
-    existing?.abort.abort();
-    primaryFriendshipReadiness.delete(binding.accountId);
-    if (binding.mode !== 'ACTIVE_CONTROL' || binding.purpose === 'DOWNLOAD_ONLY' || closing) return;
-    const abort = new AbortController();
-    const lifetimeSignal = AbortSignal.any([abort.signal, primaryFriendshipLifetime.signal]);
-    let consumedTrigger = trigger;
-    const task = track(async () => {
-      // One bounded wait for the worker ACK; teardown ends it immediately through lifetimeSignal.
-      let cancel: (() => void) | undefined;
-      const aborted = new Promise<false>((resolve) => {
-        cancel = () => resolve(false);
-        if (lifetimeSignal.aborted) cancel(); else lifetimeSignal.addEventListener('abort', cancel, { once: true });
-      });
-      const ready = await Promise.race([options.workers.waitModeAck(binding.accountId, 'ACTIVE_CONTROL', workerBoundMs), aborted])
-        .finally(() => { if (cancel) lifetimeSignal.removeEventListener('abort', cancel); });
-      if (!ready || lifetimeSignal.aborted || closing) return;
-      if (lifetimeSignal.aborted || closing) return;
-      const current = await options.workers.binding(binding.accountId);
-      if (lifetimeSignal.aborted || !samePrimaryFriendshipBinding(current, binding)
-        || !options.workers.isCurrentActiveControlBinding(binding)) return;
-      // The mode ACK arrives on init, before login. The relation check needs the logged-in LINE session; the login/ready
-      // event re-schedules this job through updateChatResourceReadiness.
-      if (!lineService.isAuthenticatedReady(binding)) return;
-      while (!lifetimeSignal.aborted && !closing) {
-        const currentTask = primaryFriendshipReadiness.get(binding.accountId);
-        const requestedTrigger = currentTask?.abort === abort ? currentTask.trigger : consumedTrigger;
-        await friendEnrollment.ensurePrimaryAdministratorFriendship(binding as Bound & { mode: 'ACTIVE_CONTROL' }, lifetimeSignal,
-          requestedTrigger);
-        consumedTrigger = requestedTrigger;
-        // A same-binding admin-bound notification can arrive after the current
-        // call has read its trigger. Consume it serially before releasing this
-        // single-flight job, so it cannot be lost or start a concurrent check.
-        const latestTask = primaryFriendshipReadiness.get(binding.accountId);
-        if (latestTask?.abort !== abort || latestTask.trigger === consumedTrigger) break;
-      }
-    }, { operation: 'line_ingest', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } }).catch((error) => {
-      if (!lifetimeSignal.aborted && !closing) console.warn('[primary-admin-friendship] operational check failed', error);
-    }).finally(() => {
-      const latestTask = primaryFriendshipReadiness.get(binding.accountId);
-      if (latestTask?.abort !== abort) return;
-      const pendingAdminBinding = latestTask.trigger === 'admin-bound' && consumedTrigger !== 'admin-bound';
-      primaryFriendshipReadiness.delete(binding.accountId);
-      // Deleting and handing off are one synchronous turn: a same-binding
-      // admin-bound callback that arrived after the loop's last read cannot
-      // fall between the final trigger check and slot release.
-      if (pendingAdminBinding && !lifetimeSignal.aborted && !closing) {
-        schedulePrimaryAdministratorFriendship(binding, lifetimeSignal, 'admin-bound');
-      }
-    });
-    primaryFriendshipReadiness.set(binding.accountId, { key, abort, promise: task, trigger });
-  };
   const roomIsCurrentControl = async (binding: WorkerBinding): Promise<boolean> => {
     const [control, current] = await Promise.all([accounts.getControlState(), options.workers.binding(binding.accountId)]);
     return control.activeAccountId === binding.accountId && control.controlEpoch === binding.controlEpoch
@@ -1301,9 +1301,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       const paired = await adminPairings.consume(envelope);
       if (paired) {
         void publishSnapshot().catch(() => console.warn('[admin-pairing] snapshot publish failed'));
-        if (capturedBinding?.mode === 'ACTIVE_CONTROL') {
-          schedulePrimaryAdministratorFriendship(capturedBinding as Bound, primaryFriendshipLifetime.signal, 'admin-bound');
-        }
         if (!closing) void track(async () => {
           if (closing) return;
           const binding = await options.workers.binding(envelope.accountId);
@@ -1382,7 +1379,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   });
   const supervisor = new AccountSupervisor(accounts, {
     spawn: async (accountId, workerInstanceId, controlEpoch, mode) => {
-      const binding: Bound = { accountId, workerInstanceId, controlEpoch, mode };
+      const lineTransport = await transportOf(accountId);
+      const block = await chromeLtsmBlock(lineTransport);
+      if (block) throw new ChromeLtsmUnavailableError(block);
+      const binding: Bound = { accountId, workerInstanceId, controlEpoch, mode, ...transportFields(lineTransport) };
       await options.workers.start(accountId, binding);
       try {
         if (!bindsOnStart) await lineService.bind(binding);
@@ -1418,9 +1418,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       void track(() => recoverPendingAfterReady(binding),
         { operation: 'delivery', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } })
         .catch(() => undefined);
-      if (binding.mode === 'ACTIVE_CONTROL' && binding.purpose !== 'DOWNLOAD_ONLY') {
-        schedulePrimaryAdministratorFriendship(binding as Bound, primaryFriendshipLifetime.signal);
-      }
     }
   }
 
@@ -1441,6 +1438,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       // Fence archived resource IO before lifecycle/database teardown can yield.
       chatResourceAdmission.close(event.accountId, 'LINE authentication was invalidated.');
       const binding: WorkerBinding = event;
+      // Use the method of the worker that lost its login. During a method switch it differs from the stored marker.
+      const invalidatedWorker = await options.workers.binding(event.accountId);
+      const invalidatedTransport = invalidatedWorker?.workerInstanceId === instance
+        ? resolveLineTransport(invalidatedWorker.lineTransport) : await transportOf(event.accountId);
       const loginAttemptId = loginAttempts.get(event.accountId) ?? null;
       await supervisor.runLifecycle(async () => {
         if (!await accounts.invalidateWorkerBinding(binding)) return;
@@ -1451,9 +1452,32 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         if (supervisor.isCurrent(binding)) supervisor.retireWithinLifecycle(binding);
         await auditWorkerStop(binding, () => options.workers.stopBinding(binding));
         lineService.unbind(instance);
-        await auditSecretClear(event.accountId, 'system', loginAttemptId ? { loginAttemptId } : undefined);
+        await auditSecretClear(event.accountId, 'system', loginAttemptId ? { loginAttemptId } : undefined, invalidatedTransport);
         if (loginAttemptId) options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId,
           state: 'reauth_required', message: 'LINE credentials were rejected. Sign in again with QR.' });
+        await publishSnapshot();
+      });
+      return;
+    }
+    if (event.type === 'error' && event.code === CHROME_LTSM_UNAVAILABLE_CODE) {
+      // The worker could not load its ltsm assets. They were removed or changed after the preflight.
+      // Do the same teardown as for an authentication failure, but keep the stored session.
+      // The account needs the assets again, not a new login. The diagnostic has no path.
+      recordWorkerDiagnostic(options, event);
+      chatResourceAdmission.close(event.accountId, 'LINE Chrome assets became unavailable.');
+      const binding: WorkerBinding = event;
+      const loginAttemptId = loginAttempts.get(event.accountId) ?? null;
+      await supervisor.runLifecycle(async () => {
+        if (!await accounts.invalidateWorkerBinding(binding)) return;
+        if (loginAttemptId && loginAttempts.get(event.accountId) === loginAttemptId) {
+          loginAttempts.delete(event.accountId);
+          await options.secretStore?.closeLogin(event.accountId, instance, loginAttemptId);
+        }
+        if (supervisor.isCurrent(binding)) supervisor.retireWithinLifecycle(binding);
+        await auditWorkerStop(binding, () => options.workers.stopBinding(binding));
+        lineService.unbind(instance);
+        options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId,
+          state: 'reauth_required', message: 'LINE Chrome 安全模組檔案無法使用；請先在登入設定中偵測或重新選擇檔案。' });
         await publishSnapshot();
       });
       return;
@@ -1462,11 +1486,30 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (loginAttempts.get(event.accountId) !== event.loginAttemptId) return;
       options.audit?.failure({ operation: 'loginQr', stage: 'authenticate', reason: event.code,
         category: event.code === 'LOGIN_TIMEOUT' ? 'timeout' : event.code === 'LOGIN_ATTEMPT_REPLACED' ? 'cancelled' : 'authentication_required',
-        recovery: event.code === 'LOGIN_ATTEMPT_REPLACED' ? 'none' : 'relogin' },
+        recovery: event.code === 'LOGIN_ATTEMPT_REPLACED' ? 'none' : 'relogin',
+        ...('detail' in event && event.detail !== undefined ? { detail: event.detail } : {}) },
         { accountId: event.accountId, workerInstanceId: event.workerInstanceId, loginAttemptId: event.loginAttemptId });
       loginAttempts.delete(event.accountId);
+      // A failed QR login ends logged out. A token login (startup or resume) and a replaced or busy attempt keep the old state.
+      const endsLoggedOut = (event.code === 'LOGIN_FAILED' || event.code === 'LOGIN_TIMEOUT')
+        && lineService.loginAttemptKind(event.accountId, instance, event.loginAttemptId) === 'qr';
       await lineService.handleWorkerEvent(instance, event);
       if (!lineService.isCurrentWorkerEvent(instance, event)) return;
+      if (endsLoggedOut) {
+        await supervisor.runLifecycle(async () => {
+          const running = await options.workers.binding(event.accountId) ?? supervisor.binding(event.accountId);
+          // Another worker owns the account now: leave it alone.
+          if (running && running.workerInstanceId !== instance) return;
+          // The login saved no secret. The attempt is already closed, so no attempt id is passed.
+          await releaseAccountSession(event.accountId, running, undefined, 'system');
+          await accounts.setConnectionStatus(event.accountId, 'disconnected');
+          options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId: event.loginAttemptId,
+            state: 'disconnected', message: event.message });
+          options.publish?.({ type: 'controlChanged', control: (await publishSnapshot.read()).control });
+        });
+        await publishSnapshot();
+        return;
+      }
       options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId: event.loginAttemptId,
         state: 'degraded', message: event.message });
       await publishSnapshot();
@@ -1524,6 +1567,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (event.type === 'pin') options.publish?.({ type: 'linePin', accountId: event.accountId, loginAttemptId: event.loginAttemptId, pin: event.pin });
     if (event.type === 'login') {
       if (!lineService.isCurrentWorkerEvent(instance, event)) return;
+      completedLoginAttempts.set(event.accountId, event.loginAttemptId);
       await updateChatResourceReadiness(instance, event);
       await noteOwnAvatarAccountConnected(event.accountId);
       options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId: event.loginAttemptId, state: 'connected', message: null });
@@ -1580,7 +1624,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   if (unsubscribeEvent) startupCleanup.add(unsubscribeEvent);
   const bindsOnStart = options.workers.onBinding !== undefined;
   async function restoreTokenForBinding(binding: Bound, signal?: AbortSignal): Promise<void> {
-    if (closing || signal?.aborted || !(await options.secretStore?.load(binding.accountId))?.token) return;
+    if (closing || signal?.aborted || !(await options.secretStore?.load(binding.accountId, binding.lineTransport))?.token) return;
     if (closing || signal?.aborted) return;
     const current = await options.workers.binding(binding.accountId);
     if (!current || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch) return;
@@ -1603,7 +1647,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       await lineService.bind(binding, signal);
       if (signal.aborted) throw new Error('Worker binding cancelled');
-      schedulePrimaryAdministratorFriendship(binding, signal);
     }, { operation: 'line_ingest', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } });
   });
   if (unsubscribeBinding) startupCleanup.add(unsubscribeBinding);
@@ -1631,7 +1674,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }, signal);
       if (signal.aborted) return;
       if (binding.mode === 'ACTIVE_CONTROL') schedulePendingDeliveryRecovery(binding.accountId);
-      schedulePrimaryAdministratorFriendship(binding, signal);
     }, { operation: 'line_ingest', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } });
   });
   if (unsubscribeRestartBinding) startupCleanup.add(unsubscribeRestartBinding);
@@ -1643,7 +1685,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       await lineService.bind(binding, signal);
       if (signal.aborted) return;
       const mode = binding.mode;
-      schedulePrimaryAdministratorFriendship(binding, signal);
       if (mode !== 'PAUSED') void track(async () => {
         if (signal.aborted || !await waitModeAckReportingTimeout(binding, mode, signal, 'line_ingest')) return;
         const current = await options.workers.binding(binding.accountId);
@@ -1683,6 +1724,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   async function startStoredAccount(account: Awaited<ReturnType<AccountRepository['getAccount']>> & {}): Promise<Bound> {
     await stopExternalImportForAccount(account.accountId);
     if (!account.productRole) throw new Error('LINE account role is unclassified; worker start is blocked');
+    const lineTransport = await transportOf(account.accountId);
+    const ltsmBlock = await chromeLtsmBlock(lineTransport);
+    if (ltsmBlock) throw new StartupStageError('admission', false, new ChromeLtsmUnavailableError(ltsmBlock));
     let control: Awaited<ReturnType<AccountRepository['getControlState']>>;
     let mode: Bound['mode'] = account.mode === 'ACTIVE_CONTROL' ? 'ACTIVE_CONTROL' : 'MONITOR_ONLY';
     try {
@@ -1703,7 +1747,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
     } catch (error) { throw error instanceof StartupStageError ? error : new StartupStageError('admission', true, error); }
     const binding: Bound = { accountId: account.accountId, workerInstanceId: randomUUID(), controlEpoch: control.controlEpoch,
-      mode };
+      mode, ...transportFields(lineTransport) };
     try {
       await options.workers.start(account.accountId, binding);
       if (!bindsOnStart) await lineService.bind(binding);
@@ -1738,15 +1782,19 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     } catch (error) {
       const stage = error instanceof StartupStageError ? error.stage : 'unknown';
       const errorCode: AuditErrorCode = stage === 'dispatch' ? 'CREDENTIAL_RESTORE_FAILED' : 'WORKER_OPERATION_FAILED';
+      // CHROMEOS without usable ltsm assets. The operator can fix this configuration problem. It is not a temporary fault.
+      const ltsmUnavailable = error instanceof StartupStageError && error.code === CHROME_LTSM_UNAVAILABLE_CODE;
       try {
         if (correlationId) {
-          options.audit?.complete(correlationId, 'failed', { errorCode, diagnostic: diagnosticFailure('startup', stage, error) });
+          options.audit?.complete(correlationId, 'failed', { errorCode, diagnostic: ltsmUnavailable
+            ? { ...diagnosticFailure('startup', stage, error), category: 'unavailable', recovery: 'check_configuration' }
+            : diagnosticFailure('startup', stage, error) });
         }
       } catch { /* Diagnostics cannot change the degraded outcome. */ }
       await options.workers.stop(account.accountId).catch((stopError: unknown) => {
         options.audit?.failure(diagnosticFailure('startup', 'cleanup', stopError), { accountId: account.accountId, initiator: 'system' }, 'WORKER_STOP_FAILED');
       });
-      await accounts.setConnectionStatus(account.accountId, 'degraded').catch((statusError: unknown) => {
+      await accounts.setConnectionStatus(account.accountId, ltsmUnavailable ? 'reauth_required' : 'degraded').catch((statusError: unknown) => {
         options.audit?.failure(diagnosticFailure('database', 'persist', statusError), { accountId: account.accountId, initiator: 'system' }, 'DATABASE_WRITE_FAILED');
       });
       return { retryable: !(error instanceof StartupStageError) || error.retryable };
@@ -1761,8 +1809,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (closing) return;
       void track(async () => {
         // No retry once the token is gone (authentication invalidated) or the account was paused/removed.
-        const saved = await options.secretStore?.load(account.accountId);
         const current = await accounts.getAccount(account.accountId);
+        const saved = await options.secretStore?.load(account.accountId, await transportOf(account.accountId));
         if (closing || !saved?.token || !current || current.mode === 'PAUSED') return;
         await attemptStartupAutoLogin(current);
       }, { operation: 'startup', identity: { accountId: account.accountId, background: true } }).catch(() => undefined);
@@ -1770,13 +1818,17 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     recoveryTimers.add(timer);
   }
 
-  async function reloginAccountWithQr(accountId: string, requestId: string): Promise<IpcResult> {
+  async function reloginAccountWithQr(accountId: string, requestId: string, requestedTransport?: LineTransportKind): Promise<IpcResult> {
     return supervisor.runLifecycle(async () => {
       await stopExternalImportForAccount(accountId);
       const account = await accounts.getAccount(accountId);
       if (!account) return failure(requestId, 'ACCOUNT_NOT_FOUND', 'LINE account not found.');
       if (!account.productRole) return failure(requestId, 'ACCOUNT_ROLE_UNCLASSIFIED', 'This account has no verified Agent or Primary Admin role.');
       if (account.mode === 'PAUSED') return failure(requestId, 'ACCOUNT_PAUSED', 'This LINE account is paused.');
+      // No requested method means the current method of the account. A different method is only stored after the QR login succeeds.
+      const lineTransport = resolveLineTransport(requestedTransport ?? await transportOf(accountId));
+      const ltsmBlock = await chromeLtsmBlock(lineTransport);
+      if (ltsmBlock) return chromeLtsmUnavailable(requestId, ltsmBlock);
       let control = await accounts.getControlState();
       if (account.productRole === 'PRIMARY_ADMIN' && control.activeAccountId === accountId) {
         return failure(requestId, 'ADMIN_CONTROL_FORBIDDEN', 'Primary Admin accounts cannot own Agent control.');
@@ -1804,7 +1856,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           && !supervisor.retireWithinLifecycle(previous)) throw new Error('Stopped LINE worker no longer owns active control');
       }
       await accounts.setConnectionStatus(accountId, 'disconnected');
-      const binding: Bound = { accountId, workerInstanceId: randomUUID(), controlEpoch: control.controlEpoch, mode: accountMode };
+      const binding: Bound = { accountId, workerInstanceId: randomUUID(), controlEpoch: control.controlEpoch, mode: accountMode,
+        ...transportFields(lineTransport) };
       try {
         await options.workers.start(accountId, binding);
         if (binding.mode === 'ACTIVE_CONTROL' && !await supervisor.adoptWithinLifecycle(binding, supervisedWorker(binding))) {
@@ -1833,7 +1886,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     });
   }
 
-  async function replaceAgentAccountWithQr(accountId: string, requestId: string): Promise<IpcResult> {
+  async function replaceAgentAccountWithQr(accountId: string, requestId: string, requestedTransport?: LineTransportKind): Promise<IpcResult> {
     return supervisor.runLifecycle(async () => {
       let createdAccountId: string | null = null;
       try {
@@ -1842,6 +1895,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const old = await accounts.getAccount(accountId);
         if (!old || old.productRole !== 'AGENT' || !old.ownMid) return failure(requestId, 'AGENT_REPLACEMENT_STALE', 'Agent 帳號已變更，請重新整理後再試。');
         if (loginAttempts.has(accountId)) return failure(requestId, 'AGENT_LOGIN_IN_PROGRESS', '請先取消目前的 LINE 登入，再更換 Agent 帳號。', true);
+        // Fail fast. Do this before Main stops or replaces anything.
+        const ltsmBlock = await chromeLtsmBlock(requestedTransport);
+        if (ltsmBlock) return chromeLtsmUnavailable(requestId, ltsmBlock);
         await stopAndClearWorkerBinding(accountId, 'user');
         let control = await accounts.getControlState();
         if (control.activeAccountId && control.activeAccountId !== accountId) {
@@ -1863,6 +1919,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           return failure(requestId, reserved.code, message, true);
         }
         createdAccountId = reserved.account.accountId;
+        // The new account has no marker yet. Store the chosen transport before the worker starts.
+        await options.secretStore?.setTransport(createdAccountId, requestedTransport ?? 'DESKTOPWIN');
         const binding = await startStoredAccount(reserved.account);
         const loginAttemptId = randomUUID();
         loginAttempts.set(binding.accountId, loginAttemptId);
@@ -2394,11 +2452,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return failure(requestId, bound.code, message);
     }
     console.info(`[external-admin-binding] primary admin bound from official LINE ${maskMid(mid)}`);
-    const activeControl = await accounts.getControlState();
-    const activeBinding = activeControl.activeAccountId ? await options.workers.binding(activeControl.activeAccountId) : null;
-    if (activeBinding?.mode === 'ACTIVE_CONTROL') {
-      schedulePrimaryAdministratorFriendship(activeBinding as Bound, primaryFriendshipLifetime.signal, 'admin-bound');
-    }
     await publishSnapshot().catch(() => undefined);
     // The admin is confirmed by the user and now bound; a failed start leaves the card to retry.
     const started = await beginExternalImport(requestId, bound.accountId);
@@ -2521,6 +2574,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           const account = await accounts.getAccount(request.accountId);
           if (!account) return failure(request.requestId, 'ACCOUNT_NOT_FOUND', 'LINE account not found.');
           if (!account.productRole) return failure(request.requestId, 'ACCOUNT_ROLE_UNCLASSIFIED', 'This account has no assigned role slot.');
+          const ltsmBlock = await chromeLtsmBlock(await transportOf(account.accountId));
+          if (ltsmBlock) return chromeLtsmUnavailable(request.requestId, ltsmBlock);
           await startStoredAccount(account);
           return accepted(request.requestId);
         });
@@ -2579,27 +2634,20 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const loginAttemptId = loginAttempts.get(request.accountId);
         if (!account.ownMid && !loginAttemptId) return failure(request.requestId, 'ACCOUNT_NOT_AUTHENTICATED', '這不是已完成登入的 LINE 帳號。');
         const binding = await options.workers.binding(request.accountId) ?? supervisor.binding(request.accountId);
-        if (account.ownMid) {
+        // A pending login has no server session in the worker, so the worker cannot log out. Cancel it locally.
+        const loginPending = !!loginAttemptId && completedLoginAttempts.get(request.accountId) !== loginAttemptId;
+        if (account.ownMid && !loginPending) {
           if (!binding) throw new Error('LINE_LOGOUT_WORKER_UNAVAILABLE');
           const logout = await lineService.requestLogout(request.accountId, binding.workerInstanceId);
           if (!logout.ok && logout.error !== 'LINE_AUTH_INVALIDATED') throw new Error('LINE_LOGOUT_FAILED');
         }
-        chatResourceAdmission.close(request.accountId, 'LINE logout was confirmed.');
-        await stopExternalImportForAccount(request.accountId);
-        if (binding) await auditWorkerStop(binding, () => options.workers.stopBinding(binding), 'user');
-        const control = await accounts.getControlState();
-        if (control.activeAccountId === request.accountId) {
-          if (binding && supervisor.isCurrent(binding)) supervisor.retireWithinLifecycle(binding);
-          else await supervisor.revokeControlAndCancel(control.controlEpoch);
+        await releaseAccountSession(request.accountId, binding, loginAttemptId, 'user');
+        // A cancelled login saved no secret, and the old method keeps its own. A real logout removes only the secrets of the
+        // method of the session that logged out: the worker's own method when it runs, else the stored marker.
+        if (!loginPending) {
+          await auditSecretClear(request.accountId, 'user', { requestId: request.requestId },
+            binding ? resolveLineTransport(binding.lineTransport) : await transportOf(request.accountId));
         }
-        loginAttempts.delete(request.accountId);
-        if (binding) lineService.unbind(binding.workerInstanceId);
-        const durableBinding = binding ?? await accounts.getWorkerBinding(request.accountId);
-        if (loginAttemptId && durableBinding) await lineService.cancelLoginAttempt(request.accountId, durableBinding.workerInstanceId, loginAttemptId);
-        if (durableBinding && !await accounts.clearStoppedWorkerBinding(durableBinding)) {
-          throw new Error('Stopped LINE worker binding changed before compare-clear');
-        }
-        await auditSecretClear(request.accountId, 'user', { requestId: request.requestId });
         await accounts.setConnectionStatus(request.accountId, 'disconnected');
         options.publish?.({ type: 'lineLoginState', accountId: request.accountId, loginAttemptId: null,
           state: 'disconnected', message: '已登出；聊天紀錄與附件索引均已保留。' });
@@ -2659,6 +2707,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         if (!sendResult) return failure(request.requestId, 'LINE_SEND_NOT_STARTED', 'LINE account is not ready for manual sending.');
         const result = await sendResult;
         if (result.status === 'sent') return accepted(request.requestId);
+        // A LINE server code is audited by recordKnownServerResult; every other worker code is audited here.
+        if (!isLineServerErrorCode(result.error)) recordSendFault(options.audit, { accountId: request.accountId, requestId: request.requestId,
+          operation: 'manualSendText' }, workerFault(result, result.status === 'failed' ? 'failed' : 'unknown'));
         return result.status === 'failed'
           ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', lineResultErrorMessage(result.error, 'LINE message was not sent.'), false,
             isLineServerErrorCode(result.error) ? result.error : undefined)
@@ -2695,14 +2746,19 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
               controlEpoch: admission.binding.controlEpoch, chatType: admission.chatType, chatId: request.chatId, requestId: randomUUID(),
               kind: item.kind, filePath: item.filePath, fileName: item.fileName, sizeBytes: item.sizeBytes, sha256: item.sha256,
               manualSend: true }, signal);
+            if (result.status !== 'sent' && !isLineServerErrorCode(result.error)) recordSendFault(options.audit, { accountId: request.accountId,
+              requestId: result.requestId, operation: 'sendMedia' }, workerFault(result, result.status === 'failed' ? 'failed' : 'unknown'));
             if (result.status !== 'sent') return result.status === 'failed'
-              ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', lineResultErrorMessage(result.error, 'LINE attachment was not sent.'), false,
+              ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', lineResultErrorMessage(result.error, 'LINE attachment was not sent.', result.detail), false,
                 isLineServerErrorCode(result.error) ? result.error : undefined)
               : failure(request.requestId, 'LINE_SEND_OUTCOME_UNKNOWN', 'LINE attachment outcome is unknown.');
           }
           return accepted(request.requestId);
         } catch (error) {
           if (error instanceof ManualMediaError) return failure(request.requestId, 'LINE_SEND_NOT_STARTED', error.message);
+          // The thrown gateway reason is kept in the audit row; the user text stays the same.
+          recordSendFault(options.audit, { accountId: request.accountId, requestId: request.requestId, operation: 'sendMedia' },
+            gatewayFault(error, error instanceof ManualSendNotStartedError ? 'failed' : 'unknown'));
           if (error instanceof ManualSendNotStartedError) return failure(request.requestId, 'LINE_SEND_NOT_STARTED', error.message);
           return failure(request.requestId, 'LINE_SEND_OUTCOME_UNKNOWN', 'LINE send outcome is unknown.');
         } finally { await staged?.cleanup().catch(() => undefined); }
@@ -2737,6 +2793,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         if (admissionFailure) return failure(request.requestId, admissionFailure.code, admissionFailure.message);
         if (!resultPromise || !ownMid) return failure(request.requestId, 'LINE_UNSEND_NOT_STARTED', 'LINE account is not ready to unsend messages.');
         const result = await resultPromise;
+        if (result.status !== 'unsent' && !isLineServerErrorCode(result.error)) recordSendFault(options.audit, { accountId: request.accountId,
+          requestId: request.requestId, operation: 'unsendMessage' }, workerFault({ error: result.error }, result.status === 'failed' ? 'failed' : 'unknown'));
         if (result.status === 'failed') return failure(request.requestId, 'LINE_UNSEND_NOT_STARTED',
           lineResultErrorMessage(result.error, 'LINE message was not unsent.'), false,
           isLineServerErrorCode(result.error) ? result.error : undefined);
@@ -2872,19 +2930,59 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         await publishSnapshot();
         return result.ok ? accepted(request.requestId) : failure(request.requestId, 'AGENT_AUTH_FAILED', result.detail ?? 'Agent 登入操作失敗。');
       }
+      if (request.type === 'getChromeLoginAvailability') {
+        const status = await options.chromeLogin?.ltsm.status().catch(() => null)
+          ?? { kind: 'missing' as const, required: CHROME_EXTENSION_VERSION };
+        return { type: 'getChromeLoginAvailability', requestId, ok: true, status };
+      }
+      if (request.type === 'detectChromeLtsm' || request.type === 'chooseChromeLtsmFolder') {
+        if (!options.chromeLogin) return failure(requestId, 'CHROME_LOGIN_UNAVAILABLE', 'Chrome 登入在此環境不可用。');
+        try {
+          if (request.type === 'detectChromeLtsm') {
+            return { type: 'detectChromeLtsm', requestId, ok: true, result: await options.chromeLogin.ltsm.detectAndInstall() };
+          }
+          const folder = await options.chromeLogin.chooseFolder();
+          if (folder === null) return { type: 'chooseChromeLtsmFolder', requestId, ok: true, result: { kind: 'cancelled' } };
+          return { type: 'chooseChromeLtsmFolder', requestId, ok: true, result: await options.chromeLogin.ltsm.installFromFolder(folder) };
+        } catch (error) {
+          options.audit?.failure({ ...diagnosticFailure('ipc', 'execute', error), ipcAction: request.type }, { requestId });
+          return failure(requestId, 'CHROME_LTSM_INSTALL_FAILED', '無法讀取或複製 LINE Chrome 安全模組檔案。', true);
+        }
+      }
+      if (request.type === 'openChromeExtensionStore') {
+        if (!options.chromeLogin) return failure(requestId, 'CHROME_LOGIN_UNAVAILABLE', 'Chrome 登入在此環境不可用。');
+        try { await options.chromeLogin.openStore(CHROME_EXTENSION_STORE_URL); }
+        catch (error) {
+          options.audit?.failure({ ...diagnosticFailure('ipc', 'execute', error), ipcAction: request.type }, { requestId });
+          return failure(requestId, 'SERVICE_UNAVAILABLE', '無法開啟外部瀏覽器。', true);
+        }
+        return { type: 'openChromeExtensionStore', requestId, ok: true };
+      }
       if (request.type === 'lineLoginQr') {
-        try { return await reloginAccountWithQr(request.accountId, request.requestId); }
+        try { return await reloginAccountWithQr(request.accountId, request.requestId, request.lineTransport); }
         catch (error) {
           options.audit?.failure({ ...diagnosticFailure('loginQr', 'dispatch', error), ipcAction: request.type }, { accountId: request.accountId, requestId: request.requestId });
           return failure(request.requestId, 'LINE_LOGIN_QR_START_FAILED', 'LINE QR 登入未能啟動，請重試。', true);
         }
       }
       if (request.type === 'lineReplaceAgentQr') {
-        return await replaceAgentAccountWithQr(request.accountId, request.requestId);
+        return await replaceAgentAccountWithQr(request.accountId, request.requestId, request.lineTransport);
       }
       if (request.type === 'lineAddAccountQr') {
         try { return await supervisor.runLifecycle(async () => {
-        const account = await accounts.reserveAccountSlot();
+        // Check the chosen login method before Main reserves a slot. A refused CHROMEOS login leaves no slot and no worker.
+        const requestedBlock = await chromeLtsmBlock(request.lineTransport);
+        if (requestedBlock) return chromeLtsmUnavailable(request.requestId, requestedBlock);
+        const reserved = await accounts.reserveAccountSlot();
+        if (request.lineTransport && await transportOf(reserved.accountId) !== request.lineTransport) {
+          // Stop a worker that remains from the previous login method. Then store the chosen method.
+          const leftover = await options.workers.binding(reserved.accountId);
+          if (leftover) await stopAndClearWorkerBinding(reserved.accountId, 'user');
+          await options.secretStore?.setTransport(reserved.accountId, request.lineTransport);
+        }
+        const slotBlock = await chromeLtsmBlock(await transportOf(reserved.accountId));
+        if (slotBlock) return chromeLtsmUnavailable(request.requestId, slotBlock);
+        const account = reserved;
         const binding = await options.workers.binding(account.accountId) ?? await startStoredAccount(account);
         await publishSnapshot();
         const loginAttemptId = randomUUID();
@@ -3096,6 +3194,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return failure(requestId, error.code, error.code === 'APPROVAL_NOT_PENDING' ? '這項核可已結束或不存在。' : '這個命令太長，無法記住，只能允許一次或拒絕。');
       }
       if (error instanceof ChatFolderError) return failure(requestId, error.code, error.message);
+      if (error instanceof ChatResourceUnsupportedError) return failure(requestId, error.code, error.message);
       if (error instanceof AgentScheduleError) {
         return failure(requestId, error.code, error.code === 'SCHEDULE_NOT_FOUND' ? '找不到這個排程。'
           : error.code === 'SCHEDULE_LIMIT' ? '啟用中的排程最多 50 個。'
@@ -3122,7 +3221,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       const owner = await accounts.getControlState();
       if ((owner.activeAccountId && owner.activeAccountId !== account.accountId && account.productRole === 'AGENT')
         || (owner.activeAccountId === account.accountId && account.productRole !== 'AGENT')) continue;
-      const saved = await options.secretStore.load(account.accountId);
+      const saved = await options.secretStore.load(account.accountId, await transportOf(account.accountId));
       if (!saved?.token) {
         await accounts.setConnectionStatus(account.accountId, 'disconnected');
         continue;
@@ -3271,7 +3370,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         reply_account_picture_path: string | null;
         reply_text: string | null; reply_kind: string | null;
         sender_picture_path: string | null; account_picture_path: string | null;
-        attachments: Array<{ id: string; kind: 'image' | 'video' | 'audio' | 'file'; name: string; mimeType: string | null; sizeBytes: number | null; status: string; canRetryManually: boolean }>;
+        attachments: Array<{ id: string; kind: 'image' | 'video' | 'audio' | 'file'; name: string; mimeType: string | null; sizeBytes: number | null; status: string; canRetryManually: boolean; blockReason?: string | null }>;
       }>(`SELECT m.message_id,m.reply_to_message_id,m.sender_id,la.own_mid,
           ${ownMessageSql('m', 'la')} AS is_own,
           ${SENDER_NAME_SQL} resolved_sender_name,
@@ -3288,6 +3387,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
               WHEN a.status='failed' AND a.retry_count < $5 AND a.retry_after IS DISTINCT FROM 'infinity'::timestamptz
                 AND NOT EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
                   AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR') THEN 'queued' ELSE a.status END,
+            'blockReason',CASE WHEN a.status='queued' AND a.error = ANY($6::text[]) THEN a.error END,
             'canRetryManually',la.status='connected' AND (m.occurred_at >= now() - interval '7 days' OR NOT EXISTS (SELECT 1 FROM message_source_provenance p
                 WHERE p.account_id=a.account_id AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR'))
               AND (a.status='expired' OR (a.status='failed' AND (a.retry_count >= $5 OR a.retry_after='infinity'::timestamptz
@@ -3325,7 +3425,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           rd.message_id,rd.sender_id,rd.own_mid,rd.sender_name,rd.sender_picture_path,rd.conversation_picture_path,rd.account_picture_path,rd.text_content,rd.kind,
           ${ownMessageSql('m', 'la')},rd.is_own,
           ${NAME_RESOLUTION_GROUP_COLUMNS}`,
-      [key.accountId, key.chatType, key.chatId, page.messages.map((item) => item.messageId), conversationSettings.attachmentAutoAttemptLimit]) : { rows: [] };
+      [key.accountId, key.chatType, key.chatId, page.messages.map((item) => item.messageId), conversationSettings.attachmentAutoAttemptLimit, [...ATTACHMENT_BLOCK_REASONS]]) : { rows: [] };
       const byId = new Map(details.rows.map((row) => [row.message_id, row]));
       const agentStatuses = new Map<string, { jobId: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'; revision: string }>();
       if (page.messages.length) {
@@ -3370,7 +3470,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         recalledContent: recalledBridge?.content?.type === 'unsent' ? null : recalledBridge?.content ?? null,
         recalledKind: recalledBridge?.kind ?? null, recalledText, attachments: (detail?.attachments ?? []).map((attachment) => ({ id: attachment.id, kind: attachment.kind, name: attachment.name,
           mimeType: attachment.mimeType ?? 'application/octet-stream', sizeBytes: Number(attachment.sizeBytes ?? 0), status: attachment.status,
-          canRetryManually: attachment.canRetryManually })) }); });
+          canRetryManually: attachment.canRetryManually,
+          ...(isAttachmentBlockReason(attachment.blockReason) ? { blockReason: attachment.blockReason } : {}) })) }); });
       return { messages: timeline, olderCursor: page.nextCursor };
     },
     async listChatNotes(key, cursor) { return chatResources.listNotes(key, cursor); },
@@ -3427,7 +3528,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       manualMediaAdmission.shutdown();
       return shutdownPromise ??= (async () => {
         const errors: unknown[] = [];
-        primaryFriendshipLifetime.abort();
         externalImportOwner?.abort.abort();
         identityReadAbort?.abort();
         const collect = (results: PromiseSettledResult<unknown>[]) => {

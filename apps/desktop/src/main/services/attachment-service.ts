@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+import { diagnosticFailure, type AttachmentBlockReason, type SafeDiagnostic } from '@line-agent/contracts';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { isWritableChatType, type AttachmentResult, type LineWorkerCommand, type NativeAttachmentDownloadInput, type WorkerBinding } from '@line-agent/contracts';
@@ -51,8 +51,46 @@ export class AttachmentService {
     private readonly resolveNativeAttachment?: (attachment: Attachment, signal: AbortSignal) => Promise<NativeAttachmentDownloadInput | null>,
     private readonly isAccountConnected?: (accountId: string) => Promise<boolean>,
     private readonly random: () => number = Math.random,
-    private readonly onServerRejection?: (result: Extract<AttachmentResult, { status: 'failed' | 'expired' }>) => void) {
+    private readonly onServerRejection?: (result: Extract<AttachmentResult, { status: 'failed' | 'expired' }>) => void,
+    private readonly onBlockReasonChanged?: (accountId: string, reason: AttachmentBlockReason) => void) {
     void maxConcurrent;
+  }
+
+  /** Last worker block reason that was reported for each account. It is cleared when a download passes the worker checks. */
+  private readonly workerBlockReasons = new Map<string, AttachmentBlockReason>();
+  private readonly externalBlockAccounts = new Set<string>();
+
+  /**
+   * Keep the reason why a queued attachment cannot download now.
+   * The row is written only when its value changes. The account audit is reported only when the account reason changes.
+   * It never throws and never changes the download order or the retry count.
+   */
+  private async recordBlock(attachment: Attachment, reason: AttachmentBlockReason): Promise<void> {
+    try {
+      // An External Monitor row keeps its own reason. A worker reason is for the account audit only.
+      if (attachment.status === 'queued' && attachment.error !== reason
+        && (!attachment.externalSource || reason === 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE')
+        && await this.messages.setAttachmentBlockReason(attachment.attachmentId, reason)) this.notifyChanged(attachment.attachmentId);
+    } catch { /* A reason write must not change attachment handling. */ }
+    try {
+      if (reason === 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE') {
+        if (this.externalBlockAccounts.has(attachment.accountId)) return;
+        this.externalBlockAccounts.add(attachment.accountId);
+      } else {
+        if (this.workerBlockReasons.get(attachment.accountId) === reason) return;
+        this.workerBlockReasons.set(attachment.accountId, reason);
+      }
+      this.onBlockReasonChanged?.(attachment.accountId, reason);
+    } catch { /* Audit must not change attachment handling. */ }
+  }
+
+  /** Set the reason on old External Monitor rows. No scan selects them. */
+  async backfillBlockReasons(): Promise<void> {
+    try {
+      for (let pass = 0; pass < 20 && !this.closed; pass += 1) {
+        if (await this.messages.backfillExternalAttachmentBlockReasons(1000) < 1000) break;
+      }
+    } catch { /* The backfill runs again at the next start. */ }
   }
 
   setAutomaticAttemptLimit(limit: number): void {
@@ -120,6 +158,10 @@ export class AttachmentService {
 
   private async downloadClaimed(attachmentId: string, signal: AbortSignal, manual: boolean): Promise<boolean> {
     const attachment = await this.messages.getAttachment(attachmentId);
+    if (!signal.aborted && attachment && !manual && attachment.externalSource && isWritableChatType(attachment.chatType)
+      && (attachment.status === 'queued' || attachment.status === 'failed') && !this.externalSourceExpired(attachment)) {
+      await this.recordBlock(attachment, 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE');
+    }
     if (signal.aborted || !attachment || attachment.status === 'ready' || attachment.status === 'downloading'
       || !isWritableChatType(attachment.chatType)
       || this.externalSourceExpired(attachment)
@@ -129,9 +171,14 @@ export class AttachmentService {
         || attachment.retryCount >= this.automaticAttemptLimit || attachment.retryAfter === 'infinity'))
         && !(attachment.status === 'queued' && attachment.externalSource))) return false;
     const binding = await this.worker.binding(attachment.accountId);
-    if (signal.aborted || !binding || binding.mode === 'PAUSED' || this.externalSourceExpired(attachment)) return false;
-    if (!await this.worker.isReady(binding, () => !this.externalSourceExpired(attachment))
-      || signal.aborted || this.externalSourceExpired(attachment)) return false;
+    if (signal.aborted || this.externalSourceExpired(attachment)) return false;
+    if (!binding) { await this.recordBlock(attachment, 'ATTACHMENT_WORKER_UNAVAILABLE'); return false; }
+    if (binding.mode === 'PAUSED') { await this.recordBlock(attachment, 'ATTACHMENT_WORKER_NOT_READY'); return false; }
+    const ready = await this.worker.isReady(binding, () => !this.externalSourceExpired(attachment));
+    if (signal.aborted || this.externalSourceExpired(attachment)) return false;
+    if (!ready) { await this.recordBlock(attachment, 'ATTACHMENT_WORKER_NOT_READY'); return false; }
+    // The worker checks passed. The claim below clears the row reason. A later block is a new reason change.
+    this.workerBlockReasons.delete(attachment.accountId);
     const mutation = { attachmentId, accountId: attachment.accountId, chatType: attachment.chatType,
       chatId: attachment.chatId, workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch };
     const attemptToken = await this.messages.claimAttachmentDownload({ ...mutation, ownerId: this.ownerId },

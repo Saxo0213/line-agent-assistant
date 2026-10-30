@@ -1,4 +1,4 @@
-import { safeErrorTextFor, desktopTextFor, generatedPreviewFor, useDesktopLocale, useDesktopText } from '../desktop-i18n.js';
+import { safeErrorTextFor, desktopTextFor, callSummaryFor, generatedPreviewFor, useDesktopLocale, useDesktopText } from '../desktop-i18n.js';
 import type { Locale } from '../../locale.js';
 import { AgentStatusMarker } from '../AgentStatusMarker.js';
 import { MessageReactions } from './MessageReactions.js';
@@ -264,17 +264,7 @@ function systemEventLabel(locale: Locale, nativeContentType: number | null, text
 export function formatCallLabelFor(locale: Locale, call: { media: 'audio' | 'video' | null; result: string | null; durationMs: number | null } | null | undefined,
   direction: 'inbound' | 'outbound', nativeContentType: number | null, text: string | null): string {
   if (!call) return systemEventLabel(locale, nativeContentType, text);
-  if (call.result === 'CANCELED') return direction === 'outbound' ? desktopTextFor(locale, 'cancelledCall') : desktopTextFor(locale, 'missedCall');
-  if (call.result === 'NORMAL' && call.durationMs !== null) {
-    const totalSeconds = Math.floor(call.durationMs / 1000);
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = totalSeconds % 60;
-    const duration = hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-      : `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-    return desktopTextFor(locale, 'arg0DurationArg1', { arg0: call.media === 'video' ? desktopTextFor(locale, 'videoCall') : desktopTextFor(locale, 'voiceCall'), arg1: duration });
-  }
-  return direction === 'outbound' ? desktopTextFor(locale, 'noAnswer') : desktopTextFor(locale, 'missedCall');
+  return callSummaryFor(locale, call, direction);
 }
 /** @deprecated Compatibility for pages not yet migrated to locale-bound helpers. */
 export function formatCallLabel(call: Parameters<typeof formatCallLabelFor>[1], direction: 'inbound' | 'outbound', nativeContentType: number | null, text: string | null): string {
@@ -516,7 +506,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
         if (!state || state.routeKey !== routeKey || state.messageId !== merged.messageId) return attachment;
         changed = true;
         return { ...attachment, kind: state.kind, name: state.name, mimeType: state.mimeType,
-          sizeBytes: state.sizeBytes, status: state.status, canRetryManually: state.canRetryManually };
+          sizeBytes: state.sizeBytes, status: state.status, canRetryManually: state.canRetryManually, blockReason: state.blockReason ?? undefined };
       });
       return changed ? { ...merged, attachments } : merged;
     });
@@ -626,7 +616,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
             }
             reconciledAttachments.current.set(attachmentId, { routeKey: keyString, messageId: target.messageId,
               kind: state.kind, name: state.name, mimeType: state.mimeType, sizeBytes: state.sizeBytes,
-              status: state.status, canRetryManually: state.canRetryManually });
+              status: state.status, canRetryManually: state.canRetryManually, blockReason: state.blockReason ?? undefined });
             failedAttachmentRefreshes.current.delete(attachmentId);
           }
           setAttachmentRefreshErrorRoute((current) => current === keyString && failedAttachmentRefreshes.current.size === 0 ? null : current);
@@ -641,10 +631,10 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
                 const state = byId.get(attachment.id);
                 const next = state && !pendingAttachmentRefreshes.current.has(attachment.id)
                   ? { ...attachment, kind: state.kind, name: state.name, mimeType: state.mimeType,
-                    sizeBytes: state.sizeBytes, status: state.status, canRetryManually: state.canRetryManually }
+                    sizeBytes: state.sizeBytes, status: state.status, canRetryManually: state.canRetryManually, blockReason: state.blockReason ?? undefined }
                   : attachment;
                 if (next !== attachment && (next.kind !== attachment.kind || next.name !== attachment.name || next.mimeType !== attachment.mimeType
-                  || next.sizeBytes !== attachment.sizeBytes || next.status !== attachment.status || next.canRetryManually !== attachment.canRetryManually)) messageChanged = true;
+                  || next.sizeBytes !== attachment.sizeBytes || next.status !== attachment.status || next.canRetryManually !== attachment.canRetryManually || next.blockReason !== attachment.blockReason)) messageChanged = true;
                 return next;
               });
               return messageChanged ? { ...item, attachments } : item;

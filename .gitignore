@@ -16,3 +16,8 @@ coverage/
 *.tsbuildinfo
 test-results/
 playwright-report/
+
+# LINE Chrome extension assets are proprietary: never commit or package them.
+**/ltsm.wasm
+**/ltsmSandbox.js
+**/line-chrome/ltsm/

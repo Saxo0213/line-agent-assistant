@@ -2,6 +2,7 @@ import { expect, it, vi } from 'vitest';
 import { FakeLineTransport } from './fake-transport.js';
 import { fetchLineRequest, fetchWithTimeout, runWorkerLoopOnPort } from './entrypoint.js';
 import { LineServerRejection } from './line-server-error.js';
+import { ChromeApiError, ChromeLoginProtocolError, tagLoginStage } from '@line-agent/line-chrome';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const cursor = { version: 1 as const, revision: '0', globalRev: '0', individualRev: '0' };
@@ -725,4 +726,58 @@ it('names the rejected command type and a bounded requestId when the command fai
   const unknown = channel.events.at(-1) as { diagnostic: { operation: string }; requestId?: string };
   expect(unknown).toMatchObject({ type: 'error', code: 'INVALID_COMMAND', diagnostic: { operation: 'unknown', stage: 'admission' } });
   expect(unknown.requestId).toBeUndefined();
+});
+
+const secretText = 'token=Tk9x PIN 123456 mid=u12345678901234567890123456789012 https://x/y?secret=abc';
+
+async function loginFailureOf(loginQr: () => Promise<unknown>): Promise<{ detail?: string; code: string } & Record<string, unknown>> {
+  const channel = port();
+  const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+  Object.defineProperty(transport, 'loginQr', { value: loginQr });
+  runWorkerLoopOnPort(channel, async () => transport);
+  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'detail-attempt' });
+  const failure = channel.events.at(-1) as { detail?: string; code: string } & Record<string, unknown>;
+  expect(JSON.stringify(channel.events)).not.toContain('Tk9x');
+  expect(JSON.stringify(channel.events)).not.toContain('123456');
+  expect(JSON.stringify(channel.events)).not.toContain('secret=abc');
+  return failure;
+}
+
+it('adds a bounded stage, class, method and code detail to a failed qrCodeLoginV2 step', async () => {
+  const error = new ChromeApiError(secretText, { code: 8, path: '/api/auth/thrift/LoginQrCode/SecondaryQrCodeLoginService/qrCodeLoginV2?x=1' });
+  tagLoginStage(error, 'qr_login_v2');
+  const failure = await loginFailureOf(async () => { throw error; });
+  expect(failure).toMatchObject({ type: 'loginFailure', code: 'LOGIN_FAILED', message: 'LINE login failed. Try again.',
+    detail: 'qr_login_v2:ChromeApiError:qrCodeLoginV2:8' });
+});
+
+it('adds the stage and class of a failed identity read and never copies the message', async () => {
+  const error = new TypeError(secretText);
+  tagLoginStage(error, 'fetch_identity');
+  const failure = await loginFailureOf(async () => { throw error; });
+  expect(failure).toMatchObject({ code: 'LOGIN_FAILED', detail: 'fetch_identity:TypeError' });
+});
+
+it('adds the fixed slug of a login protocol error', async () => {
+  const error = new ChromeLoginProtocolError(secretText, 'no_access_token');
+  tagLoginStage(error, 'token_parse');
+  const failure = await loginFailureOf(async () => { throw error; });
+  expect(failure).toMatchObject({ code: 'LOGIN_FAILED', detail: 'token_parse:ChromeLoginProtocolError:no_access_token' });
+});
+
+it('adds the worker step when the failure happens after the transport returns', async () => {
+  const failure = await loginFailureOf(async () => ({ get ownMid(): string { throw new TypeError(secretText); }, displayName: 'Agent' }));
+  expect(failure).toMatchObject({ code: 'LOGIN_FAILED', detail: 'login_event:TypeError' });
+});
+
+it('marks a failure without any stage tag and keeps the detail inside the contract pattern', async () => {
+  const failure = await loginFailureOf(async () => { throw Object.assign(new Error(secretText), { name: 'Odd name/with spaces' }); });
+  expect(failure.detail).toBe('credential_swap:Odd_name_with_spaces');
+});
+
+it('adds no detail to a timeout failure', async () => {
+  const failure = await loginFailureOf(async () => { throw Object.assign(new Error(secretText), { name: 'TimeoutError' }); });
+  expect(failure.code).toBe('LOGIN_TIMEOUT');
+  expect(Object.hasOwn(failure, 'detail')).toBe(false);
 });

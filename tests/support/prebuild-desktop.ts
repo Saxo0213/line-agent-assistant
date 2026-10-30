@@ -16,7 +16,7 @@ const STALE_LOCK_MS = 60_000;
 
 const inputRoots = [
   path.join(desktopRoot, 'src'), path.join(desktopRoot, 'native'), path.join(desktopRoot, 'scripts'),
-  path.join(repositoryRoot, 'packages', 'contracts', 'src'), path.join(repositoryRoot, 'packages', 'database', 'src'),
+  path.join(repositoryRoot, 'packages', 'contracts', 'src'), path.join(repositoryRoot, 'packages', 'line-chrome', 'src'), path.join(repositoryRoot, 'packages', 'database', 'src'),
   path.join(repositoryRoot, 'packages', 'database', 'migrations'),
   path.join(repositoryRoot, 'packages', 'agent-bridge', 'src'), path.join(repositoryRoot, 'packages', 'line-worker', 'src'),
 ];
@@ -35,6 +35,7 @@ async function newestInputTime(directory: string): Promise<number> {
 }
 
 const requiredOutputs = [
+  path.join(repositoryRoot, 'packages', 'line-chrome', 'dist', 'index.js'),
   path.join(desktopRoot, 'dist', 'main.js'),
   path.join(desktopRoot, 'dist', 'js-external-reader', 'v1', 'ExternalReaderBridge.exe'),
   path.join(desktopRoot, 'dist', 'js-external-reader', 'v1', 'manifest.json'),
@@ -92,7 +93,7 @@ function runStep(command: string, args: string[], shell = false): Promise<void> 
  * otherwise fails the desktop build with MISSING_EXPORT.
  */
 async function runBuild(): Promise<void> {
-  for (const workspace of ['contracts', 'database', 'agent-bridge', 'line-worker']) {
+  for (const workspace of ['contracts', 'line-chrome', 'database', 'agent-bridge', 'line-worker']) {
     await runStep('npm', ['run', 'build', '--workspace', `@line-agent/${workspace}`], true);
   }
   await runStep(process.execPath, [path.join(desktopRoot, 'scripts', 'build.mjs')]);

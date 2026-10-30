@@ -744,6 +744,49 @@ describe('utility worker gateway', () => {
     await gateway.shutdown();
   });
 
+  it('passes lineTransport and the ltsm store root to a CHROMEOS worker only', async () => {
+    const children: FakeChild[] = [];
+    const gateway = createUtilityWorkerGateway({ durableCursor: async () => null, chromeLtsmDir: 'C:/ltsm',
+      spawn: () => { const child = new FakeChild(); children.push(child); return child; } });
+    await gateway.start('chrome-account', { accountId: 'chrome-account', workerInstanceId: 'chrome-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL', lineTransport: 'CHROMEOS' });
+    await gateway.start('desktop-account', { accountId: 'desktop-account', workerInstanceId: 'desktop-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    const chromeInit = children[0]!.posted[0] as Record<string, unknown>;
+    const desktopInit = children[1]!.posted[0] as Record<string, unknown>;
+    expect(chromeInit).toMatchObject({ type: 'init', lineTransport: 'CHROMEOS', chromeLtsmDir: 'C:/ltsm' });
+    expect(LineWorkerCommandSchema.safeParse(chromeInit).success).toBe(true);
+    // DESKTOPWIN: its init has no new field.
+    expect(Object.hasOwn(desktopInit, 'lineTransport')).toBe(false);
+    expect(Object.hasOwn(desktopInit, 'chromeLtsmDir')).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse(desktopInit).success).toBe(true);
+    await gateway.shutdown();
+  });
+
+  it('passes the traffic log directory to every worker only when it is set', async () => {
+    const children: FakeChild[] = [];
+    const spawn = () => { const child = new FakeChild(); children.push(child); return child; };
+    const logging = createUtilityWorkerGateway({ durableCursor: async () => null, trafficLogDir: 'C:/logs/line-traffic', spawn });
+    await logging.start('a', { accountId: 'a', workerInstanceId: 'wa', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await logging.start('b', { accountId: 'b', workerInstanceId: 'wb', controlEpoch: 1, mode: 'ACTIVE_CONTROL', lineTransport: 'CHROMEOS' });
+    const plain = createUtilityWorkerGateway({ durableCursor: async () => null, spawn });
+    await plain.start('c', { accountId: 'c', workerInstanceId: 'wc', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    expect(children[0]!.posted[0]).toMatchObject({ type: 'init', trafficLogDir: 'C:/logs/line-traffic' });
+    expect(children[1]!.posted[0]).toMatchObject({ type: 'init', trafficLogDir: 'C:/logs/line-traffic' });
+    expect(LineWorkerCommandSchema.safeParse(children[1]!.posted[0]).success).toBe(true);
+    expect(Object.hasOwn(children[2]!.posted[0] as object, 'trafficLogDir')).toBe(false);
+    await logging.shutdown();
+    await plain.shutdown();
+  });
+
+  it('refuses a CHROMEOS download-only worker before spawning', async () => {
+    const children: FakeChild[] = [];
+    const gateway = createUtilityWorkerGateway({ durableCursor: async () => null, chromeLtsmDir: 'C:/ltsm',
+      spawn: () => { const child = new FakeChild(); children.push(child); return child; } });
+    await expect(gateway.start('x', { accountId: 'x', workerInstanceId: 'w', controlEpoch: 1, mode: 'MONITOR_ONLY', purpose: 'DOWNLOAD_ONLY',
+      expectedMid: 'u0', lineTransport: 'CHROMEOS' })).rejects.toThrow(/download-only/);
+    expect(children).toHaveLength(0);
+    await gateway.shutdown();
+  });
+
   it('preserves a newer explicit start intent when a stale stop targets the old child', async () => {
     vi.useFakeTimers();
     const children: FakeChild[] = [];

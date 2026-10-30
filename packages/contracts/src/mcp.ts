@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { ChatTypeSchema } from './account.js';
 import { SCHEDULE_TOOL_NAMES } from './agent-schedule.js';
+import { SendDetailSchema } from './diagnostics.js';
 
 export const McpToolNameSchema = z.enum([
   'list_targets',
@@ -508,6 +509,8 @@ export const McpSendResultSchema = z.strictObject({
   index: z.number().int().nonnegative(),
   status: z.enum(['sent', 'failed', 'unknown', 'skipped']),
   code: SendErrorCodeSchema.optional(),
+  /** Real cause of a failed or unknown item (worker code, upload stage, error class, number, gateway code). Bounded and secret-free. */
+  detail: SendDetailSchema.optional(),
 });
 export type McpSendResult = z.infer<typeof McpSendResultSchema>;
 

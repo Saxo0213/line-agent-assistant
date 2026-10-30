@@ -180,7 +180,7 @@ describe('inline account action status', () => {
     const api = { previewExternalAdminBinding: vi.fn(() => preview.promise),
       onEvent: vi.fn((listener: (event: IpcEvent) => void) => { listeners.push(listener); return unsubscribe; }) } as unknown as DesktopApi;
     render(<LineLogin api={api} accounts={[]} headingRef={React.createRef()} onNotice={() => undefined} />);
-    fireEvent.click(screen.getByRole('button', { name: '從 LINE 設定管理者並啟動外部監控' }));
+    fireEvent.click(screen.getByRole('button', { name: '管理者帳號(LINE監控模式)' }));
     expect(await screen.findByText('尋找 LINE…')).toBeTruthy();
     expect(document.querySelector('.progress-spinner')).toBeTruthy();
     act(() => listeners.forEach((listener) => listener({ type: 'externalAdminBindingProgress', phase: 'locating' })));
@@ -223,7 +223,7 @@ describe('inline account action status', () => {
     const page = (accounts: LineAccountSummary[]) => <div className="app-shell"><button onClick={() => undefined}>任務</button><LineLogin api={api} accounts={accounts}
       headingRef={React.createRef()} onNotice={onNotice} /></div>;
     const { rerender } = render(page(agentOnly));
-    fireEvent.click(screen.getByRole('button', { name: '從 LINE 設定管理者並啟動外部監控' }));
+    fireEvent.click(screen.getByRole('button', { name: '管理者帳號(LINE監控模式)' }));
     expect(screen.getByRole('dialog', { name: '啟動外部監控' })).toBeTruthy();
     expect(document.querySelector('.app-shell')?.hasAttribute('inert')).toBe(true);
     expect(api.previewExternalAdminBinding).toHaveBeenCalledTimes(1);
@@ -271,7 +271,7 @@ describe('inline account action status', () => {
     const agentOnly = [{ ...buildAgent, hasPrimaryAdmin: false } as LineAccountSummary];
     const page = (accounts: LineAccountSummary[]) => <LineLogin api={api} accounts={accounts} headingRef={React.createRef()} onNotice={() => undefined} />;
     const { rerender } = render(page(agentOnly));
-    fireEvent.click(screen.getByRole('button', { name: '從 LINE 設定管理者並啟動外部監控' }));
+    fireEvent.click(screen.getByRole('button', { name: '管理者帳號(LINE監控模式)' }));
     fireEvent.click(await screen.findByRole('button', { name: '確定' }));
     expect(await screen.findByText('檢查 LINE 來源…')).toBeTruthy();
     rerender(page([{ ...agentOnly[0]!, hasPrimaryAdmin: true }, { ...buildAdmin(), externalImportProgress: { stage: 'failed', copiedBytes: null,
@@ -322,6 +322,27 @@ describe('inline account action status', () => {
     rerender(<LineLogin api={{ lineSetAutoLogin: vi.fn() } as unknown as DesktopApi}
       accounts={[buildAdmin()]} headingRef={React.createRef()} onNotice={() => undefined} />);
     expect((screen.getByLabelText('啟動時自動登入') as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it('disables the Primary Admin login button while external monitoring runs and leaves the Agent button enabled', () => {
+    const progress = (stage: 'monitoring' | 'syncing') => ({ stage, copiedBytes: null, totalBytes: null, committedRows: '0', eligibleRows: null, message: null });
+    const accounts = (admin: LineAccountSummary) => [buildAgent, admin];
+    const page = (list: LineAccountSummary[]) => <LineLogin api={{ lineSetAutoLogin: vi.fn() } as unknown as DesktopApi}
+      accounts={list} headingRef={React.createRef()} onNotice={() => undefined} />;
+    const adminButton = () => screen.getByRole('button', { name: '登入 Admin' }) as HTMLButtonElement;
+    const agentButton = () => screen.getByRole('button', { name: '登入 Agent' }) as HTMLButtonElement;
+    const { rerender } = render(page(accounts({ ...buildAdmin(), externalImportProgress: progress('monitoring') } as unknown as LineAccountSummary)));
+    expect(adminButton().disabled).toBe(true);
+    expect(adminButton().title).toBe('外部監控中無法使用');
+    expect(adminButton().getAttribute('aria-describedby')).toBe('auto-login-disabled-admin-1');
+    expect(document.getElementById('auto-login-disabled-admin-1')?.textContent).toBe('外部監控中無法使用');
+    expect(agentButton().disabled).toBe(false);
+    rerender(page(accounts({ ...buildAdmin(), externalImportProgress: progress('syncing') } as unknown as LineAccountSummary)));
+    expect(adminButton().disabled).toBe(true);
+    expect(agentButton().disabled).toBe(false);
+    rerender(page(accounts(buildAdmin())));
+    expect(adminButton().disabled).toBe(false);
+    expect(adminButton().getAttribute('aria-describedby')).toBeNull();
   });
 
   it('clears automatic login before starting monitoring and reports a failed clear in the overlay', async () => {
@@ -440,5 +461,210 @@ describe('accounts page header', () => {
     render(<LineLogin api={{} as DesktopApi} accounts={[]} headingRef={React.createRef()} />, locale);
     expect(screen.getByRole('heading', { name: heading })).toBeTruthy();
     expect(screen.getByRole('button', { name: loginLabel })).toBeTruthy();
+  });
+});
+
+describe('LINE login method choice', () => {
+  const availability = (status: unknown) => ({ type: 'getChromeLoginAvailability', requestId: 'a', ok: true, status }) as unknown as IpcResult;
+  const unavailableError = (chromeLtsmStatus: unknown) => ({ type: 'error', requestId: 'e', ok: false, code: 'CHROME_LTSM_UNAVAILABLE',
+    message: 'x', retryable: false, chromeLtsmStatus }) as unknown as IpcResult;
+  const install = (type: 'detectChromeLtsm' | 'chooseChromeLtsmFolder', result: unknown) => ({ type, requestId: 'i', ok: true, result }) as unknown as IpcResult;
+  const chromeApi = (overrides: Record<string, unknown> = {}) => ({
+    lineAddAccountQr: vi.fn(async (..._args: unknown[]) => accepted),
+    lineReplaceAgentQr: vi.fn(async (..._args: unknown[]) => accepted),
+    getChromeLoginAvailability: vi.fn(async () => availability({ kind: 'available', version: '3.7.2' })),
+    detectChromeLtsm: vi.fn(async () => install('detectChromeLtsm', { kind: 'not-found', required: '3.7.2' })),
+    chooseChromeLtsmFolder: vi.fn(async () => install('chooseChromeLtsmFolder', { kind: 'cancelled' })),
+    openChromeExtensionStore: vi.fn(async () => ({ type: 'openChromeExtensionStore', requestId: 's', ok: true }) as unknown as IpcResult),
+    ...overrides,
+  });
+  const renderChrome = (api: ReturnType<typeof chromeApi>, accounts: LineAccountSummary[] = []) =>
+    render(<LineLogin api={api as unknown as DesktopApi} accounts={accounts} headingRef={React.createRef()} onNotice={() => undefined} />);
+
+  it('offers the two methods with Windows selected by default', () => {
+    renderChrome(chromeApi());
+    const windows = screen.getAllByRole('button', { name: 'Windows 版' })[0]!;
+    const chrome = screen.getAllByRole('button', { name: 'Chrome 版' })[0]!;
+    expect(windows.getAttribute('aria-pressed')).toBe('true');
+    expect(chrome.getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('checks availability first and then starts the Chrome login with lineTransport', async () => {
+    const api = chromeApi();
+    renderChrome(api);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Chrome 版' })[0]!);
+    fireEvent.click(screen.getByRole('button', { name: '登入 Agent LINE 帳號' }));
+    await waitFor(() => expect(api.lineAddAccountQr).toHaveBeenCalledWith('CHROMEOS'));
+    expect(api.getChromeLoginAvailability).toHaveBeenCalledOnce();
+    expect(api.getChromeLoginAvailability.mock.invocationCallOrder[0]!).toBeLessThan(api.lineAddAccountQr.mock.invocationCallOrder[0]!);
+  });
+
+  it('does not check Chrome availability for the default Windows login', async () => {
+    const api = chromeApi();
+    renderChrome(api);
+    fireEvent.click(screen.getByRole('button', { name: '登入 Agent LINE 帳號' }));
+    await waitFor(() => expect(api.lineAddAccountQr).toHaveBeenCalledWith());
+    expect(api.getChromeLoginAvailability).not.toHaveBeenCalled();
+  });
+
+  it('shows the required and the detected versions and starts no login when the version is wrong', async () => {
+    const api = chromeApi({ getChromeLoginAvailability: vi.fn(async () => availability({ kind: 'wrong-version', required: '3.7.2', detected: ['3.8.0', '3.6.1'] })) });
+    renderChrome(api);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Chrome 版' })[0]!);
+    fireEvent.click(screen.getByRole('button', { name: '登入 Agent LINE 帳號' }));
+    expect(await screen.findByText('Chrome 版登入需要在這台電腦上安裝官方 LINE Chrome 擴充功能 3.7.2。')).toBeTruthy();
+    expect(screen.getByText('所需版本：3.7.2')).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '無法使用 Chrome 版登入' })).toBeTruthy();
+    expect(screen.getByText('偵測到的版本：3.8.0, 3.6.1')).toBeTruthy();
+    expect(api.lineAddAccountQr).not.toHaveBeenCalled();
+  });
+
+  it('tells the user that damaged files are damaged', async () => {
+    const api = chromeApi({ getChromeLoginAvailability: vi.fn(async () => availability({ kind: 'corrupt', required: '3.7.2', problems: ['md5'] })) });
+    renderChrome(api);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Chrome 版' })[0]!);
+    fireEvent.click(screen.getByRole('button', { name: '登入 Agent LINE 帳號' }));
+    expect(await screen.findByText('擴充功能檔案已損壞，請重新偵測或重新選擇資料夾。')).toBeTruthy();
+  });
+
+  it('runs the three actions and lets the user continue after a match is installed', async () => {
+    const api = chromeApi({ getChromeLoginAvailability: vi.fn(async () => availability({ kind: 'missing', required: '3.7.2' })) });
+    renderChrome(api);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Chrome 版' })[0]!);
+    fireEvent.click(screen.getByRole('button', { name: '登入 Agent LINE 帳號' }));
+    fireEvent.click(await screen.findByRole('button', { name: '安裝 LINE Chrome 擴充功能' }));
+    await waitFor(() => expect(api.openChromeExtensionStore).toHaveBeenCalledOnce());
+    fireEvent.click(await screen.findByRole('button', { name: '重新偵測' }));
+    expect(await screen.findByText('這台電腦上找不到擴充功能。')).toBeTruthy();
+    expect(api.detectChromeLtsm).toHaveBeenCalledOnce();
+    // A cancelled folder picker changes nothing.
+    fireEvent.click(screen.getByRole('button', { name: '手動選擇資料夾' }));
+    await waitFor(() => expect(api.chooseChromeLtsmFolder).toHaveBeenCalledOnce());
+    await waitFor(() => expect((screen.getByRole('button', { name: '手動選擇資料夾' }) as HTMLButtonElement).disabled).toBe(false));
+    expect(screen.queryByRole('button', { name: '繼續登入' })).toBeNull();
+    expect(screen.getByText('這台電腦上找不到擴充功能。')).toBeTruthy();
+    // A chosen folder that matches lets the user continue.
+    api.chooseChromeLtsmFolder.mockResolvedValueOnce(install('chooseChromeLtsmFolder', { kind: 'installed', status: { kind: 'available', version: '3.7.2' }, source: { browser: 'manual', profile: '' } }));
+    api.getChromeLoginAvailability.mockResolvedValue(availability({ kind: 'available', version: '3.7.2' }));
+    fireEvent.click(screen.getByRole('button', { name: '手動選擇資料夾' }));
+    expect(await screen.findByRole('heading', { name: '可以使用 Chrome 版登入' })).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: '無法使用 Chrome 版登入' })).toBeNull();
+    fireEvent.click(await screen.findByRole('button', { name: '繼續登入' }));
+    await waitFor(() => expect(api.lineAddAccountQr).toHaveBeenCalledWith('CHROMEOS'));
+  });
+
+  it('shows the same explanation when the start request returns CHROME_LTSM_UNAVAILABLE', async () => {
+    const api = chromeApi({ lineAddAccountQr: vi.fn(async () => unavailableError({ kind: 'wrong-version', required: '3.7.2', detected: ['3.9.0'] })) });
+    renderChrome(api);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Chrome 版' })[0]!);
+    fireEvent.click(screen.getByRole('button', { name: '登入 Agent LINE 帳號' }));
+    expect(await screen.findByText('偵測到的版本：3.9.0')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '重新偵測' })).toBeTruthy();
+  });
+
+  it('passes the chosen method when the Agent account is replaced', async () => {
+    const api = chromeApi();
+    renderChrome(api, [{ ...buildAgent, displayName: 'Old account', hasVerifiedLineIdentity: true }]);
+    fireEvent.click(screen.getByRole('button', { name: '更換 Agent 帳號' }));
+    await screen.findByText('要將 Agent 帳號「Old account」更換為新的 LINE 帳號嗎？');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Chrome 版' }).at(-1)!);
+    fireEvent.click(screen.getAllByRole('button', { name: '更換 Agent 帳號' }).at(-1)!);
+    await waitFor(() => expect(api.lineReplaceAgentQr).toHaveBeenCalledWith(buildAgent.accountId, 'CHROMEOS'));
+  });
+
+  it('labels only Chrome accounts', () => {
+    renderChrome(chromeApi(), [{ ...buildAgent, lineTransport: 'CHROMEOS' } as LineAccountSummary]);
+    expect(document.querySelector('.login-method-badge')?.textContent).toBe('Chrome 版');
+    cleanup();
+    renderChrome(chromeApi(), [{ ...buildAgent, lineTransport: 'DESKTOPWIN' } as LineAccountSummary]);
+    expect(document.querySelector('.login-method-badge')).toBeNull();
+  });
+
+  it.each([
+    ['en', 'Chrome login needs the official LINE Chrome extension 3.7.2 on this computer.'],
+    ['ja', 'Chrome 版ログインには、このコンピューターに公式の LINE Chrome 拡張機能 3.7.2 が必要です。'],
+    ['ko', 'Chrome 버전 로그인에는 이 컴퓨터에 공식 LINE Chrome 확장 프로그램 3.7.2가 필요합니다.'],
+  ] as const)('writes the unavailable explanation in %s', (locale, expected) => {
+    expect(extraTextFor(locale, 'chromeLoginNeedsExtension')).toBe(expected);
+  });
+});
+
+describe('login method menu of an existing account', () => {
+  const availability = (status: unknown) => ({ type: 'getChromeLoginAvailability', requestId: 'a', ok: true, status }) as unknown as IpcResult;
+  const menuApi = (status: unknown = { kind: 'available', version: '3.7.2' }) => ({
+    lineLoginQr: vi.fn(async (..._args: unknown[]) => accepted),
+    getChromeLoginAvailability: vi.fn(async () => availability(status)),
+    detectChromeLtsm: vi.fn(), chooseChromeLtsmFolder: vi.fn(), openChromeExtensionStore: vi.fn(),
+  });
+  const show = (api: ReturnType<typeof menuApi>, account: Partial<LineAccountSummary> = {}, live: React.ComponentProps<typeof LineLogin>['live'] = null) =>
+    render(<LineLogin api={api as unknown as DesktopApi} accounts={[{ ...buildAgent, ...account } as LineAccountSummary]}
+      headingRef={React.createRef()} onNotice={() => undefined} live={live} />);
+  const menu = () => screen.getByRole('combobox', { name: '登入方式' }) as HTMLSelectElement;
+  const loginButton = () => screen.getByRole('button', { name: '登入 Agent' });
+
+  it('shows the current method of the account', () => {
+    show(menuApi(), { lineTransport: 'CHROMEOS' });
+    expect(menu().value).toBe('CHROMEOS');
+    cleanup();
+    show(menuApi());
+    expect(menu().value).toBe('DESKTOPWIN');
+  });
+
+  it('keeps Chrome when it is available and sends it with the login', async () => {
+    const api = menuApi();
+    show(api);
+    fireEvent.change(menu(), { target: { value: 'CHROMEOS' } });
+    await waitFor(() => expect(menu().value).toBe('CHROMEOS'));
+    expect(api.getChromeLoginAvailability).toHaveBeenCalledOnce();
+    expect(api.lineLoginQr).not.toHaveBeenCalled();
+    fireEvent.click(loginButton());
+    await waitFor(() => expect(api.lineLoginQr).toHaveBeenCalledWith(buildAgent.accountId, 'CHROMEOS'));
+  });
+
+  it('keeps Windows and shows the setup dialog when the Chrome version is wrong', async () => {
+    const api = menuApi({ kind: 'wrong-version', required: '3.7.2', detected: ['3.8.0'] });
+    show(api);
+    fireEvent.change(menu(), { target: { value: 'CHROMEOS' } });
+    expect(await screen.findByText('偵測到的版本：3.8.0')).toBeTruthy();
+    expect(menu().value).toBe('DESKTOPWIN');
+    expect(api.lineLoginQr).not.toHaveBeenCalled();
+  });
+
+  it('sends the login without lineTransport for Windows', async () => {
+    const api = menuApi();
+    show(api);
+    fireEvent.click(loginButton());
+    await waitFor(() => expect(api.lineLoginQr).toHaveBeenCalledWith(buildAgent.accountId));
+    expect(api.getChromeLoginAvailability).not.toHaveBeenCalled();
+  });
+
+  it('sends DESKTOPWIN only to leave a Chrome account', async () => {
+    const api = menuApi();
+    show(api, { lineTransport: 'CHROMEOS' });
+    fireEvent.change(menu(), { target: { value: 'DESKTOPWIN' } });
+    await waitFor(() => expect(menu().value).toBe('DESKTOPWIN'));
+    fireEvent.click(loginButton());
+    await waitFor(() => expect(api.lineLoginQr).toHaveBeenCalledWith(buildAgent.accountId, 'DESKTOPWIN'));
+  });
+
+  it('is locked only while the account is connected', () => {
+    for (const status of ['disconnected', 'degraded', 'reauth_required'] as const) {
+      show(menuApi(), { status });
+      expect(menu().disabled).toBe(false);
+      expect(menu().title).toBe('');
+      cleanup();
+    }
+    show(menuApi(), { status: 'connected' });
+    expect(menu().disabled).toBe(true);
+    expect(menu().title).toBe('登出後才能切換登入方式');
+  });
+
+  it('is disabled during a login and for the Primary Admin while monitoring', () => {
+    show(menuApi(), {}, { accountId: buildAgent.accountId, loginAttemptId: 'attempt-1', state: 'connecting', message: null });
+    expect(menu().disabled).toBe(true);
+    cleanup();
+    render(<LineLogin api={menuApi() as unknown as DesktopApi} headingRef={React.createRef()} onNotice={() => undefined}
+      accounts={[{ ...buildAdmin(), externalImportProgress: { stage: 'monitoring' } } as unknown as LineAccountSummary]} />);
+    expect(menu().disabled).toBe(true);
   });
 });

@@ -7,7 +7,8 @@ import {claudeExtensionPlan} from './extensions.js';
 /**
  * Built-in tools from the Main-resolved policy. `--restricted` keeps file tools inside the working directory.
  * Write/Edit are pre-approved only when both the execution level and principal permissions grant file writes.
- * Bash prompts through the internal permission tool only for interactive operator jobs.
+ * Bash prompts through the internal permission tool for interactive operator jobs. Non-interactive (LINE) jobs get Bash, WebSearch and WebFetch
+ * without a prompt only at the `full` level with local tools; below `full` they never get Bash.
  */
 export const CLAUDE_WEB_TOOLS=['WebSearch','WebFetch'] as const;
 export function claudeBuiltInTools(policy:AgentRunRequest['tools']):string[] {
@@ -62,10 +63,12 @@ export function claudeArguments(request:AgentRunRequest) {
   tools.push(...added);
   if(askBash||bashByToggle) tools.push('Bash');
   const askBashEffective=askBash||bashByToggle;
-  const disallowBash=!interactive||(level==='read_only'&&!bashByToggle);
+  // Non-interactive jobs at full access with local tools (admin, or a user holding agent.local_tools) run Bash unprompted; deny rules still apply.
+  const fullUnattended=fullAccess&&!interactive;
+  const disallowBash=fullUnattended?false:!interactive||(level==='read_only'&&!bashByToggle);
   // LINE jobs run in dontAsk mode: a tool missing from --allowedTools is refused, so the web tools are listed explicitly.
-  const webAllowed=request.tools.webTools&&!fullAccess?CLAUDE_WEB_TOOLS:[];
-  allowed.push(...added,...webAllowed,...extension.allowedTools);
+  const webAllowed=request.tools.webTools&&(!fullAccess||fullUnattended)?CLAUDE_WEB_TOOLS:[];
+  allowed.push(...added,...(fullUnattended?['Bash']:[]),...webAllowed,...extension.allowedTools);
   const projectDirs=request.tools.projectDirs??[];
   // Linked folders are always read-only; a job whose writes exist only for project folders must not write its own chat folder either.
   const deny=[...claudeProjectDenyRules(projectDirs),...claudeReadOnlyDenyRules([...(request.tools.fileWrite?request.tools.linkedReadDirs:[]),...(request.tools.ownFolderReadOnly?[request.workspacePath]:[])])];

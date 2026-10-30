@@ -8,6 +8,7 @@ import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { JsExternalReaderController } from './controller.js';
 import { ExternalSourceProbeAdmissionGate } from '../external-source-probe-admission.js';
 import { FileOwnerReadyMarkerStore, type OwnerProcessIdentity } from './owner-ready-session.js';
+import type { NativeMonitorAccess } from './protocol.js';
 import { verifyJsExternalReaderResources } from './resources.js';
 import { buildDesktopScript } from '../../../test-support/build-desktop.js';
 
@@ -54,7 +55,7 @@ describe('JS external reader no-EDB bridge handshake', () => {
       let input = Buffer.alloc(0), outputSequence = 0;
       const requestId = ${JSON.stringify(requestId)};
       const emit = (type, fields = {}) => { const body=Buffer.from(JSON.stringify({version:1,requestId,sequence:++outputSequence,type,...fields})); const header=Buffer.alloc(4); header.writeUInt32BE(body.length); process.stdout.write(Buffer.concat([header,body])); };
-      const decode = () => { while(input.length>=4){const length=input.readUInt32BE(0);if(input.length<4+length)return;const frame=JSON.parse(input.subarray(4,4+length).toString());input=input.subarray(4+length);if(frame.type==='owner_ready')emit('inventory',{buildCode:'accepted',buildVersion:'26.4.2.3957',buildBytes:30634432,buildSha256:'893d899f3b39d9cef59752067166b7e72c6f7021e1841b24b617ab079cf8f2b1',candidateCount:1,processCount:1,edbMiB:[1],walMiB:[0],sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)}});else if(frame.type==='verify')emit('ready',{sourceArchiveFormat:1,sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)},schemaVersion:'line-profile-mid-v1'});else if(frame.type==='directory_next')emit('directory_page',{pageNumber:frame.pageNumber,batchDigest:'${'d'.repeat(64)}',rows:[],hasMore:false});else if(frame.type==='auth_candidates')process.stderr.write('AUTH_REQUESTED\\n');else if(frame.type==='poll')emit('page',{pageNumber:frame.pageNumber,batchDigest:'${'c'.repeat(64)}',rows:[],tailRows:[],lastCursor:frame.cursor,hasMore:false});else if(frame.type==='ack'){process.stderr.write('ACK\\n');}else if(frame.type==='close'){emit('closed',{sourceAccessed:true});process.stdin.end();}}};
+      const decode = () => { while(input.length>=4){const length=input.readUInt32BE(0);if(input.length<4+length)return;const frame=JSON.parse(input.subarray(4,4+length).toString());input=input.subarray(4+length);if(frame.type==='owner_ready')emit('inventory',{buildCode:'accepted',buildVersion:'26.4.2.3957',buildBytes:30634432,buildSha256:'893d899f3b39d9cef59752067166b7e72c6f7021e1841b24b617ab079cf8f2b1',candidateCount:1,processCount:1,edbMiB:[1],walMiB:[0],sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)}});else if(frame.type==='verify')emit('ready',{sourceArchiveFormat:1,sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)},schemaVersion:'line-profile-mid-v1'});else if(frame.type==='directory_next')emit('directory_page',{pageNumber:frame.pageNumber,batchDigest:'${'d'.repeat(64)}',rows:[],hasMore:false});else if(frame.type==='auth_candidates')process.stderr.write('AUTH_REQUESTED\\n');else if(frame.type==='poll')emit('page',{pageNumber:frame.pageNumber,batchDigest:'${'c'.repeat(64)}',rows:[],tailRows:[],lastCursor:frame.cursor,hasMore:false});else if(frame.type==='ack'){process.stderr.write('ACK\\n');}else if(frame.type==='wait_change')emit('change',{changed:true});else if(frame.type==='close'){emit('closed',{sourceAccessed:true});process.stdin.end();}}};
       process.stdout.on('error',()=>{}); process.stdin.on('data',chunk=>{input=Buffer.concat([input,chunk]);decode();});process.stdin.on('end',()=>process.exit(0));
       emit('hello',{bridgeVersion:'candidate-reader-0.2.0',capability:'fixed_readonly_verify'});
     `;
@@ -122,6 +123,119 @@ describe('JS external reader no-EDB bridge handshake', () => {
     }
   }, 30_000);
 
+  // A fake bridge for the idle wait. It records every control frame on stderr and answers wait_change as the
+  // scenario says: 'true' and 'false' answer at once, 'wake' answers only after a wake frame, 'hang' never answers.
+  function idleBridgeScript(requestId: string, sourceIdentityDigest: string, scenario: string[]): string {
+    return `
+      let input = Buffer.alloc(0), outputSequence = 0, waits = 0;
+      const requestId = ${JSON.stringify(requestId)}, scenario = ${JSON.stringify(scenario)};
+      const digest = (c) => c.repeat(64);
+      const emit = (type, fields = {}) => { const body=Buffer.from(JSON.stringify({version:1,requestId,sequence:++outputSequence,type,...fields})); const header=Buffer.alloc(4); header.writeUInt32BE(body.length); process.stdout.write(Buffer.concat([header,body])); };
+      const decode = () => { while(input.length>=4){const length=input.readUInt32BE(0);if(input.length<4+length)return;const frame=JSON.parse(input.subarray(4,4+length).toString());input=input.subarray(4+length);
+        if(['poll','ack','wait_change','wake','attachment_metadata'].includes(frame.type))process.stderr.write('FRAME:'+JSON.stringify(frame)+'\\n');
+        if(frame.type==='owner_ready')emit('inventory',{buildCode:'accepted',buildVersion:'26.4.2.3957',buildBytes:30634432,buildSha256:'893d899f3b39d9cef59752067166b7e72c6f7021e1841b24b617ab079cf8f2b1',candidateCount:1,processCount:1,edbMiB:[1],walMiB:[0],sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)}});
+        else if(frame.type==='verify')emit('ready',{sourceArchiveFormat:1,sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)},schemaVersion:'line-profile-mid-v1'});
+        else if(frame.type==='directory_next')emit('directory_page',{pageNumber:frame.pageNumber,batchDigest:digest('d'),rows:[],hasMore:false});
+        else if(frame.type==='poll')emit('page',{pageNumber:frame.pageNumber,batchDigest:digest('c'),rows:[],tailRows:[],lastCursor:frame.cursor,hasMore:false});
+        else if(frame.type==='wait_change'){const mode=scenario[waits++]??'hang';if(mode==='true')emit('change',{changed:true});else if(mode==='false')emit('change',{changed:false});else process.stderr.write('WAITING:'+mode+'\\n');}
+        else if(frame.type==='wake')emit('change',{changed:false});
+        else if(frame.type==='attachment_metadata')emit('attachment_metadata',{metadata:null,errorCode:'fixture_none'});
+        else if(frame.type==='close'){emit('closed',{sourceAccessed:true});process.stdin.end();}}};
+      process.stdout.on('error',()=>{}); process.stdin.on('data',chunk=>{input=Buffer.concat([input,chunk]);decode();});process.stdin.on('end',()=>process.exit(0));
+      emit('hello',{bridgeVersion:'candidate-reader-0.2.0',capability:'fixed_readonly_verify'});
+    `;
+  }
+
+  async function runIdleScenario(scenario: string[], options: {
+    stopAfterWaitingCount: number; onWaiting?(decode: () => Promise<unknown>): void;
+  }): Promise<{ frames: Array<Record<string, unknown>>; elapsedMs: number; pages: number; decoded: unknown[] }> {
+    const resources = await verifyJsExternalReaderResources(path.dirname(bridgePath));
+    const requestRoot = await mkdtemp(path.join(os.tmpdir(), 'js-direct-idle-wait-'));
+    const requestId = randomUUID().replaceAll('-', '');
+    const mainIdentity: OwnerProcessIdentity = { pid: process.pid,
+      startedAt: '134000000000000044', imagePath: process.execPath, imageSha256: 'a'.repeat(64) };
+    const sourceIdentityDigest = 'b'.repeat(64);
+    let child: ChildProcess | undefined;
+    let bridgeIdentity: OwnerProcessIdentity | undefined;
+    let stderr = '';
+    const abort = new AbortController();
+    let waitingCount = 0;
+    let readyAccess: NativeMonitorAccess | undefined;
+    const decoded: unknown[] = [];
+    const decode = async () => {
+      const value = await readyAccess!.decodeAttachment({ envelope: { format: 1, table: '_message',
+        sourceDigest: 'd'.repeat(64), encoding: 'dpapi', data: 'AQID' }, expectedMessageId: 'm1', expectedChatId: 'chat' } as never);
+      decoded.push(value);
+      return value;
+    };
+    const launch = ((_command: string, _args: readonly string[], spawnOptions: Parameters<typeof spawn>[2]) => {
+      child = spawn(process.execPath, ['-e', idleBridgeScript(requestId, sourceIdentityDigest, scenario)], { ...spawnOptions, stdio: ['pipe', 'pipe', 'pipe'] });
+      child.stderr?.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+        for (const line of chunk.toString().split('\n')) {
+          if (!line.startsWith('WAITING:')) continue;
+          waitingCount += 1;
+          options.onWaiting?.(decode);
+          if (waitingCount >= options.stopAfterWaitingCount) abort.abort();
+        }
+      });
+      bridgeIdentity = { pid: child.pid!, startedAt: '134000000000000077', imagePath: resources.bridgePath, imageSha256: resources.bridgeSha256 };
+      return child;
+    }) as unknown as typeof spawn;
+    const controller = new JsExternalReaderController(new ExternalSourceProbeAdmissionGate(), launch);
+    let pages = 0;
+    const started = Date.now();
+    try {
+      await expect(controller.readOfficialMonitor({
+        bridgePath, requestRoot, requestId, expectedMid: 'fixture-mid', sourceIdentityDigest,
+        cursor: null, deadlineUnixMs: Date.now() + 60_000, mainIdentity,
+        markerStore: new FileOwnerReadyMarkerStore(requestRoot, requestId, async (directory) => {
+          await mkdir(directory, { recursive: true, mode: 0o700 });
+        }),
+        inspectProcess: async (pid) => pid === bridgeIdentity?.pid ? bridgeIdentity : null,
+        onProgress() {},
+        async onReady(access) { readyAccess = access; },
+        async onPage() { pages += 1; return null; },
+        signal: abort.signal,
+        // The old idle delay: a large value proves that the idle path does not use it.
+        pollIntervalMs: 60_000,
+      })).rejects.toThrow();
+      const elapsedMs = Date.now() - started;
+      const frames = stderr.split('\n').filter((line) => line.startsWith('FRAME:'))
+        .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>);
+      return { frames, elapsedMs, pages, decoded };
+    } finally {
+      abort.abort();
+      child?.kill();
+      await rm(requestRoot, { recursive: true, force: true });
+    }
+  }
+
+  it('waits for a change after an idle page, and polls again after change true or false', async () => {
+    const result = await runIdleScenario(['true', 'false', 'hang'], { stopAfterWaitingCount: 1 });
+    expect(result.frames.map((frame) => frame.type)).toEqual(
+      ['poll', 'ack', 'wait_change', 'poll', 'ack', 'wait_change', 'poll', 'ack', 'wait_change']);
+    for (const frame of result.frames.filter((item) => item.type === 'wait_change')) expect(frame.timeoutMs).toBe(30_000);
+    expect(result.pages).toBe(3);
+    // An idle delay of 5000 ms (or the 60000 ms pollIntervalMs) would show here.
+    expect(result.elapsedMs).toBeLessThan(5_000);
+  }, 30_000);
+
+  it('stops the session when the abort signal fires during the wait', async () => {
+    const result = await runIdleScenario(['hang'], { stopAfterWaitingCount: 1 });
+    expect(result.frames.map((frame) => frame.type)).toEqual(['poll', 'ack', 'wait_change']);
+    expect(result.pages).toBe(1);
+  }, 30_000);
+
+  it('sends a wake frame when auxiliary work arrives during the wait', async () => {
+    let started = false;
+    const result = await runIdleScenario(['wake', 'hang'], { stopAfterWaitingCount: 2,
+      onWaiting(decode) { if (!started) { started = true; void decode(); } } });
+    expect(result.frames.map((frame) => frame.type)).toEqual(
+      ['poll', 'ack', 'wait_change', 'wake', 'attachment_metadata', 'poll', 'ack', 'wait_change']);
+    expect(result.decoded).toEqual([{ metadata: null, errorCode: 'fixture_none' }]);
+  }, 30_000);
+
   async function readOnePage(extra: Record<string, unknown>, field: 'tailWindow' | 'unreadCounts' = 'tailWindow'): Promise<unknown> {
     const resources = await verifyJsExternalReaderResources(path.dirname(bridgePath));
     const requestRoot = await mkdtemp(path.join(os.tmpdir(), 'js-direct-tail-window-'));
@@ -133,7 +247,7 @@ describe('JS external reader no-EDB bridge handshake', () => {
       let input = Buffer.alloc(0), outputSequence = 0;
       const requestId = ${JSON.stringify(requestId)};
       const emit = (type, fields = {}) => { const body=Buffer.from(JSON.stringify({version:1,requestId,sequence:++outputSequence,type,...fields})); const header=Buffer.alloc(4); header.writeUInt32BE(body.length); process.stdout.write(Buffer.concat([header,body])); };
-      const decode = () => { while(input.length>=4){const length=input.readUInt32BE(0);if(input.length<4+length)return;const frame=JSON.parse(input.subarray(4,4+length).toString());input=input.subarray(4+length);if(frame.type==='owner_ready')emit('inventory',{buildCode:'accepted',buildVersion:'26.4.2.3957',buildBytes:30634432,buildSha256:'893d899f3b39d9cef59752067166b7e72c6f7021e1841b24b617ab079cf8f2b1',candidateCount:1,processCount:1,edbMiB:[1],walMiB:[0],sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)}});else if(frame.type==='verify')emit('ready',{sourceArchiveFormat:1,sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)},schemaVersion:'line-profile-mid-v1'});else if(frame.type==='directory_next')emit('directory_page',{pageNumber:frame.pageNumber,batchDigest:'${'d'.repeat(64)}',rows:[],hasMore:false});else if(frame.type==='auth_candidates')process.stderr.write('AUTH_REQUESTED\\n');else if(frame.type==='poll')emit('page',{pageNumber:frame.pageNumber,batchDigest:'${'c'.repeat(64)}',rows:[],tailRows:[],lastCursor:frame.cursor,hasMore:false,...${JSON.stringify(extra)}});else if(frame.type==='ack'){process.stderr.write('ACK\\n');}else if(frame.type==='close'){emit('closed',{sourceAccessed:true});process.stdin.end();}}};
+      const decode = () => { while(input.length>=4){const length=input.readUInt32BE(0);if(input.length<4+length)return;const frame=JSON.parse(input.subarray(4,4+length).toString());input=input.subarray(4+length);if(frame.type==='owner_ready')emit('inventory',{buildCode:'accepted',buildVersion:'26.4.2.3957',buildBytes:30634432,buildSha256:'893d899f3b39d9cef59752067166b7e72c6f7021e1841b24b617ab079cf8f2b1',candidateCount:1,processCount:1,edbMiB:[1],walMiB:[0],sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)}});else if(frame.type==='verify')emit('ready',{sourceArchiveFormat:1,sourceIdentityDigest:${JSON.stringify(sourceIdentityDigest)},schemaVersion:'line-profile-mid-v1'});else if(frame.type==='directory_next')emit('directory_page',{pageNumber:frame.pageNumber,batchDigest:'${'d'.repeat(64)}',rows:[],hasMore:false});else if(frame.type==='auth_candidates')process.stderr.write('AUTH_REQUESTED\\n');else if(frame.type==='poll')emit('page',{pageNumber:frame.pageNumber,batchDigest:'${'c'.repeat(64)}',rows:[],tailRows:[],lastCursor:frame.cursor,hasMore:false,...${JSON.stringify(extra)}});else if(frame.type==='ack'){process.stderr.write('ACK\\n');}else if(frame.type==='wait_change')emit('change',{changed:true});else if(frame.type==='close'){emit('closed',{sourceAccessed:true});process.stdin.end();}}};
       process.stdout.on('error',()=>{}); process.stdin.on('data',chunk=>{input=Buffer.concat([input,chunk]);decode();});process.stdin.on('end',()=>process.exit(0));
       emit('hello',{bridgeVersion:'candidate-reader-0.2.0',capability:'fixed_readonly_verify'});
     `;

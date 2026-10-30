@@ -25,11 +25,39 @@ describe('localized preview metadata', () => {
     expect(mapConversation({ ...row, latest_attachment_kind: 'file', latest_attachment_status: 'queued' }).latestMessageDisplay)
       .toEqual({ kind: 'file', status: 'queued' });
   });
+  it('passes the block reason of a queued non-image attachment to the preview and ignores other errors', () => {
+    const queued = { ...row, latest_attachment_kind: 'file' as const, latest_attachment_status: 'queued' as const };
+    expect(mapConversation({ ...queued, latest_attachment_error: 'ATTACHMENT_WORKER_UNAVAILABLE' }).latestMessageDisplay)
+      .toEqual({ kind: 'file', status: 'queued', blockReason: 'ATTACHMENT_WORKER_UNAVAILABLE' });
+    expect(mapConversation({ ...queued, latest_attachment_error: 'LINE_NATIVE_DOWNLOAD_FAILED' }).latestMessageDisplay)
+      .toEqual({ kind: 'file', status: 'queued' });
+    expect(mapConversation({ ...queued, latest_attachment_status: 'failed', latest_attachment_error: 'ATTACHMENT_WORKER_NOT_READY' }).latestMessageDisplay)
+      .toEqual({ kind: 'file', status: 'failed' });
+    expect(mapConversation({ ...queued, latest_attachment_kind: 'image', latest_attachment_error: 'ATTACHMENT_WORKER_NOT_READY' }).latestMessageDisplay)
+      .toEqual({ kind: 'image' });
+    expect(AppSnapshotSchema.shape.conversations.element.parse(mapConversation({ ...queued, latest_attachment_error: 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' })))
+      .toMatchObject({ latestMessageDisplay: { blockReason: 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' } });
+  });
   it('preserves native event prose while identifying generated fallback states', () => {
     const event = { format: 1 as const, type: 'event' as const, nativeContentType: 18, text: '原始群組事件' };
     expect(mapConversation({ ...row, latest_content: event }).latestMessageDisplay).toBeUndefined();
     expect(mapConversation({ ...row, latest_content: { ...event, text: null } }).latestMessageDisplay).toEqual({ kind: 'chat_event' });
     expect(mapConversation({ ...row, latest_source_deleted: true, latest_text: '原始文字' }).latestMessageDisplay).toEqual({ kind: 'deleted' });
+  });
+  it('replaces raw call prose with call facts for the chat-list preview', () => {
+    const raw = 'Call History : 138000 millisecs, ...';
+    const call = { media: 'audio' as const, result: 'NORMAL', durationMs: 138000 };
+    const event = { format: 1 as const, type: 'event' as const, nativeContentType: 6, text: raw, call };
+    const mapped = mapConversation({ ...row, latest_text: raw, latest_content: event, latest_is_own: true });
+    expect(mapped.latestMessageDisplay).toEqual({ kind: 'call', call: { ...call, direction: 'outbound' } });
+    expect(mapped.latestMessagePreview).not.toContain('millisecs');
+    expect(mapped.latestSticonRanges).toEqual([]);
+    expect(AppSnapshotSchema.shape.conversations.element.parse(mapped)).toEqual(mapped);
+    expect(mapConversation({ ...row, latest_text: raw, latest_content: event }).latestMessageDisplay)
+      .toEqual({ kind: 'call', call: { ...call, direction: 'inbound' } });
+    const noFacts = mapConversation({ ...row, latest_text: raw, latest_content: { ...event, call: null } });
+    expect(noFacts.latestMessageDisplay).toEqual({ kind: 'call' });
+    expect(noFacts.latestMessagePreview).toBe('通話');
   });
   it('projects Note and Album notification labels from stored metadata and keeps recall priority', () => {
     const event = { format: 1 as const, type: 'event' as const, nativeContentType: 16, text: 'POSTNOTIFICATION' };

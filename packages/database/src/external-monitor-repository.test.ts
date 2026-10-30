@@ -1605,6 +1605,9 @@ database('external monitor foundation', () => {
       batchId: 'native-mixed-first-page', cursor: { createdTime: '2', id: 'native-thread-message' }, initialImport: true, observations: rows }))
       .resolves.toMatchObject({ replayed: true });
     expect((await pool.query('SELECT count(*) FROM attachments WHERE account_id=$1', [accountId])).rows[0]?.count).toBe('2');
+    // An External Monitor attachment keeps its block reason from the insert, because no scan selects it.
+    expect((await pool.query<{ status: string; error: string | null }>('SELECT status,error FROM attachments WHERE account_id=$1', [accountId])).rows)
+      .toEqual([{ status: 'queued', error: 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' }, { status: 'queued', error: 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' }]);
     await expect(pool.query(`INSERT INTO attachments
       (account_id,chat_type,chat_id,message_id,external_attachment_id,kind,name,mime_type,size_bytes)
       VALUES ($1,'unsupported','native-thread','native-thread-message','bad-type','file','bad.bin','application/octet-stream',1)`, [accountId]))
@@ -1704,12 +1707,13 @@ database('external monitor foundation', () => {
 
   it('upserts attachments in the forward poll transaction for first and changed observations', async () => {
     const accountId = 'external-live-attachments-first-and-changed';
+    const occurredAt = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
     const { sourceId, generation, modeRevision } = await createSource(accountId);
     await stageBatch({ accountId, sourceId, generation, expectedCheckpoint: null,
       batchId: 'live-attachments-baseline', cursor: { rowid: '0' }, observations: [] });
     const observations = Array.from({ length: 55 }, (_, index) => ({ observationId: `attachment-forward-${index}`,
       canonicalMessageId: `attachment-native-${index}`, nativeMessageId: `attachment-native-${index}`, chatType: 'group' as const, chatId: 'attachment-room',
-      senderId: 'person', kind: index === 0 ? 'image' : 'text', text: null, occurredAt: '2026-10-18T00:00:00Z',
+      senderId: 'person', kind: index === 0 ? 'image' : 'text', text: null, occurredAt,
       ...(index === 0 ? { attachments: [{ id: 'attachment-native-0', kind: 'image' as const,
         name: 'first.png', mimeType: null, sizeBytes: 12, expiresAt: null }] } : {}) }));
     const first = await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { diagnosticFailure, type IngestLatency, type SafeDiagnostic } from '@line-agent/contracts';
+import { diagnosticFailure, resolveLineTransport, type IngestLatency, type SafeDiagnostic } from '@line-agent/contracts';
 import { isLocalAgentRoom, LineWorkerCommandSchema, LineWorkerEventSchema, WORKER_PROTOCOL_VERSION, type ComponentHealth, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto, type WorkerBinding } from '@line-agent/contracts';
 import type { IntegratedWorkerGateway, SendMediaRequest } from './connected-facade.js';
 import { ManualSendNotStartedError } from './services/manual-send-errors.js';
@@ -88,6 +88,10 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
   /** Called only for slow live batches (stored > 10 s after LINE's occurredAt, or > 2 s after Main received it). */
   onIngestLatency?: (report: IngestLatencyReport) => void;
   durableCursor?(accountId: string, signal: AbortSignal): Promise<TalkCursorV1Dto | null>;
+  /** Absolute path of the ltsm store root (in app userData). The gateway sends it as `chromeLtsmDir` in the init of CHROMEOS workers only. */
+  chromeLtsmDir?: string;
+  /** Absolute path of the LINE traffic log directory. The gateway sends it as `trafficLogDir` in the init of every worker. */
+  trafficLogDir?: string;
   pollIntervalMs?: number; responseTimeoutMs?: number; restartDelayMs?: number; maxRestarts?: number; stopTimeoutMs?: number;
   lifecycleTimeoutMs?: number; maxWorkers?: number; maxSendsGlobal?: number;
   /** Deterministic pacing hooks for tests: random in [0,1), clock in ms, cancellable timer. */
@@ -839,7 +843,9 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
           }
           scheduleRestart(lifecycle, state!);
         });
-        child.postMessage({ type: 'init', ...effective, protocolVersion: WORKER_PROTOCOL_VERSION, durableCursor: cursor });
+        child.postMessage({ type: 'init', ...effective, protocolVersion: WORKER_PROTOCOL_VERSION, durableCursor: cursor,
+          ...(resolveLineTransport(effective.lineTransport) === 'CHROMEOS' && options.chromeLtsmDir ? { chromeLtsmDir: options.chromeLtsmDir } : {}),
+          ...(options.trafficLogDir ? { trafficLogDir: options.trafficLogDir } : {}) });
         await runBounded(lifecycle, owner, 'binding', controller, (signal) => bindingListener?.(effective, signal));
         if (!ownsIntent(lifecycle, intent) || lifecycle.launch !== launchOwner || lifecycle.child !== state || controller.signal.aborted || lifecycle.quarantine) {
           throw new Error('Worker launch cancelled');
@@ -1016,6 +1022,9 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     onModeChange(next) { return installListener(() => modeListener, (value) => { modeListener = value; }, next); },
     async start(accountId, binding) {
       if (closing) throw new Error('Worker gateway is closing');
+      if (resolveLineTransport(binding.lineTransport) === 'CHROMEOS' && binding.purpose === 'DOWNLOAD_ONLY') {
+        throw new Error('CHROMEOS has no download-only worker');
+      }
       const occupied = occupiedAccounts();
       if (!occupied.has(accountId) && occupied.size >= maxWorkers) {
         throw new Error(`Global worker limit reached (${maxWorkers})`);

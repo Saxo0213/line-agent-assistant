@@ -4,6 +4,14 @@ import { IPC_ACTION_CODES } from './ipc-actions.js';
 /** Existing application-owned identities only; never URLs, paths or external RPC IDs. */
 export type DiagnosticIdentity = { accountId?: string; workerInstanceId?: string; requestId?: string; jobId?: string; loginAttemptId?: string; correlationId?: string; background?: boolean };
 
+/**
+ * Bounded failure detail of one LINE send. It holds only letters, digits and the characters _ : . -.
+ * It names a worker code, an upload stage, an error class and one number. It never holds a token, key, path, chat ID, MID or message text.
+ */
+export const SEND_DETAIL_PATTERN = /^[A-Za-z0-9_:.-]+$/;
+export const SEND_DETAIL_MAX_CHARS = 120;
+export const SendDetailSchema = z.string().min(1).max(SEND_DETAIL_MAX_CHARS).regex(SEND_DETAIL_PATTERN);
+
 /** Operational evidence only. Never add caller-controlled text or error objects here. */
 export const DIAGNOSTIC_OPERATIONS = [
   'init', 'adoptDownloadAuth', 'loginQr', 'loginToken', 'setSecretState', 'poll', 'ackBatch', 'history',
@@ -31,6 +39,8 @@ export const DIAGNOSTIC_REASONS = ['external_monitor_authority_stale', 'external
   'response_code_invalid', 'response_shape_invalid', 'normalization_failure', 'response_validation',
   'timeout', 'cancellation', 'unknown', 'AGENT_IDENTITY_MISMATCH', 'LOGIN_TIMEOUT', 'LOGIN_IN_PROGRESS', 'LOGIN_ATTEMPT_REPLACED', 'LOGIN_FAILED'] as const;
 export const DIAGNOSTIC_FAILURE_KINDS = ['linejs_internal', 'effect_denied', 'type_error', 'range_error', 'timeout_error', 'abort_error', 'other'] as const;
+/** Bounded machine slug of a login failure: stage, error class, method, code. Never free text. */
+export const DIAGNOSTIC_DETAIL_PATTERN = /^[A-Za-z0-9_.:-]{1,160}$/;
 export const SafeDiagnosticSchema = z.object({
   ipcAction: z.enum(IPC_ACTION_CODES).optional(),
   operation: z.enum(DIAGNOSTIC_OPERATIONS), stage: z.enum(DIAGNOSTIC_STAGES),
@@ -38,6 +48,7 @@ export const SafeDiagnosticSchema = z.object({
   reason: z.enum(DIAGNOSTIC_REASONS).optional(),
   failureKind: z.enum(DIAGNOSTIC_FAILURE_KINDS).optional(),
   provider: z.enum(['codex', 'claude']).optional(),
+  detail: z.string().regex(DIAGNOSTIC_DETAIL_PATTERN).optional(),
   outcome: z.enum(['not_started', 'failed', 'unknown', 'recovered']).optional(),
   statusCode: z.number().int().min(-1_000_000_000).max(1_000_000_000).optional(),
   upstreamStatus: z.number().int().min(100).max(599).optional(),

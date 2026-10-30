@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.288에서는 2단계 그룹 자유 모드, Agent 성격과 답장 적극성, `/folder` 프로젝트 폴더, 모든 Agent 작업의 웹 검색, 그룹 답장의 LINE 멘션을 추가했습니다. [v1.0.288 릴리스 노트](docs/releases/v1.0.288.md)를 참조하세요. 이전 변경 사항은 [v1.0.280](docs/releases/v1.0.280.md), [v1.0.279](docs/releases/v1.0.279.md), [v1.0.270](docs/releases/v1.0.270.md)에 있습니다.
+v1.0.302에서는 Agent 이미지와 파일 전송 실패(HTTP 411)를 수정하고, 전송 실패의 실제 원인을 남기며, 외부 모니터가 공식 데이터베이스 변경을 바로 읽고, `/adduser`에 LINE 친구 관계가 필요 없도록 했습니다. [v1.0.302 릴리스 노트](docs/releases/v1.0.302.md)를 참조하세요. 이전 변경 사항은 [v1.0.288](docs/releases/v1.0.288.md), [v1.0.280](docs/releases/v1.0.280.md), [v1.0.279](docs/releases/v1.0.279.md)에 있습니다.
 
 ## 설치
 

@@ -558,3 +558,123 @@ describe('system text (system message schedules)', () => {
     for (const call of repo.findAgentSendAccount.mock.calls) expect(call).toHaveLength(0);
   });
 });
+
+describe('failure causes', () => {
+  const observed = vi.fn();
+  const DB_CHECK = /^[a-z_]{1,64}$/;
+  const withAudit = async () => {
+    observed.mockClear();
+    await service.shutdown();
+    service = new AgentLineSendService({ messages: repo as unknown as AgentLineSendRepository, worker, canWriteLine: async () => canWrite,
+      attachmentRoot, audit: { observed } });
+  };
+  const failWith = (error: string | null, detail?: string, status: 'failed' | 'unknown' = 'failed') => {
+    const reply = (command: { accountId: string; workerInstanceId: string; controlEpoch: number; requestId: string }) => ({
+      type: 'sendResult' as const, accountId: command.accountId, workerInstanceId: command.workerInstanceId,
+      controlEpoch: command.controlEpoch, requestId: command.requestId, status, messageId: null, error,
+      ...(detail === undefined ? {} : { detail }) });
+    worker.send = async (command) => reply(command);
+    worker.sendMedia = async (command) => reply(command);
+  };
+
+  it('keeps the upload stage, error class and number of a PNG that fails to upload', async () => {
+    await withAudit();
+    await writeFile(path.join(workspace, 'chart.png'), 'png bytes');
+    failWith('UPLOAD_FAILED', 'obs_upload:ObsHttpError:403');
+    const results = await submit([{ type: 'file', path: 'chart.png' }]);
+    expect(results).toEqual([{ index: 0, status: 'failed', code: 'send_failed', detail: 'UPLOAD_FAILED:obs_upload:ObsHttpError:403' }]);
+    // The audit kind is the tool item type (file); the media kind is chosen by extension.
+    expect(repo.audit.at(-1)).toMatchObject({ itemKind: 'file', status: 'failed', errorCode: 'send_failed_upload_failed_obs_upload_obshttperror' });
+    expect(repo.audit.at(-1)!.errorCode).toMatch(DB_CHECK);
+    expect(observed).toHaveBeenCalledTimes(1);
+    expect(observed.mock.calls[0]![0]).toBe('worker_operation_error');
+    expect(observed.mock.calls[0]![1]).toMatchObject({ accountId: ACCOUNT, jobId: 'job-1', errorCode: 'MESSAGE_SEND_FAILED',
+      diagnostic: { operation: 'sendMedia', stage: 'write', category: 'transport_failed', upstreamStatus: 403 } });
+  });
+
+  it('classes a .png workspace file as an image and a .bin file as a file', async () => {
+    await writeFile(path.join(workspace, 'shot.PNG'), 'x');
+    await writeFile(path.join(workspace, 'data.bin'), 'y');
+    expect(statuses(await submit([{ type: 'file', path: 'shot.PNG' }, { type: 'file', path: 'data.bin' }]))).toEqual(['sent', 'sent']);
+    expect(worker.sent.map((sent) => sent.mediaKind)).toEqual(['image', 'file']);
+    expect(repo.audit.map((row) => row.itemKind)).toEqual(['file', 'file']);
+  });
+
+  it('keeps the worker code of a failed text send', async () => {
+    await withAudit();
+    failWith('SIDE_EFFECT_DENIED');
+    const results = await submit([{ type: 'text', text: 'hello' }]);
+    expect(results).toEqual([{ index: 0, status: 'failed', code: 'send_failed', detail: 'SIDE_EFFECT_DENIED' }]);
+    expect(repo.audit.at(-1)).toMatchObject({ status: 'failed', errorCode: 'send_failed_side_effect_denied' });
+    expect(observed.mock.calls[0]![1]).toMatchObject({ errorCode: 'SIDE_EFFECT_DENIED', diagnostic: { operation: 'sendText', category: 'denied' } });
+  });
+
+  it('keeps an unknown worker outcome as send_unknown with its code', async () => {
+    await withAudit();
+    failWith('TRANSPORT_OUTCOME_UNKNOWN', undefined, 'unknown');
+    const results = await submit([{ type: 'text', text: 'hello' }, { type: 'text', text: 'next' }]);
+    expect(results).toEqual([{ index: 0, status: 'unknown', code: 'send_unknown', detail: 'TRANSPORT_OUTCOME_UNKNOWN' }, { index: 1, status: 'skipped' }]);
+    expect(repo.audit.at(-1)).toMatchObject({ status: 'unknown', errorCode: 'send_unknown_transport_outcome_unknown' });
+    expect(observed.mock.calls[0]![1]).toMatchObject({ diagnostic: { category: 'outcome_unknown', outcome: 'unknown' } });
+  });
+
+  it.each([
+    ['Worker send queue is full (QUEUE_FULL)', 'queue_full'],
+    ['Worker media queue is full (QUEUE_FULL)', 'media_queue_full'],
+    ['Worker mode not acknowledged for LINE send (protocol handshake required)', 'mode_not_acknowledged'],
+    ['Stale worker binding', 'stale_binding'],
+    ['Worker send cancelled before media admission.', 'cancelled'],
+    ['/private/path leaked token=secret', 'gateway_error'],
+  ])('keeps the gateway reason of a thrown error: %s', async (message, code) => {
+    await withAudit();
+    worker.send = async () => { throw new Error(message); };
+    const results = await submit([{ type: 'text', text: 'hello' }]);
+    expect(results).toEqual([{ index: 0, status: 'unknown', code: 'send_unknown', detail: `gateway:${code}` }]);
+    expect(repo.audit.at(-1)!.errorCode).toBe(`send_unknown_gateway_${code}`);
+    expect(repo.audit.at(-1)!.errorCode).toMatch(DB_CHECK);
+    expect(JSON.stringify([results, repo.audit, observed.mock.calls])).not.toMatch(/private|secret/);
+  });
+
+  it('writes a valid DB code for every worker code and never puts a secret in a result, audit row or log row', async () => {
+    await withAudit();
+    await writeFile(path.join(workspace, 'secret-name.png'), 'body');
+    const cases: Array<[string | null, string | undefined]> = [
+      ['UPLOAD_FAILED', 'encrypt:RangeError'], ['UPLOAD_FAILED', 'obs_upload:ObsHttpError:500'], ['UPLOAD_FAILED', 'obs_preview:Error'],
+      ['UPLOAD_FAILED', 'e2ee_message:ChromeApiError:10051'], ['UPLOAD_FAILED', 'e2ee_flow'], ['FILE_CHANGED', undefined],
+      ['FILE_UNREADABLE', undefined], ['SIDE_EFFECT_DENIED', undefined], ['LOCAL_ROUTE_DENIED', undefined],
+      ['LINE_TALK_ABUSE_BLOCK', undefined], ['TRANSPORT_OUTCOME_UNKNOWN', undefined], [null, undefined], ['CODE_WITH_DIGIT_9', undefined],
+    ];
+    let job = 0;
+    for (const [error, detail] of cases) {
+      failWith(error, detail);
+      const [result] = await submit([{ type: 'file', path: 'secret-name.png' }], { jobId: `job-code-${job += 1}` });
+      expect(result).toMatchObject({ status: 'failed', code: 'send_failed' });
+      expect(result!.detail ?? '').toMatch(/^[A-Za-z0-9_:.-]{0,120}$/);
+    }
+    const codesWritten = repo.audit.map((row) => row.errorCode);
+    expect(codesWritten).toHaveLength(cases.length);
+    for (const code of codesWritten) expect(code).toMatch(DB_CHECK);
+    expect(observed).toHaveBeenCalledTimes(cases.length);
+    const logged = JSON.stringify(observed.mock.calls);
+    for (const forbidden of ['secret-name', 'body', workspace, 'u-friend']) expect(logged).not.toContain(forbidden);
+    for (const forbidden of ['secret-name', 'body', workspace]) expect(JSON.stringify(repo.audit)).not.toContain(forbidden);
+  });
+
+  it('reports a result mismatch and a missing message ID with their own detail', async () => {
+    await withAudit();
+    worker.send = async (command) => ({ type: 'sendResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId,
+      controlEpoch: command.controlEpoch, requestId: 'another-request', status: 'sent', messageId: 'm-1', error: null });
+    expect(await submit([{ type: 'text', text: 'one' }])).toEqual([{ index: 0, status: 'unknown', code: 'send_unknown', detail: 'result_mismatch' }]);
+    expect(repo.audit.at(-1)!.errorCode).toBe('send_unknown_result_mismatch');
+    worker.send = async (command) => ({ type: 'sendResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId,
+      controlEpoch: command.controlEpoch, requestId: command.requestId, status: 'sent', messageId: null, error: null });
+    expect(await submit([{ type: 'text', text: 'two' }], { jobId: 'job-2' })).toEqual([{ index: 0, status: 'unknown', code: 'send_unknown', detail: 'no_message_id' }]);
+  });
+
+  it('keeps a failed send without a worker code as send_failed', async () => {
+    worker.outcomes.set(1, 'failed');
+    const results = await submit([{ type: 'text', text: 'one' }]);
+    expect(results).toEqual([{ index: 0, status: 'failed', code: 'send_failed', detail: 'worker_no_code' }]);
+    expect(repo.audit.at(-1)!.errorCode).toBe('send_failed');
+  });
+});

@@ -19,7 +19,8 @@
   },
   "dependencies": {
     "@evex/linejs": "npm:@jsr/evex__linejs@3.5.0",
-    "@line-agent/contracts": "0.0.0"
+    "@line-agent/contracts": "0.0.0",
+    "@line-agent/line-chrome": "0.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

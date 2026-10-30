@@ -1,13 +1,17 @@
 import { desktopTextFor, generatedMessageText, useDesktopLocale, useDesktopText, useExtraText, useSafeErrorText } from '../desktop-i18n.js';
 import React, { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
-import type { IpcResult, LineAccountSummary } from '@line-agent/contracts';
+import type { ChromeLtsmInstallResult, ChromeLtsmUnavailableStatus, IpcResult, LineAccountSummary } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import { InlineBusy } from '../components/InlineBusy.js';
 import { ProgressOverlay } from '../components/ProgressOverlay.js';
 
 export type LineLoginView = { accountId: string; loginAttemptId: string | null; state: 'connecting' | 'connected' | 'disconnected' | 'degraded' | 'reauth_required'; message: string | null; imageDataUrl?: string; pin?: string };
 type PendingAction = 'add' | 'restart' | 'login';
+/** DESKTOPWIN is the default login method. CHROMEOS needs the LINE Chrome extension files. */
+type LoginMethod = 'DESKTOPWIN' | 'CHROMEOS';
+/** State of the dialog that explains why Chrome login cannot start. */
+type ChromeSetup = { status: ChromeLtsmUnavailableStatus | null; ready: boolean; busy: boolean; notFound: boolean; error: string | null; retry: () => void };
 type PendingTarget = string;
 type PendingLogin = { target: PendingTarget; action: PendingAction };
 const adminBindingErrorKeys = {
@@ -75,8 +79,19 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   const [approvingSigner, setApprovingSigner] = useState(false);
   const [progress, setProgress] = useState<{ title: string; step: string; error?: string; errorCode?: string | null; confirmation?: string; accountId?: string;
     confirmationAction?: string;
+    /** Show the login method choice in the confirmation. */ methodChoice?: boolean;
     /** After 確定: follow the Primary Admin account's first-import progress from the snapshot. */ following?: boolean; followWarning?: string | null } | null>(null);
   const confirmationResolve = useRef<((confirmed: boolean) => void) | null>(null);
+  const [loginMethod, setLoginMethod] = useState<LoginMethod>('DESKTOPWIN');
+  // The ref gives async handlers the newest choice. Some handlers run from older renders.
+  const loginMethodRef = useRef<LoginMethod>('DESKTOPWIN');
+  const [chromeSetup, setChromeSetup] = useState<ChromeSetup | null>(null);
+  // Login method menu of each existing account. An account without an entry shows its current method.
+  const [methodByAccount, setMethodByAccount] = useState<Record<string, LoginMethod>>({});
+  const accountMethod = (account: LineAccountSummary): LoginMethod => methodByAccount[account.accountId] ?? account.lineTransport ?? 'DESKTOPWIN';
+  const chooseLoginMethod = (method: LoginMethod) => { loginMethodRef.current = method; setLoginMethod(method); };
+  // Only CHROMEOS goes to main. A request without lineTransport keeps the DESKTOPWIN flow as before.
+  const chosenTransport = (): 'CHROMEOS' | undefined => loginMethodRef.current === 'CHROMEOS' ? 'CHROMEOS' : undefined;
   const notify = (message: string) => { if (onNotice) onNotice(message); else setStatus(message); };
   const previousLive = useRef(live);
   const [windowPrompt, setWindowPrompt] = useState<string | null>(null);
@@ -124,17 +139,76 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     const newName = event.scannedDisplayName || desktopText('differentLineAccount');
     void requestAgentReplacement(event.accountId, oldName, newName);
   }), [api, accounts]);
+  /** Opens the dialog for a Chrome login that cannot start. `retry` runs when the user continues. */
+  function showChromeSetup(status: ChromeLtsmUnavailableStatus | null, retry: () => void) {
+    setProgress(null);
+    setChromeSetup({ status, ready: false, busy: false, notFound: false, error: null, retry });
+  }
+  /** True when main refused the request with CHROME_LTSM_UNAVAILABLE. The dialog then explains the reason. */
+  function chromeRefusal(result: IpcResult, retry: () => void): boolean {
+    if (result.ok || result.type !== 'error' || result.code !== 'CHROME_LTSM_UNAVAILABLE') return false;
+    showChromeSetup(result.chromeLtsmStatus ?? null, retry);
+    return true;
+  }
+  /** Asks main if the Chrome login can start. If it cannot, show the dialog and return false. */
+  async function chromeLoginReady(retry: () => void): Promise<boolean> {
+    const result = await api.getChromeLoginAvailability();
+    if (result.ok && result.type === 'getChromeLoginAvailability') {
+      if (result.status.kind === 'available') return true;
+      showChromeSetup(result.status, retry);
+      return false;
+    }
+    if (!chromeRefusal(result, retry)) setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(result) });
+    return false;
+  }
+  function applyChromeInstallResult(result: ChromeLtsmInstallResult) {
+    setChromeSetup((current) => {
+      if (!current) return current;
+      if (result.kind === 'installed') return { ...current, busy: false, ready: true, notFound: false, error: null };
+      if (result.kind === 'wrong-version') return { ...current, busy: false, notFound: false, error: null,
+        status: { kind: 'wrong-version', required: result.required, detected: result.detected.map((entry) => entry.version) } };
+      if (result.kind === 'corrupt') return { ...current, busy: false, notFound: false, error: null,
+        status: { kind: 'corrupt', required: result.required, problems: result.problems } };
+      return { ...current, busy: false, notFound: true, error: null, status: { kind: 'missing', required: result.required } };
+    });
+  }
+  async function chromeSetupAction(action: 'detect' | 'choose' | 'store') {
+    setChromeSetup((current) => current ? { ...current, busy: true, error: null } : current);
+    try {
+      if (action === 'store') {
+        const opened = await api.openChromeExtensionStore();
+        setChromeSetup((current) => current ? { ...current, busy: false, error: opened.ok ? null : safeErrorText(opened) } : current);
+        return;
+      }
+      const result = action === 'detect' ? await api.detectChromeLtsm() : await api.chooseChromeLtsmFolder();
+      if (!result.ok || (result.type !== 'detectChromeLtsm' && result.type !== 'chooseChromeLtsmFolder')) {
+        setChromeSetup((current) => current ? { ...current, busy: false, error: safeErrorText(result) } : current);
+      } else if (result.result.kind === 'cancelled') {
+        // The user closed the folder picker. Nothing changes.
+        setChromeSetup((current) => current ? { ...current, busy: false } : current);
+      } else applyChromeInstallResult(result.result);
+    } catch (cause) {
+      setChromeSetup((current) => current ? { ...current, busy: false, error: safeErrorText(cause) } : current);
+    }
+  }
   async function requestAgentReplacement(accountId: string, oldName: string, newName?: string) {
     setProgress({ get title() { return desktopText('replaceAgentAccount'); }, step: desktopText('agentArchiveRemainsSeparate'),
-      confirmationAction: desktopText('replaceAgentAccount'),
+      confirmationAction: desktopText('replaceAgentAccount'), methodChoice: true,
       confirmation: newName ? desktopText('replaceAgentAccountWithArg0Arg1', { arg0: oldName, arg1: newName })
         : desktopText('replaceAgentAccountPromptArg0', { arg0: oldName }) });
     const confirmed = await new Promise<boolean>((resolve) => { confirmationResolve.current = resolve; });
     confirmationResolve.current = null;
     if (!confirmed) { setProgress(null); return; }
+    await startAgentReplacement(accountId);
+  }
+  async function startAgentReplacement(accountId: string) {
     setProgress({ get title() { return desktopText('replaceAgentAccount'); }, step: desktopText('startingLogin') });
     try {
-      const result = await api.lineReplaceAgentQr(accountId);
+      const lineTransport = chosenTransport();
+      const retry = () => void startAgentReplacement(accountId);
+      if (lineTransport && !await chromeLoginReady(retry)) return;
+      const result = lineTransport ? await api.lineReplaceAgentQr(accountId, lineTransport) : await api.lineReplaceAgentQr(accountId);
+      if (chromeRefusal(result, retry)) return;
       if (result.ok) setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: desktopText('scanTheQrCodeWithLineOnYourPhone') });
       else setProgress({ get title() { return desktopText('replaceAgentAccount'); }, step: '', error: safeErrorText(result), errorCode: result.type === 'error' ? result.code : null });
     } catch (cause) {
@@ -145,9 +219,15 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     flushSync(() => setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: desktopText('startingLogin') }));
     setPending({ target: slot, action: 'add' });
     let result: IpcResult;
-    try { result = await api.lineAddAccountQr(); }
+    const lineTransport = chosenTransport();
+    const retry = () => void addAccount(slot);
+    try {
+      if (lineTransport && !await chromeLoginReady(retry)) return;
+      result = lineTransport ? await api.lineAddAccountQr(lineTransport) : await api.lineAddAccountQr();
+    }
     catch (cause) { setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(cause, desktopText('unableToStartLineLogin')) }); return; }
     finally { setPending(null); }
+    if (chromeRefusal(result, retry)) return;
     if (result.ok) { setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: live?.pin ? desktopText('enterThePinOnYourPhone') : live?.imageDataUrl ? desktopText('scanTheQrCodeWithLineOnYourPhone') : desktopText('loggingIn') }); notify(desktopText('aNewLineAccountLoginHasStarted')); }
     else setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(result) });
   }
@@ -158,20 +238,32 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     try { result = await api.lineStart(accountId); }
     catch (cause) { setProgress({ get title() { return desktopText('restartLine'); }, step: '', error: safeErrorText(cause, desktopText('unableToRestartLine')) }); return; }
     finally { setPending(null); }
+    if (chromeRefusal(result, () => void restart(accountId))) return;
     if (result.ok) {
       setProgress(live?.state === 'connecting' ? { get title() { return desktopText('logInToLineAccount'); }, accountId, step: live.pin ? desktopText('enterThePinOnYourPhone') : live.imageDataUrl ? desktopText('scanTheQrCodeWithLineOnYourPhone') : desktopText('loggingIn') } : null);
       notify(desktopText('syncRestartRequested'));
     }
     else setProgress({ get title() { return desktopText('restartLine'); }, step: '', error: safeErrorText(result) });
   }
+  /** Chrome is checked at once. If the local files are not usable, the menu keeps its value and the setup dialog opens. */
+  async function chooseAccountMethod(accountId: string, method: LoginMethod) {
+    const store = () => setMethodByAccount((current) => ({ ...current, [accountId]: method }));
+    if (method === 'CHROMEOS' && !await chromeLoginReady(store)) return;
+    store();
+  }
   async function relogin(accountId: string) {
     flushSync(() => setProgress({ get title() { return desktopText('logInToLineAccount'); }, get step() { return desktopText('startingLogin'); }, accountId }));
     const monitoring = accounts.find((account) => account.accountId === accountId)?.externalImportProgress?.stage === 'monitoring';
     setPending({ target: accountId, action: 'login' });
+    const account = accounts.find((item) => item.accountId === accountId);
+    const method = methodByAccount[accountId] ?? account?.lineTransport ?? 'DESKTOPWIN';
+    // Only CHROMEOS is sent. DESKTOPWIN is sent only to leave a CHROMEOS account. Otherwise Main keeps the current method.
+    const lineTransport = method === 'CHROMEOS' ? 'CHROMEOS' as const : account?.lineTransport === 'CHROMEOS' ? 'DESKTOPWIN' as const : undefined;
     let result: IpcResult;
-    try { result = await api.lineLoginQr(accountId); }
+    try { result = lineTransport ? await api.lineLoginQr(accountId, lineTransport) : await api.lineLoginQr(accountId); }
     catch (cause) { setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(cause, desktopText('unableToStartLineLogin')) }); return; }
     finally { setPending(null); }
+    if (chromeRefusal(result, () => void relogin(accountId))) return;
     if (!result.ok) { setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(result) }); return; }
     setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: desktopText('scanTheQrCodeWithLineOnYourPhone') });
     const outcome = desktopText('qrLoginStarted');
@@ -367,9 +459,11 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     const busy = pending !== null && pending.target === account.accountId;
     const stage = account.externalImportProgress?.stage;
     const monitoring = stage === 'monitoring' || stage === 'syncing';
+    const adminMonitoring = monitoring && account.productRole === 'PRIMARY_ADMIN';
     const stopping = stoppingExternalImport === account.accountId;
     const starting = startingExternalImport === account.accountId;
     return <article className={`${embedded ? 'account-record' : 'panel'} route-${account.mode}`} data-account-id={account.accountId} key={account.accountId}>
+      {account.lineTransport === 'CHROMEOS' && <p className="login-method-badge">{extraText('loginMethodChrome')}</p>}
       <p>{desktopText('connectionStatus')}{monitoring && account.productRole === 'PRIMARY_ADMIN' ? desktopText('externalMonitoringActive') : account.status === 'connected' ? desktopText('connected') : account.status === 'reauth_required' ? desktopText('lineLoginRequiredAgain') : account.status === 'disconnected' ? desktopText('loggedOut') : desktopText('connectionError')}</p>
       {(!embedded || account.productRole === 'AGENT') && <p>{desktopText('lastSynced')}{account.lastSyncedAt ? new Date(account.lastSyncedAt).toLocaleString(locale) : desktopText('notSyncedYet')}</p>}
       {account.hasPrimaryAdmin === true && <p>{desktopText('primaryAdministratorLinked')}</p>}
@@ -408,10 +502,17 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
           onClick={() => void refreshAvatar(account)}>{refreshingAvatar === account.accountId ? desktopText('refreshingAvatar') : desktopText('refreshAvatar')}</button>}
         {account.productRole === 'AGENT' && account.hasPrimaryAdmin !== true && <button className="primary" onClick={() => void beginAdminPairing(account)}>{desktopText('addAdministrator')}</button>}
         <button disabled={account.status === 'disconnected' || busy} onClick={() => void restart(account.accountId)}>{desktopText('restart')}</button>
-        <button aria-label={`${account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')} ${account.displayName}`} disabled={busy} onClick={() => void relogin(account.accountId)}>{account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')}</button>
+        <button aria-label={`${account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')} ${account.displayName}`} disabled={busy || adminMonitoring} title={adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={adminMonitoring ? `auto-login-disabled-${account.accountId}` : undefined} onClick={() => void relogin(account.accountId)}>{account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')}</button>
         {account.productRole === 'AGENT' && account.hasVerifiedLineIdentity === true && account.status === 'disconnected' && <button disabled={busy || loginActive}
           onClick={() => void requestAgentReplacement(account.accountId, account.displayName)}>{desktopText('replaceAgentAccount')}</button>}
         <button aria-label={desktopText('logOutArg0', { arg0: account.displayName })} disabled={account.status === 'disconnected' || busy || loggingOut === account.accountId} onClick={() => void logout(account)}>{loggingOut === account.accountId ? desktopText('loggingOut') : desktopText('logOut')}</button>
+        <select className="login-method-select" aria-label={extraText('loginMethodLabel')} value={accountMethod(account)}
+          disabled={account.status === 'connected' || busy || loginActive || adminMonitoring}
+          title={account.status === 'connected' ? extraText('loginMethodLogoutFirst') : adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined}
+          onChange={(event) => void chooseAccountMethod(account.accountId, event.target.value as LoginMethod)}>
+          <option value="DESKTOPWIN">{extraText('loginMethodWindows')}</option>
+          <option value="CHROMEOS">{extraText('loginMethodChrome')}</option>
+        </select>
         {busy && <InlineBusy>{desktopText('startingLineLogin')}</InlineBusy>}
         {loggingOut === account.accountId && <InlineBusy>{desktopText('loggingOut')}</InlineBusy>}
         {!embedded && account.productRole === 'PRIMARY_ADMIN' && account.hasVerifiedLineIdentity === true && externalMonitorAction(account)}
@@ -419,6 +520,12 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     </article>;
   };
   const addPending = pending !== null && pending.action === 'add';
+  const methodChoice = <div className="button-row login-method-choice" role="group" aria-label={extraText('loginMethodLabel')}>
+    {(['DESKTOPWIN', 'CHROMEOS'] as const).map((method) => <button key={method} type="button" aria-pressed={loginMethod === method}
+      className={loginMethod === method ? 'primary' : undefined} disabled={loginActive || addPending}
+      onClick={() => chooseLoginMethod(method)}>{method === 'CHROMEOS' ? extraText('loginMethodChrome') : extraText('loginMethodWindows')}</button>)}
+  </div>;
+  const chromeStatus = chromeSetup?.status ?? null;
   const vacantPending = (slot: PendingTarget) => pending?.target === slot ? desktopText('startingLineLogin') : null;
   const progressAccount = progress?.accountId ? accounts.find((account) => account.accountId === progress.accountId) : undefined;
   const progressImport = progressAccount?.externalImportProgress;
@@ -461,8 +568,8 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     <section className={embedded ? 'panel combined-account-card' : undefined} aria-label={embedded ? desktopText('lineAccountSettings') : undefined}>
     {embedded && <h2 className="combined-account-title">{desktopText('account')}</h2>}
     <div className="account-role-slots">
-      <section className="account-role-slot" aria-label={extraText('agentAccountSlot')}><div className="account-role-heading"><h2>Agent</h2><p>{agent?.displayName ?? desktopText('notLoggedIn182')}</p></div>{agent ? accountCard(agent) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}>{admin ? <p>{desktopText('primaryAdministratorConfiguredANewAgentAccountWillBe')}</p> : null}<div className="action-with-status"><button className="primary" disabled={loginActive || addPending} onClick={() => void addAccount('add:agent')}>{desktopText('logInToAgentLineAccount')}</button>{vacantPending('add:agent') && <InlineBusy>{vacantPending('add:agent')!}</InlineBusy>}</div></article>}</section>
-      <section className="account-role-slot" aria-label={extraText('primaryAdminAccountSlot')}><div className="account-role-heading"><h2>Primary Admin</h2><p>{admin?.displayName ?? desktopText('notLoggedIn182')}</p></div>{admin ? accountCard(admin) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}><div className="action-with-status"><button className="primary" disabled={loginActive || addPending || agent?.hasPrimaryAdmin !== true} onClick={() => void addAccount('add:admin')}>{desktopText('logInToPrimaryAdminLineAccount')}</button>{vacantPending('add:admin') && <InlineBusy>{vacantPending('add:admin')!}</InlineBusy>}</div>
+      <section className="account-role-slot" aria-label={extraText('agentAccountSlot')}><div className="account-role-heading"><h2>Agent</h2><p>{agent?.displayName ?? desktopText('notLoggedIn182')}</p></div>{agent ? accountCard(agent) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}>{admin ? <p>{desktopText('primaryAdministratorConfiguredANewAgentAccountWillBe')}</p> : null}{methodChoice}<div className="action-with-status"><button className="primary" disabled={loginActive || addPending} onClick={() => void addAccount('add:agent')}>{desktopText('logInToAgentLineAccount')}</button>{vacantPending('add:agent') && <InlineBusy>{vacantPending('add:agent')!}</InlineBusy>}</div></article>}</section>
+      <section className="account-role-slot" aria-label={extraText('primaryAdminAccountSlot')}><div className="account-role-heading"><h2>Primary Admin</h2><p>{admin?.displayName ?? desktopText('notLoggedIn182')}</p></div>{admin ? accountCard(admin) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}>{methodChoice}<div className="action-with-status"><button className="primary" disabled={loginActive || addPending || agent?.hasPrimaryAdmin !== true} onClick={() => void addAccount('add:admin')}>{desktopText('logInToPrimaryAdminLineAccount')}</button>{vacantPending('add:admin') && <InlineBusy>{vacantPending('add:admin')!}</InlineBusy>}</div>
         {embedded && canBindAdminFromSettings && <div className="action-with-status"><button className="primary" disabled={bindingAdmin || addPending} onClick={() => void bindAdminFromOfficialLine()}>{desktopText('setAdministratorFromLineAndStartExternalMonitoring')}</button>{bindingAdmin && <InlineBusy>{desktopText('settingPrimaryAdministrator')}</InlineBusy>}</div>}
         {!embedded && (!agent || agent.hasPrimaryAdmin !== true) && <div className="action-with-status"><button className="primary" disabled={bindingAdmin || addPending} onClick={() => void bindAdminFromOfficialLine()}>{desktopText('setAdministratorFromLineAndStartExternalMonitoring')}</button></div>}</article>}</section>
     </div>
@@ -496,7 +603,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     {!onNotice && status && <div role="status" className="system-toast">{generatedMessageText(status)}</div>}
     {progress && <ProgressOverlay title={generatedMessageText(progress.title)} step={followStep ?? progress.step} error={progress.error ?? null} errorCode={progress.errorCode ?? null}
       spinner={!progress.confirmation} onClose={() => setProgress(null)}>
-      {progress.confirmation && <><p className="progress-confirmation">{progress.confirmation}</p><div className="progress-actions"><button onClick={() => confirmationResolve.current?.(false)}>{desktopText('cancel')}</button><button className="primary" onClick={() => confirmationResolve.current?.(true)}>{progress.confirmationAction ?? desktopText('confirm')}</button></div></>}
+      {progress.confirmation && <><p className="progress-confirmation">{progress.confirmation}</p>{progress.methodChoice && methodChoice}<div className="progress-actions"><button onClick={() => confirmationResolve.current?.(false)}>{desktopText('cancel')}</button><button className="primary" onClick={() => confirmationResolve.current?.(true)}>{progress.confirmationAction ?? desktopText('confirm')}</button></div></>}
       {followImport?.stage === 'copying_snapshot' && <progress aria-label={desktopText('snapshotCopyProgress')} max={100} {...(percent(followImport.copiedBytes, followImport.totalBytes) === undefined
         ? {} : { value: percent(followImport.copiedBytes, followImport.totalBytes) })} />}
       {followImport?.stage === 'importing_history' && <progress aria-label={desktopText('messageHistoryImportProgress')} max={100} {...(percent(followImport.committedRows, followImport.eligibleRows) === undefined
@@ -505,6 +612,28 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       {progress.title === desktopText('logInToLineAccount') && live?.state === 'connecting' && live.imageDataUrl && !live.pin && <img src={live.imageDataUrl} alt={desktopText('lineLoginQrCode')} width="320" height="320" />}
       {progress.title === desktopText('logInToLineAccount') && live?.state === 'connecting' && live.pin && <div className="line-auth-code"><h3>{desktopText('enterVerificationCodeOnYourPhone')}</h3><output aria-label={desktopText('line6DigitVerificationCode')}>{live.pin}</output></div>}
       {progress.title === desktopText('logInToLineAccount') && live?.state === 'connecting' && <div className="progress-actions"><button onClick={() => void cancelLogin()}>{desktopText('cancelLogin')}</button></div>}
+    </ProgressOverlay>}
+    {chromeSetup && <ProgressOverlay title={extraText(chromeSetup.ready ? 'chromeLoginReadyTitle' : 'chromeLoginUnavailableTitle')} step="" spinner={false}>
+      {chromeSetup.ready ? <p role="status">{extraText('chromeLoginReady')}</p> : <>
+        <p>{extraText('chromeLoginNeedsExtension')}</p>
+        {chromeStatus?.kind === 'wrong-version' && <>
+          <p>{extraText('chromeLoginRequiredVersion')}{chromeStatus.required}</p>
+          <p>{extraText('chromeLoginDetectedVersions')}{chromeStatus.detected.length ? chromeStatus.detected.join(', ') : extraText('chromeLoginNoneDetected')}</p>
+        </>}
+        {chromeStatus?.kind === 'corrupt' && <p>{extraText('chromeLoginCorrupt')}</p>}
+        {chromeSetup.notFound && <p role="status">{extraText('chromeLoginNotFound')}</p>}
+      </>}
+      {chromeSetup.error && <p role="alert" className="progress-error">{chromeSetup.error}</p>}
+      {chromeSetup.busy && <InlineBusy>{extraText('chromeLoginDetecting')}</InlineBusy>}
+      <div className="progress-actions">
+        {!chromeSetup.ready && <>
+          <button disabled={chromeSetup.busy} onClick={() => void chromeSetupAction('store')}>{extraText('chromeLoginInstallExtension')}</button>
+          <button disabled={chromeSetup.busy} onClick={() => void chromeSetupAction('detect')}>{extraText('chromeLoginRedetect')}</button>
+          <button disabled={chromeSetup.busy} onClick={() => void chromeSetupAction('choose')}>{extraText('chromeLoginChooseFolder')}</button>
+        </>}
+        <button disabled={chromeSetup.busy} onClick={() => setChromeSetup(null)}>{desktopText('cancel')}</button>
+        {chromeSetup.ready && <button className="primary" onClick={() => { const retry = chromeSetup.retry; setChromeSetup(null); retry(); }}>{extraText('chromeLoginContinue')}</button>}
+      </div>
     </ProgressOverlay>}
     {windowPromptAccount && <ProgressOverlay title={desktopText('startExternalMonitoring')} spinner={false}
       step={desktopText('multipleLineWindowsAreOpenSoTheMainWindow')}>

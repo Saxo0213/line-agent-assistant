@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.288 新增兩階段群組自由模式、Agent 個性與回覆積極度、`/folder` 專案資料夾、所有 Agent 工作可用網路搜尋，以及群組回覆的 LINE 標註。請參閱 [v1.0.288 版本說明](docs/releases/v1.0.288.md)；先前更新請見 [v1.0.280](docs/releases/v1.0.280.md)、[v1.0.279](docs/releases/v1.0.279.md) 與 [v1.0.270](docs/releases/v1.0.270.md)。
+v1.0.302 修正 Agent 傳送圖片與檔案失敗（HTTP 411），傳送失敗時保留實際原因，外部監控改為官方資料庫一有變動就讀取，`/adduser` 不再需要 LINE 好友關係。請參閱 [v1.0.302 版本說明](docs/releases/v1.0.302.md)；先前更新請見 [v1.0.288](docs/releases/v1.0.288.md)、[v1.0.280](docs/releases/v1.0.280.md) 與 [v1.0.279](docs/releases/v1.0.279.md)。
 
 ## 安裝
 

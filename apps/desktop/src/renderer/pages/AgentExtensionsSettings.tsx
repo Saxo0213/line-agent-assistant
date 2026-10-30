@@ -231,7 +231,7 @@ function ServerDialog({ server, text, existingNames, onSave, onClose }: {
           <label className="schedule-enabled"><input type="checkbox" name="enabled" checked={form.enabled} onChange={(event) => update({ enabled: event.target.checked })} />{text('fieldEnabled')}</label>
           {failure && !failure.field && <p role="alert" className="schedule-error">{text(failure.message)}</p>}
         </div>
-        <div className="modal-actions">
+        <div className="modal-actions schedule-footer">
           <button type="button" disabled={saving} onClick={onClose}>{text('cancel')}</button>
           <button type="submit" className="primary" disabled={saving}>{saving ? text('saving') : text('save')}</button>
         </div>
@@ -334,12 +334,12 @@ function ImportDialog({ api, text, onImported, onClose }: { api: DesktopApi; tex
           {outcome.skipped.length > 0 && <p className="muted">{text('importDoneSkipped', { arg0: outcome.skipped.map((item) => item.sourceName).join(', ') })}</p>}
         </div>}
       </div>
-      <div className="modal-actions">
+      <div className="modal-actions schedule-footer">
         {outcome && outcome !== 'failed'
           ? <button type="button" className="primary" onClick={onClose}>{text('done')}</button>
           : <>
             <button type="button" disabled={busy} onClick={onClose}>{text('cancel')}</button>
-            <button type="button" className="primary" disabled={busy || selected.size === 0} onClick={() => void submit()}>{text('importSelected', { arg0: selected.size })}</button>
+            <button type="button" className="primary" disabled={busy || selected.size === 0} onClick={() => void submit()}>{text('importSelected')}</button>
           </>}
       </div>
     </section>

@@ -22,6 +22,7 @@ import { agentBridgeEnabled, isPackagedHeadlessSmoke, registerMainWindowReadyDis
 import { resolveDatabaseMigrations, resolveJobHost, resolveSkillsDirectory, resolveWorkerEntry } from './resources.js';
 import { BootstrapSettings, bootstrapFromEnvironment } from './services/bootstrap-settings.js';
 import { SecretStore } from './services/secret-store.js';
+import { ChromeLtsmService } from './services/chrome-ltsm-service.js';
 import { createOperationalAuditRuntime } from './services/operational-audit-runtime.js';
 import { createOperationalAudit, type OperationalAudit } from './services/operational-audit.js';
 import { OperationalAuditFallback } from './services/operational-audit-fallback.js';
@@ -42,10 +43,12 @@ import { changeEmbeddedPassword, connectWithPasswordRecovery, passwordFromDataba
 import { AgentCliBridge, NodeProcessRunner } from '@line-agent/agent-bridge';
 import { AgentRepository, MessageRepository, SettingsRepository, createPool, migrate } from '@line-agent/database';
 import { StartupCleanup } from './startup-cleanup.js';
+import { startTrafficLog } from '../../../../packages/line-worker/src/traffic-log.js';
+import { startTrafficLogRetention } from '../../../../packages/line-worker/src/traffic-log-retention.js';
 import { createJsOfficialSnapshotImporter } from './services/js-external-reader/runtime-importer.js';
 import { OfficialBuildTrustService } from './services/official-build-trust.js';
 import { mainExternalSourceProbeAdmission } from './services/external-source-probe-admission.js';
-import { parseLineMediaUrl } from '@line-agent/contracts';
+import { CHROME_EXTENSION_STORE_URL, parseLineMediaUrl } from '@line-agent/contracts';
 import { createLocaleSettings, getEffectiveLocale, setEffectiveLocaleReader } from './locale-settings.js';
 import { nativeDesktopText } from '../desktop-system-copy.js';
 import { createLocaleIpcAdapter } from './locale-ipc.js';
@@ -207,6 +210,8 @@ async function initializeServices(): Promise<void> {
   const agents = new AgentRepository(pool);
   const messages = new MessageRepository(pool);
   const secretStore = new SecretStore(bootstrapSettings.root);
+  // CHROMEOS ltsm assets. The verified copies are in userData. A CHROMEOS worker gets only this store root.
+  const chromeLtsm = new ChromeLtsmService({ userDataDir: app.getPath('userData') });
   let officialSnapshotImporter: OfficialSnapshotImporter | undefined;
   // One persisted trust document (app_settings.official_line_build_trust); no timer or watcher.
   const officialBuildTrust = new OfficialBuildTrustService({
@@ -229,7 +234,15 @@ async function initializeServices(): Promise<void> {
   const bridge = new AgentCliBridge({ enabled: agentBridgeEnabled(process.env), resolveWorkspaceRoots: async () => [await workspaceAuthority.current()], runner: new NodeProcessRunner({ hostFile: jobHostFile }),
     validateResumeSession: (request) => agents.validateResumeSession(request) });
   startupCleanup.add(() => bridge.shutdown());
+  // Local log of the HTTP requests to LINE hosts. It only observes; a failure inside it never reaches a request.
+  const trafficLogDir = path.join(app.getPath('userData'), 'logs', 'line-traffic');
+  try {
+    const trafficLog = startTrafficLog({ directory: trafficLogDir, processKind: 'main', transport: null });
+    startupCleanup.add(() => trafficLog.stop());
+    startupCleanup.add(startTrafficLogRetention(trafficLogDir));
+  } catch { /* The traffic log is optional. */ }
   const workers = createUtilityWorkerGateway({
+    trafficLogDir,
     onDiagnostic: (diagnostic, accountId) => audit.failure(diagnostic, { ...(accountId ? { accountId } : {}) }),
     onIngestLatency: (report) => audit.observed(report.kind === 'main' ? 'line_ingest_slow_main' : 'line_ingest_slow_upstream',
       { initiator: 'worker', accountId: report.accountId, workerInstanceId: report.workerInstanceId, latency: report.latency }),
@@ -242,6 +255,7 @@ async function initializeServices(): Promise<void> {
       return child;
     },
     durableCursor: (accountId, signal) => messages.getLiveCursor(accountId, signal),
+    chromeLtsmDir: chromeLtsm.rootDir,
   });
   startupCleanup.add(() => workers.shutdown());
   const previewPresenter = createElectronPreviewPresenter({
@@ -261,6 +275,15 @@ async function initializeServices(): Promise<void> {
     previewCacheRoot: path.join(app.getPath('userData'), 'cache', 'line-image-previews'),
     mediaCacheRoot: path.join(app.getPath('userData'), 'avatar-cache'),
     openAttachmentPath: (file) => shell.openPath(file), openFolderPath: (folder) => shell.openPath(folder), secretStore, audit, previewPresenter,
+    chromeLogin: {
+      ltsm: chromeLtsm,
+      chooseFolder: async () => {
+        const result = await dialog.showOpenDialog(window!, { title: nativeDesktopText(getEffectiveLocale(), 'chromeLtsmFolder'), properties: ['openDirectory'] });
+        return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]!;
+      },
+      // This path opens only the Web Store page of the LINE extension.
+      openStore: async (url) => { if (url !== CHROME_EXTENSION_STORE_URL) throw new Error('Unsupported URL'); await shell.openExternal(url); },
+    },
     closePoolOnShutdown: true, runMigrations: false, contentReprojection: true, officialBuildTrust,
     skillsDirectory: resolveSkillsDirectory(app.isPackaged, appDir, process.resourcesPath),
     ...(officialSnapshotImporter ? { officialSnapshotImporter } : {}),

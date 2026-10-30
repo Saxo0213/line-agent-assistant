@@ -75,7 +75,7 @@ describe('Claude built-in tools come from the Main-resolved policy',()=>{
     expect(value(args,'--allowedTools')).not.toContain('Bash');
     expect(value(args,'--allowedTools')).toContain(hasWrite?'Write,Edit':'mcp__linejs__');
   });
-  it.each(['read_only','workspace_write','trust','full'] as const)('denies Bash on fresh and resumed %s launches', level => {
+  it.each(['read_only','workspace_write','trust'] as const)('denies Bash on fresh and resumed %s launches', level => {
     for (const resumeSessionId of [undefined,'session-1']) {
       const requestForLevel={...request('claude',root,{tools:{...request('claude',root).tools,level}}),mcp,...(resumeSessionId?{resumeSessionId}:{})};
       const args=claudeArguments(requestForLevel);
@@ -83,7 +83,34 @@ describe('Claude built-in tools come from the Main-resolved policy',()=>{
       expect(args.indexOf('--disallowedTools')).toBeLessThan(args.indexOf('--resume')===-1?args.length:args.indexOf('--resume'));
       if(args.includes('--tools')) expect(value(args,'--tools')).not.toContain('Bash');
       if(args.includes('--allowedTools')) expect(value(args,'--allowedTools')).not.toContain('Bash');
-      if(level==='full') { expect(args).not.toContain('--tools'); expect(value(args,'--disallowedTools')).toBe('Bash'); }
+    }
+  });
+  it('lets a non-interactive full-access local-tools job run Bash and web tools unprompted, fresh and resumed',()=>{
+    for (const resumeSessionId of [undefined,'session-1']) {
+      const base=request('claude',root,{tools:{...request('claude',root).tools,level:'full',webTools:true,projectDirs:[{path:'D:/ro',writable:false}],ownFolderReadOnly:true}});
+      const args=claudeArguments({...base,mcp,...(resumeSessionId?{resumeSessionId}:{})});
+      expect(args).not.toContain('--disallowedTools');
+      expect(args).not.toContain('--tools');
+      expect(value(args,'--permission-mode')).toBe('dontAsk');
+      expect(args).not.toContain('--permission-prompt-tool');
+      const allowed=value(args,'--allowedTools')!.split(',');
+      for(const tool of ['Bash','WebSearch','WebFetch','Write','Edit']) expect(allowed).toContain(tool);
+      const deny=JSON.parse(value(args,'--settings')!).permissions;
+      expect(deny.deny).toHaveLength(2);
+      expect(deny.ask).toBeUndefined();
+    }
+  });
+  it('keeps Bash disallowed at full access without the local tools permission',()=>{
+    const args=claudeArguments(request('claude',root,{tools:{...none,fileRead:true,webTools:true,level:'full'}}));
+    expect(value(args,'--disallowedTools')).toBe('Bash');
+    expect(value(args,'--allowedTools')??'').not.toContain('Bash');
+    expect(args).toContain('--restricted');
+  });
+  it('does not grant Bash below full access to a non-interactive job even with web tools',()=>{
+    for (const level of ['read_only','workspace_write','trust'] as const) {
+      const args=claudeArguments(request('claude',root,{tools:{...request('claude',root).tools,level,webTools:true}}));
+      expect(value(args,'--disallowedTools')).toBe('Bash');
+      expect(value(args,'--allowedTools')??'').not.toContain('Bash');
     }
   });
   it.each(['read_only','workspace_write','trust','full'] as const)('sets interactive MCP Bash behavior for %s', level => {
@@ -92,7 +119,11 @@ describe('Claude built-in tools come from the Main-resolved policy',()=>{
       const args=claudeArguments(req);
       const active=interactiveApproval&&hasMcp;
       const expected=previousClaudeArguments(req);
-      if(!active) expect(args).toEqual(expected);
+      if(!active&&level==='full') {
+        expected.splice(expected.indexOf('--disallowedTools'),2);
+        expected[expected.indexOf('--allowedTools')+1]+=',Bash';
+        expect(args).toEqual(expected);
+      } else if(!active) expect(args).toEqual(expected);
       else {
         expected[expected.indexOf('--permission-mode')+1]='default';
         expected.splice(expected.indexOf('--permission-mode')+2,0,'--permission-prompt-tool',claudePermissionPromptToolName);
@@ -111,11 +142,13 @@ describe('Claude built-in tools come from the Main-resolved policy',()=>{
         expect(args).not.toContain('--disallowedTools');
       } else if(active&&level==='full') {
         expect(args).not.toContain('--tools'); expect(args).not.toContain('--disallowedTools'); expect(args).not.toContain('--settings');
+      } else if(level==='full') {
+        expect(args).not.toContain('--disallowedTools'); expect(value(args,'--allowedTools')).toContain('Bash');
       } else {
         expect(value(args,'--disallowedTools')).toBe('Bash');
         if(args.includes('--tools')) expect(value(args,'--tools')).not.toContain('Bash');
       }
-      if(args.includes('--allowedTools')) expect(value(args,'--allowedTools')).not.toContain('Bash');
+      if(args.includes('--allowedTools')&&!(level==='full'&&!active)) expect(value(args,'--allowedTools')).not.toContain('Bash');
     }
   });
   it('omits --tools and --restricted for full local-tool policy',()=>{
@@ -276,7 +309,9 @@ describe('web tools for resolved principals',()=>{
     expect(args).not.toContain('--allowedTools');
     const full=claudeArguments(request('claude',root,{tools:web({localTools:true,fileRead:true,fileWrite:true,level:'full'})}));
     expect(full).not.toContain('--tools');
-    expect(value(full,'--allowedTools')??'').not.toContain('Web');
+    expect(value(full,'--allowedTools')).toBe('Write,Edit,Bash,WebSearch,WebFetch');
+    const admin=claudeArguments(request('claude',root,{tools:web({localTools:true,fileRead:true,fileWrite:true,level:'full'})}));
+    expect(admin).not.toContain('--disallowedTools');
   });
   it('does not duplicate the extension toggles',()=>{
     const toggles={webSearch:true,webFetch:true,bash:false,fileRead:false,fileWrite:false};

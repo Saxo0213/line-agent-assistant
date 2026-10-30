@@ -318,7 +318,7 @@ export class LineService {
     const binding = this.requireBinding(accountId, workerInstanceId);
     this.qrAttempts.set(accountId, { workerInstanceId, loginAttemptId, kind: 'qr' });
     this.qrPendingSecrets.delete(accountId);
-    this.secrets?.beginLogin(accountId, workerInstanceId, loginAttemptId);
+    this.secrets?.beginLogin(accountId, workerInstanceId, loginAttemptId, binding.lineTransport);
     await this.worker.send({ type: 'loginQr', accountId, workerInstanceId, controlEpoch: binding.controlEpoch, loginAttemptId });
   }
 
@@ -351,6 +351,12 @@ export class LineService {
     return result;
   }
 
+  /** Kind of the pending login attempt ('qr' or 'token'), or null when this worker has no such attempt. */
+  loginAttemptKind(accountId: string, workerInstanceId: string, loginAttemptId: string): 'qr' | 'token' | null {
+    const attempt = this.qrAttempts.get(accountId);
+    return attempt?.workerInstanceId === workerInstanceId && attempt.loginAttemptId === loginAttemptId ? attempt.kind : null;
+  }
+
   async cancelLoginAttempt(accountId: string, workerInstanceId: string, loginAttemptId: string): Promise<void> {
     const attempt = this.qrAttempts.get(accountId);
     if (attempt?.workerInstanceId === workerInstanceId && attempt.loginAttemptId === loginAttemptId) {
@@ -362,11 +368,12 @@ export class LineService {
 
   async requestTokenLogin(accountId: string, workerInstanceId: string, loginAttemptId: string): Promise<void> {
     const binding = this.requireBinding(accountId, workerInstanceId);
-    const secrets = await this.secrets?.load(accountId);
+    // Secrets are stored for each transport. A worker gets only the stored session of its own transport.
+    const secrets = await this.secrets?.load(accountId, binding.lineTransport);
     if (!secrets?.token) throw new Error('No saved LINE token for this account');
     this.qrAttempts.set(accountId, { workerInstanceId, loginAttemptId, kind: 'token' });
     this.qrPendingSecrets.delete(accountId);
-    this.secrets?.beginLogin(accountId, workerInstanceId, loginAttemptId);
+    this.secrets?.beginLogin(accountId, workerInstanceId, loginAttemptId, binding.lineTransport);
     await this.worker.send({ type: 'setSecretState', accountId, workerInstanceId,
       controlEpoch: binding.controlEpoch, loginAttemptId, secrets });
     await this.worker.send({ type: 'loginToken', accountId, workerInstanceId,

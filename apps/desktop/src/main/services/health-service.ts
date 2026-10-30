@@ -1,8 +1,8 @@
-import { CONVERSATION_PICTURE_SQL, CONVERSATION_TITLE_SQL, PEER_CONTACT_JOIN, resolveAgentLineage, sharedAdminChatSql } from '@line-agent/database';
+import { CONVERSATION_PICTURE_SQL, CONVERSATION_TITLE_SQL, PEER_CONTACT_JOIN, ownMessageSql, resolveAgentLineage, sharedAdminChatSql } from '@line-agent/database';
 import type { Pool } from 'pg';
 import { boundedSticonRawSql, previewWithSticons, projectSticons } from '../sticon-projection.js';
 import { normalizeDefaultProvider } from './default-provider.js';
-import { isLocalOnlyConversation, type AgentJobSearchQuery, type AgentJobSummary, type AgentProvider, type AppSnapshot, type ComponentHealth, type ControlSnapshot,
+import { isAttachmentBlockReason, isLocalOnlyConversation, type AgentJobSearchQuery, type AgentJobSummary, type AgentProvider, type AppSnapshot, type ComponentHealth, type ControlSnapshot,
   type ConversationKey, type ConversationSummary, type GeneratedPreview, type MessageContent, type ProviderStatus } from '@line-agent/contracts';
 
 interface LineWorkerProbe {
@@ -22,12 +22,14 @@ type ConversationRow = {
   latest_sticon_raw?: unknown;
   latest_source_deleted?: boolean | null;
   latest_content?: MessageContent | null;
+  latest_is_own?: boolean | null;
   latest_kind?: string | null;
   latest_notification_projection?: unknown;
   latest_occurred_at: Date | null;
   latest_attachment_name: string | null;
   latest_attachment_kind: 'image' | 'video' | 'audio' | 'file' | null;
   latest_attachment_status: 'queued' | 'downloading' | 'ready' | 'failed' | 'expired' | null;
+  latest_attachment_error?: string | null;
   picture_path?: string | null;
 };
 
@@ -123,7 +125,9 @@ export function mapConversation(row: ConversationRow): ConversationSummary {
   const previewed = row.latest_text ? previewWithSticons(row.latest_text, projected) : { text: '', ranges: [] };
   const postPlaceholder = row.latest_content?.type === 'event' && row.latest_content.nativeContentType === 16
     && row.latest_text?.trim().toUpperCase() === 'POSTNOTIFICATION';
-  const text = postPlaceholder ? '' : previewed.text;
+  // A call event shows the localized call text, never the raw LINE prose such as 'Call History : 138000 millisecs'.
+  const callEvent = row.latest_content?.type === 'event' && row.latest_content.nativeContentType === 6 ? row.latest_content : null;
+  const text = postPlaceholder || callEvent ? '' : previewed.text;
   const attachment = row.latest_attachment_kind
     ? row.latest_attachment_kind === 'image' ? attachmentKindLabel.image : row.latest_attachment_name?.trim() || attachmentKindLabel[row.latest_attachment_kind]
     : null;
@@ -134,14 +138,18 @@ export function mapConversation(row: ConversationRow): ConversationSummary {
   else if (row.latest_content?.type === 'unsent') display = { kind: 'unsent' };
   else if (!text && row.latest_attachment_kind) display = { kind: row.latest_attachment_kind,
     ...(row.latest_attachment_kind !== 'image' && row.latest_attachment_name?.trim() ? { name: row.latest_attachment_name.trim() } : {}),
-    ...(row.latest_attachment_kind !== 'image' && row.latest_attachment_status ? { status: row.latest_attachment_status } : {}) };
+    ...(row.latest_attachment_kind !== 'image' && row.latest_attachment_status ? { status: row.latest_attachment_status } : {}),
+    ...(row.latest_attachment_kind !== 'image' && row.latest_attachment_status === 'queued' && isAttachmentBlockReason(row.latest_attachment_error)
+      ? { blockReason: row.latest_attachment_error } : {}) };
   else if (!text && preview) {
     const content = row.latest_content;
     if (content?.type === 'event') {
       // Native event prose is historical content; only generated fallback labels are localized.
       if (!((content.nativeContentType === 18 || content.nativeContentType === 0) && content.text?.trim())) {
         const kinds: Record<number, GeneratedPreview['kind']> = { 6: 'call', 9: 'gift', 16: 'post', 18: 'chat_event' };
-        display = { kind: content.nativeContentType === 16 && postNotificationType === 'note' ? 'post_note'
+        const callFacts = callEvent?.call ? { media: callEvent.call.media, result: callEvent.call.result, durationMs: callEvent.call.durationMs,
+          direction: row.latest_is_own === true ? 'outbound' as const : 'inbound' as const } : null;
+        display = callFacts ? { kind: 'call', call: callFacts } : { kind: content.nativeContentType === 16 && postNotificationType === 'note' ? 'post_note'
           : content.nativeContentType === 16 && postNotificationType === 'album' ? 'post_album' : kinds[content.nativeContentType ?? -1] ?? 'system' };
       }
     } else {
@@ -163,22 +171,22 @@ latestMessageAt: row.latest_occurred_at?.toISOString() ?? null,
 const conversationSelect = `SELECT c.account_id, c.chat_type, c.chat_id, COALESCE(${CONVERSATION_TITLE_SQL}, '') AS title,
     CASE WHEN c.chat_type IN ('group','room') THEN COALESCE(room_policy.state = 'ENABLED', false) ELSE c.agent_enabled END AS agent_enabled,
     COALESCE(c.default_provider, CASE WHEN (SELECT value #>> '{}' FROM app_settings WHERE key = 'default_provider') = 'codex' THEN 'codex' ELSE 'claude' END) AS default_provider,
-    c.unread_count, ${CONVERSATION_PICTURE_SQL} picture_path, latest.message_id latest_message_id, latest.sticon_raw latest_sticon_raw, latest.text_content latest_text, latest.content latest_content, latest.source_deleted latest_source_deleted, latest.kind latest_kind, latest.notification_projection latest_notification_projection, latest.occurred_at latest_occurred_at,
+    c.unread_count, ${CONVERSATION_PICTURE_SQL} picture_path, latest.message_id latest_message_id, latest.sticon_raw latest_sticon_raw, latest.text_content latest_text, latest.content latest_content, latest.is_own latest_is_own, latest.source_deleted latest_source_deleted, latest.kind latest_kind, latest.notification_projection latest_notification_projection, latest.occurred_at latest_occurred_at,
     latest.attachment_name latest_attachment_name, latest.attachment_kind latest_attachment_kind,
-    latest.attachment_status latest_attachment_status
+    latest.attachment_status latest_attachment_status, latest.attachment_error latest_attachment_error
   FROM conversations c
   JOIN line_accounts la ON la.account_id=c.account_id
   ${PEER_CONTACT_JOIN}
   LEFT JOIN room_agent_policies room_policy ON room_policy.account_id=c.account_id
     AND room_policy.chat_type=c.chat_type AND room_policy.chat_id=c.chat_id
   LEFT JOIN LATERAL (
-    SELECT m.message_id, m.text_content, ${boundedSticonRawSql('m.raw')} AS sticon_raw, m.content, (m.raw ? 'sourceDeleted') AS source_deleted, m.kind,
+    SELECT m.message_id, m.text_content, ${boundedSticonRawSql('m.raw')} AS sticon_raw, m.content, ${ownMessageSql('m', 'la')} AS is_own, (m.raw ? 'sourceDeleted') AS source_deleted, m.kind,
       ${boundedNotificationProjectionSql} AS notification_projection,
       m.occurred_at, attachment.name attachment_name,
-      attachment.kind attachment_kind, attachment.status attachment_status
+      attachment.kind attachment_kind, attachment.status attachment_status, attachment.error attachment_error
     FROM messages m
     LEFT JOIN LATERAL (
-      SELECT NULLIF(BTRIM(a.name), '') AS name, a.kind, a.status FROM attachments a
+      SELECT NULLIF(BTRIM(a.name), '') AS name, a.kind, a.status, a.error FROM attachments a
       WHERE a.account_id=m.account_id AND a.chat_type=m.chat_type AND a.chat_id=m.chat_id AND a.message_id=m.message_id
       ORDER BY a.created_at, a.attachment_id LIMIT 1
     ) attachment ON true

@@ -139,273 +139,11 @@ async function startDirect(ctx: ReturnType<typeof setup>, overrides: Partial<Inb
 
 describe('FriendEnrollmentService', () => {
 
-  describe('primary administrator friendship failure audit', () => {
-    const primaryAdmin = { chatId: 'admin-chat', userId: targetMid };
-    const notFriend = async (command: Extract<LineWorkerCommand, { type: 'checkFriendRelation' }>) => event('friendRelationResult', {
-      requestId: command.requestId, targetMid: command.targetMid, status: 'not_friend', error: null });
-
-    it('records one specific failure when the relation check returns unknown', async () => {
-      const ctx = setup();
-      ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
-      ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => event('friendRelationResult', {
-        requestId: command.requestId, targetMid: command.targetMid, status: 'unknown', error: 'RELATION_RESPONSE_TIMEOUT' }));
-      await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toMatchObject({ diagnosticLogged: true });
-      expect(ctx.auditFailures).toHaveLength(1);
-      expect(ctx.auditFailures[0]).toMatchObject({ errorCode: 'RELATION_RESPONSE_TIMEOUT', action: 'friend_relation_initial',
-        diagnostic: { operation: 'checkFriendRelation', stage: 'response', category: 'timeout', reason: 'timeout' } });
-      expect(JSON.stringify(ctx.auditFailures)).not.toContain(targetMid);
-    });
-
-    it('records allowlisted friend-detail failure facts in the single failure audit row', async () => {
-      const ctx = setup();
-      ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
-      ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => event('friendRelationResult', {
-        requestId: command.requestId, targetMid: command.targetMid, status: 'unknown', error: 'RELATION_DETAIL_RPC_FAILED',
-        failureKind: 'linejs_internal', upstreamStatus: 503, upstreamCode: 102001,
-      }));
-      await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toMatchObject({ diagnosticLogged: true });
-      expect(ctx.auditFailures).toHaveLength(1);
-      expect(ctx.auditFailures[0]).toMatchObject({ errorCode: 'RELATION_DETAIL_RPC_FAILED', action: 'friend_relation_initial',
-        diagnostic: { operation: 'checkFriendRelation', stage: 'response', category: 'transport_failed', recovery: 'retry',
-          failureKind: 'linejs_internal', upstreamStatus: 503, upstreamCode: 102001 } });
-      expect(JSON.stringify(ctx.auditFailures)).not.toMatch(/private|secret|https|u[a-f]{32}/i);
-    });
-
-    it('records PRIMARY_ADMIN_NOT_FRIEND once and never adds the friend', async () => {
-      const ctx = setup();
-      ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
-      ctx.workers.checkFriendRelation.mockImplementationOnce(notFriend);
-      await ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal);
-      expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-      expect(ctx.auditFailures).toHaveLength(1);
-      expect(ctx.auditFailures[0]).toMatchObject({ errorCode: 'PRIMARY_ADMIN_NOT_FRIEND', action: 'friend_relation_initial',
-        diagnostic: { operation: 'checkFriendRelation', stage: 'response', category: 'denied' } });
-      expect(JSON.stringify(ctx.auditFailures)).not.toContain(targetMid);
-    });
-
-    it('records one failure when the worker gateway throws, and none when the binding is no longer current', async () => {
-      const ctx = setup();
-      ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
-      ctx.workers.checkFriendRelation.mockRejectedValueOnce(Object.assign(new Error('secret detail'), { name: 'TimeoutError' }));
-      await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toMatchObject({ diagnosticLogged: true });
-      expect(ctx.auditFailures).toHaveLength(1);
-      expect(ctx.auditFailures[0]).toMatchObject({ errorCode: 'FRIEND_RELATION_CHECK_FAILED',
-        diagnostic: { operation: 'checkFriendRelation', stage: 'execute', category: 'timeout' } });
-      expect(JSON.stringify(ctx.auditFailures)).not.toContain('secret detail');
-
-      const teardown = setup();
-      teardown.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
-      teardown.workers.checkFriendRelation.mockImplementationOnce(async () => { teardown.setBinding(null as never); throw new Error('worker exit'); });
-      await expect(teardown.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toThrow('worker exit');
-      expect(teardown.auditFailures).toHaveLength(0);
-    });
-
-    it('records one failure when LINE writes are not allowed, keeps returning done, and records none on teardown', async () => {
-      const ctx = setup();
-      ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
-      ctx.accounts.resolveCapabilities.mockResolvedValue({ canWriteLine: false } as never);
-      await ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal);
-      expect(ctx.workers.checkFriendRelation).not.toHaveBeenCalled();
-      expect(ctx.auditFailures).toHaveLength(1);
-      expect(ctx.auditFailures[0]).toMatchObject({ errorCode: 'SIDE_EFFECT_DENIED', action: 'friend_relation_initial',
-        diagnostic: { operation: 'checkFriendRelation', stage: 'admission', category: 'denied' } });
-
-      const teardown = setup();
-      teardown.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
-      teardown.accounts.resolveCapabilities.mockImplementation(async () => { teardown.setBinding(null as never); return { canWriteLine: false } as never; });
-      await teardown.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal);
-      expect(teardown.auditFailures).toHaveLength(0);
-    });
-
-    it('records a success result once the confirmation is persisted', async () => {
-      const ctx = setup();
-      ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
-      await ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal);
-      expect(ctx.auditOutcomes).toEqual([expect.objectContaining({ action: 'friend_relation_initial', phase: 'succeeded', resultCode: 'relation_friend' })]);
-      expect(ctx.auditFailures).toHaveLength(0);
-    });
-
-    it('does not report or cache success when confirmation persistence returns false, then retries on the next trigger', async () => {
-      const ctx = setup();
-      ctx.admins.getPrimaryAdministrator.mockResolvedValue(primaryAdmin);
-      ctx.admins.confirmPrimaryAdministratorFriendship.mockResolvedValueOnce(false);
-      const signal = new AbortController().signal;
-
-      await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, signal))
-        .rejects.toMatchObject({ diagnosticLogged: true });
-      expect(ctx.auditOutcomes).toHaveLength(0);
-      expect(ctx.auditFailures).toHaveLength(1);
-      expect(ctx.auditFailures[0]).toMatchObject({ errorCode: 'DATABASE_WRITE_FAILED', action: 'friend_relation_initial',
-        diagnostic: { operation: 'checkFriendRelation', stage: 'persist', category: 'persistence_failed', recovery: 'retry' } });
-      expect(JSON.stringify(ctx.auditFailures)).not.toContain(targetMid);
-
-      await ctx.service.ensurePrimaryAdministratorFriendship(binding, signal);
-      expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(2);
-      expect(ctx.admins.confirmPrimaryAdministratorFriendship).toHaveBeenCalledTimes(2);
-      expect(ctx.friendConfirmation).toEqual({ userId: targetMid, version: 1 });
-      expect(ctx.auditOutcomes).toEqual([expect.objectContaining({ action: 'friend_relation_initial', phase: 'succeeded', resultCode: 'relation_friend' })]);
-    });
-  });
-  it('checks and adds the primary administrator once per active binding', async () => {
+  it('does not expose a startup friendship check and never calls the worker relation check', async () => {
     const ctx = setup();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => event('friendRelationResult', {
-      requestId: command.requestId, targetMid: command.targetMid, status: 'not_friend', error: null,
-    }));
-    const controller = new AbortController();
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
-    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-    expect(ctx.auditFailures).toHaveLength(1);
-    expect(ctx.auditFailures[0]).toMatchObject({ errorCode: 'PRIMARY_ADMIN_NOT_FRIEND', action: 'friend_relation_initial' });
-  });
-
-  it('drops a rejected primary check so the next trigger runs a fresh relation check, and keeps a successful one cached', async () => {
-    const ctx = setup();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    ctx.workers.checkFriendRelation.mockRejectedValueOnce(new Error('worker exit'));
-    const controller = new AbortController();
-    await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal)).rejects.toMatchObject({ diagnosticLogged: true });
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(2);
-    expect(ctx.friendConfirmation).toEqual({ userId: targetMid, version: 1 });
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(2);
-  });
-
-  it('persists a friend result and skips relation and add RPCs on a later ready start', async () => {
-    const ctx = setup();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    const controller = new AbortController();
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    expect(ctx.friendConfirmation).toEqual({ userId: targetMid, version: 1 });
-    const restartedService = new FriendEnrollmentService({ admins: ctx.admins, whitelist: ctx.whitelist, accounts: ctx.accounts,
-      workers: ctx.workers, digestKey: randomBytes(32) });
-    await restartedService.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
-    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-  });
-
-  it('checks again when the administrator version changes', async () => {
-    const ctx = setup();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    const controller = new AbortController();
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    ctx.setAdminVersion(2);
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(2);
-    expect(ctx.admins.confirmPrimaryAdministratorFriendship).toHaveBeenCalledTimes(2);
-  });
-
-  it('retries the once-per-binding check after a primary administrator binds to an already-ready worker', async () => {
-    const ctx = setup();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue(null);
-    const controller = new AbortController();
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
+    expect('ensurePrimaryAdministratorFriendship' in ctx.service).toBe(false);
     expect(ctx.workers.checkFriendRelation).not.toHaveBeenCalled();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => event('friendRelationResult', {
-      requestId: command.requestId, targetMid: command.targetMid, status: 'not_friend', error: null,
-    }));
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
-    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-  });
-
-  it('admits one relation check when a successful pairing overlaps a no-admin check', async () => {
-    const ctx = setup();
-    const heldAdmin = deferred<{ chatId: string; userId: string } | null>();
-    ctx.admins.getPrimaryAdministrator.mockImplementationOnce(() => heldAdmin.promise);
-    const noAdminJob = ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal);
-    await vi.waitFor(() => expect(ctx.admins.getPrimaryAdministrator).toHaveBeenCalledTimes(1));
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    const pairedJob = ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal, 'admin-bound');
-    heldAdmin.resolve(null);
-    await Promise.all([noAdminJob, pairedJob]);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledWith(expect.objectContaining({ accountId: binding.accountId, targetMid }));
-  });
-
-  it('does not add a relation result released after its lifecycle signal is aborted', async () => {
-    const ctx = setup();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    const heldRelation = deferred<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>();
-    ctx.workers.checkFriendRelation.mockImplementationOnce(() => heldRelation.promise);
-    const controller = new AbortController();
-    const job = ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    await vi.waitFor(() => expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1));
-    controller.abort();
-    const command = ctx.workers.checkFriendRelation.mock.calls[0]![0];
-    heldRelation.resolve(event('friendRelationResult', { requestId: command.requestId, targetMid, status: 'not_friend', error: null }));
-    await job;
-    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
     expect(ctx.admins.confirmPrimaryAdministratorFriendship).not.toHaveBeenCalled();
-  });
-
-  it.each(['removed', 'replaced'] as const)('does not add the captured primary after it is %s during relation lookup', async (change) => {
-    const ctx = setup();
-    let version = 1;
-    ctx.admins.getPrimaryAdministratorVersion.mockImplementation(async () => version);
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    const held = deferred<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>();
-    ctx.workers.checkFriendRelation.mockImplementationOnce(() => held.promise);
-    const job = ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal);
-    await vi.waitFor(() => expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1));
-    if (change === 'removed') ctx.admins.getPrimaryAdministrator.mockResolvedValue(null);
-    else ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'replacement-chat', userId: ownMid });
-    version++;
-    const command = ctx.workers.checkFriendRelation.mock.calls[0]![0];
-    held.resolve(event('friendRelationResult', { requestId: command.requestId, targetMid, status: 'not_friend', error: null }));
-    await job;
-    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-    expect(ctx.admins.confirmPrimaryAdministratorFriendship).not.toHaveBeenCalled();
-  });
-
-  it('fails closed for unknown relation and retries a fresh check on the next trigger for the same binding', async () => {
-    const ctx = setup();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    ctx.workers.checkFriendRelation.mockImplementation(async (command) => event('friendRelationResult', {
-      requestId: command.requestId, targetMid: command.targetMid, status: 'unknown', error: 'RELATION_OUTCOME_UNKNOWN',
-    }));
-    await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toThrow();
-    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-    expect(ctx.admins.confirmPrimaryAdministratorFriendship).not.toHaveBeenCalled();
-    await expect(ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal)).rejects.toThrow();
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(2);
-  });
-
-
-  it('does not continue a cancelled binding job and allows a restarted binding to check once', async () => {
-    const ctx = setup();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    const held = deferred<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>();
-    ctx.workers.checkFriendRelation.mockImplementationOnce(() => held.promise);
-    const controller = new AbortController();
-    const oldJob = ctx.service.ensurePrimaryAdministratorFriendship(binding, controller.signal);
-    await vi.waitFor(() => expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1));
-    controller.abort();
-    ctx.setBinding(null);
-    held.resolve(event('friendRelationResult', { requestId: ctx.workers.checkFriendRelation.mock.calls[0]![0].requestId,
-      targetMid, status: 'not_friend', error: null }));
-    await expect(oldJob).resolves.toBeUndefined();
-    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-    const restarted = { ...binding, workerInstanceId: 'worker-restarted', transportGeneration: 5 };
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => ({ ...event('friendRelationResult', {
-      requestId: command.requestId, targetMid: command.targetMid, status: 'friend', error: null,
-    }), workerInstanceId: restarted.workerInstanceId, transportGeneration: restarted.transportGeneration }));
-    ctx.setBinding(restarted);
-    await ctx.service.ensurePrimaryAdministratorFriendship(restarted, new AbortController().signal);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(2);
-  });
-
-  it('does not add an already-friend primary administrator', async () => {
-    const ctx = setup();
-    ctx.admins.getPrimaryAdministrator.mockResolvedValue({ chatId: 'admin-chat', userId: targetMid });
-    await ctx.service.ensurePrimaryAdministratorFriendship(binding, new AbortController().signal);
-    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
   });
 
   it('does not check primary administrator friendship from inbound message handling or classification', async () => {
@@ -418,10 +156,10 @@ describe('FriendEnrollmentService', () => {
 
   it('localizes enrollment prompts while keeping the existing primary-admin and account authorization boundary', async () => {
     const expected: Array<[Locale, string, string]> = [
-      ['en', 'Share the LINE contact', 'LINE friend verified and added to the allowlist.'],
-      ['zh-TW', '請分享要新增的 LINE 聯絡人。', 'LINE 好友已確認，並已加入白名單。'],
-      ['ja', '追加するLINE連絡先', 'LINEの友だちを確認し、許可リストに追加しました。'],
-      ['ko', '추가할 LINE 연락처', 'LINE 친구를 확인하고 허용 목록에 추가했습니다.'],
+      ['en', 'Share the LINE contact', 'Added to the allowlist.'],
+      ['zh-TW', '請分享要新增的 LINE 聯絡人。', '已加入白名單。'],
+      ['ja', '追加するLINE連絡先', '許可リストに追加しました。'],
+      ['ko', '추가할 LINE 연락처', '허용 목록에 추가했습니다.'],
     ];
     for (const [locale, firstPrompt, successReply] of expected) {
       const ctx = setup(locale);
@@ -452,58 +190,32 @@ describe('FriendEnrollmentService', () => {
     await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true });
     expect(ctx.whitelist.activateForEnrollment).toHaveBeenCalledTimes(1);
     expect(ctx.audit.request).toHaveBeenCalledWith('friend_enrollment', expect.objectContaining({ initiator: 'user', reasonCode: 'operator_action' }));
-    expect(ctx.auditEvents).toHaveLength(4);
+    expect(ctx.auditEvents).toHaveLength(3);
     expect(ctx.auditEvents.length + 1).toBeLessThanOrEqual(7);
     expect(new Set(ctx.auditEvents.map((entry) => entry.correlationId)).size).toBe(1);
     expect(ctx.auditEvents.at(-1)).toMatchObject({ phase: 'succeeded', resultCode: 'authorization_active_reply_failed', errorCode: 'ENROLLMENT_REPLY_FAILED' });
     expect(JSON.stringify(ctx.auditEvents)).not.toContain(targetMid);
   });
 
-  it('records a relation timeout as a fixed failure without adding or granting', async () => {
+  it('grants the ACCOUNT scope for a direct flow even when the worker would answer not_friend, and never checks the relation', async () => {
     const ctx = setup();
     await startDirect(ctx);
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => event('friendRelationResult', {
-      requestId: command.requestId, targetMid, status: 'unknown', error: 'RELATION_RESPONSE_TIMEOUT',
-    }));
-    await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true });
-    expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-    expect(ctx.whitelist.activateForEnrollment).not.toHaveBeenCalled();
-    expect(ctx.auditEvents).toHaveLength(2);
-    expect(ctx.auditEvents[0]).toMatchObject({ action: 'friend_relation_initial', errorCode: 'RELATION_RESPONSE_TIMEOUT' });
-    expect(ctx.auditEvents[1]).toMatchObject({ phase: 'failed', errorCode: 'RELATION_RESPONSE_TIMEOUT' });
-  });
-
-  it('asks the person to add the Agent first when not a friend, without adding or rechecking', async () => {
-    const ctx = setup();
-    await startDirect(ctx);
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => event('friendRelationResult', {
+    ctx.workers.checkFriendRelation.mockImplementation(async (command) => event('friendRelationResult', {
       requestId: command.requestId, targetMid, status: 'not_friend', error: null,
     }));
-    ctx.workers.send.mockClear();
     await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true });
+    expect(ctx.workers.checkFriendRelation).not.toHaveBeenCalled();
     expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
-    const reply = ctx.workers.send.mock.calls.at(-1)?.[0];
-    expect(reply?.type === 'sendText' ? reply.text : '').toMatch(/adduser|新增使用者/);
-    expect(ctx.auditEvents.find((item) => item.action === 'friend_relation_initial')).toMatchObject({ resultCode: 'relation_not_friend' });
-    expect(ctx.auditEvents.at(-1)).toMatchObject({ phase: 'failed', resultCode: 'authorization_denied' });
-    expect(ctx.whitelist.activateForEnrollment).not.toHaveBeenCalled();
+    expect(ctx.whitelist.activateForEnrollment).toHaveBeenCalledTimes(1);
+    expect(ctx.whitelist.activateForEnrollment).toHaveBeenCalledWith(expect.objectContaining({ targetMid, scope: { kind: 'ACCOUNT' } }));
+    expect(ctx.auditEvents.some((item) => item.action === 'friend_relation_initial')).toBe(false);
+    expect(ctx.auditEvents.at(-1)).toMatchObject({ phase: 'succeeded' });
   });
 
-
-  it('terminates with a sanitized precheck failure when a post-relation binding guard throws', async () => {
+  it('terminates with a sanitized precheck failure when the authorization lookup throws', async () => {
     const ctx = setup();
     await startDirect(ctx);
-    let relationAccepted = false;
-    let postRelationControlReads = 0;
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => {
-      relationAccepted = true;
-      return event('friendRelationResult', { requestId: command.requestId, targetMid, status: 'friend', error: null });
-    });
-    ctx.accounts.getControlState.mockImplementation(async () => {
-      if (relationAccepted && ++postRelationControlReads === 2) throw new Error('private guard database detail');
-      return { ...ctx.controlCurrent };
-    });
+    ctx.whitelist.getActiveAuthorization.mockRejectedValueOnce(new Error('private guard database detail'));
     await expect(ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true })).resolves.toBe(true);
     expect(ctx.whitelist.activateForEnrollment).not.toHaveBeenCalled();
     const terminal = ctx.auditEvents.filter((item) => item.action === 'friend_enrollment' && item.phase === 'failed');
@@ -649,25 +361,16 @@ describe('FriendEnrollmentService', () => {
     expect(ctx.whitelist.activate).not.toHaveBeenCalled();
   });
 
-  it('does not continue an in-flight friend verification into addFriend or grant mutation after source switch', async () => {
+  it('does not continue an in-flight enrollment into grant mutation after source switch', async () => {
     const ctx = setup();
-    let entered!: () => void;
-    let resolveRelation!: (value: Extract<LineWorkerEvent, { type: 'friendRelationResult' }>) => void;
-    const relationStarted = new Promise<void>((resolve) => { entered = resolve; });
-    const relationResult = new Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>((resolve) => { resolveRelation = resolve; });
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => {
-      entered();
-      return relationResult;
+    ctx.whitelist.getActiveAuthorization.mockImplementationOnce(async () => {
+      ctx.accounts.resolveCapabilities.mockResolvedValue({ accountId: 'account-a', productRole: 'PRIMARY_ADMIN',
+        connectionMode: 'EXTERNAL_MONITOR', roleRevision: 0, modeRevision: 1, selectedSourceId: 'external-source',
+        selectedSourceGeneration: 1, selectedSourceType: 'EXTERNAL_MONITOR', sourceState: 'ACTIVE', canWriteLine: false });
+      return null;
     });
     await startDirect(ctx);
-    const consume = ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true }, ownMid);
-    await relationStarted;
-    ctx.accounts.resolveCapabilities.mockResolvedValue({ accountId: 'account-a', productRole: 'PRIMARY_ADMIN',
-      connectionMode: 'EXTERNAL_MONITOR', roleRevision: 0, modeRevision: 1, selectedSourceId: 'external-source',
-      selectedSourceGeneration: 1, selectedSourceType: 'EXTERNAL_MONITOR', sourceState: 'ACTIVE', canWriteLine: false });
-    const request = ctx.workers.checkFriendRelation.mock.calls[0]![0];
-    resolveRelation(event('friendRelationResult', { requestId: request.requestId, targetMid, status: 'not_friend', error: null }));
-    await consume;
+    await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true }, ownMid);
 
     expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
     expect(ctx.whitelist.activate).not.toHaveBeenCalled();
@@ -694,7 +397,7 @@ describe('FriendEnrollmentService', () => {
 
     expect(ctx.workers.send).toHaveBeenCalledTimes(sendCountBeforeSourceSwitch);
     expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
+    expect(ctx.workers.checkFriendRelation).not.toHaveBeenCalled();
   });
 
   it('accepts the exact Chinese command but not a command with extra text', async () => {
@@ -935,7 +638,7 @@ describe('FriendEnrollmentService', () => {
     expect(ctx.workers.send.mock.calls[0]?.[0]).toMatchObject({ type: 'sendText', text: expect.stringContaining('請分享') });
   });
 
-  it('sends a challenge to the exact primary admin and activates an already verified friend', async () => {
+  it('sends a challenge to the exact primary admin and activates the target without a friend check', async () => {
     const ctx = setup();
     await startDirect(ctx);
     expect(ctx.workers.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -946,7 +649,7 @@ describe('FriendEnrollmentService', () => {
     }));
     expect((ctx.workers.send.mock.calls[1]?.[0] as Extract<LineWorkerCommand, { type: 'sendText' }>).text).toContain('LW-ABCDEFG2');
     expect(await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true })).toBe(true);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
+    expect(ctx.workers.checkFriendRelation).not.toHaveBeenCalled();
     expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
     expect(ctx.whitelist.activate).toHaveBeenCalledWith('account-a', targetMid, 'admin-mid');
     const reply = ctx.workers.send.mock.calls.at(-1)?.[0];
@@ -1006,11 +709,9 @@ describe('FriendEnrollmentService', () => {
     expect(ctx.whitelist.activate).not.toHaveBeenCalled();
   });
 
-  it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('localizes enrollment verification failure in %s without authorization', async (locale) => {
+  it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('localizes direct enrollment grant failure in %s without authorization', async (locale) => {
     const ctx = setup(locale);
-    ctx.workers.checkFriendRelation.mockImplementation(async (command) => event('friendRelationResult', {
-      requestId: command.requestId, targetMid: command.targetMid, status: 'failed', error: 'LINE unavailable',
-    }));
+    ctx.whitelist.activateForEnrollment.mockRejectedValueOnce(new Error('grant failed'));
     await startDirect(ctx);
     await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true });
     const reply = ctx.workers.send.mock.calls.at(-1)?.[0];
@@ -1042,26 +743,10 @@ describe('FriendEnrollmentService', () => {
     expect(result?.type === 'sendText' ? result.text : '').toContain('\u5df2\u5728\u767d\u540d\u55ae\u4e2d');
   });
 
-  it('does not activate when recheck fails, the worker changes, or the admin changes', async () => {
+  it('does not activate when the worker changes or the admin changes during the flow', async () => {
     const ctx = setup();
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => event('friendRelationResult', {
-      requestId: command.requestId, targetMid: command.targetMid, status: 'not_friend', error: null,
-    })).mockImplementationOnce(async (command) => event('friendRelationResult', {
-      requestId: command.requestId, targetMid: command.targetMid, status: 'not_friend', error: null,
-    }));
     await startDirect(ctx);
-    await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true });
-    expect(ctx.whitelist.activate).not.toHaveBeenCalled();
-
-    ctx.workers.checkFriendRelation.mockReset().mockImplementation(async (command) => event('friendRelationResult', {
-      requestId: command.requestId, targetMid: command.targetMid, status: 'friend', error: null,
-    }));
-    await startDirect(ctx);
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => {
-      const result = event('friendRelationResult', { requestId: command.requestId, targetMid: command.targetMid, status: 'friend', error: null });
-      ctx.setBinding(null);
-      return result;
-    });
+    ctx.whitelist.getActiveAuthorization.mockImplementationOnce(async () => { ctx.setBinding(null); return null; });
     await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true });
     expect(ctx.whitelist.activate).not.toHaveBeenCalled();
 
@@ -1072,24 +757,16 @@ describe('FriendEnrollmentService', () => {
     expect(ctx.whitelist.activate).not.toHaveBeenCalled();
   });
 
-  it('rechecks administrator and active account control after the LINE friend result', async () => {
+  it('rechecks administrator and active account control before the grant', async () => {
     const ctx = setup();
     await startDirect(ctx);
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => {
-      const result = event('friendRelationResult', { requestId: command.requestId, targetMid: command.targetMid, status: 'friend', error: null });
-      ctx.adminCurrent.value = false;
-      return result;
-    });
+    ctx.whitelist.getActiveAuthorization.mockImplementationOnce(async () => { ctx.adminCurrent.value = false; return null; });
     await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true });
     expect(ctx.whitelist.activate).not.toHaveBeenCalled();
 
     ctx.adminCurrent.value = true;
     await startDirect(ctx);
-    ctx.workers.checkFriendRelation.mockImplementationOnce(async (command) => {
-      const result = event('friendRelationResult', { requestId: command.requestId, targetMid: command.targetMid, status: 'friend', error: null });
-      ctx.controlCurrent.activeAccountId = 'account-b';
-      return result;
-    });
+    ctx.whitelist.getActiveAuthorization.mockImplementationOnce(async () => { ctx.controlCurrent.activeAccountId = 'account-b'; return null; });
     await ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true });
     expect(ctx.whitelist.activate).not.toHaveBeenCalled();
   });
@@ -1102,7 +779,7 @@ describe('FriendEnrollmentService', () => {
       ctx.service.handle(codeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true }),
     ]);
     expect(results).toEqual([true, true]);
-    expect(ctx.workers.checkFriendRelation).toHaveBeenCalledTimes(1);
+    expect(ctx.workers.checkFriendRelation).not.toHaveBeenCalled();
     expect(ctx.whitelist.activate).toHaveBeenCalledTimes(1);
   });
 

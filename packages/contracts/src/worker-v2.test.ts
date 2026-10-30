@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { resolveLineTransport } from './account.js';
 import { LineWorkerCommandSchema, LineWorkerEventSchema } from './worker-v2.js';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
@@ -299,4 +300,57 @@ describe('sendText mentions', () => {
   it('does not allow mentions on manualSendText', () => {
     expect(LineWorkerCommandSchema.safeParse({ ...command, type: 'manualSendText', mentions: [{ start: 3, end: 7, userId: user }] }).success).toBe(false);
   });
+});
+
+describe('lineTransport on init', () => {
+  const init = { type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor };
+  const CHROME_APPLICATION = 'CHROMEOS\t3.7.2\tChrome_OS\t';
+  it('defaults to DESKTOPWIN and keeps every existing init valid', () => {
+    const parsed = LineWorkerCommandSchema.parse(init);
+    expect(parsed).not.toHaveProperty('lineTransport');
+    expect(resolveLineTransport(parsed.type === 'init' ? parsed.lineTransport : undefined)).toBe('DESKTOPWIN');
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'DESKTOPWIN' }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, purpose: 'DOWNLOAD_ONLY',
+      application: 'DESKTOPWIN\t9.9.9\tWINDOWS\t10.0' }).success).toBe(true);
+  });
+  it('accepts CHROMEOS with no application, or exactly the pinned one, plus an absolute ltsm directory', () => {
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS' }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', application: CHROME_APPLICATION }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', chromeLtsmDir: 'C:/Users/u/AppData/Roaming/app/line-chrome/ltsm' }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', chromeLtsmDir: '/home/u/app/line-chrome/ltsm' }).success).toBe(true);
+  });
+  it('accepts an absolute trafficLogDir for both transports and rejects a relative one', () => {
+    expect(LineWorkerCommandSchema.safeParse({ ...init, trafficLogDir: 'C:/u/logs/line-traffic' }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', trafficLogDir: '/u/logs/line-traffic' }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, trafficLogDir: 'logs/line-traffic' }).success).toBe(false);
+  });
+  it('rejects bad combinations', () => {
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROME' }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', application: 'DESKTOPWIN\t9.9.9\tWINDOWS\t10.0' }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', application: 'CHROMEOS\t3.7.1\tChrome_OS\t' }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', purpose: 'DOWNLOAD_ONLY' }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', chromeLtsmDir: 'relative/ltsm' }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, chromeLtsmDir: '/abs/ltsm' }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'DESKTOPWIN', chromeLtsmDir: '/abs/ltsm' }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', unknownField: 1 }).success).toBe(false);
+  });
+  it('carries the transport on the shared binding and types the unavailable-store error', () => {
+    expect(LineWorkerCommandSchema.safeParse({ type: 'poll', ...binding, lineTransport: 'CHROMEOS' }).success).toBe(true);
+    expect(LineWorkerEventSchema.safeParse({ type: 'error', ...binding, code: 'CHROME_LTSM_UNAVAILABLE', message: 'x', retryable: false,
+      chromeLtsmStatus: 'wrong-version' }).success).toBe(true);
+    expect(LineWorkerEventSchema.safeParse({ type: 'error', ...binding, code: 'CHROME_LTSM_UNAVAILABLE', message: 'x', retryable: false,
+      chromeLtsmStatus: 'available' }).success).toBe(false);
+  });
+});
+
+it('accepts an optional bounded detail on a LOGIN_FAILED failure only', () => {
+  const failure = { type: 'loginFailure', ...binding, loginAttemptId: 'attempt-1', code: 'LOGIN_FAILED',
+    message: 'LINE login failed. Try again.' };
+  expect(LineWorkerEventSchema.safeParse(failure).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ ...failure, detail: 'qr_login_v2:ChromeApiError:qrCodeLoginV2:8' }).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ ...failure, detail: 'has space' }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...failure, detail: 'a/b' }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...failure, detail: '' }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...failure, detail: 'a'.repeat(161) }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...failure, code: 'LOGIN_TIMEOUT', message: 'LINE login timed out. Try again.', detail: 'x' }).success).toBe(false);
 });

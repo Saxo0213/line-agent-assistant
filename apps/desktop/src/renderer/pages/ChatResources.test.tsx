@@ -186,6 +186,21 @@ describe('ChatResources', () => {
     await waitFor(() => expect(client.listChatNotes).toHaveBeenCalledTimes(2));
   });
 
+  it('shows the UNSUPPORTED text when the login method has no Notes or Albums', async () => {
+    const unsupported = () => { const error = new Error('detail'); error.name = 'UNSUPPORTED'; return error; };
+    const client = api();
+    client.listChatNotes = vi.fn(async () => { throw unsupported(); });
+    renderControls(client, 'connected', 'ACTIVE_CONTROL', 'zh-TW');
+    fireEvent.click(screen.getByRole('button', { name: '開啟聊天室記事' }));
+    expect((await screen.findByRole('alert')).textContent).toContain('此登入方式不支援');
+    cleanup();
+    const albums = api();
+    albums.listChatAlbums = vi.fn(async () => { throw unsupported(); });
+    renderControls(albums);
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    expect((await screen.findByRole('alert')).textContent).toContain('This login method does not support this action.');
+  });
+
   it('requests one bounded cursor page at a time and refreshes from the first page', async () => {
     const client = api();
     client.listChatNotes = vi.fn()

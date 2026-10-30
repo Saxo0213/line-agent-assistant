@@ -26,6 +26,9 @@ files:
   - assets/icons/*
   - package.json
   - '!**/*.map'
+  - '!**/ltsm.wasm'
+  - '!**/ltsmSandbox.js'
+  - '!**/line-chrome/ltsm{,/**/*}'
   - '!node_modules{,/**/*}'
 electronFuses:
   runAsNode: true
@@ -36,6 +39,11 @@ electronFuses:
 extraResources:
   - from: .packaging/resources
     to: .
+    filter:
+      - '**/*'
+      - '!**/ltsm.wasm'
+      - '!**/ltsmSandbox.js'
+      - '!**/line-chrome/ltsm{,/**/*}'
 win:
   executableName: LINE Agent Assistant
   icon: apps/desktop/assets/icons/line-agent-spring.ico

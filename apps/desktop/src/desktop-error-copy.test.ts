@@ -18,14 +18,21 @@ describe('desktop error copy', () => {
     expect(desktopErrorText('invalid-locale' as never, 'AUTH_REQUIRED')).toBe(DESKTOP_ERROR_COPY.AUTH_REQUIRED.en);
   });
 
+  it('explains the chat-resource failure code UNSUPPORTED in every language', () => {
+    expect(desktopErrorText('zh-TW', 'UNSUPPORTED')).toBe('此登入方式不支援');
+    expect(desktopErrorText('en', 'UNSUPPORTED')).toBe(DESKTOP_ERROR_COPY.UNSUPPORTED.en);
+    expect(desktopErrorText('ja', 'UNSUPPORTED')).toBe(JAPANESE_DESKTOP_ERROR_COPY.UNSUPPORTED);
+    expect(desktopErrorText('ko', 'UNSUPPORTED')).toBe(KOREAN_DESKTOP_ERROR_COPY.UNSUPPORTED);
+  });
+
   it('returns undefined for unknown codes', () => {
     expect(desktopErrorText('ja', 'UNKNOWN_ERROR_CODE')).toBeUndefined();
     expect(desktopErrorText('ko', undefined)).toBeUndefined();
   });
 
-  it('keeps Japanese and Korean translations in exact parity with all 44 error codes', () => {
+  it('keeps Japanese and Korean translations in exact parity with all 45 error codes', () => {
     const codes = Object.keys(DESKTOP_ERROR_COPY).sort();
-    expect(codes).toHaveLength(44);
+    expect(codes).toHaveLength(45);
     expect(Object.keys(JAPANESE_DESKTOP_ERROR_COPY).sort()).toEqual(codes);
     expect(Object.keys(KOREAN_DESKTOP_ERROR_COPY).sort()).toEqual(codes);
   });

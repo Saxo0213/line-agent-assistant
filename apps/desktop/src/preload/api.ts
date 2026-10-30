@@ -23,6 +23,7 @@ import {
   type AgentToolAllowlistEntry,
   type SetAgentExecutionPolicyInput,
   AppSnapshotSchema,
+  type LineTransportKind,
   ChatResourceNoteSchema,
   ChatResourceAlbumSchema,
   ChatResourcePhotoSchema,
@@ -122,9 +123,13 @@ export type DesktopApi = {
   openExternalUrl(url: string): Promise<IpcResult>;
   downloadAttachment(key: WritableConversationKey, attachmentId: string): Promise<IpcResult>;
   resolveFileTypeIcon(extension: string): Promise<string | null>;
-  lineAddAccountQr(): Promise<IpcResult>;
-  lineLoginQr(accountId: string): Promise<IpcResult>;
-  lineReplaceAgentQr(accountId: string): Promise<IpcResult>;
+  lineAddAccountQr(lineTransport?: LineTransportKind): Promise<IpcResult>;
+  lineLoginQr(accountId: string, lineTransport?: LineTransportKind): Promise<IpcResult>;
+  lineReplaceAgentQr(accountId: string, lineTransport?: LineTransportKind): Promise<IpcResult>;
+  getChromeLoginAvailability(): Promise<IpcResult>;
+  detectChromeLtsm(): Promise<IpcResult>;
+  chooseChromeLtsmFolder(): Promise<IpcResult>;
+  openChromeExtensionStore(): Promise<IpcResult>;
   lineLogout(accountId: string): Promise<IpcResult>;
   refreshLineAvatar(accountId: string): Promise<IpcResult>;
   lineSetAutoLogin(accountId: string, enabled: boolean): Promise<IpcResult>;
@@ -312,9 +317,13 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     openExternalUrl: (url) => request({ type: 'openExternalUrl', url }),
     async downloadAttachment(key, attachmentId) { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)) throw new Error('Invalid attachment ID'); return await request({ type: 'downloadAttachment', ...key, attachmentId }); },
     async resolveFileTypeIcon(extension) { if (!/^[a-z0-9]{1,12}$/.test(extension)) return null; const result = await request({ type: 'resolveFileTypeIcon', extension }); return result.type === 'resolveFileTypeIcon' ? result.dataUrl : null; },
-    lineAddAccountQr: () => request({ type: 'lineAddAccountQr' }),
-    lineLoginQr: (accountId) => request({ type: 'lineLoginQr', accountId }),
-    lineReplaceAgentQr: (accountId) => request({ type: 'lineReplaceAgentQr', accountId }),
+    lineAddAccountQr: (lineTransport) => request({ type: 'lineAddAccountQr', ...(lineTransport ? { lineTransport } : {}) }),
+    lineLoginQr: (accountId, lineTransport) => request({ type: 'lineLoginQr', accountId, ...(lineTransport ? { lineTransport } : {}) }),
+    lineReplaceAgentQr: (accountId, lineTransport) => request({ type: 'lineReplaceAgentQr', accountId, ...(lineTransport ? { lineTransport } : {}) }),
+    getChromeLoginAvailability: () => request({ type: 'getChromeLoginAvailability' }),
+    detectChromeLtsm: () => request({ type: 'detectChromeLtsm' }),
+    chooseChromeLtsmFolder: () => request({ type: 'chooseChromeLtsmFolder' }),
+    openChromeExtensionStore: () => request({ type: 'openChromeExtensionStore' }),
     lineLogout: (accountId) => request({ type: 'lineLogout', accountId }),
     refreshLineAvatar: (accountId) => request({ type: 'refreshLineAvatar', accountId }),
     lineSetAutoLogin: (accountId, enabled) => request({ type: 'lineSetAutoLogin', accountId, enabled }),

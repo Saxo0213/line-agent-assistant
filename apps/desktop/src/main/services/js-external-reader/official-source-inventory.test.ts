@@ -1,6 +1,6 @@
 import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -481,6 +481,167 @@ describe('synthetic official-source inventory', () => {
       expect(result.exitCode).toBe(0);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
+
+  it('answers wait_change with changed=false at timeout and changed=true soon after an SHM header change', async () => {
+    const root = await createSource(false);
+    const lineProcess = spawn(path.join(root, 'LINE', 'bin', 'current', 'LINE.exe'), [], {
+      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    const writer = spawn(path.join(fixtureRoot, 'SqliteFixtureHarness.exe'), ['--snapshot-hold', root], {
+      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    try {
+      await waitReady(lineProcess, 'line_process_timeout');
+      await waitReady(writer, 'fixture_writer_timeout');
+      const shmPath = path.join(root, 'LINE', 'Data', 'db', 'messages.edb-shm');
+      await withIdleDirectMonitor(root, lineProcess.pid!, async (session) => {
+        // Nothing changes: the answer comes at the timeout, not before.
+        let started = Date.now();
+        session.send('wait_change', { timeoutMs: 1000 });
+        const idle = await session.next('change');
+        expect(idle.frame).toMatchObject({ changed: false });
+        expect(idle.at - started).toBeGreaterThanOrEqual(900);
+        expect(idle.at - started).toBeLessThan(5_000);
+        // One byte inside the two WAL-index header copies (bytes 0..95) changes, as a commit does.
+        session.send('wait_change', { timeoutMs: 20_000 });
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        const handle = await open(shmPath, 'r+');
+        try {
+          const byte = Buffer.alloc(1);
+          await handle.read(byte, 0, 1, 40);
+          byte[0] = byte[0]! ^ 0xff;
+          started = Date.now();
+          await handle.write(byte, 0, 1, 40);
+        } finally { await handle.close(); }
+        const changed = await session.next('change');
+        expect(changed.frame).toMatchObject({ changed: true });
+        expect(changed.at - started).toBeLessThan(1_500);
+        // The closed input pipe ends a wait at once (the 60000 ms timeout is never reached).
+        session.send('wait_change', { timeoutMs: 60_000 });
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const exited = new Promise<number | null>((resolve) => session.child.once('exit', (code) => resolve(code)));
+        const closeStarted = Date.now();
+        session.child.stdin!.end();
+        await exited;
+        expect(Date.now() - closeStarted).toBeLessThan(5_000);
+      });
+    } finally {
+      writer.stdout?.resume(); writer.stderr?.resume(); lineProcess.stdout?.resume(); lineProcess.stderr?.resume();
+      writer.stdin.end('CLOSE\n'); lineProcess.stdin.end();
+      await waitClosed(writer); await waitClosed(lineProcess);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('answers wait_change with changed=true at once for a commit made between two pages of one round', async () => {
+    const root = await createSource(false);
+    const lineProcess = spawn(path.join(root, 'LINE', 'bin', 'current', 'LINE.exe'), [], {
+      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    const writer = spawn(path.join(fixtureRoot, 'SqliteFixtureHarness.exe'), ['--snapshot-hold', root], {
+      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    try {
+      await waitReady(lineProcess, 'line_process_timeout');
+      await waitReady(writer, 'fixture_writer_timeout');
+      let commitsBetweenPages = 0;
+      await withIdleDirectMonitor(root, lineProcess.pid!, async (session) => {
+        // The round had more than one page and the commit came after page 1 (the round bound) and before the last page.
+        expect(commitsBetweenPages).toBe(1);
+        const started = Date.now();
+        session.send('wait_change', { timeoutMs: 20_000 });
+        const answer = await session.next('change');
+        expect(answer.frame).toMatchObject({ changed: true });
+        expect(answer.at - started).toBeLessThan(1_500);
+      }, async (pageNumber) => {
+        if (pageNumber !== 1) return;
+        await sendFixtureCommand(writer, 'GROW_NEWER', 'NEWER_COMMITTED');
+        commitsBetweenPages++;
+      });
+    } finally {
+      writer.stdout?.resume(); writer.stderr?.resume(); lineProcess.stdout?.resume(); lineProcess.stderr?.resume();
+      writer.stdin.end('CLOSE\n'); lineProcess.stdin.end();
+      await waitClosed(writer); await waitClosed(lineProcess);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('ignores changes outside the writer fields: -shm bytes 96..135 and the -wal last-write time', async () => {
+    const root = await createSource(false);
+    const lineProcess = spawn(path.join(root, 'LINE', 'bin', 'current', 'LINE.exe'), [], {
+      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    const writer = spawn(path.join(fixtureRoot, 'SqliteFixtureHarness.exe'), ['--snapshot-hold', root], {
+      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    try {
+      await waitReady(lineProcess, 'line_process_timeout');
+      await waitReady(writer, 'fixture_writer_timeout');
+      const database = path.join(root, 'LINE', 'Data', 'db', 'messages.edb');
+      await withIdleDirectMonitor(root, lineProcess.pid!, async (session) => {
+        session.send('wait_change', { timeoutMs: 1000 });
+        // Reader marks and nBackfill (bytes 96..135) change, then the -wal last-write time.
+        const handle = await open(database + '-shm', 'r+');
+        try {
+          for (const offset of [100, 120, 135]) {
+            const byte = Buffer.alloc(1);
+            await handle.read(byte, 0, 1, offset);
+            byte[0] = byte[0]! ^ 0xff;
+            await handle.write(byte, 0, 1, offset);
+          }
+        } finally { await handle.close(); }
+        const walTime = new Date(Date.now() + 60_000);
+        await utimes(database + '-wal', walTime, walTime);
+        const answer = await session.next('change');
+        expect(answer.frame).toMatchObject({ changed: false });
+      });
+    } finally {
+      writer.stdout?.resume(); writer.stderr?.resume(); lineProcess.stdout?.resume(); lineProcess.stderr?.resume();
+      writer.stdin.end('CLOSE\n'); lineProcess.stdin.end();
+      await waitClosed(writer); await waitClosed(lineProcess);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('opens the change-check files with full sharing: another handle can rename and delete -shm meanwhile', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'linejs-change-signal-'));
+    try {
+      await writeFile(path.join(directory, 'messages.edb'), Buffer.alloc(4096, 1));
+      await writeFile(path.join(directory, 'messages.edb-wal'), Buffer.alloc(8192, 2));
+      await writeFile(path.join(directory, 'messages.edb-shm'), Buffer.alloc(32768, 3));
+      const child = spawn(inventoryBridgeHarness, ['x', directory, 'change_signal_loop', '3000'], {
+        stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: false,
+        env: { SystemRoot: process.env.SystemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP },
+      });
+      let output = '';
+      let diagnostics = '';
+      child.stderr.on('data', (chunk: Buffer) => { diagnostics += chunk.toString(); });
+      const ready = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`change_signal_loop_not_ready:${diagnostics}`)), 20_000);
+        child.stdout.on('data', (chunk: Buffer) => {
+          output += chunk.toString();
+          if (output.includes('READY')) { clearTimeout(timer); resolve(); }
+        });
+      });
+      const closed = new Promise<number | null>((resolve) => child.once('close', (code) => resolve(code)));
+      await ready;
+      const shm = path.join(directory, 'messages.edb-shm');
+      // Each round renames and deletes the file that the loop opens many times per second.
+      for (let round = 0; round < 15; round++) {
+        await rename(shm, `${shm}.moved`);
+        await writeFile(shm, Buffer.alloc(32768, round));
+        await rm(`${shm}.moved`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await rm(shm);
+      expect(await closed, diagnostics).toBe(0);
+      const match = /LOOP\|(\d+)\|(\d+)\|(\d+)/.exec(output);
+      expect(match, output).not.toBeNull();
+      expect(Number(match![1])).toBeGreaterThan(100);
+      // The deleted file reads as unreadable (a change), never as a sharing violation (Win32 error 32).
+      expect(Number(match![3])).toBe(0);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  }, 60_000);
 
   it('detects SHM mutation during direct reads of a concurrently committed WAL', async () => {
     const root = await createSource(false);
@@ -1310,6 +1471,74 @@ async function runProtocolInventory(root: string, scenario: string, expectedMid 
     else await waitFor(expectedAfterClose);
     await closed;
     return { frames, exitCode: child.exitCode, diagnostics };
+  } finally {
+    child.stdin.end();
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+  }
+}
+
+// Starts a direct-monitor bridge session on the fixture source, reads every page until the first one with
+// hasMore=false, and hands control to body at that point (the bridge is idle, as after an acknowledged page).
+async function withIdleDirectMonitor(root: string, realProcessId: number, body: (session: {
+  child: ChildProcess;
+  send(type: string, fields?: Record<string, unknown>): void;
+  next(type: string): Promise<{ frame: Record<string, unknown>; at: number }>;
+}) => Promise<void>, afterAck?: (pageNumber: number) => Promise<void>): Promise<void> {
+  const requestId = 'cdef0123456789abcdef012345678901';
+  const requestDirectory = path.join(root, `probe-${requestId}`);
+  await mkdir(requestDirectory);
+  const child = spawn(inventoryBridgeHarness, [requestId, root, 'pinnedaccept', String(realProcessId)], {
+    stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false, cwd: requestDirectory,
+    env: { SystemRoot: process.env.SystemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP },
+  });
+  const decoder = new FrameDecoder(FRAME_LIMITS.pageBytes);
+  const frames: Array<{ frame: Record<string, unknown>; at: number }> = [];
+  let consumed = 0;
+  let diagnostics = '';
+  child.stderr.on('data', (chunk: Buffer) => { diagnostics += chunk.toString(); });
+  child.stdout.on('data', (chunk: Buffer) => { for (const frame of decoder.push(chunk)) frames.push({ frame, at: Date.now() }); });
+  let sequence = 1;
+  const send = (type: string, fields: Record<string, unknown> = {}) => {
+    child.stdin.write(encodeFrame({ version: 1, requestId, sequence: sequence++, type, ...fields }, FRAME_LIMITS.controlBytes));
+  };
+  const next = async (type: string) => {
+    const until = Date.now() + 20_000;
+    for (;;) {
+      while (consumed < frames.length) {
+        const item = frames[consumed++]!;
+        if (item.frame.type === type) return item;
+        if (item.frame.type === 'result') throw new Error(`bridge_result:${JSON.stringify(item.frame)}:${diagnostics}`);
+      }
+      if (Date.now() >= until) throw new Error(`bridge_frame_timeout:${type}:${JSON.stringify(frames.map((item) => item.frame.type))}:${diagnostics}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+  const deadlineUnixMs = Date.now() + 120_000;
+  try {
+    await writeFile(path.join(requestDirectory, 'owner.json'), JSON.stringify({ phase: 'owned', requestId, childPid: child.pid, deadlineUnixMs }));
+    await next('hello');
+    send('init', { operation: 'direct_monitor', expectedMid: 'fixture-own-mid', deadlineUnixMs });
+    send('owner_ready');
+    const inventory = (await next('inventory')).frame;
+    send('verify', { workDeadlineUnixMs: deadlineUnixMs + 60_000, sourceIdentityDigest: inventory.sourceIdentityDigest, cursor: null });
+    await next('ready');
+    for (let number = 1; ; number++) {
+      send('directory_next', { pageNumber: number });
+      const directory = (await next('directory_page')).frame;
+      send('directory_ack', { pageNumber: number, batchDigest: directory.batchDigest });
+      if (directory.hasMore !== true) break;
+    }
+    let cursor: unknown = null;
+    for (let number = 1; ; number++) {
+      send('poll', { pageNumber: number, cursor });
+      const page = (await next('page')).frame;
+      send('ack', { pageNumber: number, batchDigest: page.batchDigest, lastCursor: page.lastCursor });
+      cursor = page.lastCursor;
+      if (page.hasMore !== true) break;
+      // The bridge reads the next page only after the next poll, so a hook here runs between two pages of one round.
+      if (afterAck) await afterAck(number);
+    }
+    await body({ child, send, next });
   } finally {
     child.stdin.end();
     if (child.exitCode === null && child.signalCode === null) child.kill();

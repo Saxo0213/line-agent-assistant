@@ -180,6 +180,8 @@ internal static class ExternalReaderBridge {
         lock (sync) { if (!disposed) { failure = error; eof = true; Cancellation.Cancel(); try { available.Set(); } catch { } } }
       } finally { Array.Clear(buffer, 0, buffer.Length); }
     }
+    // True when bytes that no frame read has consumed yet are queued (a frame that arrived during wait_change).
+    internal bool HasBufferedInput { get { lock (sync) { return chunks.Count > 0 || (current != null && currentOffset < current.Length); } } }
     internal void CancelForTimeout() {
       lock (sync) { if (disposed) return; timedOut = true; eof = true; Cancellation.Cancel(); available.Set(); }
     }
@@ -509,6 +511,7 @@ internal static class ExternalReaderBridge {
     StreamMonitorDirectory(input, output, expectedMid, sourceIdentity, initial, key, cancellation);
     int pageNumber = 0;
     bool roundBoundCaptured = false, roundBoundEmpty = false;
+    string roundSignalBefore = null;
     string roundUpperTime = null, roundUpperId = null;
     bool roundTailCaptured = false;
     string[] roundTailRows = null;
@@ -535,6 +538,9 @@ internal static class ExternalReaderBridge {
       string afterTime = cursor == null ? null : Convert.ToString(cursor["createdTime"]);
       string afterId = cursor == null ? null : Convert.ToString(cursor["id"]);
       bool forwardMore = false; string lastTime = null, lastId = null; string[] candidateRows = new string[0];
+      // The change signal is read before and after SQLite is open (see OfficialChangeSignal.Settle).
+      // The "before" value is read once per round, before the round upper bound is captured on the first page.
+      if (!roundBoundCaptured) roundSignalBefore = OfficialChangeSignal.Read(initial.DatabasePath);
       using (SafeFileHandle shmGuard = HoldExistingShm(current))
       using (Sqlite3Mc reader = Sqlite3Mc.OpenReadOnly(current.DatabasePath, key)) {
         cancellation.ThrowIfCancellationRequested();
@@ -564,6 +570,9 @@ internal static class ExternalReaderBridge {
         }
       }
       cancellation.ThrowIfCancellationRequested();
+      // SQLite is closed here: the baseline for wait_change is the signal from before the round upper bound was captured.
+      // A commit after that capture is not in this round, so it must still wake the next wait_change.
+      OfficialChangeSignal.Baseline = OfficialChangeSignal.Settle(roundSignalBefore, OfficialChangeSignal.Read(initial.DatabasePath));
       object[] candidateParsed = new object[candidateRows.Length];
       for (int i = 0; i < candidateRows.Length; i++) {
         candidateParsed[i] = Json.DeserializeObject(candidateRows[i]);
@@ -608,7 +617,7 @@ internal static class ExternalReaderBridge {
       if (tailCount > 0) roundTailOffset += tailCount;
       pageNumber++;
       if (!pageMore) {
-        roundBoundCaptured = false; roundBoundEmpty = false; roundUpperTime = null; roundUpperId = null;
+        roundBoundCaptured = false; roundBoundEmpty = false; roundUpperTime = null; roundUpperId = null; roundSignalBefore = null;
         roundTailCaptured = false; roundTailRows = null; roundTailParsed = null; roundTailOffset = 0; roundUnreadCounts = null;
       }
     }
@@ -678,6 +687,25 @@ internal static class ExternalReaderBridge {
           { "candidates", new object[0] }, { "errorCode", "auth_probe_disabled" }
         };
         EmitAuxiliary(output, "auth_candidates", response);
+        continue;
+      }
+      if (String.Equals(type, "wake", StringComparison.Ordinal)) {
+        if (bodyBytes > MaxControlFrameBytes) throw new InvalidDataException("protocol_invalid");
+        RequireFrame(request, "wake", new string[0]);
+        continue;
+      }
+      if (String.Equals(type, "wait_change", StringComparison.Ordinal)) {
+        if (bodyBytes > MaxControlFrameBytes) throw new InvalidDataException("protocol_invalid");
+        RequireFrame(request, "wait_change", new string[] { "timeoutMs" });
+        if (!(request["timeoutMs"] is int) || (int)request["timeoutMs"] < 1000 || (int)request["timeoutMs"] > 60000)
+          throw new InvalidDataException("protocol_invalid");
+        // The idle watchdog is re-armed on every check, so a wait never trips it.
+        // Queued input (a wake frame sent by the controller for auxiliary work) ends the wait with changed=false.
+        bool changed = OfficialChangeSignal.WaitForChange(pinned.DatabasePath, (int)request["timeoutMs"], cancellation,
+          delegate() { ArmWatchdog(FirstImportIdleWatchdogMs); },
+          delegate() { return protocolInput != null && protocolInput.HasBufferedInput; });
+        ArmWatchdog(FirstImportIdleWatchdogMs);
+        Emit(output, "change", new Dictionary<string, object> { { "changed", changed } });
         continue;
       }
       if (String.Equals(type, "attachment_metadata", StringComparison.Ordinal)) {
@@ -1857,5 +1885,113 @@ internal static class ExternalReaderBridge {
   static void WriteFrame(Stream output, byte[] body) {
     byte[] header = new byte[] { (byte)(body.Length >> 24), (byte)(body.Length >> 16), (byte)(body.Length >> 8), (byte)body.Length };
     output.Write(header, 0, header.Length); output.Write(body, 0, body.Length); output.Flush();
+  }
+}
+
+// Cheap change signal for the official database (WAL mode). Each write transaction updates both copies of the
+// WAL-index header at bytes 0..95 of "<db>-shm" (iChange, mxFrame, salts, checksums), and it grows "<db>-wal".
+// The signal is those 96 bytes plus the -wal size. Bytes 96..135 (reader marks, nBackfill), the last-write times
+// and the database size are not part of it: LINE's own reads, checkpoints and the late NTFS last-write update
+// must not start an extra full read. SQLite takes byte-range locks on -shm from offset 120 (WIN_SHM_BASE) and 128
+// (DMS); a read of those bytes fails with ERROR_LOCK_VIOLATION while LINE writes, so nothing from offset 96 up is read.
+// The check opens every file with a NEW handle that shares read, write and delete, and closes it at once,
+// so it never blocks LINE and never pins a file.
+internal static class OfficialChangeSignal {
+  internal const int ShmHeaderBytes = 96;
+  const uint GenericRead = 0x80000000, FileReadAttributes = 0x80, ShareAll = 7, OpenExisting = 3,
+    OpenReparsePoint = 0x00200000, DirectoryAttribute = 0x10, ReparsePointAttribute = 0x400;
+  [StructLayout(LayoutKind.Sequential)] struct Information {
+    internal uint Attributes;
+    internal uint CreationLow, CreationHigh, AccessLow, AccessHigh, WriteLow, WriteHigh, VolumeSerial;
+    internal uint SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateFileW(
+    string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetFileInformationByHandle(
+    SafeFileHandle handle, out Information information);
+
+  // The signal at the end of the last full read. Null means "unknown": every check reports a change.
+  internal static string Baseline;
+  // The last Win32 error of a failed open (test evidence: a sharing violation is error 32).
+  internal static int LastOpenError;
+
+  // Returns null when -shm is missing or unreadable. A missing -wal reads as size "missing".
+  internal static string Read(string databasePath) {
+    byte[] header = ReadShmHeader(databasePath + "-shm");
+    if (header == null) return null;
+    StringBuilder value = new StringBuilder(ShmHeaderBytes * 2 + 24);
+    for (int i = 0; i < header.Length; i++) value.Append(header[i].ToString("x2"));
+    return value.Append('|').Append(WalSize(databasePath + "-wal")).ToString();
+  }
+
+  // The baseline for the next wait. A write that commits while a full read runs makes the two values differ.
+  // The older value is then the baseline, so the next check reports a change and the next poll reads again.
+  internal static string Settle(string before, string after) {
+    if (before == null || after == null) return null;
+    return before;
+  }
+
+  // True when the database changed since Baseline, false when timeoutMs passed without a change
+  // or when interrupted() reports queued input.
+  // An unreadable -shm after a readable baseline is a change. While -shm stays unreadable and the
+  // baseline is unknown, the answer is "changed" only after the old 5000 ms poll period, so a
+  // missing sidecar never makes a tight read loop.
+  internal static bool WaitForChange(string databasePath, int timeoutMs, CancellationToken cancellation, Action rearm, Func<bool> interrupted) {
+    Stopwatch clock = Stopwatch.StartNew();
+    int unreadableAfterMs = Math.Min(timeoutMs, 5000);
+    for (;;) {
+      cancellation.ThrowIfCancellationRequested();
+      if (rearm != null) rearm();
+      if (interrupted != null && interrupted()) return false;
+      string current = Read(databasePath);
+      string baseline = Baseline;
+      if (current == null) {
+        if (baseline != null) return true;
+        if (clock.ElapsedMilliseconds >= unreadableAfterMs) return true;
+      } else if (baseline == null || !String.Equals(current, baseline, StringComparison.Ordinal)) return true;
+      long remaining = timeoutMs - clock.ElapsedMilliseconds;
+      if (remaining <= 0) return false;
+      cancellation.WaitHandle.WaitOne((int)Math.Min(200L, remaining));
+    }
+  }
+
+  static byte[] ReadShmHeader(string path) {
+    SafeFileHandle handle = Open(path, GenericRead);
+    if (handle == null) return null;
+    try {
+      Information info;
+      if (!GetFileInformationByHandle(handle, out info) || (info.Attributes & (DirectoryAttribute | ReparsePointAttribute)) != 0) return null;
+      byte[] header = new byte[ShmHeaderBytes];
+      using (FileStream stream = new FileStream(handle, FileAccess.Read, 1, false)) {
+        int offset = 0;
+        while (offset < header.Length) {
+          int read = stream.Read(header, offset, header.Length - offset);
+          if (read <= 0) return null;
+          offset += read;
+        }
+      }
+      return header;
+    } catch (Exception) { return null; }
+    finally { handle.Dispose(); }
+  }
+
+  static string WalSize(string path) {
+    SafeFileHandle handle = Open(path, FileReadAttributes);
+    if (handle == null) return "missing";
+    try {
+      Information info;
+      if (!GetFileInformationByHandle(handle, out info)) return "unreadable";
+      return (((long)info.SizeHigh << 32) | info.SizeLow).ToString(System.Globalization.CultureInfo.InvariantCulture);
+    } finally { handle.Dispose(); }
+  }
+
+  static SafeFileHandle Open(string path, uint access) {
+    SafeFileHandle handle = CreateFileW(path, access, ShareAll, IntPtr.Zero, OpenExisting, OpenReparsePoint, IntPtr.Zero);
+    if (handle == null || handle.IsInvalid) {
+      LastOpenError = Marshal.GetLastWin32Error();
+      if (handle != null) handle.Dispose();
+      return null;
+    }
+    return handle;
   }
 }

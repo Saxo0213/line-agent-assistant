@@ -32,6 +32,24 @@ export const EXTRA_DESKTOP_COPY = {
   queued: 'Queued', running: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled', interrupted: 'Interrupted',
   active: 'Active', revoked: 'Revoked', expired: 'Expired',
   searchAgentTab: 'Agent', searchPrimaryAdminTab: 'Primary Admin', formerAgentAccount: 'Former Agent account',
+  loginMethodLabel: 'Login method',
+  loginMethodLogoutFirst: 'Log out to change the login method',
+  loginMethodWindows: 'Windows version',
+  loginMethodChrome: 'Chrome version',
+  chromeLoginUnavailableTitle: 'Chrome login is not available',
+  chromeLoginReadyTitle: 'Chrome login is ready',
+  chromeLoginNeedsExtension: 'Chrome login needs the official LINE Chrome extension 3.7.2 on this computer.',
+  chromeLoginRequiredVersion: 'Required version: ',
+  chromeLoginDetectedVersions: 'Detected versions: ',
+  chromeLoginNoneDetected: 'none',
+  chromeLoginCorrupt: 'The extension files are damaged. Detect again or choose the folder again.',
+  chromeLoginInstallExtension: 'Install LINE Chrome extension',
+  chromeLoginRedetect: 'Detect again',
+  chromeLoginChooseFolder: 'Choose folder manually',
+  chromeLoginNotFound: 'The extension was not found on this computer.',
+  chromeLoginReady: 'The LINE Chrome extension is ready. You can continue to log in.',
+  chromeLoginContinue: 'Continue login',
+  chromeLoginDetecting: 'Detecting…',
 } as const;
 
 export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
@@ -41,6 +59,24 @@ export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, str
   operationFailed: '無法完成此操作，請重試。', automaticReplyConflict: '設定已在其他位置變更。最新版本已載入，您的編輯內容已保留。請再次儲存以套用。',
   queued: '已排入佇列', running: '執行中', completed: '已完成', failed: '失敗', cancelled: '已取消', interrupted: '已中斷', active: '啟用', revoked: '已撤銷', expired: '已過期',
   searchAgentTab: 'Agent', searchPrimaryAdminTab: '主要管理者', formerAgentAccount: '舊 Agent 帳號',
+  loginMethodLabel: '登入方式',
+  loginMethodLogoutFirst: '登出後才能切換登入方式',
+  loginMethodWindows: 'Windows 版',
+  loginMethodChrome: 'Chrome 版',
+  chromeLoginUnavailableTitle: '無法使用 Chrome 版登入',
+  chromeLoginReadyTitle: '可以使用 Chrome 版登入',
+  chromeLoginNeedsExtension: 'Chrome 版登入需要在這台電腦上安裝官方 LINE Chrome 擴充功能 3.7.2。',
+  chromeLoginRequiredVersion: '所需版本：',
+  chromeLoginDetectedVersions: '偵測到的版本：',
+  chromeLoginNoneDetected: '無',
+  chromeLoginCorrupt: '擴充功能檔案已損壞，請重新偵測或重新選擇資料夾。',
+  chromeLoginInstallExtension: '安裝 LINE Chrome 擴充功能',
+  chromeLoginRedetect: '重新偵測',
+  chromeLoginChooseFolder: '手動選擇資料夾',
+  chromeLoginNotFound: '這台電腦上找不到擴充功能。',
+  chromeLoginReady: '已找到 LINE Chrome 擴充功能，可以繼續登入。',
+  chromeLoginContinue: '繼續登入',
+  chromeLoginDetecting: '偵測中…',
 };
 export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
   optionalLocalAnalysis: '任意のローカル分析', agents: 'Agent', operations: '操作', agentQueue: 'Agent キュー', bytes: 'バイト', lineAccounts: 'LINE アカウント',
@@ -49,6 +85,24 @@ export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string
   operationFailed: '操作を完了できませんでした。もう一度お試しください。', automaticReplyConflict: '設定が別の場所で変更されました。最新の内容を読み込み、編集内容は保持されています。適用するには再度保存してください。',
   queued: '待機中', running: '実行中', completed: '完了', failed: '失敗', cancelled: 'キャンセル済み', interrupted: '中断', active: '有効', revoked: '取り消し済み', expired: '期限切れ',
   searchAgentTab: 'Agent', searchPrimaryAdminTab: '主管理者', formerAgentAccount: '以前の Agent アカウント',
+  loginMethodLabel: 'ログイン方法',
+  loginMethodLogoutFirst: 'ログイン方法はログアウト後に変更できます',
+  loginMethodWindows: 'Windows 版',
+  loginMethodChrome: 'Chrome 版',
+  chromeLoginUnavailableTitle: 'Chrome 版ログインは利用できません',
+  chromeLoginReadyTitle: 'Chrome 版でログインできます',
+  chromeLoginNeedsExtension: 'Chrome 版ログインには、このコンピューターに公式の LINE Chrome 拡張機能 3.7.2 が必要です。',
+  chromeLoginRequiredVersion: '必要なバージョン：',
+  chromeLoginDetectedVersions: '検出されたバージョン：',
+  chromeLoginNoneDetected: 'なし',
+  chromeLoginCorrupt: '拡張機能のファイルが破損しています。再検出するか、フォルダーを選び直してください。',
+  chromeLoginInstallExtension: 'LINE Chrome 拡張機能をインストール',
+  chromeLoginRedetect: '再検出',
+  chromeLoginChooseFolder: 'フォルダーを手動で選択',
+  chromeLoginNotFound: 'このコンピューターで拡張機能が見つかりません。',
+  chromeLoginReady: 'LINE Chrome 拡張機能を確認しました。ログインを続行できます。',
+  chromeLoginContinue: 'ログインを続行',
+  chromeLoginDetecting: '検出中…',
 };
 export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
   optionalLocalAnalysis: '선택적 로컬 분석', agents: 'Agent', operations: '작업', agentQueue: 'Agent 대기열', bytes: '바이트', lineAccounts: 'LINE 계정',
@@ -57,6 +111,24 @@ export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> 
   operationFailed: '작업을 완료할 수 없습니다. 다시 시도하세요.', automaticReplyConflict: '다른 곳에서 설정이 변경되었습니다. 최신 버전이 준비되었으며 편집 내용은 보존되었습니다. 적용하려면 다시 저장하세요.',
   queued: '대기 중', running: '실행 중', completed: '완료', failed: '실패', cancelled: '취소됨', interrupted: '중단됨', active: '활성', revoked: '취소됨', expired: '만료됨',
   searchAgentTab: 'Agent', searchPrimaryAdminTab: '주 관리자', formerAgentAccount: '이전 Agent 계정',
+  loginMethodLabel: '로그인 방식',
+  loginMethodLogoutFirst: '로그아웃한 후 로그인 방식을 변경할 수 있습니다',
+  loginMethodWindows: 'Windows 버전',
+  loginMethodChrome: 'Chrome 버전',
+  chromeLoginUnavailableTitle: 'Chrome 버전 로그인을 사용할 수 없습니다',
+  chromeLoginReadyTitle: 'Chrome 버전으로 로그인할 수 있습니다',
+  chromeLoginNeedsExtension: 'Chrome 버전 로그인에는 이 컴퓨터에 공식 LINE Chrome 확장 프로그램 3.7.2가 필요합니다.',
+  chromeLoginRequiredVersion: '필요한 버전: ',
+  chromeLoginDetectedVersions: '감지된 버전: ',
+  chromeLoginNoneDetected: '없음',
+  chromeLoginCorrupt: '확장 프로그램 파일이 손상되었습니다. 다시 감지하거나 폴더를 다시 선택하세요.',
+  chromeLoginInstallExtension: 'LINE Chrome 확장 프로그램 설치',
+  chromeLoginRedetect: '다시 감지',
+  chromeLoginChooseFolder: '폴더 직접 선택',
+  chromeLoginNotFound: '이 컴퓨터에서 확장 프로그램을 찾을 수 없습니다.',
+  chromeLoginReady: 'LINE Chrome 확장 프로그램을 찾았습니다. 로그인을 계속할 수 있습니다.',
+  chromeLoginContinue: '로그인 계속',
+  chromeLoginDetecting: '감지 중…',
 };
 
 const JAPANESE_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
@@ -100,16 +172,20 @@ export const SYSTEM_LABELS: Record<import('./locale.js').Locale, Record<keyof ty
 const NATIVE_ENGLISH_COPY = {
   newAttachmentFolder: 'Choose a new LINE attachment folder', attachmentFolder: 'Choose a LINE attachment folder',
   agentWorkspace: 'Choose an Agent workspace', showConsole: 'Show console', quit: 'Quit',
+  chromeLtsmFolder: 'Choose the LINE Chrome extension folder',
 } as const;
 const NATIVE_TRADITIONAL_COPY: Record<keyof typeof NATIVE_ENGLISH_COPY, string> = {
   newAttachmentFolder: '選擇新的 LINE 附件儲存資料夾', attachmentFolder: '選擇 LINE 附件儲存資料夾',
   agentWorkspace: '選擇 Agent 工作目錄', showConsole: '顯示操作台', quit: '結束',
+  chromeLtsmFolder: '選擇 LINE Chrome 擴充功能資料夾',
 };
 const NATIVE_JAPANESE_COPY: Record<keyof typeof NATIVE_ENGLISH_COPY, string> = {
   newAttachmentFolder: '新しい LINE 添付ファイルフォルダーを選択', attachmentFolder: 'LINE 添付ファイルフォルダーを選択', agentWorkspace: 'Agent ワークスペースを選択', showConsole: 'コンソールを表示', quit: '終了',
+  chromeLtsmFolder: 'LINE Chrome 拡張機能のフォルダーを選択',
 };
 const NATIVE_KOREAN_COPY: Record<keyof typeof NATIVE_ENGLISH_COPY, string> = {
   newAttachmentFolder: '새 LINE 첨부 파일 폴더 선택', attachmentFolder: 'LINE 첨부 파일 폴더 선택', agentWorkspace: 'Agent 작업 공간 선택', showConsole: '콘솔 표시', quit: '종료',
+  chromeLtsmFolder: 'LINE Chrome 확장 프로그램 폴더 선택',
 };
 export function nativeDesktopText(locale: import('./locale.js').Locale, key: keyof typeof NATIVE_ENGLISH_COPY): string {
   return ({ en: NATIVE_ENGLISH_COPY, 'zh-TW': NATIVE_TRADITIONAL_COPY, ja: NATIVE_JAPANESE_COPY, ko: NATIVE_KOREAN_COPY }[locale] ?? NATIVE_ENGLISH_COPY)[key];

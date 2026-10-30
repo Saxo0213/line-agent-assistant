@@ -61,3 +61,17 @@ export function boundedChatResourceResponseCode(value: unknown, present: boolean
 export function isChatResourceFailure(error: unknown): error is ChatResourceFailure {
   return error instanceof ChatResourceFailure && CHAT_RESOURCE_FAILURE_CATEGORIES.includes(error.category);
 }
+
+/**
+ * The transport has no way to serve this chat-resource action (the CHROMEOS profile has no notes API and no album list).
+ * The worker loop reports it as the stable `UNSUPPORTED` error, the same one it emits for a transport without
+ * `readChatResource`, so Main and the renderer see one code for "this login method does not support it".
+ */
+export class ChatResourceUnsupportedError extends Error {
+  readonly code = 'UNSUPPORTED';
+  constructor() { super('UNSUPPORTED'); this.name = 'ChatResourceUnsupportedError'; }
+}
+
+export function isChatResourceUnsupported(error: unknown): error is ChatResourceUnsupportedError {
+  return error instanceof ChatResourceUnsupportedError;
+}

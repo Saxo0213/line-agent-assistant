@@ -2,16 +2,33 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { LineWorkerEvent } from '@line-agent/contracts';
+import { resolveLineTransport, type LineTransportKind, type LineWorkerEvent } from '@line-agent/contracts';
 
 export type WorkerSecrets = Extract<LineWorkerEvent, { type: 'secretRotation' }>['secrets'];
+
+/**
+ * Secrets are stored for each pair of account and transport.
+ * DESKTOPWIN keeps the original file `<account>.bin`, so existing installations read the same file.
+ * CHROMEOS uses `<account>.chromeos.bin`. The file of the inactive transport stays on disk and is not changed.
+ */
+function secretFileName(accountId: string, transport: LineTransportKind): string {
+  return transport === 'CHROMEOS' ? `${accountId}.chromeos.bin` : `${accountId}.bin`;
+}
+
+/** A CHROMEOS e2eeStorage snapshot has the tag `transport: "CHROMEOS-3.7.2"`. A DESKTOPWIN (linejs) storage never has it. */
+function hasChromeSnapshotTag(secrets: WorkerSecrets): boolean {
+  const storage = secrets.e2eeStorage;
+  return typeof storage === 'object' && storage !== null && !Array.isArray(storage)
+    && typeof (storage as Record<string, unknown>).transport === 'string'
+    && ((storage as Record<string, unknown>).transport as string).startsWith('CHROMEOS');
+}
 
 export interface SecretBackend {
   protect(plain: Uint8Array): Promise<Uint8Array>;
   unprotect(cipher: Uint8Array): Promise<Uint8Array>;
 }
 
-type RotationJob = { workerInstanceId: string; loginAttemptId: string; secrets: WorkerSecrets;
+type RotationJob = { workerInstanceId: string; loginAttemptId: string; transport: LineTransportKind; secrets: WorkerSecrets;
   resolve(value: boolean): void; reject(error: unknown): void };
 
 async function runDpapi(operation: 'Protect' | 'Unprotect', data: Uint8Array): Promise<Uint8Array> {
@@ -40,15 +57,16 @@ export class DpapiUserSecretBackend implements SecretBackend {
 }
 
 export class SecretStore {
-  private readonly attempts = new Map<string, { workerInstanceId: string; loginAttemptId: string }>();
+  private readonly attempts = new Map<string, { workerInstanceId: string; loginAttemptId: string; transport: LineTransportKind }>();
   private readonly rotationLanes = new Map<string, Promise<void>>();
   private readonly pendingRotations = new Map<string, RotationJob>();
   private roomActivationKey: Promise<Buffer> | undefined;
   constructor(private readonly root: string, private readonly backend: SecretBackend = new DpapiUserSecretBackend()) {}
 
-  beginLogin(accountId: string, workerInstanceId: string, loginAttemptId: string): void {
+  /** `transport` selects the secret file for the rotations of this attempt. */
+  beginLogin(accountId: string, workerInstanceId: string, loginAttemptId: string, transport?: LineTransportKind): void {
     this.validAccount(accountId);
-    this.attempts.set(accountId, { workerInstanceId, loginAttemptId });
+    this.attempts.set(accountId, { workerInstanceId, loginAttemptId, transport: resolveLineTransport(transport) });
   }
 
   async closeLogin(accountId: string, workerInstanceId: string, loginAttemptId: string): Promise<void> {
@@ -66,7 +84,8 @@ export class SecretStore {
     if (expected?.workerInstanceId !== workerInstanceId || expected.loginAttemptId !== loginAttemptId) return false;
     return await new Promise<boolean>((resolve, reject) => {
       this.pendingRotations.get(accountId)?.resolve(false);
-      this.pendingRotations.set(accountId, { workerInstanceId, loginAttemptId, secrets: structuredClone(secrets), resolve, reject });
+      this.pendingRotations.set(accountId, { workerInstanceId, loginAttemptId, transport: expected.transport,
+        secrets: structuredClone(secrets), resolve, reject });
       if (!this.rotationLanes.has(accountId)) {
         const lane = Promise.resolve().then(() => this.drainRotations(accountId));
         this.rotationLanes.set(accountId, lane);
@@ -93,20 +112,57 @@ export class SecretStore {
         try {
           await writeFile(temporary, cipher, { mode: 0o600, flag: 'wx' });
           if (!current() || this.pendingRotations.has(accountId)) { job.resolve(false); continue; }
-          await rename(temporary, join(folder, `${accountId}.bin`));
+          await rename(temporary, join(folder, secretFileName(accountId, job.transport)));
+          // A saved login makes its transport the active one. A QR login with another method switches the account to that method here.
+          // A failed or cancelled login never reaches this line, so the marker keeps the old method.
+          if (await this.getTransport(accountId) !== job.transport) await this.setTransport(accountId, job.transport);
           job.resolve(true);
         } finally { await rm(temporary, { force: true }); }
       } catch (error) { job.reject(error); }
     }
   }
 
-  async load(accountId: string): Promise<WorkerSecrets | null> {
+  /**
+   * Active transport of the account. It is stored in a marker file `<account>.transport` in the secrets directory.
+   * If the marker is absent or not valid, the transport is DESKTOPWIN. The database does not hold this value.
+   */
+  async getTransport(accountId: string): Promise<LineTransportKind> {
     this.validAccount(accountId);
+    try {
+      const text = (await readFile(join(this.root, 'secrets', `${accountId}.transport`), 'utf8')).trim();
+      return text === 'CHROMEOS' ? 'CHROMEOS' : 'DESKTOPWIN';
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'DESKTOPWIN';
+      throw error;
+    }
+  }
+
+  /** Set the active transport. DESKTOPWIN removes the marker file. CHROMEOS writes it through a temporary file. */
+  async setTransport(accountId: string, transport: LineTransportKind): Promise<void> {
+    this.validAccount(accountId);
+    const folder = join(this.root, 'secrets');
+    const target = join(folder, `${accountId}.transport`);
+    if (transport === 'DESKTOPWIN') { await rm(target, { force: true }); return; }
+    await mkdir(folder, { recursive: true });
+    const temporary = join(folder, `${accountId}.${randomUUID()}.tmp`);
+    try {
+      await writeFile(temporary, 'CHROMEOS', { mode: 0o600, flag: 'wx' });
+      await rename(temporary, target);
+    } finally { await rm(temporary, { force: true }); }
+  }
+
+  /** Load the secrets of one transport (default DESKTOPWIN). The function never returns a snapshot of the other transport. */
+  async load(accountId: string, transport?: LineTransportKind): Promise<WorkerSecrets | null> {
+    this.validAccount(accountId);
+    const kind = resolveLineTransport(transport);
     let cipher: Buffer;
-    try { cipher = await readFile(join(this.root, 'secrets', `${accountId}.bin`)); }
+    try { cipher = await readFile(join(this.root, 'secrets', secretFileName(accountId, kind))); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
     const plain = await this.backend.unprotect(cipher);
-    return JSON.parse(Buffer.from(plain).toString('utf8')) as WorkerSecrets;
+    const secrets = JSON.parse(Buffer.from(plain).toString('utf8')) as WorkerSecrets;
+    if (kind === 'DESKTOPWIN' && hasChromeSnapshotTag(secrets)) return null;
+    if (kind === 'CHROMEOS' && secrets.e2eeStorage !== null && !hasChromeSnapshotTag(secrets)) return null;
+    return secrets;
   }
 
   loadOrCreateRoomActivationDigestKey(): Promise<Buffer> {
@@ -135,13 +191,19 @@ export class SecretStore {
     }
   }
 
-  async clear(accountId: string): Promise<void> {
+  /**
+   * Remove stored secrets and cancel the pending attempt of the account.
+   * With a transport, the function removes only the file of that transport. The other transport keeps its stored session.
+   * Without a transport, it removes the files of all transports (account replacement).
+   */
+  async clear(accountId: string, transport?: LineTransportKind): Promise<void> {
     this.validAccount(accountId);
     this.attempts.delete(accountId);
     this.pendingRotations.get(accountId)?.resolve(false);
     this.pendingRotations.delete(accountId);
     await (this.rotationLanes.get(accountId) ?? Promise.resolve());
-    await rm(join(this.root, 'secrets', `${accountId}.bin`), { force: true });
+    const kinds: LineTransportKind[] = transport === undefined ? ['DESKTOPWIN', 'CHROMEOS'] : [transport];
+    for (const kind of kinds) await rm(join(this.root, 'secrets', secretFileName(accountId, kind)), { force: true });
   }
 
   private validAccount(accountId: string): void {

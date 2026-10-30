@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
 import { AccountRepository } from './account-repository.js';
+import { AuditRepository } from './audit-repository.js';
 import { ATTACHMENT_STORED_STATUS, MessageRepository } from './message-repository.js';
 import { createTestDatabase } from './test-database.js';
 
@@ -84,6 +85,49 @@ database('Agent LINE send persistence (real database)', () => {
       await expect(row({ status: 'skipped' })).rejects.toThrow();
       await expect(row({ bytes: -1 })).rejects.toThrow();
       await expect(row({ code: 'send_failed', status: 'failed' })).resolves.toBeTruthy();
+    });
+
+    it('accepts the mapped worker and gateway error codes and refuses a code with a digit, colon or upper case letter', async () => {
+      for (const code of ['send_failed_upload_failed_obs_upload_obshttperror', 'send_failed_upload_failed_ee_message_typeerror',
+        'send_failed_file_changed', 'send_failed_side_effect_denied', 'send_unknown_transport_outcome_unknown',
+        'send_failed_line_talk_abuse_block', 'send_unknown_gateway_queue_full', 'send_unknown_gateway_stale_binding',
+        'send_unknown_result_mismatch', 'send_failed']) {
+        await expect(row({ code, status: 'failed' }), code).resolves.toBeTruthy();
+      }
+      for (const code of ['send_failed_e2ee_flow', 'send_failed:upload_failed', 'send_failed_UPLOAD_FAILED', 'send_failed_upload-failed', 'send_failed_' + 'a'.repeat(60)]) {
+        await expect(row({ code, status: 'failed' }), code).rejects.toThrow();
+      }
+    });
+
+    it('accepts the operational audit row of a failed Agent send (action, error code and safe diagnostic) and refuses free text', async () => {
+      const audit = new AuditRepository(pool);
+      const base = { action: 'worker_operation_error', phase: 'observed', initiator: 'system', correlationId: randomUUID(), accountId: 'acc-agent',
+        jobId: randomUUID(), requestId: randomUUID(), createdAt: new Date().toISOString() } as const;
+      const diagnostics = [
+        { operation: 'sendMedia', stage: 'write', category: 'transport_failed', recovery: 'retry', outcome: 'failed', upstreamStatus: 403 },
+        { operation: 'sendMedia', stage: 'execute', category: 'transport_failed', recovery: 'retry', outcome: 'failed', upstreamCode: 10051 },
+        { operation: 'sendMedia', stage: 'prepare', category: 'transport_failed', recovery: 'retry', outcome: 'failed' },
+        { operation: 'sendText', stage: 'response', category: 'outcome_unknown', recovery: 'inspect_outcome', outcome: 'unknown' },
+        { operation: 'sendMedia', stage: 'admission', category: 'queue_full', recovery: 'retry', outcome: 'not_started' },
+        { operation: 'sendMedia', stage: 'admission', category: 'stale_binding', recovery: 'retry', outcome: 'not_started' },
+        { operation: 'sendMedia', stage: 'admission', category: 'cancelled', recovery: 'retry', outcome: 'not_started' },
+        { operation: 'sendMedia', stage: 'response', category: 'invalid_input', recovery: 'retry', outcome: 'failed' },
+        { operation: 'sendMedia', stage: 'response', category: 'invalid_response', recovery: 'retry', outcome: 'unknown' },
+        { operation: 'manualSendText', stage: 'response', category: 'denied', recovery: 'check_configuration', outcome: 'failed' },
+        { operation: 'unsendMessage', stage: 'response', category: 'unavailable', recovery: 'retry', outcome: 'failed' },
+      ] as const;
+      const errorCodes = ['MESSAGE_SEND_FAILED', 'SIDE_EFFECT_DENIED', 'TRANSPORT_OUTCOME_UNKNOWN', 'QUEUE_FULL', 'NOT_STARTED', 'MESSAGE_UNSEND_FAILED'] as const;
+      for (const [index, diagnostic] of diagnostics.entries()) {
+        await expect(audit.append({ ...base, correlationId: randomUUID(), errorCode: errorCodes[index % errorCodes.length]!, diagnostic }),
+          JSON.stringify(diagnostic)).resolves.toBeUndefined();
+      }
+      await expect(audit.append({ ...base, correlationId: randomUUID(), errorCode: 'UPLOAD_FAILED:obs_upload' })).rejects.toThrow();
+      await expect(audit.append({ ...base, correlationId: randomUUID(), errorCode: 'LINE_TALK_ABUSE_BLOCK' })).resolves.toBeUndefined();
+      await expect(audit.append({ ...base, correlationId: randomUUID(), errorCode: 'LINE_TALK_NOT_A_REAL_NAME' as never })).rejects.toThrow();
+      const stored = await pool.query<{ details: Record<string, unknown> }>(
+        "SELECT details FROM audit_logs WHERE action = 'worker_operation_error' AND details->>'account_id' = 'acc-agent' AND details->'diagnostic'->>'operation' = 'sendMedia' AND details->'diagnostic'->>'upstreamStatus' = '403'");
+      expect(stored.rows).toHaveLength(1);
+      expect(stored.rows[0]!.details).toMatchObject({ error_code: 'MESSAGE_SEND_FAILED', diagnostic: { stage: 'write', upstreamStatus: 403 } });
     });
 
     it('widens the audit tool-name check with both tools', async () => {

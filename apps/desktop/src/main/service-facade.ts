@@ -1,7 +1,7 @@
 import type { IpcRequest, IpcResult, ConversationKey, WritableConversationKey, AppSnapshot, MessageContent, LineMediaTarget,
   ChatResourceNote, ChatResourceAlbum, ChatResourcePhoto } from '@line-agent/contracts';
 import type { SystemActivityResult, SystemErrorsResult } from '../desktop-protocol.js';
-import type { SticonRange } from '@line-agent/contracts';
+import type { AttachmentBlockReason, SticonRange } from '@line-agent/contracts';
 import type { AlbumOpenResult } from './services/chat-resources.js';
 
 export type TimelineMessage = {
@@ -30,11 +30,11 @@ export type TimelineMessage = {
   recalledContent?: MessageContent | null | undefined;
   recalledKind?: TimelineMessage['kind'] | null | undefined;
   recalledText?: string | null | undefined;
-  attachments: { id: string; kind: 'image' | 'video' | 'audio' | 'file'; name: string; mimeType: string; sizeBytes: number; status: string; canRetryManually?: boolean | undefined }[];
+  attachments: { id: string; kind: 'image' | 'video' | 'audio' | 'file'; name: string; mimeType: string; sizeBytes: number; status: string; canRetryManually?: boolean | undefined; blockReason?: AttachmentBlockReason | undefined }[];
 };
 export type MessagePage = { messages: TimelineMessage[]; olderCursor: string | null };
 export type AttachmentState = { attachmentId: string; messageId: string; kind: TimelineMessage['attachments'][number]['kind'];
-  name: string; mimeType: string; sizeBytes: number; status: string; canRetryManually: boolean };
+  name: string; mimeType: string; sizeBytes: number; status: string; canRetryManually: boolean; blockReason?: AttachmentBlockReason | null | undefined };
 export type FriendRow = { mid: string; name: string; avatarAvailable: boolean; hasConversation: boolean };
 export type MessageReader = { mid: string; name: string; readAt: string };
 export type WorkRecord = { id: string; title: string; status: 'todo' | 'doing' | 'waiting' | 'done'; key: ConversationKey; messageIds: string[]; attachmentIds: string[]; updatedAt: string };

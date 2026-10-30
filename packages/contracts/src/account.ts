@@ -46,6 +46,19 @@ export type AccountMode = z.infer<typeof AccountModeSchema>;
 
 export const ControlEpochSchema = z.number().int().nonnegative();
 
+/**
+ * Which LINE protocol an account's worker speaks. DESKTOPWIN is the linejs transport and the default; CHROMEOS is the
+ * LINE Chrome extension (3.7.2) protocol port. An absent value means DESKTOPWIN (see resolveLineTransport).
+ */
+export const LineTransportKindSchema = z.enum(['DESKTOPWIN', 'CHROMEOS']);
+export type LineTransportKind = z.infer<typeof LineTransportKindSchema>;
+export const DEFAULT_LINE_TRANSPORT: LineTransportKind = 'DESKTOPWIN';
+export function resolveLineTransport(value: LineTransportKind | undefined): LineTransportKind {
+  return value ?? DEFAULT_LINE_TRANSPORT;
+}
+/** The only `application` string a CHROMEOS init may carry (the trailing tab is part of the value). */
+export const CHROMEOS_APPLICATION = 'CHROMEOS\t3.7.2\tChrome_OS\t';
+
 export const WorkerBindingSchema = z.strictObject({
   accountId: IdSchema,
   workerInstanceId: IdSchema,
@@ -53,6 +66,7 @@ export const WorkerBindingSchema = z.strictObject({
   transportOwnerId: IdSchema.optional(),
   transportGeneration: ControlEpochSchema.optional(),
   writeGrantVersion: ControlEpochSchema.optional(),
+  lineTransport: LineTransportKindSchema.optional(),
 });
 export type WorkerBinding = z.infer<typeof WorkerBindingSchema>;
 

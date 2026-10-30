@@ -226,6 +226,10 @@ function fakeApi(): DesktopApi {
     lineLogout: vi.fn(async () => accepted),
     refreshLineAvatar: vi.fn(async () => accepted),
     lineSetAutoLogin: vi.fn(async () => accepted),
+    getChromeLoginAvailability: vi.fn(async () => accepted),
+    detectChromeLtsm: vi.fn(async () => accepted),
+    chooseChromeLtsmFolder: vi.fn(async () => accepted),
+    openChromeExtensionStore: vi.fn(async () => accepted),
     lineBeginAdminPairing: vi.fn(async () => ({ token: '123456', expiresAt: '2026-10-16T06:00:00.000Z' })),
     lineStart: vi.fn(async () => accepted),
     externalImportStart: vi.fn(async () => accepted),
@@ -1764,7 +1768,7 @@ describe('operator console', () => {
   });
 
   describe('binding the primary admin from the official LINE', () => {
-    const BIND_BUTTON = '從 LINE 設定管理者並啟動外部監控';
+    const BIND_BUTTON = '管理者帳號(LINE監控模式)';
     const renderAgentOnly = (api: DesktopApi, hasPrimaryAdmin: boolean) => render(
       <LineLogin api={api} accounts={[{ ...snapshot.accounts[0]!, hasPrimaryAdmin }]} headingRef={React.createRef<HTMLHeadingElement>()} live={null} />);
 
@@ -2124,7 +2128,7 @@ describe('operator console', () => {
     api.onEvent = vi.fn((next) => { listeners.push(next); return () => undefined; });
     await renderLineApp(api);
     await openSystemTab();
-    fireEvent.click(screen.getByRole('button', { name: '登入 Primary Admin LINE 帳號' }));
+    fireEvent.click(screen.getByRole('button', { name: '登入管理者帳號' }));
     await waitFor(() => expect(api.lineAddAccountQr).toHaveBeenCalledOnce());
     act(() => listeners.forEach((listener) => listener({ type: 'lineLoginState', accountId: 'account-new',
       loginAttemptId: 'attempt-2', state: 'connecting', message: null })));
@@ -2141,14 +2145,14 @@ describe('operator console', () => {
     expect(screen.queryByRole('img', { name: 'LINE QR 登入碼' })).toBeNull();
     expect(screen.getByRole('heading', { name: '在手機輸入認證碼' })).toBeTruthy();
     expect(screen.getByLabelText('LINE 6 位數認證碼').textContent).toBe('020824');
-    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('.app-shell button')).find((button) => button.textContent?.includes('登入 Primary Admin LINE 帳號'))?.disabled).toBe(true);
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('.app-shell button')).find((button) => button.textContent?.includes('登入管理者帳號'))?.disabled).toBe(true);
     expect(screen.getByText('LINE 登入中', { selector: '.system-toast' })).toBeTruthy();
 
     act(() => listeners.forEach((listener) => listener({ type: 'lineLoginState', accountId: 'account-new',
       loginAttemptId: 'attempt-2', state: 'connected', message: null })));
     expect(screen.queryByRole('heading', { name: '在手機輸入認證碼' })).toBeNull();
     expect(screen.getByText(/登入成功/)).toBeTruthy();
-    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('.app-shell button')).find((button) => button.textContent?.includes('登入 Primary Admin LINE 帳號'))?.disabled).toBe(false);
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('.app-shell button')).find((button) => button.textContent?.includes('登入管理者帳號'))?.disabled).toBe(false);
 
     act(() => listeners.forEach((listener) => listener({ type: 'lineLoginState', accountId: 'account-new',
       loginAttemptId: 'attempt-2', state: 'degraded', message: 'Worker command rejected' })));
@@ -3946,7 +3950,7 @@ describe('operator console', () => {
     const headingRef = React.createRef<HTMLHeadingElement>();
     const { rerender } = render(<LineLogin api={api} accounts={[]} headingRef={headingRef} />);
     expect((screen.getByRole('button', { name: '登入 Agent LINE 帳號' }) as HTMLButtonElement).disabled).toBe(false);
-    const adminLogin = screen.getByRole('button', { name: '登入 Primary Admin LINE 帳號' }) as HTMLButtonElement;
+    const adminLogin = screen.getByRole('button', { name: '登入管理者帳號' }) as HTMLButtonElement;
     expect(adminLogin.disabled).toBe(true);
     expect(adminLogin.title).toBe('');
     expect(screen.queryByText('Agent 帳號槽位待登入')).toBeNull();
@@ -3954,7 +3958,7 @@ describe('operator console', () => {
     expect(screen.queryByText('請先完成 Agent 管理者綁定，之後才能登入 Primary Admin。')).toBeNull();
 
     rerender(<LineLogin api={api} accounts={[{ ...snapshot.accounts[0]!, hasPrimaryAdmin: true }]} headingRef={headingRef} />);
-    expect((screen.getByRole('button', { name: '登入 Primary Admin LINE 帳號' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: '登入管理者帳號' }) as HTMLButtonElement).disabled).toBe(false);
     expect(screen.queryByText('Agent 已完成管理者綁定，可以登入 Primary Admin。')).toBeNull();
   });
 
@@ -3965,7 +3969,7 @@ describe('operator console', () => {
     ];
     render(<LineLogin api={fakeApi()} accounts={accounts} headingRef={React.createRef<HTMLHeadingElement>()} />);
     expect(screen.queryByRole('button', { name: '登入 Agent LINE 帳號' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '登入 Primary Admin LINE 帳號' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '登入管理者帳號' })).toBeNull();
   });
 
   it('keeps account selection view-only and exposes no control-switch dialog', async () => {

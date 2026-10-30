@@ -172,10 +172,10 @@ describe('AgentExtensionsSettings', () => {
     expect(within(dialog).getByText(T.issueUnsupportedTransport)).toBeTruthy();
     const boxes = within(dialog).getAllByRole('checkbox') as HTMLInputElement[];
     expect(boxes.map((box) => box.disabled)).toEqual([false, true, true]);
-    const submit = within(dialog).getByRole('button', { name: '匯入所選（0）' });
+    const submit = within(dialog).getByRole('button', { name: '匯入' });
     expect((submit as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(boxes[0]!);
-    fireEvent.click(within(dialog).getByRole('button', { name: '匯入所選（1）' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: '匯入' }));
     await waitFor(() => expect(api.importAgentMcpServers).toHaveBeenCalledWith([{ source: 'claude-code', sourceName: 'alpha' }]));
     expect(await within(dialog).findByText('已匯入：alpha')).toBeTruthy();
     expect(api.getAgentExtensions).toHaveBeenCalledTimes(2);

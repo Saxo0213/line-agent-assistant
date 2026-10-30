@@ -3,6 +3,7 @@ import { Download, FolderOpen, Image as ImageIcon, NotebookPen, RotateCw, X } fr
 import type { AlbumFailureContextDto, ConversationKey } from '@line-agent/contracts';
 import { lineMediaUrl } from '@line-agent/contracts';
 import { useDesktopLocale } from '../desktop-i18n.js';
+import { desktopErrorText } from '../../desktop-error-copy.js';
 import type { Locale } from '../../locale.js';
 
 export type ChatNote = { postId: string; createdTime: number | null; text: string | null; content?: Record<string, unknown> };
@@ -25,6 +26,8 @@ const COPY = {
   ja: { notes: 'ノート', albums: 'アルバム', close: '閉じる', refresh: '更新', loading: '読み込み中…', loadNotesError: 'ノートを読み込めません。', loadAlbumsError: 'アルバムを読み込めません。', loadPhotosError: '写真を読み込めません。', loadNoteError: 'このノートを読み込めません。', emptyNotes: 'このチャットにノートはありません。', emptyAlbums: 'このチャットにアルバムはありません。', emptyPhotos: 'このアルバムに写真はありません。', more: 'さらに読み込む', retry: '再試行', saved: '画像を保存しました', saveError: 'この画像を保存できません。', back: '戻る', photos: '写真 {n} 枚', photosPlural: '写真 {n} 枚', photo: 'LINE 写真', download: '写真を保存', untitled: '無題のノート', unnamedAlbum: '無題のアルバム', openNotes: 'チャットのノートを開く', openAlbums: 'チャットのアルバムを開く', archivingAlbum: 'アルバムの写真を保存中…', albumArchiveComplete: '{total} 枚中 {saved} 枚を保存しました。', albumArchivePartial: '{total} 枚中 {saved} 枚を保存、{failed} 枚失敗しました。', albumArchiveCancelled: 'アルバム保存をキャンセルしました。', albumArchiveFailed: 'アルバム保存に失敗しました（{code}）。', albumArchiveStage: '失敗段階：{action} / {stage}。', openSavedAlbum: '保存したアルバムフォルダーを開く', openingSavedAlbum: 'フォルダーを準備中…', savedAlbumResult: '{total} 枚中 {saved} 枚を保存しました。', savedAlbumPartial: '{total} 枚中 {saved} 枚を保存、{failed} 枚を出力できませんでした。', savedAlbumOpenFailed: '保存したアルバムフォルダーを開けません。' },
   ko: { notes: '노트', albums: '앨범', close: '닫기', refresh: '새로고침', loading: '불러오는 중…', loadNotesError: '노트를 불러올 수 없습니다.', loadAlbumsError: '앨범을 불러올 수 없습니다.', loadPhotosError: '사진을 불러올 수 없습니다.', loadNoteError: '이 노트를 불러올 수 없습니다.', emptyNotes: '이 대화에 노트가 없습니다.', emptyAlbums: '이 대화에 앨범이 없습니다.', emptyPhotos: '이 앨범에 사진이 없습니다.', more: '더 불러오기', retry: '다시 시도', saved: '이미지를 저장했습니다', saveError: '이 이미지를 저장할 수 없습니다.', back: '뒤로', photos: '사진 {n}장', photosPlural: '사진 {n}장', photo: 'LINE 사진', download: '사진 저장', untitled: '제목 없는 노트', unnamedAlbum: '제목 없는 앨범', openNotes: '대화 노트 열기', openAlbums: '대화 앨범 열기', archivingAlbum: '앨범 사진 저장 중…', albumArchiveComplete: '사진 {saved}/{total}장 저장 완료.', albumArchivePartial: '{total}장 중 {saved}장 저장, {failed}장 실패.', albumArchiveCancelled: '앨범 저장을 취소했습니다.', albumArchiveFailed: '앨범 저장 실패 ({code}).', albumArchiveStage: '실패 단계: {action} / {stage}.', openSavedAlbum: '저장된 앨범 폴더 열기', openingSavedAlbum: '폴더 준비 중…', savedAlbumResult: '사진 {saved}/{total}장 저장.', savedAlbumPartial: '{total}장 중 {saved}장 저장, {failed}장 내보내지 못했습니다.', savedAlbumOpenFailed: '저장된 앨범 폴더를 열 수 없습니다.' },
 } satisfies Record<Locale, Record<string, string>>;
+/** The main process sends the IPC error code UNSUPPORTED when the login method has no Notes or Albums. */
+const isUnsupportedError = (error: unknown) => error instanceof Error && error.name === 'UNSUPPORTED';
 type ResourceKind = 'notes' | 'albums';
 type ReadState = 'idle' | 'loading' | 'error' | 'ready';
 const keyId = (key: ConversationKey) => JSON.stringify([key.accountId, key.chatType, key.chatId]);
@@ -33,7 +36,11 @@ const savedPhotoLabel = (locale: Locale) => locale === 'zh-TW' ? '已儲存的�
 /** Per-chat Note and Album controls. Calls are explicit and one cursor page per action. */
 export function ChatResources({ api, route, accountStatus, accountMode }: { api: ChatResourceApi; route: ConversationKey; accountStatus: string; accountMode: string }) {
   const locale = useDesktopLocale();
-  const copy = COPY[locale];
+  const [unsupported, setUnsupported] = useState(false);
+  const unsupportedText = desktopErrorText(locale, 'UNSUPPORTED');
+  const copy = unsupported && unsupportedText
+    ? { ...COPY[locale], loadNotesError: unsupportedText, loadAlbumsError: unsupportedText, loadPhotosError: unsupportedText, loadNoteError: unsupportedText, saveError: unsupportedText }
+    : COPY[locale];
   const [kind, setKind] = useState<ResourceKind | null>(null);
   const [notes, setNotes] = useState<ChatNote[]>([]);
   const [albums, setAlbums] = useState<ChatAlbum[]>([]);
@@ -123,7 +130,7 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
         setNotes((current) => append ? [...current, ...page.notes] : page.notes);
         setNoteCursor(page.nextCursor); setNoteState('ready');
       }
-    } catch { if (generation === notesGeneration.current && kindRef.current === 'notes') { setNoteError(true); setNoteState('error'); } }
+    } catch (error) { setUnsupported(isUnsupportedError(error)); if (generation === notesGeneration.current && kindRef.current === 'notes') { setNoteError(true); setNoteState('error'); } }
     finally {
       requestLocks.current.delete('notes');
       const pending = pendingNotes.current; pendingNotes.current = null;
@@ -142,7 +149,7 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
         setAlbums((current) => append ? [...current, ...page.albums] : page.albums);
         setAlbumCursor(page.nextCursor); setAlbumState('ready');
       }
-    } catch { if (generation === albumsGeneration.current && kindRef.current === 'albums') { setAlbumError(true); setAlbumState('error'); } }
+    } catch (error) { setUnsupported(isUnsupportedError(error)); if (generation === albumsGeneration.current && kindRef.current === 'albums') { setAlbumError(true); setAlbumState('error'); } }
     finally {
       requestLocks.current.delete('albums');
       const pending = pendingAlbums.current; pendingAlbums.current = null;
@@ -161,7 +168,7 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
         setPhotos((current) => append ? [...current, ...page.photos] : page.photos);
         setPhotoCursor(page.nextCursor); setPhotoState('ready');
       }
-    } catch { if (generation === viewGeneration.current && kindRef.current === 'albums' && selectedAlbumRef.current?.albumId === album.albumId) { setPhotoError(true); setPhotoState('error'); } }
+    } catch (error) { setUnsupported(isUnsupportedError(error)); if (generation === viewGeneration.current && kindRef.current === 'albums' && selectedAlbumRef.current?.albumId === album.albumId) { setPhotoError(true); setPhotoState('error'); } }
     finally {
       activePhotoReads.current -= 1;
       const pending = pendingPhotos.current; pendingPhotos.current = null;
@@ -182,7 +189,7 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
     try {
       const detail = await withRequestId((requestId) => api.getChatNote(route, note.postId, requestId));
       if (generation === viewGeneration.current && kindRef.current === 'notes' && selectedNoteId.current === note.postId) { setSelectedNote(detail); setNoteDetailState('ready'); }
-    } catch { if (generation === viewGeneration.current && kindRef.current === 'notes' && selectedNoteId.current === note.postId) setNoteDetailState('error'); }
+    } catch (error) { setUnsupported(isUnsupportedError(error)); if (generation === viewGeneration.current && kindRef.current === 'notes' && selectedNoteId.current === note.postId) setNoteDetailState('error'); }
     finally {
       requestLocks.current.delete('note');
       const pending = pendingNoteDetail.current; pendingNoteDetail.current = null;
@@ -214,7 +221,7 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
       setDownloadState((current) => ({ ...current, [photo.photoId]: 'saved' }));
       setAlbums((current) => current.map((album) => album.albumId === selectedAlbum.albumId
         ? { ...album, coverPhotoIds: [photo.photoId, ...(album.coverPhotoIds ?? []).filter((id) => id !== photo.photoId)].slice(0, 2) } : album));
-    } catch { setDownloadState((current) => ({ ...current, [photo.photoId]: 'error' })); }
+    } catch (error) { setUnsupported(isUnsupportedError(error)); setDownloadState((current) => ({ ...current, [photo.photoId]: 'error' })); }
     finally { requestLocks.current.delete('download'); }
   }
   async function openReadableAlbumFolder() {
