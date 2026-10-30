@@ -2124,7 +2124,7 @@ describe('operator console', () => {
   });
   it('starts a distinct account login and renders only the current attempt QR, PIN, and status', async () => {
     const api = fakeApi(); const listeners: Parameters<DesktopApi['onEvent']>[0][] = [];
-    api.getSnapshot = vi.fn(async () => ({ ...snapshot, accounts: [{ ...snapshot.accounts[0]!, hasPrimaryAdmin: true }] }));
+    api.getSnapshot = vi.fn(async () => ({ ...snapshot, accounts: [{ ...snapshot.accounts[0]!, hasPrimaryAdmin: true, status: 'reauth_required' as const }] }));
     api.onEvent = vi.fn((next) => { listeners.push(next); return () => undefined; });
     await renderLineApp(api);
     await openSystemTab();
@@ -2210,7 +2210,7 @@ describe('operator console', () => {
     expect(screen.getByText('888888')).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: '關閉' }));
-    fireEvent.click(screen.getByRole('button', { name: '重新登入 工作' }));
+    fireEvent.click(screen.getByRole('button', { name: '登入 工作' }));
     await waitFor(() => expect(api.lineLoginQr).toHaveBeenCalledWith('account-A'));
   });
 

@@ -460,6 +460,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     const stage = account.externalImportProgress?.stage;
     const monitoring = stage === 'monitoring' || stage === 'syncing';
     const adminMonitoring = monitoring && account.productRole === 'PRIMARY_ADMIN';
+    const loggedOut = account.status === 'disconnected' || account.status === 'reauth_required';
     const stopping = stoppingExternalImport === account.accountId;
     const starting = startingExternalImport === account.accountId;
     return <article className={`${embedded ? 'account-record' : 'panel'} route-${account.mode}`} data-account-id={account.accountId} key={account.accountId}>
@@ -502,13 +503,13 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
           onClick={() => void refreshAvatar(account)}>{refreshingAvatar === account.accountId ? desktopText('refreshingAvatar') : desktopText('refreshAvatar')}</button>}
         {account.productRole === 'AGENT' && account.hasPrimaryAdmin !== true && <button className="primary" onClick={() => void beginAdminPairing(account)}>{desktopText('addAdministrator')}</button>}
         <button disabled={account.status === 'disconnected' || busy} onClick={() => void restart(account.accountId)}>{desktopText('restart')}</button>
-        <button aria-label={`${account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')} ${account.displayName}`} disabled={busy || adminMonitoring} title={adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={adminMonitoring ? `auto-login-disabled-${account.accountId}` : undefined} onClick={() => void relogin(account.accountId)}>{account.status === 'disconnected' ? desktopText('logIn') : desktopText('logInAgain')}</button>
+        {loggedOut && <button aria-label={`${desktopText('logIn')} ${account.displayName}`} disabled={busy || adminMonitoring} title={adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={adminMonitoring ? `auto-login-disabled-${account.accountId}` : undefined} onClick={() => void relogin(account.accountId)}>{desktopText('logIn')}</button>}
         {account.productRole === 'AGENT' && account.hasVerifiedLineIdentity === true && account.status === 'disconnected' && <button disabled={busy || loginActive}
           onClick={() => void requestAgentReplacement(account.accountId, account.displayName)}>{desktopText('replaceAgentAccount')}</button>}
         <button aria-label={desktopText('logOutArg0', { arg0: account.displayName })} disabled={account.status === 'disconnected' || busy || loggingOut === account.accountId} onClick={() => void logout(account)}>{loggingOut === account.accountId ? desktopText('loggingOut') : desktopText('logOut')}</button>
         <select className="login-method-select" aria-label={extraText('loginMethodLabel')} value={accountMethod(account)}
-          disabled={account.status === 'connected' || busy || loginActive || adminMonitoring}
-          title={account.status === 'connected' ? extraText('loginMethodLogoutFirst') : adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined}
+          disabled={!loggedOut || busy || loginActive || adminMonitoring}
+          title={!loggedOut ? extraText('loginMethodLogoutFirst') : adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined}
           onChange={(event) => void chooseAccountMethod(account.accountId, event.target.value as LoginMethod)}>
           <option value="DESKTOPWIN">{extraText('loginMethodWindows')}</option>
           <option value="CHROMEOS">{extraText('loginMethodChrome')}</option>

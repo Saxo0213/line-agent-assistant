@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.302 修正 Agent 傳送圖片與檔案失敗（HTTP 411），傳送失敗時保留實際原因，外部監控改為官方資料庫一有變動就讀取，`/adduser` 不再需要 LINE 好友關係。請參閱 [v1.0.302 版本說明](docs/releases/v1.0.302.md)；先前更新請見 [v1.0.288](docs/releases/v1.0.288.md)、[v1.0.280](docs/releases/v1.0.280.md) 與 [v1.0.279](docs/releases/v1.0.279.md)。
+v1.0.303 移除已登入帳號的「重新登入」按鈕：「登入」按鈕只在登出後或憑證失效時顯示。請參閱 [v1.0.303 版本說明](docs/releases/v1.0.303.md)；先前更新請見 [v1.0.302](docs/releases/v1.0.302.md)、[v1.0.288](docs/releases/v1.0.288.md) 與 [v1.0.280](docs/releases/v1.0.280.md)。
 
 ## 安裝
 

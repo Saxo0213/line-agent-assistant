@@ -415,8 +415,8 @@ describe('LineLogin does not inspect or confirm the official LINE process', () =
   it('starts add, restart, and QR login directly with one request each', async () => {
     const confirm = vi.spyOn(window, 'confirm');
     const { lineLoginQr, lineStart, lineAddAccountQr, notices, view } = setup();
-    view([{ ...agent, status: 'connected' } as LineAccountSummary]);
-    fireEvent.click(screen.getByRole('button', { name: '重新登入 工作' }));
+    view([{ ...agent, status: 'disconnected' } as LineAccountSummary]);
+    fireEvent.click(screen.getByRole('button', { name: '登入 工作' }));
     await waitFor(() => expect(lineLoginQr).toHaveBeenCalledOnce());
     expect(lineLoginQr).toHaveBeenCalledWith('account-A');
     expect(confirm).not.toHaveBeenCalled();
@@ -647,16 +647,36 @@ describe('login method menu of an existing account', () => {
     await waitFor(() => expect(api.lineLoginQr).toHaveBeenCalledWith(buildAgent.accountId, 'DESKTOPWIN'));
   });
 
-  it('is locked only while the account is connected', () => {
-    for (const status of ['disconnected', 'degraded', 'reauth_required'] as const) {
+  it('is enabled only while the account is logged out', () => {
+    for (const status of ['disconnected', 'reauth_required'] as const) {
       show(menuApi(), { status });
       expect(menu().disabled).toBe(false);
       expect(menu().title).toBe('');
       cleanup();
     }
-    show(menuApi(), { status: 'connected' });
-    expect(menu().disabled).toBe(true);
-    expect(menu().title).toBe('登出後才能切換登入方式');
+    for (const status of ['connected', 'degraded'] as const) {
+      show(menuApi(), { status });
+      expect(menu().disabled).toBe(true);
+      expect(menu().title).toBe('登出後才能切換登入方式');
+      cleanup();
+    }
+  });
+
+  it('shows the login button only for a logged-out account', () => {
+    for (const status of ['connected', 'degraded'] as const) {
+      show(menuApi(), { status });
+      expect(screen.queryByRole('button', { name: /^(重新)?登入 Agent$/ })).toBeNull();
+      expect(screen.queryAllByRole('button', { name: /^(重新)?登入/ }).filter((button) => button.getAttribute('aria-label')?.endsWith('Agent') || button.textContent === '登入')).toHaveLength(0);
+      expect(screen.getByRole('button', { name: '重新啟動' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: '登出 Agent' })).toBeTruthy();
+      cleanup();
+    }
+    for (const status of ['disconnected', 'reauth_required'] as const) {
+      show(menuApi(), { status });
+      expect(screen.getByRole('button', { name: '登入 Agent' })).toBeTruthy();
+      expect(screen.queryByRole('button', { name: /重新登入/ })).toBeNull();
+      cleanup();
+    }
   });
 
   it('is disabled during a login and for the Primary Admin while monitoring', () => {
