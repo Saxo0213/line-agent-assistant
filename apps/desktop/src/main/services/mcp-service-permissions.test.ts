@@ -42,21 +42,21 @@ describe('internal MCP tools/list and tools/call follow the effective permission
 
   it('contains unexpected external exception text at the JSON-RPC boundary', async () => {
     const sentinel = 'private-token-path-prompt-sentinel';
-    const tokens = { executeWithVerifiedToken: async () => { throw new Error(sentinel); } } as unknown as McpTokenRepository;
+    const tokens = { executeLocalClientRead: async () => { throw new Error(sentinel); } } as unknown as McpTokenRepository;
     const stored: AuditEvent[] = [];
     const audit = createOperationalAudit({ append: async (event) => { stored.push(event); }, appendFallback: async () => {}, logSinkState() {} });
     const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository,
       onDiagnostic: (diagnostic, identity) => { audit.failure(diagnostic, identity); } });
     try {
-      const response = await service.handleExternalJsonRpc('not-a-real-token', { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      const response = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
       expect(response.httpStatus).toBe(500);
       expect(response.body).toMatchObject({ error: { code: -32603, message: 'Internal MCP server error.' } });
       expect(JSON.stringify(response)).not.toContain(sentinel);
-      await service.handleExternalJsonRpc('not-a-real-token', { jsonrpc: '2.0', id: 'private-external-id-sentinel', method: 'tools/list' });
+      await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 'private-external-id-sentinel', method: 'tools/list' });
       await audit.flush();
       expect(stored).toHaveLength(2);
       expect(stored[0]?.correlationId).not.toBe(stored[1]?.correlationId);
-      expect(JSON.stringify(stored)).not.toMatch(/private-external-id-sentinel|private-token-path-prompt-sentinel|not-a-real-token/);
+      expect(JSON.stringify(stored)).not.toMatch(/private-external-id-sentinel|private-token-path-prompt-sentinel/);
     } finally { await service.shutdown(); }
   });
 
@@ -101,14 +101,14 @@ describe('Agent room history tool visibility', () => {
     await denied.service.shutdown();
   });
 
-  it('never puts the history tool in the external definitions or lists it for an external token', async () => {
+  it('never puts the history tool in the external definitions or lists it for the external client', async () => {
     expect(MCP_TOOL_DEFINITIONS.map((definition) => definition.name as string)).not.toContain('query_agent_room_history');
     const tokens = {
-      executeWithVerifiedToken: async (input: { execute: (context: { toolScopes: string[] }) => Promise<{ data: unknown }> }) =>
+      executeLocalClientRead: async (input: { execute: (context: { toolScopes: string[] }) => Promise<{ data: unknown }> }) =>
         (await input.execute({ toolScopes: ['list_targets', 'query_agent_room_history'] })).data,
     } as unknown as McpTokenRepository;
     const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository });
-    const response = await service.handleExternalJsonRpc('token', { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    const response = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
     expect((response.body as { result: { tools: Array<{ name: string }> } }).result.tools.map((tool) => tool.name)).toEqual(['list_targets']);
     await service.shutdown();
   });
@@ -143,10 +143,10 @@ describe('Agent room history tool visibility', () => {
 describe('external MCP control and approval errors', () => {
   const externalError = async (code: 'CONTROL_CHANGED' | 'APPROVAL_REQUIRED') => {
     const tokens = {
-      executeWithVerifiedToken: async () => { throw new McpDomainError(code, 'domain error'); },
+      executeLocalClientRead: async () => { throw new McpDomainError(code, 'domain error'); },
     } as unknown as McpTokenRepository;
     const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository });
-    const response = await service.handleExternalJsonRpc('valid-token', {
+    const response = await service.handleExternalJsonRpc({
       jsonrpc: '2.0', id: 9, method: 'tools/call',
       params: { name: 'list_targets', arguments: {} },
     });
@@ -176,7 +176,7 @@ describe('internal request_permission prompt tool', () => {
       verifyInternalAgent: async () => allPermissions('ALLOW'),
       verifyInternalAgentAccess: async () => ({ permissions: allPermissions('ALLOW'), roomHistory: false }),
       recordAudit: async (entry: Record<string, unknown>) => { audits.push(entry); },
-      executeWithVerifiedToken: async (input: { execute: () => Promise<{ data: unknown }> }) => input.execute(),
+      executeLocalClientRead: async (input: { execute: () => Promise<{ data: unknown }> }) => input.execute(),
     } as unknown as McpTokenRepository;
     const repository = {
       getExecutionPolicy: async () => ({ level: 'workspace_write', approvalTimeoutSeconds: 60, timeoutAction: 'DENY', version: 1, updatedAt: new Date(0).toISOString() }),
@@ -292,7 +292,7 @@ describe('internal request_permission prompt tool', () => {
 
   it('is not callable through the external MCP path', async () => {
     const h = approvalHarness();
-    const response = await h.service.handleExternalJsonRpc('la_mcp_' + 'A'.repeat(43), {
+    const response = await h.service.handleExternalJsonRpc({
       jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'request_permission', arguments: { tool_name: 'Bash', input: { command: 'ls' } } },
     });
     expect(response.httpStatus).toBe(400);

@@ -14,8 +14,9 @@ async function listen(handler: (request: import('node:http').IncomingMessage, re
   if (!address || typeof address === 'string') throw new Error('Unexpected fake server address');
   return { server, url: `http://127.0.0.1:${address.port}/mcp` };
 }
-function launch(url: string): ChildProcess {
-  const child = spawn(process.execPath, [bridgePath], { env: { ...process.env, LINEJS_MCP_URL: url, LINEJS_MCP_TOKEN: 'la_mcp_test-token' }, stdio: ['pipe', 'pipe', 'pipe'] });
+function launch(url: string, extraEnv: Record<string, string> = {}): ChildProcess {
+  const { LINEJS_MCP_TOKEN: _ignored, ...inherited } = process.env;
+  const child = spawn(process.execPath, [bridgePath], { env: { ...inherited, LINEJS_MCP_URL: url, ...extraEnv }, stdio: ['pipe', 'pipe', 'pipe'] });
   children.push(child);
   return child;
 }
@@ -47,7 +48,7 @@ afterEach(async () => {
 });
 
 describe('stdio MCP bridge', () => {
-  it('forwards initialize, tools/list, and tools/call FIFO with bearer and session headers', async () => {
+  it('forwards initialize, tools/list, and tools/call FIFO with session headers and no Authorization header', async () => {
     const received: Array<{ body: any; authorization?: string; session?: string }> = [];
     const { url } = await listen((request, response) => {
       let body = '';
@@ -70,13 +71,33 @@ describe('stdio MCP bridge', () => {
       expect(JSON.parse(await output.next())).toMatchObject({ id, result: { method } });
     }
     expect(received.map(({ authorization, session }) => ({ authorization, session }))).toEqual([
-      { authorization: 'Bearer la_mcp_test-token', session: undefined },
-      { authorization: 'Bearer la_mcp_test-token', session: 'session-123' },
-      { authorization: 'Bearer la_mcp_test-token', session: 'session-123' },
+      { authorization: undefined, session: undefined },
+      { authorization: undefined, session: 'session-123' },
+      { authorization: undefined, session: 'session-123' },
     ]);
     child.stdin!.end();
     await new Promise<void>((resolve) => child.once('exit', () => resolve()));
-    expect(output.all.join('\n')).not.toContain('la_mcp_test-token');
+  });
+
+  it('starts without LINEJS_MCP_TOKEN and never sends it, even when an old config still sets it', async () => {
+    const received: Array<string | undefined> = [];
+    const { url } = await listen((request, response) => {
+      let body = ''; request.setEncoding('utf8'); request.on('data', (chunk) => { body += chunk; }); request.on('end', () => {
+        received.push(request.headers.authorization);
+        response.setHeader('Content-Type', 'application/json');
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: JSON.parse(body).id, result: {} }));
+      });
+    });
+    for (const extraEnv of [{}, { LINEJS_MCP_TOKEN: 'la_mcp_old-config-value' }]) {
+      const child = launch(url, extraEnv);
+      const output = readLines(child);
+      child.stdin!.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' })}\n`);
+      expect(JSON.parse(await output.next())).toMatchObject({ id: 1, result: {} });
+      child.stdin!.end();
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      expect(output.all.join('\n')).not.toContain('la_mcp_old-config-value');
+    }
+    expect(received).toEqual([undefined, undefined]);
   });
 
   it('maps HTTP failures, connection refusal, oversize input, notifications, and non-loopback URLs', async () => {

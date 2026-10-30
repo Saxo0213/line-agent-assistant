@@ -482,7 +482,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
             ? {} : { value: percent(account.externalImportProgress.copiedBytes, account.externalImportProgress.totalBytes) })} />
           <p>{account.externalImportProgress.copiedBytes ?? '—'} / {account.externalImportProgress.totalBytes ?? desktopText('totalUnknown')} bytes</p>
         </>}
-        {['counting_rows', 'importing_history', 'syncing', 'monitoring', 'complete'].includes(account.externalImportProgress.stage) && <>
+        {['counting_rows', 'importing_history'].includes(account.externalImportProgress.stage) && <>
           <progress aria-label={desktopText('messageHistoryImportProgress')} max={100} {...(percent(account.externalImportProgress.committedRows, account.externalImportProgress.eligibleRows) === undefined
             ? {} : { value: percent(account.externalImportProgress.committedRows, account.externalImportProgress.eligibleRows) })} />
           <p>{desktopText('committed')}{account.externalImportProgress.committedRows} / {account.externalImportProgress.eligibleRows ?? desktopText('totalUnknown445')} {desktopText('messages')}</p>
@@ -578,27 +578,26 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     {embedded && <section className="panel external-monitor-card" aria-label={desktopText('externalMonitoring')}><h2>{desktopText('externalMonitoring')}</h2>
       {admin ? <>
         <p>{desktopText('lastSynced')}{admin.lastSyncedAt ? new Date(admin.lastSyncedAt).toLocaleString(locale) : desktopText('notSyncedYet')}</p>
-        {admin.officialLineBuild && <section className="official-line-build" aria-label={desktopText('lineVersionStatus')}>
-          <p role={admin.officialLineBuild.status === 'accepted' || admin.officialLineBuild.status === 'candidate' ? 'status' : 'alert'}>
-            {desktopText('lineVersion')}{admin.officialLineBuild.version ?? desktopText('unknown')}（{officialBuildText[admin.officialLineBuild.status]}）
-          </p>
-          {admin.officialLineBuild.status === 'rotation' && <div className="action-with-status"><button disabled={approvingSigner} onClick={() => void approveOfficialSigner()}>{approvingSigner ? desktopText('confirmingNewCertificate') : desktopText('confirmNewCertificate')}</button>{approvingSigner && <InlineBusy>{desktopText('confirmingCertificate')}</InlineBusy>}</div>}
+        {(admin.officialLineBuild || admin.hasVerifiedLineIdentity === true) && <section className="official-line-build" aria-label={desktopText('lineVersionStatus')}>
+          <div className="external-monitor-version-row">
+            {admin.officialLineBuild && <p role={admin.officialLineBuild.status === 'accepted' || admin.officialLineBuild.status === 'candidate' ? 'status' : 'alert'}>
+              {desktopText('lineVersion')}{admin.officialLineBuild.version ?? desktopText('unknown')}（{officialBuildText[admin.officialLineBuild.status]}）
+            </p>}
+            {admin.hasVerifiedLineIdentity === true && externalMonitorAction(admin, true)}
+          </div>
+          {admin.officialLineBuild?.status === 'rotation' && <div className="action-with-status"><button disabled={approvingSigner} onClick={() => void approveOfficialSigner()}>{approvingSigner ? desktopText('confirmingNewCertificate') : desktopText('confirmNewCertificate')}</button>{approvingSigner && <InlineBusy>{desktopText('confirmingCertificate')}</InlineBusy>}</div>}
         </section>}
         {admin.externalImportProgress && <section className="external-import-progress" aria-label={desktopText('lineHistoryImportProgress')}>
           {admin.externalImportProgress.stage !== 'monitoring' && <h3>{importStageLabel[admin.externalImportProgress.stage]}</h3>}
           {admin.externalImportProgress.stage === 'copying_snapshot' && <><progress aria-label={desktopText('snapshotCopyProgress')} max={100} {...(percent(admin.externalImportProgress.copiedBytes, admin.externalImportProgress.totalBytes) === undefined ? {} : { value: percent(admin.externalImportProgress.copiedBytes, admin.externalImportProgress.totalBytes) })} /><p>{admin.externalImportProgress.copiedBytes ?? '—'} / {admin.externalImportProgress.totalBytes ?? desktopText('totalUnknown')} bytes</p></>}
-          {['counting_rows', 'importing_history', 'syncing', 'monitoring', 'complete'].includes(admin.externalImportProgress.stage) && <>
+          {['counting_rows', 'importing_history'].includes(admin.externalImportProgress.stage) && <>
             <div className="external-monitor-layout">
-              {['counting_rows', 'importing_history'].includes(admin.externalImportProgress.stage) && <progress aria-label={desktopText('messageHistoryImportProgress')} max={100} {...(percent(admin.externalImportProgress.committedRows, admin.externalImportProgress.eligibleRows) === undefined ? {} : { value: percent(admin.externalImportProgress.committedRows, admin.externalImportProgress.eligibleRows) })} />}
-              <div className="external-monitor-count-row">
-                <p className="external-monitor-count">{desktopText('committed')}{admin.externalImportProgress.committedRows} / {admin.externalImportProgress.eligibleRows ?? desktopText('totalUnknown445')} {desktopText('messages')}</p>
-                {admin.hasVerifiedLineIdentity === true && externalMonitorAction(admin, true)}
-              </div>
+              <progress aria-label={desktopText('messageHistoryImportProgress')} max={100} {...(percent(admin.externalImportProgress.committedRows, admin.externalImportProgress.eligibleRows) === undefined ? {} : { value: percent(admin.externalImportProgress.committedRows, admin.externalImportProgress.eligibleRows) })} />
+              <p className="external-monitor-count">{desktopText('committed')}{admin.externalImportProgress.committedRows} / {admin.externalImportProgress.eligibleRows ?? desktopText('totalUnknown445')} {desktopText('messages')}</p>
             </div>
           </>}
           {admin.externalImportProgress.message && (() => { const described = describeExternalImportMessage(admin.externalImportProgress.message, locale); return <p role={admin.externalImportProgress.stage === 'failed' ? 'alert' : 'status'}>{described.text}{described.code && <small className="error-code"> （{described.code}）</small>}</p>; })()}
         </section>}
-        {admin.hasVerifiedLineIdentity === true && (!admin.externalImportProgress || !['counting_rows', 'importing_history', 'syncing', 'monitoring', 'complete'].includes(admin.externalImportProgress.stage)) && externalMonitorAction(admin)}
       </> : <p>{desktopText('logInToThePrimaryAdminAccountToConfigure')}</p>}
     </section>}
     {!onNotice && status && <div role="status" className="system-toast">{generatedMessageText(status)}</div>}

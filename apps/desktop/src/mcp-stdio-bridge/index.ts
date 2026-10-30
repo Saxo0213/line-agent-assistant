@@ -18,8 +18,7 @@ function idFromPrefix(line: string): JsonRpcId {
 
 export async function runBridge(env: NodeJS.ProcessEnv, input = stdin, output = stdout): Promise<void> {
   const endpointText = env.LINEJS_MCP_URL;
-  const token = env.LINEJS_MCP_TOKEN;
-  if (!endpointText || !token) throw new Error('LINEJS_MCP_URL and LINEJS_MCP_TOKEN are required.');
+  if (!endpointText) throw new Error('LINEJS_MCP_URL is required.');
   const endpoint = new URL(endpointText);
   if (endpoint.hostname !== '127.0.0.1' || endpoint.protocol !== 'http:') throw new Error('MCP bridge only accepts an http URL on 127.0.0.1.');
   let sessionId: string | null = null;
@@ -43,7 +42,6 @@ export async function runBridge(env: NodeJS.ProcessEnv, input = stdin, output = 
     const timer = setTimeout(() => controller.abort(new Error('Request timed out.')), REQUEST_TIMEOUT_MS);
     try {
       const headers: Record<string, string> = {
-        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
       };

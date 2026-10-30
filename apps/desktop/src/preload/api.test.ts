@@ -85,24 +85,13 @@ describe('sandbox preload API', () => {
     expect(calls[0]).not.toHaveProperty('path');
   });
 
-  it.each([{ mode: 'never' }, { mode: 'limited', hours: 168 }] as const)('forwards $mode expiration without legacy or hidden hours and accepts nullable summaries', async (expiration) => {
-    const calls: unknown[] = [];
-    const token = { tokenId: '11111111-1111-4111-8111-111111111111', principalId: 'external:fixture', deviceLabel: 'Fixture',
-      accountScopes: ['account-A'], toolScopes: ['list_targets'], grantVersion: 1, state: 'ACTIVE',
-      expiresAt: expiration.mode === 'never' ? null : '2026-10-25T00:00:00.000Z', revokedAt: null, lastUsedAt: null,
-      createdAt: '2026-10-18T00:00:00.000Z' };
-    const api = createDesktopApi({ async invoke(_channel, payload) {
-      calls.push(payload);
-      return { type: 'mcpIssueToken', requestId: (payload as { requestId: string }).requestId, ok: true,
-        token, plaintextToken: 'la_mcp_' + 'A'.repeat(43) };
-    }, on() {}, removeListener() {} });
-    expect((await api.mcpIssueToken({ deviceLabel: 'Fixture', accountScopes: ['account-A'], toolScopes: ['list_targets'], expiration })).token.expiresAt).toBe(token.expiresAt);
-    expect(calls).toEqual([{ type: 'mcpIssueToken', requestId: expect.any(String), deviceLabel: 'Fixture',
-      accountScopes: ['account-A'], toolScopes: ['list_targets'], expiration }]);
+  it('has no MCP token issue, list, or revoke call', () => {
+    const api = createDesktopApi({ async invoke() { return {}; }, on() {}, removeListener() {} }) as unknown as Record<string, unknown>;
+    for (const name of ['mcpIssueToken', 'mcpListTokens', 'mcpRevokeToken']) expect(api[name]).toBeUndefined();
   });
   it('keeps local MCP config paths and credentials out of IPC results', async () => {
     const calls: unknown[] = [];
-    const status = { client: 'claude-desktop', installed: true, connected: true, tokenId: '11111111-1111-4111-8111-111111111111', accountScopes: ['account-A'] };
+    const status = { client: 'claude-desktop', installed: true, connected: true };
     const api = createDesktopApi({ async invoke(_channel, payload) {
       calls.push(payload);
       const request = payload as { requestId: string; type: string };
@@ -111,11 +100,11 @@ describe('sandbox preload API', () => {
       return { type: request.type, requestId: request.requestId, ok: true, status };
     }, on() {}, removeListener() {} });
     await expect(api.mcpLocalClientStatus()).resolves.toEqual([status]);
-    await expect(api.mcpLocalClientConnect('claude-desktop', ['account-A'])).resolves.toEqual(status);
+    await expect(api.mcpLocalClientConnect('claude-desktop')).resolves.toEqual(status);
     await api.mcpLocalClientDisconnect('codex');
     expect(calls).toEqual([
       { type: 'mcpLocalClientStatus', requestId: expect.any(String) },
-      { type: 'mcpLocalClientConnect', client: 'claude-desktop', accountScopes: ['account-A'], requestId: expect.any(String) },
+      { type: 'mcpLocalClientConnect', client: 'claude-desktop', requestId: expect.any(String) },
       { type: 'mcpLocalClientDisconnect', client: 'codex', requestId: expect.any(String) },
     ]);
   });
@@ -124,7 +113,7 @@ describe('sandbox preload API', () => {
       return { type: 'error', requestId: (payload as { requestId: string }).requestId, ok: false,
         code: 'LOCAL_MCP_CONFIG_CONFLICT', message: 'Codex config conflict', retryable: false };
     }, on() {}, removeListener() {} });
-    await expect(api.mcpLocalClientConnect('codex', ['account-A'])).rejects.toMatchObject({ name: 'LOCAL_MCP_CONFIG_CONFLICT' });
+    await expect(api.mcpLocalClientConnect('codex')).rejects.toMatchObject({ name: 'LOCAL_MCP_CONFIG_CONFLICT' });
   });
   it('exposes only bounded system activity and error reads', async () => {
     const calls: unknown[] = [];

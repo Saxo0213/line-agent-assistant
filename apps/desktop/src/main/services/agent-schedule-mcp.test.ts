@@ -234,14 +234,14 @@ describe('schedule tools (mocked repository)', () => {
     }
     const handler = fakeHandler();
     const tokens = {
-      executeWithVerifiedToken: async (input: { execute: (context: unknown) => Promise<{ data: unknown }> }) =>
+      executeLocalClientRead: async (input: { execute: (context: unknown) => Promise<{ data: unknown }> }) =>
         (await input.execute({ toolScopes: ['list_targets', 'query_target_messages'] })).data,
     } as never;
     const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository, schedules: handler });
-    const listed = await service.handleExternalJsonRpc('la_mcp_x', { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    const listed = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
     expect(JSON.stringify(listed.body)).not.toContain('_schedule');
     for (const name of SCHEDULE_TOOL_NAMES) {
-      const called = await service.handleExternalJsonRpc('la_mcp_x', { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
+      const called = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
       expect(called.httpStatus).toBe(400);
       expect(JSON.stringify(called.body)).toContain('Unsupported MCP tool');
     }

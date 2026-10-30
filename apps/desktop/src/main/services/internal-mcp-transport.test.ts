@@ -126,11 +126,12 @@ database('internal Agent MCP capability transport', () => {
     } finally { await h.close(); }
   });
 
-  it('rejects unknown, external-format, wrong-instance, and spoofed capabilities', async () => {
+  it('rejects unknown, wrong-instance, and spoofed li_job_ capabilities and routes other bearer values to the external handler', async () => {
     const h = await harness();
     try {
       const job = await runningJob();
-      expect((await h.rpc(null, 'tools/list')).status).toBe(401);
+      // No bearer value goes to the external handler. This fixture has no AGENT or PRIMARY_ADMIN account, so it refuses with 403, not 401.
+      expect((await h.rpc(null, 'tools/list')).status).toBe(403);
       const unknownBefore = await auditCount('AUTH_INVALID', null);
       const unknown = 'li_job_' + 'A'.repeat(43);
       expect((await h.rpc(unknown, 'tools/list')).status).toBe(401);
@@ -139,8 +140,10 @@ database('internal Agent MCP capability transport', () => {
       expect(leaked.rows[0].n).toBe(0);
       const foreign = h.service.internalCapabilities.mint({ ...job, endpointInstance: 'another-listener' }).token;
       expect((await h.rpc(foreign, 'tools/list')).status).toBe(401);
-      // An internal capability is not an external token and vice versa.
-      expect((await h.rpc('la_mcp_' + 'A'.repeat(43), 'tools/list')).status).toBe(401);
+      // An old la_mcp_ bearer value is ignored: the request goes to the external handler (403 here), never to the internal one.
+      const legacy = await h.rpc('la_mcp_' + 'A'.repeat(43), 'tools/list');
+      expect(legacy.status).toBe(403);
+      expect(JSON.stringify(legacy.body)).not.toMatch(/request_permission|query_agent_room_history|send_to_target/);
     } finally { await h.close(); }
   });
 

@@ -32,7 +32,7 @@ function createService(options: { externalScopes?: McpToolName[]; externalAccoun
       return (await input.execute({ client: db, principalId: 'internal:chat_scoped', authorizedAccountIds: ['acc-a'],
         conversationScope: own, extraConversationScopes: [linked], ownLineNamesOnly: true })).data;
     },
-    executeWithVerifiedToken: async (input: { toolName: McpToolName | null; requestedAccountId?: string; execute(context: unknown): Promise<{ data: unknown }> }) => {
+    executeLocalClientRead: async (input: { toolName: McpToolName | null; requestedAccountId?: string; execute(context: unknown): Promise<{ data: unknown }> }) => {
       if (input.toolName && !((options.externalScopes ?? []).includes(input.toolName))) throw new McpDomainError('SCOPE_DENIED', 'Tool scope denied.');
       if (input.requestedAccountId && !(options.externalAccounts ?? []).includes(input.requestedAccountId)) throw new McpDomainError('SCOPE_DENIED', 'Account scope denied.');
       return (await input.execute({ client: db, authorizedAccountIds: options.externalAccounts ?? [], toolScopes: options.externalScopes ?? [] })).data;
@@ -58,35 +58,35 @@ describe('MCP archived chat resource tools', () => {
     await internal.service.shutdown();
 
     const external = createService({ externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'] });
-    const externalResponse = await external.service.handleExternalJsonRpc('bearer', { jsonrpc: '2.0', id: 2, method: 'tools/call',
+    const externalResponse = await external.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 2, method: 'tools/call',
       params: { name: 'list_chat_notes', arguments: own } });
     expect(externalResponse.httpStatus).toBe(200);
     expect((externalResponse.body as any).result.structuredContent).toMatchObject({ toolName: 'list_chat_notes', notes: [{ noteId: 'n1' }] });
     await external.service.shutdown();
   });
 
-  it('discovers new tools only when a reader is wired and the external token has explicit grants', async () => {
+  it('discovers new tools only when a reader is wired and the external tool scope includes them', async () => {
     const withReader = createService({ externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'] });
-    const external = await withReader.service.handleExternalJsonRpc('bearer', { jsonrpc: '2.0', id: 8, method: 'tools/list' });
+    const external = await withReader.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 8, method: 'tools/list' });
     expect((external.body as any).result.tools.map((tool: { name: string }) => tool.name)).toContain('list_chat_notes');
     const internal = await withReader.service.handleInternalJsonRpc(withReader.token, 'endpoint', { jsonrpc: '2.0', id: 9, method: 'tools/list' });
     expect((internal.body as any).result.tools.map((tool: { name: string }) => tool.name)).toContain('list_chat_notes');
     await withReader.service.shutdown();
 
     const noReader = createService({ externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'], reader: null });
-    const hidden = await noReader.service.handleExternalJsonRpc('bearer', { jsonrpc: '2.0', id: 10, method: 'tools/list' });
+    const hidden = await noReader.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 10, method: 'tools/list' });
     expect((hidden.body as any).result.tools.map((tool: { name: string }) => tool.name)).not.toContain('list_chat_notes');
     await noReader.service.shutdown();
   });
 
-  it('denies cross-account, out-of-scope, and old-token requests before filesystem lookup', async () => {
+  it('denies cross-account and out-of-scope-tool requests before filesystem lookup', async () => {
     const external = createService({ externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'] });
-    const crossAccount = await external.service.handleExternalJsonRpc('bearer', { jsonrpc: '2.0', id: 1, method: 'tools/call',
+    const crossAccount = await external.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/call',
       params: { name: 'list_chat_notes', arguments: { ...own, accountId: 'acc-b' } } });
-    const oldToken = await external.service.handleExternalJsonRpc('bearer', { jsonrpc: '2.0', id: 2, method: 'tools/call',
+    const outOfScopeTool = await external.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 2, method: 'tools/call',
       params: { name: 'get_chat_note', arguments: { ...own, noteId: 'n1' } } });
     expect(crossAccount.httpStatus).toBe(403);
-    expect(oldToken.httpStatus).toBe(403);
+    expect(outOfScopeTool.httpStatus).toBe(403);
     expect(external.reader.listNotes).not.toHaveBeenCalled();
     expect(external.reader.getNote).not.toHaveBeenCalled();
     await external.service.shutdown();
@@ -103,7 +103,7 @@ describe('MCP archived chat resource tools', () => {
     await internal.service.shutdown();
 
     const loggedOut = createService({ externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'], liveLogin: false });
-    const offline = await loggedOut.service.handleExternalJsonRpc('bearer', { jsonrpc: '2.0', id: 5, method: 'tools/call',
+    const offline = await loggedOut.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 5, method: 'tools/call',
       params: { name: 'list_chat_notes', arguments: own } });
     expect(offline.httpStatus).toBe(403);
     expect(loggedOut.reader.listNotes).not.toHaveBeenCalled();
@@ -119,7 +119,7 @@ describe('MCP archived chat resource tools', () => {
       getBinding: async () => ++checks < 2 ? ({ accountId: 'acc-a', workerInstanceId: 'worker-a', controlEpoch: 1 }) : null });
     const call = kind === 'internal'
       ? service.service.handleInternalJsonRpc(service.token, 'endpoint', { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } })
-      : service.service.handleExternalJsonRpc('bearer', { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } });
+      : service.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } });
     await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
     finish({ notes: [{ noteId: 'secret-note' }], nextCursor: null, savedAt: '2026-10-23T00:00:00.000Z' });
     const response = await call;
@@ -136,7 +136,7 @@ describe('MCP archived chat resource tools', () => {
       getBinding: async () => ({ accountId: 'acc-a', workerInstanceId: ++checks < 2 ? 'worker-a' : 'worker-b', controlEpoch: 1 }) });
     const call = kind === 'internal'
       ? service.service.handleInternalJsonRpc(service.token, 'endpoint', { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } })
-      : service.service.handleExternalJsonRpc('bearer', { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } });
+      : service.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } });
     await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
     finish({ notes: [{ noteId: 'secret-note' }], nextCursor: null, savedAt: '2026-10-23T00:00:00.000Z' });
     const response = await call;

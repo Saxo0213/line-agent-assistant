@@ -151,6 +151,19 @@ export class McpHttpServer {
       return;
     }
 
+    // A browser adds Origin to a cross-site request. A local MCP client does not send it.
+    if (req.headers.origin !== undefined) {
+      this.rejectForbidden(req, res, 'Cross-origin requests are not allowed.');
+      return;
+    }
+    // The Host header must name this listener. This stops DNS rebinding.
+    const port = this.boundPort;
+    const host = req.headers.host?.toLowerCase();
+    if (port === null || (host !== `${MCP_HTTP_HOST}:${port}` && host !== `localhost:${port}`)) {
+      this.rejectForbidden(req, res, 'Host header is not allowed.');
+      return;
+    }
+
     const url = new URL(req.url ?? '/', `http://${MCP_HTTP_HOST}`);
     if (url.pathname !== '/mcp') {
       this.sendJson(res, 404, {
@@ -232,24 +245,26 @@ export class McpHttpServer {
         return;
       }
 
+      // Only a built-in Agent job token is read. Any other bearer value is ignored.
       const authHeader = req.headers.authorization;
       const bearerMatch =
         typeof authHeader === 'string' ? /^Bearer\s+(.+)$/i.exec(authHeader.trim()) : null;
-      const bearerToken = bearerMatch?.[1]?.trim() ?? null;
+      const bearerValue = bearerMatch?.[1]?.trim() ?? null;
+      const internalToken = bearerValue?.startsWith(INTERNAL_MCP_TOKEN_PREFIX) ? bearerValue : null;
 
       // A built-in Agent permission prompt waits for the operator, bounded by the broker's policy timeout (<= 900 s);
       // only that internal call gets the longer backstop. Every other request keeps the short deadline.
-      if (bearerToken?.startsWith(INTERNAL_MCP_TOKEN_PREFIX) && isPermissionPromptCall(parsedBody) && timer) {
+      if (internalToken && isPermissionPromptCall(parsedBody) && timer) {
         clearTimeout(timer);
         timer = setTimeout(onTimeout, this.approvalRequestTimeoutMs);
-      } else if (bearerToken?.startsWith(INTERNAL_MCP_TOKEN_PREFIX) && isSendToTargetCall(parsedBody) && timer) {
+      } else if (internalToken && isSendToTargetCall(parsedBody) && timer) {
         clearTimeout(timer);
         timer = setTimeout(onTimeout, this.sendRequestTimeoutMs);
       }
 
-      const response = bearerToken?.startsWith(INTERNAL_MCP_TOKEN_PREFIX)
-        ? await this.mcpService.handleInternalJsonRpc(bearerToken, this.instanceId, parsedBody, controller.signal)
-        : await this.mcpService.handleExternalJsonRpc(bearerToken, parsedBody, controller.signal);
+      const response = internalToken
+        ? await this.mcpService.handleInternalJsonRpc(internalToken, this.instanceId, parsedBody, controller.signal)
+        : await this.mcpService.handleExternalJsonRpc(parsedBody, controller.signal);
       if (res.writableEnded) return;
       if (response.body === null) {
         res.statusCode = response.httpStatus;
@@ -271,6 +286,15 @@ export class McpHttpServer {
       this.inFlightResponses.delete(res);
       this.inFlightControllers.delete(controller);
     }
+  }
+
+  private rejectForbidden(req: IncomingMessage, res: ServerResponse, message: string): void {
+    this.sendJson(res, 403, {
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32600, message },
+    });
+    req.resume();
   }
 
   private readBoundedBody(req: IncomingMessage): Promise<string | null> {

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MCP_TOOL_EFFECTS, MCP_TOOL_NAMES } from '@line-agent/contracts';
 import type { Pool } from 'pg';
@@ -32,16 +32,10 @@ database('managed MCP scopes across real Agent replacement', () => {
     await accounts.bindPrimaryAdministrator(agentId, adminMid, adminMid);
   });
   afterEach(async () => { await close?.(); });
-  const read = (bearerToken: string, requestedAccountId?: string) => tokens.executeWithVerifiedToken({
-    bearerToken, toolName: 'list_targets', requestedAccountId,
+  const read = (requestedAccountId?: string) => tokens.executeLocalClientRead({
+    toolName: 'list_targets', ...(requestedAccountId ? { requestedAccountId } : {}),
     execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }),
   });
-  const legacy = async () => {
-    const token = await tokens.issueToken({ deviceLabel: 'Legacy Agent only', accountScopes: [agentId],
-      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    await pool.query("UPDATE mcp_agent_tokens SET principal_id='local-client:codex' WHERE token_id=$1", [token.token.tokenId]);
-    return token;
-  };
   const replace = async () => {
     const replaced = await accounts.replaceAgentAccount(agentId, (await accounts.getControlState()).controlEpoch);
     if (!replaced.ok) throw new Error(replaced.code);
@@ -49,64 +43,23 @@ database('managed MCP scopes across real Agent replacement', () => {
     return replaced.account.accountId;
   };
 
-  it.each(['request-first', 'replacement-first'] as const)('preserves the original Agent-only bearer without opening Settings (%s)', async (order) => {
-    const issued = await legacy();
-    const external = await tokens.issueToken({ deviceLabel: 'Historical external grant', accountScopes: [agentId],
-      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    if (order === 'request-first') expect(await read(issued.plaintextToken)).toEqual([agentId]);
+  it.each(['request-first', 'replacement-first'] as const)('resolves the AGENT role to the replacement account without a token (%s)', async (order) => {
+    if (order === 'request-first') expect(await read()).toContain(agentId);
     const replacementId = await replace();
-    expect(await read(issued.plaintextToken, replacementId)).toEqual([replacementId]);
-    await expect(read(issued.plaintextToken, agentId)).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
-    const once = (await tokens.listTokens()).find((token) => token.tokenId === issued.token.tokenId)!;
-    expect(once).toMatchObject({ state: 'ACTIVE', accountScopes: ['role:AGENT'] });
-    await tokens.normalizeManagedLocalClientScopes();
-    expect((await tokens.listTokens()).find((token) => token.tokenId === once.tokenId)!.grantVersion).toBe(once.grantVersion);
-    expect(await read(external.plaintextToken, agentId)).toEqual([agentId]);
-    expect((await tokens.listTokens()).find((token) => token.tokenId === external.token.tokenId)!.accountScopes).toEqual([agentId]);
+    expect(await read(replacementId)).toEqual([replacementId]);
+    await expect(read(agentId)).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+    const afterReplace = await read();
+    expect(afterReplace).toContain(replacementId);
+    expect(afterReplace).not.toContain(agentId);
   });
 
-  it('recovers an already-retired scope using the real retirement revision after the administrator binding moved', async () => {
-    const issued = await tokens.issueToken({ deviceLabel: 'Pre-upgrade legacy token', accountScopes: [agentId],
-      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    const replacementId = await replace();
-    expect((await pool.query('SELECT role_revision FROM line_accounts WHERE account_id=$1', [agentId])).rows[0].role_revision).toBe('1');
-    // Model a managed token persisted by the old release, which did not normalize before retirement.
-    await pool.query("UPDATE mcp_agent_tokens SET principal_id='local-client:codex' WHERE token_id=$1", [issued.token.tokenId]);
-    expect(await read(issued.plaintextToken)).toEqual([replacementId]);
-    expect((await tokens.listTokens()).find((token) => token.tokenId === issued.token.tokenId))
-      .toMatchObject({ state: 'ACTIVE', accountScopes: ['role:AGENT'] });
-  });
-
-  it('rejects an obsolete result after the final token UPDATE waits while real replacement commits', async () => {
-    const issued = await tokens.issueToken({ deviceLabel: 'Blocked final fence', principalId: 'local-client:codex',
-      accountScopes: ['role:AGENT'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    const blocker = await pool.connect();
-    let request: Promise<unknown> | undefined;
-    try {
-      await blocker.query('BEGIN');
-      await blocker.query('SELECT token_id FROM mcp_agent_tokens WHERE token_id=$1 FOR UPDATE', [issued.token.tokenId]);
-      let reached!: (pid: number) => void;
-      const executed = new Promise<number>((resolve) => { reached = resolve; });
-      request = tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'list_targets',
-        execute: async ({ client }) => {
-          reached((await client.query<{ pid: number }>('SELECT pg_backend_pid() pid')).rows[0]!.pid);
-          return { data: 'obsolete account data' };
-        } });
-      void request.catch(() => undefined);
-      const pid = await executed;
-      await vi.waitFor(async () => {
-        const state = (await pool.query('SELECT wait_event_type,query FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0];
-        expect(state.wait_event_type).toBe('Lock');
-        expect(state.query).toContain('UPDATE mcp_agent_tokens');
-      });
-      await replace();
-      await blocker.query('COMMIT');
-      await expect(request).rejects.toMatchObject({ code: 'CONTROL_CHANGED' });
-    } finally {
-      await blocker.query('ROLLBACK').catch(() => undefined);
-      blocker.release();
-      await request?.catch(() => undefined);
-    }
+  it('rejects an obsolete result when a real replacement commits before the final authorization fence', async () => {
+    await expect(tokens.executeLocalClientRead({ toolName: 'list_targets',
+      execute: async ({ authorizedAccountIds }) => {
+        expect(authorizedAccountIds).toContain(agentId);
+        await replace();
+        return { data: 'obsolete account data' };
+      } })).rejects.toMatchObject({ code: 'CONTROL_CHANGED' });
   });
 
   it('finishes both-role MCP fencing alongside an Admin-source-Agent writer when the Agent ID sorts first', async () => {
@@ -120,8 +73,6 @@ database('managed MCP scopes across real Agent replacement', () => {
     await pool.query(`INSERT INTO line_account_sources(source_id,account_id,source_type,generation,identity_digest,
       verified_account_mid,state,read_capability,write_capability)
       VALUES($1,'z-admin','EXTERNAL_MONITOR',1,repeat('a',64),$2,'ACTIVE',true,false)`, [sourceId, adminMid]);
-    const issued = await tokens.issueToken({ deviceLabel: 'Both roles lock order', principalId: 'local-client:codex',
-      accountScopes: ['role:AGENT', 'role:PRIMARY_ADMIN'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
     const writer = await pool.connect();
     let request: Promise<unknown> | undefined;
     try {
@@ -131,7 +82,7 @@ database('managed MCP scopes across real Agent replacement', () => {
       await writer.query("SELECT account_id FROM line_accounts WHERE account_id='z-admin' FOR UPDATE");
       let reached!: (pid: number) => void;
       const executed = new Promise<number>((resolve) => { reached = resolve; });
-      request = tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'list_targets',
+      request = tokens.executeLocalClientRead({ toolName: 'list_targets',
         execute: async ({ client, authorizedAccountIds }) => {
           reached((await client.query<{ pid: number }>('SELECT pg_backend_pid() pid')).rows[0]!.pid);
           return { data: authorizedAccountIds };
@@ -153,81 +104,6 @@ database('managed MCP scopes across real Agent replacement', () => {
       await writer.query('ROLLBACK').catch(() => undefined);
       writer.release();
       await request?.catch(() => undefined);
-    }
-  });
-});
-
-database('MCP tool scope structure migration', () => {
-  it('accepts current tools, rejects invalid scopes, and keeps unknown stored tools non-executable', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'mcp-tool-scope-migration-'));
-    let close: (() => Promise<void>) | undefined;
-    try {
-      for (const migration of await loadMigrations()) {
-        if (migration.name !== '057_mcp_tool_scope_structure.sql') await writeFile(join(directory, migration.name), migration.sql);
-      }
-      const migrated = await createTestDatabase(directory);
-      close = migrated.close;
-      await new AccountRepository(migrated.pool).ensureAccount('migration-account');
-      await migrate(migrated.pool);
-      const repository = new McpTokenRepository(migrated.pool);
-      const issued = await repository.issueToken({ deviceLabel: 'All external tools', accountScopes: ['migration-account'],
-        toolScopes: [...MCP_TOOL_NAMES], expiration: { mode: 'never' } });
-      expect(issued.token.toolScopes).toEqual([...MCP_TOOL_NAMES]);
-
-      await expect(repository.issueToken({ deviceLabel: 'Unknown', accountScopes: ['migration-account'],
-        toolScopes: ['future_tool' as never], expiration: { mode: 'never' } })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
-      await expect(repository.issueToken({ deviceLabel: 'Internal', accountScopes: ['migration-account'],
-        toolScopes: ['send_to_target' as never], expiration: { mode: 'never' } })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
-
-      await migrated.pool.query("UPDATE mcp_agent_tokens SET tool_scopes = ARRAY['future_tool']::text[] WHERE token_id = $1", [issued.token.tokenId]);
-      let executed = false;
-      await expect(repository.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'future_tool' as never,
-        execute: async () => { executed = true; return { data: 'must not run' }; } })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
-      expect(executed).toBe(false);
-
-      const invalidScopes = [[], [null], [''], Array.from({ length: 65 }, (_, index) => `tool_${index}`), ['x'.repeat(129)]];
-      for (const scopes of invalidScopes) {
-        await expect(migrated.pool.query(
-          `INSERT INTO mcp_agent_tokens (token_id, token_digest, principal_id, device_label, account_scopes, tool_scopes, expires_at)
-           VALUES ($1, $2, 'migration', 'invalid', ARRAY['migration-account'], $3::text[], now() + interval '1 day')`,
-          [randomUUID(), createHash('sha256').update(randomUUID()).digest(), scopes],
-        )).rejects.toThrow();
-      }
-    } finally {
-      await close?.();
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-});
-
-database('optional MCP expiry migration', () => {
-  it('preserves an existing expired finite token while enabling null expiry issuance', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'mcp-expiry-migration-'));
-    let close: (() => Promise<void>) | undefined;
-    try {
-      for (const migration of await loadMigrations()) {
-        if (migration.name !== '031_mcp_optional_token_expiry.sql') await writeFile(join(directory, migration.name), migration.sql);
-      }
-      const database = await createTestDatabase(directory);
-      close = database.close;
-      const repository = new McpTokenRepository(database.pool);
-      await new AccountRepository(database.pool).ensureAccount('migration-account');
-      const issued = await repository.issueToken({ deviceLabel: 'Existing finite', accountScopes: ['migration-account'],
-        toolScopes: ['list_targets'], expiration: { mode: 'limited', hours: 1 } });
-      await database.pool.query("UPDATE mcp_agent_tokens SET created_at = '2020-01-01T00:00:00Z', expires_at = '2020-01-02T00:00:00Z' WHERE token_id = $1", [issued.token.tokenId]);
-      await migrate(database.pool);
-      const restarted = new McpTokenRepository(database.pool);
-      expect((await restarted.listTokens())[0]?.expiresAt).toBe('2020-01-02T00:00:00.000Z');
-      expect(await restarted.countActiveTokens()).toBe(0);
-      await expect(restarted.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'list_targets',
-        execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'EXPIRED' });
-      expect(await restarted.revokeToken(issued.token.tokenId)).toBe(true);
-      expect((await restarted.issueToken({ deviceLabel: 'New unlimited', accountScopes: ['migration-account'],
-        toolScopes: ['list_targets'], expiration: { mode: 'never' } })).token.expiresAt).toBeNull();
-      expect(await restarted.countActiveTokens()).toBe(1);
-    } finally {
-      await close?.();
-      await rm(directory, { recursive: true, force: true });
     }
   });
 });
@@ -418,81 +294,38 @@ database('MCP token & audit repository and target/time message queries', () => {
     await close?.();
   });
 
-  it('enforces append-only mcp_agent_audit and stores only 32-byte SHA-256 token digests on issuance', async () => {
-    await expect(
-      tokens.issueToken({
-        deviceLabel: 'Invalid Scope Token',
-        accountScopes: ['non-existent-account'],
-        toolScopes: ['list_targets'],
-        expiration: { mode: 'limited', hours: 24 },
-      }),
-    ).rejects.toMatchObject({ code: 'MCP_INVALID_ACCOUNT_SCOPE' });
-
-    const issued = await tokens.issueToken({
-      deviceLabel: 'Workstation Agent',
-      principalId: 'external:workstation-1',
-      accountScopes: ['account-admin'],
-      toolScopes: ['list_targets', 'query_target_messages'],
-      expiration: { mode: 'limited', hours: 24 },
-    });
-
-    expect(issued.plaintextToken).toMatch(/^la_mcp_[A-Za-z0-9_-]{43}$/);
-    expect(issued.token.deviceLabel).toBe('Workstation Agent');
-    expect(issued.token.principalId).toBe('external:workstation-1');
-    expect(issued.token.grantVersion).toBe(1);
-    expect(issued.token.state).toBe('ACTIVE');
-
-    const storedRow = await pool.query<{ token_digest: Buffer }>(
-      'SELECT token_digest FROM mcp_agent_tokens WHERE token_id = $1',
-      [issued.token.tokenId],
-    );
-    const expectedDigest = createHash('sha256').update(issued.plaintextToken, 'utf8').digest();
-    expect(storedRow.rows[0]?.token_digest.equals(expectedDigest)).toBe(true);
-    expect(storedRow.rows[0]?.token_digest.byteLength).toBe(32);
-
-    const listed = await tokens.listTokens();
-    const found = listed.find((item) => item.tokenId === issued.token.tokenId);
-    expect(found).toBeDefined();
-    expect('plaintextToken' in (found as Record<string, unknown>)).toBe(false);
-    expect('tokenDigest' in (found as Record<string, unknown>)).toBe(false);
-
-    // Append-only trigger on mcp_agent_audit blocks UPDATE, DELETE, and TRUNCATE
+  it('keeps mcp_agent_audit append-only', async () => {
+    await tokens.recordAudit({ tokenId: null, principalId: 'local-client', initiator: 'external_agent', action: 'AUTH_REJECTED',
+      toolName: null, accountScopes: [], grantVersion: null, disposition: 'SCOPE_DENIED', resultCount: null });
     await expect(pool.query("UPDATE mcp_agent_audit SET disposition = 'REVOKED'")).rejects.toThrow(/append-only/i);
     await expect(pool.query('DELETE FROM mcp_agent_audit')).rejects.toThrow(/append-only/i);
     await expect(pool.query('TRUNCATE mcp_agent_audit')).rejects.toThrow(/append-only/i);
   });
 
-  it('persists unlimited expiry across readers while retaining finite expiry, scopes, audit and revocation', async () => {
-    const before = await tokens.countActiveTokens();
-    const unlimited = await tokens.issueToken({ deviceLabel: 'Unlimited', accountScopes: ['account-admin'],
-      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    const finite = await tokens.issueToken({ deviceLabel: 'Finite', accountScopes: ['account-admin'],
-      toolScopes: ['list_targets'], expiration: { mode: 'limited', hours: 1 } });
-    expect(unlimited.token.expiresAt).toBeNull();
-    expect(finite.token.expiresAt).not.toBeNull();
-    const restarted = new McpTokenRepository(pool);
-    expect((await restarted.listTokens()).find((token) => token.tokenId === unlimited.token.tokenId)?.expiresAt).toBeNull();
-    expect(await restarted.countActiveTokens()).toBe(before + 2);
-    await expect(restarted.executeWithVerifiedToken({ bearerToken: unlimited.plaintextToken, toolName: 'list_targets',
-      execute: async () => ({ data: 'allowed', resultCount: 1 }) })).resolves.toBe('allowed');
-    await expect(restarted.executeWithVerifiedToken({ bearerToken: unlimited.plaintextToken, toolName: 'query_target_messages',
-      execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
-    await expect(restarted.executeWithVerifiedToken({ bearerToken: unlimited.plaintextToken, toolName: 'list_targets',
-      requestedAccountId: 'account-agent', execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
-    await pool.query("UPDATE mcp_agent_tokens SET created_at = clock_timestamp() - interval '2 hours', expires_at = clock_timestamp() - interval '1 hour' WHERE token_id = $1", [finite.token.tokenId]);
-    await expect(restarted.executeWithVerifiedToken({ bearerToken: finite.plaintextToken, toolName: 'list_targets',
-      execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'EXPIRED' });
-    expect(await restarted.countActiveTokens()).toBe(before + 1);
-    expect(await restarted.revokeToken(unlimited.token.tokenId)).toBe(true);
-    await expect(restarted.executeWithVerifiedToken({ bearerToken: unlimited.plaintextToken, toolName: 'list_targets',
-      execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'REVOKED' });
-    expect(await restarted.countActiveTokens()).toBe(before);
-    const summaries = await restarted.listTokens();
-    expect(summaries.find((token) => token.tokenId === unlimited.token.tokenId)).toMatchObject({ expiresAt: null, grantVersion: 2, state: 'REVOKED' });
-    expect(summaries.find((token) => token.tokenId === finite.token.tokenId)?.expiresAt).not.toBeNull();
-    expect(await restarted.revokeToken(finite.token.tokenId)).toBe(true);
-    expect((await restarted.listAuditRecords(30)).filter((row) => row.tokenId === unlimited.token.tokenId).map((row) => row.disposition))
-      .toEqual(expect.arrayContaining(['ISSUED', 'ALLOWED', 'SCOPE_DENIED', 'REVOKED_BY_OPERATOR', 'REVOKED']));
+  it('reads as the fixed local-client principal over the AGENT and PRIMARY_ADMIN accounts with no token and audits the call', async () => {
+    const seen = await tokens.executeLocalClientRead({ toolName: 'list_targets',
+      execute: async ({ principalId, authorizedAccountIds, toolScopes }) => ({ data: { principalId, authorizedAccountIds, toolScopes }, resultCount: 2 }) });
+    expect(seen).toEqual({ principalId: 'local-client', authorizedAccountIds: ['account-admin', 'account-agent'], toolScopes: [...MCP_TOOL_NAMES] });
+    const row = (await tokens.listAuditRecords(10)).find((entry) => entry.principalId === 'local-client' && entry.action === 'TOOL_CALLED');
+    expect(row).toMatchObject({ tokenId: null, initiator: 'external_agent', toolName: 'list_targets',
+      accountScopes: ['account-admin', 'account-agent'], grantVersion: null, disposition: 'ALLOWED', resultCount: 2 });
+    // A handshake method (toolName null) reads no tool and writes no TOOL_CALLED row.
+    const before = (await tokens.listAuditRecords(1000)).length;
+    await expect(tokens.executeLocalClientRead({ toolName: null, execute: async () => ({ data: true }) })).resolves.toBe(true);
+    expect((await tokens.listAuditRecords(1000)).length).toBe(before);
+  });
+
+  it('applies one shared rate limit and audits the refusal with a null token', async () => {
+    let allowed = 2;
+    const limiter = () => allowed-- > 0;
+    for (let index = 0; index < 2; index += 1) {
+      await expect(tokens.executeLocalClientRead({ toolName: 'list_targets', rateLimiter: limiter, execute: async () => ({ data: 'ok' }) })).resolves.toBe('ok');
+    }
+    const execute = vi.fn(async () => ({ data: 'unreachable' }));
+    await expect(tokens.executeLocalClientRead({ toolName: 'list_targets', rateLimiter: limiter, execute })).rejects.toMatchObject({ code: 'RATE_LIMITED' });
+    expect(execute).not.toHaveBeenCalled();
+    expect((await tokens.listAuditRecords(10)).some((row) => row.principalId === 'local-client' && row.tokenId === null
+      && row.action === 'AUTH_REJECTED' && row.disposition === 'RATE_LIMITED')).toBe(true);
   });
 
   it('classifies target and time queries by composite (accountId, chatType, chatId) and speaker without exposing raw or local room', async () => {
@@ -558,70 +391,51 @@ database('MCP token & audit repository and target/time message queries', () => {
     expect(oct15Only.map((item) => item.messageId)).toEqual(['msg-admin-1']);
   });
 
-  it('enforces cross-account and tool-scope isolation and commits AUTH_REJECTED audit rows', async () => {
-    const scoped = await tokens.issueToken({
-      deviceLabel: 'Scoped Reader',
-      accountScopes: ['account-admin'],
-      toolScopes: ['query_target_messages'],
-      expiration: { mode: 'limited', hours: 12 },
-    });
+  it('rejects an account outside the fixed role scopes, internal-only and unknown tools, and commits AUTH_REJECTED audit rows', async () => {
+    await accounts.ensureAccount('account-outside-roles');
+    const execute = vi.fn(async () => ({ data: 'unreachable' }));
+    await expect(tokens.executeLocalClientRead({ toolName: 'query_target_messages', requestedAccountId: 'account-outside-roles', execute }))
+      .rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+    await expect(tokens.executeLocalClientRead({ toolName: 'query_target_messages', requestedAccountId: 'no-such-account', execute }))
+      .rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+    for (const toolName of ['list_send_targets', 'send_to_target', 'query_agent_room_history', 'future_tool'] as const) {
+      await expect(tokens.executeLocalClientRead({ toolName: toolName as never, execute })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+    }
+    expect(execute).not.toHaveBeenCalled();
 
-    // Calling ungranted tool query_target_messages_by_time is rejected with SCOPE_DENIED
-    await expect(
-      tokens.executeWithVerifiedToken({
-        bearerToken: scoped.plaintextToken,
-        toolName: 'query_target_messages_by_time',
-        execute: async () => ({ data: 'unreachable' }),
-      }),
-    ).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
-
-    // Requesting account-agent with a token scoped only to account-admin is rejected with SCOPE_DENIED
-    await expect(
-      tokens.executeWithVerifiedToken({
-        bearerToken: scoped.plaintextToken,
-        toolName: 'query_target_messages',
-        requestedAccountId: 'account-agent',
-        execute: async () => ({ data: 'unreachable' }),
-      }),
-    ).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
-
-    // Omitting accountId only grants authorizedAccountIds = ['account-admin'], never returning account-agent rows
-    const result = await tokens.executeWithVerifiedToken({
-      bearerToken: scoped.plaintextToken,
+    // Omitting accountId resolves to the role accounts, never to an account without a role.
+    const result = await tokens.executeLocalClientRead({
       toolName: 'query_target_messages',
       execute: async ({ client, authorizedAccountIds }) => {
-        const rows = await messages.queryTargetMessages(
-          { accountIds: authorizedAccountIds, target: 'group-alpha' },
-          client,
-        );
+        const rows = await messages.queryTargetMessages({ accountIds: authorizedAccountIds, target: 'group-alpha' }, client);
         return { data: rows, resultCount: rows.length };
       },
     });
-    expect(result.every((row) => row.accountId === 'account-admin')).toBe(true);
-    expect(result.some((row) => row.messageId === 'msg-agent-1')).toBe(false);
+    expect(new Set(result.map((row) => row.accountId))).toEqual(new Set(['account-admin', 'account-agent']));
+    // A requested account narrows the read to that account.
+    const narrowed = await tokens.executeLocalClientRead({
+      toolName: 'query_target_messages', requestedAccountId: 'account-admin',
+      execute: async ({ client, authorizedAccountIds }) => ({ data: await messages.queryTargetMessages({ accountIds: authorizedAccountIds, target: 'group-alpha' }, client) }),
+    });
+    expect(narrowed.every((row) => row.accountId === 'account-admin')).toBe(true);
+    expect(narrowed.some((row) => row.messageId === 'msg-agent-1')).toBe(false);
 
-    const audits = await tokens.listAuditRecords(10);
-    expect(
-      audits.some(
-        (row) =>
-          row.tokenId === scoped.token.tokenId &&
-          row.action === 'AUTH_REJECTED' &&
-          row.disposition === 'SCOPE_DENIED',
-      ),
-    ).toBe(true);
+    const audits = await tokens.listAuditRecords(30);
+    expect(audits.some((row) => row.tokenId === null && row.principalId === 'local-client' && row.action === 'AUTH_REJECTED'
+      && row.disposition === 'SCOPE_DENIED' && row.toolName === 'send_to_target')).toBe(true);
+    expect(audits.some((row) => row.tokenId === null && row.principalId === 'local-client' && row.action === 'AUTH_REJECTED'
+      && row.disposition === 'SCOPE_DENIED' && row.accountScopes.join() === 'account-outside-roles')).toBe(true);
   });
 
-  it('resolves a managed AGENT role selector to the replacement account before the protected read', async () => {
-    const scoped = await tokens.issueToken({ deviceLabel: 'Managed Agent', principalId: 'local-client:codex',
-      accountScopes: ['role:AGENT'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+  it('resolves the AGENT role to the replacement account before the protected read', async () => {
     await accounts.ensureAccount('account-agent-replacement');
     try {
       await pool.query("UPDATE line_accounts SET product_role = NULL, mode = 'MONITOR_ONLY' WHERE account_id = 'account-agent'");
       await pool.query("UPDATE line_accounts SET product_role = 'AGENT', mode = 'ACTIVE_CONTROL' WHERE account_id = 'account-agent-replacement'");
-      const resolved = await tokens.executeWithVerifiedToken({ bearerToken: scoped.plaintextToken, toolName: 'list_targets',
+      const resolved = await tokens.executeLocalClientRead({ toolName: 'list_targets',
         requestedAccountId: 'account-agent-replacement', execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }) });
       expect(resolved).toEqual(['account-agent-replacement']);
-      await expect(tokens.executeWithVerifiedToken({ bearerToken: scoped.plaintextToken, toolName: 'list_targets',
+      await expect(tokens.executeLocalClientRead({ toolName: 'list_targets',
         requestedAccountId: 'account-agent', execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
     } finally {
       await pool.query("UPDATE line_accounts SET product_role = NULL, mode = 'MONITOR_ONLY' WHERE account_id = 'account-agent-replacement'");
@@ -629,28 +443,12 @@ database('MCP token & audit repository and target/time message queries', () => {
     }
   });
 
-  it('normalizes legacy managed account scopes to stable roles once and removes retired scopes', async () => {
-    await accounts.ensureAccount('retired-agent-history');
-    const legacy = await tokens.issueToken({ deviceLabel: 'Legacy managed', accountScopes: ['account-agent', 'account-admin', 'retired-agent-history'],
-      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    await pool.query("UPDATE mcp_agent_tokens SET principal_id = 'local-client:codex' WHERE token_id = $1", [legacy.token.tokenId]);
-    await tokens.normalizeManagedLocalClientScopes();
-    const once = (await tokens.listTokens()).find((token) => token.tokenId === legacy.token.tokenId)!;
-    expect(once.accountScopes).toEqual(['role:AGENT', 'role:PRIMARY_ADMIN']);
-    await tokens.normalizeManagedLocalClientScopes();
-    const twice = (await tokens.listTokens()).find((token) => token.tokenId === legacy.token.tokenId)!;
-    expect(twice.accountScopes).toEqual(once.accountScopes);
-    expect(twice.grantVersion).toBe(once.grantVersion);
-  });
-
   it('discards a role-scoped read when its holder changes before the final authorization fence', async () => {
-    const scoped = await tokens.issueToken({ deviceLabel: 'Managed replacement fence', principalId: 'local-client:codex',
-      accountScopes: ['role:AGENT'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
     await accounts.ensureAccount('role-fence-replacement');
     try {
-      await expect(tokens.executeWithVerifiedToken({ bearerToken: scoped.plaintextToken, toolName: 'list_targets',
+      await expect(tokens.executeLocalClientRead({ toolName: 'list_targets',
         execute: async ({ authorizedAccountIds }) => {
-          expect(authorizedAccountIds).toEqual(['account-agent']);
+          expect(authorizedAccountIds).toEqual(['account-admin', 'account-agent']);
           await pool.query("UPDATE line_accounts SET product_role=NULL,mode='MONITOR_ONLY' WHERE account_id='account-agent'");
           await pool.query("UPDATE line_accounts SET product_role='AGENT',mode='ACTIVE_CONTROL' WHERE account_id='role-fence-replacement'");
           return { data: 'obsolete holder result' };
@@ -661,48 +459,14 @@ database('MCP token & audit repository and target/time message queries', () => {
     }
   });
 
-  it('does not infer a former Agent role from an arbitrary historical administrator binding', async () => {
-    const retired = 'retired-verified-agent';
-    const unknown = 'unknown-history-scope';
-    await accounts.ensureAccount(retired);
-    await accounts.setOwnMid(retired, `u${'a'.repeat(32)}`);
-    const adminMid = `u${'b'.repeat(32)}`;
-    await admins.bindPrimary(retired, adminMid, adminMid);
-    await accounts.ensureAccount(unknown);
-    const legacy = await tokens.issueToken({ deviceLabel: 'Retired Agent managed', accountScopes: [retired, unknown],
-      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    const external = await tokens.issueToken({ deviceLabel: 'Explicit historical grant', accountScopes: [retired],
-      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    await pool.query("UPDATE mcp_agent_tokens SET principal_id='local-client:codex' WHERE token_id=$1", [legacy.token.tokenId]);
-    await tokens.normalizeManagedLocalClientScopes();
-    const normalized = (await tokens.listTokens()).find((token) => token.tokenId === legacy.token.tokenId)!;
-    expect(normalized).toMatchObject({ state: 'REVOKED', grantVersion: legacy.token.grantVersion + 1 });
-    expect((await tokens.listTokens()).find((token) => token.tokenId === external.token.tokenId)!.accountScopes).toEqual([retired]);
-    await expect(tokens.executeWithVerifiedToken({ bearerToken: legacy.plaintextToken, toolName: 'list_targets',
-      execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'REVOKED' });
-    await tokens.normalizeManagedLocalClientScopes();
-    expect((await tokens.listTokens()).find((token) => token.tokenId === legacy.token.tokenId)!.grantVersion).toBe(normalized.grantVersion);
-  });
-
-  it('completes 6 concurrent same-token queries without 40P01 deadlock and fences in-flight reads on revokeToken', async () => {
-    const concurrentToken = await tokens.issueToken({
-      deviceLabel: 'Concurrent Token',
-      accountScopes: ['account-admin'],
-      toolScopes: ['list_targets', 'query_target_messages', 'query_target_messages_by_time'],
-      expiration: { mode: 'never' },
-    });
-
-    // 1. Run 6 parallel requests with the exact same bearer token
+  it('completes 6 concurrent external queries without a 40P01 deadlock', async () => {
     const parallelResults = await Promise.all(
       Array.from({ length: 6 }, () =>
-        tokens.executeWithVerifiedToken({
-          bearerToken: concurrentToken.plaintextToken,
+        tokens.executeLocalClientRead({
           toolName: 'query_target_messages',
+          requestedAccountId: 'account-admin',
           execute: async ({ client, authorizedAccountIds }) => {
-            const rows = await messages.queryTargetMessages(
-              { accountIds: authorizedAccountIds, target: 'Alice' },
-              client,
-            );
+            const rows = await messages.queryTargetMessages({ accountIds: authorizedAccountIds, target: 'Alice' }, client);
             return { data: rows, resultCount: rows.length };
           },
         }),
@@ -711,59 +475,14 @@ database('MCP token & audit repository and target/time message queries', () => {
     for (const rows of parallelResults) {
       expect(rows).toHaveLength(2);
     }
-
-    // 2. Start an in-flight read query, pause after Step 7 read, revokeToken concurrently, then resume Step 8 fence
-    let notifyReadReached!: () => void;
-    const readReached = new Promise<void>((resolve) => {
-      notifyReadReached = resolve;
-    });
-    let releaseReadToFence!: () => void;
-    const waitForRevoke = new Promise<void>((resolve) => {
-      releaseReadToFence = resolve;
-    });
-
-    const inFlightRead = tokens.executeWithVerifiedToken({
-      bearerToken: concurrentToken.plaintextToken,
-      toolName: 'query_target_messages',
-      execute: async ({ client, authorizedAccountIds }) => {
-        const rows = await messages.queryTargetMessages(
-          { accountIds: authorizedAccountIds, target: 'Alice' },
-          client,
-        );
-        notifyReadReached();
-        await waitForRevoke;
-        return { data: rows, resultCount: rows.length };
-      },
-    });
-
-    await readReached;
-    // revokeToken must commit immediately without blocking behind the in-flight reader
-    const revoked = await tokens.revokeToken(concurrentToken.token.tokenId);
-    expect(revoked).toBe(true);
-    releaseReadToFence();
-
-    // The in-flight read must fail closed at the post-query atomic fence with REVOKED
-    await expect(inFlightRead).rejects.toMatchObject({ code: 'REVOKED' });
-
-    const audits = await tokens.listAuditRecords(20);
-    expect(
-      audits.some(
-        (row) =>
-          row.tokenId === concurrentToken.token.tokenId &&
-          row.action === 'AUTH_REJECTED' &&
-          row.disposition === 'REVOKED',
-      ),
-    ).toBe(true);
   });
 
-  it('fences control epoch and account pause changes, excludes paused scopes, and requires approval for unclassified tools', async () => {
-    const issued = await tokens.issueToken({ deviceLabel: 'Control fence', accountScopes: ['account-admin'],
-      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+  it('fences control epoch and account pause changes, excludes paused accounts, and requires approval for unclassified tools', async () => {
     const auditDisposition = async (disposition: string) => (await tokens.listAuditRecords(30))
-      .some((entry) => entry.tokenId === issued.token.tokenId && entry.disposition === disposition);
+      .some((entry) => entry.tokenId === null && entry.principalId === 'local-client' && entry.disposition === disposition);
 
-    // Acceptance 1: active account and stable epoch returns data and records ALLOWED.
-    await expect(tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'list_targets',
+    // Acceptance 1: active accounts and stable epoch return data and record ALLOWED.
+    await expect(tokens.executeLocalClientRead({ toolName: 'list_targets',
       execute: async () => ({ data: ['ok'], resultCount: 1 }) })).resolves.toEqual(['ok']);
     expect(await auditDisposition('ALLOWED')).toBe(true);
 
@@ -772,7 +491,7 @@ database('MCP token & audit repository and target/time message queries', () => {
     let resume!: () => void;
     const atExecute = new Promise<void>((resolve) => { reached = resolve; });
     const paused = new Promise<void>((resolve) => { resume = resolve; });
-    const changedEpoch = tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'list_targets',
+    const changedEpoch = tokens.executeLocalClientRead({ toolName: 'list_targets',
       execute: async () => { reached(); await paused; return { data: ['must discard'] }; } });
     await atExecute;
     const controlState = await pool.query<{ control_epoch: number }>('SELECT control_epoch FROM account_control WHERE singleton = true');
@@ -787,13 +506,17 @@ database('MCP token & audit repository and target/time message queries', () => {
       await pool.query('UPDATE account_control SET control_epoch = $1 WHERE singleton = true', [savedControlEpoch]);
     }
 
-    // Acceptance 3: a paused account is excluded; when it is the sole scope, reject SCOPE_DENIED.
+    // Acceptance 3: a paused account is excluded; when every role account is paused, reject SCOPE_DENIED.
     await pool.query("UPDATE line_accounts SET mode = 'PAUSED' WHERE account_id = 'account-admin'");
     try {
-      await expect(tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'list_targets',
+      expect(await tokens.executeLocalClientRead({ toolName: 'list_targets', execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }) }))
+        .toEqual(['account-agent']);
+      await pool.query("UPDATE line_accounts SET mode = 'PAUSED' WHERE account_id = 'account-agent'");
+      await expect(tokens.executeLocalClientRead({ toolName: 'list_targets',
         execute: async () => ({ data: ['unreachable'] }) })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
     } finally {
       await pool.query("UPDATE line_accounts SET mode = 'MONITOR_ONLY' WHERE account_id = 'account-admin'");
+      await pool.query("UPDATE line_accounts SET mode = 'ACTIVE_CONTROL' WHERE account_id = 'account-agent'");
     }
 
     // Acceptance 4: pausing after resolution but before the fence rejects and discards data.
@@ -801,7 +524,7 @@ database('MCP token & audit repository and target/time message queries', () => {
     let unpauseGate!: () => void;
     const atPause = new Promise<void>((resolve) => { pauseReached = resolve; });
     const pauseWait = new Promise<void>((resolve) => { unpauseGate = resolve; });
-    const changedPause = tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: 'list_targets',
+    const changedPause = tokens.executeLocalClientRead({ toolName: 'list_targets',
       execute: async () => { pauseReached(); await pauseWait; return { data: ['must discard'] }; } });
     await atPause;
     await pool.query("UPDATE line_accounts SET mode = 'PAUSED' WHERE account_id = 'account-admin'");
@@ -814,22 +537,19 @@ database('MCP token & audit repository and target/time message queries', () => {
     const effects = MCP_TOOL_EFFECTS as Record<string, 'read' | 'effect'>;
     effects.list_targets = 'effect';
     try {
-      await expect(tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken,
-        toolName: 'list_targets', execute })).rejects.toMatchObject({ code: 'APPROVAL_REQUIRED' });
+      await expect(tokens.executeLocalClientRead({ toolName: 'list_targets', execute })).rejects.toMatchObject({ code: 'APPROVAL_REQUIRED' });
     } finally {
       effects.list_targets = 'read';
     }
     const readClassification = effects.list_targets;
     delete effects.list_targets;
     try {
-      await expect(tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken,
-        toolName: 'list_targets', execute })).rejects.toMatchObject({ code: 'APPROVAL_REQUIRED' });
+      await expect(tokens.executeLocalClientRead({ toolName: 'list_targets', execute })).rejects.toMatchObject({ code: 'APPROVAL_REQUIRED' });
     } finally {
       effects.list_targets = readClassification;
     }
     expect(execute).not.toHaveBeenCalled();
     expect(await auditDisposition('APPROVAL_REQUIRED')).toBe(true);
-    await tokens.revokeToken(issued.token.tokenId);
   });
 
   it('allows UI and verified Primary Admin internal Agent queries across non-paused accounts and denies unclassifiable LINE jobs', async () => {
@@ -1072,12 +792,9 @@ database('MCP token & audit repository and target/time message queries', () => {
     expect(sendAudits.filter((row) => row.action === 'TOOL_CALLED' && row.disposition === 'ALLOWED' && row.resultCount === 2)).toHaveLength(4);
     expect(sendAudits.filter((row) => row.action === 'AUTH_REJECTED' && row.disposition === 'PERMISSION_DENIED'
       && row.principalId.startsWith('internal:chat_scoped:'))).toHaveLength(2);
-    // An external token can never be scoped to, or call, the send tools.
-    await expect(tokens.issueToken({ deviceLabel: 'send', accountScopes: ['account-agent'], toolScopes: ['send_to_target' as never], expiration: { mode: 'never' } }))
-      .rejects.toMatchObject({ code: 'INVALID_INPUT' });
-    const external = await tokens.issueToken({ deviceLabel: 'ext-send', accountScopes: ['account-agent'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
+    // The external local client can never call the send tools.
     for (const toolName of ['list_send_targets', 'send_to_target'] as const) {
-      await expect(tokens.executeWithVerifiedToken({ bearerToken: external.plaintextToken, toolName, execute: async () => ({ data: 'unreachable' }) }))
+      await expect(tokens.executeLocalClientRead({ toolName, execute: async () => ({ data: 'unreachable' }) }))
         .rejects.toMatchObject({ code: 'SCOPE_DENIED' });
     }
 

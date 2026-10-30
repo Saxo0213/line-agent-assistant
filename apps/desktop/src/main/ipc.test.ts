@@ -26,11 +26,16 @@ describe('renderer IPC boundary', () => {
     expect(JSON.stringify(onDiagnostic.mock.calls)).not.toContain('private-token-path-sentinel');
   });
 
-  it('rejects generic issuance for reserved local-client principals', async () => {
+  it('rejects the removed MCP token requests as invalid', async () => {
     const dispatch = vi.fn(async () => ({ type: 'error' as const, requestId: 'local', ok: false as const, code: 'unexpected', message: 'unexpected', retryable: false }));
     const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', service: { dispatch } });
-    const result = await adapter({ senderId: 7, url: 'file:///app/index.html' }, { type: 'mcpIssueToken', requestId: 'local', deviceLabel: 'x', principalId: 'local-client:codex', accountScopes: ['account-a'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    expect(result).toMatchObject({ type: 'error', code: 'LOCAL_CLIENT_PRINCIPAL_RESERVED' });
+    for (const payload of [
+      { type: 'mcpIssueToken', requestId: 'issue', deviceLabel: 'x', accountScopes: ['account-a'], toolScopes: ['list_targets'], expiration: { mode: 'never' } },
+      { type: 'mcpListTokens', requestId: 'list' },
+      { type: 'mcpRevokeToken', requestId: 'revoke', tokenId: '11111111-1111-4111-8111-111111111111' },
+    ]) {
+      expect(await adapter({ senderId: 7, url: 'file:///app/index.html' }, payload)).toMatchObject({ type: 'error', code: 'INVALID_REQUEST' });
+    }
     expect(dispatch).not.toHaveBeenCalled();
   });
   it('rejects a request from another webContents or origin', async () => {

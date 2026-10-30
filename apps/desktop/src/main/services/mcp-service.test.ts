@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
-import { McpListTargetsInputSchema, McpQueryTargetMessagesByTimeInputSchema, McpQueryTargetMessagesInputSchema, MCP_TOOL_NAMES, type AgentEvent, type AgentRunRequest } from '@line-agent/contracts';
+import { McpListTargetsInputSchema, McpQueryTargetMessagesByTimeInputSchema, McpQueryTargetMessagesInputSchema, MCP_TOOL_EFFECTS, SEND_TO_TARGET_TOOL_NAME, type AgentEvent, type AgentRunRequest } from '@line-agent/contracts';
 import { AccountRepository, AdminRepository, FriendWhitelistRepository, McpTokenRepository, MessageRepository } from '@line-agent/database';
 import { createTestDatabase } from '../../../../../packages/database/src/test-database.js';
 import { MCP_TOOL_DEFINITIONS, McpService, numberMcpTargets } from './mcp-service.js';
@@ -99,28 +99,29 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
     const endpoint = status.endpoint!;
 
     try {
-      // 1. Missing bearer token -> 401
+      // 1. No bearer token is needed: ping works.
       const noAuthResp = await fetch(endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
       });
-      expect(noAuthResp.status).toBe(401);
+      expect(noAuthResp.status).toBe(200);
 
-      // 2. Issue token with only ['list_targets', 'query_target_messages']
-      const issued = await service.issueToken({
-        deviceLabel: 'External Analyzer',
-        accountScopes: ['account-admin'],
-        toolScopes: ['list_targets', 'query_target_messages', 'query_target_messages_by_time'],
-        expiration: { mode: 'limited', hours: 24 },
+      // 2. A cross-site request (Origin header) is refused before the service runs.
+      const originResp = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
       });
+      expect(originResp.status).toBe(403);
 
+      // 3. An old client config can still send a la_mcp_ bearer value. The server ignores it.
       const headers = {
         'content-type': 'application/json',
-        authorization: `Bearer ${issued.plaintextToken}`,
+        authorization: 'Bearer la_mcp_legacy-value-is-ignored',
       };
 
-      // 3. initialize & tools/list filtered to granted toolScopes
+      // 4. initialize & tools/list return every external tool (the chat resource tools are off in this service)
       const initResp = await fetch(endpoint, {
         method: 'POST',
         headers,
@@ -154,14 +155,16 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
         }),
       });
       const listed = (await listTargetsResp.json()) as {
-        result: { structuredContent: { targets: Array<{ no: number; chatType: string; conversationTitle: string | null; chatId: string }> } };
+        result: { structuredContent: { targets: Array<{ no: number; accountId: string; chatType: string; conversationTitle: string | null; chatId: string }> } };
       };
-      expect(listed.result.structuredContent.targets.map(({ no, chatType, conversationTitle }) => [no, chatType, conversationTitle])).toEqual([
-        [1, 'community', 'A community'],
-        [2, 'group', 'Alpha Group'],
-        [3, 'group', 'Engineering Room'],
-        [4, 'room', 'A room'],
-        [5, 'direct', 'A direct'],
+      // The local client sees the AGENT and PRIMARY_ADMIN accounts; the catalog rows belong to the admin account.
+      expect(listed.result.structuredContent.targets.filter((target) => target.accountId === 'account-admin')
+        .map(({ chatType, conversationTitle }) => [chatType, conversationTitle])).toEqual([
+        ['community', 'A community'],
+        ['group', 'Alpha Group'],
+        ['group', 'Engineering Room'],
+        ['room', 'A room'],
+        ['direct', 'A direct'],
       ]);
       const community = listed.result.structuredContent.targets.find((target) => target.chatType === 'community')!;
       const communityKey = { accountId: 'account-admin', chatType: community.chatType, chatId: community.chatId };
@@ -175,8 +178,8 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
         method: 'POST', headers,
         body: JSON.stringify({ jsonrpc: '2.0', id: 32, method: 'tools/call', params: { name: 'list_targets', arguments: { query: 'Engineering', limit: 1 } } }),
       });
-      const filteredList = await filteredListResp.json() as { result: { structuredContent: { targets: Array<{ no: number }> } } };
-      expect(filteredList.result.structuredContent.targets.map(({ no }) => no)).toEqual([1]);
+      const filteredList = await filteredListResp.json() as { result: { structuredContent: { targets: Array<{ no: number; conversationTitle: string | null }> } } };
+      expect(filteredList.result.structuredContent.targets.map(({ no, conversationTitle }) => [no, conversationTitle])).toEqual([[1, 'Engineering Room']]);
       const tiedTargets = [
         { accountId: 'account-admin', chatType: 'group', chatId: 'same-chat', conversationTitle: 'Same' },
         { accountId: 'account-admin', chatType: 'community', chatId: 'same-chat', conversationTitle: 'Same' },
@@ -224,36 +227,35 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
         expect(communityBody.result.structuredContent.messages.map((message) => message.messageId)).toContain('m-community');
       }
 
-      // 5. A token without query_target_messages_by_time cannot call it.
-      const restricted = await service.issueToken({ deviceLabel: 'Restricted Analyzer', accountScopes: ['account-admin'], toolScopes: ['list_targets'], expiration: { mode: 'limited', hours: 24 } });
-      const deniedToolResp = await fetch(endpoint, {
-        method: 'POST', headers: { ...headers, authorization: `Bearer ${restricted.plaintextToken}` },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 5,
-          method: 'tools/call',
-          params: {
-            name: 'query_target_messages_by_time',
-            arguments: { target: 'Alice', from: '2026-10-16', to: '2026-10-16' },
-          },
-        }),
+      // 5. An internal-only tool (LINE send) is not an external tool: refused, never executed.
+      const internalOnlyResp = await fetch(endpoint, {
+        method: 'POST', headers,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: SEND_TO_TARGET_TOOL_NAME, arguments: {} } }),
       });
-      expect(deniedToolResp.status).toBe(403);
+      expect(internalOnlyResp.status).toBe(400);
 
-      // 6. Revoke token -> subsequent call rejected with 401/403
-      await service.revokeToken(issued.token.tokenId);
-      await service.revokeToken(restricted.token.tokenId);
-      const revokedResp = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 6,
-          method: 'tools/call',
-          params: { name: 'list_targets', arguments: {} },
-        }),
-      });
-      expect(revokedResp.status).toBe(401);
+      // 6. A tool without the 'read' effect needs operator approval, so the external endpoint refuses it.
+      const effects = MCP_TOOL_EFFECTS as Record<string, 'read' | 'effect'>;
+      effects.list_targets = 'effect';
+      try {
+        const approvalResp = await fetch(endpoint, {
+          method: 'POST', headers,
+          body: JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'list_targets', arguments: {} } }),
+        });
+        expect(approvalResp.status).toBe(403);
+        expect(await approvalResp.json()).toMatchObject({ error: { data: { code: 'APPROVAL_REQUIRED' } } });
+      } finally {
+        effects.list_targets = 'read';
+      }
+      const auditRows = await tokens.listAuditRecords(50);
+      expect(auditRows.some((row) => row.principalId === 'local-client' && row.tokenId === null && row.action === 'TOOL_CALLED' && row.disposition === 'ALLOWED')).toBe(true);
+      expect(auditRows.some((row) => row.principalId === 'local-client' && row.tokenId === null && row.disposition === 'APPROVAL_REQUIRED')).toBe(true);
+
+      // 7. The repository refuses an internal-only tool name on its own.
+      await expect(tokens.executeLocalClientRead({
+        toolName: SEND_TO_TARGET_TOOL_NAME,
+        execute: async () => ({ data: true }),
+      })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
     } finally {
       await server.shutdown();
       await service.shutdown();
@@ -273,16 +275,7 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
     const endpoint = server.status().endpoint!;
 
     try {
-      const issued = await service.issueToken({
-        deviceLabel: 'Rate Limited Client',
-        accountScopes: ['account-admin'],
-        toolScopes: ['list_targets'],
-        expiration: { mode: 'limited', hours: 24 },
-      });
-      const headers = {
-        'content-type': 'application/json',
-        authorization: `Bearer ${issued.plaintextToken}`,
-      };
+      const headers = { 'content-type': 'application/json' };
 
       // 1. Oversized body (> 64 KiB) returns 413
       const hugePayload = JSON.stringify({
@@ -298,7 +291,7 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
       });
       expect(oversizeResp.status).toBe(413);
 
-      // 2. Per-token rate limit (configured at 3 requests/minute for this test)
+      // 2. One shared rate limit for all external requests (configured at 3 requests/minute for this test)
       for (let i = 0; i < 3; i++) {
         const okResp = await fetch(endpoint, {
           method: 'POST',
@@ -442,9 +435,6 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
       async shutdown() {},
     };
 
-    const startupLegacy = await tokens.issueToken({ deviceLabel: 'Pre-start managed Agent', accountScopes: ['account-agent'],
-      toolScopes: ['list_targets'], expiration: { mode: 'never' } });
-    await pool.query("UPDATE mcp_agent_tokens SET principal_id='local-client:codex' WHERE token_id=$1", [startupLegacy.token.tokenId]);
     const facade = await createConnectedFacade({
       pool,
       workers,
@@ -456,9 +446,6 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
     });
 
     try {
-      // Startup has normalized the managed credential before any Settings request or MCP listener admission.
-      expect(await tokens.findTokenByBearerToken(startupLegacy.plaintextToken))
-        .toMatchObject({ state: 'ACTIVE', accountScopes: ['role:AGENT'] });
       await facade.dispatch({
         type: 'setWorkspace',
         requestId: 'ws-1',
@@ -473,43 +460,16 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
         status: { running: true, host: '127.0.0.1' },
       });
 
-      // 2. IPC mcpIssueToken, mcpListTokens, mcpRevokeToken
-      const issueRes = await facade.dispatch({
-        type: 'mcpIssueToken',
-        requestId: 'issue-1',
-        deviceLabel: 'IPC Issued Token',
-        accountScopes: ['account-admin'],
-        toolScopes: ['query_target_messages_by_time'],
-        expiration: { mode: 'never' },
-      });
-      expect(issueRes.type).toBe('mcpIssueToken');
-      if (issueRes.type !== 'mcpIssueToken') throw new Error('Expected mcpIssueToken');
-      expect(issueRes.plaintextToken).toMatch(/^la_mcp_[A-Za-z0-9_-]{43}$/);
-      expect(issueRes.token.expiresAt).toBeNull();
-      expect(await facade.dispatch({ type: 'mcpIssueToken', requestId: 'issue-local-forbidden', deviceLabel: 'forbidden', principalId: 'local-client:codex', accountScopes: ['account-admin'], toolScopes: ['list_targets'], expiration: { mode: 'never' } }))
-        .toMatchObject({ type: 'error', code: 'LOCAL_CLIENT_PRINCIPAL_RESERVED' });
-
-      const listRes = await facade.dispatch({ type: 'mcpListTokens', requestId: 'list-1' });
-      expect(listRes.type).toBe('mcpListTokens');
-      if (listRes.type !== 'mcpListTokens') throw new Error('Expected mcpListTokens');
-      expect(listRes.tokens.some((t) => t.tokenId === issueRes.token.tokenId)).toBe(true);
-
-      const revokeRes = await facade.dispatch({
-        type: 'mcpRevokeToken',
-        requestId: 'rev-1',
-        tokenId: issueRes.token.tokenId,
-      });
-      expect(revokeRes).toMatchObject({ type: 'mcpRevokeToken', ok: true, revoked: true });
-
-      const localConnect = await facade.dispatch({ type: 'mcpLocalClientConnect', requestId: 'local-connect', client: 'claude-desktop', accountScopes: ['role:PRIMARY_ADMIN'] });
+      // 2. Local client connect writes a token-less entry.
+      const localConnect = await facade.dispatch({ type: 'mcpLocalClientConnect', requestId: 'local-connect', client: 'claude-desktop' });
       expect(localConnect.type).toBe('mcpLocalClientConnect');
       if (localConnect.type !== 'mcpLocalClientConnect') throw new Error('Expected local MCP client connection');
-      expect(localConnect).not.toHaveProperty('plaintextToken');
-      expect((await tokens.listTokens()).find((token) => token.tokenId === localConnect.status.tokenId)?.toolScopes).toEqual([...MCP_TOOL_NAMES]);
+      expect(localConnect.status).toEqual({ client: 'claude-desktop', installed: true, connected: true });
       const localConfigPath = join(attachmentRoot, 'client-config', 'claude_desktop_config.json');
-      expect(JSON.parse(await readFile(localConfigPath, 'utf8')).mcpServers.linejs.env.LINEJS_MCP_TOKEN).toMatch(/^la_mcp_/);
-      const localRevoke = await facade.dispatch({ type: 'mcpRevokeToken', requestId: 'local-revoke', tokenId: localConnect.status.tokenId! });
-      expect(localRevoke).toMatchObject({ type: 'mcpRevokeToken', ok: true, revoked: true });
+      const localEntry = JSON.parse(await readFile(localConfigPath, 'utf8')).mcpServers.linejs;
+      expect(localEntry.env).toEqual({ ELECTRON_RUN_AS_NODE: '1', LINEJS_MCP_URL: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/) });
+      const localDisconnect = await facade.dispatch({ type: 'mcpLocalClientDisconnect', requestId: 'local-disconnect', client: 'claude-desktop' });
+      expect(localDisconnect).toMatchObject({ type: 'mcpLocalClientDisconnect', ok: true });
       expect(JSON.parse(await readFile(localConfigPath, 'utf8')).mcpServers).toBeUndefined();
 
       // 3. Direct internal Agent tool call via mcpCallInternalTool IPC (no bearer token needed)

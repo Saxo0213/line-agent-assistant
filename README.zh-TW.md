@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.303 移除已登入帳號的「重新登入」按鈕：「登入」按鈕只在登出後或憑證失效時顯示。請參閱 [v1.0.303 版本說明](docs/releases/v1.0.303.md)；先前更新請見 [v1.0.302](docs/releases/v1.0.302.md)、[v1.0.288](docs/releases/v1.0.288.md) 與 [v1.0.280](docs/releases/v1.0.280.md)。
+v1.0.305 移除 MCP Token：Claude Desktop 與 Codex 不需要 Token 即可連線，這台電腦上的任何程式也都能透過本機位址讀取已儲存的 LINE 訊息（瀏覽器網頁會被擋下，也無法傳送）。請參閱 [v1.0.305 版本說明](docs/releases/v1.0.305.md)；先前更新請見 [v1.0.303](docs/releases/v1.0.303.md)、[v1.0.302](docs/releases/v1.0.302.md) 與 [v1.0.288](docs/releases/v1.0.288.md)。
 
 ## 安裝
 

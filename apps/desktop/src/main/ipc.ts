@@ -73,7 +73,6 @@ export function createIpcAdapter(options: AdapterOptions) {
           chatId: parsed.data.chatId }, parsed.data.attachmentId)) return fail('DOWNLOAD_NOT_AVAILABLE', 'Attachment download is not available for this conversation.');
         return { type: 'accepted', requestId, ok: true };
       }
-      if (parsed.data.type === 'mcpIssueToken' && parsed.data.principalId?.startsWith('local-client:')) return fail('LOCAL_CLIENT_PRINCIPAL_RESERVED', 'Local client tokens can only be issued by the local client connect flow.');
       let response: IpcResult;
       if (RESOURCE_REQUEST_TYPES.has(parsed.data.type)) {
         if (activeChatResourceRequests.size >= MAX_ACTIVE_CHAT_RESOURCE_REQUESTS) return fail('SERVICE_BUSY', 'Too many active chat resource requests');

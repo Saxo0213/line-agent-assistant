@@ -23,8 +23,6 @@ describe('Japanese desktop copy part 7', () => {
 
   it('uses natural Japanese for automatic replies, MCP authorization, and commands', () => {
     expect(JAPANESE_DESKTOP_COPY_PART7.thisRuleWasDeletedElsewhereYourEditsAreKept).toContain('編集内容は保持されています');
-    expect(JAPANESE_DESKTOP_COPY_PART7.chooseTheToolsThisTokenCanUseEachOperation).toContain('アカウント範囲にも制限されます');
     expect(JAPANESE_DESKTOP_COPY_PART7.agentCodexPrompt).toBe('/agent codex <prompt>');
-    expect(JAPANESE_DESKTOP_COPY_PART7.copyThisOneTimeTokenNowItCannotBe).toContain('閉じる前にコピーしてください');
   });
 });

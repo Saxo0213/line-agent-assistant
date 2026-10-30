@@ -1140,7 +1140,7 @@ describe('database settings', () => {
     expect(screen.getByLabelText('Agent account slot').querySelector('.account-role-heading')?.textContent).toContain('Not logged in');
   });
 
-  it('shows the historical import bar only during the initial import and aligns active controls with the submitted count', () => {
+  it('puts the monitor action on the LINE version row and hides the committed count while monitoring', () => {
     const account: LineAccountSummary = { accountId: 'admin-1', displayName: 'Known Admin', status: 'disconnected', lastSyncedAt: null,
       mode: 'MONITOR_ONLY', productRole: 'PRIMARY_ADMIN', hasVerifiedLineIdentity: true, canStartExternalImport: true,
       officialLineBuild: { version: '26.5.0.3975', status: 'accepted' },
@@ -1150,16 +1150,16 @@ describe('database settings', () => {
     const monitorCard = screen.getByRole('region', { name: 'External monitoring' });
     expect(monitorCard.textContent).toContain('LINE version: 26.5.0.3975');
     expect(within(monitorCard).queryByRole('heading', { name: 'Monitoring' })).toBeNull();
-    const submitted = within(monitorCard).getByText('Committed: 42 / 120 messages');
-    const layout = submitted.closest('.external-monitor-layout')!;
-    expect(layout.querySelector('.external-monitor-count')).toBe(submitted);
-    expect(layout.querySelector('progress[aria-label="Message history import progress"]')).toBeNull();
-    expect(layout.querySelector('.external-monitor-indicator')?.textContent).toBe('Monitoring');
-    expect(within(layout as HTMLElement).getByRole('button', { name: 'Stop external monitoring' })).toBeTruthy();
-    const countRow = submitted.parentElement!;
-    expect(countRow.querySelector('.external-monitor-indicator')).toBeTruthy();
-    const countRowRule = readFileSync(new NodeURL('../styles.css', import.meta.url), 'utf8').match(/\.external-monitor-count-row\{([^}]*)\}/)?.[1] ?? '';
-    expect(countRowRule).toContain('justify-content:space-between');
+    expect(within(monitorCard).queryByText('Committed: 42 / 120 messages')).toBeNull();
+    expect(within(monitorCard).queryByRole('progressbar', { name: 'Message history import progress' })).toBeNull();
+    const versionRow = monitorCard.querySelector('.external-monitor-version-row') as HTMLElement;
+    expect(versionRow).toBeTruthy();
+    expect(versionRow.textContent).toContain('LINE version: 26.5.0.3975');
+    expect(versionRow.querySelector('.external-monitor-indicator')?.textContent).toBe('Monitoring');
+    expect(within(versionRow).getByRole('button', { name: 'Stop external monitoring' })).toBeTruthy();
+    expect(within(monitorCard).getAllByRole('button', { name: 'Stop external monitoring' })).toHaveLength(1);
+    const versionRowRule = readFileSync(new NodeURL('../styles.css', import.meta.url), 'utf8').match(/\.external-monitor-version-row\{([^}]*)\}/)?.[1] ?? '';
+    expect(versionRowRule).toContain('justify-content:space-between');
     expect(within(screen.getByLabelText('Primary Admin account slot')).queryByText('Administrator account (LINE monitor mode)')).toBeNull();
   });
 
@@ -1181,7 +1181,7 @@ describe('database settings', () => {
     const submitted = within(monitorCard).getByText('Committed: 42 / 120 messages');
     const layout = submitted.closest('.external-monitor-layout')!;
     expect(layout.firstElementChild).toBe(progress);
-    expect(layout.querySelector('.external-monitor-count-row')?.contains(submitted)).toBe(true);
+    expect(layout.querySelector('.external-monitor-count')).toBe(submitted);
   });
 
   it('does not show a historical import bar after the import completes', () => {
@@ -1191,7 +1191,7 @@ describe('database settings', () => {
     renderWithStartupLocale(<Settings api={{ getDatabaseSetupStatus: vi.fn(async () => ({ configured: false, attachmentRoot: null, agentWorkspace: null, connection: null })) } as unknown as DesktopApi} headingRef={React.createRef()} accounts={[account]} />, 'en');
     const monitorCard = screen.getByRole('region', { name: 'External monitoring' });
     expect(within(monitorCard).queryByRole('progressbar', { name: 'Message history import progress' })).toBeNull();
-    expect(within(monitorCard).getByText('Committed: 120 / 120 messages')).toBeTruthy();
+    expect(within(monitorCard).queryByText('Committed: 120 / 120 messages')).toBeNull();
   });
 
   describe('embedded password change', () => {
@@ -1288,171 +1288,96 @@ describe('database settings', () => {
     expect(screen.getByRole('button', { name: '重新檢查 Codex' })).toBeTruthy();
   });
 
-  it('hides manual MCP token issuance controls while keeping the endpoint', async () => {
-    const tokenSummary: import('@line-agent/contracts').McpTokenSummary = {
-      tokenId: '11111111-1111-4111-8111-111111111111',
-      principalId: 'external:laptop-1',
-      deviceLabel: 'Analyst MacBook',
-      accountScopes: ['account-admin'],
-      toolScopes: ['list_targets', 'query_target_messages', 'query_target_messages_by_time'],
-      grantVersion: 1,
-      state: 'ACTIVE',
-      expiresAt: '2026-10-20T00:00:00.000Z',
-      revokedAt: null,
-      lastUsedAt: null,
-      createdAt: '2026-10-17T00:00:00.000Z',
-    };
-    let tokens: import('@line-agent/contracts').McpTokenSummary[] = [tokenSummary];
-    const plaintextSecret = 'la_mcp_' + 'Z'.repeat(43);
-    const api = {
-      getDatabaseSetupStatus: vi.fn(async () => ({
-        configured: true,
-        attachmentRoot: 'D:\\attachments',
-        agentWorkspace: 'D:\\workspace',
-        connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' },
-      })),
-      mcpGetStatus: vi.fn(async () => ({
-        running: true,
-        endpoint: 'http://127.0.0.1:38471/mcp',
-        host: '127.0.0.1' as const,
-        port: 38471,
-        activeTokenCount: 1,
-        inFlightRequests: 0,
-        maxConcurrentRequests: 8,
-      })),
-      mcpListTokens: vi.fn(async () => tokens),
-      mcpIssueToken: vi.fn(async (input: Parameters<DesktopApi['mcpIssueToken']>[0]) => {
-        const created = {
-          ...tokenSummary,
-          tokenId: '22222222-2222-4222-8222-222222222222',
-          deviceLabel: input.deviceLabel,
-          accountScopes: input.accountScopes,
-          expiresAt: input.expiration.mode === 'never' ? null : tokenSummary.expiresAt,
-        };
-        tokens = [created, ...tokens];
-        return { token: created, plaintextToken: plaintextSecret };
-      }),
-      mcpRevokeToken: vi.fn(async (tokenId: string) => {
-        tokens = tokens.map((item) =>
-          item.tokenId === tokenId ? { ...item, state: 'REVOKED' as const, revokedAt: '2026-10-17T12:00:00.000Z' } : item,
-        );
-        return true;
-      }),
-    } as unknown as DesktopApi;
+  const mcpStatusFixture = { running: true, endpoint: 'http://127.0.0.1:38471/mcp', host: '127.0.0.1' as const, port: 38471, inFlightRequests: 0, maxConcurrentRequests: 8 };
+  const mcpDatabaseStatus = { configured: true, attachmentRoot: null, agentWorkspace: null, connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } };
+  const mcpAccounts = [
+    { accountId: 'account-agent', displayName: 'Agent LINE', status: 'connected', lastSyncedAt: null, mode: 'ACTIVE_CONTROL', productRole: 'AGENT' },
+    { accountId: 'account-admin', displayName: 'Admin LINE', status: 'connected', lastSyncedAt: null, mode: 'MONITOR_ONLY', productRole: 'PRIMARY_ADMIN' },
+    { accountId: 'account-unknown', displayName: 'Private LINE', status: 'connected', lastSyncedAt: null, mode: 'MONITOR_ONLY', productRole: null },
+  ] as unknown as import('@line-agent/contracts').LineAccountSummary[];
 
-    render(
-      <Settings
-        api={api}
-        headingRef={React.createRef()}
-        accounts={[
-          { accountId: 'account-agent', displayName: 'Agent LINE', status: 'connected', lastSyncedAt: null, mode: 'ACTIVE_CONTROL', productRole: 'AGENT' },
-          { accountId: 'account-admin', displayName: 'Admin LINE', status: 'connected', lastSyncedAt: null, mode: 'MONITOR_ONLY', productRole: 'PRIMARY_ADMIN' },
-          { accountId: 'account-unknown', displayName: 'Private LINE', status: 'connected', lastSyncedAt: null, mode: 'MONITOR_ONLY', productRole: null },
-        ]}
-      />,
-    );
+  it('shows the endpoint and the local client cards without any token or account scope controls', async () => {
+    const api = {
+      getDatabaseSetupStatus: vi.fn(async () => mcpDatabaseStatus),
+      mcpGetStatus: vi.fn(async () => mcpStatusFixture),
+      mcpLocalClientStatus: vi.fn(async () => [
+        { client: 'claude-desktop' as const, installed: true, connected: false },
+        { client: 'codex' as const, installed: true, connected: true },
+      ]),
+      mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex') => ({ client, installed: true, connected: true })),
+      mcpLocalClientDisconnect: vi.fn(async () => undefined),
+    } as unknown as DesktopApi;
+    render(<Settings api={api} headingRef={React.createRef()} accounts={mcpAccounts} />);
     fireEvent.click(screen.getByRole('tab', { name: '助理' }));
 
     expect(await screen.findByText('http://127.0.0.1:38471/mcp')).toBeTruthy();
-    expect(screen.queryByText('Analyst MacBook')).toBeNull();
+    expect(await screen.findByRole('region', { name: 'Claude Desktop MCP 連線' })).toBeTruthy();
+    expect(await screen.findByRole('region', { name: 'Codex MCP 連線' })).toBeTruthy();
     expect(screen.queryByLabelText('設備／Agent 名稱')).toBeNull();
     expect(screen.queryByText('Token 有效期限')).toBeNull();
-    expect(screen.queryByRole('radio', { name: '限制時間' })).toBeNull();
-    expect(screen.queryByLabelText('有效時數（小時）')).toBeNull();
     expect(screen.queryByRole('button', { name: '核發 MCP Token' })).toBeNull();
     expect(screen.queryByText('帳號授權')).toBeNull();
     expect(screen.queryByText('工具授權')).toBeNull();
+    expect(screen.queryByText('帳號範圍')).toBeNull();
     expect(screen.queryByRole('button', { name: /撤銷 Token/ })).toBeNull();
-    expect(screen.queryByText(plaintextSecret)).toBeNull();
-    expect(api.mcpIssueToken).not.toHaveBeenCalled();
+    expect(document.querySelector('.mcp-local-scope-picker')).toBeNull();
+    expect(document.querySelector('.mcp-settings input[type="checkbox"]')).toBeNull();
   });
 
-  it('shows only stable role scopes for local clients and excludes retired accounts', async () => {
+  it('connects a local client with its kind only, then shows the restart note until the tab changes', async () => {
     const api = {
-      getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: null, agentWorkspace: null, connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
-      mcpGetStatus: vi.fn(async () => ({ running: true, endpoint: 'http://127.0.0.1:38471/mcp', host: '127.0.0.1' as const, port: 38471, activeTokenCount: 0, inFlightRequests: 0, maxConcurrentRequests: 8 })),
-      mcpListTokens: vi.fn(async () => []),
+      getDatabaseSetupStatus: vi.fn(async () => mcpDatabaseStatus),
+      mcpGetStatus: vi.fn(async () => mcpStatusFixture),
       mcpLocalClientStatus: vi.fn(async () => [
-        { client: 'claude-desktop' as const, installed: true, connected: false, tokenId: null, accountScopes: [] },
-        { client: 'codex' as const, installed: true, connected: true, tokenId: '11111111-1111-4111-8111-111111111111', accountScopes: ['account-agent'] },
+        { client: 'claude-desktop' as const, installed: true, connected: false },
+        { client: 'codex' as const, installed: true, connected: true },
       ]),
-      mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex', accountScopes: string[]) => ({ client, installed: true, connected: true, tokenId: '22222222-2222-4222-8222-222222222222', accountScopes })),
+      mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex') => ({ client, installed: true, connected: true })),
       mcpLocalClientDisconnect: vi.fn(async () => undefined),
     } as unknown as DesktopApi;
-    const accounts = [
-      { accountId: 'account-agent', displayName: 'Agent LINE', status: 'connected', lastSyncedAt: null, mode: 'ACTIVE_CONTROL', productRole: 'AGENT' },
-      { accountId: 'account-admin', displayName: 'Admin LINE', status: 'connected', lastSyncedAt: null, mode: 'MONITOR_ONLY', productRole: 'PRIMARY_ADMIN' },
-      { accountId: 'retired-agent', displayName: 'Retired Agent', status: 'disconnected', lastSyncedAt: null, mode: 'PAUSED', productRole: null },
-    ] as unknown as import('@line-agent/contracts').LineAccountSummary[];
-    const rendered = render(<Settings api={api} headingRef={React.createRef()} accounts={accounts} />);
+    const rendered = render(<Settings api={api} headingRef={React.createRef()} accounts={mcpAccounts} />);
     fireEvent.click(screen.getByRole('tab', { name: '助理' }));
     expect(screen.queryByText('需重新啟動 Claude Desktop／Codex 後生效')).toBeNull();
     const card = await screen.findByRole('region', { name: 'Claude Desktop MCP 連線' });
     const codexCard = await screen.findByRole('region', { name: 'Codex MCP 連線' });
-    expect(within(card).queryByText(/已連接・帳號範圍|未連接/, { selector: 'p' })).toBeNull();
     expect(within(card).getByText('未連接', { selector: '.badge' })).toBeTruthy();
-    expect(within(codexCard).queryByText(/已連接・帳號範圍/, { selector: 'p' })).toBeNull();
     expect(within(codexCard).getByText('已連接', { selector: '.badge' })).toBeTruthy();
-    expect(within(card).getByText('帳號範圍')).toBeTruthy();
-    expect(within(card).getByRole('checkbox', { name: 'Claude Desktop AGENT帳號' })).toHaveProperty('checked', true);
-    expect(within(card).getByRole('checkbox', { name: 'Claude Desktop 管理員帳號' })).toHaveProperty('checked', true);
-    expect(within(card).queryByRole('checkbox', { name: 'Claude Desktop Retired Agent' })).toBeNull();
+    expect(within(codexCard).getByRole('button', { name: '重新連接' })).toBeTruthy();
     fireEvent.click(within(card).getByRole('button', { name: '連接' }));
-    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['role:AGENT', 'role:PRIMARY_ADMIN']));
+    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop'));
     expect(screen.getByText('需重新啟動 Claude Desktop／Codex 後生效')).toBeTruthy();
     fireEvent.click(screen.getByRole('tab', { name: '指令' }));
     expect(screen.queryByText('需重新啟動 Claude Desktop／Codex 後生效')).toBeNull();
     fireEvent.click(screen.getByRole('tab', { name: '助理' }));
     expect(await screen.findByText('需重新啟動 Claude Desktop／Codex 後生效')).toBeTruthy();
     rendered.unmount();
-    render(<Settings api={api} headingRef={React.createRef()} accounts={accounts} />);
+    render(<Settings api={api} headingRef={React.createRef()} accounts={mcpAccounts} />);
     fireEvent.click(screen.getByRole('tab', { name: '助理' }));
     expect(screen.queryByText('需重新啟動 Claude Desktop／Codex 後生效')).toBeNull();
   });
-  it('shows both fixed role rows when only one real account exists and grants no missing role', async () => {
+  it('connects a local client when only one real account exists, without a scope picker', async () => {
     const api = {
-      getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: null, agentWorkspace: null, connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
-      mcpGetStatus: vi.fn(async () => ({ running: true, endpoint: 'http://127.0.0.1:38471/mcp', host: '127.0.0.1' as const, port: 38471, activeTokenCount: 0, inFlightRequests: 0, maxConcurrentRequests: 8 })),
-      mcpListTokens: vi.fn(async () => []),
+      getDatabaseSetupStatus: vi.fn(async () => mcpDatabaseStatus),
+      mcpGetStatus: vi.fn(async () => mcpStatusFixture),
       mcpLocalClientStatus: vi.fn(async () => [
-        { client: 'claude-desktop' as const, installed: true, connected: false, tokenId: null, accountScopes: [] },
-        { client: 'codex' as const, installed: true, connected: false, tokenId: null, accountScopes: [] },
+        { client: 'claude-desktop' as const, installed: true, connected: false },
+        { client: 'codex' as const, installed: true, connected: false },
       ]),
-      mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex', accountScopes: string[]) => ({ client, installed: true, connected: true, tokenId: null, accountScopes })),
+      mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex') => ({ client, installed: true, connected: true })),
     } as unknown as DesktopApi;
     const account = { accountId: 'account-agent', displayName: 'Agent LINE', status: 'connected', lastSyncedAt: null, mode: 'ACTIVE_CONTROL', productRole: 'AGENT' } as unknown as import('@line-agent/contracts').LineAccountSummary;
-    const style = document.createElement('style');
-    style.dataset.settingsLayoutTest = 'true';
-    // Load the full cascade so the generic .panel label column direction is exercised.
-    style.textContent = readFileSync(new NodeURL('../styles.css', import.meta.url), 'utf8');
-    document.head.append(style);
     render(<Settings api={api} headingRef={React.createRef()} accounts={[account]} />);
     fireEvent.click(screen.getByRole('tab', { name: '助理' }));
     const card = await screen.findByRole('region', { name: 'Claude Desktop MCP 連線' });
-    const roleCheckboxes = within(card).getAllByRole('checkbox');
-    expect(roleCheckboxes.map((checkbox) => checkbox.getAttribute('aria-label'))).toEqual([
-      'Claude Desktop AGENT帳號',
-      'Claude Desktop 管理員帳號（尚未新增）',
-    ]);
-    expect(roleCheckboxes[0]).toHaveProperty('checked', true);
-    expect(roleCheckboxes[1]).toHaveProperty('checked', false);
-    expect(roleCheckboxes[1]).toHaveProperty('disabled', true);
-    expect(roleCheckboxes[1]!.getAttribute('aria-label')).toContain('尚未新增');
-    expect(within(card).queryByText('（尚未新增）')).toBeNull();
-    const roleLabels = roleCheckboxes.map((checkbox) => checkbox.closest('label') as HTMLLabelElement);
-    expect(roleLabels.map((label) => getComputedStyle(label).flexDirection)).toEqual(['row', 'row']);
-    const scopePicker = card.querySelector('.mcp-local-scope-picker') as HTMLElement;
-    // A 320px card leaves 292px inside its padding; two 132px tracks plus the 12px gap fit.
-    expect(getComputedStyle(scopePicker).gridTemplateColumns).toContain('132px');
+    expect(within(card).queryAllByRole('checkbox')).toEqual([]);
     fireEvent.click(within(card).getByRole('button', { name: '連接' }));
-    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['role:AGENT']));
+    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop'));
   });
   it('does not show the restart note when connecting a local MCP client fails', async () => {
     const api = {
-      getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: null, agentWorkspace: null, connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
-      mcpGetStatus: vi.fn(async () => ({ running: true, endpoint: 'http://127.0.0.1:38471/mcp', host: '127.0.0.1' as const, port: 38471, activeTokenCount: 0, inFlightRequests: 0, maxConcurrentRequests: 8 })),
-      mcpListTokens: vi.fn(async () => []),
-      mcpLocalClientStatus: vi.fn(async () => [{ client: 'claude-desktop' as const, installed: true, connected: false, tokenId: null, accountScopes: [] }]),
+      getDatabaseSetupStatus: vi.fn(async () => mcpDatabaseStatus),
+      mcpGetStatus: vi.fn(async () => mcpStatusFixture),
+      mcpLocalClientStatus: vi.fn(async () => [{ client: 'claude-desktop' as const, installed: true, connected: false }]),
       mcpLocalClientConnect: vi.fn(async () => { throw new Error('connect failed'); }),
     } as unknown as DesktopApi;
     const account = { accountId: 'account-agent', displayName: 'Agent LINE', status: 'connected', lastSyncedAt: null, mode: 'ACTIVE_CONTROL', productRole: 'AGENT' } as unknown as import('@line-agent/contracts').LineAccountSummary;
@@ -1463,65 +1388,34 @@ describe('database settings', () => {
     await waitFor(() => expect(screen.getByRole('status').textContent).toContain('無法更新本機 MCP 連線設定'));
     expect(screen.queryByText('需重新啟動 Claude Desktop／Codex 後生效')).toBeNull();
   });
-  it('refreshes the MCP token count badge after connect and disconnect', async () => {
-    const statusWith = (activeTokenCount: number) => ({ running: true, endpoint: 'http://127.0.0.1:38471/mcp', host: '127.0.0.1' as const, port: 38471, activeTokenCount, inFlightRequests: 0, maxConcurrentRequests: 8 });
+  it('refreshes the MCP server status after connect and disconnect', async () => {
     const mcpGetStatus = vi.fn()
-      .mockResolvedValueOnce(statusWith(0))
-      .mockResolvedValueOnce(statusWith(1))
-      .mockResolvedValueOnce(statusWith(0));
+      .mockResolvedValueOnce(mcpStatusFixture)
+      .mockResolvedValueOnce({ ...mcpStatusFixture, running: false })
+      .mockResolvedValueOnce(mcpStatusFixture);
     const api = {
-      getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: null, agentWorkspace: null, connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
+      getDatabaseSetupStatus: vi.fn(async () => mcpDatabaseStatus),
       mcpGetStatus,
-      mcpListTokens: vi.fn(async () => []),
       mcpLocalClientStatus: vi.fn(async () => [
-        { client: 'claude-desktop' as const, installed: true, connected: false, tokenId: null, accountScopes: [] },
-        { client: 'codex' as const, installed: true, connected: false, tokenId: null, accountScopes: [] },
+        { client: 'claude-desktop' as const, installed: true, connected: false },
+        { client: 'codex' as const, installed: true, connected: false },
       ]),
-      mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex', accountScopes: string[]) => ({ client, installed: true, connected: true, tokenId: '22222222-2222-4222-8222-222222222222', accountScopes })),
+      mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex') => ({ client, installed: true, connected: true })),
       mcpLocalClientDisconnect: vi.fn(async () => undefined),
     } as unknown as DesktopApi;
     const account = { accountId: 'account-A', displayName: 'LINE 帳號 A', productRole: 'AGENT' } as unknown as import('@line-agent/contracts').LineAccountSummary;
     render(<Settings api={api} headingRef={React.createRef()} accounts={[account]} />);
     fireEvent.click(screen.getByRole('tab', { name: '助理' }));
-    expect(await screen.findByText('運行中 (0 個有效 Token)')).toBeTruthy();
     const mcpHeading = screen.getByRole('heading', { name: 'MCP 伺服器與外部 Agent 授權' });
-    const statusBadge = screen.getByText('運行中 (0 個有效 Token)');
-    expect(mcpHeading.closest('.panel-top')?.contains(statusBadge)).toBe(true);
+    const panelTop = mcpHeading.closest('.panel-top') as HTMLElement;
+    expect(await within(panelTop).findByText('執行中')).toBeTruthy();
     expect(screen.queryByText('僅綁定本機 Loopback。')).toBeNull();
     const card = await screen.findByRole('region', { name: 'Claude Desktop MCP 連線' });
     fireEvent.click(within(card).getByRole('button', { name: '連接' }));
-    expect(await screen.findByText('運行中 (1 個有效 Token)')).toBeTruthy();
+    expect(await within(panelTop).findByText('未啟動')).toBeTruthy();
     fireEvent.click(within(card).getByRole('button', { name: '中斷連接' }));
-    expect(await screen.findByText('運行中 (0 個有效 Token)')).toBeTruthy();
+    expect(await within(panelTop).findByText('執行中')).toBeTruthy();
     expect(mcpGetStatus).toHaveBeenCalledTimes(3);
-  });
-  it('keeps stable role selections independent across equivalent account snapshots', async () => {
-    const api = {
-      getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: null, agentWorkspace: null, connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
-      mcpGetStatus: vi.fn(async () => ({ running: true, endpoint: 'http://127.0.0.1:38471/mcp', host: '127.0.0.1' as const, port: 38471, activeTokenCount: 0, inFlightRequests: 0, maxConcurrentRequests: 8 })),
-      mcpListTokens: vi.fn(async () => []),
-      mcpLocalClientStatus: vi.fn(async () => [
-        { client: 'claude-desktop' as const, installed: true, connected: false, tokenId: null, accountScopes: [] },
-        { client: 'codex' as const, installed: true, connected: false, tokenId: null, accountScopes: [] },
-      ]),
-      mcpLocalClientConnect: vi.fn(async (client: 'claude-desktop' | 'codex', accountScopes: string[]) => ({ client, installed: true, connected: true, tokenId: null, accountScopes })),
-    } as unknown as DesktopApi;
-    const a = { accountId: 'A', displayName: 'Account A', status: 'connected' as const, lastSyncedAt: null, mode: 'ACTIVE_CONTROL' as const, productRole: 'AGENT' as const };
-    const b = { accountId: 'B', displayName: 'Account B', status: 'connected' as const, lastSyncedAt: null, mode: 'MONITOR_ONLY' as const, productRole: 'PRIMARY_ADMIN' as const };
-    const view = render(<Settings api={api} headingRef={React.createRef()} accounts={[a, b]} />);
-    fireEvent.click(screen.getByRole('tab', { name: '助理' }));
-    const findCard = (client: string) => screen.getAllByRole('region').find((item) => item.getAttribute('aria-label')?.startsWith(`${client} MCP`))!;
-    await waitFor(() => expect(findCard('Claude Desktop')).toBeTruthy());
-    const claude = findCard('Claude Desktop');
-    const codex = findCard('Codex');
-    fireEvent.click(within(claude).getByRole('checkbox', { name: 'Claude Desktop 管理員帳號' }));
-    expect(within(codex).getByRole('checkbox', { name: 'Codex 管理員帳號' })).toHaveProperty('checked', true);
-    view.rerender(<Settings api={api} headingRef={React.createRef()} accounts={[{ ...a }, { ...b }]} />);
-    const updatedClaude = findCard('Claude Desktop');
-    expect(within(updatedClaude).getByRole('checkbox', { name: 'Claude Desktop 管理員帳號' })).toHaveProperty('checked', false);
-    view.rerender(<Settings api={api} headingRef={React.createRef()} accounts={[{ ...a }]} />);
-    fireEvent.click(within(findCard('Claude Desktop')).getAllByRole('button')[0]!);
-    await waitFor(() => expect(api.mcpLocalClientConnect).toHaveBeenCalledWith('claude-desktop', ['role:AGENT']));
   });
 });
 

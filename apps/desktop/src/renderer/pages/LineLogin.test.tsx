@@ -170,6 +170,38 @@ describe('official LINE build status on the Primary Admin card', () => {
   });
 });
 
+describe('embedded external monitor card', () => {
+  const importing = (stage: 'monitoring' | 'importing_history', committedRows: string, eligibleRows: string) => ({
+    stage, copiedBytes: null, totalBytes: null, committedRows, eligibleRows, message: null,
+  }) as unknown as NonNullable<LineAccountSummary['externalImportProgress']>;
+  const renderEmbedded = (admin: LineAccountSummary) => {
+    const api = {} as unknown as DesktopApi;
+    render(<LineLogin api={api} accounts={[buildAgent, admin]} headingRef={React.createRef()} embedded />);
+  };
+
+  it('hides the import count while monitoring and keeps one stop button in the version row', () => {
+    renderEmbedded({ ...buildAdmin({ version: '26.5.0.3975', status: 'accepted' }), externalImportProgress: importing('monitoring', '4560', '4560') });
+    expect(screen.queryByText(/已提交/)).toBeNull();
+    expect(screen.getByText('監控中')).toBeTruthy();
+    const stops = screen.getAllByRole('button', { name: '關閉外部監控' });
+    expect(stops).toHaveLength(1);
+    const row = document.querySelector('.external-monitor-version-row')!;
+    expect(row.contains(stops[0]!)).toBe(true);
+    expect(row.textContent).toContain('LINE 版本：26.5.0.3975');
+  });
+
+  it('shows the count during the first history import', () => {
+    renderEmbedded({ ...buildAdmin({ version: '26.5.0.3975', status: 'accepted' }), externalImportProgress: importing('importing_history', '250', '1000') });
+    expect(screen.getByText('已提交 250 / 1000 則訊息')).toBeTruthy();
+  });
+
+  it('renders the stop button one time when no LINE build is known', () => {
+    renderEmbedded({ ...buildAdmin(null), externalImportProgress: importing('monitoring', '4560', '4560') });
+    expect(screen.getAllByRole('button', { name: '關閉外部監控' })).toHaveLength(1);
+    expect(document.querySelector('.external-monitor-version-row')?.querySelector('button')).toBeTruthy();
+  });
+});
+
 describe('inline account action status', () => {
   const deferred = <T,>() => { let resolve!: (value: T) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; };
 

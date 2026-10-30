@@ -13,7 +13,6 @@ export const McpToolNameSchema = z.enum([
   'get_chat_album',
 ]);
 export const MCP_TOOL_NAMES = McpToolNameSchema.options;
-export const MAX_MCP_TOOL_SCOPES = 64;
 export type McpToolName = z.infer<typeof McpToolNameSchema>;
 export const MCP_TOOL_EFFECTS: Readonly<Record<McpToolName, 'read' | 'effect'>> = {
   list_targets: 'read',
@@ -25,38 +24,11 @@ export const MCP_TOOL_EFFECTS: Readonly<Record<McpToolName, 'read' | 'effect'>> 
   get_chat_album: 'read',
 };
 
-export const McpTokenStateSchema = z.enum(['ACTIVE', 'REVOKED']);
-export type McpTokenState = z.infer<typeof McpTokenStateSchema>;
-
-export const McpPlaintextTokenSchema = z.string().regex(/^la_mcp_[A-Za-z0-9_-]{43}$/);
-
-export const McpTokenExpirationSchema = z.discriminatedUnion('mode', [
-  z.strictObject({ mode: z.literal('limited'), hours: z.number().int().min(1).max(24 * 365) }),
-  z.strictObject({ mode: z.literal('never') }),
-]);
-export type McpTokenExpiration = z.infer<typeof McpTokenExpirationSchema>;
-
-export const McpTokenSummarySchema = z.strictObject({
-  tokenId: z.uuid(),
-  principalId: z.string().trim().min(1).max(128),
-  deviceLabel: z.string().trim().min(1).max(120),
-  accountScopes: z.array(z.string().min(1)).min(1).max(16),
-  toolScopes: z.array(McpToolNameSchema).min(1).max(MAX_MCP_TOOL_SCOPES),
-  grantVersion: z.number().int().positive(),
-  state: McpTokenStateSchema,
-  expiresAt: z.iso.datetime({ offset: true }).nullable(),
-  revokedAt: z.iso.datetime({ offset: true }).nullable(),
-  lastUsedAt: z.iso.datetime({ offset: true }).nullable(),
-  createdAt: z.iso.datetime({ offset: true }),
-});
-export type McpTokenSummary = z.infer<typeof McpTokenSummarySchema>;
-
 export const McpServerStatusSchema = z.strictObject({
   running: z.boolean(),
   endpoint: z.string().nullable(),
   host: z.literal('127.0.0.1'),
   port: z.number().int().min(0).max(65535).nullable(),
-  activeTokenCount: z.number().int().nonnegative(),
   inFlightRequests: z.number().int().nonnegative(),
   maxConcurrentRequests: z.number().int().positive(),
 });
@@ -67,8 +39,6 @@ export const McpLocalClientStatusSchema = z.strictObject({
   client: McpLocalClientKindSchema,
   installed: z.boolean(),
   connected: z.boolean(),
-  tokenId: z.uuid().nullable(),
-  accountScopes: z.array(z.string().min(1)).max(16),
 });
 export type McpLocalClientKind = z.infer<typeof McpLocalClientKindSchema>;
 export type McpLocalClientStatus = z.infer<typeof McpLocalClientStatusSchema>;

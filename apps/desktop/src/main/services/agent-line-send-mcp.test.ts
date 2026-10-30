@@ -80,12 +80,13 @@ describe('send tool HTTP backstop', () => {
     expect((await post(SEND_TO_TARGET_TOOL_NAME)).status).toBe(200);
     expect((await post('list_send_targets')).status).toBe(504);
     expect((await post('query_target_messages')).status).toBe(504);
-    // The long deadline is internal-only: an external bearer keeps the short one.
+    // The long deadline is internal-only: a request without an li_job_ bearer keeps the short one.
     service.handleExternalJsonRpc.mockImplementation(async () => {
       await new Promise((resolve) => setTimeout(resolve, 400));
       return { httpStatus: 200, body: { jsonrpc: '2.0', id: 1, result: {} } };
     });
     expect((await post(SEND_TO_TARGET_TOOL_NAME, `la_mcp_${'A'.repeat(43)}`)).status).toBe(504);
+    expect((await post(SEND_TO_TARGET_TOOL_NAME, '')).status).toBe(504);
     expect(MCP_SEND_REQUEST_TIMEOUT_MS).toBe(605_000);
     await server.shutdown();
     server = undefined;

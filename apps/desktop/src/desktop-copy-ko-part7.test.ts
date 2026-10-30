@@ -20,7 +20,6 @@ describe('Korean desktop copy part 7', () => {
 
   it('uses natural Korean for automatic replies, token access, and command prompts', () => {
     expect(KOREAN_DESKTOP_COPY_PART7.thisRuleWasDeletedElsewhereYourEditsAreKept).toContain('편집 내용은 유지됩니다');
-    expect(KOREAN_DESKTOP_COPY_PART7.chooseTheLineAccountsThisTokenCanAccessAll).toContain('LINE 계정');
     expect(KOREAN_DESKTOP_COPY_PART7.agentCodexPrompt).toBe('/agent codex <프롬프트>');
   });
 });

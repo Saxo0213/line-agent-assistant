@@ -7,7 +7,6 @@ import {
   encodeMcpMessageCursor,
   McpServerStatusSchema,
   McpTargetSummarySchema,
-  McpTokenSummarySchema,
   McpToolInputUnionSchema,
   McpToolNameSchema,
   McpToolOutputUnionSchema,
@@ -16,18 +15,17 @@ import {
 } from './index.js';
 
 describe('MCP contracts and IPC schemas', () => {
-  it('accepts explicit limited and never expiration and rejects ambiguous or invalid lifetimes', () => {
-    const base = { type: 'mcpIssueToken', requestId: 'expiry-test', deviceLabel: 'External',
-      accountScopes: ['account-a'], toolScopes: ['list_targets'] };
-    for (const expiration of [{ mode: 'never' }, { mode: 'limited', hours: 1 }, { mode: 'limited', hours: 8760 }]) {
-      expect(IpcRequestSchema.safeParse({ ...base, expiration }).success).toBe(true);
-    }
-    for (const expiration of [undefined, null, { mode: 'never', hours: 24 }, { mode: 'limited' },
-      { mode: 'limited', hours: 0 }, { mode: 'limited', hours: 8761 }, { mode: 'limited', hours: 1.5 },
-      { mode: 'limited', hours: '24' }, { mode: 'unknown' }]) {
-      expect(IpcRequestSchema.safeParse({ ...base, expiration }).success).toBe(false);
-    }
-    expect(IpcRequestSchema.safeParse({ ...base, expiration: { mode: 'never' }, expiresInHours: 24 }).success).toBe(false);
+  it('has no MCP token request or result schema', () => {
+    for (const payload of [
+      { type: 'mcpIssueToken', requestId: 'r-1', deviceLabel: 'External', accountScopes: ['account-a'], toolScopes: ['list_targets'], expiration: { mode: 'never' } },
+      { type: 'mcpListTokens', requestId: 'r-2' },
+      { type: 'mcpRevokeToken', requestId: 'r-3', tokenId: '11111111-1111-4111-8111-111111111111' },
+    ]) expect(IpcRequestSchema.safeParse(payload).success).toBe(false);
+    for (const payload of [
+      { type: 'mcpIssueToken', requestId: 'r-1', ok: true },
+      { type: 'mcpListTokens', requestId: 'r-2', ok: true, tokens: [] },
+      { type: 'mcpRevokeToken', requestId: 'r-3', ok: true, revoked: true },
+    ]) expect(IpcResultSchema.safeParse(payload).success).toBe(false);
   });
   it('validates Phase 1 read-only MCP tool names', () => {
     expect(McpToolNameSchema.options).toEqual([
@@ -75,40 +73,18 @@ describe('MCP contracts and IPC schemas', () => {
     expect(McpToolInputUnionSchema.safeParse({ name: 'list_chat_albums', arguments: { accountId: 'acc', chatType: 'community', chatId: 'chat' } }).success).toBe(false);
   });
 
-  it('validates non-secret MCP token summary and server status schemas', () => {
-    const token = {
-      tokenId: '11111111-1111-4111-8111-111111111111',
-      principalId: 'external:laptop-1',
-      deviceLabel: 'Analyst Laptop',
-      accountScopes: ['account-admin', 'account-agent'],
-      toolScopes: ['list_targets', 'query_target_messages'] as const,
-      grantVersion: 1,
-      state: 'ACTIVE' as const,
-      expiresAt: '2026-10-20T00:00:00.000Z',
-      revokedAt: null,
-      lastUsedAt: null,
-      createdAt: '2026-10-17T00:00:00.000Z',
-    };
-    expect(McpTokenSummarySchema.parse(token).tokenId).toBe(token.tokenId);
-    expect(McpTokenSummarySchema.parse({ ...token, expiresAt: null }).expiresAt).toBeNull();
-    expect(
-      McpTokenSummarySchema.safeParse({
-        ...token,
-        plaintextToken: 'la_mcp_' + 'A'.repeat(43),
-      }).success,
-    ).toBe(false);
-
+  it('validates the MCP server status schema', () => {
     const status = {
       running: true,
       endpoint: 'http://127.0.0.1:38471/mcp',
       host: '127.0.0.1' as const,
       port: 38471,
-      activeTokenCount: 2,
       inFlightRequests: 0,
       maxConcurrentRequests: 8,
     };
     expect(McpServerStatusSchema.parse(status).host).toBe('127.0.0.1');
     expect(McpServerStatusSchema.safeParse({ ...status, host: '0.0.0.0' }).success).toBe(false);
+    expect(McpServerStatusSchema.safeParse({ ...status, activeTokenCount: 2 }).success).toBe(false);
   });
 
   it('requires at least one target selector for query_target_messages', () => {
@@ -239,52 +215,11 @@ describe('MCP contracts and IPC schemas', () => {
 
     // IPC requests
     expect(IpcRequestSchema.safeParse({ type: 'mcpGetStatus', requestId: 'r-1' }).success).toBe(true);
-    expect(IpcRequestSchema.safeParse({ type: 'mcpListTokens', requestId: 'r-2' }).success).toBe(true);
-    expect(
-      IpcRequestSchema.safeParse({
-        type: 'mcpIssueToken',
-        requestId: 'r-3',
-        deviceLabel: 'External CLI',
-        accountScopes: ['account-a'],
-        toolScopes: ['list_targets', 'query_target_messages'],
-        expiration: { mode: 'limited', hours: 24 },
-      }).success,
-    ).toBe(true);
-    expect(
-      IpcRequestSchema.safeParse({
-        type: 'mcpRevokeToken',
-        requestId: 'r-4',
-        tokenId: '11111111-1111-4111-8111-111111111111',
-      }).success,
-    ).toBe(true);
     expect(
       IpcRequestSchema.safeParse({
         type: 'mcpCallInternalTool',
         requestId: 'r-5',
         tool: { name: 'list_targets', arguments: { limit: 10 } },
-      }).success,
-    ).toBe(true);
-
-    // IPC results
-    expect(
-      IpcResultSchema.safeParse({
-        type: 'mcpIssueToken',
-        requestId: 'r-3',
-        ok: true,
-        token: {
-          tokenId: '11111111-1111-4111-8111-111111111111',
-          principalId: 'external:cli',
-          deviceLabel: 'External CLI',
-          accountScopes: ['account-a'],
-          toolScopes: ['list_targets', 'query_target_messages'],
-          grantVersion: 1,
-          state: 'ACTIVE',
-          expiresAt: '2026-10-18T00:00:00.000Z',
-          revokedAt: null,
-          lastUsedAt: null,
-          createdAt: '2026-10-17T00:00:00.000Z',
-        },
-        plaintextToken: 'la_mcp_' + 'A'.repeat(43),
       }).success,
     ).toBe(true);
   });

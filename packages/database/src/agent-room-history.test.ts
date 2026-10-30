@@ -274,18 +274,15 @@ database('Agent room history (real database)', () => {
     }
   });
 
-  it('refuses an external token naming the history tool and denies an external call with an audit row', async () => {
-    await expect(tokens.issueToken({ deviceLabel: 'bad', accountScopes: ['acc-agent'], toolScopes: [TOOL as never], expiration: { mode: 'never' } }))
-      .rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  it('keeps the history tool out of stored token scopes and denies an external call with an audit row', async () => {
     await expect(pool.query(
       "INSERT INTO mcp_agent_tokens (token_id, token_digest, principal_id, device_label, account_scopes, tool_scopes, expires_at) VALUES ($1, $2, 'x', 'x', ARRAY['acc-agent'], ARRAY['query_agent_room_history'], now() + interval '1 day')",
       [randomUUID(), Buffer.alloc(32, 7)])).rejects.toThrow();
-    const issued = await tokens.issueToken({ deviceLabel: 'ext', accountScopes: ['acc-agent'], toolScopes: ['list_targets'], expiration: { mode: 'never' } });
     const before = (await audits()).length;
-    await expect(tokens.executeWithVerifiedToken({ bearerToken: issued.plaintextToken, toolName: TOOL, execute: async () => ({ data: 'unreachable' }) }))
+    await expect(tokens.executeLocalClientRead({ toolName: TOOL, execute: async () => ({ data: 'unreachable' }) }))
       .rejects.toMatchObject({ code: 'SCOPE_DENIED' });
     const after = await audits();
     expect(after.length).toBe(before + 1);
-    expect(after[0]).toMatchObject({ initiator: 'external_agent', action: 'AUTH_REJECTED', disposition: 'SCOPE_DENIED', toolName: TOOL });
+    expect(after[0]).toMatchObject({ initiator: 'external_agent', action: 'AUTH_REJECTED', disposition: 'SCOPE_DENIED', toolName: TOOL, tokenId: null, principalId: 'local-client' });
   });
 });

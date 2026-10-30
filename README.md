@@ -11,7 +11,7 @@
 <ul>
 <li><strong>Agent account:</strong> Signs in to LINE, receives instructions from the administrator, and runs tasks through a locally installed Codex or Claude agent.</li>
 <li><strong>Administrator account:</strong> Supports sign-in or monitoring mode. Monitoring reads message records stored locally by LINE.</li>
-<li><strong>Message assistant:</strong> Shows conversations and attachments from both accounts in one place, searches message history, and lets the administrator ask the Agent to summarize conversations.</li>
+- Give local MCP clients read-only access to stored LINE conversations through `list_targets`, `query_target_messages`, and `query_target_messages_by_time`. The external endpoint does **not** offer internal Agent send tools or direct database, filesystem, or credential access.
 <li><strong>Conversation assistant:</strong> Lets the Agent participate in conversations, help download files and images, and set up automatic reply rules.</li>
 </ul>
 </td>
@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.303 removes the "Log in again" button from accounts that are logged in: the "Log in" button shows only after a logout or when credentials are invalid. See the [v1.0.303 release notes](docs/releases/v1.0.303.md). Earlier changes are listed in [v1.0.302](docs/releases/v1.0.302.md), [v1.0.288](docs/releases/v1.0.288.md), and [v1.0.280](docs/releases/v1.0.280.md).
+v1.0.305 removes MCP tokens: Claude Desktop and Codex connect with no token, and any program on this computer can read stored LINE messages through the local endpoint (browser pages are blocked; sending is not possible). See the [v1.0.305 release notes](docs/releases/v1.0.305.md). Earlier changes are listed in [v1.0.303](docs/releases/v1.0.303.md), [v1.0.302](docs/releases/v1.0.302.md), and [v1.0.288](docs/releases/v1.0.288.md).
 
 ## Installation
 

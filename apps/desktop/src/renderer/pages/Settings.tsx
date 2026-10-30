@@ -1,6 +1,6 @@
 import { generatedMessageText, useDesktopText, useExtraText, useSafeErrorText } from '../desktop-i18n.js';
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, DEFAULT_AGENT_STATUS_ICONS, DEFAULT_AUTORESPONDER_FALLBACK, MCP_TOOL_NAMES, normalizeAutoresponderTrigger, validateAutoresponderConfig, type AgentStatusIcons, type AutoResponderRule, type AutoResponderSettings, type ComponentHealth, type ConversationKey, type LineAccountSummary, type McpLocalClientKind, type McpLocalClientStatus, type McpServerStatus, type McpTokenSummary, type McpToolName, type ProviderStatus } from '@line-agent/contracts';
+import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, DEFAULT_AGENT_STATUS_ICONS, DEFAULT_AUTORESPONDER_FALLBACK, normalizeAutoresponderTrigger, validateAutoresponderConfig, type AgentStatusIcons, type AutoResponderRule, type AutoResponderSettings, type ComponentHealth, type ConversationKey, type LineAccountSummary, type McpLocalClientKind, type McpLocalClientStatus, type McpServerStatus, type ProviderStatus } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import { isValidEmbeddedPassword } from '../../setup-protocol.js';
 import { storeSettingsTab, type SettingsTabId } from '../settings-tab-storage.js';
@@ -15,7 +15,6 @@ import { UpdateCheckSettings } from './UpdateCheckSettings.js';
 import { AgentExtensionsSettings } from './AgentExtensionsSettings.js';
 import { AgentPersonaSettings } from './AgentPersonaSettings.js';
 
-const SHOW_MANUAL_MCP_TOKENS = false;
 const EMPTY_PROVIDERS: ProviderStatus[] = [];
 const EMPTY_ACCOUNTS: LineAccountSummary[] = [];
 
@@ -65,17 +64,6 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
   const localeReadState = localeState.status;
   const localeText = (key: Parameters<typeof translateSettings>[1]) => translateSettings(locale, key);
   const agentStatusLabel: Record<ProviderStatus['status'], string> = { unknown: desktopText('checkedAtRuntime'), logged_in: desktopText('loggedIn'), logged_out: desktopText('notLoggedIn'), not_installed: desktopText('notInstalled'), error: desktopText('unavailable') };
-  const MCP_TOOL_LABEL: Record<McpToolName, string> = {
-    list_targets: desktopText('listChats'), query_target_messages: desktopText('queryChatMessages'), query_target_messages_by_time: desktopText('queryMessagesByTime'),
-    list_chat_notes: 'List saved Notes', get_chat_note: 'Read saved Note', list_chat_albums: 'List saved Albums', get_chat_album: 'Read saved Album',
-  };
-  const MCP_TOOL_DESCRIPTION: Record<McpToolName, string> = {
-    list_targets: desktopText('listLineConversationsAndParticipantsInAuthorizedAccounts'), query_target_messages: desktopText('searchSelectedAccountsHistoryByTargetNameChatidOr'), query_target_messages_by_time: desktopText('searchSelectedAccountsHistoryWithinAFromToTime'),
-    list_chat_notes: 'List Notes already saved for an authorized chat.', get_chat_note: 'Read a saved Note by its stable ID.', list_chat_albums: 'List Albums already saved for an authorized chat.', get_chat_album: 'Read saved Album metadata and photo availability.',
-  };
-  const MCP_ACCOUNT_ROLE_LABEL: Record<NonNullable<LineAccountSummary['productRole']>, string> = {
-    AGENT: desktopText('agentAccount'), PRIMARY_ADMIN: desktopText('administratorAccount'),
-  };
   const AGENT_STATUS_ROWS: Array<{ key: keyof AgentStatusIcons; label: string }> = [
     { key: 'queued', label: desktopText('queued') }, { key: 'running', label: desktopText('running') }, { key: 'completed', label: desktopText('completed') },
     { key: 'failed', label: desktopText('failed') }, { key: 'cancelled', label: desktopText('cancelled') }, { key: 'interrupted', label: desktopText('interrupted') },
@@ -289,28 +277,9 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
     void saveAutoResponder({ displayName: autoDisplayName, fallback: candidateFallback, rules: next }, true);
   }
   const [mcpStatus, setMcpStatus] = useState<McpServerStatus | null>(null);
-  const [mcpTokens, setMcpTokens] = useState<McpTokenSummary[]>([]);
   const [mcpLocalClients, setMcpLocalClients] = useState<McpLocalClientStatus[]>([]);
-  const [mcpLocalScopes, setMcpLocalScopes] = useState<Record<McpLocalClientKind, string[] | null>>({ 'claude-desktop': null, codex: null });
-  const localRoleScopes = (['AGENT', 'PRIMARY_ADMIN'] as const)
-    .filter((role) => accounts.some((account) => account.productRole === role)).map((role) => `role:${role}`);
-  const accountIdsKey = localRoleScopes.join('\0');
   const [mcpLocalBusy, setMcpLocalBusy] = useState<McpLocalClientKind | null>(null);
   const [mcpRestartNotice, setMcpRestartNotice] = useState(false);
-  const [mcpDeviceLabel, setMcpDeviceLabel] = useState('');
-  const [mcpAccountScopes, setMcpAccountScopes] = useState<string[]>([]);
-  const [mcpToolScopes, setMcpToolScopes] = useState<McpToolName[]>([]);
-  const [mcpExpiresInHours, setMcpExpiresInHours] = useState(168);
-  const [mcpExpirationMode, setMcpExpirationMode] = useState<'limited' | 'never'>('limited');
-  const mcpLastValidHours = useRef(168);
-  const [mcpPlaintextToken, setMcpPlaintextToken] = useState<string | null>(null);
-  const [mcpBusy, setMcpBusy] = useState(false);
-
-  useEffect(() => {
-    const valid = new Set(['role:AGENT', 'role:PRIMARY_ADMIN']);
-    setMcpLocalScopes((current) => ({ ...current, 'claude-desktop': current['claude-desktop']?.filter((id) => valid.has(id)) ?? null,
-      codex: current.codex?.filter((id) => valid.has(id)) ?? null }));
-  }, [accountIdsKey]);
 
   useEffect(() => {
     if (!localStatus || onNotice) return;
@@ -368,13 +337,12 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
   }, [api, tab]);
 
   useEffect(() => {
-    if (tab !== 'agent' || typeof api.mcpListTokens !== 'function' || typeof api.mcpGetStatus !== 'function') return;
+    if (tab !== 'agent' || typeof api.mcpGetStatus !== 'function') return;
     let current = true;
     const localStatus = typeof api.mcpLocalClientStatus === 'function' ? api.mcpLocalClientStatus() : Promise.resolve([]);
-    void Promise.all([api.mcpGetStatus(), api.mcpListTokens(), localStatus]).then(([nextStatus, nextTokens, nextLocalClients]) => {
+    void Promise.all([api.mcpGetStatus(), localStatus]).then(([nextStatus, nextLocalClients]) => {
       if (!current) return;
       setMcpStatus(nextStatus);
-      setMcpTokens(nextTokens);
       setMcpLocalClients(nextLocalClients);
     }).catch((error: unknown) => {
       if (current) setStatus(safeErrorText(error, desktopText('unableToLoadMcpSettings')));
@@ -387,14 +355,12 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
     setMcpLocalBusy(client); setStatus('');
     try {
       if (action === 'connect') {
-        const selectedScopes = mcpLocalScopes[client] ?? localRoleScopes;
-        if (!selectedScopes.length) { setStatus(desktopText('selectAtLeastOneLineAccountScope')); return; }
-        const status = await api.mcpLocalClientConnect(client, selectedScopes);
+        const status = await api.mcpLocalClientConnect(client);
         setMcpLocalClients((current) => current.map((item) => item.client === client ? status : item));
         setMcpRestartNotice(true);
       } else {
         await api.mcpLocalClientDisconnect(client);
-        setMcpLocalClients((current) => current.map((item) => item.client === client ? { ...item, connected: false, tokenId: null, accountScopes: [] } : item));
+        setMcpLocalClients((current) => current.map((item) => item.client === client ? { ...item, connected: false } : item));
       }
       if (typeof api.mcpGetStatus === 'function') {
         try { setMcpStatus(await api.mcpGetStatus()); } catch { /* keep the previous badge */ }
@@ -506,34 +472,6 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
       }
     }
   }
-  async function issueMcpToken() {
-    if (!mcpDeviceLabel.trim() || mcpBusy || typeof api.mcpIssueToken !== 'function') return;
-    const scopes = mcpAccountScopes;
-    if (scopes.length === 0 || mcpToolScopes.length === 0) return;
-    setMcpBusy(true); setStatus('');
-    try {
-      const issued = await api.mcpIssueToken({
-        deviceLabel: mcpDeviceLabel.trim(),
-        accountScopes: scopes,
-        toolScopes: mcpToolScopes,
-        expiration: mcpExpirationMode === 'never' ? { mode: 'never' } : { mode: 'limited', hours: mcpExpiresInHours },
-      });
-      setMcpPlaintextToken(issued.plaintextToken);
-      setMcpDeviceLabel('');
-      setMcpTokens((current) => [issued.token, ...current]);
-    } catch (error) { setStatus(safeErrorText(error, desktopText('unableToIssueMcpToken'))); }
-    finally { setMcpBusy(false); }
-  }
-  async function revokeMcpToken(tokenId: string) {
-    if (mcpBusy || typeof api.mcpRevokeToken !== 'function') return;
-    setMcpBusy(true); setStatus('');
-    try {
-      await api.mcpRevokeToken(tokenId);
-      setMcpTokens((current) => current.map((item) => item.tokenId === tokenId ? { ...item, state: 'REVOKED', revokedAt: new Date().toISOString() } : item));
-    } catch (error) { setStatus(safeErrorText(error, desktopText('unableToRevokeMcpToken'))); }
-    finally { setMcpBusy(false); }
-  }
-
   const displayAttachmentPath = splitDisplayPath(attachmentRoot || desktopText('notConfigured'));
 
   return <div className="page settings-page"><div ref={settingsContentRef} className="settings-content" aria-hidden={connectionInfo !== null || passwordDialog || localeState.restartChoice}><header className="page-header"><div><span className="eyebrow">{extraText('preferences')}</span><div className="page-title-row"><h1 tabIndex={-1} ref={headingRef}>{desktopText('settings')}</h1><p>{desktopText('manageTheDatabaseAttachmentsAndAgents')}</p></div></div></header>
@@ -641,32 +579,18 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
       <div className="cards secondary-settings"><section className="panel agent-basics"><div className="panel-top"><h2>{desktopText('agentSettings')}</h2><div className="agent-basics-actions"><label>{desktopText('defaultAgent')}<select aria-label={desktopText('defaultAgent')} value={provider} onChange={(event) => { setProvider(event.target.value as 'codex' | 'claude'); setProviderDirty(true); }}><option value="claude">Claude</option><option value="codex">Codex</option></select></label><button className="primary" disabled={!workspace.trim() || agentSaving} onClick={() => void saveAgentSettings()}>{agentSaving ? desktopText('saving') : desktopText('save')}</button></div></div><div className="agent-login-row">{[...providers].sort((a, b) => (a.provider === b.provider ? 0 : a.provider === 'codex' ? -1 : 1)).map((item) => <section className="agent-login-panel" key={item.provider}><div className="panel-top"><h3>{item.provider === 'codex' ? 'Codex' : 'Claude'}</h3><span className="badge">{agentStatusLabel[item.status]}</span></div><AgentProviderAuthControl api={api} providerStatus={item} onStatus={setStatus} /></section>)}</div><div className="agent-setting-section agent-workspace-row"><label htmlFor="agent-workspace-path">{desktopText('workspace')}</label><div className="path-picker"><input id="agent-workspace-path" aria-label={desktopText('agentWorkspace')} value={workspace} onChange={(event) => setWorkspace(event.target.value)} placeholder={desktopText('forExampleDProjectsWorkspace')} /><button onClick={() => void chooseAgentWorkspace()}>{desktopText('chooseFolder')}</button></div></div>
         </section></div>
       <AgentPersonaSettings api={api} />
-      {typeof api.mcpListTokens === 'function' && <section className="panel mcp-settings">
+      {typeof api.mcpGetStatus === 'function' && <section className="panel mcp-settings">
         <div className="panel-top"><h2>{desktopText('mcpServerAndExternalAgentAuthorization')}</h2>
-          {mcpStatus && <span className="badge">{mcpStatus.running ? desktopText('runningArg0ActiveTokens', { arg0: mcpStatus.activeTokenCount }) : desktopText('notStarted')}</span>}</div>
+          {mcpStatus && <span className="badge">{mcpStatus.running ? desktopText('running') : desktopText('notStarted')}</span>}</div>
         {mcpStatus?.endpoint && <p>{extraText('mcpEndpoint')} <code>{mcpStatus.endpoint}</code></p>}
         {typeof api.mcpLocalClientStatus === 'function' && <div className="mcp-local-client-cards">
           {(['claude-desktop', 'codex'] as const).map((client) => {
             const status = mcpLocalClients.find((item) => item.client === client);
             const title = client === 'claude-desktop' ? 'Claude Desktop' : 'Codex';
-            const selectedScopes = mcpLocalScopes[client] ?? localRoleScopes;
             return <section className="mcp-local-client-card" key={client} aria-label={desktopText('arg0McpConnection', { arg0: title })}>
               <div className="panel-top"><h3>{title}</h3><span className="badge">{!status ? desktopText('loading') : !status.installed ? desktopText('notInstalled612') : status.connected ? desktopText('connected613') : desktopText('disconnected614')}</span></div>
-              <fieldset className="mcp-local-scope-picker">
-                <legend>{desktopText('accountScope')}</legend>
-                {(['AGENT', 'PRIMARY_ADMIN'] as const).map((role) => {
-                  const account = accounts.find((item) => item.productRole === role);
-                  const label = MCP_ACCOUNT_ROLE_LABEL[role];
-                  return <label key={`${client}-${role}`}>
-                    <input type="checkbox" aria-label={`${title} ${label}${account ? '' : desktopText('notAddedYet')}`} checked={selectedScopes.includes(`role:${role}`)} disabled={mcpLocalBusy !== null || !account}
-                      onChange={(event) => setMcpLocalScopes((current) => { const selected = current[client] ?? localRoleScopes; const scope = `role:${role}`; return { ...current, [client]: event.target.checked ? [...selected, scope] : selected.filter((id) => id !== scope) }; })} />
-                    {label}
-                  </label>;
-                })}
-                {accounts.length === 0 && <small>{desktopText('noLineAccountsAvailable')}</small>}
-              </fieldset>
               <div className="mcp-local-client-actions">
-                <button className="primary" disabled={!status?.installed || !selectedScopes.length || mcpLocalBusy !== null || !mcpStatus?.running}
+                <button className="primary" disabled={!status?.installed || mcpLocalBusy !== null || !mcpStatus?.running}
                   onClick={() => void setMcpLocalClient(client, 'connect')}>{status?.connected ? desktopText('reconnect') : desktopText('connect')}</button>
                 {status?.connected && <button disabled={mcpLocalBusy !== null} onClick={() => void setMcpLocalClient(client, 'disconnect')}>{desktopText('disconnect')}</button>}
               </div>
@@ -674,52 +598,6 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
           })}
         </div>}
         {mcpRestartNotice && typeof api.mcpLocalClientStatus === 'function' && <p className="mcp-local-restart-note">{desktopText('restartClaudeDesktopCodexToApply')}</p>}
-        {SHOW_MANUAL_MCP_TOKENS && <>
-        <div className="settings-grid mcp-token-controls">
-          <label>{desktopText('deviceAgentName')}<input value={mcpDeviceLabel} maxLength={120} placeholder={desktopText('forExampleAnalystMacbook')} onChange={(event) => setMcpDeviceLabel(event.target.value)} /></label>
-          <fieldset><legend>{desktopText('tokenExpiration')}</legend>
-            <label><input type="radio" name="mcp-expiration" checked={mcpExpirationMode === 'limited'} disabled={mcpBusy} onChange={() => { setMcpExpirationMode('limited'); setMcpExpiresInHours(mcpLastValidHours.current); }} />{desktopText('limitedDuration')}</label>
-            <label><input type="radio" name="mcp-expiration" checked={mcpExpirationMode === 'never'} disabled={mcpBusy} onChange={() => setMcpExpirationMode('never')} />{desktopText('noExpiration')}</label>
-          </fieldset>
-          {mcpExpirationMode === 'limited' && <label>{desktopText('durationHours')}<input type="number" min="1" max="8760" value={mcpExpiresInHours} onChange={(event) => {
-            const hours = Number(event.target.value);
-            setMcpExpiresInHours(hours);
-            if (Number.isInteger(hours) && hours >= 1 && hours <= 8760) mcpLastValidHours.current = hours;
-          }} /></label>}
-          <button className="primary" disabled={mcpBusy || !mcpDeviceLabel.trim() || mcpAccountScopes.length === 0 || mcpToolScopes.length === 0} onClick={() => void issueMcpToken()}>{desktopText('issueMcpToken')}</button>
-        </div>
-        <fieldset className="agent-setting-section mcp-scope-options">
-          <legend>{desktopText('accountGrants')}</legend>
-          <p className="mcp-scope-description" id="mcp-account-scope-description">{desktopText('chooseTheLineAccountsThisTokenCanAccessAll')}</p>
-          {accounts.map((account) => {
-            const label = account.productRole ? MCP_ACCOUNT_ROLE_LABEL[account.productRole] : desktopText('lineAccount');
-            return <label className="mcp-scope-choice" key={account.accountId}>
-              <input type="checkbox" aria-label={label} checked={mcpAccountScopes.includes(account.accountId)} disabled={mcpBusy} aria-describedby="mcp-account-scope-description"
-                onChange={(event) => setMcpAccountScopes((current) => event.target.checked
-                  ? [...current, account.accountId]
-                  : current.filter((id) => id !== account.accountId))} />
-              <span className="mcp-scope-copy"><strong>{label}</strong></span>
-            </label>;
-          })}
-          {accounts.length === 0 && <p>{desktopText('noLineAccountsAvailableToAuthorize')}</p>}
-        </fieldset>
-        <fieldset className="agent-setting-section mcp-scope-options">
-          <legend>{desktopText('toolGrants')}</legend>
-          <p className="mcp-scope-description" id="mcp-tool-scope-description">{desktopText('chooseTheToolsThisTokenCanUseEachOperation')}</p>
-          {MCP_TOOL_NAMES.map((tool) => <label className="mcp-scope-choice" key={tool}>
-            <input type="checkbox" aria-label={MCP_TOOL_LABEL[tool]} aria-describedby={`mcp-tool-description-${tool} mcp-tool-scope-description`} checked={mcpToolScopes.includes(tool)} disabled={mcpBusy}
-              onChange={(event) => setMcpToolScopes((current) => event.target.checked
-                ? [...current, tool]
-                : current.filter((name) => name !== tool))} />
-            <span className="mcp-scope-copy"><strong>{MCP_TOOL_LABEL[tool]}</strong><small id={`mcp-tool-description-${tool}`}>{MCP_TOOL_DESCRIPTION[tool]}</small></span>
-          </label>)}
-        </fieldset>
-        {mcpPlaintextToken && <div className="inline-notice" role="status"><strong>{desktopText('copyThisOneTimeTokenNowItCannotBe')}</strong> <code>{mcpPlaintextToken}</code></div>}
-        {mcpTokens.length > 0 && <div className="mcp-token-list">{mcpTokens.map((item) => <div key={item.tokenId} className="autoresponder-rule">
-          <div><strong>{item.deviceLabel}</strong> <span className="badge">{extraText(item.state === 'ACTIVE' ? 'active' : 'revoked')}</span> <small>{extraText('accounts')} {item.accountScopes.join(', ')}</small> <small>{desktopText('expires')}{item.expiresAt === null ? desktopText('noExpiration') : new Date(item.expiresAt).toLocaleString(locale)}</small></div>
-          {item.state === 'ACTIVE' && <button onClick={() => void revokeMcpToken(item.tokenId)}>{desktopText('revokeToken')}{item.deviceLabel})</button>}
-        </div>)}</div>}
-        </>}
       </section>}
       <AgentExtensionsSettings api={api} />
       <AgentPermissions api={api} accounts={accounts} />

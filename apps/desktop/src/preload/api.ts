@@ -33,7 +33,6 @@ import {
   McpServerStatusSchema,
   McpLocalClientKindSchema,
   McpLocalClientStatusSchema,
-  McpTokenSummarySchema,
   McpToolOutputUnionSchema,
   MessageSearchResultSchema,
   type AgentJobSearchQuery,
@@ -54,7 +53,6 @@ import {
   type McpServerStatus,
   type McpLocalClientKind,
   type McpLocalClientStatus,
-  type McpTokenSummary,
   type McpToolInputUnion,
   type McpToolName,
   type McpToolOutputUnion,
@@ -156,17 +154,8 @@ export type DesktopApi = {
   setAutoResponderSettings(expectedVersion: number, settings: Pick<AutoResponderSettings, 'displayName' | 'fallback' | 'rules'>): Promise<IpcResult>;
   mcpGetStatus(): Promise<McpServerStatus>;
   mcpLocalClientStatus(): Promise<McpLocalClientStatus[]>;
-  mcpLocalClientConnect(client: McpLocalClientKind, accountScopes: string[]): Promise<McpLocalClientStatus>;
+  mcpLocalClientConnect(client: McpLocalClientKind): Promise<McpLocalClientStatus>;
   mcpLocalClientDisconnect(client: McpLocalClientKind): Promise<void>;
-  mcpListTokens(): Promise<McpTokenSummary[]>;
-  mcpIssueToken(input: {
-    deviceLabel: string;
-    principalId?: string;
-    accountScopes: string[];
-    toolScopes: McpToolName[];
-    expiration: import('@line-agent/contracts').McpTokenExpiration;
-  }): Promise<{ token: McpTokenSummary; plaintextToken: string }>;
-  mcpRevokeToken(tokenId: string): Promise<boolean>;
   mcpCallInternalTool(tool: McpToolInputUnion): Promise<McpToolOutputUnion>;
   getAgentPermissions(accountId: string): Promise<AgentPermissionsView>;
   getAgentPermissionDefaults(): Promise<AgentPermissionDefaultsView>;
@@ -363,39 +352,14 @@ export function createDesktopApi(transport: Transport): DesktopApi {
       if (result.type !== 'mcpLocalClientStatus') throwIpcErrorOrUnexpected(result, 'Unexpected local MCP status response');
       return McpLocalClientStatusSchema.array().parse(result.clients);
     },
-    async mcpLocalClientConnect(client, accountScopes) {
-      const result = await request({ type: 'mcpLocalClientConnect', client: McpLocalClientKindSchema.parse(client), accountScopes });
+    async mcpLocalClientConnect(client) {
+      const result = await request({ type: 'mcpLocalClientConnect', client: McpLocalClientKindSchema.parse(client) });
       if (result.type !== 'mcpLocalClientConnect') throwIpcErrorOrUnexpected(result, 'Unexpected local MCP connect response');
       return McpLocalClientStatusSchema.parse(result.status);
     },
     async mcpLocalClientDisconnect(client) {
       const result = await request({ type: 'mcpLocalClientDisconnect', client: McpLocalClientKindSchema.parse(client) });
       if (result.type !== 'mcpLocalClientDisconnect') throwIpcErrorOrUnexpected(result, 'Unexpected local MCP disconnect response');
-    },
-    async mcpListTokens() {
-      const result = await request({ type: 'mcpListTokens' });
-      if (result.type !== 'mcpListTokens') throw new Error(result.type === 'error' ? result.message : 'Unexpected MCP tokens response');
-      return McpTokenSummarySchema.array().parse(result.tokens);
-    },
-    async mcpIssueToken(input) {
-      const result = await request({
-        type: 'mcpIssueToken',
-        deviceLabel: input.deviceLabel,
-        ...(input.principalId ? { principalId: input.principalId } : {}),
-        accountScopes: input.accountScopes,
-        toolScopes: input.toolScopes,
-        expiration: input.expiration,
-      });
-      if (result.type !== 'mcpIssueToken') throw new Error(result.type === 'error' ? result.message : 'Unexpected MCP issue token response');
-      return { token: McpTokenSummarySchema.parse(result.token), plaintextToken: result.plaintextToken };
-    },
-    async mcpRevokeToken(tokenId) {
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(tokenId)) {
-        throw new Error('Invalid MCP token ID');
-      }
-      const result = await request({ type: 'mcpRevokeToken', tokenId });
-      if (result.type !== 'mcpRevokeToken') throw new Error(result.type === 'error' ? result.message : 'Unexpected MCP revoke token response');
-      return result.revoked;
     },
     async mcpCallInternalTool(tool) {
       const result = await request({ type: 'mcpCallInternalTool', tool });

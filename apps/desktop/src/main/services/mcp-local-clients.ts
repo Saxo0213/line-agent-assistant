@@ -1,10 +1,8 @@
 import { copyFile, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { MCP_TOOL_NAMES } from '@line-agent/contracts';
-import type { McpService } from './mcp-service.js';
 
 export type LocalClientKind = 'claude-desktop' | 'codex';
-export interface LocalClientStatus { client: LocalClientKind; installed: boolean; connected: boolean; tokenId: string | null; accountScopes: string[] }
+export interface LocalClientStatus { client: LocalClientKind; installed: boolean; connected: boolean }
 export class LocalMcpConfigError extends Error {
   constructor(public readonly code: 'LOCAL_MCP_CONFIG_CONFLICT' | 'LOCAL_MCP_CONFIG_INVALID', message: string) { super(message); this.name = 'LocalMcpConfigError'; }
 }
@@ -13,38 +11,35 @@ export const CODEX_BLOCK_START = '# >>> LINEJS MCP (managed by LINE Agent Assist
 export const CODEX_BLOCK_END = '# <<< LINEJS MCP';
 const STATUS_PROBE_TIMEOUT_MS = 1_500;
 
-interface ConfiguredMcpCredentials { endpoint: string; token: string }
-
-function configuredCredentials(client: LocalClientKind, contents: string): ConfiguredMcpCredentials | null {
+/**
+ * Reads the endpoint of the managed entry. The entry needs no token. An old entry that still has
+ * LINEJS_MCP_TOKEN or http_headers is read the same way; the next connect rewrites it without them.
+ */
+function configuredEndpoint(client: LocalClientKind, contents: string): string | null {
   if (client === 'codex') {
     const start = contents.indexOf(CODEX_BLOCK_START);
     const end = contents.indexOf(CODEX_BLOCK_END);
     if (start < 0 || end < start) return null;
-    const block = contents.slice(start, end);
-    const endpoint = /^url\s*=\s*"([^"]+)"\s*$/m.exec(block)?.[1];
-    const token = /^http_headers\s*=\s*\{\s*Authorization\s*=\s*"Bearer\s+([^"\s]+)"\s*\}\s*$/m.exec(block)?.[1];
-    return endpoint && token ? { endpoint, token } : null;
+    return /^url\s*=\s*"([^"]+)"\s*$/m.exec(contents.slice(start, end))?.[1] ?? null;
   }
   const entry = parseClaudeConfig(contents).mcpServers;
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
   const env = (entry as Record<string, unknown>).linejs;
   if (!env || typeof env !== 'object' || Array.isArray(env)) return null;
-  const config = env as Record<string, unknown>;
-  const vars = config.env;
+  const vars = (env as Record<string, unknown>).env;
   if (!vars || typeof vars !== 'object' || Array.isArray(vars)) return null;
-  const values = vars as Record<string, unknown>;
-  return typeof values.LINEJS_MCP_URL === 'string' && typeof values.LINEJS_MCP_TOKEN === 'string'
-    ? { endpoint: values.LINEJS_MCP_URL, token: values.LINEJS_MCP_TOKEN } : null;
+  const url = (vars as Record<string, unknown>).LINEJS_MCP_URL;
+  return typeof url === 'string' ? url : null;
 }
 
-async function probeConfiguredToken(credentials: ConfiguredMcpCredentials): Promise<boolean> {
+async function probeConfiguredEndpoint(endpointUrl: string): Promise<boolean> {
   try {
-    const endpoint = new URL(credentials.endpoint);
+    const endpoint = new URL(endpointUrl);
     if (endpoint.protocol !== 'http:' || endpoint.hostname !== '127.0.0.1' || endpoint.pathname !== '/mcp') return false;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), STATUS_PROBE_TIMEOUT_MS);
     try {
-      const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${credentials.token}` },
+      const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 'local-client-status', method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'LINEJS status', version: '1' } } }),
         signal: controller.signal });
       if (!response.ok) return false;
@@ -54,10 +49,10 @@ async function probeConfiguredToken(credentials: ConfiguredMcpCredentials): Prom
   } catch { return false; }
 }
 
-function block(port: number, token: string): string {
-  return `${CODEX_BLOCK_START}\n[mcp_servers.linejs]\nurl = "http://127.0.0.1:${port}/mcp"\nhttp_headers = { Authorization = "Bearer ${token}" }\n${CODEX_BLOCK_END}`;
+function block(port: number): string {
+  return `${CODEX_BLOCK_START}\n[mcp_servers.linejs]\nurl = "http://127.0.0.1:${port}/mcp"\n${CODEX_BLOCK_END}`;
 }
-export function addCodexManagedBlock(contents: string, port: number, token: string): string {
+export function addCodexManagedBlock(contents: string, port: number): string {
   const starts = contents.split(CODEX_BLOCK_START).length - 1;
   const ends = contents.split(CODEX_BLOCK_END).length - 1;
   const start = contents.indexOf(CODEX_BLOCK_START);
@@ -73,7 +68,7 @@ export function addCodexManagedBlock(contents: string, port: number, token: stri
   });
   if (hasLinejsTable || hasLinejsRootKey) throw new LocalMcpConfigError('LOCAL_MCP_CONFIG_CONFLICT', 'Codex MCP linejs config already exists outside the managed block.');
   if (/^\s*\[mcp_servers\.linejs\]\s*$/m.test(outside)) throw new LocalMcpConfigError('LOCAL_MCP_CONFIG_CONFLICT', 'Codex 設定已有自訂的 linejs MCP 項目，未變更設定檔。');
-  const next = block(port, token);
+  const next = block(port);
   if (start >= 0) return `${contents.slice(0, start)}${next}${contents.slice(end + CODEX_BLOCK_END.length)}`;
   const separator = contents ? `${contents.endsWith('\n') ? '' : '\n'}\n` : '';
   return `${contents}${separator}${next}\n`;
@@ -131,7 +126,6 @@ export async function readClientConfig(filePath: string): Promise<string> {
 }
 
 export interface McpLocalClientsOptions {
-  tokens: McpService;
   claudeConfigPath: string;
   codexConfigPath: string;
   execPath: string;
@@ -151,56 +145,31 @@ export class McpLocalClients {
     return next;
   }
   async status(): Promise<LocalClientStatus[]> {
-    await this.options.tokens.normalizeManagedLocalClientScopes();
     return Promise.all((['claude-desktop', 'codex'] as const).map(async (client) => {
       const file = this.file(client);
       const installed = await stat(path.dirname(file)).then(() => true, () => false);
-      let credentials: ConfiguredMcpCredentials | null = null;
+      let endpoint: string | null = null;
       if (installed) {
-        try {
-          const contents = await readClientConfig(file);
-          credentials = configuredCredentials(client, contents);
-        } catch { credentials = null; }
+        try { endpoint = configuredEndpoint(client, await readClientConfig(file)); } catch { endpoint = null; }
       }
-      const token = credentials ? await this.options.tokens.findTokenByBearerToken(credentials.token) : null;
-      const activeEndpoint = this.options.getPort();
-      const endpointMatches = Boolean(credentials && activeEndpoint
-        && credentials.endpoint === `http://127.0.0.1:${activeEndpoint}/mcp`);
-      const connected = Boolean(credentials && token && token.principalId === `local-client:${client}`
-        && token.state === 'ACTIVE' && token.expiresAt === null && endpointMatches && await probeConfiguredToken(credentials));
-      return { client, installed, connected, tokenId: connected ? token!.tokenId : null,
-        accountScopes: connected ? [...token!.accountScopes] : [] };
+      const activePort = this.options.getPort();
+      const endpointMatches = Boolean(endpoint && activePort && endpoint === `http://127.0.0.1:${activePort}/mcp`);
+      const connected = Boolean(endpoint && endpointMatches && await probeConfiguredEndpoint(endpoint));
+      return { client, installed, connected };
     }));
   }
-  connect(client: LocalClientKind, accountScopes: readonly string[]): Promise<LocalClientStatus> {
+  connect(client: LocalClientKind): Promise<LocalClientStatus> {
     return this.serialize(client, async () => {
       const filePath = this.file(client);
       if (!await stat(path.dirname(filePath)).then(() => true, () => false)) throw new Error('Local MCP client is not installed.');
       const port = this.options.getPort();
       if (!port || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('MCP server is not running.');
       const current = await readClientConfig(filePath);
-      if (client === 'codex') addCodexManagedBlock(current, port, 'validation-token');
-      else updateClaudeManagedEntry(current, { command: this.options.execPath, args: [this.options.bridgePath], env: { LINEJS_MCP_TOKEN: 'validation-token' } });
-      const principalId = `local-client:${client}`;
-      const deviceLabel = client === 'codex' ? 'Codex（本機）' : 'Claude Desktop（本機）';
-      if (accountScopes.length === 0 || accountScopes.some((scope) => scope !== 'role:AGENT' && scope !== 'role:PRIMARY_ADMIN')) {
-        throw new Error('Managed local clients require one or more stable role scopes.');
-      }
-      for (const old of (await this.options.tokens.listTokens()).filter((item) => item.principalId === principalId && item.state === 'ACTIVE')) await this.options.tokens.revokeToken(old.tokenId);
-      const issued = await this.options.tokens.issueToken({ deviceLabel, principalId, accountScopes,
-        toolScopes: [...MCP_TOOL_NAMES], expiration: { mode: 'never' } });
-      try {
-        if (client === 'codex') {
-          await writeClientConfig(client, filePath, addCodexManagedBlock(current, port, issued.plaintextToken));
-        } else {
-          const next = updateClaudeManagedEntry(current, { command: this.options.execPath, args: [this.options.bridgePath],
-            env: { ELECTRON_RUN_AS_NODE: '1', LINEJS_MCP_URL: `http://127.0.0.1:${port}/mcp`, LINEJS_MCP_TOKEN: issued.plaintextToken } });
-          await writeClientConfig(client, filePath, next);
-        }
-      } catch (error) {
-        await this.options.tokens.revokeToken(issued.token.tokenId).catch(() => false);
-        throw error;
-      }
+      const next = client === 'codex'
+        ? addCodexManagedBlock(current, port)
+        : updateClaudeManagedEntry(current, { command: this.options.execPath, args: [this.options.bridgePath],
+          env: { ELECTRON_RUN_AS_NODE: '1', LINEJS_MCP_URL: `http://127.0.0.1:${port}/mcp` } });
+      await writeClientConfig(client, filePath, next);
       return (await this.status()).find((item) => item.client === client)!;
     });
   }
@@ -217,8 +186,6 @@ export class McpLocalClients {
           if (next !== current) await writeClientConfig(client, filePath, next);
         }
       }
-      const principal = `local-client:${client}`;
-      for (const token of await this.options.tokens.listTokens()) if (token.principalId === principal && token.state === 'ACTIVE') await this.options.tokens.revokeToken(token.tokenId);
     });
   }
 }

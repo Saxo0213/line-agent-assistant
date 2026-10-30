@@ -24,16 +24,12 @@ import {
   AgentToolAllowlistEntrySchema,
 } from './agent-permissions.js';
 import {
-  McpPlaintextTokenSchema,
   McpServerStatusSchema,
-  McpTokenSummarySchema,
-  McpTokenExpirationSchema,
   McpToolInputUnionSchema,
   McpToolNameSchema,
   McpToolOutputUnionSchema,
   McpLocalClientKindSchema,
   McpLocalClientStatusSchema,
-  MAX_MCP_TOOL_SCOPES,
 } from './mcp.js';
 
 const IdSchema = z.string().min(1);
@@ -204,18 +200,8 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('agentRefreshStatus'), provider: AgentProviderSchema }),
   RequestIdSchema.extend({ type: z.literal('mcpGetStatus') }),
   RequestIdSchema.extend({ type: z.literal('mcpLocalClientStatus') }),
-  RequestIdSchema.extend({ type: z.literal('mcpLocalClientConnect'), client: McpLocalClientKindSchema, accountScopes: z.array(IdSchema).min(1).max(16) }),
+  RequestIdSchema.extend({ type: z.literal('mcpLocalClientConnect'), client: McpLocalClientKindSchema }),
   RequestIdSchema.extend({ type: z.literal('mcpLocalClientDisconnect'), client: McpLocalClientKindSchema }),
-  RequestIdSchema.extend({ type: z.literal('mcpListTokens') }),
-  RequestIdSchema.extend({
-    type: z.literal('mcpIssueToken'),
-    deviceLabel: z.string().trim().min(1).max(120),
-    principalId: z.string().trim().min(1).max(128).optional(),
-    accountScopes: z.array(IdSchema).min(1).max(16),
-    toolScopes: z.array(McpToolNameSchema).min(1).max(MAX_MCP_TOOL_SCOPES),
-    expiration: McpTokenExpirationSchema,
-  }),
-  RequestIdSchema.extend({ type: z.literal('mcpRevokeToken'), tokenId: z.uuid() }),
   RequestIdSchema.extend({ type: z.literal('mcpCallInternalTool'), tool: McpToolInputUnionSchema }),
   RequestIdSchema.extend({ type: z.literal('getAgentPermissions'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('getAgentPermissionDefaults') }),
@@ -503,9 +489,6 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('mcpLocalClientStatus'), requestId: IdSchema, ok: z.literal(true), clients: z.array(McpLocalClientStatusSchema) }),
     z.strictObject({ type: z.literal('mcpLocalClientConnect'), requestId: IdSchema, ok: z.literal(true), status: McpLocalClientStatusSchema }),
     z.strictObject({ type: z.literal('mcpLocalClientDisconnect'), requestId: IdSchema, ok: z.literal(true) }),
-    z.strictObject({ type: z.literal('mcpListTokens'), requestId: IdSchema, ok: z.literal(true), tokens: z.array(McpTokenSummarySchema) }),
-    z.strictObject({ type: z.literal('mcpIssueToken'), requestId: IdSchema, ok: z.literal(true), token: McpTokenSummarySchema, plaintextToken: McpPlaintextTokenSchema }),
-    z.strictObject({ type: z.literal('mcpRevokeToken'), requestId: IdSchema, ok: z.literal(true), revoked: z.boolean() }),
     z.strictObject({ type: z.literal('mcpCallInternalTool'), requestId: IdSchema, ok: z.literal(true), result: McpToolOutputUnionSchema }),
     z.strictObject({ type: z.literal('getAgentPermissions'), requestId: IdSchema, ok: z.literal(true), view: AgentPermissionsViewSchema }),
     z.strictObject({ type: z.literal('getAgentPermissionDefaults'), requestId: IdSchema, ok: z.literal(true), defaults: AgentPermissionDefaultsViewSchema }),

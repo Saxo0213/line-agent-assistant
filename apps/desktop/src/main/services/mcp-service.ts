@@ -28,7 +28,6 @@ import {
   type WorkerBinding,
   type McpMessageRecord,
   type McpServerStatus,
-  type McpTokenSummary,
   type McpToolInputUnion,
   type McpToolName,
   type McpToolOutputUnion,
@@ -61,7 +60,6 @@ import type { SafeDiagnostic } from '@line-agent/contracts';
 
 export const MAX_CONCURRENT_MCP_REQUESTS = 8;
 export const DEFAULT_MCP_RATE_LIMIT_PER_MINUTE = 60;
-const MAX_TRACKED_TOKEN_BUCKETS = 256;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const MAX_CHAT_RESOURCE_RESPONSE_BYTES = 512 * 1024;
 
@@ -475,7 +473,7 @@ export class McpService {
   private readonly rateLimitPerMinute: number;
   private readonly inFlight = new Set<Promise<unknown>>();
   private readonly activeControllers = new Set<AbortController>();
-  private readonly tokenRateBuckets = new Map<string, number[]>();
+  private externalRequestTimes: number[] = [];
   private closing = false;
   readonly internalCapabilities: InternalMcpCapabilityRegistry;
 
@@ -508,51 +506,14 @@ export class McpService {
     return promise;
   }
 
-  private checkTokenRateLimit(tokenId: string): boolean {
+  /** One fixed bucket limits all external requests. */
+  private checkExternalRateLimit(): boolean {
     const now = Date.now();
     const cutoff = now - RATE_LIMIT_WINDOW_MS;
-    const existing = (this.tokenRateBuckets.get(tokenId) ?? []).filter((ts) => ts > cutoff);
-    if (existing.length >= this.rateLimitPerMinute) {
-      this.tokenRateBuckets.delete(tokenId);
-      this.tokenRateBuckets.set(tokenId, existing);
-      return false;
-    }
-    existing.push(now);
-    this.tokenRateBuckets.delete(tokenId);
-    this.tokenRateBuckets.set(tokenId, existing);
-    while (this.tokenRateBuckets.size > MAX_TRACKED_TOKEN_BUCKETS) {
-      const oldestKey = this.tokenRateBuckets.keys().next().value;
-      if (oldestKey === undefined) break;
-      this.tokenRateBuckets.delete(oldestKey);
-    }
+    this.externalRequestTimes = this.externalRequestTimes.filter((ts) => ts > cutoff);
+    if (this.externalRequestTimes.length >= this.rateLimitPerMinute) return false;
+    this.externalRequestTimes.push(now);
     return true;
-  }
-
-  async issueToken(input: {
-    deviceLabel: string;
-    principalId?: string;
-    accountScopes: readonly string[];
-    toolScopes: readonly McpToolName[];
-    expiration: import('@line-agent/contracts').McpTokenExpiration;
-  }): Promise<{ token: McpTokenSummary; plaintextToken: string }> {
-    return this.options.tokens.issueToken(input);
-  }
-
-  async listTokens(): Promise<McpTokenSummary[]> {
-    return this.options.tokens.listTokens();
-  }
-
-  async normalizeManagedLocalClientScopes(): Promise<void> {
-    return this.options.tokens.normalizeManagedLocalClientScopes();
-  }
-
-  async findTokenByBearerToken(plaintextToken: string): Promise<McpTokenSummary | null> {
-    return this.options.tokens.findTokenByBearerToken(plaintextToken);
-  }
-
-  async revokeToken(tokenId: string): Promise<boolean> {
-    this.tokenRateBuckets.delete(tokenId);
-    return this.options.tokens.revokeToken(tokenId);
   }
 
   async getStatus(transport: {
@@ -561,13 +522,11 @@ export class McpService {
     host: '127.0.0.1';
     port: number | null;
   }): Promise<McpServerStatus> {
-    const activeTokenCount = await this.options.tokens.countActiveTokens();
     return {
       running: transport.running && !this.closing,
       endpoint: transport.endpoint,
       host: '127.0.0.1',
       port: transport.port,
-      activeTokenCount,
       inFlightRequests: this.inFlight.size,
       maxConcurrentRequests: this.maxConcurrentRequests,
     };
@@ -1001,7 +960,6 @@ export class McpService {
   }
 
   async handleExternalJsonRpc(
-    bearerToken: string | null,
     rawPayload: unknown,
     parentSignal?: AbortSignal,
   ): Promise<{ httpStatus: number; body: Record<string, unknown> | null }> {
@@ -1038,15 +996,12 @@ export class McpService {
         };
       }
 
-      const tokenString = bearerToken?.trim() ?? '';
-
       try {
         if (rpc.method === 'initialize') {
-          await this.options.tokens.executeWithVerifiedToken({
-            bearerToken: tokenString,
+          await this.options.tokens.executeLocalClientRead({
             toolName: null,
             signal,
-            rateLimiter: (tokenId) => this.checkTokenRateLimit(tokenId),
+            rateLimiter: () => this.checkExternalRateLimit(),
             execute: async () => ({ data: true }),
           });
           return {
@@ -1064,22 +1019,20 @@ export class McpService {
         }
 
         if (rpc.method === 'notifications/initialized') {
-          await this.options.tokens.executeWithVerifiedToken({
-            bearerToken: tokenString,
+          await this.options.tokens.executeLocalClientRead({
             toolName: null,
             signal,
-            rateLimiter: (tokenId) => this.checkTokenRateLimit(tokenId),
+            rateLimiter: () => this.checkExternalRateLimit(),
             execute: async () => ({ data: true }),
           });
           return { httpStatus: 202, body: null };
         }
 
         if (rpc.method === 'ping') {
-          await this.options.tokens.executeWithVerifiedToken({
-            bearerToken: tokenString,
+          await this.options.tokens.executeLocalClientRead({
             toolName: null,
             signal,
-            rateLimiter: (tokenId) => this.checkTokenRateLimit(tokenId),
+            rateLimiter: () => this.checkExternalRateLimit(),
             execute: async () => ({ data: true }),
           });
           return {
@@ -1089,11 +1042,10 @@ export class McpService {
         }
 
         if (rpc.method === 'tools/list') {
-          const tools = await this.options.tokens.executeWithVerifiedToken({
-            bearerToken: tokenString,
+          const tools = await this.options.tokens.executeLocalClientRead({
             toolName: null,
             signal,
-            rateLimiter: (tokenId) => this.checkTokenRateLimit(tokenId),
+            rateLimiter: () => this.checkExternalRateLimit(),
             execute: async ({ toolScopes }) => ({
               data: MCP_TOOL_DEFINITIONS.filter((def) => toolScopes.includes(def.name)
                 && (this.options.chatResources || !def.name.startsWith('list_chat_') && !def.name.startsWith('get_chat_'))),
@@ -1112,11 +1064,10 @@ export class McpService {
               : {};
           const toolNameCheck = McpToolNameSchema.safeParse(params.name);
           if (!toolNameCheck.success) {
-            await this.options.tokens.executeWithVerifiedToken({
-              bearerToken: tokenString,
+            await this.options.tokens.executeLocalClientRead({
               toolName: null,
               signal,
-              rateLimiter: (tokenId) => this.checkTokenRateLimit(tokenId),
+              rateLimiter: () => this.checkExternalRateLimit(),
               execute: async () => ({ data: null }),
             });
             return {
@@ -1139,13 +1090,12 @@ export class McpService {
               ? rawArgs.accountId.trim()
               : undefined;
 
-          // Verify token, tool scope, and account scope first, then validate arguments and execute
-          const output = await this.options.tokens.executeWithVerifiedToken({
-            bearerToken: tokenString,
+          // Verify tool and account scope first, then validate arguments and execute
+          const output = await this.options.tokens.executeLocalClientRead({
             toolName,
             signal,
             ...(requestedAccountId ? { requestedAccountId } : {}),
-            rateLimiter: (tokenId) => this.checkTokenRateLimit(tokenId),
+            rateLimiter: () => this.checkExternalRateLimit(),
             execute: async ({ client, authorizedAccountIds }) => {
               const parsedInput = McpToolInputUnionSchema.safeParse({
                 name: toolName,
@@ -1433,6 +1383,6 @@ export class McpService {
     this.internalCapabilities.releaseAll();
     for (const controller of this.activeControllers) controller.abort(new Error('MCP service shutting down'));
     await Promise.allSettled([...this.inFlight]);
-    this.tokenRateBuckets.clear();
+    this.externalRequestTimes = [];
   }
 }

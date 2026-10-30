@@ -131,7 +131,7 @@
 .work-records-page .work-record-tabs{margin-top:0;margin-bottom:16px}
 @media(max-width:640px){.agent-setting-section.agent-workspace-row{grid-template-columns:minmax(0,1fr);gap:6px}.work-records-page{padding:0}}
 .settings-card-stack{display:grid;gap:16px}.system-settings-card-stack>.database-settings{margin-bottom:0}
-.combined-account-card{padding:20px}.combined-account-card>.combined-account-title{margin:0 0 12px;padding-bottom:12px;border-bottom:1px solid var(--border)}.combined-account-card .account-role-slots{max-width:none}.combined-account-card .account-role-slot{grid-template-columns:minmax(140px,200px) minmax(0,1fr)}.combined-account-card .account-record{min-width:0;border:0;border-radius:0;padding:0;background:transparent}.combined-account-card .account-role-slot+.account-role-slot{border-top:1px solid var(--border);padding-top:16px}.account-role-heading{padding:20px 0}.account-role-heading h2{margin:0}.account-role-heading p{margin:4px 0;color:var(--muted)}.external-monitor-card{margin-top:16px;padding:20px}.external-monitor-card>h2{margin:0 0 12px}.external-monitor-card>p{margin:0 0 12px}.external-monitor-card .external-monitor-action{margin-top:12px}.external-monitor-layout{display:grid;gap:6px}.external-monitor-layout>progress{width:100%}.external-monitor-count{margin:0}.external-monitor-count-row{display:flex;align-items:center;justify-content:space-between;gap:12px}.external-monitor-count-row .external-monitor-action{margin:0;align-items:center}.external-monitor-indicator{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--secondary);white-space:nowrap}.external-monitor-indicator:before{content:'●';font-size:9px;color:var(--success,#22a06b)}
+.combined-account-card{padding:20px}.combined-account-card>.combined-account-title{margin:0 0 12px;padding-bottom:12px;border-bottom:1px solid var(--border)}.combined-account-card .account-role-slots{max-width:none}.combined-account-card .account-role-slot{grid-template-columns:minmax(140px,200px) minmax(0,1fr)}.combined-account-card .account-record{min-width:0;border:0;border-radius:0;padding:0;background:transparent}.combined-account-card .account-role-slot+.account-role-slot{border-top:1px solid var(--border);padding-top:16px}.account-role-heading{padding:20px 0}.account-role-heading h2{margin:0}.account-role-heading p{margin:4px 0;color:var(--muted)}.external-monitor-card{margin-top:16px;padding:20px}.external-monitor-card>h2{margin:0 0 12px}.external-monitor-card>p{margin:0 0 12px}.external-monitor-layout{display:grid;gap:6px}.external-monitor-layout>progress{width:100%}.external-monitor-count{margin:0}.external-monitor-version-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px;margin:0 0 12px}.external-monitor-version-row>p{margin:0}.external-monitor-version-row .external-monitor-action{margin:0 0 0 auto;align-items:center}.external-monitor-indicator{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--secondary);white-space:nowrap}.external-monitor-indicator:before{content:'●';font-size:9px;color:var(--success,#22a06b)}
 .connection-info-field{display:grid;gap:6px;min-width:0}.connection-info-value{flex:1;min-width:0;overflow-wrap:anywhere;user-select:none;-webkit-user-select:none;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--subtle)}
 .account-role-slots{display:flex;flex-direction:column;gap:16px;max-width:900px}.account-role-slot{display:grid;grid-template-columns:minmax(140px,200px) minmax(0,1fr);align-items:start;gap:16px}.account-role-slot>h2{margin:0;padding:20px 0}.account-role-slot>.panel{width:100%}.slot-vacant{border-style:dashed;min-height:92px;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:8px;padding:20px}.slot-vacant>p{margin:0}
 .account-role-slot .account-record>.action-with-status+.action-with-status{margin-top:8px}
@@ -173,27 +173,13 @@ input[type="checkbox"]:disabled,input[type="radio"]:disabled{cursor:not-allowed;
 .sidebar nav,.settings-tabs,.segmented{gap:8px}
 .segmented button,.segmented button:first-child,.segmented button:last-child{border-radius:8px}
 .settings-tabs button{min-height:var(--control-height);padding:var(--control-padding-block) var(--control-padding-inline)}
-.mcp-token-controls{grid-template-columns:repeat(2,minmax(0,1fr)) auto;align-items:end}
-.mcp-token-controls label{margin-bottom:0}
-.mcp-token-controls>button{align-self:end;min-height:var(--control-height);white-space:nowrap}
-.mcp-scope-options{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:8px 16px;min-width:0;margin:16px 0 0;padding:12px 0 0;border:0;border-top:1px solid var(--border)}
-.mcp-scope-options legend{grid-column:1/-1;margin:0;padding:0 0 6px;color:var(--text);font-weight:600}
-.mcp-scope-description{grid-column:1/-1;margin:0 0 4px;color:var(--secondary);font-size:12px}
-.panel .mcp-scope-options label{display:flex;flex-direction:row;align-items:flex-start;gap:8px;margin:0;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);min-width:0}
-.mcp-scope-options input[type="checkbox"]{margin-top:3px}
 .mcp-local-client-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px;margin:16px 0}
 .mcp-local-client-card{min-width:0;padding:14px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
 .mcp-local-client-card .panel-top{align-items:flex-start;margin-bottom:12px}
 .mcp-local-client-card h3{margin:0 0 4px}
 .mcp-local-client-card p{margin:0;color:var(--muted)}
-.mcp-local-scope-picker{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,132px),1fr));gap:6px 12px;margin:0;padding:10px 0;border:0;border-top:1px solid var(--border)}
-.mcp-local-scope-picker legend{grid-column:1/-1;padding:0 0 4px;font-weight:600}
-.mcp-local-scope-picker label{display:flex;flex-direction:row;align-items:center;gap:7px;margin-bottom:0;min-width:0}
 .mcp-local-client-actions{display:flex;gap:8px;margin-top:8px}
 .mcp-local-restart-note{font-size:.9em;color:var(--muted)}
-.mcp-scope-copy{display:flex;min-width:0;flex-direction:column;gap:2px;overflow-wrap:anywhere}
-.mcp-scope-copy small{color:var(--secondary);font-size:12px;line-height:1.4;white-space:normal}
-@media(max-width:640px){.mcp-token-controls{grid-template-columns:minmax(0,1fr)}.mcp-token-controls>button{justify-self:start}}
 
 /* Application chrome behaves like a native control surface; only user content remains selectable. */
 .app-shell{-webkit-user-select:none;user-select:none}

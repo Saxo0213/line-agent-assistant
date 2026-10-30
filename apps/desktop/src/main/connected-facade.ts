@@ -764,7 +764,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     resolveProjectFolders: async (key) => await projectFolders?.resolveMounts(key) ?? [],
     folders: chatFolders, workspace });
   const mcpTokens = new McpTokenRepository(options.pool);
-  await mcpTokens.normalizeManagedLocalClientScopes();
   const getMcpLiveLoginBinding = async (accountId: string): Promise<Bound | null> => {
     if ((await accounts.resolveCapabilities(accountId))?.connectionMode !== 'SYSTEM_LOGIN') return null;
     const binding = await options.workers.binding(accountId);
@@ -819,7 +818,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     ...(options.mcpHttpPort === undefined ? {} : { port: options.mcpHttpPort }) });
   const userProfile = process.env.USERPROFILE ?? homedir();
   const appData = process.env.APPDATA ?? path.join(userProfile, 'AppData', 'Roaming');
-  mcpLocalClients = new McpLocalClients({ tokens: mcpService,
+  mcpLocalClients = new McpLocalClients({
     claudeConfigPath: options.mcpLocalClientPaths?.claudeDesktop ?? path.join(appData, 'Claude', 'claude_desktop_config.json'),
     codexConfigPath: options.mcpLocalClientPaths?.codex ?? path.join(process.env.CODEX_HOME ?? path.join(userProfile, '.codex'), 'config.toml'),
     execPath: options.mcpLocalClientExecPath ?? process.execPath,
@@ -3030,37 +3029,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return { type: request.type, requestId, ok: true, clients: await mcpLocalClients.status() };
       }
       if (request.type === 'mcpLocalClientConnect') {
-        const status = await mcpLocalClients.connect(request.client as LocalClientKind, request.accountScopes);
+        const status = await mcpLocalClients.connect(request.client as LocalClientKind);
         return { type: request.type, requestId, ok: true, status };
       }
       if (request.type === 'mcpLocalClientDisconnect') {
         await mcpLocalClients.disconnect(request.client as LocalClientKind);
         return { type: request.type, requestId, ok: true };
-      }
-      if (request.type === 'mcpListTokens') {
-        return { type: request.type, requestId, ok: true, tokens: await mcpService.listTokens() };
-      }
-      if (request.type === 'mcpIssueToken') {
-        if (request.principalId?.startsWith('local-client:')) return failure(requestId, 'LOCAL_CLIENT_PRINCIPAL_RESERVED', 'Local client tokens can only be issued by the local client connect flow.');
-        const issued = await mcpService.issueToken({
-          deviceLabel: request.deviceLabel,
-          ...(request.principalId ? { principalId: request.principalId } : {}),
-          accountScopes: request.accountScopes,
-          toolScopes: request.toolScopes,
-          expiration: request.expiration,
-        });
-        return { type: request.type, requestId, ok: true, ...issued };
-      }
-      if (request.type === 'mcpRevokeToken') {
-        const token = (await mcpService.listTokens()).find((item) => item.tokenId === request.tokenId);
-        if (token?.principalId.startsWith('local-client:')) {
-          const client = token.principalId.slice('local-client:'.length);
-          if (client === 'claude-desktop' || client === 'codex') {
-            await mcpLocalClients.disconnect(client);
-            return { type: request.type, requestId, ok: true, revoked: token.state === 'ACTIVE' };
-          }
-        }
-        return { type: request.type, requestId, ok: true, revoked: await mcpService.revokeToken(request.tokenId) };
       }
       if (request.type === 'mcpCallInternalTool') {
         const result = await mcpService.callInternalTool(request.tool, {
