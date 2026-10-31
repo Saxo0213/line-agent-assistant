@@ -2,7 +2,7 @@ import { LineWorkerCommandSchema, LineWorkerEventSchema, LOGIN_FAILURES,
   type LineWorkerCommand, type LineWorkerEvent, type WorkerErrorCode } from '@line-agent/contracts';
 import { resolveLineTransport } from '@line-agent/contracts';
 import { createLinejsAdapter } from './linejs-adapter.js';
-import { createChromeAdapter, isChromeLtsmUnavailable } from './chrome-adapter.js';
+import { isChromeLtsmUnavailable } from './chrome-ltsm-error.js';
 import { LineWorkerLoop, type LineTransport, type LineWorkerOptions } from './worker-loop.js';
 import { createWindowsAttachmentBroker } from './windows-attachment-broker.js';
 import { DIAGNOSTIC_OPERATIONS, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
@@ -334,7 +334,7 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
 
 export type TransportFactoryDeps = Readonly<{
   createLinejs?: typeof createLinejsAdapter;
-  createChrome?: typeof createChromeAdapter;
+  createChrome?: typeof import('./chrome-adapter.js').createChromeAdapter;
   /** CHROMEOS HTTP client (Node global fetch / undici by default; never Electron net). */
   chromeFetch?: (input: string, init: RequestInit) => Promise<Response>;
 }>;
@@ -344,7 +344,7 @@ export type TransportFactoryDeps = Readonly<{
  * CHROMEOS gets its own factory and a store root from `init.chromeLtsmDir`.
  */
 export function createTransportFactory(deps: TransportFactoryDeps = {}): (init: Init) => Promise<LineTransport> {
-  return (init) => {
+  return async (init) => {
     // Observation only. The log never changes a request, and a log failure never fails the factory.
     if (init.trafficLogDir !== undefined) {
       try {
@@ -353,7 +353,8 @@ export function createTransportFactory(deps: TransportFactoryDeps = {}): (init: 
       } catch { /* The traffic log is optional. */ }
     }
     if (resolveLineTransport(init.lineTransport) === 'CHROMEOS') {
-      return (deps.createChrome ?? createChromeAdapter)({
+      const createChrome = deps.createChrome ?? (await import('./chrome-adapter.js')).createChromeAdapter;
+      return createChrome({
         accountId: init.accountId, workerInstanceId: init.workerInstanceId,
         controlEpoch: init.controlEpoch, mode: init.mode,
         validateLease: () => true,

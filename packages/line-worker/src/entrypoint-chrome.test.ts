@@ -14,11 +14,31 @@ const init = (extra: Record<string, unknown> = {}): Init => LineWorkerCommandSch
 
 function port() {
   const events: any[] = [];
+  const eventWaiters = new Set<{ count: number; resolve: (events: any[]) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   let handler: ((value: unknown) => void) | undefined;
   return { events,
     onMessage: (next: (value: unknown) => void) => { handler = next; },
-    postMessage: (value: unknown) => { events.push(LineWorkerEventSchema.parse(value)); },
-    send: async (value: unknown) => { handler?.(value); await new Promise((resolve) => setTimeout(resolve, 20)); },
+    postMessage: (value: unknown) => {
+      events.push(LineWorkerEventSchema.parse(value));
+      for (const waiter of eventWaiters) {
+        if (events.length >= waiter.count) {
+          clearTimeout(waiter.timer);
+          eventWaiters.delete(waiter);
+          waiter.resolve(events);
+        }
+      }
+    },
+    send: async (value: unknown) => { handler?.(value); },
+    waitForEvents: (count: number) => {
+      if (events.length >= count) return Promise.resolve(events);
+      return new Promise<any[]>((resolve, reject) => {
+        const waiter = { count, resolve, reject, timer: setTimeout(() => {
+          eventWaiters.delete(waiter);
+          reject(new Error(`Timed out waiting for ${count} worker event(s); received ${events.length}`));
+        }, 5000) };
+        eventWaiters.add(waiter);
+      });
+    },
   };
 }
 
@@ -69,6 +89,7 @@ async function bootstrap(chromeLtsmDir: string | undefined): Promise<any[]> {
   runWorkerLoopOnPort(channel, createTransportFactory());
   await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor,
     lineTransport: 'CHROMEOS', ...(chromeLtsmDir === undefined ? {} : { chromeLtsmDir }) });
+  await channel.waitForEvents(1);
   return channel.events;
 }
 
@@ -105,7 +126,9 @@ it('keeps the process alive after a failed CHROMEOS bootstrap and rejects furthe
   const channel = port();
   runWorkerLoopOnPort(channel, createTransportFactory());
   await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor, lineTransport: 'CHROMEOS' });
+  await channel.waitForEvents(1);
   await channel.send({ type: 'poll', ...binding });
-  expect(channel.events[0]).toMatchObject({ code: 'CHROME_LTSM_UNAVAILABLE' });
-  expect(channel.events.length).toBeGreaterThanOrEqual(1);
+  await channel.waitForEvents(2);
+  expect(channel.events[0]).toMatchObject({ type: 'error', code: 'CHROME_LTSM_UNAVAILABLE' });
+  expect(channel.events[1]).toMatchObject({ type: 'error' });
 });

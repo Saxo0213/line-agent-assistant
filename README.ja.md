@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.311 では、認証トークンのない loopback MCP エンドポイントにメッセージ送信とスケジュール管理を追加しました。外部 MCP から Agent と主管理者の両アカウントのデータを照会できます。LINE メッセージは常に Agent アカウントから送信されます。外部クライアントはスケジュールの作成・一覧表示・変更・削除ができ、実行時にはアプリ内蔵 Agent が処理します。外部からの各呼び出しには個別の audit ID が保持されます。組み込み Agent はアルバム一覧も参照できます。アプリと内部・外部 MCP では Notes を無効にしました。既存の Notes アーカイブは保持されます。[v1.0.311 のリリースノート](docs/releases/v1.0.311.md)をご覧ください。以前の変更は [v1.0.310](docs/releases/v1.0.310.md)、[v1.0.305](docs/releases/v1.0.305.md)、[v1.0.303](docs/releases/v1.0.303.md) に記載しています。
+v1.0.312 では、Windows インストーラー版の Agent worker の起動問題を修正しました。この問題により LINE の接続や再起動に支障が出ることがありました。`DESKTOPWIN` の公式 LINE worker は Chrome adapter、gate、`line-chrome` を読み込みません。`CHROMEOS` worker を選択した場合にのみ、これらのコンポーネントを読み込みます。この選択用にパッケージにも依存関係を含めています。既存機能は維持し、隔離された production-entry 起動 smoke を追加しました。[v1.0.312 のリリースノート](docs/releases/v1.0.312.md)をご覧ください。以前の変更は [v1.0.311](docs/releases/v1.0.311.md)、[v1.0.310](docs/releases/v1.0.310.md)、[v1.0.305](docs/releases/v1.0.305.md) に記載しています。
 
 ## インストール
 

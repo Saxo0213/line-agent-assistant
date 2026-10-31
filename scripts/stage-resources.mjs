@@ -192,6 +192,9 @@ export async function stageResources({ repositoryRoot = thisRepositoryRoot, outp
   const contractsRoot = path.join(workerRoot, 'node_modules', '@line-agent', 'contracts');
   await copyRequired(path.join(repositoryRoot, 'packages', 'contracts', 'dist'), path.join(contractsRoot, 'dist'));
   await writeFile(path.join(contractsRoot, 'package.json'), `${JSON.stringify({ name: '@line-agent/contracts', version: '0.0.0', type: 'module', exports: { '.': './dist/index.js' }, dependencies: { zod: '^4.0.0' } }, null, 2)}\n`);
+  const lineChromeRoot = path.join(workerRoot, 'node_modules', '@line-agent', 'line-chrome');
+  await copyRequired(path.join(repositoryRoot, 'packages', 'line-chrome', 'dist'), path.join(lineChromeRoot, 'dist'));
+  await writeFile(path.join(lineChromeRoot, 'package.json'), `${JSON.stringify({ name: '@line-agent/line-chrome', version: '0.0.0', type: 'module', exports: { '.': './dist/index.js' } }, null, 2)}\n`);
   const runtimeDependencies = await copyRuntimeDependencyGraph(repositoryRoot, path.join(workerRoot, 'node_modules'), ['@evex/linejs', 'zod']);
   await pruneRuntimeDependencies(path.join(workerRoot, 'node_modules'));
 
@@ -218,6 +221,11 @@ export async function verifyStagedResources(outputRoot) {
   if (packageJson.name !== '@jsr/evex__linejs' || packageJson.version !== LINEJS_VERSION) {
     throw new Error('Staged physical @evex/linejs package is not @jsr/evex__linejs@3.5.0');
   }
+  const lineChromePackage = await readJson(path.join(outputRoot, 'line-worker', 'node_modules', '@line-agent', 'line-chrome', 'package.json'));
+  if (lineChromePackage.name !== '@line-agent/line-chrome' || lineChromePackage.exports?.['.'] !== './dist/index.js') {
+    throw new Error('Staged @line-agent/line-chrome package entry is invalid');
+  }
+  await stat(path.join(outputRoot, 'line-worker', 'node_modules', '@line-agent', 'line-chrome', 'dist', 'index.js'));
   const currentFiles = await hashFiles(outputRoot);
   const expectedNames = Object.keys(manifest.files).sort();
   const currentNames = Object.keys(currentFiles).sort();

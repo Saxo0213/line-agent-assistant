@@ -16,14 +16,16 @@ import {
   buildCatchupItems, buildChromeSyncResult, classifyE2eeSendError, decodeEncKm, decryptBlob, encryptBlob, fetchIdentity,
   generateEncKm, isRetryableE2eeSendError, isSessionKickout, loginWithToken, logoutV2, parseEncryptedAccessToken, qrLogin,
   requiredLtsmPin, pythonTruthy, tagLoginStage, thriftPath, SEALABLE_CONTENT_TYPES, CHROME_EXTENSION_VERSION, E2EE_ERROR_CODE, OBS_GENERAL_FEATURE,
-  type ChromeIdentity, type ChromeMessage, type E2eeBridge, type FetchLike, type HmacSigner, type LtsmStoreStatus, type QrLoginBridge,
+  type ChromeIdentity, type ChromeMessage, type E2eeBridge, type FetchLike, type HmacSigner, type QrLoginBridge,
   type ReactionName, type ReceiveClock, type ReceiverState, type TimerApi,
 } from '@line-agent/line-chrome';
 import {
   buildMentionContentMetadata, MEDIA_FILE_MAX_BYTES, MEDIA_IMAGE_MAX_BYTES,
   type AccountMode, type ChatResourceReadCommand, type ConversationCatalogItem, type JsonValue, type LineWorkerCommand, type OutgoingMention, type TalkCursorV1Dto,
 } from '@line-agent/contracts';
-import { createChromeMutationGate, EffectDeniedError, type ChromeEffectContext, type ChromeMutationGate, type ControlLease, type ControlLeasePhase } from './mutation-gate.js';
+import { EffectDeniedError, type ControlLease, type ControlLeasePhase } from './mutation-gate.js';
+import { createChromeMutationGate, type ChromeEffectContext, type ChromeMutationGate } from './chrome-mutation-gate.js';
+import { ChromeLtsmUnavailableError } from './chrome-ltsm-error.js';
 import {
   MediaUploadFailedError, tagMediaStage, type MediaUploadStage, type FriendAddResult, type FriendRelation, type FriendRelationDiagnostic, type LineTransport,
   type RelationCancellation, type SyncResult, type TransportIdentity,
@@ -53,27 +55,6 @@ const DEFAULT_RECEIVE_WAIT_MS = 500;
 const ADD_FRIEND_PATH = thriftPath('Relation.RelationService.addFriendByMid');
 const INT64_MAX = 9223372036854775807n;
 
-/** Bootstrap failure: the pinned ltsm assets are not usable. Carries only the store status kind and version facts. */
-export class ChromeLtsmUnavailableError extends Error {
-  readonly code = 'CHROME_LTSM_UNAVAILABLE';
-  readonly status: 'missing' | 'wrong-version' | 'corrupt';
-  readonly required: string;
-  readonly detected: readonly string[];
-  constructor(status: Exclude<LtsmStoreStatus, { kind: 'available' }>) {
-    const required = status.required;
-    const detected = status.kind === 'wrong-version' ? status.detected : [];
-    super(status.kind === 'wrong-version'
-      ? `LINE Chrome assets are for extension version ${detected.join(', ') || 'unknown'}, but ${required} is required`
-      : status.kind === 'corrupt'
-        ? `LINE Chrome assets for extension version ${required} failed verification`
-        : `LINE Chrome assets for extension version ${required} are not installed`);
-    this.name = 'ChromeLtsmUnavailableError';
-    this.status = status.kind;
-    this.required = required;
-    this.detected = detected;
-  }
-}
-
 /** The event stream is terminally down (144 failed attempts or an auth rejection). `sync` throws this until it is reopened. */
 export class ChromeReceiverDisconnectedError extends Error {
   readonly code = 'CHROME_SSE_DISCONNECTED';
@@ -81,7 +62,6 @@ export class ChromeReceiverDisconnectedError extends Error {
     super('LINE event stream is disconnected'); this.name = 'ChromeReceiverDisconnectedError';
   }
 }
-
 /** A cursor written by the DESKTOPWIN transport (non-zero globalRev / individualRev) is never replayed on CHROMEOS. */
 export class ChromeForeignCursorError extends Error {
   readonly code = 'CHROME_FOREIGN_CURSOR';
@@ -952,7 +932,7 @@ export async function createChromeAdapter(options: ChromeAdapterOptions): Promis
     return new ChromeAdapter(options, { signer: options.signer, bridge: options.bridge });
   }
   if (options.ltsmRoot === undefined) {
-    throw new ChromeLtsmUnavailableError({ kind: 'missing', required: requiredLtsmPin().version, dir: '' });
+    throw new ChromeLtsmUnavailableError({ kind: 'missing', required: requiredLtsmPin().version });
   }
   const store = new LtsmStore({ rootDir: options.ltsmRoot });
   let bridge: LtsmBridge;
@@ -965,12 +945,8 @@ export async function createChromeAdapter(options: ChromeAdapterOptions): Promis
       if (status.kind !== 'available') throw new ChromeLtsmUnavailableError(status);
     }
     // Verified assets that still fail to start are unusable for the same reason a corrupt copy is.
-    throw new ChromeLtsmUnavailableError({ kind: 'corrupt', required: CHROME_EXTENSION_VERSION, dir: '', problems: [] });
+    throw new ChromeLtsmUnavailableError({ kind: 'corrupt', required: CHROME_EXTENSION_VERSION });
   }
   const signer = new LtsmHmacSigner(bridge);
   return new ChromeAdapter(options, { signer: options.signer ?? signer, bridge: options.bridge ?? bridge, closeable: signer });
-}
-
-export function isChromeLtsmUnavailable(error: unknown): error is ChromeLtsmUnavailableError {
-  return error instanceof ChromeLtsmUnavailableError;
 }

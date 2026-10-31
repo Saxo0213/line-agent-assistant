@@ -2,7 +2,7 @@
   "name": "@line-agent/desktop",
   "private": true,
   "type": "module",
-  "version": "1.0.311",
+  "version": "1.0.312",
   "description": "Windows desktop console for LINE account automation with subscription agent CLIs",
   "author": "LINE Agent Assistant contributors",
   "main": "dist/main.js",

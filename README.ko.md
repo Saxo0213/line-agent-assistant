@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.311에서는 인증 토큰이 없는 loopback MCP 엔드포인트에 메시지 전송 및 일정 관리 기능을 추가했습니다. 외부 MCP는 Agent와 주 관리자 계정의 데이터를 모두 조회할 수 있으며 LINE 메시지는 항상 Agent 계정에서 전송됩니다. 외부 클라이언트는 일정을 만들고, 조회하고, 수정하고, 삭제할 수 있으며, 실행 시점에는 앱 내장 Agent가 처리합니다. 각 외부 호출에는 별도의 audit ID가 유지됩니다. 내장 Agent는 앨범 목록도 확인할 수 있습니다. 앱과 내부 및 외부 MCP에서 Notes 기능을 비활성화했으며 기존 Notes 보관 데이터는 유지됩니다. [v1.0.311 릴리스 노트](docs/releases/v1.0.311.md)를 참조하세요. 이전 변경 사항은 [v1.0.310](docs/releases/v1.0.310.md), [v1.0.305](docs/releases/v1.0.305.md), [v1.0.303](docs/releases/v1.0.303.md)에 있습니다.
+v1.0.312에서는 Windows 설치판 Agent worker의 시작 문제를 수정했습니다. 이 문제로 LINE 연결과 재시작이 방해받을 수 있었습니다. `DESKTOPWIN` 공식 LINE worker는 Chrome adapter, gate 또는 `line-chrome`을 불러오지 않습니다. `CHROMEOS` worker를 선택한 경우에만 이 구성 요소들을 불러옵니다. 해당 선택 기능을 위해 패키지에 의존성도 포함합니다. 기존 기능은 유지하며 격리된 production-entry 시작 smoke를 추가했습니다. [v1.0.312 릴리스 노트](docs/releases/v1.0.312.md)를 참조하세요. 이전 변경 사항은 [v1.0.311](docs/releases/v1.0.311.md), [v1.0.310](docs/releases/v1.0.310.md), [v1.0.305](docs/releases/v1.0.305.md)에 있습니다.
 
 ## 설치
 

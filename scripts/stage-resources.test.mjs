@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -23,6 +24,8 @@ test('stages and verifies the complete packaged runtime resource contract', asyn
     'line-worker/native/AttachmentBroker.exe',
     'line-worker/node_modules/@evex/linejs/package.json',
     'line-worker/node_modules/@line-agent/contracts/package.json',
+    'line-worker/node_modules/@line-agent/line-chrome/package.json',
+    'line-worker/node_modules/@line-agent/line-chrome/dist/index.js',
     'line-worker/node_modules/zod/package.json',
     'native/JobHost.exe',
     'database/migrations/001_initial.sql',
@@ -39,11 +42,28 @@ test('stages and verifies the complete packaged runtime resource contract', asyn
     && !name.startsWith('line-worker/node_modules/@evex/linejs/')
     && (/\.d\.[cm]?ts$|\.map$/.test(name) || name.startsWith('line-worker/node_modules/@types/') || /^line-worker\/node_modules\/zod\/src\//.test(name)));
   assert.deepEqual(nonRuntime, []);
+  assert.equal(Object.keys(manifest.files).some((name) => name.startsWith('line-worker/node_modules/@line-agent/line-chrome/src/')), false);
   const lineJsPackage = JSON.parse(await readFile(path.join(temporaryRoot, 'line-worker/node_modules/@evex/linejs/package.json'), 'utf8'));
   assert.equal(lineJsPackage.name, '@jsr/evex__linejs');
   await verifyStagedResources(temporaryRoot);
   await assert.rejects(import(pathToFileURL(path.join(temporaryRoot, 'line-worker/process-entry.js')).href), /private worker port and attachment root are required/);
   await assert.rejects(readFile(path.join(temporaryRoot, 'line-worker/test-fixtures/MalformedAttachmentBroker.exe')), /ENOENT/);
+
+  // Import from outside the repository so ancestor node_modules cannot hide an incomplete staged dependency graph.
+  const isolatedRoot = await mkdtemp(path.join(tmpdir(), 'line-agent-isolated-worker-'));
+  t.after(() => rm(isolatedRoot, { recursive: true, force: true }));
+  await cp(path.join(temporaryRoot, 'line-worker'), path.join(isolatedRoot, 'line-worker'), { recursive: true });
+  await rm(path.join(isolatedRoot, 'line-worker', 'chrome-adapter.js'), { force: true });
+  await rm(path.join(isolatedRoot, 'line-worker', 'node_modules', '@line-agent', 'line-chrome'), { recursive: true, force: true });
+  const isolatedEntry = pathToFileURL(path.join(isolatedRoot, 'line-worker/process-entry.js')).href;
+  const childEnv = Object.fromEntries(['PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP'].flatMap((name) =>
+    process.env[name] === undefined ? [] : [[name, process.env[name]]]));
+  childEnv.LINE_WORKER_ATTACHMENT_ROOT = path.join(isolatedRoot, 'attachments');
+  const isolatedImport = spawnSync(process.execPath, ['--input-type=module', '--eval', `await import(${JSON.stringify(isolatedEntry)})`],
+    { cwd: isolatedRoot, env: childEnv, encoding: 'utf8' });
+  assert.notEqual(isolatedImport.status, 0);
+  assert.match(isolatedImport.stderr, /private worker port and attachment root are required/);
+  assert.doesNotMatch(isolatedImport.stderr, /ERR_MODULE_NOT_FOUND|Cannot find package/);
 
   const linkedOutside = await mkdtemp(path.join(tmpdir(), 'line-agent-manifest-escape-'));
   t.after(() => rm(linkedOutside, { recursive: true, force: true }));

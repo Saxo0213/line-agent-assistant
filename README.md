@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.311 adds message sending and schedule management to the unauthenticated loopback MCP endpoint. External MCP can query both Agent and primary administrator account data; LINE messages are always sent from the Agent account. External clients can create, list, update, and delete schedules, which the built-in Agent runs when due with a separate audit ID for each external request. The built-in Agent can browse album catalogs. Notes are disabled in the app and in internal and external MCP tools; existing archived Notes are retained. See the [v1.0.311 release notes](docs/releases/v1.0.311.md). Earlier changes are listed in [v1.0.310](docs/releases/v1.0.310.md), [v1.0.305](docs/releases/v1.0.305.md), and [v1.0.303](docs/releases/v1.0.303.md).
+v1.0.312 fixes a Windows packaged Agent worker startup issue that could disrupt LINE connections and restarts. The `DESKTOPWIN` official LINE worker does not load the Chrome adapter, gate, or `line-chrome`; the `CHROMEOS` worker loads those components when selected. The package includes the dependency for that choice. Existing features are preserved. An isolated production-entry startup smoke check is added. See the [v1.0.312 release notes](docs/releases/v1.0.312.md). Earlier changes are listed in [v1.0.311](docs/releases/v1.0.311.md), [v1.0.310](docs/releases/v1.0.310.md), and [v1.0.305](docs/releases/v1.0.305.md).
 
 ## Installation
 

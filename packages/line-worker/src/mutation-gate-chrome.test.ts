@@ -4,9 +4,9 @@ import {
   type PhysicalRequest, type ThriftEndpointKey,
 } from '@line-agent/line-chrome';
 import {
-  createChromeMutationGate, EffectDeniedError, type ChromeEffectContext, type ChromeMutationGate, type EffectPhase,
-  type ControlLease,
-} from './mutation-gate.js';
+  createChromeMutationGate, type ChromeEffectContext, type ChromeMutationGate,
+} from './chrome-mutation-gate.js';
+import { EffectDeniedError, type EffectPhase, type ControlLease } from './mutation-gate.js';
 
 const lease: ControlLease = { accountId: 'a', workerInstanceId: 'w', controlEpoch: 1 };
 const TOKEN = 'access-token';

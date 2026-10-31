@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.311 為未設 token 驗證的 loopback MCP 端點新增訊息傳送與排程管理。外部 MCP 可查詢 Agent 與主要管理者帳號資料；LINE 訊息一律由 Agent 帳號送出。外部客戶端可建立、列出、修改與刪除排程，到點後由 App 內建 Agent 執行；每次外部呼叫都有獨立 audit ID。內建 Agent 也可查閱相簿目錄。App、內部與外部 MCP 都停用記事本功能；既有封存記事資料會保留。請參閱 [v1.0.311 版本說明](docs/releases/v1.0.311.md)；先前更新請見 [v1.0.310](docs/releases/v1.0.310.md)、[v1.0.305](docs/releases/v1.0.305.md) 與 [v1.0.303](docs/releases/v1.0.303.md)。
+v1.0.312 修正 Windows 安裝版 Agent worker 啟動問題，該問題可能影響 LINE 連線及重新啟動。`DESKTOPWIN` 正式 LINE worker 不載入 Chrome adapter、gate 或 `line-chrome`；選用 `CHROMEOS` worker 時才載入這些元件。打包內容包含該選項所需依賴。既有功能維持不變，並新增隔離的 production-entry 啟動 smoke。請參閱 [v1.0.312 版本說明](docs/releases/v1.0.312.md)；先前更新請見 [v1.0.311](docs/releases/v1.0.311.md)、[v1.0.310](docs/releases/v1.0.310.md) 與 [v1.0.305](docs/releases/v1.0.305.md)。
 
 ## 安裝
 
