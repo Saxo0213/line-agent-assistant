@@ -108,6 +108,15 @@ export type LinejsAdapterOptions = Readonly<ControlLease & {
   packageRoot?: string;
 }>;
 
+/** Drain a bounded slice of supplemental history while keeping any overflow queued for the next real sync. */
+function drainStartupCatchupQueue(queue: readonly unknown[], limit: number): Readonly<{
+  operations: readonly unknown[]; remaining: readonly unknown[]; hasMoreStartupItems: boolean;
+}> {
+  const count = Math.max(0, Math.min(queue.length, Math.floor(limit)));
+  const remaining = queue.slice(count);
+  return { operations: queue.slice(0, count), remaining, hasMoreStartupItems: remaining.length > 0 };
+}
+
 /** An OBS upload answered with a non-2xx status. The number is a property, so the media failure detail keeps it. */
 export class ObsUploadHttpError extends Error {
   constructor(readonly status: number) { super(`OBS upload HTTP ${status}`); this.name = 'ObsUploadHttpError'; }
@@ -652,6 +661,7 @@ export class LinejsAdapter implements LineTransport {
   #adoptedObsToken: string | null = null;
   #activeRelationAdd: RelationAddContext | undefined;
   readonly #seenConversationIds = new Set<string>();
+  #pendingCatchupMessages: unknown[] = [];
 
   private constructor(options: LinejsAdapterOptions) {
     this.#options = options;
@@ -857,6 +867,7 @@ export class LinejsAdapter implements LineTransport {
   async installSecrets(secrets: { token: string | null; qrCert: string | null; e2eeStorage: JsonValue | null }): Promise<void> {
     this.#downloadAuthAdopted = false;
     this.#adoptedObsToken = null;
+    this.#pendingCatchupMessages = [];
     this.#clearChatResourceTokens();
     await this.#storage.load(secrets.e2eeStorage, secrets.qrCert);
     if (secrets.token === null) delete this.#base.authToken;
@@ -866,6 +877,7 @@ export class LinejsAdapter implements LineTransport {
   async loginQr(): Promise<TransportIdentity> {
     this.#downloadAuthAdopted = false;
     this.#adoptedObsToken = null;
+    this.#pendingCatchupMessages = [];
     await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ qr: true, v3: true }));
     await this.#scheduleTokenRefresh();
     return this.#profile();
@@ -873,6 +885,7 @@ export class LinejsAdapter implements LineTransport {
   async loginToken(token: string): Promise<TransportIdentity> {
     this.#downloadAuthAdopted = false;
     this.#adoptedObsToken = null;
+    this.#pendingCatchupMessages = [];
     const expire = await this.#storage.get('expire');
     const refreshToken = await this.#storage.get('refreshToken');
     let tokenToUse = token;
@@ -1103,7 +1116,12 @@ export class LinejsAdapter implements LineTransport {
       // LINE ends an idle sync long poll with HTTP 410 and an empty body. That is a normal "no events" result.
       // The library fails to decode the empty body, so use the physical status, not the message text.
       if (observed.status === 410 && !isLineServerRejection(error) && !(error instanceof InternalError)
-        && !(error instanceof EffectDeniedError)) return { cursorAfter: cursor, operations: [] };
+        && !(error instanceof EffectDeniedError)) {
+        const queued = drainStartupCatchupQueue(this.#pendingCatchupMessages, 100);
+        this.#pendingCatchupMessages = [...queued.remaining];
+        return { cursorAfter: cursor, operations: queued.operations, rawOperationCount: 0,
+          hasMoreStartupItems: queued.hasMoreStartupItems };
+      }
       throw error;
     }
     let revision = cursor.revision;
@@ -1114,8 +1132,10 @@ export class LinejsAdapter implements LineTransport {
     individualRev = decimal(response.operationResponse?.individualEvents?.lastRevision, individualRev);
     const operations = [] as SyncResult['operations'] extends readonly (infer T)[] ? T[] : never[];
     const catchupChatIds: string[] = [];
+    const catchupMessages = [...this.#pendingCatchupMessages];
     const receipts = new Map<string, { chatId: string; readerMid: string; messageId: bigint; createdTime: number }>();
-    for (const operation of response.operationResponse?.operations ?? []) {
+    const rawOperations = response.operationResponse?.operations ?? [];
+    for (const operation of rawOperations) {
       revision = decimal(operation.revision, revision);
       if (operation.message) {
         try {
@@ -1150,7 +1170,7 @@ export class LinejsAdapter implements LineTransport {
         for (const encrypted of [...recent].reverse()) {
           try {
             const message = await this.#gate.invokeRpc(context, () => this.#base.e2ee.decryptE2EEMessage(encrypted as Parameters<BaseClient['e2ee']['decryptE2EEMessage']>[0])) as { id?: unknown };
-            operations.push({ source: 'history', operation: { revision: message.id, message } });
+            catchupMessages.push({ source: 'history', operation: { revision: message.id, message } });
           } catch { /* Keep polling; unavailable E2EE history is not a fake message. */ }
         }
       } catch {
@@ -1161,7 +1181,11 @@ export class LinejsAdapter implements LineTransport {
       chatId: receipt.chatId, readerMid: receipt.readerMid, messageId: receipt.messageId.toString(),
       readAt: new Date(receipt.createdTime).toISOString(),
     }));
-    return { cursorAfter: { version: 1, revision, globalRev, individualRev }, operations,
+    const queued = drainStartupCatchupQueue(catchupMessages, Math.max(0, 100 - operations.length));
+    operations.push(...queued.operations);
+    this.#pendingCatchupMessages = [...queued.remaining];
+    return { cursorAfter: { version: 1, revision, globalRev, individualRev }, operations, rawOperationCount: rawOperations.length,
+      hasMoreStartupItems: queued.hasMoreStartupItems,
       ...(readReceipts.length === 0 ? {} : { readReceipts }) };
   }
   /** In-memory drop counters for NOTIFIED_READ_MESSAGE ops (no event type carries them). */

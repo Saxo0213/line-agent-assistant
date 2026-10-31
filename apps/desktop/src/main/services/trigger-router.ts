@@ -149,6 +149,7 @@ export type TriggerDecision =
   | { type: 'agent_provider'; provider: AgentProvider | 'default' }
   /** A served non-administrator sent a bare `/agent claude|codex`: reply with the usage hint, change nothing. */
   | { type: 'agent_usage'; provider: AgentProvider }
+  | { type: 'agent_quota' }
   | FreeCommand
   | FolderCommand
   | PersonaCommand
@@ -161,6 +162,15 @@ export function parseAgentSwitch(text: string): { provider: AgentProvider | 'def
 }
 
 export function routeTrigger(envelope: InboundEnvelope, context: TriggerContext): TriggerDecision {
+  // Provider quota is a Main-owned system query and never requires an Agent workspace or model turn.
+  if (envelope.ingestion.source === 'live' && envelope.kind === 'text' && envelope.text !== null
+    && context.ownMid !== null && envelope.senderId !== context.ownMid
+    && !(typeof envelope.raw === 'object' && envelope.raw !== null && !Array.isArray(envelope.raw) && envelope.raw.contentState === 'decrypt_failed')) {
+    const text = textWithoutOwnMention(envelope, context.ownMid);
+    if (/^\/(?:quota|額度)$/i.test(text)
+      && (envelope.chatType === 'direct' ? context.senderIsPrimaryAdmin
+        : (context.agentEnabled || (context.primaryAdmin ?? context.senderIsPrimaryAdmin)) && hasOwnMention(envelope, context.ownMid))) return { type: 'agent_quota' };
+  }
   // Group free mode (docs/architecture/group-free-mode.md): `/free` is a Primary Administrator command, mention optional.
   // The sender gates of routeNormalTrigger (live, text, not own, decrypt_failed) hold for every free decision too.
   // `/folder` (docs/architecture/project-folders.md) is a Primary Administrator command in every chat type, mention optional.

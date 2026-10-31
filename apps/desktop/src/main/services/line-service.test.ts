@@ -32,7 +32,29 @@ class LineService extends BaseLineService {
 const batch = (): Extract<LineWorkerEvent, { type: 'batch' }> => ({ type: 'batch', accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1,
   batchId: 'b1', cursorBefore: cursor('0'), cursorAfter: cursor('1'), envelopes: [{ eventId: 'e1', accountId: 'a', chatType: 'direct', chatId: 'c',
     senderId: 'user', messageId: 'm1', kind: 'text', text: 'hello', mentionIds: [], mentionRanges: [], replyToMessageId: null,
-    ingestion: { source: 'live', cursor: null }, occurredAt: '2026-10-15T00:00:00.000Z', attachments: [], raw: {} }] });
+    ingestion: { source: 'live', cursor: null }, occurredAt: '2026-10-15T00:00:00.000Z', attachments: [], raw: {} }],
+  startupSync: false, startupFinal: false });
+
+it('archives startup messages as ignored routes without running inbound classification', async () => {
+  const commands: LineWorkerCommand[] = [];
+  const decisions: unknown[] = [];
+  const classifyInbound = vi.fn(async () => false);
+  const messages = { async listPendingRouteActions() { return []; }, async ingestBatchAndRoute(_batch: unknown, routes: unknown[]) {
+    decisions.push(...routes);
+    return { insertedMessageIds: ['m1'], changedMessageIds: ['m1'], readPositionsChanged: 0, jobStatuses: [], routeDecisions: routes };
+  } };
+  const service = new BaseLineService({ async bindWorker() {}, async getAccount() { return { ownMid: 'agent-mid' }; } } as never,
+    messages as never, {} as never, { async send(command) { commands.push(command); } },
+    { kick() {}, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined, undefined,
+    undefined, undefined, undefined, classifyInbound);
+  await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+  await service.handleWorkerEvent('w1', { ...batch(), startupSync: true, startupFinal: true,
+    envelopes: [{ ...batch().envelopes[0]!, text: '@Agent /stop', mentionIds: ['agent-mid'],
+      mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] }] });
+  expect(classifyInbound).not.toHaveBeenCalled();
+  expect(decisions).toEqual([{ eligible: false, action: 'ignore' }]);
+  expect(commands).toMatchObject([{ type: 'ackBatch', batchId: 'b1', startupComplete: true }]);
+});
 
 describe('Agent status reply localization', () => {
   it.each([
@@ -227,8 +249,10 @@ describe('administrative archive admission', () => {
 
 describe('LineService group mention authorization fast path', () => {
   function setup(options: { primary?: boolean; primaryError?: boolean; friend?: boolean; room?: boolean; responder?: boolean; handledMessageId?: string;
-    freeMode?: never; freeActive?: boolean } = {}) {
+    freeMode?: never; freeActive?: boolean; quotaProposal?: boolean } = {}) {
     const providerChanges: Array<string | null> = [];
+    let proposalLookups = 0;
+    let quotaRetryAccepts = 0;
     const personaChanges: unknown[] = [];
     const calls: string[] = [];
     const friendScopes: unknown[] = [];
@@ -258,7 +282,7 @@ describe('LineService group mention authorization fast path', () => {
         async getConversationPersona() { return { description: null, liveliness: null }; },
         async setConversationPersona(_key: unknown, patch: unknown) { personaChanges.push(patch); return true; } } as never,
       { async send(command: LineWorkerCommand) { commands.push(command); } },
-      { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {} },
+      { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {}, async acceptQuotaRetry() { quotaRetryAccepts++; return true; } },
       undefined, undefined, async (envelope, candidate, ownMid) => {
         enrollmentInputs.push({ candidate, ownMid });
         if (envelope.messageId !== options.handledMessageId) return false;
@@ -276,8 +300,12 @@ describe('LineService group mention authorization fast path', () => {
       } } as never,
       async (envelope) => envelope.messageId === options.handledMessageId,
       undefined, undefined, undefined, 'en', undefined, freeMode, projectFolders,
+      undefined, undefined, undefined,
+      options.quotaProposal ? async () => { proposalLookups++; return 'stale-proposal'; } : undefined,
+      undefined,
     );
-    return { service, freeCommands, folderCommands, calls, archived, kicked, replies, enrollmentInputs, friendScopes, commands, providerChanges, personaChanges };
+    return { service, freeCommands, folderCommands, calls, archived, kicked, replies, enrollmentInputs, friendScopes, commands, providerChanges, personaChanges,
+      get proposalLookups() { return proposalLookups; }, get quotaRetryAccepts() { return quotaRetryAccepts; } };
   }
 
   const groupMessage = (overrides: Partial<InboundEnvelope> = {}): InboundEnvelope => ({
@@ -367,6 +395,18 @@ describe('LineService group mention authorization fast path', () => {
       const h = await run({ primary: false }, mentioned('@Agent /agent claude'));
       expect(h.providerChanges).toEqual([]);
       expect(sentTexts(h.commands)).toContain('Add what you want done after /agent claude');
+    });
+
+    it('does not consume a retry proposal from an agent_usage dispatch even when a friend grant remains', async () => {
+      const h = setup({ primary: false, friend: true, quotaProposal: true });
+      const command = groupMessage({ chatType: 'direct', chatId: 'friend-chat', messageId: 'revoked-admin', text: '/agent codex' });
+      await h.service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+      await h.service.handleWorkerEvent('w1', { ...batch(), envelopes: [command] });
+      await h.service.idleRoomEffects();
+      expect(h.proposalLookups).toBe(0);
+      expect(h.quotaRetryAccepts).toBe(0);
+      expect(h.providerChanges).toEqual([]);
+      expect(h.commands.some((entry) => entry.type === 'sendText' && entry.text.includes('Add what you want done'))).toBe(true);
     });
 
     it('treats /agent default from a non-administrator in an unserved room as ordinary text for the responder', async () => {
@@ -727,8 +767,8 @@ it('does not start pending action recovery for a syncConfirmed event in ACTIVE_C
   const { service, calls } = syncConfirmedService();
   const binding = { accountId: 'a-sync-active', workerInstanceId: 'w-sync-active', controlEpoch: 1, mode: 'ACTIVE_CONTROL' as const };
   await service.bind(binding);
-  await vi.waitFor(() => expect(calls.pendingReads).toBeGreaterThan(0));
   const reads = calls.pendingReads;
+  expect(reads).toBe(0);
   await service.handleWorkerEvent('w-sync-active', { type: 'syncConfirmed', accountId: 'a-sync-active',
     workerInstanceId: 'w-sync-active', controlEpoch: 1 });
   expect(calls.syncConfirmed).toHaveLength(1);

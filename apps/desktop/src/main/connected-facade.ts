@@ -14,7 +14,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
 import {
-  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, migrate, parseLineStickerDescriptor,
+  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, ProviderQuotaRepository, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
 import type { Attachment, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
@@ -72,6 +72,8 @@ import type { OfficialBuildTrustService } from './services/official-build-trust.
 import {probeInitialProviderAuth} from './provider-auth.js';
 import { AUDIT_ERROR_CODES, type AuditErrorCode, type OperationalAudit } from './services/operational-audit.js';
 import { resolveChatProvider } from './services/default-provider.js';
+import { ProviderQuotaService, quotaFailureSuggestion } from './services/provider-quota-service.js';
+import { providerFailureResetAt } from '@line-agent/agent-bridge';
 import { diagnosticFailure, parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AuditEventsReadResult } from './services/operational-audit-runtime.js';
 import { systemActivityResult, systemErrorsResult } from './services/system-records.js';
@@ -592,6 +594,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   };
   const messages = new MessageRepository(options.pool);
   const agents = new AgentRepository(options.pool);
+  const providerQuota = new ProviderQuotaRepository(options.pool);
   const settings = new SettingsRepository(options.pool);
   let conversationSettingsError: string | null = null;
   let conversationSettings = await settings.getConversationSettings().catch((error: unknown) => {
@@ -958,8 +961,65 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return loaded;
     },
   };
+  let providerQuotaService!: ProviderQuotaService;
+  const validateQuotaFailureNotice = async (jobId:string, expected?:WorkerBinding):Promise<Bound|null> => {
+    const job=await agents.getJob(jobId);
+    if(!job||job.sourceType!=='line') return null;
+    const current=await options.workers.binding(job.accountId);
+    if(!current||current.mode!=='ACTIVE_CONTROL'||current.purpose==='DOWNLOAD_ONLY'||current.accountId!==job.accountId
+      ||current.controlEpoch!==job.creationEpoch||(expected&&(current.workerInstanceId!==expected.workerInstanceId||current.controlEpoch!==expected.controlEpoch))
+      ||!lineService.isAuthenticatedReady(current)||!options.workers.isCurrentActiveControlBinding(current)) return null;
+    if(!await providerQuota.validateFailureNoticeAuthority({jobId,accountId:job.accountId,workerInstanceId:current.workerInstanceId,controlEpoch:current.controlEpoch})) return null;
+    return current;
+  };
+  const handleProviderQuotaFailure = async (jobId: string, event: Extract<AgentEvent,{type:'failed'}>, observedAt = new Date().toISOString()): Promise<void> => {
+    const failedJob=await agents.getJob(jobId);
+    if(!failedJob) return;
+    const resetAt=event.quotaRecoveryAt??providerFailureResetAt(event.message,Date.parse(observedAt));
+    await providerQuota.recordFailure({provider:failedJob.provider,observedAt,recoveryAt:resetAt??null,
+      source:'Agent PROVIDER_LIMIT failure',evidence:event.message});
+    if(failedJob.sourceType!=='line') return;
+    if(!await validateQuotaFailureNotice(jobId)) { await providerQuota.skipNotice(jobId); return; }
+    const targetProvider=failedJob.provider==='codex'?'claude':'codex';
+    const alternate=await providerQuotaService.get(targetProvider);
+    await providerQuota.saveSnapshot({provider:targetProvider,requestedAt:alternate.requestedAt,fetchedAt:alternate.fetchedAt,
+      stale:alternate.stale,snapshot:alternate});
+    const stored=await providerQuota.get(targetProvider);
+    const alternateBlocked=!!stored?.blocked||alternate.windows.some(window=>window.blocksProvider&&window.usedPercent>=100);
+    const currentState=await providerQuota.get(failedJob.provider);
+    const alternateAvailable=!alternate.error&&!alternate.stale&&!!alternate.fetchedAt&&alternate.availabilityKnown&&alternate.windows.length>0
+      &&!alternate.windows.some(window=>window.blocksProvider&&window.usedPercent>=100)&&!!stored&&!stored.blocked;
+    const consentAvailable=alternateAvailable&&await providerQuota.createProposal(jobId,targetProvider,new Date(Date.now()+10*60_000).toISOString());
+    if(!await validateQuotaFailureNotice(jobId)) { await providerQuota.skipNotice(jobId); return; }
+    await providerQuota.createNotice(jobId);
+    const noticeBinding=await validateQuotaFailureNotice(jobId);
+    if(!noticeBinding) { await providerQuota.skipNotice(jobId); return; }
+    if(!await providerQuota.claimNotice(jobId)) return;
+    const failedName=failedJob.provider==='codex'?'Codex':'Claude';
+    const targetName=targetProvider==='codex'?'Codex':'Claude';
+    const recovery=currentState?.recoveryAt??resetAt??null;
+    const suggestion=quotaFailureSuggestion({currentName:failedName,currentRecoveryAt:recovery,targetName,
+      currentBlocked:currentState?.blocked===true,alternateBlocked,alternateRecoveryAt:stored?.recoveryAt??null,
+      alternateAvailable,alternateQueryError:alternate.error,alternateStale:alternate.stale,consentAvailable,
+      originalSenderAdmin:consentAvailable});
+    const currentReset=recovery?new Intl.DateTimeFormat('zh-TW',{timeZone:'Asia/Taipei',dateStyle:'medium',timeStyle:'short'}).format(new Date(recovery)):'重設時間未知';
+    const failureStatus=currentState?.blocked&&alternateBlocked?`${failedName} 額度已用完。`:`${failedName} 額度已用完；預計重設：${currentReset}。`;
+    try {
+      const sent=await agentLineSend.sendSystemText({runId:randomUUID(),target:failedJob,principalId:'system:provider_quota',
+        text:`${failureStatus}這次工作已失敗。${suggestion}`,
+        validateBeforeSend:async(binding)=>{
+          const sameBinding=binding.accountId===noticeBinding.accountId&&binding.workerInstanceId===noticeBinding.workerInstanceId
+            &&binding.controlEpoch===noticeBinding.controlEpoch;
+          const valid=sameBinding&&!!await validateQuotaFailureNotice(jobId,noticeBinding);
+          if(!valid) await providerQuota.skipNotice(jobId);
+          return !!valid;
+        }});
+      await providerQuota.finishNotice(jobId,sent.status==='sent'?'sent':'unknown');
+    } catch { await providerQuota.finishNotice(jobId,'unknown').catch(()=>undefined); }
+  };
   agentService = new AgentService(agents, workspace, options.agent,
     async (jobId, event) => {
+      if (event.type === 'failed' && event.code === 'PROVIDER_LIMIT') await handleProviderQuotaFailure(jobId,event).catch(()=>undefined);
       if (event.type === 'failed') options.audit?.failure({ operation: 'agent',
         stage: event.code === 'BRIDGE_ERROR' ? 'spawn' : event.code === 'INVALID_JSONL' ? 'parse' : 'execute',
         category: event.code === 'AUTH_REQUIRED' ? 'authentication_required' : event.code === 'TIMEOUT' ? 'timeout' : 'unknown',
@@ -981,7 +1041,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     (projection) => publishAgentJobStatus(projection),
     internalMcpLauncher, agentJobEnvironment,
     (diagnostic, jobId) => options.audit?.failure(diagnostic, { ...(jobId ? { jobId } : {}) }),
-    (chat) => resolveEffectivePersona(settings, chat).then((persona) => persona.description));
+    (chat) => resolveEffectivePersona(settings, chat).then((persona) => persona.description),
+    async (provider) => {
+      const current=await providerQuota.get(provider);
+      if(!current?.blocked) return null;
+      const reset=current.recoveryAt?Date.parse(current.recoveryAt):NaN;
+      if(!Number.isFinite(reset)||reset>Date.now()) return {blocked:true,recoveryAt:current.recoveryAt};
+      const snapshot=await providerQuotaService.refreshNow(provider);
+      await providerQuota.saveSnapshot({provider,requestedAt:snapshot.requestedAt,fetchedAt:snapshot.fetchedAt,stale:snapshot.stale,snapshot});
+      const updated=await providerQuota.get(provider);
+      return updated?.blocked?{blocked:true,recoveryAt:updated.recoveryAt}:null;
+    });
+  providerQuotaService = new ProviderQuotaService((provider) => agentService.queryQuota(provider));
   agentService.setStatusRotationIntervalSeconds(conversationSettings.agentStatusRotationIntervalSeconds);
   stopAgentService = onceCleanup(() => agentService.shutdown());
   startupCleanup.add(stopAgentService);
@@ -1347,7 +1418,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           if (conversation) options.publish?.({ type: 'messageStored', key: change.key, messageId: change.messageId, conversation });
         }
       }, { operation: 'line_ingest', identity: { ...(changes[0] ? { accountId: changes[0].key.accountId } : {}), background: true } }).catch(() => undefined);
-    }, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic), freeMode, projectFolders);
+    }, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic), freeMode, projectFolders,
+    (input) => agentLineSend.sendSystemText(input),
+    async (snapshot) => providerQuota.saveSnapshot({ provider: snapshot.provider, requestedAt: snapshot.requestedAt,
+      fetchedAt: snapshot.fetchedAt, stale: snapshot.stale, snapshot }), providerQuotaService,
+    (key, senderId, targetProvider) => providerQuota.pendingProposal({ ...key, senderId, targetProvider }),
+    (provider) => providerQuota.get(provider));
   lineServiceReady = true;
   delivery = new DeliveryService(agents, {
     binding: (accountId) => options.workers.binding(accountId),
@@ -1718,6 +1794,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch
       || !lineService.isAuthenticatedReady(current) || !options.workers.isCurrentActiveControlBinding(current)) return;
     await delivery.recoverPending(binding.accountId);
+    for(const failure of await providerQuota.recoverableFailures(binding.accountId)) {
+      if(failure.event.type==='failed'&&failure.event.code==='PROVIDER_LIMIT') {
+        await handleProviderQuotaFailure(failure.jobId,failure.event as unknown as Extract<AgentEvent,{type:'failed'}>,failure.observedAt).catch(()=>undefined);
+      }
+    }
     if ((await accounts.getAccount(binding.accountId))?.productRole !== 'AGENT') return;
     if (signal?.aborted || closing || !lineService.isAuthenticatedReady(current)
       || !options.workers.isCurrentActiveControlBinding(current)) return;
@@ -3413,8 +3494,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (page.messages.length) {
         try {
           const jobs = await options.pool.query<{ job_id: string; source_message_id: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'; revision: string }>(
-            `SELECT job_id, source_message_id, status, ((extract(epoch FROM updated_at) * 1000000)::numeric(20,0))::text AS revision FROM agent_jobs WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3
-             AND source_type='line' AND source_message_id=ANY($4::text[])`,
+            `SELECT DISTINCT ON (source_message_id) job_id, source_message_id, status, ((extract(epoch FROM updated_at) * 1000000)::numeric(20,0))::text AS revision FROM agent_jobs WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3
+             AND source_type='line' AND source_message_id=ANY($4::text[]) ORDER BY source_message_id,(retry_of_job_id IS NOT NULL) DESC,updated_at DESC`,
             [key.accountId, key.chatType, key.chatId, page.messages.map((item) => item.messageId)]);
           for (const job of jobs.rows) agentStatuses.set(job.source_message_id, { jobId: job.job_id, status: job.status, revision: job.revision });
         } catch { /* Agent projection is optional; message detail must remain available. */ }

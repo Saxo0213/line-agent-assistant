@@ -11,6 +11,7 @@ export interface ProcessSpec {
   cwd?: string;
   env: NodeJS.ProcessEnv;
   input?: string;
+  keepStdinOpen?: boolean;
   interactive?: boolean;
   /** Per-run internal MCP capability; injected into the child environment only, never into args. */
   mcpToken?: string;
@@ -23,6 +24,8 @@ export interface RunningProcess {
   stderr: AsyncIterable<Uint8Array>;
   exited: Promise<ExitResult>;
   cancel(): Promise<void>;
+  write?(input: string): void;
+  endInput?(): void;
 }
 export interface ProcessRunner { start(spec: ProcessSpec): RunningProcess }
 
@@ -52,10 +55,13 @@ export class NodeProcessRunner implements ProcessRunner {
       child.once('close', (code, signal) => resolve({code, signal}));
     });
     child.stdin.on('error', () => {}); // EPIPE is reported by the process exit, never thrown in Main.
-    child.stdin.end(spec.input ?? '');
+    if(spec.keepStdinOpen) { if(spec.input) child.stdin.write(spec.input); }
+    else child.stdin.end(spec.input ?? '');
     let cancellation:Promise<void>|undefined;
     return {
       stdout: child.stdout, stderr: child.stderr, exited,
+      write:(input:string)=>{if(child.stdin.destroyed||child.stdin.writableEnded) throw new Error('Process stdin is closed');child.stdin.write(input);},
+      endInput:()=>{if(!child.stdin.destroyed&&!child.stdin.writableEnded) child.stdin.end();},
       cancel: () => cancellation ??= (async()=>{
         const signals=new Set<ChildProcess>();
         let timer:ReturnType<typeof setTimeout>|undefined;

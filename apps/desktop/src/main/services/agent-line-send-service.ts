@@ -82,6 +82,7 @@ export const SYSTEM_SCHEDULE_PRINCIPAL = 'system:schedule';
 export const FREE_MODE_PRINCIPAL = 'system:free_mode';
 /** Audit principal of a /folder reply (docs/architecture/project-folders.md). */
 export const PROJECT_FOLDER_PRINCIPAL = 'system:project_folder';
+export const PROVIDER_QUOTA_PRINCIPAL = 'system:provider_quota';
 
 export interface SystemTextInput {
   /** Audit `job_id`: the schedule run id (a system message has no Agent job). */
@@ -89,8 +90,10 @@ export interface SystemTextInput {
   target: { accountId: string; chatType: SendChatType; chatId: string };
   text: string;
   /** Audit principal; defaults to the schedule principal. */
-  principalId?: typeof SYSTEM_SCHEDULE_PRINCIPAL | typeof FREE_MODE_PRINCIPAL | typeof PROJECT_FOLDER_PRINCIPAL;
+  principalId?: typeof SYSTEM_SCHEDULE_PRINCIPAL | typeof FREE_MODE_PRINCIPAL | typeof PROJECT_FOLDER_PRINCIPAL | typeof PROVIDER_QUOTA_PRINCIPAL;
   signal?: AbortSignal;
+  /** Rechecked after FIFO wait and immediately before LINE send; false means a safely skipped write. */
+  validateBeforeSend?: (binding: WorkerBinding) => Promise<boolean>;
 }
 /** `unknown` means the message may have reached LINE; the caller must never retry it. */
 export type SystemTextResult = { status: 'sent' } | { status: 'failed'; code: SendErrorCode } | { status: 'unknown'; code: SendErrorCode };
@@ -129,6 +132,7 @@ interface CallState {
   readonly isLive: () => boolean;
   readonly baseline: { controlEpoch: number; workerInstanceId: string };
   halted: boolean;
+  validateBeforeSend?: (binding: WorkerBinding) => Promise<boolean>;
 }
 interface QueueEntry { call: CallState; item: ReadyItem; resolve(result: McpSendResult): void }
 
@@ -365,10 +369,12 @@ export class AgentLineSendService implements AgentLineSendHandler {
     if (!target) return deny('send_target_invalid');
     const plan: SendPlan = { jobId: input.runId, principalId, accountId, chatType: target.chatType,
       chatId: target.chatId, workspacePath: null, items: [{ index: 0, auditKind: 'text', kind: 'text', parts, byteSize }] };
-    const output = await this.run(plan, { signal: input.signal ?? new AbortController().signal, isLive: () => !this.stopping });
+    const output = await this.run(plan, { signal: input.signal ?? new AbortController().signal, isLive: () => !this.stopping,
+      ...(input.validateBeforeSend ? { validateBeforeSend: input.validateBeforeSend } : {}) });
     const result = output.results[0];
     if (result?.status === 'sent') return { status: 'sent' };
     if (result?.status === 'unknown') return { status: 'unknown', code: 'send_unknown' };
+    if (result?.status === 'skipped') return { status: 'failed', code: 'send_line_unavailable' };
     return { status: 'failed', code: result?.status === 'failed' ? result.code ?? 'send_failed' : 'send_line_unavailable' };
   }
 
@@ -379,7 +385,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     return binding && binding.mode === 'ACTIVE_CONTROL' && acknowledged ? binding : null;
   }
 
-  async run(plan: SendPlan, context: { signal: AbortSignal; isLive(): boolean }): Promise<McpSendToTargetOutput> {
+  async run(plan: SendPlan, context: { signal: AbortSignal; isLive(): boolean; validateBeforeSend?: (binding: WorkerBinding) => Promise<boolean> }): Promise<McpSendToTargetOutput> {
     const count = plan.items.length;
     const refuse = async (index: number, code: SendErrorCode): Promise<McpSendToTargetOutput> => {
       const item = plan.items[index]!;
@@ -397,7 +403,8 @@ export class AgentLineSendService implements AgentLineSendHandler {
     if (this.stopping || context.signal.aborted || !context.isLive()) return failedAt(count, 0, 'send_line_unavailable');
 
     const call: CallState = { plan, isLive: context.isLive, halted: false,
-      baseline: { controlEpoch: binding.controlEpoch, workerInstanceId: binding.workerInstanceId } };
+      baseline: { controlEpoch: binding.controlEpoch, workerInstanceId: binding.workerInstanceId },
+      ...(context.validateBeforeSend ? { validateBeforeSend: context.validateBeforeSend } : {}) };
     const release = () => this.haltQueued(call);
     const results = prepared.items.map((item) => new Promise<McpSendResult>((resolve) => {
       this.queue.push({ call, item, resolve });
@@ -497,6 +504,11 @@ export class AgentLineSendService implements AgentLineSendHandler {
       for (const part of item.parts) {
         const binding = await fresh();
         if (!binding) return unavailable(sentParts > 0);
+        if(call.validateBeforeSend) {
+          let valid=false;
+          try { valid=await call.validateBeforeSend(binding); } catch { valid=false; }
+          if(!valid) { await record('denied','send_line_unavailable'); return skipped(index); }
+        }
         const requestId = randomUUID();
         let outcome: 'sent' | SendFault;
         try {

@@ -521,8 +521,9 @@ describe('plan shape', () => {
 describe('system text (system message schedules)', () => {
   const RUN = 'run-0001';
   const direct = { accountId: ACCOUNT, chatType: 'direct' as const, chatId: 'u-friend' };
-  const send = (text: string, over: { runId?: string; target?: typeof direct; signal?: AbortSignal } = {}) =>
-    service.sendSystemText({ runId: over.runId ?? RUN, target: over.target ?? direct, text, ...(over.signal ? { signal: over.signal } : {}) });
+  const send = (text: string, over: { runId?: string; target?: typeof direct; signal?: AbortSignal; validateBeforeSend?: () => Promise<boolean> } = {}) =>
+    service.sendSystemText({ runId: over.runId ?? RUN, target: over.target ?? direct, text, ...(over.signal ? { signal: over.signal } : {}),
+      ...(over.validateBeforeSend ? { validateBeforeSend: over.validateBeforeSend } : {}) });
 
   it('sends through the same queue and writes a system:schedule audit row keyed by the run id', async () => {
     expect(await send('早安')).toEqual({ status: 'sent' });
@@ -573,6 +574,22 @@ describe('system text (system message schedules)', () => {
     expect(worker.sent).toHaveLength(0);
     expect(repo.audit.length).toBeGreaterThan(0);
     expect(repo.audit.every((row) => row.principalId === 'system:schedule' && row.status === 'denied' && row.jobId === RUN)).toBe(true);
+  });
+
+  it('revalidates system notice authority at the LINE write handoff and skips after revocation', async () => {
+    const gate = deferred();
+    worker.gates.push(gate.promise);
+    const first = submit([{ type: 'text', text: 'blocks the queue' }], { jobId: 'job-blocker' });
+    await vi.waitFor(() => expect(worker.sent).toHaveLength(1));
+    let authorized = true;
+    const validateBeforeSend = vi.fn(async () => authorized);
+    const notice = send('quota notice', { validateBeforeSend });
+    authorized = false;
+    gate.resolve();
+    expect(statuses(await first)).toEqual(['sent']);
+    expect(await notice).toEqual({ status: 'failed', code: 'send_line_unavailable' });
+    expect(validateBeforeSend).toHaveBeenCalledTimes(1);
+    expect(worker.sent.map((item) => item.text)).toEqual(['blocks the queue']);
   });
 
   it('reports a failed send and never retries an unknown one, including a gateway exception', async () => {

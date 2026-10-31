@@ -57,7 +57,7 @@ export async function recentContactCards(db: Queryable, envelope: InboundEnvelop
   if (Number.isNaN(at.getTime())) return [];
   const previous = await db.query<{ occurred_at: Date }>(
     `SELECT m.occurred_at FROM agent_jobs j JOIN messages m ON m.account_id = j.account_id AND m.message_id = j.source_message_id
-     WHERE j.account_id = $1 AND j.chat_type = $2 AND j.chat_id = $3 AND j.source_type = 'line' AND j.source_message_id <> $4
+     WHERE j.account_id = $1 AND j.chat_type = $2 AND j.chat_id = $3 AND j.source_type = 'line' AND j.retry_of_job_id IS NULL AND j.source_message_id <> $4
      ORDER BY m.occurred_at DESC LIMIT 1`, [envelope.accountId, envelope.chatType, envelope.chatId, envelope.messageId]);
   const after = Math.max(at.getTime() - AGENT_CONTACT_CARD_WINDOW_MS, previous.rows[0] ? new Date(previous.rows[0].occurred_at).getTime() : Number.NEGATIVE_INFINITY);
   const stored = await db.query<{ message_id: string; occurred_at: Date; content: unknown; raw: unknown }>(

@@ -98,7 +98,8 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('tool_completed'), toolUseId: IdSchema, summary: z.string() }),
   z.strictObject({ type: z.literal('approval_required'), approvalId: IdSchema, summary: z.string().min(1) }),
   z.strictObject({ type: z.literal('completed'), finalText: z.string(), usage: UsageSchema.optional() }),
-  z.strictObject({ type: z.literal('failed'), code: z.string().min(1), message: z.string().min(1), retryable: z.boolean() }),
+  z.strictObject({ type: z.literal('failed'), code: z.string().min(1), message: z.string().min(1), retryable: z.boolean(),
+    quotaRecoveryAt: TimestampSchema.optional() }),
   z.strictObject({ type: z.literal('cancelled') }),
   z.strictObject({ type: z.literal('mcp_status'), status: z.enum(['configured', 'available', 'not_loaded']), message: z.string().min(1) }),
 ]);

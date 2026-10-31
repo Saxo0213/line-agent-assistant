@@ -642,7 +642,7 @@ export class MessageRepository {
         if (priorRoute.rows[0]?.action === 'prompt') {
           const existing = await client.query<{ job_id: string; status: 'queued' | 'failed'; revision: string }>(
             `SELECT job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision
-             FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2`,
+             FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2 AND retry_of_job_id IS NULL`,
             [batch.accountId, envelope.messageId]);
           const job = existing.rows[0];
           if (job) {
@@ -672,7 +672,7 @@ export class MessageRepository {
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,2))', [`${batch.accountId}:${envelope.messageId}`]);
         const existing = await client.query<{ job_id: string; status: 'queued' | 'failed'; revision: string }>(
           `SELECT job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision
-           FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2`, [batch.accountId,envelope.messageId]);
+           FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2 AND retry_of_job_id IS NULL`, [batch.accountId,envelope.messageId]);
         let job = existing.rows[0];
         if (!job) {
           const provider = decision.eligible ? decision.provider : failure!.provider;
@@ -687,14 +687,14 @@ export class MessageRepository {
             `INSERT INTO agent_jobs(job_id,account_id,chat_type,chat_id,provider,source_type,source_message_id,source_sender_id,prompt,workspace_path,
                generation,creation_epoch,status,completed_at,direct_friend_grant_id,direct_friend_grant_version,room_agent_grant_id,room_agent_grant_version)
              VALUES($1,$2,$3,$4,$5,'line',$6,$7,$8,$9,$10,$11,$12,CASE WHEN $12='failed' THEN now() ELSE NULL END,$13,$14,$15,$16)
-             ON CONFLICT(account_id,source_message_id) WHERE source_type='line' DO NOTHING
+             ON CONFLICT(account_id,source_message_id) WHERE source_type='line' AND retry_of_job_id IS NULL DO NOTHING
              RETURNING job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision`,
             [jobId,batch.accountId,envelope.chatType,envelope.chatId,provider,envelope.messageId,envelope.senderId,prompt,workspacePath,session.rows[0]!.generation,
               batch.controlEpoch,failure?'failed':'queued',requestedAuthorization?.directGrantId??null,requestedAuthorization?.directGrantVersion??null,
               requestedAuthorization?.roomGrantId??null,requestedAuthorization?.roomGrantVersion??null]);
           job = inserted.rows[0] ?? (await client.query<{ job_id: string; status: 'queued'|'failed'; revision: string }>(
             `SELECT job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision
-             FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2`, [batch.accountId,envelope.messageId])).rows[0];
+             FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2 AND retry_of_job_id IS NULL`, [batch.accountId,envelope.messageId])).rows[0];
           if (!job) throw new Error('Agent job insert did not produce or find a job');
           if (failure && inserted.rowCount) await client.query('INSERT INTO agent_events(job_id,event) VALUES($1,$2::jsonb)',
             [job.job_id,JSON.stringify({type:'failed',code:failure.code,message:failure.reason,retryable:false})]);
@@ -753,6 +753,7 @@ export class MessageRepository {
        WHERE a.account_id=$1 AND a.connection_mode='SYSTEM_LOGIN' AND a.mode='ACTIVE_CONTROL'
          AND a.worker_instance_id=$2 AND a.worker_binding_epoch=$3 AND ac.control_epoch=$3
          AND a.own_mid=s.verified_account_mid AND r.message_id IS NULL
+         AND COALESCE(o.normalized_payload->'livePayload'->'recovery'->>'startupSuppressed','false') <> 'true'
          AND o.normalized_payload->'livePayload'->'recovery'->'envelope' IS NOT NULL
          AND o.observation_id > $4
        ORDER BY o.observation_id ASC LIMIT $5`,
@@ -767,6 +768,41 @@ export class MessageRepository {
       return { observationId: row.observation_id, envelope: parsed.success ? parsed.data : null,
         receiptMode, receiptControlEpoch, sensitive: recovery.sensitive === true };
     });
+  }
+
+  /** Close pending inbound effects before startup catch-up; suppression leaves effect_applied_at untouched. */
+  async suppressPendingRouteActions(input: { accountId: string; workerInstanceId: string; controlEpoch: number }): Promise<void> {
+    await this.pool.query(
+      `UPDATE message_routes r SET action='ignore', provider=NULL
+       FROM line_accounts a JOIN account_control c ON c.singleton=true
+       WHERE r.account_id=$1 AND a.account_id=r.account_id AND a.worker_instance_id=$2
+         AND a.worker_binding_epoch=$3 AND a.mode='ACTIVE_CONTROL' AND c.control_epoch=$3
+         AND r.action IN ('stop','new','status') AND r.effect_applied_at IS NULL AND r.creation_epoch=$3`,
+      [input.accountId, input.workerInstanceId, input.controlEpoch],
+    );
+  }
+
+  /** Mark unrouted live observations suppressed so later bind recovery cannot turn them into automation. */
+  async suppressUnroutedLiveSourceMessages(input: { accountId: string; workerInstanceId: string; controlEpoch: number }): Promise<void> {
+    await this.pool.query(
+      `UPDATE external_source_observations o
+       SET normalized_payload=jsonb_set(o.normalized_payload,
+         '{livePayload,recovery,startupSuppressed}','true'::jsonb,true)
+       FROM message_source_provenance p
+       JOIN line_account_sources s ON s.account_id=p.account_id AND s.source_id=p.source_id
+         AND s.generation=p.generation AND s.source_type='SYSTEM_LOGIN' AND s.state='ACTIVE'
+       JOIN line_accounts a ON a.account_id=s.account_id AND a.selected_source_id=s.source_id
+         AND a.selected_source_generation=s.generation
+       JOIN account_control ac ON ac.singleton=true
+       LEFT JOIN message_routes r ON r.account_id=p.account_id AND r.message_id=p.message_id
+       WHERE o.source_id=p.source_id AND o.generation=p.generation AND o.observation_id=p.observation_id
+         AND p.account_id=$1 AND p.origin='SYSTEM_LOGIN_LIVE' AND r.message_id IS NULL
+         AND a.connection_mode='SYSTEM_LOGIN' AND a.mode='ACTIVE_CONTROL' AND a.worker_instance_id=$2
+         AND a.worker_binding_epoch=$3 AND ac.control_epoch=$3 AND a.own_mid=s.verified_account_mid
+         AND o.normalized_payload->'livePayload'->'recovery'->'envelope' IS NOT NULL
+         AND COALESCE(o.normalized_payload->'livePayload'->'recovery'->>'startupSuppressed','false') <> 'true'`,
+      [input.accountId, input.workerInstanceId, input.controlEpoch],
+    );
   }
 
   /** Forward-only read-position upsert, one statement per batch. Receipts for unknown conversations are dropped. */
@@ -1066,7 +1102,7 @@ export class MessageRepository {
         }
       } else {
         const existing = await client.query<{ job_id: string }>(
-          `SELECT job_id FROM agent_jobs WHERE account_id = $1 AND source_type = 'line' AND source_message_id = $2`,
+          `SELECT job_id FROM agent_jobs WHERE account_id = $1 AND source_type = 'line' AND source_message_id = $2 AND retry_of_job_id IS NULL`,
           [envelope.accountId, envelope.messageId],
         );
         jobId = existing.rows[0]?.job_id;

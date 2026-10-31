@@ -8,6 +8,7 @@ import {AgentCliBridge} from './index.js';
 import {WindowsExecutableResolver} from './executable-resolver.js';
 import {NodeProcessRunner} from './process-runner.js';
 import type {ProcessSpec} from './process-runner.js';
+import type {RunningProcess} from './process-runner.js';
 import {alive, cleanup, csc, fixtures, hostFile, installFixture, readPids, request, temporaryDirectory, waitDead} from './test-support.js';
 
 let root:string;
@@ -26,6 +27,37 @@ function resultPayload(events:AgentEvent[]) {
   const last=events.at(-1); expect(last?.type).toBe('completed');
   return JSON.parse(last && 'finalText' in last ? last.finalText : '{}');
 }
+
+describe('direct provider quota queries',()=>{
+  it('performs bounded Codex app-server initialize then rate-limit request without exposing stderr',async()=>{
+    const lines:string[]=[];let wake:((value:string|null)=>void)|undefined;let initialized=false;let ended=false;
+    const stdout:AsyncIterable<Uint8Array>={async *[Symbol.asyncIterator](){for(;;){const line=lines.length?lines.shift()!:await new Promise<string|null>(resolve=>{wake=resolve;});
+      if(line===null)return;yield new TextEncoder().encode(`${line}\n`);}}};
+    const push=(line:string)=>{if(wake){const resolve=wake;wake=undefined;resolve(line);}else lines.push(line);};
+    let specification:ProcessSpec|undefined;
+    const child:RunningProcess={stdout,stderr:(async function*(){yield new TextEncoder().encode('credential=never-forward-this');})(),
+      exited:Promise.resolve({code:0,signal:null}),async cancel(){ended=true;},
+      write(input){const messages=input.trim().split(/\r?\n/).map(line=>JSON.parse(line) as {id?:number;method?:string});
+        if(messages.some(message=>message.method==='initialize')){expect(initialized).toBe(false);push(JSON.stringify({id:1,result:{serverInfo:{name:'codex'}}}));initialized=true;}
+        if(messages.some(message=>message.method==='account/rateLimits/read')){expect(initialized).toBe(true);push(JSON.stringify({id:2,result:{rateLimits:{primary:{usedPercent:37,windowDurationMins:240,resetsAt:1790000000}}}}));}},
+      endInput(){}};
+    const instance=new AgentCliBridge({enabled:true,environment:{...process.env},resolver:{resolve:async()=>({file:'C:\\Codex\\codex.exe',prefixArgs:[],version:'1.0.0',kind:'native'})},
+      runner:{start(spec){specification=spec;return child;}}});
+    await expect(instance.queryQuota('codex')).resolves.toMatchObject({rateLimits:{primary:{usedPercent:37}}});
+    expect(specification?.keepStdinOpen).toBe(true);
+    expect(specification?.args).toEqual(['app-server','--listen','stdio://']);
+    expect(ended).toBe(true);
+    await instance.shutdown();
+  });
+  it('fails promptly when app-server ends with a malformed unterminated stdout fragment',async()=>{
+    const child:RunningProcess={stdout:(async function*(){yield new TextEncoder().encode('{"unexpected":');})(),
+      stderr:(async function*(){})(),exited:Promise.resolve({code:1,signal:null}),async cancel(){},write(){},endInput(){}};
+    const instance=new AgentCliBridge({enabled:true,environment:{...process.env},resolver:{resolve:async()=>({file:'C:\\Codex\\codex.exe',prefixArgs:[],version:'1.0.0',kind:'native'})},
+      runner:{start(){return child;}}});
+    await expect(instance.queryQuota('codex')).rejects.toThrow('Codex app-server exited before returning rate limits');
+    await instance.shutdown();
+  });
+});
 
 describe('trusted executable resolution',()=>{
   it.each(['codex','claude'] as const)('validates %s resume against the execution cwd after an alias is retargeted',async provider=>{

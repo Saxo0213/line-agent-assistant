@@ -37,6 +37,13 @@ function setup(mode: 'MONITOR_ONLY' | 'ACTIVE_CONTROL' = 'MONITOR_ONLY') {
   return { worker, transport, events, init, revokeLease: () => { validLease = false; } };
 }
 
+async function pollAndAckStartup(worker: LineWorkerLoop, events: any[]): Promise<void> {
+  await worker.handle({ type: 'poll', ...binding });
+  const batch = events.filter((event) => event.type === 'batch' && event.startupSync === true).at(-1);
+  if (batch) await worker.handle({ type: 'ackBatch', ...binding, batchId: batch.batchId,
+    cursorAfter: batch.cursorAfter, ...(batch.startupFinal ? { startupComplete: true } : {}) });
+}
+
 async function authenticate(worker: LineWorkerLoop): Promise<void> {
   await worker.handle({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
 }
@@ -1143,6 +1150,29 @@ describe('one-account worker loop', () => {
     expect(worker.durableCursor).toEqual(next);
   });
 
+  it('keeps startup suppression across a saturated raw page and releases only after final batch ack', async () => {
+    const { worker, transport, events, init } = setup();
+    await init;
+    await authenticate(worker);
+    transport.enqueueSync({ cursorAfter: next, operations: [message], rawOperationCount: 100 });
+    await worker.handle({ type: 'poll', ...binding });
+    const saturated = events.find((event) => event.type === 'batch');
+    expect(saturated).toMatchObject({ startupSync: true, startupFinal: false });
+    await worker.handle({ type: 'ackBatch', ...binding, batchId: saturated.batchId, cursorAfter: next });
+
+    transport.enqueueSync({ cursorAfter: { ...next, revision: '10' }, operations: [message], rawOperationCount: 1 });
+    await worker.handle({ type: 'poll', ...binding });
+    const final = events.filter((event) => event.type === 'batch').at(-1);
+    expect(final).toMatchObject({ startupSync: true, startupFinal: true });
+    expect(events.some((event) => event.type === 'startupSyncComplete')).toBe(false);
+    await worker.handle({ type: 'ackBatch', ...binding, batchId: final.batchId, cursorAfter: final.cursorAfter, startupComplete: true });
+    expect(events.at(-1)).toMatchObject({ type: 'startupSyncComplete', batchId: final.batchId });
+
+    transport.enqueueSync({ cursorAfter: { ...next, revision: '11' }, operations: [message], rawOperationCount: 1 });
+    await worker.handle({ type: 'poll', ...binding });
+    expect(events.filter((event) => event.type === 'batch').at(-1)).toMatchObject({ startupSync: false, startupFinal: false });
+  });
+
   it('treats a repeated ack of the batch just acknowledged as done but still rejects mismatches', async () => {
     const { worker, transport, events, init } = setup();
     await init;
@@ -1717,7 +1747,7 @@ describe('one-account worker loop', () => {
     const { worker, transport, events, init } = setup();
     await init;
     await authenticate(worker);
-    for (let attempt = 0; attempt < 12; attempt++) await worker.handle({ type: 'poll', ...binding });
+    for (let attempt = 0; attempt < 12; attempt++) await pollAndAckStartup(worker, events);
     expect(transport.syncCalls).toHaveLength(12);
     expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
   });
@@ -1760,15 +1790,15 @@ describe('one-account worker loop', () => {
       await worker.handle({ type: 'poll', ...binding });
       expect(confirmed()).toEqual([]);
       transport.syncError = undefined;
-      await worker.handle({ type: 'poll', ...binding });
+      await pollAndAckStartup(worker, events);
       expect(confirmed()).toHaveLength(1);
       expect(confirmed()[0]).toMatchObject({ type: 'syncConfirmed', ...binding });
       expect(LineWorkerEventSchema.safeParse(confirmed()[0]).success).toBe(true);
       vi.setSystemTime(Date.now() + SYNC_CONFIRMED_INTERVAL_MS - 1);
-      await worker.handle({ type: 'poll', ...binding });
+      await pollAndAckStartup(worker, events);
       expect(confirmed()).toHaveLength(1);
       vi.setSystemTime(Date.now() + 1);
-      await worker.handle({ type: 'poll', ...binding });
+      await pollAndAckStartup(worker, events);
       expect(confirmed()).toHaveLength(2);
     } finally { vi.useRealTimers(); }
   });
@@ -1784,18 +1814,18 @@ describe('one-account worker loop', () => {
     try {
       await init;
       await authenticate(worker);
-      for (let attempt = 0; attempt < 12; attempt++) await worker.handle({ type: 'poll', ...binding });
+      for (let attempt = 0; attempt < 12; attempt++) await pollAndAckStartup(worker, events);
       expect(physicalTransport).toHaveBeenCalledTimes(12);
       expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
       expect(events.filter((event) => event.type === 'error')).toEqual([]);
-      expect(events.filter((event) => event.type === 'batch')).toEqual([]);
+      expect(events.filter((event) => event.type === 'batch').every((event) => event.startupSync === true)).toBe(true);
 
       httpStatus = 500;
       for (let attempt = 0; attempt < 5; attempt++) await worker.handle({ type: 'poll', ...binding });
       expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toHaveLength(1);
 
       httpStatus = 410;
-      await worker.handle({ type: 'poll', ...binding });
+      await pollAndAckStartup(worker, events);
       expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ state: 'ready' });
     } finally { adapter.revoke(); }
   });
@@ -1816,7 +1846,7 @@ describe('one-account worker loop', () => {
       transport.syncError = new Error('sync failed');
       for (let attempt = 0; attempt < 4; attempt++) await worker.handle({ type: 'poll', ...binding });
       transport.syncError = undefined;
-      await expect(worker.handle({ type: 'poll', ...binding })).resolves.toBeUndefined();
+      await expect(pollAndAckStartup(worker, events)).resolves.toBeUndefined();
       transport.syncError = new Error('sync failed');
       for (let attempt = 0; attempt < 4; attempt++) await worker.handle({ type: 'poll', ...binding });
       expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
@@ -1824,7 +1854,7 @@ describe('one-account worker loop', () => {
       rejectConfirmed = false;
       transport.syncError = undefined;
       vi.setSystemTime(Date.now() + SYNC_CONFIRMED_INTERVAL_MS);
-      await worker.handle({ type: 'poll', ...binding });
+      await pollAndAckStartup(worker, events);
       expect(events.filter((event) => event.type === 'syncConfirmed')).toHaveLength(1);
     } finally { vi.useRealTimers(); }
   });

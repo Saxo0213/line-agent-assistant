@@ -6,6 +6,7 @@ import { AgentRepository, queuedConversationDiscoverySql } from './agent-reposit
 import { AccountRepository } from './account-repository.js';
 import { MessageRepository } from './message-repository.js';
 import { SettingsRepository } from './settings-repository.js';
+import { ProviderQuotaRepository } from './provider-quota-repository.js';
 import { createTestDatabase } from './test-database.js';
 import { migrate } from './migrate.js';
 import { createPool } from './pool.js';
@@ -390,5 +391,107 @@ database('AgentRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () =>
     await settings.setAppSetting('workspace_path', 'C:\\work');
     expect(await settings.getAppSetting('workspace_path')).toBe('C:\\work');
     await expect(settings.setAppSetting('line_token', 'secret')).rejects.toThrow('not allowed');
+  });
+
+  it('atomically accepts a consented cross-provider retry and preserves source uniqueness for later LINE admissions', async () => {
+    const key={accountId:'account-A',chatType:'direct' as const,chatId:'quota-consent-chat'};
+    const senderId='quota-admin-mid';
+    const original={...envelope(key.chatId),senderId,messageId:`quota-original-${++sequence}`,text:'original work'};
+    const confirm={...envelope(key.chatId),senderId,messageId:`quota-confirm-${++sequence}`,text:'/agent codex'};
+    await messages.ingestAndRoute(original,{eligible:false});
+    await messages.ingestAndRoute(confirm,{eligible:false});
+    expect(await settings.setConversationProvider(key,'claude')).toBe(true);
+    await pool.query(`INSERT INTO conversations(account_id,chat_type,chat_id,title,agent_enabled,default_provider)
+      VALUES('account-A','direct','quota-admin-chat','admin',true,'codex') ON CONFLICT(account_id,chat_type,chat_id) DO NOTHING`);
+    await pool.query(`INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
+      VALUES('account-A','direct','quota-admin-chat',$1,'PRIMARY_ADMIN') ON CONFLICT DO NOTHING`,[senderId]);
+    const senderGrantId=randomUUID();
+    await pool.query(`INSERT INTO line_friend_whitelist_grants(grant_id,account_id,target_mid,capability,version,state)
+      VALUES($1,'account-A',$2,'AGENT_USE',1,'ACTIVE')`,[senderGrantId,senderId]);
+    await pool.query(`UPDATE line_accounts SET worker_instance_id='quota-worker',worker_binding_epoch=$2 WHERE account_id=$1`,['account-A',controlEpoch]);
+    const originalJobId=randomUUID();
+    await pool.query(`INSERT INTO agent_jobs(job_id,account_id,chat_type,chat_id,provider,source_type,source_message_id,source_sender_id,
+      prompt,workspace_path,generation,status,creation_epoch,direct_friend_grant_id,direct_friend_grant_version)
+      VALUES($1,$2,$3,$4,'claude','line',$5,$6,'original work','C:\\work',0,'failed',$7,$8,1)`,
+      [originalJobId,key.accountId,key.chatType,key.chatId,original.messageId,senderId,controlEpoch,senderGrantId]);
+    await pool.query(`INSERT INTO agent_events(job_id,event) VALUES($1,$2::jsonb)`,
+      [originalJobId,JSON.stringify({type:'failed',code:'PROVIDER_LIMIT',message:'Claude limit',retryable:true})]);
+    await pool.query(`INSERT INTO agent_events(job_id,event) VALUES($1,$2::jsonb)`,
+      [originalJobId,JSON.stringify({type:'failed',code:'PROVIDER_LIMIT',message:'Claude retry limit',retryable:true})]);
+    const quota=new ProviderQuotaRepository(pool);
+    const noticeAuthority={jobId:originalJobId,accountId:key.accountId,workerInstanceId:'quota-worker',controlEpoch};
+    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(true);
+    await pool.query(`UPDATE line_friend_whitelist_grants SET state='REVOKED',revoked_at=now() WHERE grant_id=$1`,[senderGrantId]);
+    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(false);
+    await quota.skipNotice(originalJobId);
+    expect((await pool.query<{notification_state:string}>('SELECT notification_state FROM provider_quota_notices WHERE job_id=$1',[originalJobId])).rows[0]?.notification_state).toBe('skipped');
+    await pool.query(`UPDATE line_friend_whitelist_grants SET state='ACTIVE',revoked_at=NULL WHERE grant_id=$1`,[senderGrantId]);
+    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(true);
+    await pool.query('UPDATE account_control SET control_epoch=control_epoch+1 WHERE singleton=true');
+    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(false);
+    await pool.query('UPDATE account_control SET control_epoch=$1 WHERE singleton=true',[controlEpoch]);
+    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(true);
+    const queryAt=new Date().toISOString();
+    await quota.saveSnapshot({provider:'claude',requestedAt:queryAt,fetchedAt:queryAt,stale:false,snapshot:{windows:[
+      {label:'一般工作階段額度',usedPercent:0,blocksProvider:true,resetsAt:null},
+      {label:'一般每週額度',usedPercent:60,blocksProvider:true,resetsAt:null},
+      {label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-02T00:00:00Z'},
+    ]}});
+    expect((await quota.get('claude'))?.blocked).toBe(false);
+    await quota.saveSnapshot({provider:'claude',requestedAt:new Date(Date.now()+5).toISOString(),fetchedAt:new Date(Date.now()+5).toISOString(),stale:false,
+      snapshot:{windows:[{label:'一般工作階段額度',usedPercent:100,blocksProvider:true,resetsAt:'2026-11-01T00:00:00Z'},
+        {label:'一般每週額度',usedPercent:100,blocksProvider:true,resetsAt:'2026-11-05T00:00:00Z'},
+        {label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-03T00:00:00Z'}]}});
+    expect(await quota.get('claude')).toMatchObject({blocked:true,recoveryAt:'2026-11-05T00:00:00.000Z'});
+    await quota.saveSnapshot({provider:'claude',requestedAt:new Date(Date.now()+10).toISOString(),fetchedAt:new Date(Date.now()+10).toISOString(),stale:false,
+      snapshot:{availabilityKnown:false,windows:[{label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-02T00:00:00Z'}]}});
+    expect(await quota.get('claude')).toMatchObject({blocked:true,recoveryAt:'2026-11-05T00:00:00.000Z'});
+    await quota.saveSnapshot({provider:'claude',requestedAt:new Date(Date.now()+15).toISOString(),fetchedAt:new Date(Date.now()+15).toISOString(),stale:false,
+      snapshot:{availabilityKnown:true,windows:[{label:'一般工作階段額度',usedPercent:20,blocksProvider:true,resetsAt:null},
+        {label:'一般每週額度',usedPercent:57,blocksProvider:true,resetsAt:null},
+        {label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-02T00:00:00Z'}]}});
+    expect(await quota.get('claude')).toMatchObject({blocked:false});
+    const refusalAt=new Date(Date.now()-2_000).toISOString();
+    await quota.recordFailure({provider:'codex',observedAt:refusalAt,recoveryAt:null,source:'test refusal',evidence:'limit'});
+    await quota.saveSnapshot({provider:'codex',requestedAt:new Date(Date.now()-3_000).toISOString(),fetchedAt:new Date().toISOString(),stale:false,
+      snapshot:{provider:'codex',windows:[{usedPercent:12,resetsAt:null}]}});
+    expect((await quota.get('codex'))?.blocked).toBe(true);
+    await quota.saveSnapshot({provider:'codex',requestedAt:new Date().toISOString(),fetchedAt:new Date().toISOString(),stale:true,
+      snapshot:{provider:'codex',windows:[]}});
+    expect((await quota.get('codex'))?.blocked).toBe(true);
+    await quota.saveSnapshot({provider:'codex',requestedAt:new Date(Date.now()+5).toISOString(),fetchedAt:new Date(Date.now()+5).toISOString(),stale:false,
+      snapshot:{provider:'codex',windows:[{usedPercent:12,resetsAt:null}]}});
+    expect((await quota.get('codex'))?.blocked).toBe(false);
+    await pool.query(`INSERT INTO provider_quota_state(provider,blocked,snapshot,snapshot_fetched_at,snapshot_stale)
+      VALUES('codex',false,'{"availabilityKnown":true,"windows":[{"blocksProvider":true,"usedPercent":40}]}'::jsonb,now(),false)
+      ON CONFLICT(provider) DO UPDATE SET blocked=false,snapshot='{"availabilityKnown":true,"windows":[{"blocksProvider":true,"usedPercent":40}]}'::jsonb,snapshot_fetched_at=now(),snapshot_stale=false`);
+    expect(await quota.createProposal(originalJobId,'codex',new Date(Date.now()+60_000).toISOString())).toBe(true);
+    expect(await quota.createProposal(originalJobId,'codex',new Date(Date.now()+60_000).toISOString())).toBe(true);
+    await pool.query(`DELETE FROM account_administrators WHERE account_id='account-A' AND user_id=$1`,[senderId]);
+    expect(await agents.acceptQuotaRetry({jobId:originalJobId,senderId,messageId:confirm.messageId,targetProvider:'codex',
+      workerInstanceId:'quota-worker',controlEpoch})).toBeNull();
+    await pool.query(`INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
+      VALUES('account-A','direct','quota-admin-chat',$1,'PRIMARY_ADMIN')`,[senderId]);
+    await quota.saveSnapshot({provider:'codex',requestedAt:new Date(Date.now()+10).toISOString(),fetchedAt:new Date(Date.now()+10).toISOString(),stale:false,
+      snapshot:{availabilityKnown:false,windows:[{label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-02T00:00:00Z'}]}});
+    expect(await agents.acceptQuotaRetry({jobId:originalJobId,senderId,messageId:confirm.messageId,targetProvider:'codex',
+      workerInstanceId:'quota-worker',controlEpoch})).toBeNull();
+    await quota.saveSnapshot({provider:'codex',requestedAt:new Date(Date.now()+15).toISOString(),fetchedAt:new Date(Date.now()+15).toISOString(),stale:false,
+      snapshot:{availabilityKnown:true,windows:[{label:'一般工作階段額度',usedPercent:40,blocksProvider:true,resetsAt:null}]}});
+    const accepted=await agents.acceptQuotaRetry({jobId:originalJobId,senderId,messageId:confirm.messageId,targetProvider:'codex',
+      workerInstanceId:'quota-worker',controlEpoch});
+    expect(accepted).toMatchObject({sourceType:'line',status:'queued',accountId:key.accountId,chatId:key.chatId});
+    await quota.createNotice(accepted!.jobId);
+    expect(await quota.claimNotice(accepted!.jobId)).toBe(true);
+    expect(await quota.claimNotice(accepted!.jobId)).toBe(false);
+    const retry=await pool.query<{provider:string;retry_of_job_id:string;source_message_id:string}>(
+      'SELECT provider,retry_of_job_id,source_message_id FROM agent_jobs WHERE job_id=$1',[accepted!.jobId]);
+    expect(retry.rows[0]).toMatchObject({provider:'codex',retry_of_job_id:originalJobId,source_message_id:original.messageId});
+    expect((await pool.query<{status:string}>('SELECT status FROM agent_jobs WHERE job_id=$1',[originalJobId])).rows[0]?.status).toBe('failed');
+    expect(await settings.getConversationAgent(key)).toEqual({enabled:false,provider:'codex'});
+    expect(await agents.acceptQuotaRetry({jobId:originalJobId,senderId,messageId:confirm.messageId,targetProvider:'codex',
+      workerInstanceId:'quota-worker',controlEpoch})).toBeNull();
+    const admitted=await messages.ingestAndRoute({...envelope(key.chatId),messageId:`quota-following-${++sequence}`},route);
+    expect(admitted.jobId).toBeTruthy();
   });
 });

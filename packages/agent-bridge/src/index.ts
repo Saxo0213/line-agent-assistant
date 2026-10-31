@@ -1,5 +1,5 @@
-import {realpath, stat} from 'node:fs/promises';
-import {basename} from 'node:path';
+import {readFile,realpath, stat} from 'node:fs/promises';
+import {basename,join} from 'node:path';
 import {AgentRunRequestSchema, PROVIDER_TOOLS_UNSUPPORTED, PROVIDER_TOOLS_UNSUPPORTED_MESSAGE, type AgentEvent,type AgentProvider,type AgentRunRequest,type ResumeSessionValidationResult} from '@line-agent/contracts';
 import {AuthController,type AuthStatus} from './auth.js';
 import {buildChildEnvironment} from './child-environment.js';
@@ -8,6 +8,7 @@ import {codexArguments,CodexEvents} from './codex.js';
 import {extensionEnvironment} from './extensions.js';
 import {claudeJudgeArguments,codexJudgeArguments,judgeInput,JUDGE_DEFAULT_TIMEOUT_MS,type JudgeRequest,type JudgeResult} from './judge.js';
 import {isAuthenticationDiagnostic} from './failure.js';
+export {providerFailureResetAt} from './failure.js';
 import {isWithin,protocolCompatibility,WindowsExecutableResolver,type ExecutableResolver} from './executable-resolver.js';
 import {parseJsonl,ProtocolError} from './jsonl.js';
 import {NodeProcessRunner,type ProcessRunner,type RunningProcess} from './process-runner.js';
@@ -25,6 +26,17 @@ export interface BridgeOptions {
 }
 interface Job {cancelled:boolean; cancellationFailed?:boolean; child?:RunningProcess; launchSettled:Promise<void>; finishLaunch():void}
 const failed=(code:string,message:string):AgentEvent=>({type:'failed',code,message,retryable:false});
+
+async function claudeOAuthToken(env:NodeJS.ProcessEnv):Promise<string> {
+  const home=env.USERPROFILE ?? env.HOME;
+  if(!home) throw new Error('Claude OAuth credentials are unavailable');
+  const file=join(home,'.claude','.credentials.json');
+  const data=JSON.parse(await readFile(file,'utf8')) as Record<string,unknown>;
+  const oauth=(data.claudeAiOauth ?? data.claude_ai_oauth) as Record<string,unknown>|undefined;
+  const token=oauth?.accessToken ?? oauth?.access_token;
+  if(typeof token!=='string'||!token) throw new Error('Claude OAuth credentials are unavailable');
+  return token;
+}
 
 /** Main/background only. Enabled by default; LINE services do not depend on it. */
 export class AgentCliBridge {
@@ -72,6 +84,57 @@ export class AgentCliBridge {
     const status=await this.auth.getAuthStatus(provider);
     this.reportAuthStatus(status);
     return status;
+  });}
+  /** Read quota through the same executable resolver and isolated identity used by Agent runs. */
+  queryQuota(provider:AgentProvider) {return this.operation(async()=>{
+    const {env}=buildChildEnvironment(this.options.environment ?? process.env);
+    if(provider==='claude') {
+      try {
+        const token=await claudeOAuthToken(env);
+        const controller=new AbortController();
+        const timer=setTimeout(()=>controller.abort(),12_000);
+        try {
+          const response=await fetch('https://api.anthropic.com/api/oauth/usage',{
+            headers:{authorization:`Bearer ${token}`,'anthropic-beta':'oauth-2025-04-20'},signal:controller.signal,
+          });
+          if(!response.ok) throw new Error(`Anthropic usage API returned HTTP ${response.status}`);
+          return await response.json();
+        } finally {clearTimeout(timer);}
+      } catch(error) {
+        if(error instanceof Error && /^Anthropic usage API returned HTTP \d+$/.test(error.message)) throw error;
+        throw new Error('Anthropic OAuth usage query failed');
+      }
+    }
+    const executable=await this.resolver.resolve('codex');
+    if(!executable) throw new Error('Codex CLI is unavailable');
+    const child=this.runner.start({file:executable.file,args:[...executable.prefixArgs,'app-server','--listen','stdio://'],env,keepStdinOpen:true});
+    let timedOut=false;
+    const timer=setTimeout(()=>{timedOut=true;void child.cancel().catch(()=>undefined);},12_000);
+    const stderrDrain=(async()=>{let size=0;for await(const chunk of child.stderr){size+=chunk.byteLength;if(size>64_000) break;}})();
+    const iterator=child.stdout[Symbol.asyncIterator]();let buffer='';let total=0;
+    const nextLine=async():Promise<string|null>=>{for(;;){const newline=buffer.indexOf('\n');if(newline>=0){const line=buffer.slice(0,newline).replace(/\r$/,'');buffer=buffer.slice(newline+1);return line;}
+      const next=await iterator.next();if(next.done){if(!buffer)return null;const finalLine=buffer;buffer='';return finalLine;}const chunk=Buffer.from(next.value).toString('utf8');total+=chunk.length;
+      if(total>256_000)throw new Error('Codex app-server response exceeded the limit');buffer+=chunk;}};
+    const responseFor=async(id:number):Promise<Record<string,unknown>>=>{for(;;){const line=await nextLine();if(line===null)throw new Error('Codex app-server exited before returning rate limits');
+      if(!line.trim())continue;let message:Record<string,unknown>;try{message=JSON.parse(line) as Record<string,unknown>;}catch{continue;}
+      if(message.id===id){if(message.error)throw new Error(id===1?'Codex app-server initialization failed':'Codex app-server could not read rate limits');
+        return message;}}};
+    try {
+      child.write?.('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"linejs","version":"1.0.0"},"capabilities":null}}\n');
+      await responseFor(1);
+      child.write?.('{"method":"initialized"}\n{"id":2,"method":"account/rateLimits/read"}\n');
+      const message=await responseFor(2);
+      child.endInput?.();
+      const exit=await child.exited;
+      if(timedOut) throw new Error('Codex app-server query timed out');
+      if(exit.code!==0) throw new Error('Codex app-server exited before returning rate limits');
+      void stderrDrain.catch(()=>undefined);
+      return message.result;
+    } catch(error) {
+      if(timedOut) throw new Error('Codex app-server query timed out');
+      if(error instanceof Error && /^(Codex app-server (?:initialization failed|could not read rate limits|response exceeded the limit|exited before returning rate limits))$/.test(error.message)) throw error;
+      throw new Error('Codex app-server rate limit query failed');
+    } finally {clearTimeout(timer);await child.cancel().catch(()=>undefined);}
   });}
   openLogin(provider:AgentProvider) {return this.operation(()=>this.auth.openLogin(provider));}
   logout(provider:AgentProvider) {return this.operation(()=>this.auth.logout(provider));}

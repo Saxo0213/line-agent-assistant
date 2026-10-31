@@ -489,10 +489,12 @@ describe('ChromeAdapter.sync', () => {
 
     const first = await adapter.sync({ ...cursor0, revision: '100' });
     expect(first.operations).toHaveLength(100); // 99 live + 1 catch-up item
+    expect(first).toMatchObject({ rawOperationCount: 100, hasMoreStartupItems: true });
     expect(server.to(tp('getRecentMessagesV2'))).toHaveLength(1);
 
     const second = await adapter.sync({ ...cursor0, revision: '200' });
     expect(second.operations).toHaveLength(19); // the rest of the same catch-up, without a second read
+    expect(second).toMatchObject({ rawOperationCount: 0, hasMoreStartupItems: false });
     expect(server.to(tp('getRecentMessagesV2'))).toHaveLength(1);
     const third = await adapter.sync({ ...cursor0, revision: '200' });
     expect(third.operations).toHaveLength(0);

@@ -10,6 +10,7 @@ export * from './chat-album-catalog-repository.js';
 export * from './native-reactions.js';
 export * from './sticker-descriptor.js';
 export * from './agent-repository.js';
+export * from './provider-quota-repository.js';
 export * from './agent-schedule-repository.js';
 export * from './settings-repository.js';
 export * from './agent-extensions-repository.js';

@@ -43,6 +43,7 @@ export const MCP_OBSERVATION_TIMEOUT_MS = 10_000;
 
 export interface AgentRunner {
   run(request: AgentRunRequest): AsyncIterable<AgentEvent>;
+  queryQuota?(provider: AgentProvider): Promise<unknown>;
   /** Resolves only after the owned process tree has exited. */
   cancel(jobId: string): Promise<void>;
 }
@@ -145,6 +146,7 @@ export class AgentService {
     private readonly onDiagnostic?: (diagnostic: SafeDiagnostic, jobId?: string) => void,
     /** The persona description in force for a LINE chat (docs/architecture/agent-persona.md); blank adds nothing to the prompt. */
     private readonly resolvePersonaDescription?: (chat: { accountId: string; chatType: string; chatId: string }) => Promise<string>,
+    private readonly quotaGate?: (provider: AgentProvider) => Promise<{ blocked: boolean; recoveryAt: string | null } | null>,
   ) {}
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown, jobId?: string): void {
@@ -409,6 +411,21 @@ export class AgentService {
     return this.agents.listJobEvents(key, jobId);
   }
 
+  queryQuota(provider: AgentProvider): Promise<unknown> {
+    if (!this.bridge.queryQuota) return Promise.reject(new Error('Provider quota query is unavailable'));
+    return this.bridge.queryQuota(provider);
+  }
+
+  async acceptQuotaRetry(input: { jobId: string; senderId: string; messageId: string; targetProvider: AgentProvider;
+    workerInstanceId: string; controlEpoch: number }): Promise<boolean> {
+    if (this.shuttingDown) return false;
+    const projection = await this.agents.acceptQuotaRetry(input);
+    if (!projection) return false;
+    this.publishLifecycle(projection);
+    if (!this.shuttingDown) this.kick(projection);
+    return true;
+  }
+
   /** Events of a scheduled run (never room events: the room's own lookup excludes schedule jobs). */
   getScheduleJobEvents(jobId: string): Promise<AgentEvent[]> {
     return this.agents.listJobEvents(AGENT_SCHEDULE_QUEUE_KEY, jobId);
@@ -592,6 +609,26 @@ export class AgentService {
           continue;
         }
         const plan = prepared;
+        if(this.quotaGate) {
+          let gate:{blocked:boolean;recoveryAt:string|null}|null;
+          try { gate=await this.quotaGate(job.provider); }
+          catch(error) {
+            this.reportFailure('persist',error,job.jobId);
+            const event:AgentEvent={type:'failed',code:'QUOTA_STATE_UNAVAILABLE',message:'Provider quota state could not be checked; retry later.',retryable:true};
+            await this.agents.appendEvent(job.jobId,event).catch((persistError:unknown)=>this.reportFailure('persist',persistError,job.jobId));
+            const projection=await this.agents.failJob(job.jobId);
+            if(projection){execution.terminal=true;this.publishLifecycle(projection);this.sendReaction(execution,'SAD','failed');await this.onEvent?.(job.jobId,event);}
+            continue;
+          }
+          if(gate?.blocked) {
+            const event:AgentEvent={type:'failed',code:'PROVIDER_LIMIT',message:'Provider usage is still exhausted.',retryable:true,
+              ...(gate.recoveryAt?{quotaRecoveryAt:gate.recoveryAt}:{})};
+            await this.agents.appendEvent(job.jobId,event).catch((error:unknown)=>this.reportFailure('persist',error,job.jobId));
+            const projection=await this.agents.failJob(job.jobId);
+            if(projection){execution.terminal=true;this.publishLifecycle(projection);this.sendReaction(execution,'SAD','failed');await this.onEvent?.(job.jobId,event);}
+            continue;
+          }
+        }
         // Attachments must still exist on every run, including a retry; a missing file fails the job instead of being dropped.
         let attachmentFiles: ResolvedAttachment[] = [];
         if (job.sourceType === 'ui' && job.attachments?.length) {

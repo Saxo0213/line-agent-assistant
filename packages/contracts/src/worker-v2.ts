@@ -168,7 +168,9 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   LoginAttempt.extend({ type: z.literal('loginToken') }),
   LoginAttempt.extend({ type: z.literal('setSecretState'), secrets: Secrets }),
   Bound.extend({ type: z.literal('poll') }),
-  Bound.extend({ type: z.literal('ackBatch'), batchId: Id, cursorAfter: TalkCursorV1Schema }),
+  Bound.extend({ type: z.literal('ackBatch'), batchId: Id, cursorAfter: TalkCursorV1Schema,
+    /** Releases startup suppression only after the final startup batch was durably stored. */
+    startupComplete: z.boolean().optional() }),
   Conversation.extend({ type: z.literal('history'), requestId: Id, cursor: Id.nullable(), limit: z.number().int().min(1).max(100) }),
   ChatResourceReadCommandSchema,
   Bound.extend({ type: z.literal('refreshOwnProfile'), requestId: Id.max(128), timeoutMs: z.number().int().min(1_000).max(30_000) }),
@@ -229,7 +231,10 @@ export const LineWorkerEventSchema = z.union([
     Bound.extend({ type: z.literal('logoutResult'), requestId: Id.max(128), ok: z.literal(false), error: z.enum(['LINE_LOGOUT_FAILED', 'LINE_AUTH_INVALIDATED']) }),
   ]),
   Bound.extend({ type: z.literal('batch'), batchId: Id, cursorBefore: TalkCursorV1Schema, cursorAfter: TalkCursorV1Schema, envelopes: z.array(InboundEnvelopeSchema),
+    /** Startup sync batches are archived without inbound automation. */
+    startupSync: z.boolean().optional(), startupFinal: z.boolean().optional(),
     readReceipts: z.array(ReadReceiptSchema).max(500).optional() }),
+  Bound.extend({ type: z.literal('startupSyncComplete'), batchId: Id }),
   Bound.extend({ type: z.literal('conversationCatalog'), conversations: z.array(ConversationCatalogItemSchema) }),
   Conversation.extend({ type: z.literal('historyResult'), requestId: Id, nextCursor: Id.nullable(), envelopes: z.array(InboundEnvelopeSchema) }),
   ChatResourceReadResultSchema,

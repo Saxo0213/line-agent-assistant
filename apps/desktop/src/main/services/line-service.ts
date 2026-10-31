@@ -13,6 +13,8 @@ import { claimed as permissionTicketClaimed, type PermissionCommandService, type
 import type { Locale } from '../../locale.js';
 import { linePrompt } from './line-prompts.js';
 import { resolveChatProvider, resolveDefaultProvider } from './default-provider.js';
+import { formatProviderQuota, ProviderQuotaService, type ProviderQuotaSnapshot } from './provider-quota-service.js';
+import type { SystemTextResult } from './agent-line-send-service.js';
 
 import { pickWorkerBinding } from '../worker-binding-fields.js';
 export type BoundWorker = WorkerBinding & { mode: AccountMode };
@@ -29,6 +31,9 @@ export interface AgentControl {
   stopChat(key: WritableConversationKey): Promise<boolean | void>;
   resetChat(key: WritableConversationKey, commandMessageId?: string): Promise<void>;
   getChatStatus?(key: WritableConversationKey): Promise<{ runningJobId: string | null }>;
+  queryQuota?(provider: import('@line-agent/contracts').AgentProvider): Promise<unknown>;
+  acceptQuotaRetry?(input: { jobId: string; senderId: string; messageId: string; targetProvider: import('@line-agent/contracts').AgentProvider;
+    workerInstanceId: string; controlEpoch: number }): Promise<boolean>;
 }
 
 interface AttachmentControl { downloadById(attachmentId: string): Promise<boolean>; }
@@ -68,10 +73,12 @@ export class LineService {
   private connectionHealthGeneration = 0;
   private readonly bindingReady = new Map<string, Promise<void>>();
   private readonly recoveryReady = new Map<string, Promise<void>>();
+  private readonly startupSync = new Map<string, { binding: BoundWorker; active: boolean }>();
   private readonly accountBindingReady = new Map<string, Promise<void>>();
   private readonly roomEffects = new Set<Promise<void>>();
   private readonly ingressLanes = new Map<string, { tail: Promise<unknown>; count: number }>();
   private ingressClosed = false;
+  private readonly quotaService: ProviderQuotaService;
   constructor(
     private readonly accounts: AccountRepository,
     private readonly messages: MessageRepository,
@@ -99,7 +106,13 @@ export class LineService {
     private readonly onDiagnostic?: (diagnostic: SafeDiagnostic) => void,
     private readonly freeMode?: FreeModeControl,
     private readonly projectFolders?: ProjectFolderControl,
-  ) {}
+    private readonly sendSystemText?: (input: { runId: string; target: WritableConversationKey; text: string;
+      principalId: 'system:provider_quota' }) => Promise<SystemTextResult>,
+    private readonly persistQuotaSnapshot?: (snapshot: import('./provider-quota-service.js').ProviderQuotaSnapshot) => Promise<void>,
+    quotaService?: ProviderQuotaService,
+    private readonly findQuotaProposal?: (key: WritableConversationKey, senderId: string, targetProvider: import('@line-agent/contracts').AgentProvider) => Promise<string | null>,
+    private readonly loadQuotaState?: (provider: import('@line-agent/contracts').AgentProvider) => Promise<import('@line-agent/database').StoredQuotaState | null>,
+  ) { this.quotaService = quotaService ?? new ProviderQuotaService((provider) => this.agents.queryQuota!(provider)); }
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown): void {
     try { this.onDiagnostic?.(diagnosticFailure('line_ingest', stage, error)); } catch { /* Preserve ingestion and replay ownership. */ }
@@ -114,6 +127,7 @@ export class LineService {
       this.bindings.delete(instance);
       this.bindingReady.delete(instance);
       this.recoveryReady.delete(instance);
+      if (instance !== binding.workerInstanceId) this.startupSync.delete(instance);
       if (instance !== binding.workerInstanceId || prior.controlEpoch !== binding.controlEpoch) {
         this.attachmentReadiness.delete(instance);
         this.transportHealth.delete(instance);
@@ -121,6 +135,10 @@ export class LineService {
       }
     }
     this.bindings.set(binding.workerInstanceId, binding);
+    const startup = this.startupSync.get(binding.workerInstanceId);
+    this.startupSync.set(binding.workerInstanceId, sameOwner && startup
+      ? { binding, active: startup.active }
+      : { binding, active: true });
     if (!sameOwner) {
       this.transportHealth.set(binding.workerInstanceId, 'disconnected');
       this.catalogHealth.set(binding.workerInstanceId, 'ready');
@@ -152,6 +170,7 @@ export class LineService {
     });
     const recovery = registered.then(() => {
       if (signal?.aborted) throw new Error('Worker binding cancelled');
+      if (this.isStartupSyncActive(binding)) return this.suppressStartupReplay(binding, signal);
       return this.drainPendingActions(binding, signal).then(() => this.reconcileUnroutedLiveMessages(binding, signal));
     });
     // Retain the rejection for the event handler while preventing an early unhandled rejection.
@@ -160,6 +179,25 @@ export class LineService {
     this.recoveryReady.set(binding.workerInstanceId, recovery);
     this.accountBindingReady.set(binding.accountId, registered);
     return registered;
+  }
+  private isStartupSyncActive(binding: BoundWorker): boolean {
+    const state = this.startupSync.get(binding.workerInstanceId);
+    return state?.active === true && state.binding.accountId === binding.accountId
+      && state.binding.controlEpoch === binding.controlEpoch
+      && state.binding.transportOwnerId === binding.transportOwnerId
+      && state.binding.transportGeneration === binding.transportGeneration;
+  }
+  private async suppressStartupReplay(binding: BoundWorker, signal?: AbortSignal): Promise<void> {
+    const repository = this.messages as MessageRepository & {
+      suppressPendingRouteActions?: (input: { accountId: string; workerInstanceId: string; controlEpoch: number }) => Promise<void>;
+      suppressUnroutedLiveSourceMessages?: (input: { accountId: string; workerInstanceId: string; controlEpoch: number }) => Promise<void>;
+    };
+    if (signal?.aborted || this.bindings.get(binding.workerInstanceId) !== binding) return;
+    const input = { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+      controlEpoch: binding.controlEpoch };
+    await repository.suppressPendingRouteActions?.(input);
+    if (signal?.aborted || this.bindings.get(binding.workerInstanceId) !== binding) return;
+    await repository.suppressUnroutedLiveSourceMessages?.(input);
   }
 
   private async reconcileUnroutedLiveMessages(binding: BoundWorker, signal?: AbortSignal): Promise<void> {
@@ -211,6 +249,7 @@ export class LineService {
       if (pending?.workerInstanceId === workerInstanceId) this.qrPendingSecrets.delete(binding.accountId);
     }
     this.bindings.delete(workerInstanceId);
+    this.startupSync.delete(workerInstanceId);
     this.attachmentReadiness.delete(workerInstanceId);
     this.transportHealth.delete(workerInstanceId);
     this.catalogHealth.delete(workerInstanceId);
@@ -288,8 +327,20 @@ export class LineService {
   }
 
   /** Primary Administrator's `/agent claude|codex|default`, or the usage hint for a served non-administrator. */
-  private async applyAgentCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string, dispatch: AgentDispatch): Promise<void> {
+  private async applyAgentCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string, senderId: string, dispatch: AgentDispatch): Promise<void> {
     const name = (provider: 'claude' | 'codex') => provider === 'codex' ? 'Codex' : 'Claude';
+    const consentProvider = dispatch.provider === 'default' ? null : dispatch.provider;
+    if (dispatch.type === 'agent_provider' && consentProvider && this.findQuotaProposal && this.agents.acceptQuotaRetry) {
+      const jobId = await this.findQuotaProposal(key, senderId, consentProvider);
+      if (jobId) {
+        const accepted = await this.agents.acceptQuotaRetry({ jobId, senderId, messageId, targetProvider: consentProvider,
+          workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch });
+        await this.sendChatText(binding, key, accepted
+          ? `已將此聊天室切換為 ${name(consentProvider)}，原工作已排入一次重試。`
+          : '無法確認這次切換：聊天室授權、額度或工作狀態已變更，沒有切換或重試。', messageId);
+        return;
+      }
+    }
     if (dispatch.type === 'agent_usage') {
       await this.sendChatText(binding, key, linePrompt(this.locale, 'agentSwitchUsage', { name: dispatch.provider }), messageId);
       return;
@@ -299,6 +350,31 @@ export class LineService {
       ? linePrompt(this.locale, 'agentSwitchedDefault', { name: name(await resolveDefaultProvider(this.settings)) })
       : linePrompt(this.locale, 'agentSwitched', { name: name(dispatch.provider) });
     await this.sendChatText(binding, key, text, messageId);
+  }
+
+  private async applyQuotaCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string): Promise<void> {
+    try {
+      if (!this.agents.queryQuota) throw new Error('Provider quota query is unavailable');
+      const [conversation, queried] = await Promise.all([this.settings.getConversationAgent(key), this.quotaService.getAll()]);
+      const quotas = await Promise.all(queried.map(async (snapshot) => {
+        await this.persistQuotaSnapshot?.(snapshot).catch((error)=>this.reportFailure('persist',error));
+        const state=await this.loadQuotaState?.(snapshot.provider).catch(()=>null);
+        let result=snapshot;
+        if(snapshot.error && state?.snapshot && typeof state.snapshot==='object') {
+          const saved=state.snapshot as ProviderQuotaSnapshot;
+          if(saved.provider===snapshot.provider && Array.isArray(saved.windows)) result={...saved,requestedAt:snapshot.requestedAt,
+            fetchedAt:state.snapshotFetchedAt,stale:true,error:snapshot.error};
+        }
+        return {...result,blocked:state?.blocked??false,recoveryAt:state?.recoveryAt??null,evidence:state?.evidence??null};
+      }));
+      const current = await resolveChatProvider(this.settings, conversation?.provider);
+      const text = [`目前聊天室 Agent：${current === 'codex' ? 'Codex' : 'Claude'}`,
+        ...quotas.map(formatProviderQuota)].join('\n\n');
+      if (this.sendSystemText) {
+        const result = await this.sendSystemText({ runId: randomUUID(), target: key, text, principalId: 'system:provider_quota' });
+        if (result.status !== 'sent') this.reportFailure('execute', new Error(`Quota status LINE send ${result.status}`));
+      } else await this.sendChatText(binding, key, text, messageId);
+    } catch (error) { this.reportFailure('execute', error); }
   }
 
   /** Primary Administrator's `/persona` in a group/room: executes it and answers with the confirmation text. */
@@ -480,8 +556,17 @@ export class LineService {
       catch (error) { this.reportFailure('persist', error); }
       return;
     }
+    if (event.type === 'startupSyncComplete') {
+      const state = this.startupSync.get(processInstanceId);
+      if (state && state.binding === binding) state.active = false;
+      return;
+    }
     if ((event.type === 'batch' || event.type === 'historyResult')
       && (await this.accounts.resolveCapabilities?.(event.accountId))?.connectionMode === 'EXTERNAL_MONITOR') return;
+    if (event.type === 'batch' && event.startupSync === false) {
+      const state = this.startupSync.get(processInstanceId);
+      if (state?.binding === binding) state.active = false;
+    }
     await this.bindingReady.get(processInstanceId);
     if (!this.isCurrentWorkerEvent(processInstanceId, event)) return;
     if (binding.mode === 'ACTIVE_CONTROL' && !recovered) {
@@ -643,6 +728,38 @@ export class LineService {
     const useIndependentIngest = typeof (this.messages as unknown as { ingestBatchSource?: unknown }).ingestBatchSource === 'function';
     if (useIndependentIngest && !recovered) await this.messages.prepareBatchConversations({ ...event, envelopes: prepared.map(({ envelope }) => envelope) });
     const sourceBatch = { ...event, envelopes: prepared.map(({ envelope }) => envelope) };
+    if (event.startupSync === true || (event.startupSync === undefined && this.isStartupSyncActive(binding))) {
+      const decisions: RoutingDecision[] = prepared.map(() => ({ eligible: false, action: 'ignore' }));
+      let result: Awaited<ReturnType<MessageRepository['ingestBatchAndRoute']>>;
+      if (useIndependentIngest && !recovered) {
+        const stored = await this.messages.ingestBatchSource(sourceBatch,
+          new Set(prepared.filter((item) => item.sensitive).map((item) => item.envelope.messageId)));
+        const admitted = await this.messages.admitLiveBatch(sourceBatch, decisions);
+        await this.messages.recordBatchRoutes(sourceBatch, admitted.routeDecisions, new Set());
+        result = { ...stored, ...admitted };
+      } else {
+        result = await this.messages.ingestBatchAndRoute(sourceBatch, decisions);
+      }
+      if (result.readPositionsChanged > 0 && result.readPositionChanges?.length) {
+        try { this.publishReadPositionChanges?.(result.readPositionChanges); } catch { /* UI refresh is best effort */ }
+      }
+      if (this.attachments) {
+        const inserted = new Set(result.insertedMessageIds);
+        for (const envelope of prepared.map(({ envelope }) => envelope).filter((entry) => inserted.has(entry.messageId))) {
+          for (const descriptor of envelope.attachments) {
+            const attachment = await this.messages.getAttachmentBySource(
+              { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId },
+              envelope.messageId, descriptor.id,
+            );
+            if (attachment) this.queueAttachmentDownload(attachment.attachmentId);
+          }
+        }
+      }
+      await this.worker.send({ type: 'ackBatch', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+        controlEpoch: binding.controlEpoch, batchId: event.batchId, cursorAfter: event.cursorAfter,
+        ...(event.startupFinal === true ? { startupComplete: true } : {}) });
+      return result.changedMessageIds;
+    }
     const workspacePromise = this.workspaceAuthority.inspect();
     const storagePromise = useIndependentIngest && !recovered
       ? this.messages.ingestBatchSource(sourceBatch, new Set(prepared.filter((item) => item.sensitive).map((item) => item.envelope.messageId)))
@@ -665,6 +782,7 @@ export class LineService {
     const permissionTickets = new Map<object, PermissionTicket>();
     const freeDispatches = new Map<string, FreeDispatch>();
     const agentDispatches = new Map<string, AgentDispatch>();
+      const quotaDispatches = new Set<string>();
     const primaryAdminMessageIds = new Set<string>();
     const folderDispatches = new Map<string, FolderCommand>();
     const folderAdminCommandIds = new Set<string>();
@@ -715,8 +833,10 @@ export class LineService {
         : routed.type === 'free_message' ? { message: true } : null;
       if (primaryAdmin === true) primaryAdminMessageIds.add(envelope.messageId);
       const agentDispatch = routed.type === 'agent_provider' || routed.type === 'agent_usage' ? routed : null;
+      if (routed.type === 'agent_quota') quotaDispatches.add(envelope.messageId);
       const decision: Exclude<TriggerDecision, FreeCommand | FolderCommand | PersonaCommand | { type: 'free_message' } | AgentDispatch> = routed.type === 'free' || routed.type === 'free_range' || routed.type === 'folder'
-        || routed.type === 'persona' || routed.type === 'free_message' || routed.type === 'agent_provider' || routed.type === 'agent_usage' ? { type: 'ignore' } : routed;
+        || routed.type === 'persona' || routed.type === 'free_message' || routed.type === 'agent_provider' || routed.type === 'agent_usage'
+        || routed.type === 'agent_quota' ? { type: 'ignore' } : routed;
       const authorization = !primaryAdmin && friendAuthorization ? {
         directGrantId: friendAuthorization.grantId,
         directGrantVersion: friendAuthorization.version,
@@ -888,7 +1008,13 @@ export class LineService {
       const dispatch = agentDispatches.get(envelope.messageId);
       if (!dispatch || primaryAdminLookupFailedIds.has(envelope.messageId) || this.bindings.get(binding.workerInstanceId) !== binding) continue;
       const agentKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
-      this.scheduleRoomEffect(() => this.applyAgentCommand(binding, agentKey, envelope.messageId, dispatch));
+      this.scheduleRoomEffect(() => this.applyAgentCommand(binding, agentKey, envelope.messageId, envelope.senderId, dispatch));
+    }
+    for (const { envelope } of admitted) {
+      if (!quotaDispatches.has(envelope.messageId) || primaryAdminLookupFailedIds.has(envelope.messageId)
+        || this.bindings.get(binding.workerInstanceId) !== binding) continue;
+      const quotaKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
+      this.scheduleRoomEffect(() => this.applyQuotaCommand(binding, quotaKey, envelope.messageId));
     }
     for (const attachmentId of attachmentIds) this.queueAttachmentDownload(attachmentId);
     for (const { control, envelope, ownMid } of admitted) {
@@ -897,7 +1023,8 @@ export class LineService {
         this.scheduleRoomEffect(() => this.roomControl?.handle(control.command));
       } else if (!useIndependentIngest && control.type === 'none' && !administrative.has(envelope.messageId)
         && !primaryAdminActions.has(envelope.messageId) && !committedAgentActions.has(envelope.messageId)
-        && !agentDispatches.has(envelope.messageId) && !(isFreeCommandText(envelope, ownMid) && primaryAdminMessageIds.has(envelope.messageId))
+        && !agentDispatches.has(envelope.messageId) && !quotaDispatches.has(envelope.messageId)
+        && !(isFreeCommandText(envelope, ownMid) && primaryAdminMessageIds.has(envelope.messageId))
         && !folderAdminCommandIds.has(envelope.messageId) && !personaAdminCommandIds.has(envelope.messageId) && this.roomControl?.respond) {
         const body = ownMentionBody(envelope, ownMid);
         if (body !== null) this.scheduleRoomEffect(async () => {

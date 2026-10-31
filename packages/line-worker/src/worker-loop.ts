@@ -21,6 +21,8 @@ export type SyncItem = unknown | Readonly<{
   operation: unknown; source?: 'live' | 'history'; decryptionError?: DecryptionFailure;
 }>;
 export type SyncResult = Readonly<{ cursorAfter: TalkCursorV1Dto; operations: readonly SyncItem[];
+  /** Number of raw Talk.sync operations before adapters append bounded recent-history catch-up items. */
+  rawOperationCount?: number; hasMoreStartupItems?: boolean;
   readReceipts?: readonly Readonly<{ chatId: string; readerMid: string; messageId: string; readAt: string }>[] }>;
 export type FriendRelation = 'friend' | 'not_friend' | 'unknown';
 export type FriendRelationDiagnostic = Readonly<{ status: FriendRelation; error: string | null; failureKind?: ChatResourceFailureKind;
@@ -240,6 +242,9 @@ export class LineWorkerLoop {
   #revoked = false;
   #stopped = false;
   #polling = false;
+  #startupSync = true;
+  #startupFinalBatchId: string | undefined;
+  #lastStartupCompleteBatchId: string | undefined;
   #receiveGeneration = 0;
   readonly #usedEffectPermits = new Set<string>();
   #syncFailures = 0;
@@ -443,6 +448,9 @@ export class LineWorkerLoop {
         if (this.#secretRestoreInFlight) throw new Error('secret restore in progress');
         this.#loginAttemptId = command.loginAttemptId;
         this.#loginInFlight = true;
+        this.#startupSync = true;
+        this.#startupFinalBatchId = undefined;
+        this.#lastStartupCompleteBatchId = undefined;
         try {
           await this.#emit({ type: 'status', ...this.#identity(), state: 'connecting', message: null });
           let loginStage = 'credential_swap';
@@ -474,11 +482,24 @@ export class LineWorkerLoop {
       case 'ackBatch':
         // Main may ack a re-emitted copy of a batch it already acknowledged; that repeat is already done.
         if (this.#lastAckedBatch?.batchId === command.batchId && this.#cursor!.pendingBatch?.batchId !== command.batchId
-          && cursorsEqual(command.cursorAfter, this.#cursor!.durableCursor)) return;
+          && cursorsEqual(command.cursorAfter, this.#cursor!.durableCursor)) {
+          if (command.startupComplete && this.#lastStartupCompleteBatchId === command.batchId) {
+            await this.#emit({ type: 'startupSyncComplete', ...this.#identity(), batchId: command.batchId });
+          }
+          return;
+        }
+        const startupFinal = this.#startupFinalBatchId === command.batchId;
+        if (command.startupComplete && !startupFinal) throw new Error('Startup completion requires the final startup batch');
         this.#cursor!.acknowledge({ accountId: binding.accountId, batchId: command.batchId,
           cursorBefore: this.#cursor!.pendingBatch?.cursorBefore ?? this.#cursor!.durableCursor,
           cursorAfter: command.cursorAfter });
         this.#lastAckedBatch = { batchId: command.batchId };
+        if (command.startupComplete && startupFinal) {
+          this.#startupSync = false;
+          this.#startupFinalBatchId = undefined;
+          this.#lastStartupCompleteBatchId = command.batchId;
+          await this.#emit({ type: 'startupSyncComplete', ...this.#identity(), batchId: command.batchId });
+        } else if (startupFinal) this.#startupFinalBatchId = undefined;
         return;
       case 'history':
         await this.#withTransportCall(() => this.#history(command));
@@ -767,7 +788,8 @@ export class LineWorkerLoop {
     if (this.#polling || this.#authInvalidated) return;
     const pending = this.#cursor!.pendingBatch;
     if (pending) {
-      await this.#emit({ type: 'batch', ...this.#identity(), ...pending });
+      await this.#emit({ type: 'batch', ...this.#identity(), ...pending,
+        startupSync: this.#startupSync, startupFinal: this.#startupSync && this.#startupFinalBatchId === pending.batchId });
       return;
     }
     this.#polling = true;
@@ -799,9 +821,12 @@ export class LineWorkerLoop {
         await this.#emit({ type: 'syncConfirmed', ...this.#identity() }).catch(() => undefined);
       }
       if (result.operations.length > 100) throw new Error('sync response exceeds bounded batch limit');
+      const rawOperationCount = result.rawOperationCount ?? result.operations.length;
+      if (!Number.isSafeInteger(rawOperationCount) || rawOperationCount < 0) throw new Error('sync response has invalid raw operation count');
       const readReceipts = result.readReceipts ?? [];
       if (readReceipts.length > 500) throw new Error('sync response exceeds bounded read receipt limit');
-      if (result.operations.length === 0 && readReceipts.length === 0 && JSON.stringify(before) === JSON.stringify(result.cursorAfter)) return;
+      if (result.operations.length === 0 && readReceipts.length === 0 && JSON.stringify(before) === JSON.stringify(result.cursorAfter)
+        && !this.#startupSync) return;
       const context = { accountId: this.#binding!.accountId, ownMid: this.#ownMid ?? '',
         source: 'live' as const, cursor: null };
       const envelopes = result.operations.map((item) => {
@@ -812,7 +837,10 @@ export class LineWorkerLoop {
         return normalizeOperation(item, context);
       });
       const batch = this.#cursor!.stage(randomUUID(), result.cursorAfter, envelopes as unknown as readonly JsonValue[], readReceipts);
-      await this.#emit({ type: 'batch', ...this.#identity(), ...batch });
+      const startupFinal = this.#startupSync && rawOperationCount < 100 && result.hasMoreStartupItems !== true;
+      if (startupFinal) this.#startupFinalBatchId = batch.batchId;
+      await this.#emit({ type: 'batch', ...this.#identity(), ...batch,
+        startupSync: this.#startupSync, startupFinal: this.#startupSync && startupFinal });
     } finally {
       this.#polling = false;
     }

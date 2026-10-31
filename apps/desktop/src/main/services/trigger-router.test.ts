@@ -204,3 +204,19 @@ describe('bare /agent switch commands', () => {
     expect(routeTrigger(bare, { ...context, freeModeActive: true })).toEqual({ type: 'free_message' });
   });
 });
+
+describe('provider quota system command', () => {
+  const mention={mentionIds:['agent-mid'],mentionRanges:[{start:0,end:6,userId:'agent-mid'}]};
+  it('routes bare /quota and /額度 without model or workspace admission',()=>{
+    const direct=envelope({chatType:'direct',text:'/QuOtA',mentionIds:[],mentionRanges:[]});
+    expect(routeTrigger(direct,{...context,senderIsPrimaryAdmin:true,primaryAdmin:true,workspaceConfigured:false})).toEqual({type:'agent_quota'});
+    expect(routeTrigger(envelope({text:'@Agent /額度',...mention}),{...context,workspaceConfigured:false})).toEqual({type:'agent_quota'});
+  });
+  it('keeps direct and group sender/room gates',()=>{
+    const direct=envelope({chatType:'direct',text:'/quota',mentionIds:[],mentionRanges:[]});
+    expect(routeTrigger(direct,{...context,primaryAdmin:false,senderIsPrimaryAdmin:false})).toEqual({type:'ignore'});
+    expect(routeTrigger(envelope({text:'@Agent /quota',...mention}),{...context,agentEnabled:false})).toEqual({type:'ignore'});
+    expect(routeTrigger(envelope({text:'@Agent /quota',...mention}),{...context,agentEnabled:true})).toEqual({type:'agent_quota'});
+    expect(routeTrigger(envelope({text:'@Agent /quota now',...mention}),context).type).not.toBe('agent_quota');
+  });
+});

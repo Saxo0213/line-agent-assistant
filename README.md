@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.312 fixes a Windows packaged Agent worker startup issue that could disrupt LINE connections and restarts. The `DESKTOPWIN` official LINE worker does not load the Chrome adapter, gate, or `line-chrome`; the `CHROMEOS` worker loads those components when selected. The package includes the dependency for that choice. Existing features are preserved. An isolated production-entry startup smoke check is added. See the [v1.0.312 release notes](docs/releases/v1.0.312.md). Earlier changes are listed in [v1.0.311](docs/releases/v1.0.311.md), [v1.0.310](docs/releases/v1.0.310.md), and [v1.0.305](docs/releases/v1.0.305.md).
+v1.0.314 archives startup catch-up messages without triggering automation, then resumes monitoring after storage and synchronization are acknowledged. It also includes system quota queries (`/額度` or `/quota`), quota reset tracking, and consented chat-wide Agent switching with a retry of the failed task. You can install it through the app's **Check for updates**. See the [v1.0.314 release notes](docs/releases/v1.0.314.md) for all changes since the previous public release, [v1.0.312](docs/releases/v1.0.312.md).
 
 ## Installation
 

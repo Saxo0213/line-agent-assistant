@@ -69,6 +69,7 @@ it('decodes one physical sync Talk rejection without retaining its private reaso
   } finally { adapter.revoke(); legy.mockRestore(); }
 });
 
+
 it('preserves an E2EE preparation Talk rejection before sendMedia reaches sendMessage', async () => {
   const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
     E2EE: { prototype: { encryptByKeyMaterial: (...args: any[]) => Promise<unknown>;
@@ -1867,11 +1868,52 @@ async function monitorAdapter(physicalTransport: (request: Request) => Promise<R
   return adapter;
 }
 
+it('drains supplemental history on a real empty HTTP 410 sync before marking startup final', async () => {
+  const { TalkService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/talk/mod.js', import.meta.url).href) as {
+    TalkService: { prototype: { sync: (...args: any[]) => Promise<unknown>;
+      getRecentMessagesV2: (...args: any[]) => Promise<unknown> } };
+  };
+  const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
+    E2EE: { prototype: { decryptE2EEMessage: (...args: any[]) => Promise<unknown> } };
+  };
+  const chatId = `c${'d'.repeat(32)}`;
+  const history = Array.from({ length: 20 }, (_, index) => ({ id: `history-${index}` }));
+  const operations = [{ type: 'NOTIFIED_READ_MESSAGE', revision: 1n, param1: chatId,
+    param2: `u${'e'.repeat(32)}`, param3: '1', createdTime: 1_760_000_000_000 },
+  ...Array.from({ length: 99 }, (_, index) => ({ revision: BigInt(index + 2), type: 26, message: { id: `raw-${index}` } }))];
+  const sync = vi.spyOn(TalkService.prototype, 'sync').mockResolvedValueOnce({
+    operationResponse: { operations, globalEvents: { lastRevision: '100' } },
+  });
+  const recent = vi.spyOn(TalkService.prototype, 'getRecentMessagesV2').mockResolvedValue(history);
+  const decrypt = vi.spyOn(E2EE.prototype, 'decryptE2EEMessage').mockImplementation(async (_encrypted: unknown) => {
+    const id = (_encrypted as { id: string }).id;
+    return { id, from: `u${'f'.repeat(32)}`, to: 'u-self', contentType: 'NONE', text: id, createdTime: 1_760_000_000_000 };
+  });
+  const physicalTransport = vi.fn(async () => new Response(null, { status: 410 }));
+  const adapter = await monitorAdapter(physicalTransport);
+  try {
+    const first = await adapter.sync(cursor);
+    expect(first).toMatchObject({ rawOperationCount: 100, hasMoreStartupItems: true });
+    expect(first.operations).toHaveLength(100);
+    expect(recent).toHaveBeenCalledOnce();
+
+    const final = await adapter.sync(first.cursorAfter);
+    expect(final).toMatchObject({ rawOperationCount: 0, hasMoreStartupItems: false });
+    expect(final.operations).toHaveLength(19);
+    expect(final.operations.every((item) => typeof item === 'object' && item !== null && 'source' in item && item.source === 'history')).toBe(true);
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    expect(sync).toHaveBeenCalledTimes(2);
+  } finally {
+    adapter.revoke();
+    sync.mockRestore(); recent.mockRestore(); decrypt.mockRestore();
+  }
+});
+
 it('treats an empty HTTP 410 sync long poll as a normal empty result after one physical request', async () => {
   const physicalTransport = vi.fn(async () => new Response(null, { status: 410 }));
   const adapter = await monitorAdapter(physicalTransport);
   try {
-    await expect(adapter.sync(cursor)).resolves.toEqual({ cursorAfter: cursor, operations: [] });
+    await expect(adapter.sync(cursor)).resolves.toEqual({ cursorAfter: cursor, operations: [], rawOperationCount: 0, hasMoreStartupItems: false });
     expect(physicalTransport).toHaveBeenCalledOnce();
   } finally { adapter.revoke(); }
 });
@@ -1885,7 +1927,7 @@ it('treats an HTTP 410 sync with a non-Thrift body as a normal empty result', as
   const physicalTransport = vi.fn(async () => new Response(null, { status: 410 }));
   const adapter = await monitorAdapter(physicalTransport);
   try {
-    await expect(adapter.sync(cursor)).resolves.toEqual({ cursorAfter: cursor, operations: [] });
+    await expect(adapter.sync(cursor)).resolves.toEqual({ cursorAfter: cursor, operations: [], rawOperationCount: 0, hasMoreStartupItems: false });
     expect(physicalTransport).toHaveBeenCalledOnce();
     expect(legy).toHaveBeenCalledOnce();
   } finally { adapter.revoke(); legy.mockRestore(); }
@@ -1947,7 +1989,7 @@ it('sends the same sync request for an HTTP 410 answer and an HTTP 200 answer', 
   const physicalTransport = vi.fn(async () => new Response(null, { status: answer.status }));
   const adapter = await monitorAdapter(physicalTransport);
   try {
-    await expect(adapter.sync(cursor)).resolves.toEqual({ cursorAfter: cursor, operations: [] });
+    await expect(adapter.sync(cursor)).resolves.toEqual({ cursorAfter: cursor, operations: [], rawOperationCount: 0, hasMoreStartupItems: false });
     answer = new Response(okBody, { status: 200 });
     await expect(adapter.sync(cursor)).resolves.toMatchObject({ operations: [] });
     expect(physicalTransport).toHaveBeenCalledTimes(2);

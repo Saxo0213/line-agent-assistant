@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.312에서는 Windows 설치판 Agent worker의 시작 문제를 수정했습니다. 이 문제로 LINE 연결과 재시작이 방해받을 수 있었습니다. `DESKTOPWIN` 공식 LINE worker는 Chrome adapter, gate 또는 `line-chrome`을 불러오지 않습니다. `CHROMEOS` worker를 선택한 경우에만 이 구성 요소들을 불러옵니다. 해당 선택 기능을 위해 패키지에 의존성도 포함합니다. 기존 기능은 유지하며 격리된 production-entry 시작 smoke를 추가했습니다. [v1.0.312 릴리스 노트](docs/releases/v1.0.312.md)를 참조하세요. 이전 변경 사항은 [v1.0.311](docs/releases/v1.0.311.md), [v1.0.310](docs/releases/v1.0.310.md), [v1.0.305](docs/releases/v1.0.305.md)에 있습니다.
+v1.0.314는 시작 시 초기 메시지를 자동화 없이 저장하고 저장 및 동기화 확인이 끝난 후 모니터링을 재개합니다. 시스템 사용량 조회(`/額度` 또는 `/quota`), 복구 시간 기록, 사용자 동의에 따른 채팅 Agent 전환과 실패 작업 재시도도 포함합니다. 앱의 '업데이트 확인'으로 설치할 수 있습니다. 이전 공개 버전 [v1.0.312](docs/releases/v1.0.312.md) 이후 변경 사항은 [v1.0.314 릴리스 노트](docs/releases/v1.0.314.md)를 참조하세요.
 
 ## 설치
 

@@ -268,6 +268,7 @@ export class ChromeAdapter implements LineTransport {
     this.#state.install(secrets);
     this.#channelTokens.clear();
     this.#receiver.reset();
+    this.#pendingCatchup = [];
     this.#obsToken = undefined;
     this.#friends.reset();
     this.#ownMid = this.#state.mid;
@@ -280,6 +281,7 @@ export class ChromeAdapter implements LineTransport {
 
   async loginQr(): Promise<TransportIdentity> {
     this.#channelTokens.clear();
+    this.#pendingCatchup = [];
     this.#obsToken = undefined;
     this.#receiver.reset();
     this.#friends.reset();
@@ -315,6 +317,7 @@ export class ChromeAdapter implements LineTransport {
 
   async loginToken(token: string): Promise<TransportIdentity> {
     this.#channelTokens.clear();
+    this.#pendingCatchup = [];
     this.#obsToken = undefined;
     this.#receiver.reset();
     this.#friends.reset();
@@ -434,7 +437,8 @@ export class ChromeAdapter implements LineTransport {
           if (isSessionKickout(error)) throw error;
         }
       }
-      return { cursorAfter: built.cursorAfter, operations,
+      return { cursorAfter: built.cursorAfter, operations, rawOperationCount: drained.operations.length,
+        hasMoreStartupItems: this.#pendingCatchup.length > 0,
         ...(built.readReceipts === undefined ? {} : { readReceipts: built.readReceipts }) } satisfies SyncResult;
     });
   }

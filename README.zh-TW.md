@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.312 修正 Windows 安裝版 Agent worker 啟動問題，該問題可能影響 LINE 連線及重新啟動。`DESKTOPWIN` 正式 LINE worker 不載入 Chrome adapter、gate 或 `line-chrome`；選用 `CHROMEOS` worker 時才載入這些元件。打包內容包含該選項所需依賴。既有功能維持不變，並新增隔離的 production-entry 啟動 smoke。請參閱 [v1.0.312 版本說明](docs/releases/v1.0.312.md)；先前更新請見 [v1.0.311](docs/releases/v1.0.311.md)、[v1.0.310](docs/releases/v1.0.310.md) 與 [v1.0.305](docs/releases/v1.0.305.md)。
+v1.0.314 啟動時的補訊只存檔、不觸發自動化，完成存檔與同步確認後才恢復監控。另包含系統額度查詢（`/額度` 或 `/quota`）、額度恢復時間，以及經使用者同意後切換聊天室 Agent 並重試失敗任務。可透過 App「檢查更新」安裝。上一個公開版本 [v1.0.312](docs/releases/v1.0.312.md) 至本版的完整變更，請見 [v1.0.314 版本說明](docs/releases/v1.0.314.md)。
 
 ## 安裝
 

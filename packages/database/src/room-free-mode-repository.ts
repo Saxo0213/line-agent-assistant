@@ -112,7 +112,7 @@ export class RoomFreeModeRepository {
         `INSERT INTO agent_jobs(job_id, account_id, chat_type, chat_id, provider, source_type, source_message_id, source_sender_id, prompt,
            workspace_path, generation, creation_epoch, status, room_agent_grant_id, room_agent_grant_version, free_mode)
          VALUES($1,$2,$3,$4,$5,'line',$6,$7,$8,$9,$10,$11,'queued',$12,$13,true)
-         ON CONFLICT(account_id, source_message_id) WHERE source_type = 'line' DO NOTHING RETURNING job_id`,
+         ON CONFLICT(account_id, source_message_id) WHERE source_type = 'line' AND retry_of_job_id IS NULL DO NOTHING RETURNING job_id`,
         [jobId, key.accountId, key.chatType, key.chatId, input.provider, input.sourceMessageId, FREE_MODE_MEMBER_ID, input.prompt,
           input.workspacePath, session.rows[0]?.generation ?? 0, control.rows[0].control_epoch,
           input.roomGrant.grantId, input.roomGrant.version]);

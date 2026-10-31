@@ -808,6 +808,88 @@ export class AgentRepository {
     return result[0] ?? null;
   }
 
+  async acceptQuotaRetry(input: { jobId: string; senderId: string; messageId: string; targetProvider: AgentProvider;
+    workerInstanceId: string; controlEpoch: number }): Promise<AgentJobStatusProjection | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const proposal = await client.query<any>(`SELECT p.*,j.account_id AS job_account,j.chat_type AS job_chat_type,j.chat_id AS job_chat_id,
+        j.status AS job_status,j.provider AS job_provider,j.source_type,j.source_message_id AS job_source_message_id,j.source_sender_id AS job_sender_id,j.creation_epoch,
+        j.prompt,j.workspace_path,j.source_request_id,j.attachments,j.free_mode,j.direct_friend_grant_id AS job_direct_grant,
+        j.direct_friend_grant_version AS job_direct_version,j.room_agent_grant_id AS job_room_grant,j.room_agent_grant_version AS job_room_version,
+        c.control_epoch,a.mode,a.connection_mode,a.worker_instance_id AS current_worker,a.worker_binding_epoch
+        FROM provider_quota_proposals p JOIN agent_jobs j ON j.job_id=p.job_id JOIN line_accounts a ON a.account_id=j.account_id
+        CROSS JOIN account_control c WHERE p.job_id=$1 AND c.singleton=true FOR UPDATE OF p,j,a,c`, [input.jobId]);
+      const p=proposal.rows[0];
+      if(!p || p.state!=='pending' || new Date(p.expires_at).getTime()<=Date.now() || p.target_provider!==input.targetProvider
+        || p.source_sender_id!==input.senderId || p.job_status!=='failed' || p.source_type!=='line'
+        || p.job_account!==p.account_id || p.job_chat_type!==p.chat_type || p.job_chat_id!==p.chat_id
+        || p.source_message_id!==p.job_source_message_id || p.job_provider!==p.failed_provider || p.source_sender_id!==p.job_sender_id
+        || String(p.control_epoch)!==String(input.controlEpoch) || String(p.creation_epoch)!==String(input.controlEpoch)
+        || p.mode!=='ACTIVE_CONTROL' || p.connection_mode!=='SYSTEM_LOGIN' || p.current_worker!==input.workerInstanceId
+        || String(p.worker_binding_epoch)!==String(input.controlEpoch)) { await client.query('ROLLBACK'); return null; }
+      const command=await client.query<{text_content:string|null;sender_id:string;mention_ranges:unknown;own_mid:string|null}>(`SELECT m.text_content,m.sender_id,m.mention_ranges,a.own_mid
+        FROM messages m JOIN conversations c ON c.account_id=m.account_id AND c.chat_type=$4 AND c.chat_id=m.chat_id
+        JOIN line_accounts a ON a.account_id=m.account_id
+        WHERE m.account_id=$1 AND m.message_id=$2 AND m.chat_id=$3 AND m.ingestion_source='live' FOR SHARE OF m,c,a`,
+        [p.account_id,input.messageId,p.chat_id,p.chat_type]);
+      let commandBody=command.rows[0]?.text_content??'';
+      const ranges=Array.isArray(command.rows[0]?.mention_ranges)?command.rows[0]!.mention_ranges as Array<{start:number;end:number;userId:string}>:[];
+      const ownMention=ranges.find((range)=>range.userId===command.rows[0]?.own_mid && range.start>=0 && range.end>range.start && range.end<=commandBody.length);
+      if(ownMention) commandBody=commandBody.slice(0,ownMention.start)+commandBody.slice(ownMention.end);
+      const commandText=commandBody.trim().replace(/\s+/g,' ').toLowerCase();
+      if(command.rows[0]?.sender_id!==input.senderId || commandText!==`/agent ${input.targetProvider}`) {
+        await client.query('ROLLBACK'); return null;
+      }
+      const admin=await client.query(`SELECT 1 FROM account_administrators WHERE account_id=$1 AND user_id=$2 AND role='PRIMARY_ADMIN' FOR SHARE`,[p.account_id,input.senderId]);
+      if(!admin.rowCount) { await client.query('ROLLBACK'); return null; }
+      const existingRetry=await client.query('SELECT 1 FROM agent_jobs WHERE retry_of_job_id=$1',[input.jobId]);
+      if(existingRetry.rowCount) { await client.query('ROLLBACK'); return null; }
+      const output=await client.query('SELECT 1 FROM agent_outputs WHERE job_id=$1',[input.jobId]);
+      if(output.rowCount) { await client.query('ROLLBACK'); return null; }
+      const quotas=await client.query<{blocked:boolean;snapshot_stale:boolean;snapshot_fetched_at:Date|null;snapshot:unknown}>(`SELECT blocked,snapshot_stale,snapshot_fetched_at,snapshot FROM provider_quota_state WHERE provider=$1 FOR SHARE`,[input.targetProvider]);
+      const quotaSnapshot=quotas.rows[0]?.snapshot&&typeof quotas.rows[0].snapshot==='object'
+        ? quotas.rows[0].snapshot as {availabilityKnown?:unknown;windows?:unknown}:{};
+      const hasGeneralWindow=Array.isArray(quotaSnapshot.windows)&&quotaSnapshot.windows.some((window)=>!!window&&typeof window==='object'
+        &&(window as {blocksProvider?:unknown}).blocksProvider===true);
+      const availabilityKnown=quotaSnapshot.availabilityKnown===true||(quotaSnapshot.availabilityKnown!==false&&hasGeneralWindow);
+      if(!quotas.rows[0] || quotas.rows[0].blocked || quotas.rows[0].snapshot_stale || !quotas.rows[0].snapshot_fetched_at
+        || quotas.rows[0].snapshot_fetched_at.getTime()<Date.now()-5*60_000 || !availabilityKnown) { await client.query('ROLLBACK'); return null; }
+      if(p.direct_grant_id) {
+        const grant=await client.query(`SELECT 1 FROM line_friend_whitelist_grants WHERE grant_id=$1 AND account_id=$2 AND target_mid=$3
+          AND version=$4 AND state='ACTIVE' AND (scope_kind='ACCOUNT' OR (scope_kind='CHAT' AND chat_type=$5 AND chat_id=$6)) FOR SHARE`,
+          [p.direct_grant_id,p.account_id,input.senderId,p.direct_grant_version,p.chat_type,p.chat_id]);
+        if(!grant.rowCount) { await client.query('ROLLBACK'); return null; }
+      }
+      if(p.room_grant_id) {
+        const grant=await client.query(`SELECT 1 FROM room_agent_grants WHERE grant_id=$1 AND account_id=$2 AND chat_type=$3 AND chat_id=$4
+          AND version=$5 AND state='ACTIVE' FOR SHARE`,[p.room_grant_id,p.account_id,p.chat_type,p.chat_id,p.room_grant_version]);
+        if(!grant.rowCount) { await client.query('ROLLBACK'); return null; }
+      }
+      const key: WritableConversationKey={accountId:p.account_id,chatType:p.chat_type,chatId:p.chat_id};
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[queueLockKey(key)]);
+      const sessionKey: SessionKey={...key,provider:input.targetProvider,sourceType:'line'};
+      await ensureSessionRow(client,sessionKey);
+      const generation=await readSessionGeneration(client,sessionKey,true);
+      const newJobId=randomUUID();
+      const inserted=await client.query<StatusProjectionRow>(`INSERT INTO agent_jobs(job_id,account_id,chat_type,chat_id,provider,source_type,
+        source_message_id,source_request_id,prompt,workspace_path,generation,status,creation_epoch,attachments,source_sender_id,
+        direct_friend_grant_id,direct_friend_grant_version,room_agent_grant_id,room_agent_grant_version,free_mode,retry_of_job_id)
+        VALUES($1,$2,$3,$4,$5,'line',$6,$7,$8,$9,$10,'queued',$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        RETURNING ${statusProjectionColumns}`,[newJobId,p.account_id,p.chat_type,p.chat_id,input.targetProvider,p.source_message_id,p.source_request_id,
+        p.prompt,p.workspace_path,generation,input.controlEpoch,JSON.stringify(Array.isArray(p.attachments)?p.attachments:[]),p.source_sender_id,p.job_direct_grant,p.job_direct_version,
+        p.job_room_grant,p.job_room_version,p.free_mode,input.jobId]);
+      const changed=await client.query('UPDATE conversations SET default_provider=$4,updated_at=now() WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3',
+        [p.account_id,p.chat_type,p.chat_id,input.targetProvider]);
+      if(changed.rowCount!==1) { await client.query('ROLLBACK'); return null; }
+      const consumed=await client.query(`UPDATE provider_quota_proposals SET state='accepted',consumed_at=now(),retry_job_id=$2,
+        confirmation_message_id=$3 WHERE job_id=$1 AND state='pending'`,[input.jobId,newJobId,input.messageId]);
+      if(consumed.rowCount!==1) { await client.query('ROLLBACK'); return null; }
+      await client.query('COMMIT');
+      return inserted.rows[0]?toStatusProjection(inserted.rows[0]):null;
+    } catch(error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
+  }
+
   async cancelJob(jobId: string): Promise<AgentJobStatusProjection | null> {
     const result = await transitionAgentJobStatus(this.pool, 'cancelled', "job_id = $1 AND status IN ('queued', 'running')", [jobId]);
     return result[0] ?? null;
