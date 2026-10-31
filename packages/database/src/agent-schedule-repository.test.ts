@@ -6,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
 import { AGENT_SCHEDULE_MAX_ENABLED, type AgentScheduleCreateInput } from '@line-agent/contracts';
 import { AgentRepository } from './agent-repository.js';
+import { AccountRepository } from './account-repository.js';
 import { AgentScheduleError, AgentScheduleRepository, planNextFire } from './agent-schedule-repository.js';
 import { migrate } from './migrate.js';
 import { createTestDatabase } from './test-database.js';
@@ -29,7 +30,13 @@ database('Agent schedule repository (real database)', () => {
     agents = new AgentRepository(pool);
   });
   afterAll(async () => { await close(); });
-  beforeEach(async () => { await pool.query('DELETE FROM agent_schedules'); });
+  beforeEach(async () => {
+    await pool.query('DELETE FROM agent_schedules');
+    const accounts = new AccountRepository(pool);
+    await accounts.ensureAccount('account-A');
+    await accounts.ensureAccount('account-B');
+    await pool.query("UPDATE line_accounts SET product_role = CASE account_id WHEN 'account-A' THEN 'AGENT' ELSE 'PRIMARY_ADMIN' END, mode = 'MONITOR_ONLY' WHERE account_id = ANY($1::text[])", [['account-A', 'account-B']]);
+  });
 
   // 2026-10-01T01:00:00Z is 09:00 in Asia/Taipei.
   const NINE = new Date('2026-10-01T01:00:00Z');
@@ -40,6 +47,37 @@ database('Agent schedule repository (real database)', () => {
     expect(created.recurrence).toEqual({ kind: 'daily', time: '09:00' });
     expect(await repo.get(created.scheduleId)).toEqual(created);
     expect((await repo.list()).map((s) => s.scheduleId)).toEqual([created.scheduleId]);
+  });
+
+  it('isolates external schedule list, update and delete by the persisted caller account scope', async () => {
+    const accountA = await repo.create({ ...daily('external A'), targets: [{ accountId: 'account-A', chatType: 'group', chatId: 'g-a', title: 'A' }] }, NINE, ['account-A']);
+    const accountB = await repo.create({ ...daily('external B'), targets: [{ accountId: 'account-B', chatType: 'group', chatId: 'g-b', title: 'B' }] }, NINE, ['account-B']);
+    const internal = await repo.create(daily('internal'), NINE);
+
+    expect((await repo.listExternalScoped(['account-A'])).map((schedule) => schedule.scheduleId)).toEqual([accountA.scheduleId]);
+    expect((await repo.listExternalScoped(['account-A', 'account-B'])).map((schedule) => schedule.scheduleId)).toEqual([accountA.scheduleId, accountB.scheduleId]);
+    await expect(repo.updateExternalScoped(internal.scheduleId, { enabled: false }, ['account-A'], [], NINE)).rejects.toMatchObject({ code: 'SCHEDULE_NOT_FOUND' });
+    await expect(repo.updateExternalScoped(accountA.scheduleId, { targets: [{ accountId: 'account-B', chatType: 'group', chatId: 'g-b', title: 'B' }] },
+      ['account-A', 'account-B'], ['account-B'], NINE)).rejects.toMatchObject({ code: 'SCHEDULE_INVALID_TARGET' });
+    expect(await repo.deleteExternalScoped(accountB.scheduleId, ['account-A'])).toBe(false);
+    expect(await repo.deleteExternalScoped(internal.scheduleId, ['account-A', 'account-B'])).toBe(false);
+    expect(await repo.deleteExternalScoped(accountA.scheduleId, ['account-A'])).toBe(true);
+  });
+
+  it('rechecks account roles and pause state inside external schedule operations', async () => {
+    await pool.query("UPDATE line_accounts SET mode='PAUSED' WHERE account_id='account-A'");
+    await expect(repo.create(daily('paused external'), NINE, ['account-A'])).rejects.toMatchObject({ code: 'SCHEDULE_INVALID_TARGET' });
+    await expect(repo.listExternalScoped(['account-A'])).rejects.toMatchObject({ code: 'SCHEDULE_INVALID_TARGET' });
+  });
+
+  it('validates external update shapes using the locked merged schedule row', async () => {
+    const summary = await repo.create({ ...daily('summary'), task: { type: 'summary' },
+      targets: [{ accountId: 'account-A', chatType: 'group', chatId: 'g-a', title: 'A' }] }, NINE, ['account-A']);
+    await expect(repo.updateExternalScoped(summary.scheduleId, { targets: [] }, ['account-A'], [], NINE))
+      .rejects.toMatchObject({ code: 'SCHEDULE_INVALID' });
+    const message = await repo.create({ ...daily('message'), task: { type: 'message', text: 'x' }, delivery: { mode: 'primary_admin' } }, NINE, ['account-A']);
+    await expect(repo.updateExternalScoped(message.scheduleId, { delivery: { mode: 'record_only' } }, ['account-A'], [], NINE))
+      .rejects.toMatchObject({ code: 'SCHEDULE_INVALID' });
   });
 
   it('claims a due schedule once and moves next_fire_at forward', async () => {

@@ -2433,67 +2433,12 @@ database('connected facade account login semantics', () => {
     expect(commands.slice(commandsBeforeInvalidation).some((command) => command.type === 'loginToken' || command.type === 'loginQr')).toBe(false);
   });
 
-  it.each(['auth invalidation', 'logout'] as const)('fences a suspended archive publication synchronously on %s', async (transition) => {
-    await addStoredAccounts('account-a');
-    await activate('account-a');
-    await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES ('account-a','group','archive-chat','Archive test') ON CONFLICT DO NOTHING");
-    await facade.dispatch({ type: 'lineLoginQr', requestId: `archive-initial-qr-${transition}`, accountId: 'account-a' });
-    const binding = bindings.get('account-a')!;
-    const initialAttempt = latestLoginAttempt('account-a');
-    await workerEventHandler!(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: initialAttempt,
-      ownMid: 'own-account-a', displayName: 'Agent' });
-    await workerEventHandler!(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
-    let release!: () => void;
-    let publicationStarted = false;
-    const wait = new Promise<void>((resolve) => { release = resolve; });
-    archivePublishGate = { entered: () => { publicationStarted = true; }, wait };
-    const noteRead = facade.dispatch({ type: 'getChatNote', requestId: `archive-note-${transition}`, accountId: 'account-a',
-      chatType: 'group', chatId: 'archive-chat', postId: 'note-a' });
-    await vi.waitFor(() => expect(publicationStarted).toBe(true), { timeout: 1500 });
-
-    let lifecycleRelease!: () => void;
-    let lifecycleStarted = false;
-    const lifecycleGate = new Promise<void>((resolve) => { lifecycleRelease = resolve; });
-    const lifecycleEntered = () => { lifecycleStarted = true; };
-    if (transition === 'auth invalidation') {
-      pendingWorkerStop = { started: lifecycleEntered, wait: lifecycleGate };
-      const invalidation = workerEventHandler!(binding.workerInstanceId, { type: 'authInvalidated', ...binding });
-      await vi.waitFor(() => expect(lifecycleStarted).toBe(true), { timeout: 1500 });
-      const during = facade.dispatch({ type: 'getChatNote', requestId: 'archive-note-during-invalidation', accountId: 'account-a',
-        chatType: 'group', chatId: 'archive-chat', postId: 'note-a' });
-      await expect(during).resolves.toMatchObject({ ok: false, message: expect.stringContaining('archive is closed') });
-      expect(archiveReads).toBe(1);
-      await expect(noteRead).resolves.toMatchObject({ ok: false, message: expect.stringContaining('invalidated') });
-      release();
-      await vi.waitFor(() => expect(archiveCommits).toBe(0));
-      lifecycleRelease();
-      await invalidation;
-    } else {
-      pendingWorkerStop = { started: lifecycleEntered, wait: lifecycleGate };
-      const logout = facade.dispatch({ type: 'lineLogout', requestId: 'archive-logout', accountId: 'account-a' });
-      await vi.waitFor(() => expect(lifecycleStarted).toBe(true), { timeout: 1500 });
-      const during = facade.dispatch({ type: 'getChatNote', requestId: 'archive-note-during-logout', accountId: 'account-a',
-        chatType: 'group', chatId: 'archive-chat', postId: 'note-a' });
-      await expect(during).resolves.toMatchObject({ ok: false, message: expect.stringContaining('archive is closed') });
-      expect(archiveReads).toBe(1);
-      await expect(noteRead).resolves.toMatchObject({ ok: false, message: expect.stringContaining('logout') });
-      release();
-      await vi.waitFor(() => expect(archiveCommits).toBe(0));
-      lifecycleRelease();
-      await logout;
-    }
-    expect(archiveCommits).toBe(0);
-    await activate('account-a');
-    expect((await facade.dispatch({ type: 'lineLoginQr', requestId: `archive-recover-qr-${transition}`, accountId: 'account-a' })).ok).toBe(true);
-    const recoveredBinding = bindings.get('account-a')!;
-    const recoveredAttempt = latestLoginAttempt('account-a');
-    await workerEventHandler!(recoveredBinding.workerInstanceId, { type: 'login', ...recoveredBinding,
-      loginAttemptId: recoveredAttempt, ownMid: 'own-account-a', displayName: 'Agent' });
-    await workerEventHandler!(recoveredBinding.workerInstanceId, { type: 'status', ...recoveredBinding, state: 'ready', message: null });
-    await expect(facade.dispatch({ type: 'getChatNote', requestId: `archive-after-recovery-${transition}`, accountId: 'account-a',
-      chatType: 'group', chatId: 'archive-chat', postId: 'note-a' })).resolves.toMatchObject({ ok: true });
-    expect(archiveReads).toBe(2);
-    expect(archiveCommits).toBe(1);
+  it('rejects direct facade Notes reads without sending a LINE resource request', async () => {
+    const key = { accountId: 'account-a', chatType: 'group' as const, chatId: 'archive-chat' };
+    const readsBefore = archiveReads;
+    await expect(facade.listChatNotes(key, null)).rejects.toThrow('Notes are disabled.');
+    await expect(facade.getChatNote(key, 'note-a')).rejects.toThrow('Notes are disabled.');
+    expect(archiveReads).toBe(readsBefore);
   });
 
   it('returns the IPC error code UNSUPPORTED for a worker UNSUPPORTED result and keeps other codes', async () => {

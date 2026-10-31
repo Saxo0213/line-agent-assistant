@@ -16,16 +16,16 @@ import {
 } from '@line-agent/contracts';
 import { AgentScheduleError, resolveCurrentAgentKey, type AgentLineage, type AgentScheduleClaim, type AgentScheduleClaimResult, type AgentScheduleRepository } from '@line-agent/database';
 import { composeScheduleRunContext, composeScheduledPrompt, computeScheduleWindow, type ScheduleTimeWindow } from './agent-schedule-prompt.js';
-import type { AgentScheduleMessageReader } from './agent-schedule-reader.js';
+import type { AgentScheduleMessageContext, AgentScheduleMessageReader } from './agent-schedule-reader.js';
 import { NEW_MESSAGES_EMPTY_LINE, evaluateNewMessages, listedText, type NewMessagesEvaluation, type ScheduleOwnDelivery } from './agent-schedule-rules.js';
 
 export const AGENT_SCHEDULE_TICK_MS = 30_000;
 
 export type AgentScheduleStore = Pick<AgentScheduleRepository,
   'list' | 'get' | 'create' | 'update' | 'delete' | 'claimDue' | 'markSubmitted' | 'markFailed' | 'markSent' | 'markSendFailed' | 'markSendUnknown' | 'markNoMessages'
-  | 'recoverStale' | 'listRuns' | 'previousSubmittedFor'>;
+  | 'recoverStale' | 'listRuns' | 'previousSubmittedFor'> & Partial<Pick<AgentScheduleRepository, 'listExternalScoped' | 'updateExternalScoped' | 'deleteExternalScoped'>>;
 
-export interface AgentScheduleSubmission { provider: AgentProvider; requestId: string; prompt: string }
+export interface AgentScheduleSubmission { provider: AgentProvider; requestId: string; prompt: string; mcpAccountScope?: readonly string[] | null }
 
 export type AgentScheduleTargetPurpose = 'read' | 'delivery';
 
@@ -133,7 +133,9 @@ export class AgentScheduleService {
           window: computeScheduleWindow({ window: claim.window, recurrence: claim.recurrence, scheduledFor: claim.scheduledFor,
             previousSubmittedFor: claim.previousSubmittedFor }),
         });
-        const job = await this.options.submit({ provider: claim.provider, requestId: scheduleRequestId(claim.scheduleId, claim.scheduledFor), prompt });
+        const accountScope = await this.currentAccountScope(claim.externalAccountScope);
+        const job = await this.options.submit({ provider: claim.provider, requestId: scheduleRequestId(claim.scheduleId, claim.scheduledFor), prompt,
+          ...(accountScope != null ? { mcpAccountScope: accountScope } : {}) });
         await this.options.store.markSubmitted(claim.runId, job.jobId);
       } catch (error) {
         this.options.onError?.(error);
@@ -191,10 +193,10 @@ export class AgentScheduleService {
 
   /** Reads the window and applies the rules of a new_messages task. A read error is thrown with its real error. */
   private async evaluateNewMessages(task: AgentScheduleNewMessagesTask, targets: readonly AgentScheduleTarget[], window: ScheduleTimeWindow,
-    ownDelivery: ScheduleOwnDelivery | null): Promise<{ evaluation: NewMessagesEvaluation; incomplete: boolean }> {
+    ownDelivery: ScheduleOwnDelivery | null, context?: AgentScheduleMessageContext): Promise<{ evaluation: NewMessagesEvaluation; incomplete: boolean }> {
     const reader = this.options.readMessages;
     if (!reader) throw new Error('The schedule message reader is not available.');
-    const read = await reader({ from: window.from, to: window.to, targets });
+    const read = await reader({ from: window.from, to: window.to, targets, ...(context ? { context } : {}) });
     return { evaluation: evaluateNewMessages({ task, messages: read.messages, window, ownDelivery }), incomplete: read.incomplete };
   }
 
@@ -209,9 +211,11 @@ export class AgentScheduleService {
     if (task.type !== 'new_messages') return;
     const window = computeScheduleWindow({ window: claim.window, recurrence: claim.recurrence, scheduledFor: claim.scheduledFor,
       previousSubmittedFor: claim.previousSubmittedFor });
+    const accountScope = await this.currentAccountScope(claim.externalAccountScope);
     let result: { evaluation: NewMessagesEvaluation; incomplete: boolean };
     try {
-      result = await this.evaluateNewMessages(task, claim.targets, window, await this.ownDelivery(claim.delivery));
+      result = await this.evaluateNewMessages(task, claim.targets, window, await this.ownDelivery(claim.delivery),
+        { sourceType: 'schedule', accountScope });
     } catch (error) {
       this.options.onError?.(error);
       await store.markFailed(claim.runId).catch((markError: unknown) => { this.options.onError?.(markError); });
@@ -240,7 +244,8 @@ export class AgentScheduleService {
         title: claim.title, prompt: claim.prompt, task, targets: claim.targets, delivery: claim.delivery, window,
         llmChats: llmChats.map((chat) => ({ accountId: chat.accountId, chatType: chat.chatType, chatId: chat.chatId, title: chat.title })),
       });
-      const job = await this.options.submit({ provider: claim.provider, requestId: scheduleRequestId(claim.scheduleId, claim.scheduledFor), prompt });
+      const job = await this.options.submit({ provider: claim.provider, requestId: scheduleRequestId(claim.scheduleId, claim.scheduledFor), prompt,
+        ...(accountScope !== null ? { mcpAccountScope: accountScope } : {}) });
       await store.markSubmitted(claim.runId, job.jobId);
     } catch (error) {
       this.options.onError?.(error);
@@ -252,7 +257,7 @@ export class AgentScheduleService {
    * The hidden run-time instructions of a schedule-sourced job (request id `schedule:<id>:<scheduledFor>`), rebuilt from the schedule
    * row at job start. Returns null when the request id is not a schedule's or the schedule no longer exists.
    */
-  async runContext(sourceRequestId: string): Promise<string | null> {
+  async runContext(sourceRequestId: string, jobId?: string): Promise<string | null> {
     if (!isScheduledRunRequestId(sourceRequestId)) return null;
     const match = /^schedule:([0-9a-f-]{36}):(.+)$/i.exec(sourceRequestId);
     const scheduledFor = match ? new Date(match[2]!) : null;
@@ -265,7 +270,9 @@ export class AgentScheduleService {
     const window = computeScheduleWindow({ window: schedule.window, recurrence: schedule.recurrence, scheduledFor, previousSubmittedFor });
     // new_messages: evaluate the rules again for this slot; the Agent reads only the chats whose rule says llm.
     const llmChats = schedule.task.type === 'new_messages'
-      ? (await this.evaluateNewMessages(schedule.task, mapped.targets, window, await this.ownDelivery(mapped.delivery))).evaluation.chats.filter((chat) => chat.action === 'llm')
+      ? (await this.evaluateNewMessages(schedule.task, mapped.targets, window, await this.ownDelivery(mapped.delivery), jobId
+        ? { sourceType: 'job', jobId, generation: 0, accountId: null }
+        : { sourceType: 'schedule', accountScope: null })).evaluation.chats.filter((chat) => chat.action === 'llm')
         .map((chat) => ({ accountId: chat.accountId, chatType: chat.chatType, chatId: chat.chatId, title: chat.title }))
       : undefined;
     return composeScheduleRunContext({
@@ -276,6 +283,13 @@ export class AgentScheduleService {
 
   private async lineage(): Promise<AgentLineage | null> {
     try { return await this.options.agentLineage?.() ?? null; } catch (error) { this.options.onError?.(error); return null; }
+  }
+
+  private async currentAccountScope(accountScope: readonly string[] | null): Promise<string[] | null> {
+    if (accountScope === null) return null;
+    const lineage = await this.lineage();
+    return [...new Set(accountScope.map((accountId) => lineage?.currentAccountId && lineage.accountIds.includes(accountId)
+      ? lineage.currentAccountId : accountId))];
   }
 
   /** Maps the read targets and the line_target delivery through the Agent lineage; the stored row is never rewritten. */
@@ -297,6 +311,7 @@ export class AgentScheduleService {
   }
 
   list(): Promise<AgentSchedule[]> { return this.options.store.list(); }
+  listExternal(accountIds: readonly string[]): Promise<AgentSchedule[]> { return this.options.store.listExternalScoped?.(accountIds) ?? Promise.resolve([]); }
   listRuns(scheduleId: string, limit = 20): Promise<AgentScheduleRun[]> { return this.options.store.listRuns(scheduleId, limit); }
   listTargets(query: string | undefined, limit = 20, purpose: AgentScheduleTargetPurpose = 'read'): Promise<AgentScheduleTargetOption[]> {
     return this.options.targets ? this.options.targets.list(query, limit, purpose) : Promise.resolve([]);
@@ -343,6 +358,19 @@ export class AgentScheduleService {
   }
 
   async create(input: AgentScheduleCreateInput): Promise<AgentSchedule> {
+    return this.createWithAccountScope(input, null);
+  }
+
+  async createExternal(input: AgentScheduleCreateInput, accountScope: readonly string[], signal?: AbortSignal): Promise<AgentSchedule> {
+    const scope = [...new Set(accountScope)];
+    const required = this.scheduleTargetAccounts(input.targets, input.delivery);
+    if (required.some((accountId) => !scope.includes(accountId))) {
+      throw new AgentScheduleError('SCHEDULE_INVALID_TARGET', 'Schedule target is outside its authorized account scope.');
+    }
+    return this.createWithAccountScope(input, scope, signal);
+  }
+
+  private async createWithAccountScope(input: AgentScheduleCreateInput, accountScope: readonly string[] | null, signal?: AbortSignal): Promise<AgentSchedule> {
     const invalid = agentScheduleShapeError({ prompt: input.prompt, targets: input.targets, task: input.task, delivery: input.delivery });
     if (invalid) throw new AgentScheduleError('SCHEDULE_INVALID', invalid);
     const resolved: AgentScheduleCreateInput = {
@@ -350,7 +378,8 @@ export class AgentScheduleService {
       targets: await this.resolveTargets(input.targets),
       delivery: input.delivery.mode === 'line_target' ? { mode: 'line_target', target: await this.resolveSendTarget(await this.currentDeliveryTarget(input.delivery.target)) } : input.delivery,
     };
-    const schedule = await this.options.store.create(resolved, this.now());
+    if (signal?.aborted) throw signal.reason ?? new Error('Schedule request cancelled before database mutation.');
+    const schedule = await this.options.store.create(resolved, this.now(), accountScope);
     this.changed();
     return schedule;
   }
@@ -372,9 +401,37 @@ export class AgentScheduleService {
     return schedule;
   }
 
+  async updateExternal(scheduleId: string, patch: AgentScheduleUpdatePatch, allowedAccountIds: readonly string[], signal?: AbortSignal): Promise<AgentSchedule> {
+    const required = this.scheduleTargetAccounts(patch.targets, patch.delivery);
+    if (required.some((accountId) => !allowedAccountIds.includes(accountId))) {
+      throw new AgentScheduleError('SCHEDULE_INVALID_TARGET', 'Schedule target is outside its authorized account scope.');
+    }
+    const resolved: AgentScheduleUpdatePatch = { ...patch };
+    if (patch.targets) resolved.targets = await this.resolveTargets(patch.targets);
+    if (patch.delivery?.mode === 'line_target') {
+      resolved.delivery = { mode: 'line_target', target: await this.resolveSendTarget(await this.currentDeliveryTarget(patch.delivery.target)) };
+    }
+    if (!this.options.store.updateExternalScoped) throw new AgentScheduleError('SCHEDULE_NOT_FOUND', 'Schedule not found.');
+    if (signal?.aborted) throw signal.reason ?? new Error('Schedule request cancelled before database mutation.');
+    const schedule = await this.options.store.updateExternalScoped(scheduleId, resolved, allowedAccountIds, required, this.now());
+    this.changed();
+    return schedule;
+  }
+
   async delete(scheduleId: string): Promise<boolean> {
     const deleted = await this.options.store.delete(scheduleId);
     if (deleted) this.options.publish?.();
     return deleted;
+  }
+
+  async deleteExternal(scheduleId: string, allowedAccountIds: readonly string[], signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) throw signal.reason ?? new Error('Schedule request cancelled before database mutation.');
+    const deleted = await this.options.store.deleteExternalScoped?.(scheduleId, allowedAccountIds) ?? false;
+    if (deleted) this.changed();
+    return deleted;
+  }
+
+  private scheduleTargetAccounts(targets: readonly AgentScheduleTarget[] | undefined, delivery: AgentSchedule['delivery'] | undefined): string[] {
+    return [...new Set([...(targets ?? []).map((target) => target.accountId), ...(delivery?.mode === 'line_target' ? [delivery.target.accountId] : [])])];
   }
 }

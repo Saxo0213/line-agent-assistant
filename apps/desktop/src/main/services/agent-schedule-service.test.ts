@@ -7,7 +7,7 @@ const SCHEDULE_ID = '11111111-1111-4111-8111-111111111111';
 const claim = (overrides: Partial<AgentScheduleClaim> = {}): AgentScheduleClaim => ({
   runId: 'run-1', scheduleId: SCHEDULE_ID, scheduledFor: new Date('2026-10-01T01:00:00.000Z'), title: '早報', prompt: '整理昨天的訊息並傳給我', provider: 'claude',
   recurrence: { kind: 'daily', time: '09:00' }, timezone: 'Asia/Taipei', targets: [], task: { type: 'custom' }, window: { mode: 'since_last_run' },
-  delivery: { mode: 'record_only' }, previousSubmittedFor: null, ...overrides,
+  delivery: { mode: 'record_only' }, externalAccountScope: null, previousSubmittedFor: null, ...overrides,
 });
 
 function fakeStore(claims: AgentScheduleClaim[][] = [[claim()]]) {
@@ -29,8 +29,73 @@ function fakeStore(claims: AgentScheduleClaim[][] = [[claim()]]) {
 afterEach(() => { vi.useRealTimers(); });
 
 describe('AgentScheduleService', () => {
+  it('publishes and ticks after external updates and publishes after external deletes', async () => {
+    const store = fakeStore([[]]);
+    const updateExternalScoped = vi.fn(async () => ({ scheduleId: SCHEDULE_ID }) as never);
+    const deleteExternalScoped = vi.fn(async () => true);
+    Object.assign(store, { updateExternalScoped, deleteExternalScoped });
+    const publish = vi.fn();
+    const service = new AgentScheduleService({ store, submit: vi.fn(async () => ({ jobId: 'job-1' })), publish });
+    await service.updateExternal(SCHEDULE_ID, { enabled: false }, ['agent']);
+    expect(updateExternalScoped).toHaveBeenCalledWith(SCHEDULE_ID, { enabled: false }, ['agent'], [], expect.any(Date));
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(store.claimDue).toHaveBeenCalledTimes(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await service.deleteExternal(SCHEDULE_ID, ['agent']);
+    expect(deleteExternalScoped).toHaveBeenCalledWith(SCHEDULE_ID, ['agent']);
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(store.claimDue).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not create an external schedule when cancellation occurs during target resolution', async () => {
+    const store = fakeStore([[]]);
+    let finish!: () => void;
+    const resolver = { resolve: vi.fn(async (targets: readonly { accountId: string; chatType: 'group'; chatId: string; title: string }[]) => {
+      await new Promise<void>((resolve) => { finish = resolve; });
+      return [...targets];
+    }), list: vi.fn(async () => []) };
+    const controller = new AbortController();
+    const service = new AgentScheduleService({ store, submit: vi.fn(async () => ({ jobId: 'job-1' })), targets: resolver as never });
+    const input: AgentScheduleCreateInput = { title: 's', prompt: 'p', provider: 'claude', recurrence: { kind: 'daily', time: '09:00' }, timezone: 'Asia/Taipei',
+      targets: [{ accountId: 'agent', chatType: 'group', chatId: 'g1', title: 'Group' }], task: { type: 'summary' }, window: { mode: 'since_last_run' },
+      delivery: { mode: 'primary_admin' }, jitterMinutes: 0, enabled: true };
+    const operation = service.createExternal(input, ['agent'], controller.signal);
+    await vi.waitFor(() => expect(resolver.resolve).toHaveBeenCalled());
+    controller.abort(new Error('disconnected'));
+    finish();
+    await expect(operation).rejects.toThrow('disconnected');
+    expect(store.create).not.toHaveBeenCalled();
+  });
+
+  it('does not update or delete an external schedule after cancellation before mutation starts', async () => {
+    const store = fakeStore([[]]);
+    let finish!: () => void;
+    const resolver = { resolve: vi.fn(async (targets: readonly { accountId: string; chatType: 'group'; chatId: string; title: string }[]) => {
+      await new Promise<void>((resolve) => { finish = resolve; });
+      return [...targets];
+    }), list: vi.fn(async () => []) };
+    const updateExternalScoped = vi.fn(async () => ({ scheduleId: SCHEDULE_ID }) as never);
+    const deleteExternalScoped = vi.fn(async () => true);
+    Object.assign(store, { updateExternalScoped, deleteExternalScoped });
+    store.get.mockResolvedValueOnce({ scheduleId: SCHEDULE_ID, title: 's', prompt: '', provider: 'claude', recurrence: { kind: 'daily', time: '09:00' },
+      timezone: 'Asia/Taipei', targets: [{ accountId: 'agent', chatType: 'group', chatId: 'g1', title: 'Group' }], task: { type: 'summary' },
+      window: { mode: 'since_last_run' }, delivery: { mode: 'primary_admin' } } as never);
+    const service = new AgentScheduleService({ store, submit: vi.fn(async () => ({ jobId: 'job-1' })), targets: resolver as never });
+    const updateAbort = new AbortController();
+    const operation = service.updateExternal(SCHEDULE_ID, { targets: [{ accountId: 'agent', chatType: 'group', chatId: 'g1', title: 'Group' }] }, ['agent'], updateAbort.signal);
+    await vi.waitFor(() => expect(resolver.resolve).toHaveBeenCalled());
+    updateAbort.abort(new Error('disconnected during update resolution'));
+    finish();
+    await expect(operation).rejects.toThrow('disconnected during update resolution');
+    expect(updateExternalScoped).not.toHaveBeenCalled();
+    const deleteAbort = new AbortController();
+    deleteAbort.abort(new Error('disconnected before delete'));
+    await expect(service.deleteExternal(SCHEDULE_ID, ['agent'], deleteAbort.signal)).rejects.toThrow('disconnected before delete');
+    expect(deleteExternalScoped).not.toHaveBeenCalled();
+  });
+
   it('submits each Agent claim as an isolated schedule job with the deterministic request id and a prefixed prompt', async () => {
-    const store = fakeStore();
+    const store = fakeStore([[claim({ externalAccountScope: ['agent', 'admin'] })]]);
     const submit = vi.fn(async () => ({ jobId: 'job-1' }));
     const publish = vi.fn();
     const service = new AgentScheduleService({ store, submit, publish });
@@ -41,6 +106,7 @@ describe('AgentScheduleService', () => {
       provider: 'claude',
       requestId: `schedule:${SCHEDULE_ID}:2026-10-01T01:00:00.000Z`,
       prompt: '[排程] 早報\n任務：自訂\n輸出：只存排程紀錄\n指示：整理昨天的訊息並傳給我',
+      mcpAccountScope: ['agent', 'admin'],
     });
     expect(store.markSubmitted).toHaveBeenCalledWith('run-1', 'job-1');
     expect(store.markFailed).not.toHaveBeenCalled();
@@ -125,7 +191,7 @@ describe('AgentScheduleService', () => {
     const input: AgentScheduleCreateInput = { title: 't', prompt: 'p', provider: 'claude', recurrence: { kind: 'daily', time: '09:00' }, timezone: 'Asia/Taipei', targets: [],
       task: { type: 'custom' }, window: { mode: 'since_last_run' }, delivery: { mode: 'record_only' }, jitterMinutes: 0, enabled: true };
     await service.create(input);
-    expect(store.create).toHaveBeenCalledWith(input, new Date('2026-10-01T00:00:00Z'));
+    expect(store.create).toHaveBeenCalledWith(input, new Date('2026-10-01T00:00:00Z'), null);
     await vi.waitFor(() => expect(store.claimDue).toHaveBeenCalledTimes(1));
     store.get.mockResolvedValueOnce({ prompt: 'p', targets: [], task: { type: 'custom' } } as never);
     await service.update(SCHEDULE_ID, { enabled: false });

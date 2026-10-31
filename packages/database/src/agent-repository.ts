@@ -117,6 +117,8 @@ export interface ScheduleJobRequest {
   requestId: string;
   prompt: string;
   workspacePath: string;
+  /** Non-null only for externally created schedules; copied to the job so its MCP calls retain the same account scope. */
+  mcpAccountScope?: readonly string[] | null;
 }
 
 /** A prompt typed in the shared Agent room; it has no LINE account or chat. */
@@ -396,10 +398,11 @@ export class AgentRepository {
    */
   async enqueueScheduleJob(request: ScheduleJobRequest, jobId: string = randomUUID()): Promise<{ disposition: 'inserted' | 'duplicate'; jobId: string }> {
     const inserted = await this.pool.query<{ job_id: string }>(
-      `INSERT INTO agent_jobs (job_id, provider, source_type, source_request_id, prompt, workspace_path, generation)
-       VALUES ($1, $2, 'schedule', $3, $4, $5, 0)
+      `INSERT INTO agent_jobs (job_id, provider, source_type, source_request_id, prompt, workspace_path, generation, mcp_account_scope)
+       VALUES ($1, $2, 'schedule', $3, $4, $5, 0, $6)
        ON CONFLICT DO NOTHING RETURNING job_id`,
-      [jobId, request.provider, request.requestId, request.prompt, request.workspacePath]);
+      [jobId, request.provider, request.requestId, request.prompt, request.workspacePath,
+        request.mcpAccountScope === undefined || request.mcpAccountScope === null ? null : [...new Set(request.mcpAccountScope)]]);
     const existing = inserted.rows[0] ?? (await this.pool.query<{ job_id: string }>(
       "SELECT job_id FROM agent_jobs WHERE source_type = 'schedule' AND source_request_id = $1", [request.requestId])).rows[0];
     if (!existing) throw new Error('Schedule job insertion failed');

@@ -25,7 +25,7 @@ export interface InternalMcpLauncher {
   /** App-owned Skill guidance text, or null when unavailable. */
   skill(): Promise<string | null>;
   /** Hidden run-time instructions of a schedule-sourced job (request id `schedule:...`), or null when unavailable. */
-  scheduleContext?(sourceRequestId: string): Promise<string | null>;
+  scheduleContext?(sourceRequestId: string, jobId: string): Promise<string | null>;
 }
 
 /** Stable identity of a provider session generation (key order independent). */
@@ -62,6 +62,7 @@ export interface ScheduleSubmission {
   provider: AgentProvider;
   requestId: string;
   prompt: string;
+  mcpAccountScope?: readonly string[] | null;
 }
 
 export type AgentReaction = 'NICE' | 'AMAZING' | 'FUN' | 'LOVE' | 'SAD' | 'OMG' | 'UNDO';
@@ -344,7 +345,8 @@ export class AgentService {
    */
   async submitScheduled(input: ScheduleSubmission): Promise<{ disposition: 'inserted' | 'duplicate'; jobId: string }> {
     const workspacePath = await this.workspace.current();
-    const result = await this.agents.enqueueScheduleJob({ provider: input.provider, requestId: input.requestId, prompt: input.prompt, workspacePath });
+    const result = await this.agents.enqueueScheduleJob({ provider: input.provider, requestId: input.requestId, prompt: input.prompt, workspacePath,
+      ...(input.mcpAccountScope !== undefined ? { mcpAccountScope: input.mcpAccountScope } : {}) });
     this.kick(AGENT_SCHEDULE_QUEUE_KEY);
     return result;
   }
@@ -647,7 +649,7 @@ export class AgentService {
                 sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, jobId: job.jobId })))().catch(() => null);
               // Schedule-sourced jobs get their machine instructions here, in the run request only (the stored prompt stays the short card).
               const scheduleContext = job.sourceType === 'schedule' || isScheduledRunRequestId(job.sourceRequestId)
-                ? await (async () => await this.mcpLauncher?.scheduleContext?.(job.sourceRequestId!))().catch(() => null) ?? SCHEDULE_CONTEXT_UNAVAILABLE : null;
+                ? await (async () => await this.mcpLauncher?.scheduleContext?.(job.sourceRequestId!, job.jobId))().catch(() => null) ?? SCHEDULE_CONTEXT_UNAVAILABLE : null;
               const visible = scheduleContext ? `${request.prompt}
 
 ${scheduleContext}` : request.prompt;

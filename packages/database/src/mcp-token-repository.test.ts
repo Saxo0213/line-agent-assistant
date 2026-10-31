@@ -13,6 +13,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadMigrations, migrate } from './migrate.js';
+import { AgentRepository } from './agent-repository.js';
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -305,7 +306,8 @@ database('MCP token & audit repository and target/time message queries', () => {
   it('reads as the fixed local-client principal over the AGENT and PRIMARY_ADMIN accounts with no token and audits the call', async () => {
     const seen = await tokens.executeLocalClientRead({ toolName: 'list_targets',
       execute: async ({ principalId, authorizedAccountIds, toolScopes }) => ({ data: { principalId, authorizedAccountIds, toolScopes }, resultCount: 2 }) });
-    expect(seen).toEqual({ principalId: 'local-client', authorizedAccountIds: ['account-admin', 'account-agent'], toolScopes: [...MCP_TOOL_NAMES] });
+    expect(seen).toEqual({ principalId: 'local-client', authorizedAccountIds: ['account-admin', 'account-agent'],
+      toolScopes: [...MCP_TOOL_NAMES, 'list_send_targets', 'send_to_target', 'list_schedules', 'create_schedule', 'update_schedule', 'delete_schedule'] });
     const row = (await tokens.listAuditRecords(10)).find((entry) => entry.principalId === 'local-client' && entry.action === 'TOOL_CALLED');
     expect(row).toMatchObject({ tokenId: null, initiator: 'external_agent', toolName: 'list_targets',
       accountScopes: ['account-admin', 'account-agent'], grantVersion: null, disposition: 'ALLOWED', resultCount: 2 });
@@ -398,10 +400,14 @@ database('MCP token & audit repository and target/time message queries', () => {
       .rejects.toMatchObject({ code: 'SCOPE_DENIED' });
     await expect(tokens.executeLocalClientRead({ toolName: 'query_target_messages', requestedAccountId: 'no-such-account', execute }))
       .rejects.toMatchObject({ code: 'SCOPE_DENIED' });
-    for (const toolName of ['list_send_targets', 'send_to_target', 'query_agent_room_history', 'future_tool'] as const) {
+    for (const toolName of ['query_agent_room_history', 'future_tool'] as const) {
       await expect(tokens.executeLocalClientRead({ toolName: toolName as never, execute })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
     }
     expect(execute).not.toHaveBeenCalled();
+    for (const toolName of ['list_send_targets', 'send_to_target', 'list_schedules', 'create_schedule', 'update_schedule', 'delete_schedule'] as const) {
+      await expect(tokens.executeLocalClientRead({ toolName, execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }) }))
+        .resolves.toEqual(['account-admin', 'account-agent']);
+    }
 
     // Omitting accountId resolves to the role accounts, never to an account without a role.
     const result = await tokens.executeLocalClientRead({
@@ -421,8 +427,6 @@ database('MCP token & audit repository and target/time message queries', () => {
     expect(narrowed.some((row) => row.messageId === 'msg-agent-1')).toBe(false);
 
     const audits = await tokens.listAuditRecords(30);
-    expect(audits.some((row) => row.tokenId === null && row.principalId === 'local-client' && row.action === 'AUTH_REJECTED'
-      && row.disposition === 'SCOPE_DENIED' && row.toolName === 'send_to_target')).toBe(true);
     expect(audits.some((row) => row.tokenId === null && row.principalId === 'local-client' && row.action === 'AUTH_REJECTED'
       && row.disposition === 'SCOPE_DENIED' && row.accountScopes.join() === 'account-outside-roles')).toBe(true);
   });
@@ -504,6 +508,15 @@ database('MCP token & audit repository and target/time message queries', () => {
     } finally {
       resume();
       await pool.query('UPDATE account_control SET control_epoch = $1 WHERE singleton = true', [savedControlEpoch]);
+    }
+
+    // A paused Agent is excluded even when the Primary Admin remains usable; send target listing must receive only this scope.
+    await pool.query("UPDATE line_accounts SET mode = 'PAUSED' WHERE account_id = 'account-agent'");
+    try {
+      expect(await tokens.executeLocalClientRead({ toolName: 'list_send_targets', execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }) }))
+        .toEqual(['account-admin']);
+    } finally {
+      await pool.query("UPDATE line_accounts SET mode = 'ACTIVE_CONTROL' WHERE account_id = 'account-agent'");
     }
 
     // Acceptance 3: a paused account is excluded; when every role account is paused, reject SCOPE_DENIED.
@@ -792,10 +805,10 @@ database('MCP token & audit repository and target/time message queries', () => {
     expect(sendAudits.filter((row) => row.action === 'TOOL_CALLED' && row.disposition === 'ALLOWED' && row.resultCount === 2)).toHaveLength(4);
     expect(sendAudits.filter((row) => row.action === 'AUTH_REJECTED' && row.disposition === 'PERMISSION_DENIED'
       && row.principalId.startsWith('internal:chat_scoped:'))).toHaveLength(2);
-    // The external local client can never call the send tools.
+    // External send tools are allowed only through the separately authorized local-client path.
     for (const toolName of ['list_send_targets', 'send_to_target'] as const) {
-      await expect(tokens.executeLocalClientRead({ toolName, execute: async () => ({ data: 'unreachable' }) }))
-        .rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+      await expect(tokens.executeForInternalAgent({ context: friendCtx, toolName,
+        execute: async () => ({ data: 'unreachable' }) })).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
     }
 
     // Missing job, non-running job, stale generation, and capability context mismatch are all denied.
@@ -848,6 +861,51 @@ database('MCP token & audit repository and target/time message queries', () => {
       && r.principalId === 'internal:chat_scoped:direct:chat-friend-direct' && r.accountScopes.join() === 'account-agent')).toBe(true);
     expect(audits.some((r) => r.action === 'TOOL_CALLED' && r.principalId === 'internal:chat_scoped:group:group-alpha'
       && r.accountScopes.join() === 'account-agent')).toBe(true);
+  });
+
+  it('copies external schedule scope into internal authorization for reads, sends and schedule listing', async () => {
+    const agents = new AgentRepository(pool);
+    const scoped = await agents.enqueueScheduleJob({ provider: 'claude', requestId: `schedule:${randomUUID()}`, prompt: 'scoped', workspacePath: 'C:\\workspace',
+      mcpAccountScope: ['account-agent'] });
+    await pool.query("UPDATE agent_jobs SET status='running' WHERE job_id=$1", [scoped.jobId]);
+    const context = { sourceType: 'job' as const, jobId: scoped.jobId, generation: 0, accountId: null };
+    const read = await tokens.executeForInternalAgent({ context, toolName: 'list_targets',
+      execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }) });
+    expect(read).toEqual(['account-agent']);
+    await expect(tokens.executeForInternalAgent({ context, toolName: 'list_targets', requestedAccountId: 'account-admin',
+      execute: async () => ({ data: ['must not read'] }) })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+    const schedules = await tokens.executeForInternalAgent({ context, toolName: 'list_schedules',
+      execute: async ({ accountScope, authorizedAccountIds }) => ({ data: { accountScope, authorizedAccountIds } }) });
+    expect(schedules).toEqual({ accountScope: ['account-agent'], authorizedAccountIds: ['account-agent'] });
+    const sends = await tokens.executeForInternalAgent({ context, toolName: 'list_send_targets',
+      execute: async ({ accountScope, authorizedAccountIds }) => ({ data: { accountScope, authorizedAccountIds } }) });
+    expect(sends).toEqual({ accountScope: ['account-agent'], authorizedAccountIds: ['account-agent'] });
+
+    const schedulerRead = await tokens.executeForInternalAgent({ context: { sourceType: 'schedule', accountScope: ['account-agent'] }, toolName: 'list_targets',
+      execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }) });
+    expect(schedulerRead).toEqual(['account-agent']);
+    await pool.query("UPDATE line_accounts SET mode='PAUSED' WHERE account_id='account-agent'");
+    const pausedRead = await tokens.executeForInternalAgent({ context: { ...context, jobId: scoped.jobId }, toolName: 'list_targets',
+      execute: async ({ authorizedAccountIds }) => ({ data: authorizedAccountIds }) });
+    expect(pausedRead).toEqual([]);
+    await pool.query("UPDATE line_accounts SET mode='MONITOR_ONLY' WHERE account_id='account-agent'");
+    await expect(tokens.executeForInternalAgent({ context: { sourceType: 'schedule', accountScope: ['account-agent'] }, toolName: 'list_targets',
+      requestedAccountId: 'account-admin', execute: async () => ({ data: 'must not read' }) })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+
+    await pool.query("UPDATE agent_jobs SET status='completed' WHERE job_id=$1", [scoped.jobId]);
+    const wrongScope = await agents.enqueueScheduleJob({ provider: 'claude', requestId: `schedule:${randomUUID()}`, prompt: 'wrong scope', workspacePath: 'C:\\workspace',
+      mcpAccountScope: ['account-admin'] });
+    await pool.query("UPDATE agent_jobs SET status='running' WHERE job_id=$1", [wrongScope.jobId]);
+    await expect(tokens.executeForInternalAgent({ context: { ...context, jobId: wrongScope.jobId }, toolName: 'send_to_target',
+      execute: async () => ({ data: 'must not send' }) })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+    await pool.query("UPDATE agent_jobs SET status='completed' WHERE job_id=$1", [wrongScope.jobId]);
+
+    const legacy = await agents.enqueueScheduleJob({ provider: 'claude', requestId: `schedule:${randomUUID()}`, prompt: 'legacy scope', workspacePath: 'C:\\workspace' });
+    await pool.query("UPDATE agent_jobs SET status='running' WHERE job_id=$1", [legacy.jobId]);
+    const full = await tokens.executeForInternalAgent({ context: { ...context, jobId: legacy.jobId }, toolName: 'list_targets',
+      execute: async ({ authorizedAccountIds, accountScope }) => ({ data: { authorizedAccountIds, accountScope } }) });
+    expect(full.accountScope).toBeUndefined();
+    expect(full.authorizedAccountIds).toEqual(expect.arrayContaining(['account-admin', 'account-agent']));
   });
 
   it('destroys an MCP database client on request abort and releases the pool for later work', async () => {

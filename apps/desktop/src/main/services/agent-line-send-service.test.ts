@@ -100,9 +100,10 @@ const makeService = (callBudgetMs?: number) => new AgentLineSendService({
   messages: repo as unknown as AgentLineSendRepository, worker, canWriteLine: async () => canWrite, attachmentRoot,
   ...(callBudgetMs === undefined ? {} : { callBudgetMs }),
 });
-interface Submit { jobId?: string; chatType?: string; chatId?: string; signal?: AbortSignal; isLive?: () => boolean }
+interface Submit { jobId?: string; chatType?: string; chatId?: string; signal?: AbortSignal; isLive?: () => boolean; accountScope?: readonly string[] | null }
 async function authorize(items: unknown[], options: Submit = {}) {
   return service.authorize(fakeClient(), { jobId: options.jobId ?? 'job-1', principalId: PRINCIPAL,
+    ...(options.accountScope !== undefined ? { accountScope: options.accountScope } : {}),
     rawInput: { chatType: options.chatType ?? 'direct', chatId: options.chatId ?? 'u-friend', items } });
 }
 async function submit(items: unknown[], options: Submit = {}) {
@@ -118,7 +119,7 @@ async function storedAttachment(id: string, content: string, over: Partial<SendA
   await mkdir(path.join(attachmentRoot, 'ab'), { recursive: true });
   await writeFile(path.join(attachmentRoot, 'ab', `${id}.bin`), content);
   const value = { attachmentId: id, kind: 'file' as const, name: `${id}-name.txt`, status: 'ready' as const, relativePath,
-    sha256: createHash('sha256').update(content).digest('hex'), sizeBytes: Buffer.byteLength(content), masked: false, ...over };
+    accountId: ACCOUNT, sha256: createHash('sha256').update(content).digest('hex'), sizeBytes: Buffer.byteLength(content), masked: false, ...over };
   repo.attachments.set(id, value);
   return value;
 }
@@ -143,6 +144,13 @@ afterEach(async () => {
 });
 
 describe('target and account authorization', () => {
+  it('returns no Agent send targets when the current external account scope excludes a paused Agent', async () => {
+    repo.account = ACCOUNT;
+    const output = await service.listTargets(fakeClient(), { query: 'Alice' }, ['primary-admin']);
+    expect(output).toEqual({ targets: [] });
+    expect(repo.listSendTargets).not.toHaveBeenCalled();
+  });
+
   it('rejects community and thread targets without touching LINE', async () => {
     for (const chatType of ['community', 'thread']) {
       const results = await submit([{ type: 'text', text: 'hi' }, { type: 'text', text: 'again' }], { chatType });
@@ -182,6 +190,39 @@ describe('target and account authorization', () => {
 });
 
 describe('items', () => {
+  it('rejects scoped sends whose archived message or stored attachment comes from another account', async () => {
+    repo.messages.set('source-other', { kind: 'text', text: 'secret', masked: false, attachments: [] });
+    const attachmentId = randomUUID();
+    await storedAttachment(attachmentId, 'private attachment', { accountId: 'acct-other' });
+    const messageResult = await submit([{ type: 'message', accountId: 'acct-other', chatType: 'direct', chatId: 'u-friend', messageId: 'source-other' }],
+      { accountScope: [ACCOUNT] });
+    const attachmentResult = await submit([{ type: 'attachment', attachmentId }], { accountScope: [ACCOUNT] });
+    expect(codes(messageResult)).toEqual(['send_source_unavailable']);
+    expect(codes(attachmentResult)).toEqual(['send_attachment_unavailable']);
+    expect(worker.sent).toHaveLength(0);
+  });
+
+  it('uses the configured Agent workspace for file items from a call without an Agent job', async () => {
+    await writeFile(path.join(workspace, 'external-report.txt'), 'external report');
+    const external = new AgentLineSendService({ messages: repo as unknown as AgentLineSendRepository, worker,
+      canWriteLine: async () => canWrite, attachmentRoot, workspacePath: async () => workspace });
+    const noJobClient = { query: vi.fn(async () => ({ rows: [] })) } as never;
+    try {
+      const callId = randomUUID();
+      const principalId = `local-client:${callId}`;
+      const authorized = await external.authorize(noJobClient, { jobId: callId, principalId,
+        rawInput: { chatType: 'direct', chatId: 'u-friend', items: [{ type: 'file', path: 'external-report.txt' }] } });
+      expect(authorized.kind).toBe('plan');
+      if (authorized.kind === 'plan') {
+        expect(authorized.plan.workspacePath).toBe(workspace);
+        const result = await external.run(authorized.plan, { signal: new AbortController().signal, isLive: () => true });
+        expect(statuses(result.results)).toEqual(['sent']);
+        expect(worker.sent[0]?.fileName).toBe('external-report.txt');
+        expect(repo.audit[0]).toMatchObject({ jobId: callId, principalId, itemKind: 'file', status: 'sent' });
+      }
+    } finally { await external.shutdown(); }
+  });
+
   it('splits long text at 4900 characters and sends the parts in order', async () => {
     expect(statuses(await submit([{ type: 'text', text: 'a'.repeat(4900) + 'b'.repeat(100) }]))).toEqual(['sent']);
     expect(worker.sent.map((entry) => entry.text!.length)).toEqual([4900, 100]);
@@ -226,7 +267,7 @@ describe('items', () => {
     await storedAttachment('att-queued', 'x', { status: 'queued' });
     await storedAttachment('att-masked', 'x', { masked: true });
     await storedAttachment('att-size', 'abcdef', { sizeBytes: 3 });
-    repo.attachments.set('att-gone', { attachmentId: 'att-gone', kind: 'file', name: 'g.txt', status: 'ready', relativePath: 'ab/gone.bin',
+    repo.attachments.set('att-gone', { attachmentId: 'att-gone', accountId: ACCOUNT, kind: 'file', name: 'g.txt', status: 'ready', relativePath: 'ab/gone.bin',
       sha256: null, sizeBytes: 5, masked: false });
     await storedAttachment('att-hash', 'abcdef', { sha256: createHash('sha256').update('different').digest('hex') });
     expect(statuses(await submit([{ type: 'attachment', attachmentId: 'att-ok' }]))).toEqual(['sent']);

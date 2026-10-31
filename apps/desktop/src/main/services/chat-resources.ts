@@ -308,7 +308,6 @@ function validateArchivePage(value: ChatResourceArchivePage, limit: number): Cha
 
 /** Main-owned, explicitly triggered LINE resource reads and native-store archive writes. */
 export class ChatResourceArchiveService {
-  private readonly notificationFlights = new Map<string, { dirty: boolean; promise: Promise<void> }>();
   private readonly queued: AdmissionTask[] = [];
   private readonly activeControllers = new Map<string, Set<AbortController>>();
   private readonly activeTasks = new Map<string, Set<AdmissionTask>>();
@@ -338,8 +337,7 @@ export class ChatResourceArchiveService {
     | { albums: AlbumDto[]; nextCursor: string | null } | { photos: PhotoDto[]; nextCursor: string | null }
     | { albumId: string; photoId: string; sizeBytes: number } | AlbumOpenResult | ReadableAlbumFolderResult> {
     const key = chatResourceConversationKey(request);
-    if (request.type === 'listChatNotes') return this.listNotes(key, request.cursor ?? null, signal);
-    if (request.type === 'getChatNote') return { note: await this.getNote(key, request.postId ?? '', signal) };
+    if (request.type === 'listChatNotes' || request.type === 'getChatNote') throw new Error('Notes are disabled.');
     if (request.type === 'listChatAlbums') return this.listAlbums(key, request.cursor ?? null, signal, 'modal', undefined, request.refresh === true);
     if (request.type === 'listChatAlbumPhotos') return this.listAlbumPhotos(key, request.albumId ?? '', request.cursor ?? null, signal, request.refresh === true);
     if (request.type === 'downloadChatAlbumPhoto') return this.downloadAlbumPhoto(key, request.albumId ?? '', request.photoId ?? '', request.oid ?? '', request.prefix ?? '', signal);
@@ -370,28 +368,9 @@ export class ChatResourceArchiveService {
     if (!this.stopped) this.closedAccounts.delete(accountId);
   }
 
-  /** Coalesces a chat's notifications into the active refresh plus one dirty trailing refresh at a time. */
-  refreshNotesFromNotification(key: ConversationKey): Promise<void> {
-    if (this.stopped) return Promise.resolve();
-    const id = `${key.accountId}\0${key.chatType}\0${key.chatId}`;
-    const existing = this.notificationFlights.get(id);
-    if (existing) { existing.dirty = true; return existing.promise; }
-    if (this.notificationFlights.size >= 32) return Promise.resolve();
-    const flight = { dirty: false, promise: Promise.resolve() };
-    flight.promise = (async () => {
-      do {
-        flight.dirty = false;
-        try { await this.listNotes(key, null, undefined, 'notification'); }
-        catch (error) {
-          if (!this.stopped && error instanceof Error && error.message === 'Chat resource service is busy.') {
-            flight.dirty = true;
-            await this.whenAdmissionAvailable();
-          }
-        }
-      } while (flight.dirty && !this.stopped);
-    })().finally(() => this.notificationFlights.delete(id));
-    this.notificationFlights.set(id, flight);
-    return flight.promise;
+  /** Disabled so Note notifications never start LINE reads. */
+  refreshNotesFromNotification(_key: ConversationKey): Promise<void> {
+    return Promise.resolve();
   }
 
   async shutdown(): Promise<void> {
@@ -423,8 +402,9 @@ export class ChatResourceArchiveService {
     return this.shutdownPromise;
   }
 
-  async listNotes(key: ConversationKey, cursor: string | null, signal?: AbortSignal, source: 'modal' | 'notification' = 'modal') {
-    return this.admit(key, signal, (operationSignal, generation) => this.listNotesImpl(key, cursor, operationSignal, generation, source));
+  async listNotes(_key: ConversationKey, _cursor: string | null, _signal?: AbortSignal, _source: 'modal' | 'notification' = 'modal')
+    : Promise<{ notes: NoteDto[]; nextCursor: string | null }> {
+    throw new Error('Notes are disabled.');
   }
   private async listNotesImpl(key: ConversationKey, cursor: string | null, signal: AbortSignal, generation: number, source: 'modal' | 'notification' = 'modal') {
     const { value, binding } = await this.read(key, 'listNotes', { cursor, limit: CHAT_RESOURCE_PAGE_LIMIT }, signal, generation, source);
@@ -435,8 +415,8 @@ export class ChatResourceArchiveService {
     return { notes, nextCursor: page.nextCursor };
   }
 
-  async getNote(key: ConversationKey, postId: string, signal?: AbortSignal) {
-    return this.admit(key, signal, (operationSignal, generation) => this.getNoteImpl(key, postId, operationSignal, generation));
+  async getNote(_key: ConversationKey, _postId: string, _signal?: AbortSignal): Promise<NoteDto> {
+    throw new Error('Notes are disabled.');
   }
   private async getNoteImpl(key: ConversationKey, postId: string, signal: AbortSignal, generation: number) {
     const id = boundedId(postId, 'post ID');
@@ -1024,11 +1004,6 @@ export class ChatResourceArchiveService {
     if (this.queued.length >= MAX_ARCHIVE_PENDING && !this.stopped) return;
     for (const resolve of this.admissionWaiters) resolve();
     this.admissionWaiters.clear();
-  }
-
-  private whenAdmissionAvailable(): Promise<void> {
-    if (this.stopped || this.queued.length < MAX_ARCHIVE_PENDING) return Promise.resolve();
-    return new Promise((resolve) => this.admissionWaiters.add(resolve));
   }
 
   private assertCurrent(accountId: string, generation: number, binding: ChatResourceBinding | null, signal: AbortSignal): void {

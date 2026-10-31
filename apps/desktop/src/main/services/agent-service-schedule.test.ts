@@ -80,8 +80,9 @@ database('AgentService: isolated scheduled runs', () => {
     const bind = vi.spyOn(agents, 'bindSession');
     const reset = vi.spyOn(agents, 'resetGeneration');
     const validate = vi.spyOn(agents, 'validateResumeSession');
-    const job = await svc.submitScheduled({ provider: 'claude', requestId: slot(1), prompt: '[排程] 早報' });
+    const job = await svc.submitScheduled({ provider: 'claude', requestId: slot(1), prompt: '[排程] 早報', mcpAccountScope: ['account-a'] });
     expect(job.disposition).toBe('inserted');
+    expect((await pool.query('SELECT mcp_account_scope FROM agent_jobs WHERE job_id=$1', [job.jobId])).rows[0]?.mcp_account_scope).toEqual(['account-a']);
     await until(async () => await status(job.jobId) === 'completed');
     const request = requests.find((item) => item.jobId === job.jobId)!;
     expect(request.source).toEqual({ type: 'schedule', requestId: slot(1) });
@@ -116,7 +117,7 @@ database('AgentService: isolated scheduled runs', () => {
     const job = await svc.submitScheduled({ provider: 'claude', requestId: slot(3), prompt: '[排程] 早報\n任務：自訂' });
     await until(async () => await status(job.jobId) === 'completed');
     const request = requests.find((item) => item.jobId === job.jobId)!;
-    expect(context).toHaveBeenCalledWith(slot(3));
+    expect(context).toHaveBeenCalledWith(slot(3), job.jobId);
     expect(request.prompt).toContain('# skill');
     expect(request.prompt).toContain('輸出位置：排程紀錄與 LINE');
     expect(request.prompt).toContain('[排程] 早報\n任務：自訂\n\n【排程規則】hidden machine rules');

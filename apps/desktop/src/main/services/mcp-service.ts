@@ -33,11 +33,13 @@ import {
   type ConversationKey,
   type WorkerBinding,
   type McpMessageRecord,
+  type McpListSendTargetsOutput,
   type McpServerStatus,
   type McpToolInputUnion,
   type McpToolName,
   type McpToolOutputUnion,
   type McpInternalToolName,
+  McpInternalToolNameSchema,
   type McpAgentRoomHistoryOutput,
 } from '@line-agent/contracts';
 import {
@@ -49,7 +51,7 @@ import {
   type MessageRepository,
   queryAgentRoomHistory,
 } from '@line-agent/database';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import {
   InternalMcpCapabilityRegistry,
@@ -58,7 +60,7 @@ import {
   type InternalMcpObservation,
 } from './internal-mcp-capabilities.js';
 import type { AgentApprovalBroker } from './agent-approval-broker.js';
-import type { AgentLineSendHandler } from './agent-line-send-service.js';
+import type { AgentLineSendHandler, AuthorizeOutcome } from './agent-line-send-service.js';
 import { isScheduledRunRequestId, type AgentScheduleService } from './agent-schedule-service.js';
 import { formatTaipei } from './agent-schedule-prompt.js';
 import type { McpChatResourceReader } from './mcp-chat-resource-reader.js';
@@ -281,8 +283,7 @@ export const AGENT_ROOM_HISTORY_TOOL_DEFINITION = {
 } as const;
 
 /**
- * Internal-only LINE send tools (docs/architecture/agent-line-send.md). Listed and callable only for the
- * Primary Admin's LINE jobs and the desktop operator; tools/call re-checks on every call.
+ * Local MCP LINE send tools. The external endpoint is loopback-only and rechecks account/write authority per call.
  */
 export const LIST_SEND_TARGETS_TOOL_DEFINITION = {
   name: LIST_SEND_TARGETS_TOOL_NAME,
@@ -298,7 +299,7 @@ export const LIST_SEND_TARGETS_TOOL_DEFINITION = {
 export const SEND_TO_TARGET_TOOL_DEFINITION = {
   name: SEND_TO_TARGET_TOOL_NAME,
   description:
-    'Send messages to one LINE chat of the Agent account (chatType direct, group or room; never a community). Each item becomes one LINE message, sent in order: {type:"text", text} (up to 5000 characters), {type:"message", accountId, chatType, chatId, messageId} to forward an archived message (use the ids from the query_target_messages results; text, images and files are forwarded), {type:"attachment", attachmentId} to send a stored attachment, or {type:"file", path} to send a file you made in the job workspace (jpg, jpeg, png and gif are sent as images, anything else as a file). Images up to 20 MiB, files up to 100 MiB; media cannot be sent to a room chat. At most 10 items per call and 30 per job. Results are returned per item as sent, failed, unknown or skipped; the first failed or unknown item stops the call and later items are skipped. Never repeat an item whose status is unknown: tell the admin instead, because it may have been delivered.',
+    'Send messages to one LINE chat of the Agent account (chatType direct, group or room; never a community). Each item becomes one LINE message, sent in order: {type:"text", text} (up to 5000 characters), {type:"message", accountId, chatType, chatId, messageId} to forward an archived message (use the ids from the query_target_messages results; text, images and files are forwarded), {type:"attachment", attachmentId} to send a stored attachment, or {type:"file", path} to send a file in the authorized workspace (the job workspace for internal calls, the configured Agent workspace for external local calls; jpg, jpeg, png and gif are sent as images, anything else as a file). Images up to 20 MiB, files up to 100 MiB; media cannot be sent to a room chat. At most 10 items per call and 30 per job. Results are returned per item as sent, failed, unknown or skipped; the first failed or unknown item stops the call and later items are skipped. Never repeat an item whose status is unknown: tell the admin instead, because it may have been delivered.',
   inputSchema: {
     type: 'object',
     additionalProperties: false,
@@ -317,7 +318,7 @@ export const SEND_TO_TARGET_TOOL_DEFINITION = {
             { type: 'object', additionalProperties: false, required: ['type', 'attachmentId'],
               properties: { type: { const: 'attachment' }, attachmentId: { type: 'string', minLength: 1 } } },
             { type: 'object', additionalProperties: false, required: ['type', 'path'],
-              properties: { type: { const: 'file' }, path: { type: 'string', minLength: 1, maxLength: 1024, description: 'Path inside the job workspace.' } } },
+              properties: { type: { const: 'file' }, path: { type: 'string', minLength: 1, maxLength: 1024, description: 'Path inside the authorized Agent workspace.' } } },
           ],
         },
       },
@@ -328,8 +329,7 @@ export const SEND_TO_TARGET_TOOL_DEFINITION = {
 const SEND_TOOLS = [LIST_SEND_TARGETS_TOOL_DEFINITION, SEND_TO_TARGET_TOOL_DEFINITION] as const;
 
 /**
- * Internal-only schedule tools (docs/architecture/agent-schedules.md). Same principals as the send tools (Primary Admin and
- * the desktop operator); never in MCP_TOOL_DEFINITIONS or a token scope. A job started by a schedule cannot mutate schedules.
+ * Local MCP schedule tools. A job started by a schedule cannot mutate schedules.
  */
 const RECURRENCE_JSON_SCHEMA = {
   description: 'When to fire. once {at} or once {inMinutes: 1..10080} (a one-time run that many minutes from now; use it for "in 5 minutes" / 5 分鐘後); daily {time}; weekly {days (0=Sunday..6=Saturday), time}; interval {everyMinutes (5..10080), anchorAt}; cron {expression: 5 fields minute hour day-of-month month day-of-week}. time is HH:mm in the schedule timezone; at and anchorAt are ISO-8601 datetimes with offset.',
@@ -356,6 +356,8 @@ const READ_TARGET_JSON_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['accountId', 'chatType', 'chatId'],
   properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room', 'community', 'thread'] }, chatId: { type: 'string' }, title: { type: 'string', maxLength: 200 } },
 } as const;
+
+const DISABLED_NOTE_TOOLS = new Set<McpToolName>(['list_chat_notes', 'get_chat_note']);
 const SEND_TARGET_JSON_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['accountId', 'chatType', 'chatId'],
   properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, title: { type: 'string', maxLength: 200 } },
@@ -459,7 +461,8 @@ export const DELETE_SCHEDULE_TOOL_DEFINITION = {
 } as const;
 const SCHEDULE_TOOLS = [LIST_SCHEDULES_TOOL_DEFINITION, CREATE_SCHEDULE_TOOL_DEFINITION, UPDATE_SCHEDULE_TOOL_DEFINITION, DELETE_SCHEDULE_TOOL_DEFINITION] as const;
 /** The schedule operations McpService needs; AgentScheduleService provides them. */
-export type AgentScheduleToolHandler = Pick<AgentScheduleService, 'list' | 'create' | 'update' | 'delete' | 'primaryAdminChat'>;
+export type AgentScheduleToolHandler = Pick<AgentScheduleService, 'list' | 'create' | 'update' | 'delete' | 'primaryAdminChat'>
+  & Partial<Pick<AgentScheduleService, 'listExternal' | 'createExternal' | 'updateExternal' | 'deleteExternal'>>;
 
 export function numberMcpTargets<T extends {
   accountId: string;
@@ -563,6 +566,7 @@ export class McpService {
   private readonly maxConcurrentRequests: number;
   private readonly rateLimitPerMinute: number;
   private readonly inFlight = new Set<Promise<unknown>>();
+  private readonly requestSlots = new Set<Promise<unknown>>();
   private readonly activeControllers = new Set<AbortController>();
   private externalRequestTimes: number[] = [];
   private closing = false;
@@ -574,11 +578,11 @@ export class McpService {
     this.rateLimitPerMinute = options.rateLimitPerMinute ?? DEFAULT_MCP_RATE_LIMIT_PER_MINUTE;
   }
 
-  private track<T>(work: (signal: AbortSignal) => Promise<T>, parentSignal?: AbortSignal): Promise<T> {
+  private track<T>(work: (signal: AbortSignal, releaseRequestSlot: () => void) => Promise<T>, parentSignal?: AbortSignal): Promise<T> {
     if (this.closing) {
       return Promise.reject(new McpDomainError('RATE_LIMITED', 'MCP service is shutting down.'));
     }
-    if (this.inFlight.size >= this.maxConcurrentRequests) {
+    if (this.requestSlots.size >= this.maxConcurrentRequests) {
       return Promise.reject(
         new McpDomainError('RATE_LIMITED', 'Maximum concurrent MCP requests exceeded.'),
       );
@@ -588,11 +592,19 @@ export class McpService {
     if (parentSignal?.aborted) abort();
     else parentSignal?.addEventListener('abort', abort, { once: true });
     this.activeControllers.add(controller);
-    const promise = Promise.resolve().then(() => work(controller.signal));
+    let promise: Promise<T>;
+    let requestSlotReleased = false;
+    const releaseRequestSlot = () => {
+      if (requestSlotReleased) return;
+      requestSlotReleased = true;
+      if (promise) this.requestSlots.delete(promise);
+    };
+    promise = Promise.resolve().then(() => work(controller.signal, releaseRequestSlot));
     this.inFlight.add(promise);
+    this.requestSlots.add(promise);
     void promise.then(
-      () => { this.inFlight.delete(promise); this.activeControllers.delete(controller); parentSignal?.removeEventListener('abort', abort); },
-      () => { this.inFlight.delete(promise); this.activeControllers.delete(controller); parentSignal?.removeEventListener('abort', abort); },
+      () => { this.inFlight.delete(promise); this.requestSlots.delete(promise); this.activeControllers.delete(controller); parentSignal?.removeEventListener('abort', abort); },
+      () => { this.inFlight.delete(promise); this.requestSlots.delete(promise); this.activeControllers.delete(controller); parentSignal?.removeEventListener('abort', abort); },
     );
     return promise;
   }
@@ -632,6 +644,7 @@ export class McpService {
     extraConversationScopes: ReadonlyArray<Pick<ConversationKey, 'chatType' | 'chatId'>> = [],
     signal?: AbortSignal,
   ): Promise<{ output: McpToolOutputUnion; resultCount: number }> {
+    if (DISABLED_NOTE_TOOLS.has(tool.name)) throw new McpDomainError('SCOPE_DENIED', 'Chat notes are disabled.');
     const scopeFilter = {
       ...(conversationScope ? { conversationScope } : {}),
       ...(extraConversationScopes.length > 0 ? { extraConversationScopes } : {}),
@@ -879,16 +892,17 @@ export class McpService {
       if (toolName === LIST_SEND_TARGETS_TOOL_NAME) {
         return { data: await this.track(() => this.options.tokens.executeForInternalAgent({
           context, toolName, signal,
-          execute: async ({ client }) => {
-            const output = await handler.listTargets(client, rawArguments);
+          execute: async ({ client, accountScope }) => {
+            const output = await handler.listTargets(client, rawArguments, accountScope);
             return { data: output, resultCount: output.targets.length };
           },
         }), signal) };
       }
       const outcome = await this.track(() => this.options.tokens.executeForInternalAgent({
         context, toolName, signal,
-        execute: async ({ client, principalId }) => {
-          const authorized = await handler.authorize(client, { jobId: capability.jobId, principalId, rawInput: rawArguments });
+        execute: async ({ client, principalId, accountScope }) => {
+          const authorized = await handler.authorize(client, { jobId: capability.jobId, principalId, rawInput: rawArguments,
+            ...(accountScope !== undefined ? { accountScope } : {}) });
           const count = authorized.kind === 'plan' ? authorized.plan.items.length : authorized.output.results.length;
           return { data: authorized, resultCount: count };
         },
@@ -924,10 +938,11 @@ export class McpService {
     try {
       const job = await this.track(() => this.options.tokens.executeForInternalAgent({
         context, toolName, signal,
-        execute: async ({ client }) => {
+        execute: async ({ client, accountScope }) => {
           const row = (await client.query<{ source_type: string; source_request_id: string | null; provider: 'codex' | 'claude' }>(
             'SELECT source_type, source_request_id, provider FROM agent_jobs WHERE job_id = $1', [context.jobId])).rows[0];
-          return { data: { scheduledRun: row?.source_type === 'schedule' || isScheduledRunRequestId(row?.source_request_id), provider: row?.provider ?? 'claude' as const }, resultCount: 0 };
+          return { data: { scheduledRun: row?.source_type === 'schedule' || isScheduledRunRequestId(row?.source_request_id), provider: row?.provider ?? 'claude' as const,
+            accountScope }, resultCount: 0 };
         },
       }), signal);
       if (toolName !== LIST_SCHEDULES_TOOL_NAME && job.scheduledRun) {
@@ -939,7 +954,7 @@ export class McpService {
         const parsed = ListSchedulesToolInputSchema.safeParse(rawArguments);
         if (!parsed.success) return invalid(parsed.error);
         const { status } = parsed.data;
-        const schedules = (await handler.list()).filter((schedule) => status === 'all' || schedule.enabled === (status === 'active'));
+        const schedules = (job.accountScope == null ? await handler.list() : await handler.listExternal?.(job.accountScope) ?? []).filter((schedule) => status === 'all' || schedule.enabled === (status === 'active'));
         return { data: { toolName, schedules } };
       }
       if (toolName === CREATE_SCHEDULE_TOOL_NAME) {
@@ -973,6 +988,54 @@ export class McpService {
       return { data: { toolName, deleted: true, scheduleId: parsed.data.scheduleId } };
     } catch (error) {
       if (error instanceof McpDomainError && (error.code === 'PERMISSION_DENIED' || error.code === 'SCOPE_DENIED')) return notPermitted;
+      if (error instanceof AgentScheduleError) return { error: { code: error.code, message: error.message } };
+      throw error;
+    }
+  }
+
+  /** External local-client schedule mutation happens after the short audited MCP transaction commits. */
+  private async callExternalScheduleTool(toolName: ScheduleToolName, rawArguments: Record<string, unknown>, authorizedAccountIds: readonly string[], signal: AbortSignal): Promise<unknown> {
+    const handler = this.options.schedules;
+    if (!handler) return { error: { code: 'schedule_not_permitted' } };
+    if (!handler.listExternal || !handler.createExternal || !handler.updateExternal || !handler.deleteExternal) return { error: { code: 'schedule_not_permitted' } };
+    const invalid = (error: { issues: ReadonlyArray<{ message: string }> }) =>
+      ({ error: { code: 'INVALID_INPUT', message: error.issues[0]?.message ?? 'Invalid input.' } });
+    try {
+      if (toolName === LIST_SCHEDULES_TOOL_NAME) {
+        const parsed = ListSchedulesToolInputSchema.safeParse(rawArguments);
+        if (!parsed.success) return invalid(parsed.error);
+        return { toolName, schedules: (await handler.listExternal(authorizedAccountIds)).filter((schedule) => parsed.data.status === 'all' || schedule.enabled === (parsed.data.status === 'active')) };
+      }
+      if (toolName === CREATE_SCHEDULE_TOOL_NAME) {
+        const parsed = CreateScheduleToolInputSchema.safeParse(rawArguments);
+        if (!parsed.success) return invalid(parsed.error);
+        const input = parsed.data;
+        const targets = input.targets ?? [];
+        const delivery = input.delivery ?? { mode: 'primary_admin' as const };
+        const referencedAccounts = [...new Set([...targets.map((target) => target.accountId), ...(delivery.mode === 'line_target' ? [delivery.target.accountId] : [])])];
+        const accountScope = [...authorizedAccountIds];
+        if (referencedAccounts.some((accountId) => !authorizedAccountIds.includes(accountId))) {
+          return { error: { code: 'SCHEDULE_INVALID_TARGET', message: 'Schedule target is outside the authorized account scope.' } };
+        }
+        const schedule = await handler.createExternal({ title: input.title, prompt: input.prompt ?? '', recurrence: this.scheduleRecurrence(input.recurrence),
+          provider: input.provider ?? 'claude', timezone: input.timezone ?? 'Asia/Taipei', targets,
+          task: input.task ?? (targets.length ? { type: 'summary' } : { type: 'custom' }), window: input.window ?? { mode: 'since_last_run' },
+          delivery, enabled: input.enabled ?? true, jitterMinutes: input.jitterMinutes ?? 0 }, accountScope, signal);
+        const deliveryLabel = schedule.delivery.mode === 'primary_admin' ? '管理員'
+          : schedule.delivery.mode === 'line_target' ? schedule.delivery.target.title.trim() || schedule.delivery.target.chatId : '只保存在排程紀錄';
+        return { toolName, schedule, nextFireAtTaipei: schedule.nextFireAt ? formatTaipei(new Date(schedule.nextFireAt)) : null, deliveryLabel };
+      }
+      if (toolName === UPDATE_SCHEDULE_TOOL_NAME) {
+        const parsed = UpdateScheduleToolInputSchema.safeParse(rawArguments);
+        if (!parsed.success) return invalid(parsed.error);
+        const { scheduleId, recurrence, ...rest } = parsed.data;
+        return { toolName, schedule: await handler.updateExternal(scheduleId, { ...rest, ...(recurrence ? { recurrence: this.scheduleRecurrence(recurrence) } : {}) }, authorizedAccountIds, signal) };
+      }
+      const parsed = DeleteScheduleToolInputSchema.safeParse(rawArguments);
+      if (!parsed.success) return invalid(parsed.error);
+      if (!await handler.deleteExternal(parsed.data.scheduleId, authorizedAccountIds, signal)) return { error: { code: 'SCHEDULE_NOT_FOUND', message: 'Schedule not found.' } };
+      return { toolName, deleted: true, scheduleId: parsed.data.scheduleId };
+    } catch (error) {
       if (error instanceof AgentScheduleError) return { error: { code: error.code, message: error.message } };
       throw error;
     }
@@ -1078,7 +1141,7 @@ export class McpService {
     parentSignal?: AbortSignal,
   ): Promise<{ httpStatus: number; body: Record<string, unknown> | null }> {
     const diagnosticIdentity = { correlationId: crypto.randomUUID() };
-    return this.track(async (signal) => {
+    return this.track(async (signal, releaseRequestSlot) => {
       if (!rawPayload || typeof rawPayload !== 'object' || Array.isArray(rawPayload)) {
         return {
           httpStatus: 400,
@@ -1161,7 +1224,7 @@ export class McpService {
             signal,
             rateLimiter: () => this.checkExternalRateLimit(),
             execute: async ({ toolScopes }) => ({
-              data: MCP_TOOL_DEFINITIONS.filter((def) => toolScopes.includes(def.name)
+              data: [...MCP_TOOL_DEFINITIONS, ...(this.options.lineSend ? SEND_TOOLS : []), ...(this.options.schedules ? SCHEDULE_TOOLS : [])].filter((def) => !DISABLED_NOTE_TOOLS.has(def.name as McpToolName) && toolScopes.includes(def.name)
                 && (this.options.chatResources || !def.name.startsWith('list_chat_') && !def.name.startsWith('get_chat_'))),
             }),
           });
@@ -1176,7 +1239,7 @@ export class McpService {
             rpc.params && typeof rpc.params === 'object' && !Array.isArray(rpc.params)
               ? (rpc.params as { name?: unknown; arguments?: unknown })
               : {};
-          const toolNameCheck = McpToolNameSchema.safeParse(params.name);
+          const toolNameCheck = McpInternalToolNameSchema.safeParse(params.name);
           if (!toolNameCheck.success) {
             await this.options.tokens.executeLocalClientRead({
               toolName: null,
@@ -1203,6 +1266,56 @@ export class McpService {
             typeof rawArgs.accountId === 'string' && rawArgs.accountId.trim()
               ? rawArgs.accountId.trim()
               : undefined;
+
+          if (toolName === LIST_SEND_TARGETS_TOOL_NAME || toolName === SEND_TO_TARGET_TOOL_NAME) {
+            const handler = this.options.lineSend;
+            if (!handler) throw new McpDomainError('SCOPE_DENIED', 'LINE send tools are unavailable.');
+            const requestId = randomUUID();
+            const principalId = `local-client:${requestId}`;
+            const staged = toolName === LIST_SEND_TARGETS_TOOL_NAME
+              ? await this.options.tokens.executeLocalClientRead<McpListSendTargetsOutput>({
+                toolName, principalId, signal, ...(requestedAccountId ? { requestedAccountId } : {}),
+                rateLimiter: () => this.checkExternalRateLimit(),
+                execute: async ({ client, authorizedAccountIds }) => {
+                  const data = await handler.listTargets(client, rawArgs, authorizedAccountIds);
+                  return { data, resultCount: data.targets.length };
+                },
+              })
+              : await this.options.tokens.executeLocalClientRead<AuthorizeOutcome>({
+                toolName, principalId, signal, ...(requestedAccountId ? { requestedAccountId } : {}),
+                rateLimiter: () => this.checkExternalRateLimit(),
+                execute: async ({ client, authorizedAccountIds }) => ({ data: await handler.authorize(client, { jobId: requestId, principalId, rawInput: rawArgs, accountScope: authorizedAccountIds }) }),
+              });
+            let data: unknown;
+            if ('targets' in staged) data = staged;
+            else if (staged.kind === 'plan') {
+              releaseRequestSlot();
+              data = await handler.run(staged.plan, { signal, isLive: () => !signal.aborted && !this.closing });
+            }
+            else data = staged.output;
+            return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data, isError: false } } };
+          }
+
+          if (isScheduleToolName(toolName)) {
+            const handler = this.options.schedules;
+            if (!handler) throw new McpDomainError('SCOPE_DENIED', 'Schedule tools are unavailable.');
+            const requestId = randomUUID();
+            const authorizedAccountIds = await this.options.tokens.executeLocalClientRead({ toolName, principalId: `local-client:${requestId}`, signal,
+              rateLimiter: () => this.checkExternalRateLimit(), execute: async ({ authorizedAccountIds }) => {
+                const parsed = toolName === CREATE_SCHEDULE_TOOL_NAME ? CreateScheduleToolInputSchema.safeParse(rawArgs)
+                  : toolName === UPDATE_SCHEDULE_TOOL_NAME ? UpdateScheduleToolInputSchema.safeParse(rawArgs)
+                    : toolName === DELETE_SCHEDULE_TOOL_NAME ? DeleteScheduleToolInputSchema.safeParse(rawArgs)
+                      : ListSchedulesToolInputSchema.safeParse(rawArgs);
+                if (!parsed.success) throw new McpDomainError('INVALID_INPUT', parsed.error.issues[0]?.message ?? 'Invalid input.');
+                return { data: authorizedAccountIds };
+              } });
+            if (signal.aborted || this.closing) return { httpStatus: 200, body: { jsonrpc: '2.0', id,
+              error: { code: -32800, message: 'Request cancelled before schedule operation started.' } } };
+            releaseRequestSlot();
+            const result = await this.callExternalScheduleTool(toolName, rawArgs, authorizedAccountIds, signal);
+            const isError = !!result && typeof result === 'object' && 'error' in result;
+            return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result, isError } } };
+          }
 
           // Verify tool and account scope first, then validate arguments and execute
           const output = await this.options.tokens.executeLocalClientRead({
@@ -1362,6 +1475,7 @@ export class McpService {
     const verify = () => this.track(() => this.options.tokens.verifyInternalAgentAccess({ context, signal }), signal);
     const allowedTools = (permissions: EffectivePermissions) => MCP_TOOL_DEFINITIONS.filter(
       (definition) => MCP_TOOL_PERMISSIONS[definition.name].some((permission) => permissions[permission] === 'ALLOW')
+        && !DISABLED_NOTE_TOOLS.has(definition.name)
         && (this.options.chatResources || !definition.name.startsWith('list_chat_') && !definition.name.startsWith('get_chat_')));
     const finalCheck = async (toolName: McpInternalToolName | null): Promise<void> => {
       if (this.internalCapabilities.isLive(capability) && !signal.aborted) return;

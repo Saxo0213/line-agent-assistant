@@ -23,7 +23,7 @@ const msg = (chatId: string, minute: number, overrides: Partial<ScheduleMessage>
 });
 const claim = (task: AgentScheduleNewMessagesTask, overrides: Partial<AgentScheduleClaim> = {}): AgentScheduleClaim => ({
   runId: 'run-1', scheduleId: SCHEDULE_ID, scheduledFor: SLOT, title: '新訊息', prompt: '', provider: 'claude', recurrence: { kind: 'daily', time: '09:00' }, timezone: 'Asia/Taipei',
-  targets: [], task, window: { mode: 'lookback', minutes: 60 }, delivery: { mode: 'primary_admin' }, previousSubmittedFor: null, ...overrides,
+  targets: [], task, window: { mode: 'lookback', minutes: 60 }, delivery: { mode: 'primary_admin' }, externalAccountScope: null, previousSubmittedFor: null, ...overrides,
 });
 
 function fakeStore(claims: AgentScheduleClaim[]) {
@@ -39,6 +39,7 @@ function fakeStore(claims: AgentScheduleClaim[]) {
 
 function harness(messages: ScheduleMessage[], c: AgentScheduleClaim, options: {
   send?: 'sent' | 'failed' | 'unknown' | Error; incomplete?: boolean; admin?: typeof ADMIN | null; reader?: AgentScheduleMessageReader | null; submitError?: Error;
+  agentLineage?: () => Promise<{ currentAccountId: string | null; accountIds: string[] }>;
 } = {}) {
   const store = fakeStore([c]);
   const order: string[] = [];
@@ -57,7 +58,7 @@ function harness(messages: ScheduleMessage[], c: AgentScheduleClaim, options: {
   const publish = vi.fn();
   const service = new AgentScheduleService({
     store, submit: submit as never, sendSystemText: sendSystemText as never, ...(options.reader === null ? {} : { readMessages: options.reader ?? reader }),
-    primaryAdminChat: async () => options.admin === undefined ? ADMIN : options.admin, onError, publish, now: () => SLOT,
+    primaryAdminChat: async () => options.admin === undefined ? ADMIN : options.admin, ...(options.agentLineage ? { agentLineage: options.agentLineage } : {}), onError, publish, now: () => SLOT,
   });
   return { store, reader, sendSystemText, submit, onError, publish, order, service };
 }
@@ -67,6 +68,15 @@ const noEffects = (h: ReturnType<typeof harness>) => {
 };
 
 describe('new_messages run', () => {
+  it('rechecks startup new_messages rules through the durable scheduled job scope', async () => {
+    const h = harness([], claim(newTask({ rules: [llmWhen('big', 'llm')] })));
+    h.store.get.mockResolvedValueOnce({ scheduleId: SCHEDULE_ID, title: '新訊息', prompt: '', provider: 'claude', recurrence: { kind: 'daily', time: '09:00' },
+      timezone: 'Asia/Taipei', targets: [], task: newTask({ rules: [llmWhen('big', 'llm')] }), window: { mode: 'lookback', minutes: 60 },
+      delivery: { mode: 'record_only' } } as never);
+    await h.service.runContext(`schedule:${SCHEDULE_ID}:${SLOT.toISOString()}`, 'schedule-job');
+    expect(h.reader).toHaveBeenCalledWith(expect.objectContaining({ context: { sourceType: 'job', jobId: 'schedule-job', generation: 0, accountId: null } }));
+  });
+
   it('marks no_messages and sends nothing when the window has no messages', async () => {
     const h = harness([], claim(newTask()));
     await h.service.tick();
@@ -115,6 +125,23 @@ describe('new_messages run', () => {
       prompt: `[排程] 新訊息\n任務：新訊息整理\n來源：群組huge（群組）、群組big（群組）\n範圍：${RANGE}\n輸出：傳給管理員` });
     expect(h.store.markSubmitted).toHaveBeenCalledWith('run-1', 'job-1');
     expect(h.store.markSent).not.toHaveBeenCalled();
+  });
+
+  it('keeps an external account fence on new_messages reads and the resulting job', async () => {
+    const h = harness([msg('big', 2)], claim(newTask({ rules: [llmWhen('big', 'llm')] }), { externalAccountScope: ['agent'] }));
+    await h.service.tick();
+    expect(h.reader).toHaveBeenCalledWith(expect.objectContaining({ context: { sourceType: 'schedule', accountScope: ['agent'] } }));
+    expect(h.submit).toHaveBeenCalledWith(expect.objectContaining({ mcpAccountScope: ['agent'] }));
+  });
+
+  it('uses the current Agent lineage scope for a claimed new_messages read after replacement', async () => {
+    const h = harness([msg('big', 2, { accountId: 'agent-new' })], claim(newTask({ rules: [llmWhen('big', 'llm')] }), {
+      externalAccountScope: ['agent-old'], targets: [{ accountId: 'agent-old', chatType: 'group', chatId: 'big', title: '群組big' }],
+    }), { agentLineage: async () => ({ currentAccountId: 'agent-new', accountIds: ['agent-new', 'agent-old'] }) });
+    await h.service.tick();
+    expect(h.reader).toHaveBeenCalledWith(expect.objectContaining({ targets: [{ accountId: 'agent-new', chatType: 'group', chatId: 'big', title: '群組big' }],
+      context: { sourceType: 'schedule', accountScope: ['agent-new'] } }));
+    expect(h.submit).toHaveBeenCalledWith(expect.objectContaining({ mcpAccountScope: ['agent-new'] }));
   });
 
   it('creates a job and sends nothing when only llm chats remain', async () => {
@@ -267,10 +294,10 @@ describe('new_messages run', () => {
       const previous = new Date('2026-10-01T00:20:00.000Z');
       const h = harness([], claim(newTask(), { targets, window: { mode: 'since_last_run' }, previousSubmittedFor: previous }));
       await h.service.tick();
-      expect(h.reader).toHaveBeenCalledWith({ from: previous, to: SLOT, targets });
+      expect(h.reader).toHaveBeenCalledWith({ from: previous, to: SLOT, targets, context: { sourceType: 'schedule', accountScope: null } });
       const lookback = harness([], claim(newTask(), { window: { mode: 'lookback', minutes: 90 } }));
       await lookback.service.tick();
-      expect(lookback.reader).toHaveBeenCalledWith({ from: new Date(SLOT.getTime() - 90 * 60_000), to: SLOT, targets: [] });
+      expect(lookback.reader).toHaveBeenCalledWith({ from: new Date(SLOT.getTime() - 90 * 60_000), to: SLOT, targets: [], context: { sourceType: 'schedule', accountScope: null } });
     });
   });
 });
@@ -287,7 +314,7 @@ describe('runContext of a new_messages schedule', () => {
     const h = harness([msg('small', 1), msg('big', 2), msg('noise', 3)], claim(newTask()));
     h.store.get.mockResolvedValue(schedule(newTask({ rules: [llmWhen('big', 'llm'), llmWhen('noise', 'skip')] }), { prompt: '看重點' }) as never);
     const context = (await h.service.runContext(requestId))!;
-    expect(h.reader).toHaveBeenCalledWith({ from: new Date(SLOT.getTime() - 60 * 60_000), to: SLOT, targets: [] });
+    expect(h.reader).toHaveBeenCalledWith({ from: new Date(SLOT.getTime() - 60 * 60_000), to: SLOT, targets: [], context: { sourceType: 'schedule', accountScope: null } });
     expect(context).toContain('【排程規則】無人值守');
     expect(context).toContain(`時間：${RANGE}（台灣時間）；查詢用 UTC from=2026-10-01T00:00:00.000Z to=2026-10-01T01:00:00.000Z`);
     expect(context).toContain('分頁規則');
@@ -308,7 +335,7 @@ describe('runContext of a new_messages schedule', () => {
     h.store.previousSubmittedFor.mockResolvedValue(new Date('2026-10-01T00:30:00.000Z'));
     await h.service.runContext(requestId);
     expect(h.store.previousSubmittedFor).toHaveBeenCalledWith(SCHEDULE_ID, SLOT);
-    expect(h.reader).toHaveBeenCalledWith({ from: new Date('2026-10-01T00:30:00.000Z'), to: SLOT, targets: [] });
+    expect(h.reader).toHaveBeenCalledWith({ from: new Date('2026-10-01T00:30:00.000Z'), to: SLOT, targets: [], context: { sourceType: 'schedule', accountScope: null } });
     const other = harness([], claim(newTask()));
     other.store.get.mockResolvedValue(schedule({ type: 'custom' } as never, { prompt: '做事' }) as never);
     const text = (await other.service.runContext(requestId))!;

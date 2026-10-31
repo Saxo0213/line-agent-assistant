@@ -3,6 +3,7 @@ import {
   AGENT_SCHEDULE_JITTER_MAX_MINUTES,
   AGENT_SCHEDULE_MAX_ENABLED,
   AGENT_SCHEDULE_REQUEST_PREFIX,
+  agentScheduleShapeError,
   nextFireAfter,
   scheduleExecutionKind,
   scheduleMayUseLlm,
@@ -65,6 +66,8 @@ export interface AgentScheduleClaim {
   task: AgentScheduleTask;
   window: AgentScheduleWindow;
   delivery: AgentScheduleDelivery;
+  /** Null means an internal operator schedule with the legacy full scope; arrays restrict the scheduled MCP job. */
+  externalAccountScope: string[] | null;
   /** scheduled_for of the schedule's latest earlier run that counts for the since_last_run window (see COUNTED_OUTCOMES_SQL); null when none. */
   previousSubmittedFor: Date | null;
 }
@@ -78,12 +81,13 @@ export interface AgentScheduleClaimResult {
 interface ScheduleRow {
   schedule_id: string; title: string; prompt: string; provider: AgentProvider; recurrence: AgentScheduleRecurrence; timezone: string;
   targets: AgentScheduleTarget[]; task: AgentScheduleTask; task_window: AgentScheduleWindow; delivery: AgentScheduleDelivery;
+  external_account_scope: string[] | null;
   enabled: boolean; jitter_minutes: number; next_fire_at: Date | null; next_nominal_at: Date | null; last_fire_at: Date | null; last_outcome: AgentScheduleRunOutcome | null;
   created_at: Date; updated_at: Date;
 }
 interface RunRow { run_id: string; schedule_id: string; scheduled_for: Date; outcome: AgentScheduleRunOutcome; job_id: string | null; reply_preview: string | null; created_at: Date }
 
-const COLUMNS = `schedule_id, title, prompt, provider, recurrence, timezone, targets, task, task_window, delivery, enabled, jitter_minutes, next_fire_at, next_nominal_at, last_fire_at, last_outcome, created_at, updated_at`;
+const COLUMNS = `schedule_id, title, prompt, provider, recurrence, timezone, targets, task, task_window, delivery, enabled, jitter_minutes, next_fire_at, next_nominal_at, last_fire_at, last_outcome, created_at, updated_at, external_account_scope`;
 
 /**
  * Runs that move the since_last_run window forward. Every task counts 'submitted'. A new_messages task also counts the outcomes of a run
@@ -132,6 +136,27 @@ export class AgentScheduleRepository {
     return result.rows.map(toSchedule);
   }
 
+  async listExternalScoped(accountIds: readonly string[]): Promise<AgentSchedule[]> {
+    return this.transaction(async (client) => {
+      const allowed = await this.assertExternalAccountAuthority(client, accountIds);
+      const result = await client.query<ScheduleRow>(`SELECT ${COLUMNS} FROM agent_schedules
+        WHERE external_account_scope IS NOT NULL AND external_account_scope <@ $1::text[] ORDER BY created_at ASC, schedule_id ASC`, [allowed]);
+      return result.rows.map(toSchedule);
+    });
+  }
+
+  /** Rechecks role and pause state in the same transaction as external schedule CRUD, closing the post-MCP-auth race. */
+  private async assertExternalAccountAuthority(client: PoolClient, accountIds: readonly string[]): Promise<string[]> {
+    const expected = [...new Set(accountIds)].sort();
+    const current = (await client.query<{ account_id: string }>(`SELECT account_id FROM line_accounts
+      WHERE account_id = ANY($1::text[]) AND product_role = ANY($2::text[]) AND mode <> 'PAUSED'
+      ORDER BY account_id ASC FOR SHARE`, [expected, ['AGENT', 'PRIMARY_ADMIN']])).rows.map((row) => row.account_id);
+    if (current.length !== expected.length || current.some((accountId, index) => accountId !== expected[index])) {
+      throw new AgentScheduleError('SCHEDULE_INVALID_TARGET', 'An authorized LINE account changed before the schedule operation started.');
+    }
+    return expected;
+  }
+
   async get(scheduleId: string): Promise<AgentSchedule | null> {
     const result = await this.pool.query<ScheduleRow>(`SELECT ${COLUMNS} FROM agent_schedules WHERE schedule_id = $1`, [scheduleId]);
     return result.rows[0] ? toSchedule(result.rows[0]) : null;
@@ -146,50 +171,87 @@ export class AgentScheduleRepository {
     }
   }
 
-  async create(input: AgentScheduleCreateInput, now: Date = new Date()): Promise<AgentSchedule> {
+  async create(input: AgentScheduleCreateInput, now: Date = new Date(), externalAccountScope: readonly string[] | null = null): Promise<AgentSchedule> {
     const next = input.enabled ? planNextFire(input.recurrence, input.timezone, now, input.jitterMinutes, () => this.random()) : null;
     if (input.enabled && next === null) throw new AgentScheduleError('SCHEDULE_NO_FUTURE_TIME', 'The schedule has no future fire time.');
     return this.transaction(async (client) => {
+      if (externalAccountScope !== null) await this.assertExternalAccountAuthority(client, externalAccountScope);
       if (input.enabled) await this.assertEnabledRoom(client, null);
       const result = await client.query<ScheduleRow>(
-        `INSERT INTO agent_schedules (title, prompt, provider, recurrence_kind, recurrence, timezone, targets, task, task_window, delivery, enabled, next_fire_at, next_nominal_at, jitter_minutes)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12, $13, $14) RETURNING ${COLUMNS}`,
+        `INSERT INTO agent_schedules (title, prompt, provider, recurrence_kind, recurrence, timezone, targets, task, task_window, delivery, enabled, next_fire_at, next_nominal_at, jitter_minutes, external_account_scope)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12, $13, $14, $15) RETURNING ${COLUMNS}`,
         [input.title, input.prompt, input.provider, input.recurrence.kind, JSON.stringify(input.recurrence), input.timezone,
-          JSON.stringify(input.targets), JSON.stringify(input.task), JSON.stringify(input.window), JSON.stringify(input.delivery), input.enabled, next?.fireAt ?? null, next?.nominal ?? null, input.jitterMinutes]);
+          JSON.stringify(input.targets), JSON.stringify(input.task), JSON.stringify(input.window), JSON.stringify(input.delivery), input.enabled, next?.fireAt ?? null, next?.nominal ?? null, input.jitterMinutes,
+          externalAccountScope === null ? null : [...new Set(externalAccountScope)]]);
       return toSchedule(result.rows[0]!);
     });
   }
 
-  async update(scheduleId: string, patch: AgentScheduleUpdatePatch, now: Date = new Date()): Promise<AgentSchedule> {
+  async update(scheduleId: string, patch: AgentScheduleUpdatePatch, now: Date = new Date(), externalAccountScope?: readonly string[] | null): Promise<AgentSchedule> {
     return this.transaction(async (client) => {
       const current = (await client.query<ScheduleRow>(`SELECT ${COLUMNS} FROM agent_schedules WHERE schedule_id = $1 FOR UPDATE`, [scheduleId])).rows[0];
       if (!current) throw new AgentScheduleError('SCHEDULE_NOT_FOUND', 'Schedule not found.');
-      const recurrence = patch.recurrence ?? current.recurrence;
-      const timezone = patch.timezone ?? current.timezone;
-      const enabled = patch.enabled ?? current.enabled;
-      const jitterMinutes = patch.jitterMinutes ?? current.jitter_minutes;
-      if (enabled && !current.enabled) await this.assertEnabledRoom(client, scheduleId);
-      const retime = patch.recurrence !== undefined || patch.timezone !== undefined || jitterMinutes !== current.jitter_minutes || (enabled && !current.enabled) || (enabled && current.next_fire_at === null);
-      let next: { nominal: Date | null; fireAt: Date | null } | null = enabled ? { nominal: current.next_nominal_at ?? current.next_fire_at, fireAt: current.next_fire_at } : null;
-      if (enabled && retime) {
-        next = planNextFire(recurrence, timezone, now, jitterMinutes, () => this.random());
-        if (next === null) throw new AgentScheduleError('SCHEDULE_NO_FUTURE_TIME', 'The schedule has no future fire time.');
-      }
-      const result = await client.query<ScheduleRow>(
-        `UPDATE agent_schedules SET title = $2, prompt = $3, provider = $4, recurrence_kind = $5, recurrence = $6::jsonb, timezone = $7,
-           targets = $8::jsonb, task = $9::jsonb, task_window = $10::jsonb, delivery = $11::jsonb,
-           enabled = $12, next_fire_at = $13, next_nominal_at = $14, jitter_minutes = $15, updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
-         WHERE schedule_id = $1 RETURNING ${COLUMNS}`,
-        [scheduleId, patch.title ?? current.title, patch.prompt ?? current.prompt, patch.provider ?? current.provider, recurrence.kind,
-          JSON.stringify(recurrence), timezone, JSON.stringify(patch.targets ?? current.targets), JSON.stringify(patch.task ?? current.task),
-          JSON.stringify(patch.window ?? current.task_window), JSON.stringify(patch.delivery ?? current.delivery), enabled, next?.fireAt ?? null, next?.nominal ?? null, jitterMinutes]);
-      return toSchedule(result.rows[0]!);
+      return this.updateRow(client, scheduleId, patch, now, externalAccountScope === undefined ? current.external_account_scope ?? null : externalAccountScope, current);
     });
+  }
+
+  private async updateRow(client: PoolClient, scheduleId: string, patch: AgentScheduleUpdatePatch, now: Date,
+    externalAccountScope: readonly string[] | null, current: ScheduleRow): Promise<AgentSchedule> {
+    const recurrence = patch.recurrence ?? current.recurrence;
+    const timezone = patch.timezone ?? current.timezone;
+    const enabled = patch.enabled ?? current.enabled;
+    const jitterMinutes = patch.jitterMinutes ?? current.jitter_minutes;
+    if (enabled && !current.enabled) await this.assertEnabledRoom(client, scheduleId);
+    const retime = patch.recurrence !== undefined || patch.timezone !== undefined || jitterMinutes !== current.jitter_minutes || (enabled && !current.enabled) || (enabled && current.next_fire_at === null);
+    let next: { nominal: Date | null; fireAt: Date | null } | null = enabled ? { nominal: current.next_nominal_at ?? current.next_fire_at, fireAt: current.next_fire_at } : null;
+    if (enabled && retime) {
+      next = planNextFire(recurrence, timezone, now, jitterMinutes, () => this.random());
+      if (next === null) throw new AgentScheduleError('SCHEDULE_NO_FUTURE_TIME', 'The schedule has no future fire time.');
+    }
+    const result = await client.query<ScheduleRow>(
+      `UPDATE agent_schedules SET title = $2, prompt = $3, provider = $4, recurrence_kind = $5, recurrence = $6::jsonb, timezone = $7,
+         targets = $8::jsonb, task = $9::jsonb, task_window = $10::jsonb, delivery = $11::jsonb,
+         enabled = $12, next_fire_at = $13, next_nominal_at = $14, jitter_minutes = $15, external_account_scope = $16,
+         updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+       WHERE schedule_id = $1 RETURNING ${COLUMNS}`,
+      [scheduleId, patch.title ?? current.title, patch.prompt ?? current.prompt, patch.provider ?? current.provider, recurrence.kind,
+        JSON.stringify(recurrence), timezone, JSON.stringify(patch.targets ?? current.targets), JSON.stringify(patch.task ?? current.task),
+        JSON.stringify(patch.window ?? current.task_window), JSON.stringify(patch.delivery ?? current.delivery), enabled, next?.fireAt ?? null, next?.nominal ?? null, jitterMinutes,
+        externalAccountScope === null ? null : [...new Set(externalAccountScope)]]);
+    return toSchedule(result.rows[0]!);
   }
 
   async delete(scheduleId: string): Promise<boolean> {
     const result = await this.pool.query('DELETE FROM agent_schedules WHERE schedule_id = $1', [scheduleId]);
     return (result.rowCount ?? 0) > 0;
+  }
+
+  async updateExternalScoped(scheduleId: string, patch: AgentScheduleUpdatePatch, allowedAccountIds: readonly string[], requiredAccountIds: readonly string[], now: Date = new Date()): Promise<AgentSchedule> {
+    return this.transaction(async (client) => {
+      const currentAuthority = await this.assertExternalAccountAuthority(client, allowedAccountIds);
+      const current = (await client.query<ScheduleRow>(`SELECT ${COLUMNS} FROM agent_schedules WHERE schedule_id = $1 FOR UPDATE`, [scheduleId])).rows[0];
+      const scope = current?.external_account_scope;
+      if (!current || scope === null || scope === undefined || scope.some((accountId) => !currentAuthority.includes(accountId))) {
+        throw new AgentScheduleError('SCHEDULE_NOT_FOUND', 'Schedule not found.');
+      }
+      if (requiredAccountIds.some((accountId) => !scope.includes(accountId))) {
+        throw new AgentScheduleError('SCHEDULE_INVALID_TARGET', 'Schedule target is outside its authorized account scope.');
+      }
+      const invalid = agentScheduleShapeError({ prompt: patch.prompt ?? current.prompt, targets: patch.targets ?? current.targets,
+        task: patch.task ?? current.task, delivery: patch.delivery ?? current.delivery });
+      if (invalid) throw new AgentScheduleError('SCHEDULE_INVALID', invalid);
+      // Reuse the existing schedule update rules while keeping this row locked; retain the original scope.
+      return this.updateRow(client, scheduleId, patch, now, scope, current);
+    });
+  }
+
+  async deleteExternalScoped(scheduleId: string, allowedAccountIds: readonly string[]): Promise<boolean> {
+    return this.transaction(async (client) => {
+      const currentAuthority = await this.assertExternalAccountAuthority(client, allowedAccountIds);
+      const result = await client.query(`DELETE FROM agent_schedules WHERE schedule_id = $1 AND external_account_scope IS NOT NULL
+        AND external_account_scope <@ $2::text[]`, [scheduleId, currentAuthority]);
+      return (result.rowCount ?? 0) > 0;
+    });
   }
 
   /**
@@ -234,6 +296,7 @@ export class AgentScheduleRepository {
             [row.schedule_id, scheduledFor, row.task.type]);
           claims.push({ runId, scheduleId: row.schedule_id, scheduledFor, title: row.title, prompt: row.prompt, provider: row.provider,
             recurrence: row.recurrence, timezone: row.timezone, targets: row.targets, task: row.task, window: row.task_window, delivery: row.delivery,
+            externalAccountScope: row.external_account_scope,
             previousSubmittedFor: previous.rows[0]?.previous ?? null });
         }
       }

@@ -49,6 +49,8 @@ describe('MCP archived chat resource tools', () => {
   beforeEach(() => vi.clearAllMocks());
   it('serves successful internal and external JSON-RPC queries from the archive reader', async () => {
     const internal = createService();
+    const internalTools = await internal.service.handleInternalJsonRpc(internal.token, 'endpoint', { jsonrpc: '2.0', id: 0, method: 'tools/list' });
+    expect((internalTools.body as any).result.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(['list_chat_albums', 'get_chat_album']));
     const internalResponse = await internal.service.handleInternalJsonRpc(internal.token, 'endpoint', { jsonrpc: '2.0', id: 1, method: 'tools/call',
       params: { name: 'get_chat_album', arguments: { ...own, albumId: 'a1' } } });
     expect(internalResponse.httpStatus).toBe(200);
@@ -57,20 +59,33 @@ describe('MCP archived chat resource tools', () => {
     expect(internal.reader.getAlbum).toHaveBeenCalledWith(own, 'a1', expect.any(AbortSignal));
     await internal.service.shutdown();
 
-    const external = createService({ externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'] });
+    const external = createService({ externalScopes: ['list_chat_notes', 'list_chat_albums', 'get_chat_album'], externalAccounts: ['acc-a'] });
     const externalResponse = await external.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 2, method: 'tools/call',
       params: { name: 'list_chat_notes', arguments: own } });
-    expect(externalResponse.httpStatus).toBe(200);
-    expect((externalResponse.body as any).result.structuredContent).toMatchObject({ toolName: 'list_chat_notes', notes: [{ noteId: 'n1' }] });
+    expect(externalResponse.httpStatus).toBe(403);
+    expect(externalResponse.body).toMatchObject({ error: { message: 'Chat notes are disabled.' } });
+    expect(external.reader.listNotes).not.toHaveBeenCalled();
+    const externalAlbums = await external.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'list_chat_albums', arguments: own } });
+    expect(externalAlbums.httpStatus).toBe(200);
+    expect((externalAlbums.body as any).result.structuredContent).toMatchObject({ toolName: 'list_chat_albums', albums: [{ albumId: 'a1' }] });
+    const externalAlbum = await external.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 4, method: 'tools/call',
+      params: { name: 'get_chat_album', arguments: { ...own, albumId: 'a1' } } });
+    expect(externalAlbum.httpStatus).toBe(200);
+    expect((externalAlbum.body as any).result.structuredContent).toMatchObject({ toolName: 'get_chat_album', photos: [{ photoId: 'p1', available: true }] });
+    expect(JSON.stringify(externalAlbum.body)).not.toContain('private/path');
     await external.service.shutdown();
   });
 
   it('discovers new tools only when a reader is wired and the external tool scope includes them', async () => {
-    const withReader = createService({ externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'] });
+    const withReader = createService({ externalScopes: ['list_chat_notes', 'list_chat_albums', 'get_chat_album'], externalAccounts: ['acc-a'] });
     const external = await withReader.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 8, method: 'tools/list' });
-    expect((external.body as any).result.tools.map((tool: { name: string }) => tool.name)).toContain('list_chat_notes');
+    expect((external.body as any).result.tools.map((tool: { name: string }) => tool.name)).not.toContain('list_chat_notes');
+    expect((external.body as any).result.tools.map((tool: { name: string }) => tool.name)).not.toContain('get_chat_note');
+    expect((external.body as any).result.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(['list_chat_albums', 'get_chat_album']));
     const internal = await withReader.service.handleInternalJsonRpc(withReader.token, 'endpoint', { jsonrpc: '2.0', id: 9, method: 'tools/list' });
-    expect((internal.body as any).result.tools.map((tool: { name: string }) => tool.name)).toContain('list_chat_notes');
+    expect((internal.body as any).result.tools.map((tool: { name: string }) => tool.name)).not.toContain('list_chat_notes');
+    expect((internal.body as any).result.tools.map((tool: { name: string }) => tool.name)).not.toContain('get_chat_note');
     await withReader.service.shutdown();
 
     const noReader = createService({ externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'], reader: null });
@@ -111,37 +126,26 @@ describe('MCP archived chat resource tools', () => {
     await loggedOut.service.shutdown();
   });
 
-  it.each(['internal', 'external'] as const)('denies %s results when login is lost during the archive read', async (kind) => {
-    let finish!: (value: { notes: unknown[]; nextCursor: null; savedAt: string }) => void;
-    let checks = 0;
-    const deferredReader: McpChatResourceReader = { ...readResult, listNotes: vi.fn(() => new Promise<{ notes: unknown[]; nextCursor: null; savedAt: string }>((resolve) => { finish = resolve; })) };
-    const service = createService({ reader: deferredReader, externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'],
-      getBinding: async () => ++checks < 2 ? ({ accountId: 'acc-a', workerInstanceId: 'worker-a', controlEpoch: 1 }) : null });
-    const call = kind === 'internal'
-      ? service.service.handleInternalJsonRpc(service.token, 'endpoint', { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } })
-      : service.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } });
-    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
-    finish({ notes: [{ noteId: 'secret-note' }], nextCursor: null, savedAt: '2026-10-23T00:00:00.000Z' });
-    const response = await call;
-    expect(response.httpStatus).toBe(403);
-    expect(JSON.stringify(response.body)).not.toContain('secret-note');
+  it.each(['list_chat_notes', 'get_chat_note'] as const)('rejects direct internal and external calls to disabled %s', async (name) => {
+    const service = createService({ externalScopes: [name], externalAccounts: ['acc-a'] });
+    const args = name === 'list_chat_notes' ? own : { ...own, noteId: 'n1' };
+    const internal = await service.service.handleInternalJsonRpc(service.token, 'endpoint', { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name, arguments: args } });
+    const external = await service.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name, arguments: args } });
+    expect(internal.httpStatus).toBe(403);
+    expect(external.httpStatus).toBe(403);
+    expect(internal.body).toMatchObject({ error: { message: 'Chat notes are disabled.' } });
+    expect(external.body).toMatchObject({ error: { message: 'Chat notes are disabled.' } });
+    expect(service.reader.listNotes).not.toHaveBeenCalled();
+    expect(service.reader.getNote).not.toHaveBeenCalled();
     await service.service.shutdown();
   });
 
-  it.each(['internal', 'external'] as const)('denies %s results when the authenticated binding is replaced during the archive read', async (kind) => {
-    let finish!: (value: { notes: unknown[]; nextCursor: null; savedAt: string }) => void;
-    let checks = 0;
-    const deferredReader: McpChatResourceReader = { ...readResult, listNotes: vi.fn(() => new Promise<{ notes: unknown[]; nextCursor: null; savedAt: string }>((resolve) => { finish = resolve; })) };
-    const service = createService({ reader: deferredReader, externalScopes: ['list_chat_notes'], externalAccounts: ['acc-a'],
-      getBinding: async () => ({ accountId: 'acc-a', workerInstanceId: ++checks < 2 ? 'worker-a' : 'worker-b', controlEpoch: 1 }) });
-    const call = kind === 'internal'
-      ? service.service.handleInternalJsonRpc(service.token, 'endpoint', { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } })
-      : service.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'list_chat_notes', arguments: own } });
-    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
-    finish({ notes: [{ noteId: 'secret-note' }], nextCursor: null, savedAt: '2026-10-23T00:00:00.000Z' });
-    const response = await call;
-    expect(response.httpStatus).toBe(403);
-    expect(JSON.stringify(response.body)).not.toContain('secret-note');
+  it('continues serving external Album calls after Notes tools are disabled', async () => {
+    const service = createService({ externalScopes: ['list_chat_notes', 'list_chat_albums'], externalAccounts: ['acc-a'] });
+    const response = await service.service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'list_chat_albums', arguments: own } });
+    expect(response.httpStatus).toBe(200);
+    expect((response.body as any).result.structuredContent).toMatchObject({ toolName: 'list_chat_albums', albums: [{ albumId: 'a1' }] });
+    expect(service.reader.listAlbums).toHaveBeenCalledOnce();
     await service.service.shutdown();
   });
 });

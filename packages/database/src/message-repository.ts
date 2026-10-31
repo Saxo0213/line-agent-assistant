@@ -264,7 +264,7 @@ export type SendTargetRecord = Readonly<{
   no: number; chatType: SendChatType; chatId: string; title: string | null; members: string[]; memberCount: number;
 }>;
 export type SendAttachment = Readonly<{
-  attachmentId: string; kind: Attachment['kind']; name: string | null; status: Attachment['status'];
+  attachmentId: string; accountId: string; kind: Attachment['kind']; name: string | null; status: Attachment['status'];
   relativePath: string | null; sha256: string | null; sizeBytes: number | null;
 }>;
 export type SendSourceMessage = Readonly<{ kind: string; text: string | null; masked: boolean; attachments: SendAttachment[] }>;
@@ -273,11 +273,11 @@ export type LineSendAuditRow = Readonly<{
   itemKind: 'text' | 'message' | 'attachment' | 'file'; byteSize: number; status: 'sent' | 'failed' | 'unknown' | 'denied'; errorCode?: string | null;
 }>;
 type SendAttachmentRow = {
-  attachment_id: string; kind: Attachment['kind']; name: string | null; status: Attachment['status'];
+  attachment_id: string; account_id: string; kind: Attachment['kind']; name: string | null; status: Attachment['status'];
   relative_path: string | null; sha256: string | null; size_bytes: string | null;
 };
 const toSendAttachment = (row: SendAttachmentRow): SendAttachment => ({
-  attachmentId: row.attachment_id, kind: row.kind, name: row.name, status: row.status, relativePath: row.relative_path,
+  attachmentId: row.attachment_id, accountId: row.account_id, kind: row.kind, name: row.name, status: row.status, relativePath: row.relative_path,
   sha256: row.sha256, sizeBytes: row.size_bytes === null ? null : Number(row.size_bytes),
 });
 
@@ -1935,7 +1935,7 @@ export class MessageRepository {
     if (!row) return null;
     if (row.masked) return { kind: row.kind, text: null, masked: true, attachments: [] };
     const attachments = await queryable.query<SendAttachmentRow>(
-      `SELECT a.attachment_id, a.kind, a.name, a.status, a.relative_path, a.sha256, a.size_bytes
+      `SELECT a.attachment_id, a.account_id, a.kind, a.name, a.status, a.relative_path, a.sha256, a.size_bytes
        FROM attachments a
        WHERE a.account_id = $1 AND a.chat_type = $2 AND a.chat_id = $3 AND a.message_id = $4
        ORDER BY a.created_at ASC, a.attachment_id ASC`,
@@ -1950,7 +1950,7 @@ export class MessageRepository {
   ): Promise<(SendAttachment & { masked: boolean }) | null> {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(attachmentId)) return null;
     const result = await queryable.query<SendAttachmentRow & { masked: boolean }>(
-      `SELECT a.attachment_id, a.kind, a.name, a.status, a.relative_path, a.sha256, a.size_bytes, COALESCE(${AGENT_MASKED_SQL}, false) AS masked
+      `SELECT a.attachment_id, a.account_id, a.kind, a.name, a.status, a.relative_path, a.sha256, a.size_bytes, COALESCE(${AGENT_MASKED_SQL}, false) AS masked
        FROM attachments a
        JOIN messages m ON m.account_id = a.account_id AND m.chat_type = a.chat_type AND m.chat_id = a.chat_id AND m.message_id = a.message_id
        WHERE a.attachment_id = $1`,

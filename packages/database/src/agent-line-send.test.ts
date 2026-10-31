@@ -130,12 +130,10 @@ database('Agent LINE send persistence (real database)', () => {
       expect(stored.rows[0]!.details).toMatchObject({ error_code: 'MESSAGE_SEND_FAILED', diagnostic: { stage: 'write', upstreamStatus: 403 } });
     });
 
-    it('widens the audit tool-name check with both tools', async () => {
+    it('keeps the generalized audit tool-name length check', async () => {
       const def = await pool.query<{ def: string }>(
         "SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'mcp_agent_audit_tool_name_check' AND conrelid = 'mcp_agent_audit'::regclass");
-      expect(def.rows[0]?.def).toContain('list_send_targets');
-      expect(def.rows[0]?.def).toContain('send_to_target');
-      expect(def.rows[0]?.def).toContain('query_agent_room_history');
+      expect(def.rows[0]?.def).toContain('char_length(tool_name) <= 128');
     });
   });
 
@@ -185,7 +183,7 @@ database('Agent LINE send persistence (real database)', () => {
     const normal = await repo.resolveSendSourceMessage({ ...key, messageId: 'm-normal' });
     expect(normal).toMatchObject({ kind: 'file', text: 'hello', masked: false });
     expect(normal?.attachments).toEqual([{
-      attachmentId: att.normal, kind: 'file', name: 'normal.pdf', status: ATTACHMENT_STORED_STATUS, relativePath: 'a/b/spec.pdf', sha256: 'a'.repeat(64), sizeBytes: 2048,
+      attachmentId: att.normal, accountId: 'acc-agent', kind: 'file', name: 'normal.pdf', status: ATTACHMENT_STORED_STATUS, relativePath: 'a/b/spec.pdf', sha256: 'a'.repeat(64), sizeBytes: 2048,
     }]);
     for (const messageId of ['m-recalled', 'm-deleted']) {
       expect(await repo.resolveSendSourceMessage({ ...key, messageId })).toEqual({ kind: 'text', text: null, masked: true, attachments: [] });

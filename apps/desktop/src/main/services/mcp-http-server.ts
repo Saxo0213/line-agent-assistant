@@ -24,7 +24,7 @@ export interface McpHttpServerOptions {
   unref?: boolean;
 }
 
-/** Backstop for an internal send_to_target call, which waits for a paced queue of LINE sends (budget 600 s) plus margin. */
+/** Backstop for a send_to_target call, which waits for the shared paced queue (budget 600 s) plus margin. */
 export const MCP_SEND_REQUEST_TIMEOUT_MS = 605_000;
 
 function isInternalToolCall(body: unknown, toolName: string): boolean {
@@ -252,12 +252,12 @@ export class McpHttpServer {
       const bearerValue = bearerMatch?.[1]?.trim() ?? null;
       const internalToken = bearerValue?.startsWith(INTERNAL_MCP_TOKEN_PREFIX) ? bearerValue : null;
 
-      // A built-in Agent permission prompt waits for the operator, bounded by the broker's policy timeout (<= 900 s);
-      // only that internal call gets the longer backstop. Every other request keeps the short deadline.
+      // A built-in Agent permission prompt waits for the operator, bounded by the broker's policy timeout (<= 900 s).
+      // Any send_to_target call can wait for the shared FIFO queue, so both local transports get the send backstop.
       if (internalToken && isPermissionPromptCall(parsedBody) && timer) {
         clearTimeout(timer);
         timer = setTimeout(onTimeout, this.approvalRequestTimeoutMs);
-      } else if (internalToken && isSendToTargetCall(parsedBody) && timer) {
+      } else if (isSendToTargetCall(parsedBody) && timer) {
         clearTimeout(timer);
         timer = setTimeout(onTimeout, this.sendRequestTimeoutMs);
       }

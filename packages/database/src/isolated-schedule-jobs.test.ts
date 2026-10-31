@@ -41,6 +41,13 @@ database('isolated scheduled runs (migration 072, real database)', () => {
     expect((await room(request(1))).disposition).toBe('inserted');
   });
 
+  it('copies an external schedule account scope onto the isolated schedule job', async () => {
+    const result = await agents.enqueueScheduleJob({ provider: 'claude', requestId: request(8), prompt: 'scoped', workspacePath: WORKSPACE,
+      mcpAccountScope: ['account-B', 'account-A', 'account-A'] });
+    const row = (await pool.query<{ mcp_account_scope: string[] | null }>('SELECT mcp_account_scope FROM agent_jobs WHERE job_id=$1', [result.jobId])).rows[0];
+    expect(row?.mcp_account_scope).toEqual(['account-B', 'account-A']);
+  });
+
   it('claims on its own queue, one run at a time, with no session and no room lookups', async () => {
     const a = await schedule(1);
     const b = await schedule(2);

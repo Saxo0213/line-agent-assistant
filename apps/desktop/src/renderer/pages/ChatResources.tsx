@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Download, FolderOpen, Image as ImageIcon, NotebookPen, RotateCw, X } from 'lucide-react';
+import { Download, FolderOpen, Image as ImageIcon, RotateCw, X } from 'lucide-react';
 import type { AlbumFailureContextDto, ConversationKey } from '@line-agent/contracts';
 import { lineMediaUrl } from '@line-agent/contracts';
 import { useDesktopLocale } from '../desktop-i18n.js';
@@ -61,7 +61,6 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
   const [readableFolderState, setReadableFolderState] = useState<'idle' | 'loading' | 'saved' | 'partial' | 'error'>('idle');
   const [readableFolderCounts, setReadableFolderCounts] = useState({ saved: 0, failed: 0, total: 0 });
   const dialog = useRef<HTMLDivElement | null>(null);
-  const openButton = useRef<HTMLButtonElement | null>(null);
   const albumButton = useRef<HTMLButtonElement | null>(null);
   const requestLocks = useRef(new Set<string>());
   const activeRequests = useRef(new Set<string>());
@@ -110,8 +109,9 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
     ++viewGeneration.current; kindRef.current = null; selectedNoteId.current = null; selectedAlbumRef.current = null;
     ++notesGeneration.current; ++albumsGeneration.current;
     pendingNotes.current = null; pendingAlbums.current = null; pendingPhotos.current = null; pendingNoteDetail.current = null;
-    setKind(null); setSelectedNote(null); setSelectedAlbum(null); (kind === 'albums' ? albumButton.current : openButton.current)?.focus();
+    setKind(null); setSelectedNote(null); setSelectedAlbum(null); albumButton.current?.focus();
   };
+  useEffect(() => { if (kind === 'notes') close(); }, [kind]);
   const refresh = () => {
     const generation = ++viewGeneration.current;
     selectedNoteId.current = null; pendingNoteDetail.current = null; setSelectedNote(null);
@@ -275,20 +275,13 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
   </>;
   return <>
     <div className="chat-resources-actions">
-      <button type="button" ref={openButton} aria-haspopup="dialog" aria-expanded={kind === 'notes'} aria-label={copy.openNotes} title={copy.notes} onClick={() => open('notes')}><NotebookPen size={17} aria-hidden="true" /></button>
       <button type="button" ref={albumButton} aria-haspopup="dialog" aria-expanded={kind === 'albums'} aria-label={copy.openAlbums} title={copy.albums} onClick={() => open('albums')}><ImageIcon size={17} aria-hidden="true" /></button>
     </div>
-    {kind && <div className="chat-resources-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+    {kind === 'albums' && <div className="chat-resources-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
       <section ref={dialog} className="chat-resources-dialog" role="dialog" aria-modal="true" aria-labelledby="chat-resources-title" tabIndex={-1}>
-        <header className="chat-resources-dialog-header"><h2 id="chat-resources-title">{kind === 'notes' ? copy.notes : copy.albums}</h2><div><button type="button" aria-label={copy.refresh} title={copy.refresh} disabled={kind === 'notes' ? noteState === 'loading' : selectedAlbum ? photoState === 'loading' : albumState === 'loading'} onClick={refresh}><RotateCw size={17} aria-hidden="true" /></button><button type="button" aria-label={copy.close} onClick={close}><X size={18} aria-hidden="true" /></button></div></header>
+        <header className="chat-resources-dialog-header"><h2 id="chat-resources-title">{copy.albums}</h2><div><button type="button" aria-label={copy.refresh} title={copy.refresh} disabled={selectedAlbum ? photoState === 'loading' : albumState === 'loading'} onClick={refresh}><RotateCw size={17} aria-hidden="true" /></button><button type="button" aria-label={copy.close} onClick={close}><X size={18} aria-hidden="true" /></button></div></header>
         <div className="chat-resources-body">
-          {kind === 'notes' && <>
-            {selectedNote ? <div className="chat-resource-detail"><button type="button" className="chat-resource-back" onClick={backFromNote}>{copy.back}</button><h3>{selectedNote.text?.split('\n')[0]?.trim() || copy.untitled}</h3>
-              {noteDetailState === 'loading' && <p role="status">{copy.loading}</p>}{noteDetailState === 'error' && <p role="alert">{copy.loadNoteError}</p>}{noteDetailState === 'ready' && <pre>{selectedNote.text ?? ''}</pre>}</div>
-              : <><ul className="chat-resource-list">{notes.map((note) => <li key={note.postId}><button type="button" onClick={() => void selectNote(note)} aria-label={note.text?.split('\n')[0]?.trim() || copy.untitled}><strong>{note.text?.split('\n')[0]?.trim() || copy.untitled}</strong>{note.createdTime !== null && <time dateTime={new Date(note.createdTime).toISOString()}>{new Intl.DateTimeFormat(locale, { dateStyle: 'medium' }).format(note.createdTime)}</time>}</button></li>)}</ul>
-                {stateLine(noteState, notes.length === 0, noteError, copy.emptyNotes, copy.loadNotesError, () => void loadNotes(false), noteCursor !== null, () => void loadNotes(true))}</>}
-          </>}
-          {kind === 'albums' && <>
+          <>
             {selectedAlbum ? <div className="chat-resource-detail"><button type="button" className="chat-resource-back" onClick={backFromAlbum}>{copy.back}</button><h3>{selectedAlbum.title?.trim() || copy.unnamedAlbum}</h3>
               <button type="button" disabled={readableFolderState === 'loading'} onClick={() => void openReadableAlbumFolder()}><FolderOpen size={16} aria-hidden="true" />{readableFolderState === 'loading' ? copy.openingSavedAlbum : copy.openSavedAlbum}</button>
               {readableFolderState === 'saved' && <p role="status">{copy.savedAlbumResult.replace('{saved}', String(readableFolderCounts.saved)).replace('{total}', String(readableFolderCounts.total))}</p>}
@@ -307,7 +300,7 @@ export function ChatResources({ api, route, accountStatus, accountMode }: { api:
                   <span className="chat-resource-album-meta"><strong>{album.title?.trim() || copy.unnamedAlbum}</strong><span>{photoCountText(locale, copy, album.photoCount)}</span></span>
                 </button></li>)}</ul>
                 {stateLine(albumState, albums.length === 0, albumError, copy.emptyAlbums, copy.loadAlbumsError, () => void loadAlbums(false), albumCursor !== null, () => void loadAlbums(true))}</>}
-          </>}
+          </>
         </div>
       </section>
     </div>}

@@ -179,6 +179,13 @@ export class AccountRepository {
         `INSERT INTO line_accounts(account_id,display_name,product_role) VALUES($1,'LINE Agent','AGENT')
          RETURNING account_id,mode,own_mid`, [nextId]);
       await appendAgentLineage(client, nextId);
+      // The Agent role, and every schedule scope that authorized its former holder, move together atomically.
+      await client.query(`UPDATE agent_schedules SET external_account_scope = ARRAY(
+          SELECT DISTINCT scoped_id FROM unnest(array_replace(external_account_scope, $1::text, $2::text)) AS scoped_id ORDER BY scoped_id)
+        WHERE external_account_scope @> ARRAY[$1::text]`, [accountId, nextId]);
+      await client.query(`UPDATE agent_jobs SET mcp_account_scope = ARRAY(
+          SELECT DISTINCT scoped_id FROM unnest(array_replace(mcp_account_scope, $1::text, $2::text)) AS scoped_id ORDER BY scoped_id)
+        WHERE mcp_account_scope @> ARRAY[$1::text]`, [accountId, nextId]);
       await client.query(
         `INSERT INTO conversations(account_id,chat_type,chat_id,title,agent_enabled)
          VALUES($1,'direct',$2,$3,true) ON CONFLICT(account_id,chat_type,chat_id) DO NOTHING`,

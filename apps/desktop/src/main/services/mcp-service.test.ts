@@ -228,12 +228,12 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
         expect(communityBody.result.structuredContent.messages.map((message) => message.messageId)).toContain('m-community');
       }
 
-      // 5. An internal-only tool (LINE send) is not an external tool: refused, never executed.
+      // 5. A local LINE send tool is recognized but unavailable when no send service is wired.
       const internalOnlyResp = await fetch(endpoint, {
         method: 'POST', headers,
         body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: SEND_TO_TARGET_TOOL_NAME, arguments: {} } }),
       });
-      expect(internalOnlyResp.status).toBe(400);
+      expect(internalOnlyResp.status).toBe(403);
 
       // 6. A tool without the 'read' effect needs operator approval, so the external endpoint refuses it.
       const effects = MCP_TOOL_EFFECTS as Record<string, 'read' | 'effect'>;
@@ -252,11 +252,11 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
       expect(auditRows.some((row) => row.principalId === 'local-client' && row.tokenId === null && row.action === 'TOOL_CALLED' && row.disposition === 'ALLOWED')).toBe(true);
       expect(auditRows.some((row) => row.principalId === 'local-client' && row.tokenId === null && row.disposition === 'APPROVAL_REQUIRED')).toBe(true);
 
-      // 7. The repository refuses an internal-only tool name on its own.
+      // 7. Send tools are authorized for the token-less local client over its current role account scope.
       await expect(tokens.executeLocalClientRead({
         toolName: SEND_TO_TARGET_TOOL_NAME,
-        execute: async () => ({ data: true }),
-      })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+        execute: async ({ principalId, authorizedAccountIds }) => ({ data: { principalId, authorizedAccountIds } }),
+      })).resolves.toMatchObject({ principalId: 'local-client', authorizedAccountIds: expect.arrayContaining(['account-admin', 'account-agent']) });
     } finally {
       await server.shutdown();
       await service.shutdown();

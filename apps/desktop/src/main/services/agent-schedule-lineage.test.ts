@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Pool } from 'pg';
-import { AccountRepository, AgentScheduleRepository, MessageRepository, resolveAgentLineage } from '@line-agent/database';
+import { AccountRepository, AgentRepository, AgentScheduleRepository, MessageRepository, resolveAgentLineage } from '@line-agent/database';
 import { createTestDatabase } from '../../../../../packages/database/src/test-database.js';
 import { AgentLineSendService, type AgentLineSendWorker } from './agent-line-send-service.js';
 import { AgentScheduleService } from './agent-schedule-service.js';
@@ -13,6 +13,8 @@ database('schedule targets after an Agent account swap (real database)', () => {
   let close: () => Promise<void>;
   let oldId = '';
   let newId = '';
+  let scopedScheduleId = '';
+  let scopedJobId = '';
 
   beforeAll(async () => {
     ({ pool, close } = await createTestDatabase());
@@ -22,6 +24,13 @@ database('schedule targets after an Agent account swap (real database)', () => {
     await accounts.activateControl(oldId, epoch);
     await accounts.bindWorker({ accountId: oldId, workerInstanceId: 'w-old', controlEpoch: epoch });
     await accounts.applyWorkerLogin({ accountId: oldId, workerInstanceId: 'w-old', controlEpoch: epoch }, mid('a'), 'Agent');
+    const schedules = new AgentScheduleRepository(pool);
+    const scopedSchedule = await schedules.create({ title: 'external scoped', prompt: 'read scoped account', provider: 'claude', recurrence: { kind: 'daily', time: '09:00' }, timezone: 'Asia/Taipei',
+      targets: [], task: { type: 'custom' }, window: { mode: 'since_last_run' }, delivery: { mode: 'record_only' }, jitterMinutes: 0, enabled: false }, new Date(), [oldId]);
+    scopedScheduleId = scopedSchedule.scheduleId;
+    const queued = await new AgentRepository(pool).enqueueScheduleJob({ requestId: `schedule:${scopedScheduleId}:2026-10-01T01:00:00.000Z`,
+      provider: 'claude', prompt: 'scoped run', workspacePath: process.cwd(), mcpAccountScope: [oldId] });
+    scopedJobId = queued.jobId;
     await accounts.revokeControl(epoch);
     await accounts.clearStoppedWorkerBinding({ accountId: oldId, workerInstanceId: 'w-old', controlEpoch: epoch });
     await accounts.setConnectionStatus(oldId, 'disconnected');
@@ -67,5 +76,15 @@ database('schedule targets after an Agent account swap (real database)', () => {
     expect(audit).toEqual([{ account_id: newId, status: 'sent', principal_id: 'system:schedule' }]);
     expect((await store.get(created.scheduleId))?.delivery).toMatchObject({ mode: 'line_target', target: { accountId: oldId } });
     expect((await store.listRuns(created.scheduleId, 5)).map((run) => run.outcome)).toEqual(['sent']);
+  });
+
+  it('moves persisted external schedule and queued job scopes with Agent replacement', async () => {
+    expect((await pool.query('SELECT external_account_scope FROM agent_schedules WHERE schedule_id = $1', [scopedScheduleId])).rows[0]?.external_account_scope).toEqual([newId]);
+    expect((await pool.query('SELECT mcp_account_scope FROM agent_jobs WHERE job_id = $1', [scopedJobId])).rows[0]?.mcp_account_scope).toEqual([newId]);
+    const schedules = new AgentScheduleRepository(pool);
+    expect((await schedules.listExternalScoped([newId])).map((schedule) => schedule.scheduleId)).toContain(scopedScheduleId);
+    await expect(schedules.updateExternalScoped(scopedScheduleId, { enabled: false }, [newId], [], new Date())).resolves.toMatchObject({ scheduleId: scopedScheduleId });
+    await expect(schedules.deleteExternalScoped(scopedScheduleId, [oldId])).rejects.toMatchObject({ code: 'SCHEDULE_INVALID_TARGET' });
+    expect(await schedules.deleteExternalScoped(scopedScheduleId, [newId])).toBe(true);
   });
 });

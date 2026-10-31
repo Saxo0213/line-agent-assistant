@@ -26,6 +26,9 @@ function fakeHandler() {
   return {
     list: vi.fn(async () => [schedule, { ...schedule, scheduleId: DISABLED_ID, enabled: false, nextFireAt: null }]), create: vi.fn(async (input: { delivery?: unknown } = {}) => ({ ...schedule, ...(input.delivery ? { delivery: input.delivery } : {}) }) as typeof schedule),
     update: vi.fn(async () => schedule), delete: vi.fn(async () => true),
+    listExternal: vi.fn(async () => [schedule]),
+    createExternal: vi.fn(async (input: { delivery?: unknown }, _scope: readonly string[] = []) => ({ ...schedule, ...(input.delivery ? { delivery: input.delivery } : {}) }) as typeof schedule),
+    updateExternal: vi.fn(async () => schedule), deleteExternal: vi.fn(async () => true),
     primaryAdminChat: vi.fn(async () => ({ accountId: 'acc', chatId: 'uadmin', title: '徐佳誠' })),
   } satisfies AgentScheduleToolHandler;
 }
@@ -227,25 +230,78 @@ describe('schedule tools (mocked repository)', () => {
     await h.service.shutdown();
   });
 
-  it('keeps the schedule tools off the external endpoint', async () => {
+  it('offers external schedule tools and executes them without an Agent job', async () => {
     for (const name of SCHEDULE_TOOL_NAMES) {
       expect(McpToolNameSchema.safeParse(name).success).toBe(false);
       expect(McpInternalToolNameSchema.safeParse(name).success).toBe(true);
     }
     const handler = fakeHandler();
+    const principals: string[] = [];
     const tokens = {
-      executeLocalClientRead: async (input: { execute: (context: unknown) => Promise<{ data: unknown }> }) =>
-        (await input.execute({ toolScopes: ['list_targets', 'query_target_messages'] })).data,
+      executeLocalClientRead: async (input: { principalId?: string; execute: (context: unknown) => Promise<{ data: unknown }> }) => {
+        if (input.principalId) principals.push(input.principalId);
+        return (await input.execute({ client: {}, principalId: input.principalId ?? 'local-client:request-1', authorizedAccountIds: ['agent'], toolScopes: ['list_targets', 'query_target_messages', ...SCHEDULE_TOOL_NAMES] })).data;
+      },
     } as never;
     const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository, schedules: handler });
     const listed = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
-    expect(JSON.stringify(listed.body)).not.toContain('_schedule');
-    for (const name of SCHEDULE_TOOL_NAMES) {
-      const called = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
-      expect(called.httpStatus).toBe(400);
-      expect(JSON.stringify(called.body)).toContain('Unsupported MCP tool');
+    expect(JSON.stringify(listed.body)).toContain('list_schedules');
+    const called = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_schedules', arguments: {} } });
+    expect(called.httpStatus).toBe(200);
+    expect(handler.listExternal).toHaveBeenCalledWith(['agent']);
+    for (const [name, arguments_] of [['create_schedule', { title: 'External', prompt: 'Run a check', recurrence }],
+      ['update_schedule', { scheduleId: SCHEDULE_ID, enabled: false }], ['delete_schedule', { scheduleId: SCHEDULE_ID }]] as const) {
+      const response = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: name, method: 'tools/call', params: { name, arguments: arguments_ } });
+      expect(response.httpStatus, `${name}: ${JSON.stringify(response.body)}`).toBe(200);
     }
-    expect(handler.list).not.toHaveBeenCalled();
+    expect(handler.createExternal).toHaveBeenCalledWith(expect.objectContaining({ title: 'External' }), ['agent'], expect.any(AbortSignal));
+    expect(handler.updateExternal).toHaveBeenCalledWith(SCHEDULE_ID, { enabled: false }, ['agent'], expect.any(AbortSignal));
+    expect(handler.deleteExternal).toHaveBeenCalledWith(SCHEDULE_ID, ['agent'], expect.any(AbortSignal));
+    handler.deleteExternal.mockResolvedValueOnce(false);
+    const missing = resultOf(await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 10, method: 'tools/call',
+      params: { name: 'delete_schedule', arguments: { scheduleId: '44444444-4444-4444-8444-444444444444' } } }));
+    expect(missing.isError).toBe(true);
+    expect(new Set(principals).size).toBe(5);
+    expect(principals.every((principal) => principal.startsWith('local-client:'))).toBe(true);
+    await service.shutdown();
+  });
+
+  it('does not start an external schedule mutation if the request aborts after authorization commits', async () => {
+    const handler = fakeHandler();
+    const abort = new AbortController();
+    let committed = false;
+    const tokens = {
+      executeLocalClientRead: async (input: { execute: (context: unknown) => Promise<{ data: unknown }> }) => {
+        const result = (await input.execute({ client: {}, principalId: 'local-client:test', authorizedAccountIds: ['agent'], toolScopes: [...SCHEDULE_TOOL_NAMES] })).data;
+        committed = true;
+        abort.abort(new Error('client disconnected'));
+        return result;
+      },
+    } as never;
+    const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository, schedules: handler });
+    const response = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'create_schedule', arguments: { title: 'External', prompt: 'Run', recurrence } } }, abort.signal);
+    expect(committed).toBe(true);
+    expect(response.body).toMatchObject({ error: { code: -32800 } });
+    expect(handler.createExternal).not.toHaveBeenCalled();
+    await service.shutdown();
+  });
+
+  it('rejects external schedule targets outside the authorized account scope', async () => {
+    const handler = fakeHandler();
+    const tokens = { executeLocalClientRead: async (input: { execute: (context: unknown) => Promise<{ data: unknown }> }) =>
+      (await input.execute({ client: {}, principalId: 'local-client:test', authorizedAccountIds: ['agent'] })).data } as never;
+    const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository, schedules: handler });
+    const response = resultOf(await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'create_schedule', arguments: {
+      title: 'Cross account', recurrence, targets: [{ accountId: 'other-account', chatType: 'group', chatId: 'g1', title: 'Group' }],
+    } } }));
+    expect(response.isError).toBe(true);
+    expect(handler.createExternal).not.toHaveBeenCalled();
+    const delivery = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'create_schedule', arguments: {
+      title: 'Cross account delivery', recurrence, delivery: { mode: 'line_target', target: { accountId: 'other-account', chatType: 'direct', chatId: 'u1', title: 'User' } },
+    } } });
+    expect(delivery.body).toMatchObject({ error: expect.any(Object) });
+    expect(handler.createExternal).not.toHaveBeenCalled();
     await service.shutdown();
   });
 });

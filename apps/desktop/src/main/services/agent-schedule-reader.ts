@@ -6,7 +6,10 @@ export interface AgentScheduleMessageRead {
   /** True when the read stopped at the cap of one run (NEW_MESSAGES_RUN_MESSAGE_CAP). */
   incomplete: boolean;
 }
-export type AgentScheduleMessageReader = (input: { from: Date; to: Date; targets: readonly AgentScheduleTarget[] }) => Promise<AgentScheduleMessageRead>;
+export type AgentScheduleMessageContext =
+  | { sourceType: 'schedule'; accountScope: readonly string[] | null }
+  | { sourceType: 'job'; jobId: string; generation: number; accountId: null };
+export type AgentScheduleMessageReader = (input: { from: Date; to: Date; targets: readonly AgentScheduleTarget[]; context?: AgentScheduleMessageContext }) => Promise<AgentScheduleMessageRead>;
 
 const PAGE_LIMIT = 200;
 
@@ -16,8 +19,8 @@ const PAGE_LIMIT = 200;
  * (every readable chat); with targets it queries each target. It stops at the run cap and then reports the result as incomplete.
  * `callTool` is McpService.callInternalTool with the schedule context.
  */
-export function createScheduleMessageReader(callTool: (tool: McpToolInputUnion) => Promise<McpToolOutputUnion>): AgentScheduleMessageReader {
-  return async ({ from, to, targets }) => {
+export function createScheduleMessageReader(callTool: (tool: McpToolInputUnion, context?: AgentScheduleMessageContext) => Promise<McpToolOutputUnion>): AgentScheduleMessageReader {
+  return async ({ from, to, targets, context }) => {
     const messages: ScheduleMessage[] = [];
     const selectors: Array<Pick<AgentScheduleTarget, 'accountId' | 'chatType' | 'chatId'> | null> =
       targets.length > 0 ? targets.map((target) => ({ accountId: target.accountId, chatType: target.chatType, chatId: target.chatId })) : [null];
@@ -26,7 +29,7 @@ export function createScheduleMessageReader(callTool: (tool: McpToolInputUnion) 
       for (;;) {
         const output = await callTool({ name: 'query_target_messages_by_time', arguments: {
           from: from.toISOString(), to: to.toISOString(), limit: PAGE_LIMIT, ...(selector ?? {}), ...(cursor ? { cursor } : {}),
-        } });
+        } }, context);
         if (output.toolName !== 'query_target_messages_by_time') throw new Error('Unexpected MCP output while reading schedule messages.');
         const room = NEW_MESSAGES_RUN_MESSAGE_CAP - messages.length;
         messages.push(...output.messages.slice(0, room));

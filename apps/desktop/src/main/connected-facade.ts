@@ -95,7 +95,6 @@ const REPLY_SENDER_PICTURE_SQL = senderPictureSql({ m: 'qm', la: 'qla', c: 'qc',
 
 type Bound = WorkerBinding & { mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; purpose?: 'DOWNLOAD_ONLY'; expectedMid?: string; application?: string };
 type SendResult = Extract<LineWorkerEvent, { type: 'sendResult' }>;
-const NOTE_NOTIFICATION_AUTO_FETCH = false; // Paused at the user's request (2026-10-25): no automatic Note fetch from notifications.
 const MACHINE_CODE_PATTERN = /^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)*$/;
 function asChatResourceBinding(binding: (Bound | null) | undefined): ChatResourceBinding | null {
   if (!binding || binding.mode !== 'ACTIVE_CONTROL' || typeof binding.transportOwnerId !== 'string'
@@ -780,6 +779,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   // Agent LINE send queue (list_send_targets / send_to_target). Built before the MCP service that hands it work; it sends
   // through the same worker gateway and write gate as DeliveryService, and drops its pending items on shutdown.
   const agentLineSend = new AgentLineSendService({ messages, canWriteLine, attachmentRoot: options.attachmentRoot,
+    workspacePath: async () => workspace.current().catch(() => null),
     worker: {
       binding: (accountId) => options.workers.binding(accountId),
       waitModeAck: (accountId, mode, timeoutMs) => options.workers.waitModeAck(accountId, mode, timeoutMs),
@@ -801,7 +801,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     submit: (input) => agentService.submitScheduled(input),
     sendSystemText: (input) => agentLineSend.sendSystemText({ runId: input.runId, target: input.target, text: input.text }),
     // new_messages reads: Main calls the MCP tool itself with the schedule principal (internal:schedule). mcpService is built right after this service.
-    readMessages: createScheduleMessageReader((tool) => mcpService.callInternalTool(tool, { sourceType: 'schedule' })),
+    readMessages: createScheduleMessageReader((tool, context) => mcpService.callInternalTool(tool, context ?? { sourceType: 'schedule', accountScope: null })),
     publish: () => { options.publish?.({ type: 'agentSchedulesChanged' }); },
     onError: (error) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); } });
   stopAgentSchedules = onceCleanup(() => agentSchedules.stop());
@@ -949,7 +949,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return { endpoint: transport.endpoint, token };
     },
     release: (jobId) => mcpService.internalCapabilities.release(jobId),
-    scheduleContext: (sourceRequestId) => agentSchedules.runContext(sourceRequestId),
+    scheduleContext: (sourceRequestId, jobId) => agentSchedules.runContext(sourceRequestId, jobId),
     skill: async () => {
       if (!options.skillsDirectory) return null;
       if (skillText) return skillText;
@@ -1283,9 +1283,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     { send: async (command) => { await sendLineCommand(command); } }, agentService, options.secretStore, attachmentService,
     async (envelope, secretCandidate, ownMid, capturedBinding) => {
       const postNotificationSubtype = nativePostNotificationSubtype(envelope);
-      if (postNotificationSubtype === 'note') {
-        if (NOTE_NOTIFICATION_AUTO_FETCH && !closing && capturedBinding?.mode === 'ACTIVE_CONTROL') void chatResources.refreshNotesFromNotification({ accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId });
-      } else if (!closing && capturedBinding?.mode === 'ACTIVE_CONTROL' && postNotificationSubtype === 'album') {
+      if (!closing && capturedBinding?.mode === 'ACTIVE_CONTROL' && postNotificationSubtype === 'album') {
         const current = await options.workers.binding(envelope.accountId);
         const archiveBinding = asChatResourceBinding(current);
         if (archiveBinding && sameCapturedBinding(archiveBinding, capturedBinding)) {

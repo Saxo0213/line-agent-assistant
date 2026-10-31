@@ -68,6 +68,8 @@ export interface AgentLineSendOptions {
   canWriteLine(accountId: string): Promise<boolean>;
   /** Root of the stored attachments (resolved with the same safe resolver the open/preview path uses). */
   attachmentRoot: string;
+  /** Configured Agent workspace for local MCP calls that have no Agent job row. */
+  workspacePath?: () => Promise<string | null>;
   /** Operational audit: one row for each failed or unknown item, with the real cause as bounded enums and numbers. */
   audit?: Pick<OperationalAudit, 'observed'>;
   /** Test hook: per-call budget. */
@@ -117,8 +119,8 @@ export interface SendPlan {
 export type AuthorizeOutcome = { kind: 'rejected'; output: McpSendToTargetOutput } | { kind: 'plan'; plan: SendPlan };
 
 export interface AgentLineSendHandler {
-  listTargets(client: Queryable, rawInput: unknown): Promise<McpListSendTargetsOutput>;
-  authorize(client: Queryable, input: { jobId: string; principalId: string; rawInput: unknown }): Promise<AuthorizeOutcome>;
+  listTargets(client: Queryable, rawInput: unknown, accountScope?: readonly string[] | null): Promise<McpListSendTargetsOutput>;
+  authorize(client: Queryable, input: { jobId: string; principalId: string; rawInput: unknown; accountScope?: readonly string[] | null }): Promise<AuthorizeOutcome>;
   run(plan: SendPlan, context: { signal: AbortSignal; isLive(): boolean }): Promise<McpSendToTargetOutput>;
 }
 
@@ -191,11 +193,11 @@ export class AgentLineSendService implements AgentLineSendHandler {
     return this.queue.filter((entry) => entry.call.plan.jobId === jobId).length + (this.active?.call.plan.jobId === jobId ? 1 : 0);
   }
 
-  async listTargets(client: Queryable, rawInput: unknown): Promise<McpListSendTargetsOutput> {
+  async listTargets(client: Queryable, rawInput: unknown, accountScope?: readonly string[] | null): Promise<McpListSendTargetsOutput> {
     const parsed = McpListSendTargetsInputSchema.safeParse(rawInput);
     if (!parsed.success) throw new McpDomainError('INVALID_INPUT', parsed.error.issues[0]?.message ?? 'Invalid list_send_targets arguments.');
     const accountId = await this.options.messages.findAgentSendAccount(client);
-    if (!accountId) return { targets: [] };
+    if (!accountId || (accountScope !== undefined && accountScope !== null && !accountScope.includes(accountId))) return { targets: [] };
     const admin = await findSharedAdminChat(client).catch(() => null);
     const adminId = admin !== null && admin.accountId === accountId ? admin.adminMid : null;
     let rows = await this.options.messages.listSendTargets({ accountId, query: parsed.data.query, limit: 20 }, client);
@@ -211,7 +213,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
   }
 
   /** Runs inside the short MCP transaction: principal is already verified; checks the Agent account, target, caps and sources. */
-  async authorize(client: Queryable, input: { jobId: string; principalId: string; rawInput: unknown }): Promise<AuthorizeOutcome> {
+  async authorize(client: Queryable, input: { jobId: string; principalId: string; rawInput: unknown; accountScope?: readonly string[] | null }): Promise<AuthorizeOutcome> {
     const parsed = McpSendToTargetInputSchema.safeParse(input.rawInput);
     if (!parsed.success) {
       const raw = input.rawInput as { chatType?: unknown; items?: unknown } | null;
@@ -234,6 +236,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     };
 
     const accountId = await messages.findAgentSendAccount(client);
+    if (input.accountScope !== undefined && input.accountScope !== null && (!accountId || !input.accountScope.includes(accountId))) return reject(0, 'send_line_unavailable');
     if (!accountId || !await this.options.canWriteLine(accountId)) return reject(0, 'send_line_unavailable');
     const target = await messages.getSendTarget(accountId, chatType, chatId, client);
     if (!target) return reject(0, 'send_target_invalid');
@@ -243,11 +246,14 @@ export class AgentLineSendService implements AgentLineSendHandler {
     let workspacePath: string | null = null;
     if (items.some((item) => item.type === 'file')) {
       const job = await client.query<{ workspace_path: string }>('SELECT workspace_path FROM agent_jobs WHERE job_id = $1', [input.jobId]);
-      workspacePath = job.rows[0]?.workspace_path ?? null;
+      workspacePath = job.rows[0]?.workspace_path ?? await this.options.workspacePath?.() ?? null;
     }
     const planned: PlannedItem[] = [];
     for (const [index, item] of items.entries()) {
-      const outcome = await this.planItem(client, item, index, workspacePath);
+      if (input.accountScope !== undefined && input.accountScope !== null && item.type === 'message' && !input.accountScope.includes(item.accountId)) {
+        return reject(index, 'send_source_unavailable');
+      }
+      const outcome = await this.planItem(client, item, index, workspacePath, input.accountScope);
       if ('code' in outcome) return reject(index, outcome.code);
       if (outcome.kind === 'media' && target.chatType === 'room') return reject(index, 'send_media_unsupported_chat');
       planned.push(outcome);
@@ -256,7 +262,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
       chatId: target.chatId, workspacePath, items: planned } };
   }
 
-  private async planItem(client: Queryable, item: McpSendItem, index: number, workspacePath: string | null):
+  private async planItem(client: Queryable, item: McpSendItem, index: number, workspacePath: string | null, accountScope?: readonly string[] | null):
   Promise<PlannedItem | { code: SendErrorCode }> {
     const messages = this.options.messages;
     if (item.type === 'text') {
@@ -269,6 +275,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     if (item.type === 'attachment') {
       const attachment = await messages.getSendAttachment(item.attachmentId, client);
       if (!attachment || attachment.masked || attachment.status !== ATTACHMENT_STORED_STATUS
+        || (accountScope !== undefined && accountScope !== null && !accountScope.includes(attachment.accountId))
         || !attachment.relativePath || attachment.sizeBytes === null) return { code: 'send_attachment_unavailable' };
       return { index, auditKind: 'attachment', kind: 'media', mediaKind: attachment.kind === 'image' ? 'image' : 'file',
         name: attachment.name ?? path.posix.basename(attachment.relativePath),
@@ -276,7 +283,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     }
     const source = await messages.resolveSendSourceMessage(
       { accountId: item.accountId, chatType: item.chatType, chatId: item.chatId, messageId: item.messageId }, client);
-    if (!source || source.masked) return { code: 'send_source_unavailable' };
+    if (!source || source.masked || (accountScope !== undefined && accountScope !== null && !accountScope.includes(item.accountId))) return { code: 'send_source_unavailable' };
     if (source.kind === 'text') {
       if (!source.text) return { code: 'send_source_unavailable' };
       return { index, auditKind: 'message', kind: 'text', parts: splitDeliveryText(source.text), byteSize: utf8Length(source.text) };

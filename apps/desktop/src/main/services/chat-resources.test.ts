@@ -346,27 +346,32 @@ describe('ChatResourceArchiveService', () => {
     expect(readChatResource).not.toHaveBeenCalled();
   });
 
-  it('archives all five worker resource actions through the typed store seam', async () => {
+  it('archives the enabled worker resource actions through the typed store seam', async () => {
     const savedFile = { folderName: createHash('sha256').update(album.albumId).digest('hex'), fileName: 'record_f_saved.jpg',
       contentHash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), byteCount: 3, revision: 1, savedAt: new Date().toISOString() };
     const { service, readChatResource, published, store } = await setup({}, {
       inspectAlbumPhoto: vi.fn(async () => null),
       publishAlbumPhoto: vi.fn(async () => savedFile),
     });
-    await service.listNotes(key, null);
-    await service.getNote(key, noteA.postId);
     await service.listAlbums(key, null);
     await service.listAlbumPhotos(key, album.albumId, null);
     const result = await service.downloadAlbumPhoto(key, album.albumId, photo.photoId, photo.oid, photo.prefix);
     const commands = readChatResource.mock.calls.map(([command]) => command);
-    expect(commands.map(({ action }) => action)).toEqual(['listNotes', 'getNote', 'listAlbums', 'listAlbumPhotos', 'downloadAlbumPhoto']);
+    expect(commands.map(({ action }) => action)).toEqual(['listAlbums', 'listAlbumPhotos', 'downloadAlbumPhoto']);
     expect(commands[0]).toMatchObject({ transportOwnerId: 'owner-1', transportGeneration: 2, writeGrantVersion: 3 });
-    expect(commands[2]).toMatchObject({ transportOwnerId: 'owner-1', transportGeneration: 2, writeGrantVersion: 3 });
-    expect(commands[4]).toMatchObject({ prefix: 'album/a', maxBytes: 20 * 1024 * 1024 });
+    expect(commands[2]).toMatchObject({ prefix: 'album/a', maxBytes: 20 * 1024 * 1024 });
     expect(result).toMatchObject({ photoId: photo.photoId, sizeBytes: 3 });
-    expect(published.map(({ kind }) => kind)).toEqual(['note', 'note', 'album', 'photo-page']);
+    expect(published.map(({ kind }) => kind)).toEqual(['album', 'photo-page']);
     expect(store.publishAlbumPhoto).toHaveBeenCalledOnce();
-    expect(Buffer.from(published[0]!.content).toString()).toContain('A');
+  });
+
+  it('rejects direct Notes service calls without reading LINE', async () => {
+    const { service, readChatResource } = await setup();
+    await expect(service.listNotes(key, null)).rejects.toThrow('Notes are disabled.');
+    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('Notes are disabled.');
+    expect(readChatResource).not.toHaveBeenCalled();
+    await expect(service.listAlbums(key, null)).resolves.toMatchObject({ albums: expect.any(Array) });
+    expect(readChatResource.mock.calls.map(([command]) => command.action)).toEqual(['listAlbums']);
   });
 
   it('repairs a missing saved-file catalog row from native inspection without reading LINE', async () => {
@@ -933,14 +938,14 @@ describe('ChatResourceArchiveService', () => {
 
   it('rejects monitored accounts and unknown conversations before contacting LINE or the store', async () => {
     const { service, readChatResource } = await setup({ isWritableAccount: async () => false });
-    await expect(service.listNotes(key, null)).rejects.toThrow('read-only');
+    await expect(service.listAlbums(key, null)).rejects.toThrow('read-only');
     expect(readChatResource).not.toHaveBeenCalled();
     const invalid = await setup({ conversationExists: async () => false });
     await expect(invalid.service.listAlbums(key, null)).rejects.toThrow('conversation');
     expect(invalid.readChatResource).not.toHaveBeenCalled();
   });
 
-  it('records only fixed gateway failure categories for note and album live reads', async () => {
+  it('records only fixed gateway failure categories for Album live reads', async () => {
     const records: unknown[] = [];
     const { service } = await setup({
       readChatResource: async () => { throw Object.assign(new Error('account credential secret and chat body'), { diagnostic: {
@@ -948,9 +953,8 @@ describe('ChatResourceArchiveService', () => {
       } }); },
       recordDiagnostic: (record) => records.push(record),
     });
-    await expect(service.listNotes(key, null)).rejects.toThrow('account credential secret');
     await expect(service.listAlbums(key, null)).rejects.toThrow('account credential secret');
-    expect(records).toHaveLength(2);
+    expect(records).toHaveLength(1);
     for (const record of records) {
       expect(record).toMatchObject({ status: 'failure', errorCode: 'ACCOUNT_BINDING_CHANGED', failureStage: 'gateway_admission',
         failureReason: 'stale_binding', currentBindingMatch: false, currentEpochMatch: true, workerReady: true });
@@ -998,7 +1002,7 @@ describe('ChatResourceArchiveService', () => {
     const records: unknown[] = [];
     const { service } = await setup({ readChatResource: async () => { throw new Error('account is temporarily unavailable'); },
       recordDiagnostic: (record) => records.push(record) });
-    await expect(service.listNotes(key, null)).rejects.toThrow('temporarily unavailable');
+    await expect(service.listAlbums(key, null)).rejects.toThrow('temporarily unavailable');
     expect(records[0]).toMatchObject({ errorCode: 'UNKNOWN', failureStage: 'resource_read', failureReason: 'unknown' });
   });
 
@@ -1008,7 +1012,7 @@ describe('ChatResourceArchiveService', () => {
       requestId: command.requestId, action: command.action, accountId: key.accountId, workerInstanceId: 'worker-1', controlEpoch: 1,
       chatType: key.chatType, chatId: key.chatId, ok: false, error: 'normalization_failure' }),
       recordDiagnostic: (record) => records.push(record) });
-    await expect(service.listNotes(key, null)).rejects.toThrow('LINE_READ_FAILED');
+    await expect(service.listAlbums(key, null)).rejects.toThrow('LINE_READ_FAILED');
     expect(records[0]).toMatchObject({ failureStage: 'worker_response', failureReason: 'worker_response_error',
       failureCategory: 'normalization_failure' });
     expect(JSON.stringify(records[0])).not.toContain('normalization_failure token');
@@ -1026,38 +1030,25 @@ describe('ChatResourceArchiveService', () => {
     expect(JSON.stringify(records[0])).not.toContain('message');
   });
 
-  it.each([
-    [403, 403],
-    ['missing', 'missing'],
-    ['non_numeric', 'non_numeric'],
-  ] as const)('records only a bounded Note response code for a modal read (%s)', async (_label, responseCode) => {
-    const records: unknown[] = [];
-    const { service } = await setup({ readChatResource: async (command) => ({ type: 'chatResourceResult',
-      requestId: command.requestId, action: command.action, accountId: key.accountId, workerInstanceId: 'worker-1', controlEpoch: 1,
-      chatType: key.chatType, chatId: key.chatId, ok: false, error: 'response_code_invalid', responseCode }),
-      recordDiagnostic: (record) => records.push(record) });
-    await expect(service.listNotes(key, null)).rejects.toThrow('LINE_READ_FAILED');
-    expect(records[0]).toMatchObject({ failureCategory: 'response_code_invalid', responseCode });
-    expect(JSON.stringify(records[0])).not.toContain('secret');
-  });
-
-  it('does not persist Note response codes from background notification reads', async () => {
-    const records: unknown[] = [];
-    const { service } = await setup({ readChatResource: async (command) => ({ type: 'chatResourceResult',
-      requestId: command.requestId, action: command.action, accountId: key.accountId, workerInstanceId: 'worker-1', controlEpoch: 1,
-      chatType: key.chatType, chatId: key.chatId, ok: false, error: 'response_code_invalid', responseCode: 403 }),
-      recordDiagnostic: (record) => records.push(record) });
-    await expect(service.listNotes(key, null, undefined, 'notification')).rejects.toThrow('LINE_READ_FAILED');
-    expect(records[0]).not.toHaveProperty('responseCode');
+  it('preserves existing Note archive records while Note service reads are disabled', async () => {
+    const { service, readChatResource, store } = await setup();
+    const content = Buffer.from('existing archived note');
+    const controller = new AbortController();
+    await store.publish({ key, kind: 'note', resourceId: noteA.postId, content, signal: controller.signal, guard() {} });
+    await expect(service.listNotes(key, null)).rejects.toThrow('Notes are disabled.');
+    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('Notes are disabled.');
+    const saved = await store.read({ key, kind: 'note', resourceId: noteA.postId });
+    expect(saved && Buffer.from(saved.content).toString()).toBe('existing archived note');
+    expect(readChatResource).not.toHaveBeenCalled();
   });
 
   it('closes account admission on invalidation until the facade confirms authenticated readiness', async () => {
     const { service, readChatResource, published } = await setup();
     service.invalidateAccount(key.accountId, 'logout');
-    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('archive is closed');
+    await expect(service.listAlbums(key, null)).rejects.toThrow('archive is closed');
     expect(readChatResource).not.toHaveBeenCalled();
     service.reopenAccount(key.accountId);
-    await expect(service.getNote(key, noteA.postId)).resolves.toMatchObject({ postId: noteA.postId });
+    await expect(service.listAlbums(key, null)).resolves.toMatchObject({ albums: [expect.objectContaining({ albumId: album.albumId })] });
     expect(readChatResource).toHaveBeenCalledOnce();
     expect(published).toHaveLength(1);
   });
@@ -1071,7 +1062,7 @@ describe('ChatResourceArchiveService', () => {
     const teardownGate = new Promise<void>((resolve) => { finishTeardown = resolve; });
     let teardownFinished = false;
     const teardown = (async () => { admission.close(key.accountId, 'logout'); await teardownGate; teardownFinished = true; })();
-    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('archive is closed');
+    await expect(service.listAlbums(key, null)).rejects.toThrow('archive is closed');
     expect(readChatResource).not.toHaveBeenCalled();
     expect(teardownFinished).toBe(false);
     finishTeardown();
@@ -1080,19 +1071,19 @@ describe('ChatResourceArchiveService', () => {
     const fresh = { accountId: key.accountId, workerInstanceId: 'worker-2', controlEpoch: 2, transportOwnerId: 'owner-2',
       transportGeneration: 3, writeGrantVersion: 4, mode: 'ACTIVE_CONTROL' } as const;
     admission.authenticated({ ...fresh, workerInstanceId: 'worker-1', controlEpoch: 1 });
-    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('archive is closed');
+    await expect(service.listAlbums(key, null)).rejects.toThrow('archive is closed');
     admission.authenticated(fresh);
-    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('archive is closed');
+    await expect(service.listAlbums(key, null)).rejects.toThrow('archive is closed');
     admission.observeBinding(fresh);
     admission.authenticated(fresh);
     setBinding(fresh);
     admission.ready(fresh);
-    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('archive is closed');
+    await expect(service.listAlbums(key, null)).rejects.toThrow('archive is closed');
     expect(readChatResource).not.toHaveBeenCalled();
 
     ready = true;
     admission.ready(fresh);
-    await expect(service.getNote(key, noteA.postId)).resolves.toMatchObject({ postId: noteA.postId });
+    await expect(service.listAlbums(key, null)).resolves.toMatchObject({ albums: [expect.objectContaining({ albumId: album.albumId })] });
     expect(readChatResource).toHaveBeenCalledOnce();
     expect(published).toHaveLength(1);
   });
@@ -1103,7 +1094,7 @@ describe('ChatResourceArchiveService', () => {
     delete withoutStore.store;
     const noStore = new ChatResourceArchiveService(withoutStore);
     services.add(noStore);
-    await expect(noStore.listNotes(key, null)).rejects.toThrow('CHAT_RESOURCE_STORE_UNAVAILABLE');
+    await expect(noStore.listAlbums(key, null)).rejects.toThrow('CHAT_RESOURCE_STORE_UNAVAILABLE');
     expect(readChatResource).not.toHaveBeenCalled();
   });
 
@@ -1117,7 +1108,7 @@ describe('ChatResourceArchiveService', () => {
     expect(published).toHaveLength(0);
   });
 
-  it('projects IPC envelopes into exact worker commands for every action', async () => {
+  it('rejects disabled Note IPC actions without reading LINE and keeps Album reads available', async () => {
     const { service, readChatResource } = await setup({}, {
       inspectAlbumPhoto: vi.fn(async () => null),
       publishAlbumPhoto: vi.fn(async () => ({ folderName: createHash('sha256').update(album.albumId).digest('hex'),
@@ -1125,13 +1116,13 @@ describe('ChatResourceArchiveService', () => {
         byteCount: 3, revision: 1, savedAt: new Date().toISOString() })),
     });
     const base = { accountId: key.accountId, chatType: key.chatType, chatId: key.chatId };
-    await service.dispatchIpc({ ...base, requestId: 'renderer-list-notes', type: 'listChatNotes', cursor: null });
-    await service.dispatchIpc({ ...base, requestId: 'renderer-get-note', type: 'getChatNote', postId: noteA.postId });
+    await expect(service.dispatchIpc({ ...base, requestId: 'renderer-list-notes', type: 'listChatNotes', cursor: null })).rejects.toThrow('Notes are disabled.');
+    await expect(service.dispatchIpc({ ...base, requestId: 'renderer-get-note', type: 'getChatNote', postId: noteA.postId })).rejects.toThrow('Notes are disabled.');
     await service.dispatchIpc({ ...base, requestId: 'renderer-list-albums', type: 'listChatAlbums', cursor: null });
     await service.dispatchIpc({ ...base, requestId: 'renderer-list-photos', type: 'listChatAlbumPhotos', albumId: album.albumId, cursor: null });
     await service.dispatchIpc({ ...base, requestId: 'renderer-download-photo', type: 'downloadChatAlbumPhoto', albumId: album.albumId, photoId: photo.photoId, oid: photo.oid, prefix: photo.prefix });
     const commands = readChatResource.mock.calls.map(([command]) => command);
-    expect(commands).toHaveLength(5);
+    expect(commands).toHaveLength(3);
     for (const command of commands) {
       expect(command).toMatchObject({ type: 'chatResourceRead', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId,
         workerInstanceId: 'worker-1', controlEpoch: 1 });
@@ -1139,19 +1130,14 @@ describe('ChatResourceArchiveService', () => {
     }
   });
 
-  it('forwards a renderer cancellation signal through IPC to the worker before publication', async () => {
-    let entered!: () => void;
-    const started = new Promise<void>((resolve) => { entered = resolve; });
+  it('rejects disabled Note IPC actions even when a caller signal is provided', async () => {
     const { service, readChatResource, published } = await setup({ readChatResource: (_command, signal) => new Promise((resolve, reject) => {
-      entered();
       signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
     }) });
     const controller = new AbortController();
     const request = service.dispatchIpc({ ...key, requestId: 'cancel-read', type: 'listChatNotes', cursor: null }, controller.signal);
-    await started;
-    controller.abort(new Error('modal closed'));
-    await expect(request).rejects.toThrow('modal closed');
-    expect(readChatResource).toHaveBeenCalledOnce();
+    await expect(request).rejects.toThrow('Notes are disabled.');
+    expect(readChatResource).not.toHaveBeenCalled();
     expect(published).toHaveLength(0);
   });
 
@@ -1179,7 +1165,7 @@ describe('ChatResourceArchiveService', () => {
     const { service, published, setGate, setBinding } = await setup();
     const started = deferred(), commit = deferred();
     setGate({ started: () => started.resolve(), wait: commit.promise });
-    const operation = service.getNote(key, noteA.postId);
+    const operation = service.listAlbums(key, null);
     await started.promise;
     if (transition === 'logout') setBinding(null);
     else if (transition === 'mode change') setBinding({ accountId: key.accountId, workerInstanceId: 'worker-1', controlEpoch: 1,
@@ -1196,7 +1182,7 @@ describe('ChatResourceArchiveService', () => {
     const { service, published, setGate } = await setup();
     const started = deferred(), commit = deferred();
     setGate({ started: () => started.resolve(), wait: commit.promise });
-    const operation = service.getNote(key, noteA.postId);
+    const operation = service.listAlbums(key, null);
     await started.promise;
     const shutdown = service.shutdown();
     commit.resolve();
@@ -1214,7 +1200,7 @@ describe('ChatResourceArchiveService', () => {
       entered(); await publishGate.promise; input.guard();
       throw new Error('late publish should be fenced');
     }, close: async () => new Promise<void>(() => {}), forceClose });
-    const operation = service.getNote(key, noteA.postId);
+    const operation = service.listAlbums(key, null);
     void operation.catch(() => undefined);
     await enteredPromise;
     const started = Date.now();
@@ -1231,7 +1217,7 @@ describe('ChatResourceArchiveService', () => {
     const forceClose = vi.fn();
     const { service, readChatResource } = await setup({ readChatResource: (command) => new Promise((resolve) => { release = resolve; }) },
       { close: async () => {}, forceClose });
-    const operation = service.getNote(key, noteA.postId);
+    const operation = service.listAlbums(key, null);
     void operation.catch(() => undefined);
     await vi.waitFor(() => expect(readChatResource).toHaveBeenCalledOnce());
     await service.shutdown();
@@ -1251,51 +1237,31 @@ describe('ChatResourceArchiveService', () => {
   });
 
   it('assigns a newer revision for A→B→A and retains every snapshot', async () => {
-    let text = 'A';
-    const { service, revisions, readChatResource, store } = await setup({ readChatResource: async (command) => ({
-      type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true,
-      accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
-      chatType: command.chatType, chatId: command.chatId, note: { ...noteA, text },
-    } as ChatResourceReadResult) });
-    await service.getNote(key, noteA.postId);
-    text = 'B'; await service.getNote(key, noteA.postId);
-    text = 'A'; await service.getNote(key, noteA.postId);
-    const versions = [...revisions.values()][0]!;
-    expect(versions.map((version) => version.revision)).toEqual([1, 2, 3]);
-    expect(Buffer.from(versions.at(-1)!.content).toString()).toContain('A');
-    expect(versions).toHaveLength(3);
-    expect(Date.parse(versions.at(-1)!.savedAt)).toBeGreaterThan(Date.parse(versions[0]!.savedAt));
-    expect((await store.read({ key, kind: 'note', resourceId: noteA.postId }))?.revision).toBe(3);
-    expect((await store.list({ key, kind: 'note', limit: 50 })).items[0]?.revision).toBe(3);
-    expect(readChatResource).toHaveBeenCalledTimes(3);
+    const { service, readChatResource, store } = await setup();
+    await store.publish({ key, kind: 'note', resourceId: noteA.postId, content: Buffer.from('existing archive'),
+      signal: new AbortController().signal, guard() {} });
+    await expect(service.listNotes(key, null)).rejects.toThrow('Notes are disabled.');
+    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('Notes are disabled.');
+    const archived = await store.read({ key, kind: 'note', resourceId: noteA.postId });
+    expect(archived && Buffer.from(archived.content).toString()).toBe('existing archive');
+    expect(readChatResource).not.toHaveBeenCalled();
   });
 
   it('rejects stale worker responses and caller cancellation', async () => {
     const { service } = await setup({ readChatResource: async (command) => ({
       type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true,
       accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
-      chatType: command.chatType, chatId: 'other-chat', notes: [], nextCursor: null,
+      chatType: command.chatType, chatId: 'other-chat', albums: [], nextCursor: null,
     } as ChatResourceReadResult) });
-    await expect(service.listNotes(key, null)).rejects.toThrow('Invalid LINE resource response');
+    await expect(service.listAlbums(key, null)).rejects.toThrow('Invalid LINE resource response');
     const controller = new AbortController(); controller.abort(new Error('cancelled'));
-    await expect(service.listNotes(key, null, controller.signal)).rejects.toThrow('cancelled');
+    await expect(service.listAlbums(key, null, controller.signal)).rejects.toThrow('cancelled');
   });
 
-  it('coalesces duplicate notifications and performs one trailing refresh', async () => {
-    const pending: Array<() => void> = [];
-    const { service, readChatResource } = await setup({ readChatResource: (command) => new Promise<ChatResourceReadResult>((resolve) => {
-      pending.push(() => resolve({ type: 'chatResourceResult', requestId: command.requestId, action: command.action, ok: true,
-        accountId: command.accountId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
-        chatType: command.chatType, chatId: command.chatId, notes: [], nextCursor: null }));
-    }) });
-    const first = service.refreshNotesFromNotification(key);
-    const second = service.refreshNotesFromNotification(key);
-    await vi.waitFor(() => expect(readChatResource).toHaveBeenCalledTimes(1));
-    pending.shift()!();
-    await vi.waitFor(() => expect(readChatResource).toHaveBeenCalledTimes(2));
-    pending.shift()!();
-    await Promise.all([first, second]);
-    expect(readChatResource).toHaveBeenCalledTimes(2);
+  it('does not refresh Notes from background notifications', async () => {
+    const { service, readChatResource } = await setup();
+    await service.refreshNotesFromNotification(key);
+    expect(readChatResource).not.toHaveBeenCalled();
   });
 
   it('stops an album reconciliation when its captured binding changes between operations', async () => {

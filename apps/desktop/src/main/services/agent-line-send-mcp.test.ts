@@ -62,6 +62,45 @@ describe('send tool visibility (mocked repository)', () => {
     expect(SEND_TO_TARGET_TOOL_DEFINITION.description).toMatch(/unknown/);
     expect(SEND_TO_TARGET_TOOL_DEFINITION.inputSchema.properties.items.maxItems).toBe(10);
   });
+
+  it('releases request slots after external send authorization while multiple sends wait in the worker queue', async () => {
+    let transactionOpen = false;
+    let releaseSend!: (value: { results: [] }) => void;
+    const sendFinished = new Promise<{ results: [] }>((resolve) => { releaseSend = resolve; });
+    const handler = {
+      listTargets: vi.fn(async () => ({ targets: [] })),
+      authorize: vi.fn(async () => {
+        expect(transactionOpen).toBe(true);
+        return { kind: 'plan' as const, plan: { jobId: 'call-id', principalId: 'local-client:call-id', accountId: 'a', chatType: 'direct' as const, chatId: 'c', workspacePath: null, items: [] } };
+      }),
+      run: vi.fn(async () => {
+        expect(transactionOpen).toBe(false);
+        return sendFinished;
+      }),
+    };
+    const tokens = {
+      executeLocalClientRead: async (input: { execute: (context: unknown) => Promise<{ data: unknown }>; principalId?: string }) => {
+        transactionOpen = true;
+        try { return (await input.execute({ client: {}, principalId: input.principalId, authorizedAccountIds: ['a'], toolScopes: ['list_targets', 'list_send_targets', 'send_to_target'] })).data; }
+        finally { transactionOpen = false; }
+      },
+    } as never;
+    const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository, lineSend: handler, maxConcurrentRequests: 2 });
+    const sendRequest = (id: number) => service.handleExternalJsonRpc({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'send_to_target', arguments: { chatType: 'direct', chatId: 'c', items: [{ type: 'text', text: 'hello' }] } } });
+    const sends = [sendRequest(1), sendRequest(2)];
+    await vi.waitFor(() => expect(handler.run).toHaveBeenCalledTimes(2));
+    expect(handler.authorize).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ jobId: expect.any(String), principalId: expect.stringMatching(/^local-client:/), accountScope: ['a'] }));
+    const listing = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    expect(listing.httpStatus).toBe(200);
+    expect(JSON.stringify(listing.body)).toContain('send_to_target');
+    const targets = await service.handleExternalJsonRpc({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'list_send_targets', arguments: { query: 'A' } } });
+    expect(targets.httpStatus).toBe(200);
+    expect(handler.listTargets).toHaveBeenCalledOnce();
+    expect(handler.listTargets).toHaveBeenCalledWith(expect.anything(), { query: 'A' }, ['a']);
+    releaseSend({ results: [] });
+    expect((await Promise.all(sends)).map((response) => response.httpStatus)).toEqual([200, 200]);
+    await service.shutdown();
+  });
 });
 
 describe('send tool HTTP backstop', () => {
@@ -85,8 +124,8 @@ describe('send tool HTTP backstop', () => {
       await new Promise((resolve) => setTimeout(resolve, 400));
       return { httpStatus: 200, body: { jsonrpc: '2.0', id: 1, result: {} } };
     });
-    expect((await post(SEND_TO_TARGET_TOOL_NAME, `la_mcp_${'A'.repeat(43)}`)).status).toBe(504);
-    expect((await post(SEND_TO_TARGET_TOOL_NAME, '')).status).toBe(504);
+    expect((await post(SEND_TO_TARGET_TOOL_NAME, `la_mcp_${'A'.repeat(43)}`)).status).toBe(200);
+    expect((await post(SEND_TO_TARGET_TOOL_NAME, '')).status).toBe(200);
     expect(MCP_SEND_REQUEST_TIMEOUT_MS).toBe(605_000);
     await server.shutdown();
     server = undefined;

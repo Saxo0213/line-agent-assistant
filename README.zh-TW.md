@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.310 新增程式排程：系統依可組合的規則自行列出新訊息，只有規則選擇時才使用 LLM；另外新增跨聊天室的 MCP 查詢，並修正只有日期的查詢。請參閱 [v1.0.310 版本說明](docs/releases/v1.0.310.md)；先前更新請見 [v1.0.305](docs/releases/v1.0.305.md)、[v1.0.303](docs/releases/v1.0.303.md) 與 [v1.0.302](docs/releases/v1.0.302.md)。
+v1.0.311 為未設 token 驗證的 loopback MCP 端點新增訊息傳送與排程管理。外部 MCP 可查詢 Agent 與主要管理者帳號資料；LINE 訊息一律由 Agent 帳號送出。外部客戶端可建立、列出、修改與刪除排程，到點後由 App 內建 Agent 執行；每次外部呼叫都有獨立 audit ID。內建 Agent 也可查閱相簿目錄。App、內部與外部 MCP 都停用記事本功能；既有封存記事資料會保留。請參閱 [v1.0.311 版本說明](docs/releases/v1.0.311.md)；先前更新請見 [v1.0.310](docs/releases/v1.0.310.md)、[v1.0.305](docs/releases/v1.0.305.md) 與 [v1.0.303](docs/releases/v1.0.303.md)。
 
 ## 安裝
 

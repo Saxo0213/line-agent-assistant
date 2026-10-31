@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.310 adds program schedules: the app lists new messages by itself with composable rules and uses an LLM only where a rule selects it, plus MCP queries across all chats and a fix for date-only queries. See the [v1.0.310 release notes](docs/releases/v1.0.310.md). Earlier changes are listed in [v1.0.305](docs/releases/v1.0.305.md), [v1.0.303](docs/releases/v1.0.303.md), and [v1.0.302](docs/releases/v1.0.302.md).
+v1.0.311 adds message sending and schedule management to the unauthenticated loopback MCP endpoint. External MCP can query both Agent and primary administrator account data; LINE messages are always sent from the Agent account. External clients can create, list, update, and delete schedules, which the built-in Agent runs when due with a separate audit ID for each external request. The built-in Agent can browse album catalogs. Notes are disabled in the app and in internal and external MCP tools; existing archived Notes are retained. See the [v1.0.311 release notes](docs/releases/v1.0.311.md). Earlier changes are listed in [v1.0.310](docs/releases/v1.0.310.md), [v1.0.305](docs/releases/v1.0.305.md), and [v1.0.303](docs/releases/v1.0.303.md).
 
 ## Installation
 

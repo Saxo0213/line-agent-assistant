@@ -39,6 +39,16 @@ function renderControls(client = api(), status: 'connected' | 'disconnected' = '
 }
 
 describe('ChatResources', () => {
+  it('hides the Notes action and never reads Notes while keeping Albums available', async () => {
+    const client = api();
+    renderControls(client);
+    expect(screen.queryByRole('button', { name: 'Open chat notes' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    expect(await screen.findByRole('dialog', { name: 'Albums' })).toBeTruthy();
+    expect(client.listChatNotes).not.toHaveBeenCalled();
+    expect(client.getChatNote).not.toHaveBeenCalled();
+    expect(client.listChatAlbums).toHaveBeenCalledOnce();
+  });
   it('omits Note and Album actions while the account is not logged in', () => {
     renderControls(api(), 'disconnected');
     expect(screen.queryByRole('button', { name: 'Notes' })).toBeNull();
@@ -51,23 +61,13 @@ describe('ChatResources', () => {
     expect(screen.queryByRole('button', { name: 'Open chat albums' })).toBeNull();
   });
 
-  it('opens an accessible Notes dialog and shows note content', async () => {
+  it('never exposes a Notes dialog', () => {
     const client = api();
     renderControls(client);
-    const notesAction = screen.getByRole('button', { name: 'Open chat notes' });
-    const albumsAction = screen.getByRole('button', { name: 'Open chat albums' });
-    expect(notesAction.textContent).toBe('');
-    expect(albumsAction.textContent).toBe('');
-    expect(notesAction.getAttribute('title')).toBe('Notes');
-    expect(albumsAction.getAttribute('title')).toBe('Albums');
-    fireEvent.click(notesAction);
-    expect(await screen.findByRole('dialog', { name: 'Notes' })).toBeTruthy();
-    expect(screen.queryByRole('navigation', { name: 'Notes / Albums' })).toBeNull();
-    expect(await screen.findByRole('button', { name: 'Agenda' })).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Agenda' }));
-    expect(await screen.findByText((_, element) => element?.tagName === 'PRE' && element.textContent === 'Agenda\nNext week')).toBeTruthy();
-    expect(client.listChatNotes).toHaveBeenCalledWith(route, null, expect.any(String));
-    expect(client.getChatNote).toHaveBeenCalledWith(route, note.postId, expect.any(String));
+    expect(screen.queryByRole('button', { name: 'Open chat notes' })).toBeNull();
+    expect(screen.queryByRole('dialog', { name: 'Notes' })).toBeNull();
+    expect(client.listChatNotes).not.toHaveBeenCalled();
+    expect(client.getChatNote).not.toHaveBeenCalled();
   });
 
   it('opens Albums from its header action without an in-dialog Notes or Albums switcher', async () => {
@@ -78,12 +78,8 @@ describe('ChatResources', () => {
     expect(screen.queryByRole('button', { name: 'Notes' })).toBeNull();
   });
 
-  it('sends null cursors accepted by IPC for first Notes, Albums, and photo pages', async () => {
+  it('sends null cursors accepted by IPC for first Album and photo pages', async () => {
     const client = api();
-    client.listChatNotes = vi.fn(async (_key, cursor, requestId) => {
-      expect(IpcRequestSchema.safeParse({ type: 'listChatNotes', ...route, cursor, requestId }).success).toBe(true);
-      return { notes: [note], nextCursor: null };
-    });
     client.listChatAlbums = vi.fn(async (_key, cursor, requestId) => {
       expect(IpcRequestSchema.safeParse({ type: 'listChatAlbums', ...route, cursor, requestId }).success).toBe(true);
       return { albums: [album], nextCursor: null };
@@ -94,14 +90,11 @@ describe('ChatResources', () => {
     });
     renderControls(client);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    await screen.findByRole('button', { name: 'Agenda' });
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
     await screen.findByRole('button', { name: 'Download photo' });
 
-    expect(client.listChatNotes).toHaveBeenCalledWith(route, null, expect.any(String));
+    expect(client.listChatNotes).not.toHaveBeenCalled();
     expect(client.listChatAlbums).toHaveBeenCalledWith(route, null, expect.any(String));
     expect(client.listChatAlbumPhotos).toHaveBeenCalledWith(route, album.albumId, null, expect.any(String));
   });
@@ -175,69 +168,48 @@ describe('ChatResources', () => {
     expect(client.listChatAlbumPhotos).toHaveBeenLastCalledWith(route, album.albumId, null, expect.any(String), true);
   });
 
-  it('shows a retryable error when a list read fails', async () => {
+  it('shows a retryable error when an Album list read fails', async () => {
     const client = api();
-    client.listChatNotes = vi.fn(async () => { throw new Error('private backend detail'); });
+    client.listChatAlbums = vi.fn(async () => { throw new Error('private backend detail'); });
     renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    expect((await screen.findByRole('alert')).textContent).toContain('Unable to load notes');
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    expect((await screen.findByRole('alert')).textContent).toContain('Unable to load albums');
     expect(screen.queryByText('private backend detail')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    await waitFor(() => expect(client.listChatNotes).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(client.listChatAlbums).toHaveBeenCalledTimes(2));
   });
 
-  it('shows the UNSUPPORTED text when the login method has no Notes or Albums', async () => {
+  it('shows the UNSUPPORTED text when the login method has no Albums', async () => {
     const unsupported = () => { const error = new Error('detail'); error.name = 'UNSUPPORTED'; return error; };
-    const client = api();
-    client.listChatNotes = vi.fn(async () => { throw unsupported(); });
-    renderControls(client, 'connected', 'ACTIVE_CONTROL', 'zh-TW');
-    fireEvent.click(screen.getByRole('button', { name: '開啟聊天室記事' }));
-    expect((await screen.findByRole('alert')).textContent).toContain('此登入方式不支援');
-    cleanup();
     const albums = api();
     albums.listChatAlbums = vi.fn(async () => { throw unsupported(); });
-    renderControls(albums);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
-    expect((await screen.findByRole('alert')).textContent).toContain('This login method does not support this action.');
+    renderControls(albums, 'connected', 'ACTIVE_CONTROL', 'zh-TW');
+    fireEvent.click(screen.getByRole('button', { name: '開啟聊天室相簿' }));
+    expect((await screen.findByRole('alert')).textContent).toContain('此登入方式不支援');
   });
 
-  it('requests one bounded cursor page at a time and refreshes from the first page', async () => {
+  it('requests bounded Album pages and refreshes from the first page', async () => {
     const client = api();
-    client.listChatNotes = vi.fn()
-      .mockResolvedValueOnce({ notes: [note], nextCursor: 'cursor-2' })
-      .mockResolvedValueOnce({ notes: [], nextCursor: null })
-      .mockResolvedValueOnce({ notes: [note], nextCursor: null });
+    client.listChatAlbums = vi.fn()
+      .mockResolvedValueOnce({ albums: [album], nextCursor: 'cursor-2' })
+      .mockResolvedValueOnce({ albums: [], nextCursor: null })
+      .mockResolvedValueOnce({ albums: [album], nextCursor: null });
     renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     await screen.findByRole('button', { name: 'Load more' });
-    expect(client.listChatNotes).toHaveBeenCalledTimes(1);
+    expect(client.listChatAlbums).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
-    await waitFor(() => expect(client.listChatNotes).toHaveBeenCalledWith(route, 'cursor-2', expect.any(String)));
+    await waitFor(() => expect(client.listChatAlbums).toHaveBeenCalledWith(route, 'cursor-2', expect.any(String)));
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
-    await waitFor(() => expect(client.listChatNotes).toHaveBeenLastCalledWith(route, null, expect.any(String)));
+    await waitFor(() => expect(client.listChatAlbums).toHaveBeenLastCalledWith(route, null, expect.any(String), true));
   });
 
   it.each([
-    ['zh-TW', '開啟聊天室記事'], ['ja', 'チャットのノートを開く'], ['ko', '대화 노트 열기'],
-  ] as const)('localizes resource actions in %s', (locale, label) => {
+    ['zh-TW', '開啟聊天室相簿'], ['ja', 'チャットのアルバムを開く'], ['ko', '대화 앨범 열기'],
+  ] as const)('localizes the Album action in %s', (locale, label) => {
     renderControls(api(), 'connected', 'ACTIVE_CONTROL', locale);
     expect(screen.getByRole('button', { name: label })).toBeTruthy();
-  });
-
-  it('refreshes the first Notes page after closing and reopening', async () => {
-    const client = api();
-    const refreshed = { ...note, postId: 'note-2', text: 'Updated agenda' };
-    client.listChatNotes = vi.fn()
-      .mockResolvedValueOnce({ notes: [note], nextCursor: null })
-      .mockResolvedValueOnce({ notes: [refreshed], nextCursor: null });
-    renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    await screen.findByRole('button', { name: 'Agenda' });
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    expect(await screen.findByRole('button', { name: 'Updated agenda' })).toBeTruthy();
-    expect(client.listChatNotes).toHaveBeenCalledTimes(2);
-    expect(client.listChatNotes).toHaveBeenLastCalledWith(route, null, expect.any(String));
+    expect(screen.queryByRole('button', { name: /notes|記事|노트/i })).toBeNull();
   });
 
   it('refreshes Albums when closing and reopening its header action', async () => {
@@ -282,29 +254,29 @@ describe('ChatResources', () => {
   it('cancels active reads when the modal closes and ignores a late success', async () => {
     const client = api();
     let activeRequestId: string | undefined;
-    const pending = deferred<{ notes: typeof note[]; nextCursor: string | null }>();
+    const pending = deferred<{ albums: typeof album[]; nextCursor: string | null }>();
     let calls = 0;
-    client.listChatNotes = vi.fn((_key: ConversationKey, _cursor: string | null, requestId?: string) => {
+    client.listChatAlbums = vi.fn((_key: ConversationKey, _cursor: string | null, requestId?: string) => {
       activeRequestId = requestId;
-      return calls++ === 0 ? pending.promise : Promise.resolve({ notes: [], nextCursor: null });
+      return calls++ === 0 ? pending.promise : Promise.resolve({ albums: [], nextCursor: null });
     });
     renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     expect(activeRequestId).toEqual(expect.any(String));
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(client.cancelChatResourceRequest).toHaveBeenCalledWith(activeRequestId);
-    pending.resolve({ notes: [{ ...note, postId: 'late-note', text: 'Late result' }], nextCursor: null });
+    pending.resolve({ albums: [{ ...album, title: 'Late result' }], nextCursor: null });
     await waitFor(() => expect(screen.queryByText('Late result')).toBeNull());
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    await screen.findByText('No notes in this chat.');
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    await screen.findByText('No albums in this chat.');
     expect(screen.queryByRole('button', { name: 'Late result' })).toBeNull();
   });
 
-  it('removes settled request tracking so closing does not cancel a completed read', async () => {
+  it('removes settled Album request tracking so closing does not cancel a completed read', async () => {
     const client = api();
     renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    await screen.findByRole('button', { name: 'Agenda' });
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    await screen.findByRole('button', { name: 'Trip' });
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(client.cancelChatResourceRequest).not.toHaveBeenCalled();
   });
@@ -312,9 +284,9 @@ describe('ChatResources', () => {
   it('aborts active reads when the selected chat changes', async () => {
     const client = api();
     let activeRequestId: string | undefined;
-    client.listChatNotes = vi.fn((_key: ConversationKey, _cursor: string | null, requestId?: string) => { activeRequestId = requestId; return new Promise<never>(() => {}); });
+    client.listChatAlbums = vi.fn((_key: ConversationKey, _cursor: string | null, requestId?: string) => { activeRequestId = requestId; return new Promise<never>(() => {}); });
     const view = renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     expect(activeRequestId).toEqual(expect.any(String));
     view.rerender(<LocaleProvider value={{ status: 'loaded', effectiveLocale: 'en', preference: 'en', busy: false, error: null, retry() {}, retryRestart() {}, setPreference() {} }}>
       <ChatResources api={client} route={{ ...route, chatId: 'group-2' }} accountStatus="connected" accountMode="ACTIVE_CONTROL" />
@@ -322,59 +294,24 @@ describe('ChatResources', () => {
     expect(client.cancelChatResourceRequest).toHaveBeenCalledWith(activeRequestId);
   });
 
-  it('cancels active reads on unmount', () => {
+  it('cancels active Album reads on unmount', () => {
     const client = api();
     let activeRequestId: string | undefined;
-    client.listChatNotes = vi.fn((_key: ConversationKey, _cursor: string | null, requestId?: string) => { activeRequestId = requestId; return new Promise<never>(() => {}); });
+    client.listChatAlbums = vi.fn((_key: ConversationKey, _cursor: string | null, requestId?: string) => { activeRequestId = requestId; return new Promise<never>(() => {}); });
     const view = renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     view.unmount();
     expect(client.cancelChatResourceRequest).toHaveBeenCalledWith(activeRequestId);
   });
 
-  it('ignores note detail results after Back and reopen', async () => {
-    const client = api();
-    const pending = deferred<typeof note>();
-    client.getChatNote = vi.fn(() => pending.promise);
-    renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Agenda' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    await screen.findByRole('button', { name: 'Agenda' });
-    pending.resolve({ ...note, text: 'Late stale note' });
-    await waitFor(() => expect(screen.queryByText('Late stale note')).toBeNull());
-    expect(screen.queryByRole('heading', { name: 'Late stale note' })).toBeNull();
-  });
-
   it('keeps Shift+Tab inside the dialog when focus starts on the dialog container', async () => {
     renderControls();
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Notes' });
-    await screen.findByRole('button', { name: 'Agenda' });
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Albums' });
+    await screen.findByRole('button', { name: 'Trip' });
     dialog.focus();
     fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Agenda' }));
-  });
-
-  it('applies a pending Notes page after opening and leaving note detail', async () => {
-    const client = api();
-    const note2 = { ...note, postId: 'note-2', text: 'Second page note' };
-    const pending = deferred<{ notes: typeof note2[]; nextCursor: string | null }>();
-    client.listChatNotes = vi.fn()
-      .mockResolvedValueOnce({ notes: [note], nextCursor: 'cursor-2' })
-      .mockReturnValueOnce(pending.promise);
-    renderControls(client);
-    fireEvent.click(screen.getByRole('button', { name: 'Open chat notes' }));
-    await screen.findByRole('button', { name: 'Load more' });
-    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Agenda' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
-    pending.resolve({ notes: [note2], nextCursor: 'cursor-3' });
-    expect(await screen.findByRole('button', { name: 'Second page note' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Refresh' }).hasAttribute('disabled')).toBe(false);
-    expect(screen.getByRole('button', { name: 'Load more' })).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Trip' }));
   });
 
   it('applies a pending Albums page after opening and leaving album detail', async () => {

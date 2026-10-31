@@ -1,4 +1,4 @@
-import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
+import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
 import { lockAndCheckAgentAuthorization, lockAndCheckRoomAgentGrant } from './agent-authorization.js';
 import { findSharedAdminChat, type SharedAdminChat } from './agent-repository.js';
@@ -48,6 +48,8 @@ export const SCHEDULE_PRINCIPAL_ID = 'internal:schedule';
 /** Data scope derived server-side from the job row; never from tool arguments. */
 export type InternalDataScope =
   | { kind: 'full' }
+  /** Account scope copied from an externally created schedule to its durable job row. */
+  | { kind: 'accounts'; accountIds: readonly string[] }
   /** `records.query_all_chats` ALLOW: every chat of the job's own account, the only widening past the current chat. */
   | { kind: 'account'; accountId: string }
   /** The job's own chat plus the group/room chats of the user's linked folders. */
@@ -61,7 +63,7 @@ export type InternalAgentExecutionContext =
    * Main itself reading for a program schedule (new_messages) with no job row. Same principal (`internal:schedule`), scope, permissions and
    * audit row as a scheduled Agent run (resolveInternalPrincipal maps a schedule job to this same context); no Agent room history.
    */
-  | { sourceType: 'schedule' }
+  | { sourceType: 'schedule'; accountScope?: readonly string[] | null }
   /**
    * Built-in Agent MCP capability: the durable job row (running, exact generation, account)
    * is rechecked on every request and its source_type decides the authority.
@@ -165,11 +167,13 @@ export class McpTokenRepository {
   }
 
   /**
-   * Read path of the external local MCP client. The client has no token. The 127.0.0.1 bind and the HTTP
+   * Request path of the external local MCP client. The client has no token. The 127.0.0.1 bind and the HTTP
    * request guard are the only gate. Authority is fixed: the AGENT and PRIMARY_ADMIN accounts, every external tool.
    */
   async executeLocalClientRead<T>(input: {
     toolName: McpInternalToolName | null;
+    /** A unique identity for one external MCP request; never supplied by the client. */
+    principalId?: string;
     requestedAccountId?: string;
     rateLimiter?: () => boolean;
     signal?: AbortSignal;
@@ -177,11 +181,11 @@ export class McpTokenRepository {
       client: PoolClient;
       principalId: string;
       authorizedAccountIds: string[];
-      toolScopes: McpToolName[];
+      toolScopes: McpInternalToolName[];
     }) => Promise<{ data: T; resultCount?: number }>;
   }): Promise<T> {
     return this.withMcpTransaction(input.signal, async (client) => {
-      const principalId = LOCAL_CLIENT_PRINCIPAL_ID;
+      const principalId = input.principalId ?? LOCAL_CLIENT_PRINCIPAL_ID;
       const reject = async (accountScopes: readonly string[], disposition: McpAuditRecord['disposition']): Promise<void> => {
         await this.insertAudit(client, {
           tokenId: null, principalId, initiator: 'external_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
@@ -196,9 +200,11 @@ export class McpTokenRepository {
         throw new McpDomainError('RATE_LIMITED', 'MCP request rate limit exceeded.');
       }
 
-      // Internal-only tools (Agent room history, LINE send) are never available to the external client.
+      // The local loopback client can use the explicitly supported LINE send and schedule tools.
+      // Agent-room history remains internal-only.
       const externalTool = input.toolName === null ? null : McpToolNameSchema.safeParse(input.toolName);
-      if (input.toolName !== null && externalTool && !externalTool.success) {
+      const localEffectTool = input.toolName === LIST_SEND_TARGETS_TOOL_NAME || input.toolName === SEND_TO_TARGET_TOOL_NAME || isScheduleToolName(input.toolName);
+      if (input.toolName !== null && !externalTool?.success && !localEffectTool) {
         await reject([], 'SCOPE_DENIED');
         throw new McpDomainError('SCOPE_DENIED', `The external MCP endpoint does not offer tool "${input.toolName}".`);
       }
@@ -243,7 +249,7 @@ export class McpTokenRepository {
           client,
           principalId,
           authorizedAccountIds,
-          toolScopes: [...MCP_TOOL_NAMES],
+          toolScopes: [...MCP_TOOL_NAMES, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, ...SCHEDULE_TOOL_NAMES],
         }));
       } catch (stepError) {
         if (stepError instanceof McpDomainError && stepError.code === 'INVALID_INPUT') {
@@ -310,10 +316,10 @@ export class McpTokenRepository {
     toolName: McpInternalToolName | null,
     includeHistory = toolName === AGENT_ROOM_HISTORY_TOOL_NAME,
   ): Promise<{ principalId: string; scope: InternalDataScope; permissions: EffectivePermissions; history: { allowed: boolean; shared: SharedAdminChat | null } }> {
-    let context: { sourceType: 'ui' } | { sourceType: 'schedule' } | { sourceType: 'line'; jobId: string };
+    let context: { sourceType: 'ui' } | { sourceType: 'schedule'; accountScope: string[] | null } | { sourceType: 'line'; jobId: string };
     if (initial.sourceType === 'job') {
-      const row = (await client.query<{ account_id: string | null; generation: string | number; status: string; source_type: string }>(
-        `SELECT account_id, generation, status, source_type FROM agent_jobs WHERE job_id = $1`,
+      const row = (await client.query<{ account_id: string | null; generation: string | number; status: string; source_type: string; mcp_account_scope: string[] | null }>(
+        `SELECT account_id, generation, status, source_type, mcp_account_scope FROM agent_jobs WHERE job_id = $1`,
         [initial.jobId],
       )).rows[0];
       // A UI job of the shared Agent room has no account (NULL === NULL); a LINE job must match its account exactly,
@@ -322,11 +328,13 @@ export class McpTokenRepository {
         || (row.source_type !== 'ui' && row.source_type !== 'line' && row.source_type !== 'schedule') || (row.source_type === 'line' && row.account_id === null)) {
         return this.rejectInternal(client, toolName, row?.account_id ? [row.account_id] : [], 'The Agent job is no longer authorized to use LINEJS MCP tools.');
       }
-      context = row.source_type === 'ui' ? { sourceType: 'ui' } : row.source_type === 'schedule' ? { sourceType: 'schedule' } : { sourceType: 'line', jobId: initial.jobId };
-    } else context = initial;
+      context = row.source_type === 'ui' ? { sourceType: 'ui' } : row.source_type === 'schedule' ? { sourceType: 'schedule', accountScope: row.mcp_account_scope } : { sourceType: 'line', jobId: initial.jobId };
+    } else context = initial.sourceType === 'schedule' ? { sourceType: 'schedule', accountScope: initial.accountScope == null ? null : [...initial.accountScope] } : initial;
     if (context.sourceType === 'schedule') {
-      // A scheduled run reads like the operator but has no Agent room history.
-      return { principalId: SCHEDULE_PRINCIPAL_ID, scope: { kind: 'full' }, permissions: allPermissions('ALLOW'), history: { allowed: false, shared: null } };
+      // NULL is legacy/internal full operator scope; externally created schedules carry their fixed account scope.
+      return { principalId: SCHEDULE_PRINCIPAL_ID,
+        scope: context.accountScope === null ? { kind: 'full' } : { kind: 'accounts', accountIds: context.accountScope },
+        permissions: allPermissions('ALLOW'), history: { allowed: false, shared: null } };
     }
     if (context.sourceType === 'ui') {
       return { principalId: 'internal:ui', scope: { kind: 'full' }, permissions: allPermissions('ALLOW'),
@@ -449,6 +457,8 @@ export class McpTokenRepository {
       extraConversationScopes?: ReadonlyArray<Pick<ConversationKey, 'chatType' | 'chatId'>>;
       /** True for every non-admin principal: names come from each member's own LINE display name, never the owner's nickname. */
       ownLineNamesOnly: boolean;
+      /** Present for schedule jobs; null is full operator scope and an array is the persisted account fence. */
+      accountScope?: readonly string[] | null;
       /** Agent room history only: the admin-direct chat shared at this call, or null; pass to queryAgentRoomHistory. */
       sharedAdminChat?: SharedAdminChat | null;
     }) => Promise<{ data: T; resultCount?: number }>;
@@ -463,7 +473,7 @@ export class McpTokenRepository {
         if (!history.allowed) {
           await this.insertAudit(client, {
             tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
-            accountScopes: [], grantVersion: null, disposition: 'PERMISSION_DENIED', resultCount: null,
+            accountScopes: scope.kind === 'accounts' ? [...scope.accountIds] : [], grantVersion: null, disposition: 'PERMISSION_DENIED', resultCount: null,
           });
           await client.query('COMMIT');
           throw new McpDomainError('PERMISSION_DENIED', 'This Agent job does not have permission to use this tool.');
@@ -473,7 +483,7 @@ export class McpTokenRepository {
         });
         await this.insertAudit(client, {
           tokenId: null, principalId, initiator: 'internal_agent', action: 'TOOL_CALLED', toolName: input.toolName,
-          accountScopes: [], grantVersion: null, disposition: 'ALLOWED', resultCount: resultCount ?? null,
+          accountScopes: scope.kind === 'accounts' ? [...scope.accountIds] : [], grantVersion: null, disposition: 'ALLOWED', resultCount: resultCount ?? null,
         });
         return data;
       }
@@ -485,17 +495,31 @@ export class McpTokenRepository {
         if (!mayLineSend(principalId)) {
           await this.insertAudit(client, {
             tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
-            accountScopes: [], grantVersion: null, disposition: 'PERMISSION_DENIED', resultCount: null,
+            accountScopes: scope.kind === 'accounts' ? [...scope.accountIds] : [], grantVersion: null, disposition: 'PERMISSION_DENIED', resultCount: null,
           });
           await client.query('COMMIT');
           throw new McpDomainError('PERMISSION_DENIED', 'This Agent job does not have permission to use this tool.');
         }
+        let authorizedAccountIds: string[] = [];
+        let effectiveAccountScope: string[] | null = null;
+        if (scope.kind === 'accounts') {
+          const requested = input.requestedAccountId?.trim();
+          const live = (await client.query<{ account_id: string }>("SELECT account_id FROM line_accounts WHERE product_role = ANY($1::text[]) AND mode <> 'PAUSED' AND account_id = ANY($2::text[]) ORDER BY account_id ASC", [['AGENT', 'PRIMARY_ADMIN'], scope.accountIds])).rows.map((row) => row.account_id);
+          effectiveAccountScope = live;
+          if (requested && !live.includes(requested)) return this.rejectInternal(client, input.toolName, [requested], 'This scheduled Agent job may only access its authorized LINE accounts.');
+          const agentAccount = (await client.query<{ account_id: string }>("SELECT account_id FROM line_accounts WHERE product_role = 'AGENT' AND connection_mode = 'SYSTEM_LOGIN' LIMIT 1")).rows[0]?.account_id ?? null;
+          if ((input.toolName === LIST_SEND_TARGETS_TOOL_NAME || input.toolName === SEND_TO_TARGET_TOOL_NAME) && (!agentAccount || !scope.accountIds.includes(agentAccount) || !live.includes(agentAccount))) {
+            return this.rejectInternal(client, input.toolName, agentAccount ? [agentAccount] : [], 'This scheduled Agent job may not send from an account outside its authorized scope.');
+          }
+          authorizedAccountIds = requested ? [requested] : live;
+        }
         const { data, resultCount } = await input.execute({
-          client, principalId, authorizedAccountIds: [], ownLineNamesOnly: false,
+          client, principalId, authorizedAccountIds, ownLineNamesOnly: false,
+          accountScope: effectiveAccountScope,
         });
         await this.insertAudit(client, {
           tokenId: null, principalId, initiator: 'internal_agent', action: 'TOOL_CALLED', toolName: input.toolName,
-          accountScopes: [], grantVersion: null, disposition: 'ALLOWED', resultCount: resultCount ?? null,
+          accountScopes: scope.kind === 'accounts' ? [...scope.accountIds] : [], grantVersion: null, disposition: 'ALLOWED', resultCount: resultCount ?? null,
         });
         return data;
       }
@@ -508,7 +532,7 @@ export class McpTokenRepository {
           initiator: 'internal_agent',
           action: 'AUTH_REJECTED',
           toolName: input.toolName,
-          accountScopes: scope.kind === 'full' ? [] : [scope.accountId],
+          accountScopes: scope.kind === 'full' ? [] : scope.kind === 'accounts' ? [...scope.accountIds] : [scope.accountId],
           grantVersion: null,
           disposition: 'PERMISSION_DENIED',
           resultCount: null,
@@ -538,6 +562,19 @@ export class McpTokenRepository {
       );
       const nonPausedAccounts = accountsResult.rows.map((row) => row.account_id);
       const requestedAccount = input.requestedAccountId?.trim();
+      if (scope.kind === 'accounts') {
+        const scopedLive = (await client.query<{ account_id: string }>(
+          "SELECT account_id FROM line_accounts WHERE product_role = ANY($1::text[]) AND mode <> 'PAUSED' AND account_id = ANY($2::text[]) ORDER BY account_id ASC",
+          [['AGENT', 'PRIMARY_ADMIN'], scope.accountIds],
+        )).rows.map((row) => row.account_id);
+        if (requestedAccount && !scopedLive.includes(requestedAccount)) return deny([requestedAccount], 'This scheduled Agent job may only query records of its authorized LINE accounts.');
+        const authorizedAccountIds = requestedAccount ? [requestedAccount] : scopedLive;
+        const { data, resultCount } = await input.execute({ client, principalId, authorizedAccountIds, ownLineNamesOnly: false,
+          accountScope: scopedLive });
+        await this.insertAudit(client, { tokenId: null, principalId, initiator: 'internal_agent', action: 'TOOL_CALLED', toolName: input.toolName,
+          accountScopes: authorizedAccountIds, grantVersion: null, disposition: 'ALLOWED', resultCount: resultCount ?? null });
+        return data;
+      }
       // Chat-scoped principals get one uniform denial (below) so error text never reveals whether another account exists.
       if (scope.kind === 'full' && requestedAccount && !nonPausedAccounts.includes(requestedAccount)) {
         await this.insertAudit(client, {
