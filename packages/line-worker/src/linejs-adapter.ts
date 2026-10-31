@@ -638,6 +638,8 @@ export class LinejsAdapter implements LineTransport {
   readonly #attachmentDownloadContext = new AsyncLocalStorage<AttachmentDownloadContext>();
   readonly #mediaUploadContext = new AsyncLocalStorage<MediaUploadScope>();
   readonly #serverLogoutContext = new AsyncLocalStorage<ServerLogoutContext>();
+  // Records the physical HTTP status of the current sync RPC so an empty long-poll 410 can be told apart from a real failure.
+  readonly #syncPhysicalStatus = new AsyncLocalStorage<{ status?: number }>();
   readonly #requestFailures = new WeakSet<object>();
   #revoked = false;
   #refreshingCredentials = false;
@@ -805,7 +807,12 @@ export class LinejsAdapter implements LineTransport {
           active.consumed = true;
           active.onPhysicalStart();
         }
-        return await options.physicalTransport(request);
+        const response = await options.physicalTransport(request);
+        if (source?.path === '/SYNC4' && source.methodName === 'sync') {
+          const observed = this.#syncPhysicalStatus.getStore();
+          if (observed) observed.status = response.status;
+        }
+        return response;
       },
       validateControlLease: async (lease, phase: ControlLeasePhase) => {
         const identityMatches = lease.accountId === options.accountId &&
@@ -1085,10 +1092,20 @@ export class LinejsAdapter implements LineTransport {
   }
   async sync(cursor: TalkCursorV1Dto): Promise<SyncResult> {
     const context = this.#readContext();
-    const response = await this.#gate.invokeRpc(context, () => this.#base.talk.sync({
-      revision: BigInt(cursor.revision), globalRev: BigInt(cursor.globalRev),
-      individualRev: BigInt(cursor.individualRev), limit: 100,
-    })) as Awaited<ReturnType<BaseClient['talk']['sync']>>;
+    const observed: { status?: number } = {};
+    let response: Awaited<ReturnType<BaseClient['talk']['sync']>>;
+    try {
+      response = await this.#syncPhysicalStatus.run(observed, () => this.#gate.invokeRpc(context, () => this.#base.talk.sync({
+        revision: BigInt(cursor.revision), globalRev: BigInt(cursor.globalRev),
+        individualRev: BigInt(cursor.individualRev), limit: 100,
+      }))) as Awaited<ReturnType<BaseClient['talk']['sync']>>;
+    } catch (error) {
+      // LINE ends an idle sync long poll with HTTP 410 and an empty body. That is a normal "no events" result.
+      // The library fails to decode the empty body, so use the physical status, not the message text.
+      if (observed.status === 410 && !isLineServerRejection(error) && !(error instanceof InternalError)
+        && !(error instanceof EffectDeniedError)) return { cursorAfter: cursor, operations: [] };
+      throw error;
+    }
     let revision = cursor.revision;
     let globalRev = cursor.globalRev;
     let individualRev = cursor.individualRev;

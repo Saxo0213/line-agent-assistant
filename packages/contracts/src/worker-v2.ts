@@ -212,6 +212,7 @@ export const LineWorkerEventSchema = z.union([
   Bound.extend({ type: z.literal('modeAck'), mode: AccountModeSchema, drained: z.boolean() }),
   Bound.extend({ type: z.literal('workerProtocolAck'), protocolVersion: z.literal(WORKER_PROTOCOL_VERSION), manualSend: z.literal(true) }),
   Bound.extend({ type: z.literal('authInvalidated') }),
+  Bound.extend({ type: z.literal('syncConfirmed') }),
   Bound.extend({ type: z.literal('downloadAuthResult'), requestId: Id, accepted: z.boolean(), error: z.enum(['PROFILE_MISMATCH', 'AUTH_UNAVAILABLE', 'APPLICATION_MISMATCH']).nullable() }),
   Bound.extend({ type: z.literal('downloadAuthInvalidated') }),
   Bound.extend({ type: z.literal('downloadReady'), ownMid: Id }),

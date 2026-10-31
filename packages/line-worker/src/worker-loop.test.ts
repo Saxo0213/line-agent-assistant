@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { FakeLineTransport } from './fake-transport.js';
-import { LineWorkerLoop, LOGOUT_DEADLINE_MS, type TransportIdentity } from './worker-loop.js';
+import { LineWorkerLoop, LOGOUT_DEADLINE_MS, SYNC_CONFIRMED_INTERVAL_MS, type TransportIdentity } from './worker-loop.js';
 import { createLinejsAdapter } from './linejs-adapter.js';
 import { decodeHistoryCursor, encodeHistoryCursor } from './cursor.js';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
@@ -1692,7 +1692,7 @@ describe('one-account worker loop', () => {
     transport.syncError = undefined;
     await expect(worker.handle({ type: 'poll', ...binding })).resolves.toBeUndefined();
     expect(transport.syncCalls).toHaveLength(6);
-    expect(events.at(-1)).toMatchObject({ type: 'status', ...binding, state: 'ready', message: null });
+    expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ type: 'status', ...binding, state: 'ready', message: null });
   });
 
   it('emits fixed poll rejection diagnostics on each failure and keeps degraded recovery behavior', async () => {
@@ -1709,8 +1709,124 @@ describe('one-account worker loop', () => {
     transport.syncError = undefined;
     await worker.handle({ type: 'poll', ...binding });
     expect(transport.syncCalls).toHaveLength(6);
-    expect(events.at(-1)).toMatchObject({ type: 'status', state: 'ready', message: null });
+    expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ type: 'status', state: 'ready', message: null });
     expect(JSON.stringify(events)).not.toContain('token=private');
+  });
+
+  it('emits no degraded status after 12 successful empty polls', async () => {
+    const { worker, transport, events, init } = setup();
+    await init;
+    await authenticate(worker);
+    for (let attempt = 0; attempt < 12; attempt++) await worker.handle({ type: 'poll', ...binding });
+    expect(transport.syncCalls).toHaveLength(12);
+    expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
+  });
+
+  it('emits degraded once after 5 poll failures and ready on the next success', async () => {
+    const { worker, transport, events, init } = setup();
+    await init;
+    await authenticate(worker);
+    transport.syncError = new Error('sync failed');
+    for (let attempt = 0; attempt < 8; attempt++) await worker.handle({ type: 'poll', ...binding });
+    expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toHaveLength(1);
+    const readyBefore = events.filter((event) => event.type === 'status' && event.state === 'ready').length;
+    transport.syncError = undefined;
+    await worker.handle({ type: 'poll', ...binding });
+    expect(events.filter((event) => event.type === 'status' && event.state === 'ready')).toHaveLength(readyBefore + 1);
+    expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ type: 'status', state: 'ready' });
+  });
+
+  it('does not degrade when a success separates two runs of 4 poll failures', async () => {
+    const { worker, transport, events, init } = setup();
+    await init;
+    await authenticate(worker);
+    transport.syncError = new Error('sync failed');
+    for (let attempt = 0; attempt < 4; attempt++) await worker.handle({ type: 'poll', ...binding });
+    transport.syncError = undefined;
+    await worker.handle({ type: 'poll', ...binding });
+    transport.syncError = new Error('sync failed');
+    for (let attempt = 0; attempt < 4; attempt++) await worker.handle({ type: 'poll', ...binding });
+    expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
+  });
+
+  it('emits syncConfirmed at most once per interval and only after a successful poll', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const { worker, transport, events, init } = setup();
+      await init;
+      await authenticate(worker);
+      const confirmed = () => events.filter((event) => event.type === 'syncConfirmed');
+      transport.syncError = new Error('sync failed');
+      await worker.handle({ type: 'poll', ...binding });
+      expect(confirmed()).toEqual([]);
+      transport.syncError = undefined;
+      await worker.handle({ type: 'poll', ...binding });
+      expect(confirmed()).toHaveLength(1);
+      expect(confirmed()[0]).toMatchObject({ type: 'syncConfirmed', ...binding });
+      expect(LineWorkerEventSchema.safeParse(confirmed()[0]).success).toBe(true);
+      vi.setSystemTime(Date.now() + SYNC_CONFIRMED_INTERVAL_MS - 1);
+      await worker.handle({ type: 'poll', ...binding });
+      expect(confirmed()).toHaveLength(1);
+      vi.setSystemTime(Date.now() + 1);
+      await worker.handle({ type: 'poll', ...binding });
+      expect(confirmed()).toHaveLength(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('an idle account stays ready through repeated HTTP 410 long polls', async () => {
+    let httpStatus = 410;
+    const physicalTransport = vi.fn(async () => new Response(null, { status: httpStatus }));
+    const adapter = await createLinejsAdapter({ ...binding, mode: 'MONITOR_ONLY', validateLease: () => false, physicalTransport });
+    await adapter.installSecrets({ token: ['{"alg":"HS256"}', '{"sub":"u-self"}', 'signature']
+      .map((part) => Buffer.from(part).toString('base64url')).join('.'), qrCert: null, e2eeStorage: null });
+    const { worker, transport, events, init } = setup();
+    transport.sync = (syncCursor) => adapter.sync(syncCursor as Parameters<typeof adapter.sync>[0]);
+    try {
+      await init;
+      await authenticate(worker);
+      for (let attempt = 0; attempt < 12; attempt++) await worker.handle({ type: 'poll', ...binding });
+      expect(physicalTransport).toHaveBeenCalledTimes(12);
+      expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
+      expect(events.filter((event) => event.type === 'error')).toEqual([]);
+      expect(events.filter((event) => event.type === 'batch')).toEqual([]);
+
+      httpStatus = 500;
+      for (let attempt = 0; attempt < 5; attempt++) await worker.handle({ type: 'poll', ...binding });
+      expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toHaveLength(1);
+
+      httpStatus = 410;
+      await worker.handle({ type: 'poll', ...binding });
+      expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ state: 'ready' });
+    } finally { adapter.revoke(); }
+  });
+
+  it('keeps the failure count and the poll result when the syncConfirmed emit rejects', async () => {
+    const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+    const events: any[] = [];
+    let rejectConfirmed = true;
+    const worker = new LineWorkerLoop({ transport, validateLease: async () => true, emit: (event) => {
+      if (event.type === 'syncConfirmed' && rejectConfirmed) return Promise.reject(new Error('emit failed'));
+      events.push(event);
+    } });
+    await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
+    await authenticate(worker);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      // 4 failures, one success whose confirmation emit rejects, then 4 failures: the success must still reset the count.
+      transport.syncError = new Error('sync failed');
+      for (let attempt = 0; attempt < 4; attempt++) await worker.handle({ type: 'poll', ...binding });
+      transport.syncError = undefined;
+      await expect(worker.handle({ type: 'poll', ...binding })).resolves.toBeUndefined();
+      transport.syncError = new Error('sync failed');
+      for (let attempt = 0; attempt < 4; attempt++) await worker.handle({ type: 'poll', ...binding });
+      expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
+      expect(events.filter((event) => event.type === 'syncConfirmed')).toEqual([]);
+      rejectConfirmed = false;
+      transport.syncError = undefined;
+      vi.setSystemTime(Date.now() + SYNC_CONFIRMED_INTERVAL_MS);
+      await worker.handle({ type: 'poll', ...binding });
+      expect(events.filter((event) => event.type === 'syncConfirmed')).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
   });
 
   it('keeps a ready worker usable after a retryable scheduled token refresh failure', async () => {

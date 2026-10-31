@@ -30,7 +30,7 @@ describe('decideToolUse', () => {
 
   it.each([
     ['read_only','Read',{file_path:'C:\\work\\a'},'allow'], ['read_only','Write',{file_path:'C:\\work\\a'},'deny'],
-    ['read_only','WebFetch',{},'ask'], ['read_only','mcp__linejs__list_targets',{},'allow'],
+    ['read_only','WebFetch',{},'ask'], ['read_only','mcp__linejs__list_targets',{},'allow'], ['read_only','mcp__linejs__list_active_chats',{},'allow'],
     ['workspace_write','Write',{file_path:'C:\\work\\a'},'ask'], ['trust','WebFetch',{},'allow'],
     ['full','Write',{file_path:'D:\\outside\\a'},'allow'], ['full','Other',{},'allow'],
   ] as const)('level matrix %s / %s -> %s', (level,tool,input,want) => {

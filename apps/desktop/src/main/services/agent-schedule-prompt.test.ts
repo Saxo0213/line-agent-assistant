@@ -141,8 +141,10 @@ describe('hidden schedule run context', () => {
       '指示：整理昨天的訊息',
     ]);
     expect(context).toContain('來源：未固定聊天室');
-    expect(context).toContain('list_targets');
-    expect(context).toContain('query_target_messages_by_time');
+    expect(context).toContain('只呼叫一次 query_target_messages_by_time，帶 from 與 to，不帶 target');
+    expect(context).toContain('每則訊息都有 chatId 與 conversationTitle');
+    expect(context).toContain('不要逐一聊天室查詢');
+    expect(context).not.toContain('list_targets');
     expect(context).toContain('時間：');
   });
 });

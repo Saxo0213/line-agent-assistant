@@ -3,6 +3,9 @@ import {
   agentScheduleShapeError,
   resolveScheduleMessagePlaceholders,
   type AgentProvider,
+  type AgentSchedulePreviewNewMessagesOutput,
+  type AgentSchedulePreviewNewMessagesRequest,
+  type AgentScheduleNewMessagesTask,
   type AgentSchedule,
   type AgentScheduleCreateInput,
   type AgentScheduleRun,
@@ -12,12 +15,14 @@ import {
   type AgentScheduleUpdatePatch,
 } from '@line-agent/contracts';
 import { AgentScheduleError, resolveCurrentAgentKey, type AgentLineage, type AgentScheduleClaim, type AgentScheduleClaimResult, type AgentScheduleRepository } from '@line-agent/database';
-import { composeScheduleRunContext, composeScheduledPrompt, computeScheduleWindow } from './agent-schedule-prompt.js';
+import { composeScheduleRunContext, composeScheduledPrompt, computeScheduleWindow, type ScheduleTimeWindow } from './agent-schedule-prompt.js';
+import type { AgentScheduleMessageReader } from './agent-schedule-reader.js';
+import { NEW_MESSAGES_EMPTY_LINE, evaluateNewMessages, listedText, type NewMessagesEvaluation, type ScheduleOwnDelivery } from './agent-schedule-rules.js';
 
 export const AGENT_SCHEDULE_TICK_MS = 30_000;
 
 export type AgentScheduleStore = Pick<AgentScheduleRepository,
-  'list' | 'get' | 'create' | 'update' | 'delete' | 'claimDue' | 'markSubmitted' | 'markFailed' | 'markSent' | 'markSendFailed' | 'markSendUnknown'
+  'list' | 'get' | 'create' | 'update' | 'delete' | 'claimDue' | 'markSubmitted' | 'markFailed' | 'markSent' | 'markSendFailed' | 'markSendUnknown' | 'markNoMessages'
   | 'recoverStale' | 'listRuns' | 'previousSubmittedFor'>;
 
 export interface AgentScheduleSubmission { provider: AgentProvider; requestId: string; prompt: string }
@@ -51,6 +56,8 @@ export interface AgentScheduleServiceOptions {
   submit: (input: AgentScheduleSubmission) => Promise<{ jobId: string }>;
   /** Sends the text of a system message schedule (no Agent job, no provider). Called only after the claim transaction committed. */
   sendSystemText?: AgentScheduleSystemSender;
+  /** Reads the messages of a window for new_messages schedules (same scope, redaction and audit as a scheduled Agent run). */
+  readMessages?: AgentScheduleMessageReader;
   targets?: AgentScheduleTargetResolver;
   /** Resolves the Agent account lineage; stored targets of former Agent accounts are mapped to the current account at fire time. */
   agentLineage?: () => Promise<AgentLineage>;
@@ -119,6 +126,7 @@ export class AgentScheduleService {
     for (const rawClaim of result.claims) {
       const claim = await this.remapTargets(rawClaim);
       if (claim.task.type === 'message') { await this.sendSystemMessage(claim); continue; }
+      if (claim.task.type === 'new_messages') { await this.runNewMessages(claim); continue; }
       try {
         const prompt = composeScheduledPrompt({
           title: claim.title, prompt: claim.prompt, task: claim.task, targets: claim.targets, delivery: claim.delivery,
@@ -143,12 +151,7 @@ export class AgentScheduleService {
     const store = this.options.store;
     try {
       if (claim.task.type !== 'message') return;
-      let target: AgentScheduleSendTarget | null = null;
-      if (claim.delivery.mode === 'line_target') target = claim.delivery.target;
-      else if (claim.delivery.mode === 'primary_admin') {
-        const admin = await this.primaryAdminChat();
-        if (admin) target = { accountId: admin.accountId, chatType: 'direct', chatId: admin.chatId, title: admin.title };
-      }
+      const target = await this.deliveryTarget(claim.delivery);
       if (!target || !this.options.sendSystemText) { await store.markSendFailed(claim.runId); return; }
       const result = await this.options.sendSystemText({ runId: claim.runId, target,
         text: resolveScheduleMessagePlaceholders(claim.task.text, claim.scheduledFor) });
@@ -158,6 +161,90 @@ export class AgentScheduleService {
     } catch (error) {
       this.options.onError?.(error);
       await store.markSendFailed(claim.runId).catch((markError: unknown) => { this.options.onError?.(markError); });
+    }
+  }
+
+  /** The LINE chat a program schedule sends to: the line_target chat, or the Primary Admin's direct chat; null when there is none. */
+  private async deliveryTarget(delivery: AgentSchedule['delivery']): Promise<AgentScheduleSendTarget | null> {
+    if (delivery.mode === 'line_target') return delivery.target;
+    if (delivery.mode === 'primary_admin') {
+      const admin = await this.primaryAdminChat();
+      if (admin) return { accountId: admin.accountId, chatType: 'direct', chatId: admin.chatId, title: admin.title };
+    }
+    return null;
+  }
+
+  /**
+   * The delivery chat as the chat of the own lists (the messages that the schedule sent are not new messages). Null when there is no
+   * delivery chat. A lookup error goes to onError and counts as none; the send step looks up the target again and handles its own error.
+   */
+  private async ownDelivery(delivery: AgentSchedule['delivery'] | null | undefined): Promise<ScheduleOwnDelivery | null> {
+    if (!delivery) return null;
+    try {
+      const target = await this.deliveryTarget(delivery);
+      return target ? { accountId: target.accountId, chatType: target.chatType, chatId: target.chatId } : null;
+    } catch (error) {
+      this.options.onError?.(error);
+      return null;
+    }
+  }
+
+  /** Reads the window and applies the rules of a new_messages task. A read error is thrown with its real error. */
+  private async evaluateNewMessages(task: AgentScheduleNewMessagesTask, targets: readonly AgentScheduleTarget[], window: ScheduleTimeWindow,
+    ownDelivery: ScheduleOwnDelivery | null): Promise<{ evaluation: NewMessagesEvaluation; incomplete: boolean }> {
+    const reader = this.options.readMessages;
+    if (!reader) throw new Error('The schedule message reader is not available.');
+    const read = await reader({ from: window.from, to: window.to, targets });
+    return { evaluation: evaluateNewMessages({ task, messages: read.messages, window, ownDelivery }), incomplete: read.incomplete };
+  }
+
+  /**
+   * A new_messages run. Main reads the window and applies the rules. Chats with action list are sent as one text through the Agent LINE
+   * send queue; chats with action llm start one Agent job (only when there are some). With nothing to send and no llm chat the run ends as
+   * no_messages (or sends one line when sendWhenEmpty). `send_unknown` is final. A read error ends the run as failed.
+   */
+  private async runNewMessages(claim: AgentScheduleClaim): Promise<void> {
+    const store = this.options.store;
+    const task = claim.task;
+    if (task.type !== 'new_messages') return;
+    const window = computeScheduleWindow({ window: claim.window, recurrence: claim.recurrence, scheduledFor: claim.scheduledFor,
+      previousSubmittedFor: claim.previousSubmittedFor });
+    let result: { evaluation: NewMessagesEvaluation; incomplete: boolean };
+    try {
+      result = await this.evaluateNewMessages(task, claim.targets, window, await this.ownDelivery(claim.delivery));
+    } catch (error) {
+      this.options.onError?.(error);
+      await store.markFailed(claim.runId).catch((markError: unknown) => { this.options.onError?.(markError); });
+      return;
+    }
+    try {
+      const llmChats = result.evaluation.chats.filter((chat) => chat.action === 'llm');
+      let text = listedText(result.evaluation.chats, result.incomplete);
+      if (text.length === 0 && llmChats.length === 0) {
+        if (!task.sendWhenEmpty) { await store.markNoMessages(claim.runId); return; }
+        text = NEW_MESSAGES_EMPTY_LINE;
+      }
+      if (text.length > 0) {
+        let status: 'sent' | 'failed' | 'unknown' = 'failed';
+        try {
+          const target = await this.deliveryTarget(claim.delivery);
+          if (target && this.options.sendSystemText) status = (await this.options.sendSystemText({ runId: claim.runId, target, text })).status;
+        } catch (error) {
+          this.options.onError?.(error);
+        }
+        if (status === 'unknown') { await store.markSendUnknown(claim.runId); return; }
+        if (status !== 'sent') { await store.markSendFailed(claim.runId); return; }
+      }
+      if (llmChats.length === 0) { await store.markSent(claim.runId); return; }
+      const prompt = composeScheduledPrompt({
+        title: claim.title, prompt: claim.prompt, task, targets: claim.targets, delivery: claim.delivery, window,
+        llmChats: llmChats.map((chat) => ({ accountId: chat.accountId, chatType: chat.chatType, chatId: chat.chatId, title: chat.title })),
+      });
+      const job = await this.options.submit({ provider: claim.provider, requestId: scheduleRequestId(claim.scheduleId, claim.scheduledFor), prompt });
+      await store.markSubmitted(claim.runId, job.jobId);
+    } catch (error) {
+      this.options.onError?.(error);
+      await store.markFailed(claim.runId).catch((markError: unknown) => { this.options.onError?.(markError); });
     }
   }
 
@@ -175,9 +262,15 @@ export class AgentScheduleService {
     const previousSubmittedFor = await this.options.store.previousSubmittedFor(schedule.scheduleId, scheduledFor);
     const mapped = await this.remapTargets(schedule);
     const adminChat = schedule.delivery.mode === 'primary_admin' ? await this.primaryAdminChat() : null;
+    const window = computeScheduleWindow({ window: schedule.window, recurrence: schedule.recurrence, scheduledFor, previousSubmittedFor });
+    // new_messages: evaluate the rules again for this slot; the Agent reads only the chats whose rule says llm.
+    const llmChats = schedule.task.type === 'new_messages'
+      ? (await this.evaluateNewMessages(schedule.task, mapped.targets, window, await this.ownDelivery(mapped.delivery))).evaluation.chats.filter((chat) => chat.action === 'llm')
+        .map((chat) => ({ accountId: chat.accountId, chatType: chat.chatType, chatId: chat.chatId, title: chat.title }))
+      : undefined;
     return composeScheduleRunContext({
-      title: schedule.title, prompt: schedule.prompt, task: schedule.task, targets: mapped.targets, delivery: mapped.delivery, adminChat,
-      window: computeScheduleWindow({ window: schedule.window, recurrence: schedule.recurrence, scheduledFor, previousSubmittedFor }),
+      title: schedule.title, prompt: schedule.prompt, task: schedule.task, targets: mapped.targets, delivery: mapped.delivery, adminChat, window,
+      ...(llmChats ? { llmChats } : {}),
     });
   }
 
@@ -207,6 +300,28 @@ export class AgentScheduleService {
   listRuns(scheduleId: string, limit = 20): Promise<AgentScheduleRun[]> { return this.options.store.listRuns(scheduleId, limit); }
   listTargets(query: string | undefined, limit = 20, purpose: AgentScheduleTargetPurpose = 'read'): Promise<AgentScheduleTargetOption[]> {
     return this.options.targets ? this.options.targets.list(query, limit, purpose) : Promise.resolve([]);
+  }
+
+  /**
+   * Preview of a new_messages form: reads and evaluates the latest window that ends now. A delivery of the form (mapped through the Agent
+   * lineage) removes the own lists, as a real run does; with none, no message is removed as own. It never sends, never creates a job and never
+   * writes a run.
+   */
+  async previewNewMessages(input: AgentSchedulePreviewNewMessagesRequest): Promise<AgentSchedulePreviewNewMessagesOutput> {
+    const resolved = await this.resolveTargets(input.targets);
+    const lineage = await this.lineage();
+    const targets = lineage ? resolved.map((target) => resolveCurrentAgentKey(lineage, target)) : resolved;
+    const to = this.now();
+    const window = computeScheduleWindow({ window: input.window, recurrence: input.recurrence ?? { kind: 'daily', time: '00:00' }, scheduledFor: to,
+      previousSubmittedFor: null });
+    const delivery = input.delivery ? (await this.remapTargets({ targets: [], delivery: input.delivery })).delivery : null;
+    const { evaluation, incomplete } = await this.evaluateNewMessages(input.task, targets, window, await this.ownDelivery(delivery));
+    return {
+      from: window.from.toISOString(), to: window.to.toISOString(),
+      chats: evaluation.chats.map((chat) => ({ accountId: chat.accountId, chatType: chat.chatType, chatId: chat.chatId, title: chat.title,
+        messageCount: chat.messageCount, senderCount: chat.senderCount, action: chat.action, text: chat.text })),
+      messageCount: evaluation.messageCount, chatCount: evaluation.chatCount, listedChars: evaluation.listedChars, incomplete,
+    };
   }
 
   /** The Primary Admin's direct chat with the Agent account now, or null (also when the lookup fails). */

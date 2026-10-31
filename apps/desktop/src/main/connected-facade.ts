@@ -31,6 +31,7 @@ import { FreeModeService } from './services/free-mode-service.js';
 import { PERSONA_DESCRIPTION_SETTING, PERSONA_LIVELINESS_SETTING, readGlobalPersona, resolveEffectivePersona } from './services/agent-persona.js';
 import { defaultProjectPathPolicy } from './services/project-folder-path.js';
 import { ProjectFolderService } from './services/project-folder-service.js';
+import { createScheduleMessageReader } from './services/agent-schedule-reader.js';
 import { createAgentScheduleTargetResolver } from './services/agent-schedule-targets.js';
 import { AgentAttachmentError } from './services/agent-attachments.js';
 import { loadLinejsMcpSkill } from './services/mcp-skill.js';
@@ -799,6 +800,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     },
     submit: (input) => agentService.submitScheduled(input),
     sendSystemText: (input) => agentLineSend.sendSystemText({ runId: input.runId, target: input.target, text: input.text }),
+    // new_messages reads: Main calls the MCP tool itself with the schedule principal (internal:schedule). mcpService is built right after this service.
+    readMessages: createScheduleMessageReader((tool) => mcpService.callInternalTool(tool, { sourceType: 'schedule' })),
     publish: () => { options.publish?.({ type: 'agentSchedulesChanged' }); },
     onError: (error) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); } });
   stopAgentSchedules = onceCleanup(() => agentSchedules.stop());
@@ -1593,6 +1596,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (event.type === 'catalogRefreshStatus') {
       recordWorkerDiagnostic(options, event);
       await publishSnapshot();
+    }
+    if (event.type === 'syncConfirmed') {
+      await publishSnapshot().catch(() => undefined);
+      return;
     }
     if (event.type === 'historyResult') {
       options.publish?.({ type: 'lineHistorySynced', requestId: event.requestId,
@@ -3157,6 +3164,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       if (request.type === 'listAgentScheduleRuns') {
         return { type: request.type, requestId, ok: true, runs: await agentSchedules.listRuns(request.scheduleId, request.limit) };
+      }
+      if (request.type === 'previewAgentScheduleNewMessages') {
+        return { type: request.type, requestId, ok: true, preview: await agentSchedules.previewNewMessages(request.preview) };
       }
       if (request.type === 'listAgentScheduleTargets') {
         return { type: request.type, requestId, ok: true, targets: await agentSchedules.listTargets(request.query || undefined, request.limit, request.purpose) };

@@ -29,6 +29,7 @@ export type FriendAddResult = Readonly<{ status: 'added' | 'failed' | 'unknown';
 
 const FRIEND_ADD_LOCAL_FAILURES = new Set(['SIDE_EFFECT_DENIED', 'NOT_STARTED', 'NOT_READY', 'REQUEST_ID_CONFLICT', 'QUEUE_FULL']);
 export const LOGOUT_DEADLINE_MS = 10_000;
+export const SYNC_CONFIRMED_INTERVAL_MS = 60_000;
 function safeFriendAddResult(result: FriendAddResult): FriendAddResult {
   if (result.status === 'added') return { status: 'added', error: null };
   if (result.status === 'failed' && typeof result.error === 'string' &&
@@ -242,6 +243,7 @@ export class LineWorkerLoop {
   #receiveGeneration = 0;
   readonly #usedEffectPermits = new Set<string>();
   #syncFailures = 0;
+  #lastSyncConfirmedAt = 0;
   #sending = false;
   #currentSend: Promise<void> | undefined;
   readonly #addLedger = new Map<string, { targetMid: string; sourceChatMid?: string; result: Promise<FriendAddResult> }>();
@@ -790,6 +792,11 @@ export class LineWorkerLoop {
             message: isLineServerRejection(error) ? error.message : null });
         }
         return;
+      }
+      // Liveness record only: it must not change the poll result, so an emit failure is ignored.
+      if (Date.now() - this.#lastSyncConfirmedAt >= SYNC_CONFIRMED_INTERVAL_MS) {
+        this.#lastSyncConfirmedAt = Date.now();
+        await this.#emit({ type: 'syncConfirmed', ...this.#identity() }).catch(() => undefined);
       }
       if (result.operations.length > 100) throw new Error('sync response exceeds bounded batch limit');
       const readReceipts = result.readReceipts ?? [];

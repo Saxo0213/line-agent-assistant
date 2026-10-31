@@ -64,7 +64,7 @@ describe('internal MCP tools/list and tools/call follow the effective permission
     for (const permission of ['records.query_current_chat', 'records.query_all_chats'] as const) {
       const { rpc, service } = harness(withEffects({ [permission]: 'ALLOW' }));
       const names = ((await rpc('tools/list')).body as { result: { tools: Array<{ name: string }> } }).result.tools.map((tool) => tool.name);
-      expect(names).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album']);
+      expect(names).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_active_chats', 'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album']);
       await service.shutdown();
     }
   });
@@ -74,7 +74,7 @@ describe('internal MCP tools/list and tools/call follow the effective permission
     expect(((await denied.rpc('tools/list')).body as { result: { tools: unknown[] } }).result.tools).toEqual([]);
     await denied.service.shutdown();
     const admin = harness(allPermissions('ALLOW'));
-    expect(((await admin.rpc('tools/list')).body as { result: { tools: unknown[] } }).result.tools).toHaveLength(7);
+    expect(((await admin.rpc('tools/list')).body as { result: { tools: unknown[] } }).result.tools).toHaveLength(8);
     await admin.service.shutdown();
     expect(AGENT_PERMISSION_IDS).toHaveLength(7);
   });
@@ -94,10 +94,10 @@ describe('Agent room history tool visibility', () => {
 
   it('lists the history tool only when the repository says the Agent room (or its shared chat) may use it', async () => {
     const allowed = harness(allPermissions('ALLOW'), undefined, true);
-    expect(await names(allowed.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album', 'query_agent_room_history']);
+    expect(await names(allowed.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_active_chats', 'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album', 'query_agent_room_history']);
     await allowed.service.shutdown();
     const denied = harness(allPermissions('ALLOW'), undefined, false);
-    expect(await names(denied.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album']);
+    expect(await names(denied.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_active_chats', 'list_chat_notes', 'get_chat_note', 'list_chat_albums', 'get_chat_album']);
     await denied.service.shutdown();
   });
 
@@ -137,6 +137,17 @@ describe('Agent room history tool visibility', () => {
     expect(AGENT_ROOM_HISTORY_TOOL_DEFINITION.description).toMatch(/Agent room conversation history[\s\S]*newest first/);
     expect(AGENT_ROOM_HISTORY_TOOL_DEFINITION.description).toContain('nextCursor');
     expect(AGENT_ROOM_HISTORY_TOOL_DEFINITION.inputSchema.additionalProperties).toBe(false);
+  });
+});
+
+describe('query_target_messages_by_time tool definition', () => {
+  it('tells the Agent to read all chats in one call without a target', () => {
+    const definition = MCP_TOOL_DEFINITIONS.find((tool) => tool.name === 'query_target_messages_by_time')!;
+    for (const needle of ['omit every target field and give from', 'accountId, chatType, chatId and conversationTitle', 'Do not call this tool once per chat',
+      'Do not call list_targets first', 'from is required when no target field is given', 'oldest first', 'Never report a time window as empty']) expect(definition.description).toContain(needle);
+    expect((definition.inputSchema.properties as Record<string, { description?: string }>).target?.description).toContain('Omit to read all chats.');
+    const plain = MCP_TOOL_DEFINITIONS.find((tool) => tool.name === 'query_target_messages')!;
+    expect((plain.inputSchema.properties as Record<string, { description?: string }>).target?.description).not.toContain('Omit to read all chats.');
   });
 });
 
@@ -212,7 +223,7 @@ describe('internal request_permission prompt tool', () => {
   it('is listed only for a capability with an approval binding and a broker, and never in the public catalog', async () => {
     const interactive = approvalHarness();
     const tools = await listed(interactive);
-    expect(tools.map((tool) => tool.name)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'request_permission']);
+    expect(tools.map((tool) => tool.name)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_active_chats', 'request_permission']);
     expect(tools.at(-1)!.inputSchema).toMatchObject({ type: 'object', required: ['tool_name', 'input'],
       properties: { tool_name: { type: 'string' }, input: { type: 'object' }, tool_use_id: { type: 'string' } } });
     await interactive.cleanup();

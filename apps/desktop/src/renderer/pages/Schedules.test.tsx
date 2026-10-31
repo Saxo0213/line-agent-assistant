@@ -24,7 +24,7 @@ const target = (chatId: string, title: string, chatType: AgentScheduleTarget['ch
 const base: AgentSchedule = {
   scheduleId: '11111111-1111-4111-8111-111111111111', title: '晨間提醒', prompt: '整理待辦', provider: 'claude',
   recurrence: { kind: 'daily', time: '09:00' }, timezone: 'Asia/Taipei', targets: [], task: { type: 'custom' }, window: { mode: 'since_last_run' },
-  delivery: { mode: 'record_only' }, enabled: true, jitterMinutes: 0, nextFireAt: '2026-10-29T01:00:00.000Z', lastFireAt: '2026-10-28T01:00:00.000Z', lastOutcome: 'submitted',
+  delivery: { mode: 'record_only' }, enabled: true, jitterMinutes: 0, execution: 'agent', mayUseLlm: true, nextFireAt: '2026-10-29T01:00:00.000Z', lastFireAt: '2026-10-28T01:00:00.000Z', lastOutcome: 'submitted',
   createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z',
 };
 const withId = (n: number, patch: Partial<AgentSchedule>): AgentSchedule => ({ ...base, scheduleId: `${n}${n}${n}${n}${n}${n}${n}${n}-1111-4111-8111-111111111111`, ...patch });
@@ -449,7 +449,7 @@ describe('Schedules form defaults and pickers', () => {
     const dialog = await openNew();
     expect(within(dialog).getByLabelText('助理')).toBeTruthy();
     expect(within(dialog).getByRole('switch', { name: '啟用' })).toBeTruthy();
-    pick('系統訊息');
+    pick('程式排程');
     expect(within(dialog).queryByLabelText('助理')).toBeNull();
     expect(within(dialog).getByRole('switch', { name: '啟用' })).toBeTruthy();
   });
@@ -537,8 +537,9 @@ describe('Schedules dialog interface guidelines', () => {
     const save = within(dialog).getByRole('button', { name: '儲存' });
     save.focus();
     fireEvent.keyDown(save, { key: 'Tab' });
-    expect(document.activeElement).toBe(screen.getByLabelText('標題'));
-    fireEvent.keyDown(screen.getByLabelText('標題'), { key: 'Tab', shiftKey: true });
+    const first = screen.getByRole('radio', { name: '程式排程' });
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(first, { key: 'Tab', shiftKey: true });
     expect(document.activeElement).toBe(save);
   });
 
@@ -599,7 +600,7 @@ describe('Schedules: system messages, record-only delivery and run replies', () 
   it('offers the 系統訊息 task with only the text, recurrence, delivery and enabled fields', async () => {
     const { api } = setup({ targets: [target('c1', '客戶群')] });
     await openNew();
-    pick('系統訊息');
+    pick('程式排程');
     expect(screen.getByText(/由系統直接傳送這段文字/)).toBeTruthy();
     expect(screen.getByLabelText('訊息內容')).toBeTruthy();
     expect(screen.getByText(/\{\{date\}\}（YYYY-MM-DD）、\{\{time\}\}（HH:mm）、\{\{weekday\}\}/)).toBeTruthy();
@@ -628,7 +629,7 @@ describe('Schedules: system messages, record-only delivery and run replies', () 
   it('requires the message text and bounds it at 5000 characters', async () => {
     const { api } = setup();
     await openNew();
-    pick('系統訊息');
+    pick('程式排程');
     setField('標題', '空');
     save();
     expect((await screen.findAllByText('請輸入訊息內容。')).length).toBeGreaterThan(0);
@@ -643,9 +644,9 @@ describe('Schedules: system messages, record-only delivery and run replies', () 
     setField('標題', '只存'); setField('指令', '整理');
     pick('只保存在排程紀錄');
     expect(screen.getByRole('radio', { name: '只保存在排程紀錄' }).getAttribute('aria-checked')).toBe('true');
-    pick('系統訊息');
+    pick('程式排程');
     expect(screen.getByRole('radio', { name: '傳給我（主要管理者）' }).getAttribute('aria-checked')).toBe('true');
-    pick('自訂');
+    pick('Agent 排程');
     expect(screen.getByRole('radio', { name: '傳給我（主要管理者）' }).getAttribute('aria-checked')).toBe('true');
     pick('只保存在排程紀錄');
     save();

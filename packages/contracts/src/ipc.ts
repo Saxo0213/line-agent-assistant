@@ -5,7 +5,7 @@ import { AgentAttachmentSummarySchema, AgentAttachmentUploadsSchema, AgentEventS
 import { AgentStatusIconsSchema } from './agent-status-icons.js';
 import { AgentPersonaSchema } from './agent-persona.js';
 import { AgentExtensionToolsSchema, AgentExtensionsStateSchema, AgentMcpImportListingSchema, AgentMcpImportResultSchema, AgentMcpImportSelectionSchema, AgentMcpServerInputSchema, AgentMcpServerSummarySchema } from './agent-extensions.js';
-import { AgentScheduleCreateInputSchema, AgentScheduleListRunsInputSchema, AgentScheduleListTargetsInputSchema, AgentScheduleRunSchema, AgentScheduleSchema, AgentScheduleTargetOptionSchema, AgentScheduleUpdatePatchSchema } from './agent-schedule.js';
+import { AgentScheduleCreateInputSchema, AgentScheduleListRunsInputSchema, AgentScheduleListTargetsInputSchema, AgentSchedulePreviewNewMessagesInputSchema, AgentSchedulePreviewNewMessagesOutputSchema, AgentScheduleRunSchema, AgentScheduleSchema, AgentScheduleTargetOptionSchema, AgentScheduleUpdatePatchSchema } from './agent-schedule.js';
 import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN } from './agent-status-rotation.js';
 import { AutoResponderRuleSchema, AutoResponderSettingsSchema, validateAutoresponderConfig } from './autoresponder.js';
 import { AccountModeSchema, ChatTypeSchema, ConversationKeySchema, LineTransportKindSchema, WritableConversationKeySchema } from './account.js';
@@ -224,6 +224,7 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('deleteAgentSchedule'), scheduleId: z.uuid() }),
   RequestIdSchema.merge(AgentScheduleListRunsInputSchema).extend({ type: z.literal('listAgentScheduleRuns') }),
   RequestIdSchema.merge(AgentScheduleListTargetsInputSchema).extend({ type: z.literal('listAgentScheduleTargets') }),
+  RequestIdSchema.extend({ type: z.literal('previewAgentScheduleNewMessages'), preview: AgentSchedulePreviewNewMessagesInputSchema }),
   RequestIdSchema.extend({ type: z.literal('getAgentExtensions') }),
   RequestIdSchema.extend({ type: z.literal('saveAgentMcpServer'), server: AgentMcpServerInputSchema }),
   RequestIdSchema.extend({ type: z.literal('deleteAgentMcpServer'), serverId: z.uuid() }),
@@ -512,6 +513,7 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('deleteAgentSchedule'), requestId: IdSchema, ok: z.literal(true) }),
     z.strictObject({ type: z.literal('listAgentScheduleRuns'), requestId: IdSchema, ok: z.literal(true), runs: z.array(AgentScheduleRunSchema).max(50) }),
     z.strictObject({ type: z.literal('listAgentScheduleTargets'), requestId: IdSchema, ok: z.literal(true), targets: z.array(AgentScheduleTargetOptionSchema).max(50) }),
+    z.strictObject({ type: z.literal('previewAgentScheduleNewMessages'), requestId: IdSchema, ok: z.literal(true), preview: AgentSchedulePreviewNewMessagesOutputSchema }),
     z.strictObject({ type: z.literal('getAgentExtensions'), requestId: IdSchema, ok: z.literal(true), extensions: AgentExtensionsStateSchema }),
     z.strictObject({ type: z.literal('saveAgentMcpServer'), requestId: IdSchema, ok: z.literal(true), server: AgentMcpServerSummarySchema }),
     z.strictObject({ type: z.literal('deleteAgentMcpServer'), requestId: IdSchema, ok: z.literal(true) }),

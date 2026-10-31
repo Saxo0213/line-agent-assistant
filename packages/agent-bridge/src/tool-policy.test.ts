@@ -41,7 +41,7 @@ describe('Claude built-in tools come from the Main-resolved policy',()=>{
     const args=claudeArguments({...request('claude',root,{tools:none}),mcp});
     expect(value(args,'--tools')).toBe('');
     expect(args).not.toContain('--add-dir');
-    expect(value(args,'--allowedTools')).toBe('mcp__linejs__list_targets,mcp__linejs__query_target_messages,mcp__linejs__query_target_messages_by_time,mcp__linejs__query_agent_room_history,mcp__linejs__list_send_targets,mcp__linejs__send_to_target,mcp__linejs__list_schedules,mcp__linejs__create_schedule,mcp__linejs__update_schedule,mcp__linejs__delete_schedule');
+    expect(value(args,'--allowedTools')).toBe('mcp__linejs__list_targets,mcp__linejs__query_target_messages,mcp__linejs__query_target_messages_by_time,mcp__linejs__list_active_chats,mcp__linejs__query_agent_room_history,mcp__linejs__list_send_targets,mcp__linejs__send_to_target,mcp__linejs__list_schedules,mcp__linejs__create_schedule,mcp__linejs__update_schedule,mcp__linejs__delete_schedule');
   });
   it('grants read tools for chat_folder.read and adds Write/Edit (explicitly allowed) for chat_folder.write',()=>{
     const read=claudeArguments(request('claude',root,{tools:{...none,fileRead:true,level:'workspace_write'}}));

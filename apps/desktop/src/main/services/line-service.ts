@@ -474,6 +474,12 @@ export class LineService {
       pending.resolve({ ok: event.ok, error: event.error });
       return;
     }
+    if (event.type === 'syncConfirmed') {
+      // Liveness record only. It returns before drainPendingActions so it cannot change traffic timing to LINE.
+      try { await this.accounts.applyWorkerSyncConfirmed(binding); }
+      catch (error) { this.reportFailure('persist', error); }
+      return;
+    }
     if ((event.type === 'batch' || event.type === 'historyResult')
       && (await this.accounts.resolveCapabilities?.(event.accountId))?.connectionMode === 'EXTERNAL_MONITOR') return;
     await this.bindingReady.get(processInstanceId);

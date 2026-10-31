@@ -7,6 +7,7 @@ export const McpToolNameSchema = z.enum([
   'list_targets',
   'query_target_messages',
   'query_target_messages_by_time',
+  'list_active_chats',
   'list_chat_notes',
   'get_chat_note',
   'list_chat_albums',
@@ -18,6 +19,7 @@ export const MCP_TOOL_EFFECTS: Readonly<Record<McpToolName, 'read' | 'effect'>> 
   list_targets: 'read',
   query_target_messages: 'read',
   query_target_messages_by_time: 'read',
+  list_active_chats: 'read',
   list_chat_notes: 'read',
   get_chat_note: 'read',
   list_chat_albums: 'read',
@@ -76,6 +78,9 @@ export const McpMessageAttachmentSchema = z.strictObject({
 });
 export type McpMessageAttachment = z.infer<typeof McpMessageAttachmentSchema>;
 
+export const McpMessageKindSchema = z.enum(['text', 'image', 'video', 'audio', 'file', 'sticker', 'contact', 'event', 'location', 'rich']);
+export const McpMessageDirectionSchema = z.enum(['inbound', 'outbound']);
+
 export const McpMessageRecordSchema = z.strictObject({
   accountId: z.string().min(1),
   accountDisplayName: z.string().nullable(),
@@ -85,8 +90,8 @@ export const McpMessageRecordSchema = z.strictObject({
   messageId: z.string().min(1),
   senderId: z.string().min(1),
   senderName: z.string().nullable(),
-  direction: z.enum(['inbound', 'outbound']),
-  kind: z.enum(['text', 'image', 'video', 'audio', 'file', 'sticker', 'contact', 'event', 'location', 'rich']),
+  direction: McpMessageDirectionSchema,
+  kind: McpMessageKindSchema,
   text: z.string().nullable(),
   recalled: z.boolean(),
   occurredAt: z.iso.datetime({ offset: true }),
@@ -94,15 +99,17 @@ export const McpMessageRecordSchema = z.strictObject({
 });
 export type McpMessageRecord = z.infer<typeof McpMessageRecordSchema>;
 
+/** Date-only MCP time bounds are full days in Taiwan time (Asia/Taipei, fixed UTC+08:00, no DST). */
+const MCP_DATE_ONLY_UTC_OFFSET = '+08:00';
+
 export function normalizeMcpTimeBound(value: string, bound: 'from' | 'to'): string | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
   if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-    const candidate = bound === 'from' ? `${trimmed}T00:00:00.000Z` : `${trimmed}T23:59:59.999Z`;
-    const parsed = Date.parse(candidate);
-    if (!Number.isFinite(parsed)) return null;
-    const normalized = new Date(parsed).toISOString();
-    return normalized.startsWith(trimmed) ? normalized : null;
+    const dayStart = Date.parse(`${trimmed}T00:00:00.000Z`);
+    if (!Number.isFinite(dayStart) || new Date(dayStart).toISOString().slice(0, 10) !== trimmed) return null;
+    const parsed = Date.parse(`${trimmed}T${bound === 'from' ? '00:00:00.000' : '23:59:59.999'}${MCP_DATE_ONLY_UTC_OFFSET}`);
+    return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
   }
   if (!z.iso.datetime({ offset: true }).safeParse(trimmed).success) {
     return null;
@@ -208,23 +215,21 @@ export const McpQueryTargetMessagesInputSchema = TargetSelectorBaseSchema.superR
 });
 export type McpQueryTargetMessagesInput = z.infer<typeof McpQueryTargetMessagesInputSchema>;
 
-export const McpQueryTargetMessagesByTimeInputSchema = TargetSelectorBaseSchema.extend({
-  from: z.string().trim().min(1).max(64).optional(),
-  to: z.string().trim().min(1).max(64).optional(),
-}).superRefine((value, ctx) => {
-  if (!hasTargetSelector(value)) {
-    ctx.addIssue({
-      code: 'custom',
-      message: 'At least one target selector (target, chatId, conversationTitle, senderId, or senderName) is required.',
-    });
+/** Fields shared by query_target_messages_by_time and list_active_chats; the SQL for them is shared in the database package. */
+const McpMessageFilterFields = {
+  excludeChatIds: z.array(z.string().trim().min(1).max(256)).max(100).optional(),
+  direction: McpMessageDirectionSchema.optional(),
+  kinds: z.array(McpMessageKindSchema).min(1).max(10).optional(),
+  excludeKinds: z.array(McpMessageKindSchema).min(1).max(10).optional(),
+};
+
+function addMessageFilterIssues(value: { kinds?: unknown; excludeKinds?: unknown }, ctx: z.RefinementCtx): void {
+  if (value.kinds !== undefined && value.excludeKinds !== undefined) {
+    ctx.addIssue({ code: 'custom', message: 'kinds and excludeKinds cannot be used together.' });
   }
-  if (!value.from && !value.to) {
-    ctx.addIssue({
-      code: 'custom',
-      message: 'At least one time bound (from or to) is required for query_target_messages_by_time.',
-    });
-    return;
-  }
+}
+
+function addTimeRangeIssues(value: { from?: string | undefined; to?: string | undefined }, ctx: z.RefinementCtx): void {
   const normalizedFrom = value.from ? normalizeMcpTimeBound(value.from, 'from') : null;
   if (value.from && !normalizedFrom) {
     ctx.addIssue({
@@ -245,8 +250,59 @@ export const McpQueryTargetMessagesByTimeInputSchema = TargetSelectorBaseSchema.
       message: 'Invalid time range: from must be less than or equal to to.',
     });
   }
+}
+
+export const McpQueryTargetMessagesByTimeInputSchema = TargetSelectorBaseSchema.extend({
+  from: z.string().trim().min(1).max(64).optional(),
+  to: z.string().trim().min(1).max(64).optional(),
+  ...McpMessageFilterFields,
+}).superRefine((value, ctx) => {
+  if (!hasTargetSelector(value) && !value.from) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'from is required when no target selector (target, chatId, conversationTitle, senderId, or senderName) is given.',
+    });
+  }
+  if (!value.from && !value.to) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'At least one time bound (from or to) is required for query_target_messages_by_time.',
+    });
+    return;
+  }
+  addTimeRangeIssues(value, ctx);
+  addMessageFilterIssues(value, ctx);
 });
 export type McpQueryTargetMessagesByTimeInput = z.infer<typeof McpQueryTargetMessagesByTimeInputSchema>;
+
+export const MCP_ACTIVE_CHATS_DEFAULT_LIMIT = 200;
+export const MCP_ACTIVE_CHATS_MAX_LIMIT = 500;
+
+export const McpListActiveChatsInputSchema = z.strictObject({
+  from: z.string().trim().min(1).max(64),
+  to: z.string().trim().min(1).max(64).optional(),
+  accountId: z.string().trim().min(1).optional(),
+  chatType: ChatTypeSchema.optional(),
+  ...McpMessageFilterFields,
+  /** Values above the maximum are clamped to MCP_ACTIVE_CHATS_MAX_LIMIT instead of rejected. */
+  limit: z.number().int().min(1).transform((value) => Math.min(value, MCP_ACTIVE_CHATS_MAX_LIMIT)).optional(),
+}).superRefine((value, ctx) => {
+  addTimeRangeIssues(value, ctx);
+  addMessageFilterIssues(value, ctx);
+});
+export type McpListActiveChatsInput = z.infer<typeof McpListActiveChatsInputSchema>;
+
+export const McpActiveChatSchema = z.strictObject({
+  accountId: z.string().min(1),
+  accountDisplayName: z.string().nullable(),
+  chatType: ChatTypeSchema,
+  chatId: z.string().min(1),
+  conversationTitle: z.string().nullable(),
+  messageCount: z.number().int().positive(),
+  senderCount: z.number().int().positive(),
+  lastMessageAt: z.iso.datetime({ offset: true }),
+});
+export type McpActiveChat = z.infer<typeof McpActiveChatSchema>;
 
 const McpResourceChatTypeSchema = z.enum(['direct', 'group', 'room']);
 const ChatResourceSelectorSchema = z.strictObject({ accountId: z.string().trim().min(1).max(256), chatType: McpResourceChatTypeSchema, chatId: z.string().trim().min(1).max(256) });
@@ -266,6 +322,10 @@ export const McpToolInputUnionSchema = z.discriminatedUnion('name', [
   z.strictObject({
     name: z.literal('query_target_messages_by_time'),
     arguments: McpQueryTargetMessagesByTimeInputSchema,
+  }),
+  z.strictObject({
+    name: z.literal('list_active_chats'),
+    arguments: McpListActiveChatsInputSchema,
   }),
   z.strictObject({ name: z.literal('list_chat_notes'), arguments: McpChatResourceListInputSchema }),
   z.strictObject({ name: z.literal('get_chat_note'), arguments: McpChatResourceGetNoteInputSchema }),
@@ -304,6 +364,13 @@ export const McpToolOutputUnionSchema = z.discriminatedUnion('toolName', [
     page: McpMessagePageSchema,
     from: z.iso.datetime({ offset: true }).nullable(),
     to: z.iso.datetime({ offset: true }).nullable(),
+  }),
+  z.strictObject({
+    toolName: z.literal('list_active_chats'),
+    from: z.iso.datetime({ offset: true }),
+    to: z.iso.datetime({ offset: true }).nullable(),
+    chats: z.array(McpActiveChatSchema).max(MCP_ACTIVE_CHATS_MAX_LIMIT),
+    truncated: z.boolean(),
   }),
   z.strictObject({ toolName: z.literal('list_chat_notes'), accountId: z.string(), chatType: McpResourceChatTypeSchema, chatId: z.string(), notes: z.array(McpArchivedNoteSummarySchema).max(50), nextCursor: z.string().max(512).nullable(), savedAt: McpSavedAtSchema }),
   z.strictObject({ toolName: z.literal('get_chat_note'), accountId: z.string(), chatType: McpResourceChatTypeSchema, chatId: z.string(), note: McpArchivedNoteSchema.nullable(), savedAt: McpSavedAtSchema }),

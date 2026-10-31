@@ -81,7 +81,7 @@ database('internal Agent MCP capability transport', () => {
       expect(initialized.status).toBe(202);
       const list = await h.rpc(token, 'tools/list');
       expect(list.body.result.tools.map((tool: { name: string }) => tool.name))
-        .toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'query_agent_room_history']);
+        .toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_active_chats', 'query_agent_room_history']);
       expect(h.observed).toContainEqual([job.jobId, 'available']);
       const before = await auditCount('ALLOWED', 'list_targets');
       const call = await h.rpc(token, 'tools/call', { name: 'list_targets', arguments: { query: 'Internal' } });

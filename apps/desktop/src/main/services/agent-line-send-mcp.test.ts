@@ -32,7 +32,7 @@ describe('send tool visibility (mocked repository)', () => {
 
   it('lists the send tools only for a principal that may send, and only when the service exists', async () => {
     const allowed = harness(true);
-    expect(await toolNames(allowed.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', ...SEND_TOOLS]);
+    expect(await toolNames(allowed.rpc)).toEqual(['list_targets', 'query_target_messages', 'query_target_messages_by_time', 'list_active_chats', ...SEND_TOOLS]);
     await allowed.service.shutdown();
     const denied = harness(false);
     expect(await toolNames(denied.rpc)).not.toContain('send_to_target');

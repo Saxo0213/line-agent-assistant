@@ -22,7 +22,7 @@ const recurrence = { kind: 'daily', time: '09:00' } as const;
 function fakeHandler() {
   const schedule = { scheduleId: SCHEDULE_ID, title: 't', prompt: 'p', provider: 'codex' as const, recurrence, timezone: 'Asia/Taipei', targets: [], task: { type: 'custom' as const }, window: { mode: 'since_last_run' as const },
     delivery: { mode: 'primary_admin' as const } as { mode: 'primary_admin' } | { mode: 'record_only' } | { mode: 'line_target'; target: { accountId: string; chatType: 'direct' | 'group' | 'room'; chatId: string; title: string } }, enabled: true,
-    jitterMinutes: 0, nextFireAt: '2026-10-02T01:00:00.000Z', lastFireAt: null, lastOutcome: null, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z' };
+    jitterMinutes: 0, execution: 'agent' as 'agent' | 'program', mayUseLlm: true, nextFireAt: '2026-10-02T01:00:00.000Z', lastFireAt: null, lastOutcome: null, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z' };
   return {
     list: vi.fn(async () => [schedule, { ...schedule, scheduleId: DISABLED_ID, enabled: false, nextFireAt: null }]), create: vi.fn(async (input: { delivery?: unknown } = {}) => ({ ...schedule, ...(input.delivery ? { delivery: input.delivery } : {}) }) as typeof schedule),
     update: vi.fn(async () => schedule), delete: vi.fn(async () => true),

@@ -19,6 +19,17 @@ describe('app-owned LINEJS MCP Skill', () => {
     const text = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
     for (const needle of ['這次請求中指名聊天室', '不沿用先前對話中提過的', '沒指名聊天室就建立 `custom`', '`targets` 留空']) expect(text).toContain(needle);
   });
+  it('tells the Agent to read all chats in one call without a target', async () => {
+    const text = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
+    for (const needle of ['所有對象欄位都省略', '一次呼叫即回傳全部可讀聊天室的訊息', '不要逐一聊天室查詢']) expect(text).toContain(needle);
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThan(MCP_SKILL_MAX_BYTES);
+  });
+  it('tells the Agent to see active chats first and to use the by-time filters', async () => {
+    const text = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
+    for (const needle of ['`list_active_chats`', '先呼叫它，再用 `query_target_messages_by_time` 帶 `chatId`', '`messageCount`', '`senderCount`', '`lastMessageAt`', '`truncated`',
+      '`excludeChatIds`', '`direction`', '`kinds`', '`excludeKinds`', '擇一，不可同時使用', '`cursor` 要搭配相同的過濾條件']) expect(text).toContain(needle);
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThan(MCP_SKILL_MAX_BYTES);
+  });
   it('tells the Agent to use a contact card mid as the send target', async () => {
     const text = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
     for (const needle of ['[聯絡人卡片]', '`chatId` 等於該 mid', '不要改傳到其他聊天室']) expect(text).toContain(needle);

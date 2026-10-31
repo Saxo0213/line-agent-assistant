@@ -1855,6 +1855,108 @@ it('does not convert an ordinary LINEJS network request error into auth invalida
   } finally { request.mockRestore(); }
 });
 
+async function legyModule() {
+  return await import(new URL('../../../node_modules/@evex/linejs/base/request/legy.js', import.meta.url).href) as {
+    LegyEncryptedTransport: { prototype: { fetch: (request: Request, fetcher: (request: Request) => Promise<Response>,
+      options: { endpoint?: string }) => Promise<Response> } };
+  };
+}
+async function monitorAdapter(physicalTransport: (request: Request) => Promise<Response>) {
+  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  return adapter;
+}
+
+it('treats an empty HTTP 410 sync long poll as a normal empty result after one physical request', async () => {
+  const physicalTransport = vi.fn(async () => new Response(null, { status: 410 }));
+  const adapter = await monitorAdapter(physicalTransport);
+  try {
+    await expect(adapter.sync(cursor)).resolves.toEqual({ cursorAfter: cursor, operations: [] });
+    expect(physicalTransport).toHaveBeenCalledOnce();
+  } finally { adapter.revoke(); }
+});
+
+it('treats an HTTP 410 sync with a non-Thrift body as a normal empty result', async () => {
+  const { LegyEncryptedTransport } = await legyModule();
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async (_request, fetcher, options) => {
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    return new Response('not thrift', { status: 410 });
+  });
+  const physicalTransport = vi.fn(async () => new Response(null, { status: 410 }));
+  const adapter = await monitorAdapter(physicalTransport);
+  try {
+    await expect(adapter.sync(cursor)).resolves.toEqual({ cursorAfter: cursor, operations: [] });
+    expect(physicalTransport).toHaveBeenCalledOnce();
+    expect(legy).toHaveBeenCalledOnce();
+  } finally { adapter.revoke(); legy.mockRestore(); }
+});
+
+it('keeps a decoded Talk rejection on an HTTP 410 sync as a LineServerRejection', async () => {
+  const { LegyEncryptedTransport } = await legyModule();
+  const secret = 'token=private MID=u12345678901234567890123456789012';
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async (_request, fetcher, options) => {
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    const rejected = await linejsTalkRejectionResponse('sync', 4, secret);
+    return new Response(await rejected.arrayBuffer(), { status: 410 });
+  });
+  const physicalTransport = vi.fn(async () => new Response(null, { status: 410 }));
+  const adapter = await monitorAdapter(physicalTransport);
+  try {
+    const error = await adapter.sync(cursor).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(LineServerRejection);
+    expect(error).toMatchObject({ code: 'LINE_TALK_EXCESSIVE_ACCESS', upstreamCode: 4 });
+    expect(physicalTransport).toHaveBeenCalledOnce();
+  } finally { adapter.revoke(); legy.mockRestore(); }
+});
+
+it('still rejects an empty HTTP 500 sync and a sync network error', async () => {
+  const serverError = vi.fn(async () => new Response(null, { status: 500 }));
+  const failing = await monitorAdapter(serverError);
+  try {
+    await expect(failing.sync(cursor)).rejects.toThrow('status=500');
+    expect(serverError).toHaveBeenCalledOnce();
+  } finally { failing.revoke(); }
+  const networkError = new Error('network unavailable');
+  const offline = await monitorAdapter(async () => { throw networkError; });
+  try { await expect(offline.sync(cursor)).rejects.toBe(networkError); }
+  finally { offline.revoke(); }
+});
+
+it('does not treat an empty HTTP 410 on a different RPC as a normal result', async () => {
+  const physicalTransport = vi.fn(async () => new Response(null, { status: 410 }));
+  const adapter = await monitorAdapter(physicalTransport);
+  try {
+    await expect(adapter.refreshOwnProfile()).rejects.toThrow('status=410');
+    expect(physicalTransport).toHaveBeenCalledOnce();
+  } finally { adapter.revoke(); }
+});
+
+it('sends the same sync request for an HTTP 410 answer and an HTTP 200 answer', async () => {
+  const { LegyEncryptedTransport } = await legyModule();
+  const client = new BaseClient({ device: 'DESKTOPWIN' });
+  const okBody = Buffer.from(client.thrift.writeThrift([[12, 0, [[8, 99, 1]]]], 'sync', Protocols[4]!));
+  okBody[1] = 0x41;
+  const seen: Array<{ method: string; url: string; headers: Array<[string, string]>; body: string }> = [];
+  let answer = new Response(null, { status: 410 });
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch').mockImplementation(async (request, fetcher, options) => {
+    seen.push({ method: request.method, url: request.url, headers: [...request.headers.entries()].sort(),
+      body: Buffer.from(await request.clone().arrayBuffer()).toString('hex') });
+    await fetcher(new Request(options.endpoint ?? 'https://gf.line.naver.jp/enc', { method: 'POST', body: 'fixture' }));
+    return answer;
+  });
+  const physicalTransport = vi.fn(async () => new Response(null, { status: answer.status }));
+  const adapter = await monitorAdapter(physicalTransport);
+  try {
+    await expect(adapter.sync(cursor)).resolves.toEqual({ cursorAfter: cursor, operations: [] });
+    answer = new Response(okBody, { status: 200 });
+    await expect(adapter.sync(cursor)).resolves.toMatchObject({ operations: [] });
+    expect(physicalTransport).toHaveBeenCalledTimes(2);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toEqual(seen[0]);
+    expect(new URL(seen[0]!.url).pathname).toBe('/SYNC4');
+  } finally { adapter.revoke(); legy.mockRestore(); }
+});
+
 it('denies monitor sends and stale active sends before the physical RequestClient fetch', async () => {
   const physicalTransport = vi.fn(async () => { throw new Error('network must not be reached'); });
   const monitor = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => true, physicalTransport });

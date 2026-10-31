@@ -1,6 +1,7 @@
 import {
   AgentPermissionsViewSchema,
   AgentApprovalDecisionSchema,
+  AgentSchedulePreviewNewMessagesInputSchema,
   PendingAgentApprovalSchema,
   type AgentApprovalDecision,
   type AgentExtensionTools,
@@ -9,6 +10,8 @@ import {
   type AgentMcpServerInput,
   type AgentSchedule,
   type AgentScheduleCreateInput,
+  type AgentSchedulePreviewNewMessagesInput,
+  type AgentSchedulePreviewNewMessagesOutput,
   type AgentScheduleRun,
   type AgentScheduleTargetOption,
   type AgentScheduleUpdatePatch,
@@ -197,6 +200,8 @@ export type DesktopApi = {
   listAgentScheduleRuns(scheduleId: string, limit?: number): Promise<AgentScheduleRun[]>;
   /** Chats a schedule can use. read (default): any chat the Agent can read, communities included; delivery: the Agent account's direct, group and room chats. */
   listAgentScheduleTargets(query?: string, limit?: number, purpose?: 'read' | 'delivery'): Promise<AgentScheduleTargetOption[]>;
+  /** Reads and evaluates the latest window of a new_messages form. Never sends and never starts a job. */
+  previewAgentScheduleNewMessages(input: AgentSchedulePreviewNewMessagesInput): Promise<AgentSchedulePreviewNewMessagesOutput>;
   getDatabaseSetupStatus(): Promise<DatabaseSetupStatus>;
   listDatabases(connection: DatabaseConnectionInput): Promise<string[]>;
   createDatabase(connection: DatabaseConnectionInput, database: string): Promise<string[]>;
@@ -429,6 +434,11 @@ export function createDesktopApi(transport: Transport): DesktopApi {
       const result = await request({ type: 'listAgentScheduleTargets', ...(query ? { query } : {}), limit, purpose });
       if (result.type !== 'listAgentScheduleTargets') throw new Error(result.type === 'error' ? result.message : 'Unexpected schedule targets response');
       return result.targets;
+    },
+    async previewAgentScheduleNewMessages(input) {
+      const result = await request({ type: 'previewAgentScheduleNewMessages', preview: AgentSchedulePreviewNewMessagesInputSchema.parse(input) });
+      if (result.type !== 'previewAgentScheduleNewMessages') throw new Error(result.type === 'error' ? result.message : 'Unexpected schedule preview response');
+      return result.preview;
     },
     async listAgentScheduleRuns(scheduleId, limit = 20) {
       const result = await request({ type: 'listAgentScheduleRuns', scheduleId, limit });

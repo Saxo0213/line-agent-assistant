@@ -12,8 +12,9 @@ description: 使用 LINEJS 內建 MCP 工具查詢已封存的 LINE 對話
 ## 工具
 
 - `list_targets`：列出可查詢的對話與成員。不確定對象名稱、chatId 或帳號時，先用 `query` 關鍵字呼叫它，再決定要查哪一個。
+- `list_active_chats`：列出某段時間內有訊息的聊天室，每個聊天室附訊息數（`messageCount`）、發話者人數（`senderCount`）與最新訊息時間（`lastMessageAt`），最新在前；不回傳訊息內容。`from` 必填，`to` 選填。要知道哪些聊天室有新訊息、各有幾則時，先呼叫它，再用 `query_target_messages_by_time` 帶 `chatId`（必要時加 `accountId`）只讀需要的聊天室，不必讀回所有訊息。`chatType`、`excludeChatIds`、`direction`、`kinds`、`excludeKinds` 的用法與訊息查詢相同，所以回傳的數量等於之後讀到的訊息數。`truncated` 為 true 表示還有聊天室沒列出，請縮小時間範圍或加條件。
 - `query_target_messages`：查詢某個對話或發話者的訊息。用 `target`，或明確的 `chatType` + `chatId`；可加 `text` 關鍵字、`limit` 與 `cursor`；結果最新在前。
-- `query_target_messages_by_time`：問題含時間範圍（昨天、上週、某日期）時使用，`from` / `to` 為 ISO-8601 或 `YYYY-MM-DD`；結果依時間由舊到新排列。
+- `query_target_messages_by_time`：問題含時間範圍（昨天、上週、某日期）時使用，`from` / `to` 為 ISO-8601（含時區偏移）或 `YYYY-MM-DD`；`YYYY-MM-DD` 以台灣時間（Asia/Taipei）計算整天：`from` 從當日 00:00:00.000 起，`to` 到當日 23:59:59.999 止；結果依時間由舊到新排列。要讀取所有聊天室的新訊息時，不帶 `target`（所有對象欄位都省略）、只給 `from`，一次呼叫即回傳全部可讀聊天室的訊息（每則含 `chatId` 與 `conversationTitle`）；不要逐一聊天室查詢，也不必先呼叫 `list_targets`。查詢端可用 `excludeChatIds`（略過指定的 `chatId`）、`direction`（`inbound` 只看收到的訊息，`outbound` 只看帳號送出的訊息）、`kinds` 或 `excludeKinds`（擇一，不可同時使用）過濾，不必先讀回全部訊息再自行剔除；翻頁時 `cursor` 要搭配相同的過濾條件。
 - 兩個訊息查詢工具都是分頁：每頁最多 200 則（`limit` 超過 200 會被截為 200），輸出含 `hasMore`、`nextCursor` 與 `page`。`hasMore` 為 true 時，用相同條件加上 `cursor=nextCursor` 再呼叫，直到 `hasMore` 為 false；逐頁整理後再合併。`cursor` 只能搭配同一組查詢條件。除非最後一頁（`hasMore=false`）仍沒有訊息，否則不要說某個時段沒有訊息。
 
 - `query_agent_room_history`：讀取 Agent 室的對話紀錄（管理者的提問與 Agent 的最終回覆，最新在前）。只有在 Agent 室，或與管理者的 1:1 LINE 私訊（Agent 室共用該私訊紀錄時）才有這個工具；沒有就是不可用。參數：`query`（關鍵字）、`provider`、`from` / `to`（ISO-8601）、`cursor`、`limit`。每筆有 `origin`（`agent_room` 或 `line_admin_direct`），文字被截斷時 `promptTruncated` / `replyTruncated` 為 true；用回傳的 `nextCursor` 取下一頁。
@@ -21,7 +22,7 @@ description: 使用 LINEJS 內建 MCP 工具查詢已封存的 LINE 對話
 ## 原則
 
 1. 先 `list_targets` 確認對象，再查訊息；多個候選時請使用者確認，不要猜。
-2. 有時間條件就用 `query_target_messages_by_time`，並盡量縮小範圍；訊息多時依分頁規則逐頁讀完，不要只看第一頁就下結論。
+2. 有時間條件就用 `query_target_messages_by_time`，並盡量縮小範圍；訊息多時依分頁規則逐頁讀完，不要只看第一頁就下結論。只想處理有新訊息的聊天室時，先用 `list_active_chats` 看哪些聊天室有訊息與數量，再只讀需要的聊天室。
 3. 可用的工具與查詢範圍由管理者的「權限」設定決定：預設只能查詢觸發你的這個聊天室（管理者另有授權的連結群組除外）。看到 `PERMISSION_DENIED` 或工具清單中沒有某個工具，就是未被允許，請如實告知，不要嘗試繞過。你的工作目錄是這個聊天室專屬的資料夾，筆記與整理過的內容請放在那裡。
 4. 工具回傳「無權限」、「帳號已暫停」或「工具未載入」時，如實告知使用者，不要編造內容，也不要改用其他方式繞過。
 5. 只引用查詢結果中的內容；最後一頁（`hasMore=false`）為空就說查無資料。
@@ -75,6 +76,18 @@ description: 使用 LINEJS 內建 MCP 工具查詢已封存的 LINE 對話
 
 建立後簡短回覆：對象、下次執行時間（用回傳的 `nextFireAtTaipei`）、範圍、任務、輸出（用回傳的 `deliveryLabel`），並告知可以隨時要求修改。
 
+### 兩種排程：程式排程與 Agent 排程
+
+`list_schedules` 的每個排程帶 `execution`（`program`／`agent`）與 `mayUseLlm`。
+
+- 程式排程（`message`、`new_messages`）：由系統自己做完，不啟動 Agent；`new_messages` 只有在某條規則 `then: "llm"` 時，才對那些聊天室啟動 Agent。
+- Agent 排程（`custom`、`summary`、`keyword_digest`）：需要判斷的工作，每次都啟動 Agent。
+- 使用者要「列出／轉發新訊息」一律用 `new_messages`，不要用 `custom`。`targets` 留空就是所有可讀的聊天室。
+- 「訊息太多就總結」這類條件寫成規則 `then: "llm"`。
+- `new_messages` 欄位：`messageFilter`（只用 `message.*`）、`rules`（最多 20 條，依序比對，第一條成立的決定該聊天室；都不成立就是 `list`）、`maxMessagesPerChat`（1 到 200，預設 20）、`maxTextChars`（20 到 2000，預設 200）、`sendWhenEmpty`（沒有新訊息時是否仍傳一行說明，預設 false）。規則的 `then` 為 `list`（列出）、`skip`（略過）、`llm`（交給 Agent 總結）。
+- 條件是 `{metric, op, value}`，或 `{all:[…]}`／`{any:[…]}`（最多兩層，全部條件合計 50 個）。規則只能用 `chat.messageCount`、`chat.senderCount`、`chat.textChars`、`chat.keywordHits`（另帶 `keywords`）、`run.messageCount`、`run.chatCount`、`run.listedChars`（數字，op 為 `> >= < <= == !=`）與 `chat.id`、`chat.type`（`== != in not_in`）；`messageFilter` 只能用 `message.direction`、`message.kind`（`== != in not_in`）與 `message.textContains`（`any_of`／`none_of`）。
+- 例：略過某聊天室、超過 20 則就總結：`task: {type:"new_messages", messageFilter:{metric:"message.direction",op:"==",value:"inbound"}, rules:[{when:{metric:"chat.id",op:"==",value:"<chatId>"},then:"skip"},{when:{metric:"chat.messageCount",op:">",value:20},then:"llm"}]}`。
+
 ### recurrence
 
 時間為 `HH:mm`，依 `timezone` 計算：
@@ -89,8 +102,8 @@ description: 使用 LINEJS 內建 MCP 工具查詢已封存的 LINE 對話
 
 - `summary`、`keyword_digest`：`prompt` 留空，除非使用者提出額外要求；不要在 `prompt` 重述來源、時間、範圍、輸出或規則，系統會自動加上。
 - `custom`：`prompt` 用一兩句話說明要做什麼。
-- `task`：`{type:"summary", focus?}`、`{type:"keyword_digest", keywords}`（1 到 20 個）、`{type:"custom"}`、`{type:"message", text}`（系統訊息，不啟動 Agent）。
-- `delivery`：預設 `primary_admin`；`line_target` 指定其他聊天室；`record_only`（只保存在排程紀錄、不傳送）只有 Agent 任務可用。
+- `task`：`{type:"summary", focus?}`、`{type:"keyword_digest", keywords}`（1 到 20 個）、`{type:"custom"}`、`{type:"message", text}`（系統訊息，不啟動 Agent）、`{type:"new_messages", …}`（程式排程，見上）。
+- `delivery`：預設 `primary_admin`；`line_target` 指定其他聊天室；`record_only`（只保存在排程紀錄、不傳送）只有 Agent 任務可用（`message`、`new_messages` 不可用）。
 - `targets` 最多 20 個，不可重複；`window` 最長 7 天。
 
 ### 限制

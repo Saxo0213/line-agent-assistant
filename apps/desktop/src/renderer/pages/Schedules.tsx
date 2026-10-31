@@ -4,13 +4,15 @@ import type { DesktopApi } from '../../preload/api.js';
 import { useDesktopLocale } from '../desktop-i18n.js';
 import { scheduleTextFor, type ScheduleCopyKey } from '../../desktop-schedule-copy.js';
 import { shortWall, wallDisplay } from '../scheduleForm.js';
+import { describeLlmRules } from '../scheduleRules.js';
 import { ScheduleForm, type ScheduleFormResult } from './ScheduleForm.js';
 
 const OUTCOME_KEYS: Record<AgentScheduleRunOutcome, ScheduleCopyKey> = {
   submitting: 'outcomeSubmitting', submitted: 'outcomeSubmitted', missed: 'outcomeMissed', skipped_overlap: 'outcomeSkippedOverlap', failed: 'outcomeFailed',
-  sent: 'outcomeSent', send_failed: 'outcomeSendFailed', send_unknown: 'outcomeSendUnknown',
+  sent: 'outcomeSent', send_failed: 'outcomeSendFailed', send_unknown: 'outcomeSendUnknown', no_messages: 'outcomeNoMessages',
 };
-const TASK_KEYS = { custom: 'taskCustom', summary: 'taskSummary', keyword_digest: 'taskKeywordDigest', message: 'taskMessage' } as const satisfies Record<AgentSchedule['task']['type'], ScheduleCopyKey>;
+const TASK_KEYS = { custom: 'taskCustom', summary: 'taskSummary', keyword_digest: 'taskKeywordDigest', message: 'taskMessage', new_messages: 'taskNewMessages' } as const satisfies Record<AgentSchedule['task']['type'], ScheduleCopyKey>;
+const EXECUTION_KEYS = { program: 'kindProgram', agent: 'kindAgent' } as const satisfies Record<AgentSchedule['execution'], ScheduleCopyKey>;
 const DAY_KEYS = ['day0', 'day1', 'day2', 'day3', 'day4', 'day5', 'day6'] as const;
 const ERROR_KEYS: Record<string, ScheduleCopyKey> = {
   SCHEDULE_LIMIT: 'errLimit', SCHEDULE_NO_FUTURE_TIME: 'errNoFutureTime', SCHEDULE_NOT_FOUND: 'errNotFound', SCHEDULE_INVALID: 'errInvalid', SCHEDULE_INVALID_TARGET: 'errInvalidTarget',
@@ -203,12 +205,19 @@ export function Schedules({ api, defaultProvider, providers, headingRef, onNotic
           const delivery = deliveryText(schedule);
           const lastOutcome = schedule.enabled ? schedule.lastOutcome : null;
           const statusTitle = !schedule.enabled ? text('disabledBadge') : lastOutcome ? `${outcomeText(lastOutcome)}${schedule.lastFireAt ? ` · ${wallDisplay(schedule.lastFireAt, schedule.timezone)}` : ''}` : text('statusWaiting');
+          const titles = new Map(schedule.targets.map((chat) => [chat.chatId, chat.title]));
+          const llmWhen = schedule.execution === 'program' && schedule.mayUseLlm ? describeLlmRules(schedule.task, text, { chatTitle: (id) => titles.get(id) }) : '';
           return <tr key={schedule.scheduleId} className={schedule.enabled ? 'schedule-row-main' : 'schedule-row-main disabled'}
             onClick={(event) => { const button = event.currentTarget.querySelector<HTMLElement>('button.schedule-name-button'); if (button) openEditor(schedule, button); }}>
             <td><div className="schedule-title-line">
               <button type="button" className="schedule-name-button" title={schedule.title} aria-label={text('editSchedule', { arg0: schedule.title })}>{schedule.title}</button>
+            </div>
+            <div className="schedule-badge-line">
               <span className="badge">{text(TASK_KEYS[schedule.task.type])}</span>
-            </div></td>
+              <span className="badge">{text(EXECUTION_KEYS[schedule.execution])}</span>
+              {schedule.execution === 'program' && schedule.mayUseLlm && <span className="badge">{text('llmBadge')}</span>}
+            </div>
+            {llmWhen && <div className="schedule-sub-line" title={text('llmWhen', { arg0: llmWhen })}>{text('llmWhen', { arg0: llmWhen })}</div>}</td>
             <td className={runAt.past ? 'schedule-time-past' : undefined} title={timeTitle(schedule)}>{runAt.text}</td>
             <td title={delivery}>{delivery}</td>
             <td className="schedule-status" title={statusTitle}>{!schedule.enabled ? <span className="muted">{text('disabledBadge')}</span>

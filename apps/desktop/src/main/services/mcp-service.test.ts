@@ -143,6 +143,7 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
         'list_targets',
         'query_target_messages',
         'query_target_messages_by_time',
+        'list_active_chats',
       ]);
       const listTargetsResp = await fetch(endpoint, {
         method: 'POST',
@@ -318,6 +319,159 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
       expect(rateLimitedResp.status).toBe(429);
     } finally {
       await server.shutdown();
+      await service.shutdown();
+    }
+  });
+
+  it('reads the new messages of all chats in one query_target_messages_by_time call without a target, with paging, scope, redaction, audit and rate limit intact', async () => {
+    const friendMid = `u${'c'.repeat(32)}`;
+    const win = { from: '2026-11-01T00:00:00.000Z', to: '2026-11-02T00:00:00.000Z' };
+    const insert = async (id: string, accountId: string, chatType: string, chatId: string, senderId: string, at: string, text: string) => {
+      await pool.query(
+        `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, ingestion_source, occurred_at, raw)
+         VALUES ($1, $2, $3, $4, $5, $6, 'text', $7, 'live', $8, '{}'::jsonb)`,
+        [accountId, id, `ev-${id}`, chatId, chatType, senderId, text, at]);
+    };
+    await messages.upsertConversationCatalog('account-admin', [
+      { chatType: 'group', chatId: 'all-g1', title: 'All G1', members: [] },
+      { chatType: 'room', chatId: 'all-r1', title: 'All R1', members: [] },
+    ]);
+    await messages.upsertConversationCatalog('account-agent', [
+      { chatType: 'direct', chatId: friendMid, title: 'Nick-All', members: [] },
+      { chatType: 'group', chatId: 'all-g2', title: 'All G2', members: [] },
+      { chatType: 'group', chatId: 'all-g3', title: 'All G3', members: [] },
+      { chatType: 'direct', chatId: '__local_agent_room__', title: 'Agent Room', members: [] },
+    ]);
+    await pool.query("INSERT INTO line_contacts(account_id, mid, display_name) VALUES ('account-agent', $1, 'Peer-All')", [friendMid]);
+    // x03 and x04 share one timestamp; x00 and x10 lie just outside the window; x07 belongs to the local Agent room.
+    await insert('x00', 'account-admin', 'group', 'all-g1', 'u-all', '2026-10-31T23:59:59.000Z', 'before the window');
+    await insert('x01', 'account-admin', 'group', 'all-g1', 'u-all', '2026-11-01T00:00:00.000Z', 'window start');
+    await insert('x02', 'account-agent', 'direct', friendMid, friendMid, '2026-11-01T01:00:00.000Z', 'friend one');
+    await insert('x03', 'account-admin', 'room', 'all-r1', 'u-all', '2026-11-01T02:00:00.000Z', 'tie one');
+    await insert('x04', 'account-agent', 'group', 'all-g2', 'u-all', '2026-11-01T02:00:00.000Z', 'tie two');
+    await insert('x05', 'account-admin', 'group', 'all-g1', 'u-all', '2026-11-01T03:00:00.000Z', 'leak api_key=sk-secretvalue12345');
+    await insert('x06', 'account-agent', 'direct', friendMid, friendMid, '2026-11-01T04:00:00.000Z', 'friend two');
+    await insert('x07', 'account-agent', 'direct', '__local_agent_room__', 'local', '2026-11-01T04:30:00.000Z', 'local agent room');
+    await insert('x08', 'account-admin', 'room', 'all-r1', 'u-all', '2026-11-01T05:00:00.000Z', 'room two');
+    await insert('x09', 'account-agent', 'group', 'all-g2', 'u-all', '2026-11-01T06:00:00.000Z', 'g2 two');
+    await insert('x10', 'account-admin', 'group', 'all-g1', 'u-all', '2026-11-02T00:00:00.001Z', 'after the window');
+    await insert('x11', 'account-agent', 'group', 'all-g3', 'u-all', '2026-11-01T07:00:00.000Z', 'g3 only');
+    await insert('src', 'account-agent', 'direct', friendMid, friendMid, '2026-10-30T00:00:00.000Z', 'job trigger');
+    const allIds = ['x01', 'x02', 'x03', 'x04', 'x05', 'x06', 'x08', 'x09', 'x11'];
+    const service = new McpService({ pool, tokens, messages, rateLimitPerMinute: 4 });
+    const ui = { sourceType: 'ui' } as const;
+    const byTime = async (args: Record<string, unknown>, context: Parameters<McpService['callInternalTool']>[1] = ui) => {
+      const out = await service.callInternalTool({ name: 'query_target_messages_by_time', arguments: args } as never, context);
+      if (out.toolName !== 'query_target_messages_by_time') throw new Error('unexpected tool');
+      return out;
+    };
+    const pageAll = async (args: Record<string, unknown>, context?: Parameters<McpService['callInternalTool']>[1]) => {
+      const rows: Array<{ messageId: string; accountId: string; chatType: string; chatId: string; conversationTitle: string | null; text: string | null }> = [];
+      let cursor: string | undefined;
+      let pages = 0;
+      for (;;) {
+        const out = await byTime({ ...args, ...(cursor ? { cursor } : {}) }, context);
+        pages += 1;
+        rows.push(...out.messages);
+        if (!out.hasMore) break;
+        cursor = out.nextCursor as string;
+      }
+      return { rows, pages };
+    };
+    try {
+      // Paging: all chats, oldest first, no duplicate and no gap, nothing outside the window, no local Agent room.
+      const paged = await pageAll({ ...win, limit: 4 });
+      expect(paged.pages).toBe(3);
+      expect(paged.rows.map((row) => row.messageId)).toEqual(allIds);
+      expect(new Set(paged.rows.map((row) => `${row.accountId}/${row.chatType}/${row.chatId}`)).size).toBe(5);
+      expect(paged.rows.every((row) => row.conversationTitle !== null)).toBe(true);
+      expect(paged.rows.find((row) => row.messageId === 'x05')!.text).toContain('[REDACTED]');
+      expect(JSON.stringify(paged.rows)).not.toContain('sk-secretvalue12345');
+      const fromOnly = await pageAll({ from: win.from, limit: 200 });
+      expect(fromOnly.rows.map((row) => row.messageId)).toEqual([...allIds, 'x10']);
+
+      // Cursor: valid for the same query only.
+      const first = await byTime({ ...win, limit: 4 });
+      expect(first.hasMore).toBe(true);
+      const cursor = first.nextCursor as string;
+      expect((await byTime({ ...win, limit: 4, cursor })).messages.map((row) => row.messageId)).toEqual(allIds.slice(4, 8));
+      await expect(byTime({ ...win, limit: 4, chatId: 'all-g1', cursor })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+      await expect(byTime({ ...win, from: '2026-11-01T00:00:01.000Z', limit: 4, cursor })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+      await expect(service.callInternalTool({ name: 'query_target_messages', arguments: { chatId: 'all-g1', cursor } } as never, ui)).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+
+      // Scope: a chat-scoped job reads only its own chat, with its own LINE names only.
+      const grant = await new FriendWhitelistRepository(pool).activate('account-agent', friendMid, 'test-admin');
+      const jobId = randomUUID();
+      await pool.query(
+        `INSERT INTO agent_jobs (job_id, account_id, chat_type, chat_id, provider, source_type, source_message_id, prompt, workspace_path, generation, creation_epoch, status,
+           direct_friend_grant_id, direct_friend_grant_version)
+         VALUES ($1, 'account-agent', 'direct', $2, 'claude', 'line', 'src', 'scope', 'C:\\workspace', 1, 1, 'running', $3, $4)`,
+        [jobId, friendMid, grant.grantId, grant.version]);
+      const job = { sourceType: 'line', jobId } as const;
+      const scoped = await pageAll({ ...win, limit: 1 }, job);
+      expect(scoped.rows.map((row) => row.messageId)).toEqual(['x02', 'x06']);
+      expect(scoped.rows.every((row) => row.accountId === 'account-agent' && row.chatId === friendMid)).toBe(true);
+      expect(scoped.rows.map((row) => row.conversationTitle)).toEqual(['Peer-All', 'Peer-All']);
+      expect(paged.rows.find((row) => row.messageId === 'x02')!.conversationTitle).toBe('Nick-All');
+      await expect(byTime({ ...win, accountId: 'account-admin' }, job)).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+
+      // A linked folder adds only the listed chat.
+      const folderId = randomUUID();
+      await pool.query("INSERT INTO chat_folders(folder_id, account_id, chat_type, chat_id) VALUES ($1, 'account-agent', 'group', 'all-g2')", [folderId]);
+      await pool.query("INSERT INTO agent_folder_links(account_id, subject_mid, folder_id, access, version) VALUES ('account-agent', $1, $2, 'READ', 1)", [friendMid, folderId]);
+      expect((await pageAll({ ...win, limit: 2 }, job)).rows.map((row) => row.messageId)).toEqual(['x02', 'x04', 'x06', 'x09']);
+
+      // Account filter on the external path; the external path stays read-only, rate limited and audited.
+      const rpc = (id: number, args: Record<string, unknown>) => service.handleExternalJsonRpc({
+        jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'query_target_messages_by_time', arguments: args } });
+      const messageCount = async () => (await pool.query('SELECT count(*) AS n FROM messages')).rows[0].n as string;
+      const countBefore = await messageCount();
+      const idsOf = (response: Awaited<ReturnType<typeof rpc>>) =>
+        ((response.body as { result: { structuredContent: { messages: Array<{ messageId: string }> } } }).result.structuredContent.messages).map((row) => row.messageId);
+      const everything = await rpc(1, { ...win });
+      expect(everything.httpStatus).toBe(200);
+      expect(idsOf(everything)).toEqual(allIds);
+      const agentOnly = await rpc(2, { ...win, accountId: 'account-agent' });
+      expect(idsOf(agentOnly)).toEqual(['x02', 'x04', 'x06', 'x09', 'x11']);
+      expect((await rpc(3, { to: win.to })).httpStatus).toBe(400);
+      expect((await rpc(4, { ...win, limit: 1 })).httpStatus).toBe(200);
+      expect((await rpc(5, { ...win })).httpStatus).toBe(429);
+      expect(await messageCount()).toBe(countBefore);
+      const audits = (await tokens.listAuditRecords(100)).filter((row) => row.toolName === 'query_target_messages_by_time' && row.principalId === 'local-client');
+      expect(audits.some((row) => row.action === 'TOOL_CALLED' && row.disposition === 'ALLOWED' && row.resultCount === allIds.length)).toBe(true);
+      expect(audits.some((row) => row.action === 'TOOL_CALLED' && row.disposition === 'ALLOWED' && row.resultCount === 5)).toBe(true);
+      expect(MCP_TOOL_EFFECTS.query_target_messages_by_time).toBe('read');
+    } finally {
+      await pool.query("DELETE FROM agent_jobs WHERE source_message_id = 'src'");
+      await pool.query("DELETE FROM messages WHERE message_id = 'src' OR message_id ~ '^x[0-9]{2}$'");
+      await pool.query("DELETE FROM conversations WHERE chat_id LIKE 'all-%' OR chat_id = $1 OR chat_id = '__local_agent_room__'", [friendMid]);
+      await service.shutdown();
+    }
+  });
+
+  it('reads a date-only from and to as one full day in Taiwan time in query_target_messages_by_time', async () => {
+    await messages.upsertConversationCatalog('account-admin', [{ chatType: 'group', chatId: 'all-day', title: 'All Day', members: [] }]);
+    const insert = async (id: string, at: string) => {
+      await pool.query(
+        `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, ingestion_source, occurred_at, raw)
+         VALUES ('account-admin', $1, $2, 'all-day', 'group', 'u-day', 'text', $1, 'live', $3, '{}'::jsonb)`,
+        [id, `ev-${id}`, at]);
+    };
+    await insert('x20', '2026-10-29T15:30:00.000Z'); // 23:30 Taiwan time, 2026-10-29: outside
+    await insert('x21', '2026-10-29T16:30:00.000Z'); // 00:30 Taiwan time, 2026-10-30: inside
+    await insert('x22', '2026-10-30T15:30:00.000Z'); // 23:30 Taiwan time, 2026-10-30: inside
+    await insert('x23', '2026-10-30T16:30:00.000Z'); // 00:30 Taiwan time, 2026-10-31: outside
+    const service = new McpService({ pool, tokens, messages, rateLimitPerMinute: 100 });
+    try {
+      const out = await service.callInternalTool({ name: 'query_target_messages_by_time', arguments: {
+        chatType: 'group', chatId: 'all-day', from: '2026-10-30', to: '2026-10-30' } } as never, { sourceType: 'ui' });
+      if (out.toolName !== 'query_target_messages_by_time') throw new Error('unexpected tool');
+      expect(out.messages.map((row) => row.messageId)).toEqual(['x21', 'x22']);
+      expect(out.from).toBe('2026-10-29T16:00:00.000Z');
+      expect(out.to).toBe('2026-10-30T15:59:59.999Z');
+    } finally {
+      await pool.query("DELETE FROM messages WHERE message_id ~ '^x2[0-9]$'");
+      await pool.query("DELETE FROM conversations WHERE chat_id = 'all-day'");
       await service.shutdown();
     }
   });

@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.305 移除 MCP Token：Claude Desktop 與 Codex 不需要 Token 即可連線，這台電腦上的任何程式也都能透過本機位址讀取已儲存的 LINE 訊息（瀏覽器網頁會被擋下，也無法傳送）。請參閱 [v1.0.305 版本說明](docs/releases/v1.0.305.md)；先前更新請見 [v1.0.303](docs/releases/v1.0.303.md)、[v1.0.302](docs/releases/v1.0.302.md) 與 [v1.0.288](docs/releases/v1.0.288.md)。
+v1.0.310 新增程式排程：系統依可組合的規則自行列出新訊息，只有規則選擇時才使用 LLM；另外新增跨聊天室的 MCP 查詢，並修正只有日期的查詢。請參閱 [v1.0.310 版本說明](docs/releases/v1.0.310.md)；先前更新請見 [v1.0.305](docs/releases/v1.0.305.md)、[v1.0.303](docs/releases/v1.0.303.md) 與 [v1.0.302](docs/releases/v1.0.302.md)。
 
 ## 安裝
 

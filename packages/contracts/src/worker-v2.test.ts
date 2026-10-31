@@ -18,6 +18,13 @@ it('binds logout commands and results to the complete worker identity and reques
     error: 'private server message' }).success).toBe(false);
 });
 
+it('accepts a syncConfirmed event only with the worker binding and no extra field', () => {
+  const event = { type: 'syncConfirmed', ...binding };
+  expect(LineWorkerEventSchema.safeParse(event).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ type: 'syncConfirmed', accountId: 'account-A' }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...event, extra: true }).success).toBe(false);
+});
+
 it('accepts only restricted Talk codes on failed attachment IPC events', () => {
   const event = { type: 'attachmentResult', ...binding, chatType: 'group', chatId: 'c-group',
     attachmentId: '11111111-1111-4111-8111-111111111111',

@@ -17,6 +17,20 @@ describe('account worker invalidation fence', () => {
     await expect(accounts.invalidateWorkerBinding({ accountId: 'a', workerInstanceId: 'worker-old', controlEpoch: 7 }))
       .resolves.toBe(false);
   });
+
+  it('writes only the sync time for the exact worker binding and reports whether one row changed', async () => {
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [] });
+    const accounts = new AccountRepository({ query } as never);
+
+    await expect(accounts.applyWorkerSyncConfirmed({ accountId: 'a', workerInstanceId: 'worker-1', controlEpoch: 7 })).resolves.toBe(true);
+    const sql = String(query.mock.calls[0]![0]);
+    expect(sql).toContain('SET last_synced_at=now(), updated_at=now()');
+    expect(sql).not.toMatch(/status\s*=/);
+    expect(sql).toContain("WHERE account_id=$1 AND worker_instance_id=$2 AND worker_binding_epoch=$3 AND mode <> 'PAUSED'");
+    expect(query.mock.calls[0]![1]).toEqual(['a', 'worker-1', 7]);
+    query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    await expect(accounts.applyWorkerSyncConfirmed({ accountId: 'a', workerInstanceId: 'worker-1', controlEpoch: 7 })).resolves.toBe(false);
+  });
 });
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
@@ -47,6 +61,29 @@ database('verified own MID storage', () => {
     await expect(accounts.invalidateWorkerBinding(old)).resolves.toBe(false);
     expect((await pool.query("SELECT status,worker_instance_id,worker_binding_epoch FROM line_accounts WHERE account_id='fenced-invalidation'")).rows[0])
       .toEqual({ status: 'reauth_required', worker_instance_id: 'new-worker', worker_binding_epoch: String(controlEpoch) });
+  });
+
+  it('refreshes last_synced_at without changing status and refuses a stale binding or a PAUSED account', async () => {
+    const accounts = new AccountRepository(pool);
+    const binding = { accountId: 'sync-confirmed', workerInstanceId: 'sync-worker', controlEpoch: 1 };
+    await accounts.ensureAccount(binding.accountId);
+    await accounts.bindWorker(binding);
+    await pool.query("UPDATE line_accounts SET status='degraded', last_synced_at='2020-01-01T00:00:00Z' WHERE account_id=$1", [binding.accountId]);
+    const read = async () => (await pool.query('SELECT status, last_synced_at FROM line_accounts WHERE account_id=$1', [binding.accountId])).rows[0];
+
+    await expect(accounts.applyWorkerSyncConfirmed(binding)).resolves.toBe(true);
+    const after = await read();
+    expect(after.status).toBe('degraded');
+    expect(new Date(after.last_synced_at).getTime()).toBeGreaterThan(new Date('2020-01-01T00:00:00Z').getTime());
+
+    await pool.query("UPDATE line_accounts SET last_synced_at='2020-01-01T00:00:00Z' WHERE account_id=$1", [binding.accountId]);
+    await expect(accounts.applyWorkerSyncConfirmed({ ...binding, workerInstanceId: 'other-worker' })).resolves.toBe(false);
+    await expect(accounts.applyWorkerSyncConfirmed({ ...binding, controlEpoch: 2 })).resolves.toBe(false);
+    expect(new Date((await read()).last_synced_at).toISOString()).toBe('2020-01-01T00:00:00.000Z');
+
+    await pool.query("UPDATE line_accounts SET mode='PAUSED' WHERE account_id=$1", [binding.accountId]);
+    await expect(accounts.applyWorkerSyncConfirmed(binding)).resolves.toBe(false);
+    expect(new Date((await read()).last_synced_at).toISOString()).toBe('2020-01-01T00:00:00.000Z');
   });
 
   it('leaves reauth_required final when a health write is held before or attempted after the fence', async () => {

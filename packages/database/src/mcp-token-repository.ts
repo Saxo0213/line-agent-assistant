@@ -58,6 +58,11 @@ export type InternalAgentExecutionContext =
   | { sourceType: 'ui'; requestId?: string }
   | { sourceType: 'line'; jobId: string }
   /**
+   * Main itself reading for a program schedule (new_messages) with no job row. Same principal (`internal:schedule`), scope, permissions and
+   * audit row as a scheduled Agent run (resolveInternalPrincipal maps a schedule job to this same context); no Agent room history.
+   */
+  | { sourceType: 'schedule' }
+  /**
    * Built-in Agent MCP capability: the durable job row (running, exact generation, account)
    * is rechecked on every request and its source_type decides the authority.
    */

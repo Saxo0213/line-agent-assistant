@@ -8,7 +8,7 @@ export const BASH_COMMAND_MAX_LENGTH = 2000;
 
 const reads = new Set(['Read', 'Glob', 'Grep']);
 const writes = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
-const queryMcpTools = new Set(['mcp__linejs__list_targets', 'mcp__linejs__query_target_messages', 'mcp__linejs__query_target_messages_by_time', 'mcp__linejs__query_agent_room_history', 'mcp__linejs__list_schedules']);
+const queryMcpTools = new Set(['mcp__linejs__list_targets', 'mcp__linejs__query_target_messages', 'mcp__linejs__query_target_messages_by_time', 'mcp__linejs__list_active_chats', 'mcp__linejs__query_agent_room_history', 'mcp__linejs__list_schedules']);
 
 function pathInsideWorkspace(value: unknown, workspaceRoot: string): boolean {
   if (typeof value !== 'string' || !value.trim() || !workspaceRoot.trim()) return false;

@@ -681,6 +681,70 @@ it('tracks catalog health separately from attachment readiness', async () => {
   expect(service.isAttachmentReady(binding)).toBe(true);
 });
 
+function syncConfirmedService(options: { applySyncConfirmed?: (binding: unknown) => Promise<boolean>; diagnostics?: unknown[] } = {}) {
+  const calls = { status: 0, syncConfirmed: [] as unknown[], pendingReads: 0 };
+  const service = new BaseLineService({ async bindWorker() {}, async getAccount() { return { ownMid: 'u-self' }; },
+    async applyWorkerLogin() { return true; },
+    async applyWorkerConnectionStatus() { calls.status += 1; return true; },
+    async applyWorkerSyncConfirmed(binding: unknown) { calls.syncConfirmed.push(binding); return await (options.applySyncConfirmed?.(binding) ?? true); },
+  } as never,
+  { async listPendingRouteActions() { calls.pendingReads += 1; return []; }, async applyPendingRouteAction() {} } as never,
+  {} as never, { async send() {} }, { kick() {}, async stopChat() {}, async resetChat() {} },
+  undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'en',
+  (diagnostic) => { options.diagnostics?.push(diagnostic); });
+  return { service, calls };
+}
+
+it('persists a current syncConfirmed event without a connection status write', async () => {
+  const { service, calls } = syncConfirmedService();
+  const binding = { accountId: 'a-sync', workerInstanceId: 'w-sync', controlEpoch: 1, mode: 'MONITOR_ONLY' as const };
+  await service.bind(binding);
+  const statusBefore = calls.status;
+  await service.handleWorkerEvent('w-sync', { type: 'syncConfirmed', accountId: 'a-sync', workerInstanceId: 'w-sync', controlEpoch: 1 });
+  expect(calls.syncConfirmed).toEqual([binding]);
+  expect(calls.status).toBe(statusBefore);
+  expect(service.binding('a-sync')).toBeDefined();
+});
+
+it('reports a persist diagnostic and does not throw when the syncConfirmed write rejects or returns false', async () => {
+  const diagnostics: unknown[] = [];
+  const { service, calls } = syncConfirmedService({ diagnostics, applySyncConfirmed: async () => { throw new Error('database outage'); } });
+  const binding = { accountId: 'a-sync-fail', workerInstanceId: 'w-sync-fail', controlEpoch: 1, mode: 'MONITOR_ONLY' as const };
+  await service.bind(binding);
+  const event = { type: 'syncConfirmed' as const, accountId: 'a-sync-fail', workerInstanceId: 'w-sync-fail', controlEpoch: 1 };
+  await expect(service.handleWorkerEvent('w-sync-fail', event)).resolves.toBeUndefined();
+  expect(calls.syncConfirmed).toHaveLength(1);
+  expect(diagnostics).toHaveLength(1);
+  expect(diagnostics[0]).toMatchObject({ stage: 'persist' });
+  expect(service.binding('a-sync-fail')).toBeDefined();
+  const refused = syncConfirmedService({ applySyncConfirmed: async () => false });
+  await refused.service.bind(binding);
+  await expect(refused.service.handleWorkerEvent('w-sync-fail', event)).resolves.toBeUndefined();
+  expect(refused.service.binding('a-sync-fail')).toBeDefined();
+});
+
+it('does not start pending action recovery for a syncConfirmed event in ACTIVE_CONTROL mode', async () => {
+  const { service, calls } = syncConfirmedService();
+  const binding = { accountId: 'a-sync-active', workerInstanceId: 'w-sync-active', controlEpoch: 1, mode: 'ACTIVE_CONTROL' as const };
+  await service.bind(binding);
+  await vi.waitFor(() => expect(calls.pendingReads).toBeGreaterThan(0));
+  const reads = calls.pendingReads;
+  await service.handleWorkerEvent('w-sync-active', { type: 'syncConfirmed', accountId: 'a-sync-active',
+    workerInstanceId: 'w-sync-active', controlEpoch: 1 });
+  expect(calls.syncConfirmed).toHaveLength(1);
+  expect(calls.pendingReads).toBe(reads);
+});
+
+it('ignores a stale syncConfirmed event from another worker instance', async () => {
+  const { service, calls } = syncConfirmedService();
+  const binding = { accountId: 'a-sync-stale', workerInstanceId: 'w-sync-stale', controlEpoch: 1, mode: 'MONITOR_ONLY' as const };
+  await service.bind(binding);
+  await service.handleWorkerEvent('w-sync-stale', { type: 'syncConfirmed', accountId: 'a-sync-stale', workerInstanceId: 'w-old', controlEpoch: 1 });
+  await service.handleWorkerEvent('w-sync-stale', { type: 'syncConfirmed', accountId: 'a-sync-stale', workerInstanceId: 'w-sync-stale', controlEpoch: 0 });
+  await service.handleWorkerEvent('w-old', { type: 'syncConfirmed', accountId: 'a-sync-stale', workerInstanceId: 'w-old', controlEpoch: 1 });
+  expect(calls.syncConfirmed).toEqual([]);
+});
+
 it('exposes accepted native login readiness for manual send admission and clears it on reconnect', async () => {
   const service = new LineService({ async bindWorker() {}, async getAccount() { return { ownMid: 'u-self' }; },
     async applyWorkerLogin() { return true; } } as never,

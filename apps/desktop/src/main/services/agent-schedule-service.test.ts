@@ -20,6 +20,7 @@ function fakeStore(claims: AgentScheduleClaim[][] = [[claim()]]) {
     claimDue: vi.fn(async () => { const next = queue.shift() ?? []; return { claims: next, changed: next.length > 0 }; }),
     markSubmitted: vi.fn(async () => true), markFailed: vi.fn(async () => true),
     markSent: vi.fn(async () => true), markSendFailed: vi.fn(async () => true), markSendUnknown: vi.fn(async () => true),
+    markNoMessages: vi.fn(async () => true),
     previousSubmittedFor: vi.fn(async (): Promise<Date | null> => null),
   };
   return store satisfies AgentScheduleStore;

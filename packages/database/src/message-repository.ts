@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpMessageRecord, type McpTargetSummary, type MessageSearchScope, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
+import { InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpActiveChat, type McpMessageRecord, type McpTargetSummary, type MessageSearchScope, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { parseLineStickerDescriptor, type StickerDescriptor } from './sticker-descriptor.js';
 import { CONVERSATION_TITLE_SQL, MEMBER_NAME_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nameFragments, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, upsertLineContacts, type LineContactInput } from './name-resolution.js';
@@ -173,6 +173,86 @@ export type ConversationCatalogEntry = Readonly<{
 /** Agent/MCP-visible messages hide recalled and source-deleted content in projections and in every filter predicate. */
 const AGENT_MASKED_SQL = "(m.content->>'type' = 'unsent' OR m.raw ? 'sourceDeleted')";
 const AGENT_VISIBLE_TEXT_SQL = `CASE WHEN ${AGENT_MASKED_SQL} THEN NULL ELSE m.text_content END`;
+
+/** The direction of a stored message as an MCP record reports it; the direction filter compares against this same expression. */
+const MESSAGE_DIRECTION_SQL = `CASE WHEN ${ownMessageSql('m', 'la')} THEN 'outbound' ELSE 'inbound' END`;
+
+/** SQL placeholders (such as '$1') for the visibility rules that every MCP message read shares. */
+interface MessageScopePlaceholders {
+  accountIds: string;
+  scopeAccountIds: string;
+  scopeChatType: string;
+  scopeChatId: string;
+  extraScopes: string;
+  lineageOrder: string;
+}
+
+/**
+ * Which stored messages an MCP principal may see (alias m): authorized accounts, local Agent room excluded, conversation scope
+ * with linked chats, and one copy of each message across the Agent lineage. queryTargetMessageRows and listActiveChats both embed
+ * this fragment so that their row sets cannot differ.
+ */
+function messageScopeWhereSql(p: MessageScopePlaceholders): string {
+  return `m.account_id = ANY(${p.accountIds}::text[])
+         AND (m.kind <> 'event' OR m.content IS NOT NULL)
+         AND m.chat_id <> '__local_agent_room__'
+         AND (${p.scopeAccountIds}::text[] IS NULL OR (m.account_id = ANY(${p.scopeAccountIds}::text[]) AND m.chat_type = ${p.scopeChatType} AND m.chat_id = ${p.scopeChatId})
+           OR EXISTS (SELECT 1 FROM jsonb_to_recordset(${p.extraScopes}::jsonb) AS x(chat_type text, chat_id text)
+                      WHERE m.account_id = ANY(${p.scopeAccountIds}::text[]) AND x.chat_type = m.chat_type AND x.chat_id = m.chat_id))
+         AND (cardinality(${p.lineageOrder}::text[]) = 0 OR NOT EXISTS (
+           SELECT 1 FROM messages m2 WHERE m2.account_id = ANY(${p.accountIds}::text[]) AND m2.chat_type = m.chat_type AND m2.chat_id = m.chat_id
+             AND m2.message_id = m.message_id
+             AND array_position(${p.lineageOrder}::text[], m2.account_id) < array_position(${p.lineageOrder}::text[], m.account_id)))`;
+}
+
+/** Values for MessageScopePlaceholders, in the order scopeAccountIds, scopeChatType, scopeChatId, extraScopes, lineageOrder. */
+function messageScopeValues(
+  lineage: { scopeAccountIds: string[] | null; order: string[] },
+  input: { conversationScope?: ConversationKey; extraConversationScopes?: readonly Pick<ConversationKey, 'chatType' | 'chatId'>[] },
+): [string[] | null, string | null, string | null, string, string[]] {
+  return [
+    lineage.scopeAccountIds,
+    input.conversationScope?.chatType ?? null,
+    input.conversationScope?.chatId ?? null,
+    JSON.stringify((input.extraConversationScopes ?? []).map((scope) => ({ chat_type: scope.chatType, chat_id: scope.chatId }))),
+    lineage.order,
+  ];
+}
+
+interface MessageFilterPlaceholders {
+  chatType: string;
+  from: string;
+  to: string;
+  excludeChatIds: string;
+  direction: string;
+  kinds: string;
+  excludeKinds: string;
+}
+
+/** Filters shared by query_target_messages_by_time and list_active_chats (aliases m, la). A null value turns a filter off. */
+function messageFilterWhereSql(p: MessageFilterPlaceholders): string {
+  return `(${p.chatType}::text IS NULL OR m.chat_type = ${p.chatType})
+         AND (${p.from}::timestamptz IS NULL OR m.occurred_at >= ${p.from}::timestamptz)
+         AND (${p.to}::timestamptz IS NULL OR m.occurred_at <= ${p.to}::timestamptz)
+         AND (${p.excludeChatIds}::text[] IS NULL OR NOT (m.chat_id = ANY(${p.excludeChatIds}::text[])))
+         AND (${p.direction}::text IS NULL OR ${MESSAGE_DIRECTION_SQL} = ${p.direction}::text)
+         AND (${p.kinds}::text[] IS NULL OR m.kind = ANY(${p.kinds}::text[]))
+         AND (${p.excludeKinds}::text[] IS NULL OR NOT (m.kind = ANY(${p.excludeKinds}::text[])))`;
+}
+
+/** Optional filters of the by-time read; arrays that are absent or empty are off. */
+interface MessageFilterInput {
+  excludeChatIds?: readonly string[];
+  direction?: McpMessageRecord['direction'];
+  kinds?: readonly McpMessageRecord['kind'][];
+  excludeKinds?: readonly McpMessageRecord['kind'][];
+}
+
+/** Values for MessageFilterPlaceholders after chatType/from/to: excludeChatIds, direction, kinds, excludeKinds. */
+function messageFilterValues(input: MessageFilterInput): [string[] | null, string | null, string[] | null, string[] | null] {
+  const list = <T extends string>(values: readonly T[] | undefined): T[] | null => (values && values.length > 0 ? [...values] : null);
+  return [list(input.excludeChatIds), input.direction ?? null, list(input.kinds), list(input.excludeKinds)];
+}
 
 /** Chat types the Agent may send to. Community and thread are never writable. */
 export const SEND_CHAT_TYPES = ['direct', 'group', 'room'] as const;
@@ -1894,6 +1974,88 @@ export class MessageRepository {
     return Number(result.rows[0]?.n ?? 0);
   }
 
+  /**
+   * Chats that have messages in the window, with counts, from the same row set queryTargetMessageRows returns for the same
+   * scope and filters (messageScopeWhereSql, messageFilterWhereSql). Lineage accounts merge by (chatType, chatId) and the
+   * highest-ranked account supplies the key and names, like listConversationTargets. Newest chat activity first.
+   */
+  async listActiveChats(
+    input: {
+      accountIds: readonly string[];
+      conversationScope?: ConversationKey;
+      extraConversationScopes?: readonly Pick<ConversationKey, 'chatType' | 'chatId'>[];
+      chatType?: ConversationKey['chatType'];
+      from: string;
+      to?: string;
+      limit: number;
+      ownLineNamesOnly?: boolean;
+    } & MessageFilterInput,
+    queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'> = this.pool,
+  ): Promise<{ chats: McpActiveChat[]; truncated: boolean }> {
+    if (input.accountIds.length === 0) return { chats: [], truncated: false };
+    const lineage = await expandAgentLineage(queryable, input.accountIds, input.conversationScope?.accountId);
+    const names = nameFragments(input.ownLineNamesOnly === true);
+    const limit = Math.max(1, Math.min(500, Math.trunc(input.limit)));
+    const result = await queryable.query<{
+      account_id: string;
+      account_display_name: string | null;
+      chat_type: ConversationKey['chatType'];
+      chat_id: string;
+      conversation_title: string | null;
+      message_count: number;
+      sender_count: number;
+      last_message_at: Date;
+    }>(
+      `WITH visible AS (
+         SELECT m.account_id, m.chat_type, m.chat_id, m.sender_id, m.occurred_at,
+                NULLIF(la.display_name, '') AS account_display_name,
+                ${names.title} AS conversation_title,
+                array_position($9::text[], m.account_id) AS lineage_rank
+         FROM messages m
+         JOIN line_accounts la ON la.account_id = m.account_id
+         LEFT JOIN conversations c
+           ON c.account_id = m.account_id
+          AND c.chat_type = m.chat_type
+          AND c.chat_id = m.chat_id
+         ${PEER_CONTACT_JOIN}
+         WHERE ${messageScopeWhereSql({ accountIds: '$1', scopeAccountIds: '$5', scopeChatType: '$6', scopeChatId: '$7', extraScopes: '$8', lineageOrder: '$9' })}
+           AND ${messageFilterWhereSql({ chatType: '$2', from: '$3', to: '$4', excludeChatIds: '$10', direction: '$11', kinds: '$12', excludeKinds: '$13' })}
+       )
+       SELECT (array_agg(account_id ORDER BY lineage_rank NULLS LAST, account_id))[1] AS account_id,
+              (array_agg(account_display_name ORDER BY lineage_rank NULLS LAST, account_id))[1] AS account_display_name,
+              chat_type,
+              chat_id,
+              (array_agg(conversation_title ORDER BY lineage_rank NULLS LAST, account_id))[1] AS conversation_title,
+              count(*)::int AS message_count,
+              count(DISTINCT sender_id)::int AS sender_count,
+              max(occurred_at) AS last_message_at
+       FROM visible
+       GROUP BY chat_type, chat_id, CASE WHEN lineage_rank IS NULL THEN account_id END
+       ORDER BY max(occurred_at) DESC, chat_type ASC, chat_id ASC, min(account_id) ASC
+       LIMIT $14`,
+      [
+        lineage.accountIds,
+        input.chatType ?? null,
+        input.from,
+        input.to ?? null,
+        ...messageScopeValues(lineage, input),
+        ...messageFilterValues(input),
+        limit + 1,
+      ],
+    );
+    const chats = result.rows.slice(0, limit).map((row) => ({
+      accountId: row.account_id,
+      accountDisplayName: row.account_display_name,
+      chatType: row.chat_type,
+      chatId: row.chat_id,
+      conversationTitle: row.conversation_title,
+      messageCount: row.message_count,
+      senderCount: row.sender_count,
+      lastMessageAt: row.last_message_at.toISOString(),
+    }));
+    return { chats, truncated: result.rows.length > limit };
+  }
+
   async queryTargetMessages(
     input: {
       accountIds: readonly string[];
@@ -1917,7 +2079,7 @@ export class MessageRepository {
       after?: { occurredAt: string; messageId: string };
       /** Non-admin principals: sender and conversation names ignore the owner's local nicknames. */
       ownLineNamesOnly?: boolean;
-    },
+    } & MessageFilterInput,
     queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'> = this.pool,
   ): Promise<McpMessageRecord[]> {
     return (await this.queryTargetMessagePage(input, queryable)).messages;
@@ -1982,10 +2144,7 @@ export class MessageRepository {
               m.message_id,
               m.sender_id,
               ${names.sender} AS sender_name,
-              CASE
-                WHEN ${ownMessageSql('m', 'la')} THEN 'outbound'
-                ELSE 'inbound'
-              END AS direction,
+              ${MESSAGE_DIRECTION_SQL} AS direction,
               m.kind,
               COALESCE(${AGENT_MASKED_SQL}, false) AS recalled,
               ${AGENT_VISIBLE_TEXT_SQL} AS text_content,
@@ -2022,17 +2181,8 @@ export class MessageRepository {
         AND a.chat_type = m.chat_type
         AND a.chat_id = m.chat_id
         AND a.message_id = m.message_id
-       WHERE m.account_id = ANY($1::text[])
-         AND (m.kind <> 'event' OR m.content IS NOT NULL)
-         AND m.chat_id <> '__local_agent_room__'
-         AND ($12::text[] IS NULL OR (m.account_id = ANY($12::text[]) AND m.chat_type = $13 AND m.chat_id = $14)
-           OR EXISTS (SELECT 1 FROM jsonb_to_recordset($15::jsonb) AS x(chat_type text, chat_id text)
-                      WHERE m.account_id = ANY($12::text[]) AND x.chat_type = m.chat_type AND x.chat_id = m.chat_id))
-         AND (cardinality($16::text[]) = 0 OR NOT EXISTS (
-           SELECT 1 FROM messages m2 WHERE m2.account_id = ANY($1::text[]) AND m2.chat_type = m.chat_type AND m2.chat_id = m.chat_id
-             AND m2.message_id = m.message_id
-             AND array_position($16::text[], m2.account_id) < array_position($16::text[], m.account_id)))
-         AND ($2::text IS NULL OR m.chat_type = $2)
+       WHERE ${messageScopeWhereSql({ accountIds: '$1', scopeAccountIds: '$12', scopeChatType: '$13', scopeChatId: '$14', extraScopes: '$15', lineageOrder: '$16' })}
+         AND ${messageFilterWhereSql({ chatType: '$2', from: '$9', to: '$10', excludeChatIds: '$19', direction: '$20', kinds: '$21', excludeKinds: '$22' })}
          AND ($3::text IS NULL OR m.chat_id = $3)
          AND ($4::text IS NULL OR position(lower($4) in lower(coalesce(${names.title}, ''))) > 0)
          AND ($5::text IS NULL OR m.sender_id = $5)
@@ -2069,8 +2219,6 @@ export class MessageRepository {
            )
          )
          AND ($8::text IS NULL OR position(lower($8) in lower(coalesce(${AGENT_VISIBLE_TEXT_SQL}, ''))) > 0)
-         AND ($9::timestamptz IS NULL OR m.occurred_at >= $9::timestamptz)
-         AND ($10::timestamptz IS NULL OR m.occurred_at <= $10::timestamptz)
          AND ($17::timestamptz IS NULL OR (m.occurred_at, m.message_id) ${ascending ? '>' : '<'} ($17::timestamptz, $18::text))
        GROUP BY m.account_id, m.chat_type, m.chat_id, m.message_id, m.sender_id, m.kind, m.content, m.text_content, m.occurred_at, m.raw, la.own_mid,
                 ${NAME_RESOLUTION_GROUP_COLUMNS}
@@ -2088,13 +2236,10 @@ export class MessageRepository {
         from,
         to,
         limit,
-        lineage.scopeAccountIds,
-        input.conversationScope?.chatType ?? null,
-        input.conversationScope?.chatId ?? null,
-        JSON.stringify((input.extraConversationScopes ?? []).map((scope) => ({ chat_type: scope.chatType, chat_id: scope.chatId }))),
-        lineage.order,
+        ...messageScopeValues(lineage, input),
         afterTime,
         afterId,
+        ...messageFilterValues(input),
       ],
     );
 

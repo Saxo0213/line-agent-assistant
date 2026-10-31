@@ -2,9 +2,12 @@ import {
   AGENT_SCHEDULE_DEFAULT_TIMEZONE, AGENT_SCHEDULE_FOCUS_MAX, AGENT_SCHEDULE_JITTER_MAX_MINUTES, AGENT_SCHEDULE_INTERVAL_MAX_MINUTES, AGENT_SCHEDULE_INTERVAL_MIN_MINUTES,
   AGENT_SCHEDULE_KEYWORDS_MAX, AGENT_SCHEDULE_KEYWORD_MAX, AGENT_SCHEDULE_LOOKBACK_MAX_MINUTES, AGENT_SCHEDULE_LOOKBACK_MIN_MINUTES,
   AGENT_SCHEDULE_MAX_TARGETS, AGENT_SCHEDULE_MESSAGE_MAX, AGENT_SCHEDULE_PROMPT_MAX, AGENT_SCHEDULE_TITLE_MAX, isValidTimeZone, nextFireAfter, scheduleTargetKey, validateCron,
-  type AgentSchedule, type AgentScheduleCreateInput, type AgentScheduleRecurrence, type AgentScheduleSendTarget, type AgentScheduleTarget, type AgentScheduleTask, type AgentScheduleWindow,
+  type AgentSchedule, type AgentScheduleCreateInput, type AgentSchedulePreviewNewMessagesInput, type AgentScheduleRecurrence, type AgentScheduleNewMessagesTask, type AgentScheduleSendTarget, type AgentScheduleTarget, type AgentScheduleTask, type AgentScheduleWindow,
 } from '@line-agent/contracts';
 import type { ScheduleCopyKey } from '../desktop-schedule-copy.js';
+import {
+  buildNewMessagesTask, defaultNewMessagesDraft, draftFromTask, hasLlmRule, type NewMessagesDraft, type RuleErrors,
+} from './scheduleRules.js';
 
 export type RecurrenceKind = AgentScheduleRecurrence['kind'];
 export type ScheduleFormState = {
@@ -14,6 +17,8 @@ export type ScheduleFormState = {
   /** Text of a system message task (task type 'message'). */
   messageText: string;
   keywords: string[];
+  /** Draft of a new_messages task (message filter, rules, parameters). */
+  newMessages: NewMessagesDraft;
   targets: AgentScheduleTarget[];
   prompt: string;
   kind: RecurrenceKind;
@@ -35,7 +40,7 @@ export type ScheduleFormState = {
   enabled: boolean;
 };
 export type FormError = { key: ScheduleCopyKey; values?: Record<string, unknown> };
-export type FormErrors = Partial<Record<'title' | 'prompt' | 'messageText' | 'targets' | 'keywords' | 'focus' | 'recurrence' | 'window' | 'delivery' | 'timezone', FormError>>;
+export type FormErrors = Partial<Record<'title' | 'rules' | 'prompt' | 'messageText' | 'targets' | 'keywords' | 'focus' | 'recurrence' | 'window' | 'delivery' | 'timezone', FormError>>;
 
 const dateTimeParts = (instant: Date, timezone: string) => {
   const out: Record<string, string> = {};
@@ -81,7 +86,7 @@ export function defaultFormState(provider: 'codex' | 'claude', now = new Date())
   const timezone = AGENT_SCHEDULE_DEFAULT_TIMEZONE;
   const nextHour = new Date(Math.ceil((now.getTime() + 60_000) / 3_600_000) * 3_600_000);
   return {
-    title: '', taskType: 'custom', focus: '', messageText: '', keywords: [], targets: [], prompt: '',
+    title: '', taskType: 'custom', focus: '', messageText: '', keywords: [], newMessages: defaultNewMessagesDraft(), targets: [], prompt: '',
     kind: 'daily', onceAt: isoToWall(nextHour, timezone), time: '09:00', days: [1, 2, 3, 4, 5], everyMinutes: '60',
     anchorAt: isoToWall(now, timezone), cron: '0 9 * * 1-5', windowMode: 'since_last_run', lookbackMinutes: '1440',
     deliveryMode: 'primary_admin', deliveryTarget: null, provider, timezone, jitterMinutes: AGENT_SCHEDULE_JITTER_MAX_MINUTES, enabled: true,
@@ -100,6 +105,7 @@ export function formStateFromSchedule(schedule: AgentSchedule): ScheduleFormStat
   if (schedule.task.type === 'summary') next.focus = schedule.task.focus ?? '';
   if (schedule.task.type === 'message') next.messageText = schedule.task.text;
   if (schedule.task.type === 'keyword_digest') next.keywords = [...schedule.task.keywords];
+  if (schedule.task.type === 'new_messages') next.newMessages = draftFromTask(schedule.task, schedule.targets);
   const recurrence = schedule.recurrence;
   if (recurrence.kind === 'once') next.onceAt = isoToWall(recurrence.at, schedule.timezone);
   else if (recurrence.kind === 'daily') next.time = recurrence.time;
@@ -141,49 +147,102 @@ export function recurrenceFromForm(form: ScheduleFormState): { recurrence: Agent
   }
 }
 
+/** Window of the form, or a field error. */
+function windowFromForm(form: ScheduleFormState): { window: AgentScheduleWindow } | { error: FormError } {
+  if (form.windowMode !== 'lookback') return { window: { mode: 'since_last_run' } };
+  const minutes = Number(form.lookbackMinutes);
+  if (!/^\d+$/.test(form.lookbackMinutes.trim()) || minutes < AGENT_SCHEDULE_LOOKBACK_MIN_MINUTES || minutes > AGENT_SCHEDULE_LOOKBACK_MAX_MINUTES) {
+    return { error: { key: 'errMinutes', values: { arg0: AGENT_SCHEDULE_LOOKBACK_MIN_MINUTES, arg1: AGENT_SCHEDULE_LOOKBACK_MAX_MINUTES } } };
+  }
+  return { window: { mode: 'lookback', minutes } };
+}
+
+/** A system message and a new_messages task are program tasks: both are always delivered to LINE. */
+export const isProgramTask = (taskType: AgentScheduleTask['type']): boolean => taskType === 'message' || taskType === 'new_messages';
+
+/** True when a run of the form can start an Agent that needs a prompt and a provider: every Agent task, and new_messages with a rule that says llm. */
+export const formUsesLlm = (form: ScheduleFormState): boolean => form.taskType === 'new_messages' ? hasLlmRule(form.newMessages) : form.taskType !== 'message';
+
+/** Fields to change when the user picks a task: a program task cannot be record_only. */
+export function taskChangePatch(form: ScheduleFormState, taskType: AgentScheduleTask['type']): Partial<ScheduleFormState> {
+  return { taskType, ...(isProgramTask(taskType) && form.deliveryMode === 'record_only' ? { deliveryMode: 'primary_admin' as const } : {}) };
+}
+
+export type BuildErrors = { errors: FormErrors; ruleErrors?: RuleErrors };
+
 /** Create input of the form, or per-field errors. Mirrors AgentScheduleCreateInputSchema and its cross-field rules. */
-export function buildScheduleInput(form: ScheduleFormState): { input: AgentScheduleCreateInput; errors?: undefined } | { input?: undefined; errors: FormErrors } {
+export function buildScheduleInput(form: ScheduleFormState): { input: AgentScheduleCreateInput; errors?: undefined; ruleErrors?: undefined } | ({ input?: undefined } & BuildErrors) {
   const errors: FormErrors = {};
+  let ruleErrors: RuleErrors | undefined;
   const title = form.title.trim();
   if (!title) errors.title = { key: 'errTitleRequired' };
   else if (title.length > AGENT_SCHEDULE_TITLE_MAX) errors.title = { key: 'errTitleTooLong' };
   const isMessage = form.taskType === 'message';
+  const isNewMessages = form.taskType === 'new_messages';
   // A system message uses only its text: no prompt, no chats to read, no time range, and always goes to LINE.
-  const prompt = isMessage ? '' : form.prompt.trim();
+  // A new_messages task uses a prompt only when a rule hands a chat to the LLM.
+  const prompt = isMessage || (isNewMessages && !hasLlmRule(form.newMessages)) ? '' : form.prompt.trim();
   const messageText = form.messageText.trim();
   if (isMessage) {
     if (!messageText) errors.messageText = { key: 'errMessageRequired' };
     else if (messageText.length > AGENT_SCHEDULE_MESSAGE_MAX) errors.messageText = { key: 'errMessageTooLong' };
   } else if (prompt.length > AGENT_SCHEDULE_PROMPT_MAX) errors.prompt = { key: 'errPromptTooLong' };
   else if (form.taskType === 'custom' && !prompt) errors.prompt = { key: 'errPromptRequired' };
-  if (!isMessage && form.taskType !== 'custom' && form.targets.length === 0) errors.targets = { key: 'errTargetsRequired' };
+  if (!isProgramTask(form.taskType) && form.taskType !== 'custom' && form.targets.length === 0) errors.targets = { key: 'errTargetsRequired' };
   const focus = form.focus.trim();
   if (form.taskType === 'summary' && focus.length > AGENT_SCHEDULE_FOCUS_MAX) errors.focus = { key: 'errFocusTooLong' };
   if (form.taskType === 'keyword_digest' && form.keywords.length === 0) errors.keywords = { key: 'errKeywordsRequired' };
+  let newMessagesTask: AgentScheduleNewMessagesTask | undefined;
+  if (isNewMessages) {
+    const built = buildNewMessagesTask(form.newMessages);
+    if (built.task) newMessagesTask = built.task;
+    else { ruleErrors = built.errors; errors.rules = built.errors.general ?? { key: 'errRulesInvalid' }; }
+  }
   if (!isValidTimeZone(form.timezone)) errors.timezone = { key: 'errTimezone' };
   const recurrence = recurrenceFromForm(form);
   if ('error' in recurrence && !errors.timezone) errors.recurrence = recurrence.error;
   let window: AgentScheduleWindow = { mode: 'since_last_run' };
-  if (!isMessage && form.windowMode === 'lookback') {
-    const minutes = Number(form.lookbackMinutes);
-    if (!/^\d+$/.test(form.lookbackMinutes.trim()) || minutes < AGENT_SCHEDULE_LOOKBACK_MIN_MINUTES || minutes > AGENT_SCHEDULE_LOOKBACK_MAX_MINUTES) {
-      errors.window = { key: 'errMinutes', values: { arg0: AGENT_SCHEDULE_LOOKBACK_MIN_MINUTES, arg1: AGENT_SCHEDULE_LOOKBACK_MAX_MINUTES } };
-    } else window = { mode: 'lookback', minutes };
+  if (!isMessage) {
+    const result = windowFromForm(form);
+    if ('error' in result) errors.window = result.error; else window = result.window;
   }
   if (form.deliveryMode === 'line_target' && !form.deliveryTarget) errors.delivery = { key: 'errDeliveryTarget' };
-  if (Object.keys(errors).length > 0 || 'error' in recurrence) return { errors };
-  const task: AgentScheduleTask = form.taskType === 'custom' ? { type: 'custom' }
-    : form.taskType === 'message' ? { type: 'message', text: messageText }
+  if (Object.keys(errors).length > 0 || 'error' in recurrence) return { errors, ...(ruleErrors ? { ruleErrors } : {}) };
+  const task: AgentScheduleTask = newMessagesTask ?? (form.taskType === 'custom' ? { type: 'custom' }
+    : isMessage ? { type: 'message', text: messageText }
     : form.taskType === 'summary' ? (focus ? { type: 'summary', focus } : { type: 'summary' })
-      : { type: 'keyword_digest', keywords: form.keywords };
+      : { type: 'keyword_digest', keywords: form.keywords });
   return {
     input: {
       title, prompt, provider: form.provider, recurrence: recurrence.recurrence, timezone: form.timezone, targets: isMessage ? [] : form.targets,
       task, window,
       delivery: form.deliveryMode === 'line_target' && form.deliveryTarget ? { mode: 'line_target', target: form.deliveryTarget }
-        : form.deliveryMode === 'record_only' && !isMessage ? { mode: 'record_only' } : { mode: 'primary_admin' },
+        : form.deliveryMode === 'record_only' && !isProgramTask(form.taskType) ? { mode: 'record_only' } : { mode: 'primary_admin' },
       jitterMinutes: Math.max(0, Math.min(AGENT_SCHEDULE_JITTER_MAX_MINUTES, Math.floor(form.jitterMinutes))),
       enabled: form.enabled,
+    },
+  };
+}
+
+/**
+ * Input of the new_messages preview: the task, targets and window of the form, and the recurrence and delivery only when they are valid.
+ * The title, prompt and provider are not part of it. A preview never saves the form.
+ */
+export function buildPreviewInput(form: ScheduleFormState): { input: AgentSchedulePreviewNewMessagesInput; errors?: undefined; ruleErrors?: undefined } | ({ input?: undefined } & BuildErrors) {
+  const errors: FormErrors = {};
+  const built = buildNewMessagesTask(form.newMessages);
+  if (!built.task) errors.rules = built.errors.general ?? { key: 'errRulesInvalid' };
+  const window = windowFromForm(form);
+  if ('error' in window) errors.window = window.error;
+  if (!built.task || 'error' in window) return { errors, ...(built.task ? {} : { ruleErrors: built.errors }) };
+  const recurrence = recurrenceFromForm(form);
+  const delivery: AgentSchedulePreviewNewMessagesInput['delivery'] = form.deliveryMode === 'line_target' ? (form.deliveryTarget ? { mode: 'line_target', target: form.deliveryTarget } : undefined)
+    : form.deliveryMode === 'primary_admin' ? { mode: 'primary_admin' } : undefined;
+  return {
+    input: {
+      task: built.task, targets: form.targets, window: window.window,
+      ...('recurrence' in recurrence ? { recurrence: recurrence.recurrence } : {}),
+      ...(delivery ? { delivery } : {}),
     },
   };
 }

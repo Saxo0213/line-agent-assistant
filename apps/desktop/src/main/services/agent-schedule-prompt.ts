@@ -55,6 +55,8 @@ export interface ScheduledPromptInput {
   window: ScheduleTimeWindow;
   /** The Primary Admin's direct chat with the Agent account at run time (primary_admin delivery); null when there is none. */
   adminChat?: { accountId: string; chatId: string; title?: string } | null;
+  /** new_messages only: the chats whose rule says llm. They are the only chats the Agent reads; the other chats are listed by Main. */
+  llmChats?: readonly AgentScheduleTarget[];
 }
 
 const targetLabel = (target: AgentScheduleTarget): string => target.title.trim() || target.chatId;
@@ -96,8 +98,9 @@ const oneLine = (text: string, max: number): string => {
 export function composeScheduledPrompt(input: ScheduledPromptInput): string {
   const reads = input.task.type !== 'custom' || input.targets.length > 0;
   const lines: string[] = [`${AGENT_SCHEDULE_PROMPT_PREFIX}${input.title}`];
-  lines.push(`任務：${input.task.type === 'summary' ? '總結' : input.task.type === 'keyword_digest' ? `關鍵字彙整（${input.task.keywords.join('、')}）` : '自訂'}`);
-  if (input.targets.length > 0) lines.push(`來源：${sourceSummary(input.targets)}`);
+  lines.push(`任務：${input.task.type === 'summary' ? '總結' : input.task.type === 'keyword_digest' ? `關鍵字彙整（${input.task.keywords.join('、')}）` : input.task.type === 'new_messages' ? '新訊息整理' : '自訂'}`);
+  const sources = input.task.type === 'new_messages' ? input.llmChats ?? [] : input.targets;
+  if (sources.length > 0) lines.push(`來源：${sourceSummary(sources)}`);
   if (reads) lines.push(`範圍：${formatTaipeiRange(input.window)}`);
   lines.push(`輸出：${deliveryLabel(input)}`);
   if (input.prompt.trim()) lines.push(`${input.task.type === 'custom' ? '指示' : '補充'}：${oneLine(input.prompt, VISIBLE_EXTRA_MAX)}`);
@@ -111,7 +114,21 @@ const SUMMARY_FORMAT = '每個來源一個區塊（純文字）：\n【<聊天�
 /** The hidden run-time instructions of one scheduled run (injected by Main when the job starts; never stored in the job prompt). */
 export function composeScheduleRunContext(input: ScheduledPromptInput): string {
   const lines: string[] = ['【排程規則】無人值守：不要提問或等待確認；資訊不足就盡力完成並註明缺少什麼。'];
-  const reads = input.task.type !== 'custom' || input.targets.length > 0;
+  const newMessages = input.task.type === 'new_messages';
+  const reads = !newMessages && (input.task.type !== 'custom' || input.targets.length > 0);
+  if (newMessages) {
+lines.push(`時間：${formatTaipeiRange(input.window)}（台灣時間）；查詢用 UTC from=${input.window.from.toISOString()} to=${input.window.to.toISOString()}`);
+lines.push(PAGING_RULE);
+const chats = input.llmChats ?? [];
+lines.push(chats.length > 0
+  ? '來源（只處理下列聊天室；其他聊天室已由系統依規則列出，不要重複。每個聊天室用 query_target_messages_by_time 帶 accountId、chatType、chatId，查到 hasMore=false 為止，只查上述時間）：'
+  : '來源：沒有需要處理的聊天室；不要查詢任何聊天室，回覆一行「此時段沒有需要整理的聊天室」。');
+for (const chat of chats) lines.push(`• ${targetLabel(chat)}（accountId=${chat.accountId}，chatType=${chat.chatType}，chatId=${chat.chatId}）`);
+if (input.task.type === 'new_messages' && input.task.messageFilter && chats.length > 0) {
+  lines.push(`訊息過濾：只使用符合下列條件的訊息，其他訊息視為不存在。message.direction 的 inbound 是別人傳入、outbound 是自己傳出；message.kind 是訊息類型；message.textContains 比對文字且不分大小寫。條件：${JSON.stringify(input.task.messageFilter)}`);
+}
+lines.push(`任務：總結。${SUMMARY_FORMAT}`);
+  }
   if (reads) {
 lines.push(`時間：${formatTaipeiRange(input.window)}（台灣時間）；查詢用 UTC from=${input.window.from.toISOString()} to=${input.window.to.toISOString()}`);
 lines.push(PAGING_RULE);
@@ -122,7 +139,7 @@ for (const target of input.targets) {
   }
   if (input.task.type === 'custom' && !reads) {
 lines.push(`時間：${formatTaipeiRange(input.window)}（台灣時間）；查詢用 UTC from=${input.window.from.toISOString()} to=${input.window.to.toISOString()}`);
-lines.push('來源：未固定聊天室。依指示自行決定要讀取的聊天室：先用 list_targets 列出可讀取的對話，再對需要的每個聊天室用 query_target_messages_by_time 查上述時間（該工具一次查一個聊天室，查到 hasMore=false）。');
+lines.push('來源：未固定聊天室。依指示自行決定要讀取哪些聊天室。要讀取所有聊天室的新訊息時，只呼叫一次 query_target_messages_by_time，帶 from 與 to，不帶 target：它會回傳所有聊天室的訊息，每則訊息都有 chatId 與 conversationTitle；查到 hasMore=false 為止。不要逐一聊天室查詢；只有要讀取某個特定聊天室時，才帶 chatId 或 target。');
 lines.push(PAGING_RULE);
   }
   if (input.task.type === 'summary') {

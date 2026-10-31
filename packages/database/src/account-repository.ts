@@ -480,6 +480,15 @@ export class AccountRepository {
     return result.rowCount === 1;
   }
 
+  async applyWorkerSyncConfirmed(binding: WorkerBinding): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE line_accounts SET last_synced_at=now(), updated_at=now()
+       WHERE account_id=$1 AND worker_instance_id=$2 AND worker_binding_epoch=$3 AND mode <> 'PAUSED'`,
+      [binding.accountId, binding.workerInstanceId, binding.controlEpoch],
+    );
+    return result.rowCount === 1;
+  }
+
   async refreshWorkerAvatar(binding: WorkerBinding, ownMid: string, displayName: string | null, picturePath?: string | null): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE line_accounts a SET display_name=COALESCE($4,a.display_name),

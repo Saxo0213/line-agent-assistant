@@ -1,5 +1,9 @@
 import {
   AGENT_ROOM_HISTORY_TOOL_NAME,
+  AGENT_SCHEDULE_CHAT_NUMBER_METRICS,
+  AGENT_SCHEDULE_MESSAGE_DIRECTIONS,
+  AGENT_SCHEDULE_MESSAGE_KINDS,
+  AGENT_SCHEDULE_NUMBER_OPS,
   LIST_SEND_TARGETS_TOOL_NAME,
   SEND_TO_TARGET_TOOL_NAME,
   LIST_SCHEDULES_TOOL_NAME,
@@ -17,6 +21,8 @@ import {
   ChatTypeSchema,
   McpAgentRoomHistoryOutputSchema,
   MCP_TOOL_PERMISSIONS,
+  MCP_ACTIVE_CHATS_DEFAULT_LIMIT,
+  McpMessageKindSchema,
   McpToolOutputUnionSchema,
   McpToolInputUnionSchema,
   type EffectivePermissions,
@@ -90,6 +96,30 @@ function pickMessageShape(args: { accountId?: string | undefined; target?: strin
   return { a: args.accountId ?? null, t: args.target ?? null, ct: args.chatType ?? null, c: args.chatId ?? null, ti: args.conversationTitle ?? null, si: args.senderId ?? null, sn: args.senderName ?? null, x: args.text ?? null };
 }
 
+/** Cursor shape of the by-time filters; absent filters add no key, so a cursor from an unfiltered query keeps its hash. */
+function pickMessageFilterShape(args: { excludeChatIds?: readonly string[] | undefined; direction?: string | undefined; kinds?: readonly string[] | undefined; excludeKinds?: readonly string[] | undefined }): Record<string, unknown> {
+  const sorted = (values: readonly string[] | undefined) => (values && values.length > 0 ? [...new Set(values)].sort() : null);
+  const excludeChatIds = sorted(args.excludeChatIds);
+  const kinds = sorted(args.kinds);
+  const excludeKinds = sorted(args.excludeKinds);
+  return {
+    ...(excludeChatIds ? { xc: excludeChatIds } : {}),
+    ...(args.direction ? { d: args.direction } : {}),
+    ...(kinds ? { k: kinds } : {}),
+    ...(excludeKinds ? { xk: excludeKinds } : {}),
+  };
+}
+
+/** Message query filters of the by-time tools in the form the repository takes. */
+function messageFilterArgs(args: { excludeChatIds?: string[] | undefined; direction?: 'inbound' | 'outbound' | undefined; kinds?: McpMessageRecord['kind'][] | undefined; excludeKinds?: McpMessageRecord['kind'][] | undefined }) {
+  return {
+    ...(args.excludeChatIds ? { excludeChatIds: args.excludeChatIds } : {}),
+    ...(args.direction ? { direction: args.direction } : {}),
+    ...(args.kinds ? { kinds: args.kinds } : {}),
+    ...(args.excludeKinds ? { excludeKinds: args.excludeKinds } : {}),
+  };
+}
+
 type MessageQueryBase = Parameters<MessageRepository['queryTargetMessagePage']>[0];
 
 /** One keyset page of archived messages; the cursor is bound to the query shape so it cannot be replayed on another query. */
@@ -123,6 +153,13 @@ export interface McpToolDefinition {
   description: string;
   inputSchema: Record<string, unknown>;
 }
+
+const MESSAGE_FILTER_JSON_PROPERTIES = {
+  excludeChatIds: { type: 'array', maxItems: 100, items: { type: 'string', minLength: 1, maxLength: 256 }, description: 'Skip messages of these chats (chatId values, exact match).' },
+  direction: { type: 'string', enum: ['inbound', 'outbound'], description: 'inbound = received messages only; outbound = messages sent by the account only.' },
+  kinds: { type: 'array', minItems: 1, items: { type: 'string', enum: McpMessageKindSchema.options }, description: 'Keep only these message kinds. Cannot be combined with excludeKinds.' },
+  excludeKinds: { type: 'array', minItems: 1, items: { type: 'string', enum: McpMessageKindSchema.options }, description: 'Drop these message kinds. Cannot be combined with kinds.' },
+} as const;
 
 export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
@@ -164,24 +201,43 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: 'query_target_messages_by_time',
     description:
-      'Query archived LINE messages for a specified target within an explicit [from, to] time window (ISO-8601 datetime or YYYY-MM-DD). A number refers to the no in the most recent list_targets result. Messages are returned oldest first (chronological) within the window. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.',
+      'Query archived LINE messages within an explicit [from, to] time window (ISO-8601 datetime with offset or YYYY-MM-DD). A YYYY-MM-DD value is a full day in Taiwan time (Asia/Taipei, UTC+08:00): from starts at 00:00:00.000 and to ends at 23:59:59.999 of that day. To read new messages from all chats, omit every target field and give from. One call returns the messages of all readable chats, and each message has its accountId, chatType, chatId and conversationTitle. Do not call this tool once per chat. Do not call list_targets first for this purpose. To see which chats have new messages and how many, call list_active_chats first, then read only the chats you need with chatId. To skip chats you do not want, pass excludeChatIds. To keep or drop message kinds, pass kinds or excludeKinds (not both); direction keeps only inbound (received) or only outbound (sent by the account) messages. These four filters apply to every page, so pass the same values together with cursor. To read one chat, give a target field (a number refers to the no in the most recent list_targets result). from is required when no target field is given. Messages are returned oldest first (chronological) within the window. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         accountId: { type: 'string' },
-        target: { type: 'string', description: 'Target conversation title, chatId, speaker displayName, or senderId.' },
+        target: { type: 'string', description: 'Target conversation title, chatId, speaker displayName, or senderId. Omit to read all chats.' },
         chatType: { type: 'string', enum: ChatTypeSchema.options },
         chatId: { type: 'string' },
         conversationTitle: { type: 'string' },
         senderId: { type: 'string' },
         senderName: { type: 'string' },
         text: { type: 'string' },
-        from: { type: 'string', description: 'Start timestamp (ISO-8601 with offset or YYYY-MM-DD).' },
-        to: { type: 'string', description: 'End timestamp (ISO-8601 with offset or YYYY-MM-DD).' },
+        from: { type: 'string', description: 'Start timestamp (ISO-8601 with offset or YYYY-MM-DD). YYYY-MM-DD starts at 00:00:00.000 Taiwan time (Asia/Taipei).' },
+        to: { type: 'string', description: 'End timestamp (ISO-8601 with offset or YYYY-MM-DD). YYYY-MM-DD ends at 23:59:59.999 Taiwan time (Asia/Taipei).' },
+        ...MESSAGE_FILTER_JSON_PROPERTIES,
         limit: { type: 'integer', minimum: 1, default: 50, description: 'Page size; values above 200 are clamped to 200.' },
         cursor: { type: 'string', maxLength: 512, description: 'nextCursor from the previous page of the same query.' },
       },
+    },
+  },
+  {
+    name: 'list_active_chats',
+    description:
+      'List the chats that have messages in a [from, to] time window, with the message count, the number of different senders and the time of the newest message of each chat. It returns no message text. Use this tool first to see which chats have new messages and how many, and then read only the chats that you need with query_target_messages_by_time (give chatId, and accountId when needed). from is required; to is optional (ISO-8601 datetime with offset or YYYY-MM-DD; YYYY-MM-DD is a full day in Taiwan time, Asia/Taipei, UTC+08:00). The counts are the messages that query_target_messages_by_time returns for the same window and the same filters, so excludeChatIds, direction, kinds and excludeKinds work the same way. Chats are sorted by the newest message first. limit defaults to 200 and values above 500 are clamped to 500; when truncated is true, more chats exist than were returned, so narrow the window or the filters.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        from: { type: 'string', description: 'Start timestamp (ISO-8601 with offset or YYYY-MM-DD). YYYY-MM-DD starts at 00:00:00.000 Taiwan time (Asia/Taipei).' },
+        to: { type: 'string', description: 'End timestamp (ISO-8601 with offset or YYYY-MM-DD). YYYY-MM-DD ends at 23:59:59.999 Taiwan time (Asia/Taipei).' },
+        accountId: { type: 'string' },
+        chatType: { type: 'string', enum: ChatTypeSchema.options },
+        ...MESSAGE_FILTER_JSON_PROPERTIES,
+        limit: { type: 'integer', minimum: 1, default: MCP_ACTIVE_CHATS_DEFAULT_LIMIT, description: 'Maximum chats returned; values above 500 are clamped to 500.' },
+      },
+      required: ['from'],
     },
   },
   {
@@ -290,7 +346,7 @@ const RECURRENCE_JSON_SCHEMA = {
 } as const;
 export const LIST_SCHEDULES_TOOL_DEFINITION = {
   name: LIST_SCHEDULES_TOOL_NAME,
-  description: 'List scheduled Agent triggers with their next fire time and last outcome. By default it returns only active (enabled) schedules. Pass status "all" (or "disabled") when the user asks about disabled or all schedules. Before updating, deleting or re-enabling a schedule that may be disabled, call it with status "all" to get its scheduleId.',
+  description: 'List scheduled triggers with their next fire time and last outcome. Each schedule has execution (program = Main does all the work, agent = an Agent job does the work) and mayUseLlm (true when a run can start an LLM). By default it returns only active (enabled) schedules. Pass status "all" (or "disabled") when the user asks about disabled or all schedules. Before updating, deleting or re-enabling a schedule that may be disabled, call it with status "all" to get its scheduleId.',
   inputSchema: {
     type: 'object', additionalProperties: false,
     properties: { status: { type: 'string', enum: ['active', 'disabled', 'all'], default: 'active', description: 'active = enabled schedules only (default); disabled = disabled schedules only; all = both.' } },
@@ -304,17 +360,52 @@ const SEND_TARGET_JSON_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['accountId', 'chatType', 'chatId'],
   properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, title: { type: 'string', maxLength: 200 } },
 } as const;
+const NUMBER_OPS_JSON = [...AGENT_SCHEDULE_NUMBER_OPS];
+const TEXT_VALUE_JSON = { oneOf: [{ type: 'string', minLength: 1, maxLength: 256 }, { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string', minLength: 1, maxLength: 256 } }] } as const;
+const RULE_LEAF_JSON = { oneOf: [
+  { type: 'object', additionalProperties: false, required: ['metric', 'op', 'value'],
+    properties: { metric: { enum: [...AGENT_SCHEDULE_CHAT_NUMBER_METRICS] }, op: { enum: NUMBER_OPS_JSON }, value: { type: 'integer', minimum: 0 } } },
+  { type: 'object', additionalProperties: false, required: ['metric', 'op', 'value', 'keywords'],
+    properties: { metric: { const: 'chat.keywordHits' }, op: { enum: NUMBER_OPS_JSON }, value: { type: 'integer', minimum: 0 },
+      keywords: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string', minLength: 1, maxLength: 50 } } } },
+  { type: 'object', additionalProperties: false, required: ['metric', 'op', 'value'],
+    properties: { metric: { enum: ['chat.id', 'chat.type'] }, op: { enum: ['==', '!=', 'in', 'not_in'] }, value: TEXT_VALUE_JSON } },
+] } as const;
+const MESSAGE_LEAF_JSON = { oneOf: [
+  { type: 'object', additionalProperties: false, required: ['metric', 'op', 'value'],
+    properties: { metric: { enum: ['message.direction', 'message.kind'] }, op: { enum: ['==', '!=', 'in', 'not_in'] },
+      value: { description: 'message.direction: inbound or outbound. message.kind: ' + AGENT_SCHEDULE_MESSAGE_KINDS.join(', ') + '. A string for == and !=, an array (1..100) for in and not_in.',
+        oneOf: [{ type: 'string', enum: [...AGENT_SCHEDULE_MESSAGE_DIRECTIONS, ...AGENT_SCHEDULE_MESSAGE_KINDS] },
+          { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string', enum: [...AGENT_SCHEDULE_MESSAGE_DIRECTIONS, ...AGENT_SCHEDULE_MESSAGE_KINDS] } }] } } },
+  { type: 'object', additionalProperties: false, required: ['metric', 'op', 'value'],
+    properties: { metric: { const: 'message.textContains' }, op: { enum: ['any_of', 'none_of'] },
+      value: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string', minLength: 1, maxLength: 50 } } } },
+] } as const;
+/** A condition: a leaf, or a group {all}/{any} of leaves and groups, two group levels at most. */
+const conditionJson = <L extends object>(leaf: L) => {
+  const group = <C extends object>(child: C) => ({ oneOf: [
+    { type: 'object', additionalProperties: false, required: ['all'], properties: { all: { type: 'array', minItems: 1, maxItems: 50, items: child } } },
+    { type: 'object', additionalProperties: false, required: ['any'], properties: { any: { type: 'array', minItems: 1, maxItems: 50, items: child } } },
+  ] });
+  return { oneOf: [leaf, group({ oneOf: [leaf, group(leaf)] })] };
+};
 const SCHEDULE_TASK_PROPERTIES = {
   jitterMinutes: { type: 'integer', minimum: 0, maximum: 5, description: 'Random start delay: each run starts a random 0..N minutes (whole seconds) after its scheduled time, never before it, and never past the next occurrence. 0 (default when omitted on create) means no delay. Set it only when the user asks for a random or irregular start time.' },
   targets: { type: 'array', maxItems: 20, items: READ_TARGET_JSON_SCHEMA,
     description: 'Chats the run reads (groups, rooms, direct chats and communities), up to 20 and without duplicates. Only chats the user names in the current request; never one carried over from earlier conversation; leave empty when none is named. Resolve each with list_targets (use its exact accountId, chatType and chatId) and refer to it by title when talking to the user. The local Agent room is not allowed.' },
-  task: { description: 'What the run does. custom (default): run the prompt as written. summary {focus?}: per-target summary of the window (topics, decisions, action items, mentions of the admin, unanswered questions); needs targets. keyword_digest {keywords: 1..20}: list messages that match any keyword; needs targets. For summary and keyword_digest the prompt is optional extra instructions. message {text}: a fixed system message (alarm / reminder / fixed notice) that Main sends by itself at fire time, with NO Agent run; use it for every 提醒我… / 鬧鐘 / 定時通知 request; text is the user\'s wording as-is (1..5000 chars) and may contain {{date}} (YYYY-MM-DD), {{time}} (HH:mm) and {{weekday}} (星期一…星期日), filled in Asia/Taipei; targets, window and prompt are not used and delivery must not be record_only.',
+  task: { description: 'What the run does. custom (default): run the prompt as written. summary {focus?}: per-target summary of the window (topics, decisions, action items, mentions of the admin, unanswered questions); needs targets. keyword_digest {keywords: 1..20}: list messages that match any keyword; needs targets. For summary and keyword_digest the prompt is optional extra instructions. new_messages {messageFilter?, rules?, maxMessagesPerChat?, maxTextChars?, sendWhenEmpty?}: a PROGRAM task; Main reads the new messages of the window itself and lists them (targets empty = every readable chat), and runs an LLM only for chats whose rule says then="llm". Use it for every request to list, forward or filter new messages (never custom). messageFilter keeps only the messages that match (metrics message.direction, message.kind with ops == != in not_in; message.textContains with any_of or none_of). rules (at most 20; for each chat the first rule whose when is true decides, none = list): when is a condition on chat.messageCount, chat.senderCount, chat.textChars, run.messageCount, run.chatCount, run.listedChars (ops > >= < <= == !=; integer value), chat.keywordHits (same ops, plus keywords 1..20), chat.id or chat.type (ops == != in not_in); then is list (send the messages), skip (drop the chat) or llm (an Agent summarizes the chat). A condition is a leaf {metric, op, value} or a group {all:[…]} / {any:[…]} that nests at most 2 levels; a task has at most 50 leaves in messageFilter and rules together. maxMessagesPerChat 1..200 (default 20), maxTextChars 20..2000 (default 200), sendWhenEmpty (default false: nothing is sent when there is nothing to list). Delivery is never record_only. Example: {type:"new_messages", messageFilter:{metric:"message.direction",op:"==",value:"inbound"}, rules:[{when:{metric:"chat.id",op:"==",value:"<chatId>"},then:"skip"},{when:{any:[{metric:"chat.messageCount",op:">",value:20},{metric:"run.listedChars",op:">",value:2000}]},then:"llm"}]}. message {text}: a fixed system message (alarm / reminder / fixed notice) that Main sends by itself at fire time, with NO Agent run; use it for every 提醒我… / 鬧鐘 / 定時通知 request; text is the user\'s wording as-is (1..5000 chars) and may contain {{date}} (YYYY-MM-DD), {{time}} (HH:mm) and {{weekday}} (星期一…星期日), filled in Asia/Taipei; targets, window and prompt are not used and delivery must not be record_only.',
     oneOf: [
       { type: 'object', additionalProperties: false, required: ['type'], properties: { type: { const: 'custom' } } },
       { type: 'object', additionalProperties: false, required: ['type', 'text'], properties: { type: { const: 'message' }, text: { type: 'string', minLength: 1, maxLength: 5000 } } },
       { type: 'object', additionalProperties: false, required: ['type'], properties: { type: { const: 'summary' }, focus: { type: 'string', maxLength: 500 } } },
       { type: 'object', additionalProperties: false, required: ['type', 'keywords'],
         properties: { type: { const: 'keyword_digest' }, keywords: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string', minLength: 1, maxLength: 50 } } } },
+      { type: 'object', additionalProperties: false, required: ['type'],
+        properties: { type: { const: 'new_messages' }, messageFilter: conditionJson(MESSAGE_LEAF_JSON),
+          rules: { type: 'array', maxItems: 20, items: { type: 'object', additionalProperties: false, required: ['when', 'then'],
+            properties: { when: conditionJson(RULE_LEAF_JSON), then: { enum: ['list', 'skip', 'llm'] } } } },
+          maxMessagesPerChat: { type: 'integer', minimum: 1, maximum: 200, default: 20 }, maxTextChars: { type: 'integer', minimum: 20, maximum: 2000, default: 200 },
+          sendWhenEmpty: { type: 'boolean', default: false } } },
     ] },
   window: { description: 'Which messages the run covers, ending at the fire time. since_last_run (default): from the last submitted run (or one recurrence period). lookback {minutes: 5..10080}. Never longer than 7 days.',
     oneOf: [
@@ -330,7 +421,7 @@ const SCHEDULE_TASK_PROPERTIES = {
 } as const;
 export const CREATE_SCHEDULE_TOOL_DEFINITION = {
   name: CREATE_SCHEDULE_TOOL_NAME,
-  description: 'Create a scheduled Agent trigger now, without asking the user to confirm fields they did not mention. Defaults: results go to the administrator (Primary Admin) by LINE (我 / 給我 means the administrator, so omit delivery); task summary when the user names chats (targets), else custom with the request as prompt and empty targets; window since the last run (pass window {mode: "lookback", minutes} when the user states a range, e.g. 過去 6 小時 = 360); timezone Asia/Taipei; provider of the current job; enabled. For "in 5 minutes" / 5 分鐘後 use recurrence {kind: "once", inMinutes: 5}. Resolve chats yourself with list_targets (communities included) and refer to them by title. Ask a question only when a chat name matches several conversations or the user gave no time at all. After creating, reply with a short summary (target, next run time, range, task, delivery) using nextFireAtTaipei and deliveryLabel from the result, and say the user can ask to change it. For summary and keyword_digest leave prompt empty unless the user gave extra requirements, and never restate source, time, range, output or rules in prompt (the system adds them); a custom prompt is one or two sentences of what to do. At each fire time an unattended job runs in its own new session (never the Agent room). A reminder, alarm or fixed notice (提醒我…) is a message task: pass task {type: "message", text} with the user\'s reminder text as written and no prompt; Main sends it directly with no Agent run. Up to 50 schedules can be enabled. Use targets (and summary or keyword_digest) only for chats the user names in the current request; never carry a chat over from earlier conversation. When the request names no chat, create a custom task whose prompt restates the request and leave targets empty: at each run the Agent chooses the chats to read.',
+  description: 'Create a scheduled trigger now, without asking the user to confirm fields they did not mention. There are two kinds of schedule. Program: message (a fixed text) and new_messages (list the new messages by rules); Main does all the work and a program schedule uses no LLM, except for chats where a rule selects then="llm". Agent: custom, summary, keyword_digest, for work that needs judgment; every run starts an Agent. A request to list or forward new messages must use new_messages, not custom. A condition such as "too many messages means summarize" is a rule with then="llm". Defaults: results go to the administrator (Primary Admin) by LINE (我 / 給我 means the administrator, so omit delivery); task summary when the user names chats (targets), else custom with the request as prompt and empty targets; window since the last run (pass window {mode: "lookback", minutes} when the user states a range, e.g. 過去 6 小時 = 360); timezone Asia/Taipei; provider of the current job; enabled. For "in 5 minutes" / 5 分鐘後 use recurrence {kind: "once", inMinutes: 5}. Resolve chats yourself with list_targets (communities included) and refer to them by title. Ask a question only when a chat name matches several conversations or the user gave no time at all. After creating, reply with a short summary (target, next run time, range, task, delivery) using nextFireAtTaipei and deliveryLabel from the result, and say the user can ask to change it. For summary and keyword_digest leave prompt empty unless the user gave extra requirements, and never restate source, time, range, output or rules in prompt (the system adds them); a custom prompt is one or two sentences of what to do. At each fire time an unattended job runs in its own new session (never the Agent room). A reminder, alarm or fixed notice (提醒我…) is a message task: pass task {type: "message", text} with the user\'s reminder text as written and no prompt; Main sends it directly with no Agent run. Up to 50 schedules can be enabled. Use targets (and summary or keyword_digest) only for chats the user names in the current request; never carry a chat over from earlier conversation. When the request names no chat, create a custom task whose prompt restates the request and leave targets empty: at each run the Agent chooses the chats to read.',
   inputSchema: {
     type: 'object', additionalProperties: false, required: ['title', 'recurrence'],
     properties: {
@@ -593,6 +684,28 @@ export class McpService {
       };
     }
 
+    if (tool.name === 'list_active_chats') {
+      const from = normalizeMcpTimeBound(tool.arguments.from, 'from');
+      const to = tool.arguments.to ? normalizeMcpTimeBound(tool.arguments.to, 'to') : null;
+      if (!from) throw new McpDomainError('INVALID_INPUT', 'Invalid from timestamp.');
+      const { chats, truncated } = await this.options.messages.listActiveChats(
+        {
+          accountIds: authorizedAccountIds,
+          ...scopeFilter,
+          ...(tool.arguments.chatType ? { chatType: tool.arguments.chatType } : {}),
+          ...messageFilterArgs(tool.arguments),
+          from,
+          ...(to ? { to } : {}),
+          limit: tool.arguments.limit ?? MCP_ACTIVE_CHATS_DEFAULT_LIMIT,
+        },
+        client,
+      );
+      return {
+        output: { toolName: 'list_active_chats', from, to, chats, truncated },
+        resultCount: chats.length,
+      };
+    }
+
     if (tool.name === 'list_chat_notes' || tool.name === 'list_chat_albums' || tool.name === 'get_chat_note' || tool.name === 'get_chat_album') {
       const args = tool.arguments as { accountId: string; chatType: ConversationKey['chatType']; chatId: string; limit?: number; cursor?: string; noteId?: string; albumId?: string };
       const key: ConversationKey = { accountId: args.accountId, chatType: args.chatType, chatId: args.chatId };
@@ -680,9 +793,10 @@ export class McpService {
         ...(tool.arguments.text ? { text: tool.arguments.text } : {}),
         ...(normalizedFrom ? { from: normalizedFrom } : {}),
         ...(normalizedTo ? { to: normalizedTo } : {}),
+        ...messageFilterArgs(tool.arguments),
       },
       tool.arguments,
-      { tool: tool.name, ...pickMessageShape(tool.arguments), from: normalizedFrom, to: normalizedTo },
+      { tool: tool.name, ...pickMessageShape(tool.arguments), from: normalizedFrom, to: normalizedTo, ...pickMessageFilterShape(tool.arguments) },
       'asc',
       client,
     );

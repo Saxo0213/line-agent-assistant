@@ -104,9 +104,9 @@ export type AgentScheduleRecurrence = z.infer<typeof AgentScheduleRecurrenceSche
 
 /**
  * Agent runs end as submitted / failed / missed / skipped_overlap. System message runs (no Agent job) end as sent / send_failed /
- * send_unknown; `send_unknown` is never retried.
+ * send_unknown; `send_unknown` is never retried. A new_messages run that finds nothing to list ends as no_messages.
  */
-export const AgentScheduleRunOutcomeSchema = z.enum(['submitting', 'submitted', 'missed', 'skipped_overlap', 'failed', 'sent', 'send_failed', 'send_unknown']);
+export const AgentScheduleRunOutcomeSchema = z.enum(['submitting', 'submitted', 'missed', 'skipped_overlap', 'failed', 'sent', 'send_failed', 'send_unknown', 'no_messages']);
 export type AgentScheduleRunOutcome = z.infer<typeof AgentScheduleRunOutcomeSchema>;
 
 export const AGENT_SCHEDULE_MAX_TARGETS = 20;
@@ -164,6 +164,88 @@ export function resolveScheduleMessagePlaceholders(text: string, at: Date): stri
   return text.replace(/\{\{(?:date|time|weekday)\}\}/g, (match) => values[match]!);
 }
 
+// ---- new_messages: a program task. Main lists the new messages of the window by rules; an LLM runs only for a rule with then = 'llm'. ----
+export const AGENT_SCHEDULE_RULES_MAX = 20;
+export const AGENT_SCHEDULE_LEAVES_MAX = 50;
+export const AGENT_SCHEDULE_NEW_MESSAGES_DEFAULT_PER_CHAT = 20;
+export const AGENT_SCHEDULE_NEW_MESSAGES_PER_CHAT_MAX = 200;
+export const AGENT_SCHEDULE_NEW_MESSAGES_DEFAULT_TEXT_CHARS = 200;
+export const AGENT_SCHEDULE_NEW_MESSAGES_TEXT_CHARS_MIN = 20;
+export const AGENT_SCHEDULE_NEW_MESSAGES_TEXT_CHARS_MAX = 2_000;
+export const AGENT_SCHEDULE_NUMBER_OPS = ['>', '>=', '<', '<=', '==', '!='] as const;
+export type AgentScheduleNumberOp = (typeof AGENT_SCHEDULE_NUMBER_OPS)[number];
+/** Same values as McpMessageKindSchema / McpMessageDirectionSchema (mcp.ts imports this file, so they are repeated here and tested for equality). */
+export const AGENT_SCHEDULE_MESSAGE_KINDS = ['text', 'image', 'video', 'audio', 'file', 'sticker', 'contact', 'event', 'location', 'rich'] as const;
+export const AGENT_SCHEDULE_MESSAGE_DIRECTIONS = ['inbound', 'outbound'] as const;
+export const AGENT_SCHEDULE_CHAT_NUMBER_METRICS = ['chat.messageCount', 'chat.senderCount', 'chat.textChars', 'run.messageCount', 'run.chatCount', 'run.listedChars'] as const;
+
+const NumberOpSchema = z.enum(AGENT_SCHEDULE_NUMBER_OPS);
+const CountValueSchema = z.number().int().min(0).max(1_000_000_000);
+const KeywordListSchema = z.array(z.string().trim().min(1).max(AGENT_SCHEDULE_KEYWORD_MAX)).min(1).max(AGENT_SCHEDULE_KEYWORDS_MAX);
+
+/** A text metric: op == / != with one value, or in / not_in with 1..100 values. */
+const textLeaf = <M extends string, V extends z.ZodType<string>>(metric: M, value: V) => z.union([
+  z.strictObject({ metric: z.literal(metric), op: z.enum(['==', '!=']), value }),
+  z.strictObject({ metric: z.literal(metric), op: z.enum(['in', 'not_in']), value: z.array(value).min(1).max(100) }),
+]);
+
+/** Leaves of a rule: they describe a chat or the whole run. */
+export const AgentScheduleRuleLeafSchema = z.union([
+  z.strictObject({ metric: z.enum(AGENT_SCHEDULE_CHAT_NUMBER_METRICS), op: NumberOpSchema, value: CountValueSchema }),
+  z.strictObject({ metric: z.literal('chat.keywordHits'), op: NumberOpSchema, value: CountValueSchema, keywords: KeywordListSchema }),
+  textLeaf('chat.id', z.string().min(1).max(256)),
+  textLeaf('chat.type', ChatTypeSchema),
+]);
+/** Leaves of messageFilter: they describe one message. */
+export const AgentScheduleMessageLeafSchema = z.union([
+  textLeaf('message.direction', z.enum(AGENT_SCHEDULE_MESSAGE_DIRECTIONS)),
+  textLeaf('message.kind', z.enum(AGENT_SCHEDULE_MESSAGE_KINDS)),
+  z.strictObject({ metric: z.literal('message.textContains'), op: z.enum(['any_of', 'none_of']), value: z.array(z.string().min(1).max(AGENT_SCHEDULE_KEYWORD_MAX)).min(1).max(AGENT_SCHEDULE_KEYWORDS_MAX) }),
+]);
+export type AgentScheduleRuleLeaf = z.infer<typeof AgentScheduleRuleLeafSchema>;
+export type AgentScheduleMessageLeaf = z.infer<typeof AgentScheduleMessageLeafSchema>;
+export type AgentScheduleLeaf = AgentScheduleRuleLeaf | AgentScheduleMessageLeaf;
+export type AgentScheduleCondition = AgentScheduleLeaf | { all: AgentScheduleCondition[] } | { any: AgentScheduleCondition[] };
+
+/** A condition is a leaf or a group; a group holds leaves and at most one more level of groups (2 levels in all). */
+function conditionSchema<L extends z.ZodType>(leaf: L) {
+  const inner = z.union([z.strictObject({ all: z.array(leaf).min(1).max(AGENT_SCHEDULE_LEAVES_MAX) }), z.strictObject({ any: z.array(leaf).min(1).max(AGENT_SCHEDULE_LEAVES_MAX) })]);
+  const child = z.union([leaf, inner]);
+  const outer = z.union([z.strictObject({ all: z.array(child).min(1).max(AGENT_SCHEDULE_LEAVES_MAX) }), z.strictObject({ any: z.array(child).min(1).max(AGENT_SCHEDULE_LEAVES_MAX) })]);
+  return z.union([leaf, outer]);
+}
+export const AgentScheduleMessageConditionSchema = conditionSchema(AgentScheduleMessageLeafSchema);
+export const AgentScheduleRuleConditionSchema = conditionSchema(AgentScheduleRuleLeafSchema);
+
+export const AGENT_SCHEDULE_RULE_ACTIONS = ['list', 'skip', 'llm'] as const;
+export type AgentScheduleRuleAction = (typeof AGENT_SCHEDULE_RULE_ACTIONS)[number];
+export const AgentScheduleRuleSchema = z.strictObject({ when: AgentScheduleRuleConditionSchema, then: z.enum(AGENT_SCHEDULE_RULE_ACTIONS) });
+export type AgentScheduleRule = z.infer<typeof AgentScheduleRuleSchema>;
+
+/** The number of leaves in a condition tree. */
+export function countScheduleLeaves(condition: AgentScheduleCondition): number {
+  if ('all' in condition) return condition.all.reduce((sum, child) => sum + countScheduleLeaves(child), 0);
+  if ('any' in condition) return condition.any.reduce((sum, child) => sum + countScheduleLeaves(child), 0);
+  return 1;
+}
+
+/**
+ * A program task: Main reads the new messages of the window (all readable chats when targets are empty), drops those that fail
+ * messageFilter, and decides per chat with the first matching rule (list when none matches). Only a chat whose rule says llm starts an Agent.
+ */
+export const AgentScheduleNewMessagesTaskSchema = z.strictObject({
+  type: z.literal('new_messages'),
+  messageFilter: AgentScheduleMessageConditionSchema.optional(),
+  rules: z.array(AgentScheduleRuleSchema).max(AGENT_SCHEDULE_RULES_MAX).optional(),
+  maxMessagesPerChat: z.number().int().min(1).max(AGENT_SCHEDULE_NEW_MESSAGES_PER_CHAT_MAX).default(AGENT_SCHEDULE_NEW_MESSAGES_DEFAULT_PER_CHAT),
+  maxTextChars: z.number().int().min(AGENT_SCHEDULE_NEW_MESSAGES_TEXT_CHARS_MIN).max(AGENT_SCHEDULE_NEW_MESSAGES_TEXT_CHARS_MAX).default(AGENT_SCHEDULE_NEW_MESSAGES_DEFAULT_TEXT_CHARS),
+  sendWhenEmpty: z.boolean().default(false),
+}).superRefine((task, ctx) => {
+  const leaves = (task.messageFilter ? countScheduleLeaves(task.messageFilter) : 0)
+    + (task.rules ?? []).reduce((sum, rule) => sum + countScheduleLeaves(rule.when), 0);
+  if (leaves > AGENT_SCHEDULE_LEAVES_MAX) ctx.addIssue({ code: 'custom', message: `A task can have at most ${AGENT_SCHEDULE_LEAVES_MAX} conditions in messageFilter and rules together` });
+});
+
 export const AgentScheduleTaskSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('custom') }),
   /** A system message (alarm / reminder): Main sends `text` to LINE at fire time. No Agent job, no provider, no tokens. */
@@ -173,8 +255,22 @@ export const AgentScheduleTaskSchema = z.discriminatedUnion('type', [
     type: z.literal('keyword_digest'),
     keywords: z.array(z.string().trim().min(1).max(AGENT_SCHEDULE_KEYWORD_MAX)).min(1).max(AGENT_SCHEDULE_KEYWORDS_MAX),
   }),
+  AgentScheduleNewMessagesTaskSchema,
 ]);
 export type AgentScheduleTask = z.infer<typeof AgentScheduleTaskSchema>;
+export type AgentScheduleNewMessagesTask = Extract<AgentScheduleTask, { type: 'new_messages' }>;
+
+/** program: Main does all the work (message, new_messages). agent: an Agent job does the work. */
+export type AgentScheduleExecution = 'program' | 'agent';
+export function scheduleExecutionKind(task: Pick<AgentScheduleTask, 'type'>): AgentScheduleExecution {
+  return task.type === 'message' || task.type === 'new_messages' ? 'program' : 'agent';
+}
+/** True when a run of the task can start an LLM: every Agent task, and a new_messages task with a rule that says llm. */
+export function scheduleMayUseLlm(task: AgentScheduleTask): boolean {
+  if (task.type === 'message') return false;
+  if (task.type === 'new_messages') return (task.rules ?? []).some((rule) => rule.then === 'llm');
+  return true;
+}
 
 export const AgentScheduleWindowSchema = z.discriminatedUnion('mode', [
   z.strictObject({ mode: z.literal('since_last_run') }),
@@ -204,6 +300,11 @@ export function agentScheduleShapeError(shape: {
     if (shape.delivery?.mode === 'record_only') return 'A system message must be delivered to LINE';
     return null;
   }
+  if (shape.task.type === 'new_messages') {
+    // 0..20 targets (none = all readable chats) and no prompt needed.
+    if (shape.delivery?.mode === 'record_only') return 'A new_messages task must be delivered to LINE';
+    return null;
+  }
   if (shape.task.type === 'custom' && shape.prompt.trim().length === 0) return 'A custom task needs a prompt';
   if (shape.task.type !== 'custom' && shape.targets.length === 0) return 'This task needs at least one target';
   return null;
@@ -230,6 +331,9 @@ export const AgentScheduleSchema = z.strictObject({
   delivery: AgentScheduleDeliverySchema,
   jitterMinutes: z.number().int().min(0).max(AGENT_SCHEDULE_JITTER_MAX_MINUTES),
   enabled: z.boolean(),
+  /** Derived from the task (scheduleExecutionKind / scheduleMayUseLlm); never stored. */
+  execution: z.enum(['program', 'agent']),
+  mayUseLlm: z.boolean(),
   nextFireAt: TimestampSchema.nullable(),
   lastFireAt: TimestampSchema.nullable(),
   lastOutcome: AgentScheduleRunOutcomeSchema.nullable(),
@@ -362,6 +466,43 @@ export const AgentScheduleListRunsInputSchema = z.strictObject({
   scheduleId: z.uuid(),
   limit: z.number().int().min(1).max(AGENT_SCHEDULE_RUNS_MAX_LIMIT).default(20),
 });
+
+/** Form values of a new_messages schedule; the preview reads and evaluates the latest window that ends now. It never sends and never starts a job. */
+export const AgentSchedulePreviewNewMessagesInputSchema = z.strictObject({
+  task: AgentScheduleNewMessagesTaskSchema,
+  targets: z.array(AgentScheduleTargetSchema).max(AGENT_SCHEDULE_MAX_TARGETS).default([]),
+  window: AgentScheduleWindowSchema.default({ mode: 'since_last_run' }),
+  /** Only the default lookback of since_last_run uses it (default: daily). */
+  recurrence: AgentScheduleRecurrenceSchema.optional(),
+  /** The delivery of the form; the preview removes the lists that this delivery chat received, as a real run does. */
+  delivery: AgentScheduleDeliverySchema.optional(),
+});
+export type AgentSchedulePreviewNewMessagesInput = z.input<typeof AgentSchedulePreviewNewMessagesInputSchema>;
+/** The parsed form (defaults applied) that Main receives. */
+export type AgentSchedulePreviewNewMessagesRequest = z.output<typeof AgentSchedulePreviewNewMessagesInputSchema>;
+export const AgentSchedulePreviewChatSchema = z.strictObject({
+  accountId: z.string(),
+  chatType: ChatTypeSchema,
+  chatId: z.string(),
+  title: z.string(),
+  messageCount: z.number().int().min(0),
+  senderCount: z.number().int().min(0),
+  action: z.enum(AGENT_SCHEDULE_RULE_ACTIONS),
+  /** The formatted text of the chat (what a list action sends). */
+  text: z.string(),
+});
+export const AgentSchedulePreviewNewMessagesOutputSchema = z.strictObject({
+  from: TimestampSchema,
+  to: TimestampSchema,
+  chats: z.array(AgentSchedulePreviewChatSchema),
+  messageCount: z.number().int().min(0),
+  chatCount: z.number().int().min(0),
+  /** Length of the text when every chat is listed. */
+  listedChars: z.number().int().min(0),
+  /** True when the read stopped at the message cap of one run. */
+  incomplete: z.boolean(),
+});
+export type AgentSchedulePreviewNewMessagesOutput = z.infer<typeof AgentSchedulePreviewNewMessagesOutputSchema>;
 
 export const AgentScheduleListTargetsInputSchema = z.strictObject({
   /** read: chats a schedule may read (communities included); delivery: chats it may send to. */

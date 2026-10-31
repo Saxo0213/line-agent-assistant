@@ -283,6 +283,7 @@ function fakeApi(): DesktopApi {
     deleteAgentSchedule: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
     listAgentScheduleRuns: vi.fn(async () => []),
     listAgentScheduleTargets: vi.fn(async () => []),
+    previewAgentScheduleNewMessages: vi.fn(async () => ({ from: '2026-10-29T00:00:00.000Z', to: '2026-10-29T01:00:00.000Z', chats: [], messageCount: 0, chatCount: 0, listedChars: 0, incomplete: false })),
     getDatabaseSetupStatus: vi.fn(async () => ({ configured: true, attachmentRoot: 'D:\\attachments', agentWorkspace: 'D:\\workspace', connection: { host: 'localhost', port: 5432, username: 'postgres', ssl: 'disable' as const, database: 'line_agent' } })),
     listDatabases: vi.fn(async () => []),
     createDatabase: vi.fn(async () => []),

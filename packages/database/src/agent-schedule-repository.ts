@@ -4,6 +4,8 @@ import {
   AGENT_SCHEDULE_MAX_ENABLED,
   AGENT_SCHEDULE_REQUEST_PREFIX,
   nextFireAfter,
+  scheduleExecutionKind,
+  scheduleMayUseLlm,
   type AgentProvider,
   type AgentSchedule,
   type AgentScheduleCreateInput,
@@ -63,7 +65,7 @@ export interface AgentScheduleClaim {
   task: AgentScheduleTask;
   window: AgentScheduleWindow;
   delivery: AgentScheduleDelivery;
-  /** scheduled_for of the schedule's latest earlier run that was submitted, for the since_last_run window; null when none. */
+  /** scheduled_for of the schedule's latest earlier run that counts for the since_last_run window (see COUNTED_OUTCOMES_SQL); null when none. */
   previousSubmittedFor: Date | null;
 }
 
@@ -83,10 +85,20 @@ interface RunRow { run_id: string; schedule_id: string; scheduled_for: Date; out
 
 const COLUMNS = `schedule_id, title, prompt, provider, recurrence, timezone, targets, task, task_window, delivery, enabled, jitter_minutes, next_fire_at, next_nominal_at, last_fire_at, last_outcome, created_at, updated_at`;
 
+/**
+ * Runs that move the since_last_run window forward. Every task counts 'submitted'. A new_messages task also counts the outcomes of a run
+ * that did its work without an Agent job (sent, no_messages, send_unknown); otherwise the window would grow and messages would repeat.
+ * The other task types never end a run with those outcomes, so their window does not change. send_failed and failed do not count:
+ * the next window then covers the messages again. `taskType` is an SQL expression for the current task type of the schedule.
+ */
+const countedOutcomesSql = (taskType: string): string =>
+  `(outcome = 'submitted' OR (${taskType} = 'new_messages' AND outcome IN ('sent', 'no_messages', 'send_unknown')))`;
+
 const iso = (value: Date): string => value.toISOString();
 const toSchedule = (row: ScheduleRow): AgentSchedule => ({
   scheduleId: row.schedule_id, title: row.title, prompt: row.prompt, provider: row.provider, recurrence: row.recurrence,
-  timezone: row.timezone, targets: row.targets, task: row.task, window: row.task_window, delivery: row.delivery, enabled: row.enabled, jitterMinutes: row.jitter_minutes, nextFireAt: row.next_fire_at ? iso(row.next_fire_at) : null,
+  timezone: row.timezone, targets: row.targets, task: row.task, window: row.task_window, delivery: row.delivery, enabled: row.enabled, jitterMinutes: row.jitter_minutes,
+  execution: scheduleExecutionKind(row.task), mayUseLlm: scheduleMayUseLlm(row.task), nextFireAt: row.next_fire_at ? iso(row.next_fire_at) : null,
   lastFireAt: row.last_fire_at ? iso(row.last_fire_at) : null, lastOutcome: row.last_outcome,
   createdAt: iso(row.created_at), updatedAt: iso(row.updated_at),
 });
@@ -218,8 +230,8 @@ export class AgentScheduleRepository {
         const runId = inserted.rows[0]?.run_id;
         if (runId && outcome === 'submitting') {
           const previous = await client.query<{ previous: Date | null }>(
-            `SELECT max(scheduled_for) AS previous FROM agent_schedule_runs WHERE schedule_id = $1 AND outcome = 'submitted' AND scheduled_for < $2`,
-            [row.schedule_id, scheduledFor]);
+            `SELECT max(scheduled_for) AS previous FROM agent_schedule_runs WHERE schedule_id = $1 AND ${countedOutcomesSql('$3::text')} AND scheduled_for < $2`,
+            [row.schedule_id, scheduledFor, row.task.type]);
           claims.push({ runId, scheduleId: row.schedule_id, scheduledFor, title: row.title, prompt: row.prompt, provider: row.provider,
             recurrence: row.recurrence, timezone: row.timezone, targets: row.targets, task: row.task, window: row.task_window, delivery: row.delivery,
             previousSubmittedFor: previous.rows[0]?.previous ?? null });
@@ -229,7 +241,7 @@ export class AgentScheduleRepository {
     });
   }
 
-  private async settle(runId: string, outcome: 'submitted' | 'failed' | 'sent' | 'send_failed' | 'send_unknown', jobId: string | null): Promise<boolean> {
+  private async settle(runId: string, outcome: 'submitted' | 'failed' | 'sent' | 'send_failed' | 'send_unknown' | 'no_messages', jobId: string | null): Promise<boolean> {
     return this.transaction(async (client) => {
       const run = await client.query<{ schedule_id: string; scheduled_for: Date }>(
         `UPDATE agent_schedule_runs SET outcome = $2, job_id = $3 WHERE run_id = $1 AND outcome = 'submitting' RETURNING schedule_id, scheduled_for`,
@@ -247,15 +259,17 @@ export class AgentScheduleRepository {
   markSent(runId: string): Promise<boolean> { return this.settle(runId, 'sent', null); }
   markSendFailed(runId: string): Promise<boolean> { return this.settle(runId, 'send_failed', null); }
   markSendUnknown(runId: string): Promise<boolean> { return this.settle(runId, 'send_unknown', null); }
+  /** A new_messages run that found nothing to list: nothing was sent and no job was created. */
+  markNoMessages(runId: string): Promise<boolean> { return this.settle(runId, 'no_messages', null); }
 
   /**
-   * Startup recovery: a run left in `submitting` is never retried. An Agent run becomes `missed`; a system message run may already
-   * have reached LINE, so it becomes `send_unknown`. Returns how many runs changed.
+   * Startup recovery: a run left in `submitting` is never retried. An Agent run becomes `missed`; a system message run or a
+   * new_messages run may already have reached LINE (or created its job), so it becomes `send_unknown`. Returns how many runs changed.
    */
   async recoverStale(): Promise<number> {
     return this.transaction(async (client) => {
       const stale = await client.query<{ schedule_id: string; scheduled_for: Date; outcome: AgentScheduleRunOutcome }>(
-        `UPDATE agent_schedule_runs r SET outcome = CASE WHEN COALESCE((SELECT s.task->>'type' FROM agent_schedules s WHERE s.schedule_id = r.schedule_id), '') = 'message'
+        `UPDATE agent_schedule_runs r SET outcome = CASE WHEN COALESCE((SELECT s.task->>'type' FROM agent_schedules s WHERE s.schedule_id = r.schedule_id), '') IN ('message', 'new_messages')
              THEN 'send_unknown' ELSE 'missed' END
          WHERE r.outcome = 'submitting' RETURNING r.schedule_id, r.scheduled_for, r.outcome`);
       for (const row of stale.rows) {
@@ -266,10 +280,11 @@ export class AgentScheduleRepository {
     });
   }
 
-  /** scheduled_for of the schedule's latest submitted run before `scheduledFor`, for the since_last_run window; null when none. */
+  /** scheduled_for of the schedule's latest counted run before `scheduledFor`, for the since_last_run window; null when none. */
   async previousSubmittedFor(scheduleId: string, scheduledFor: Date): Promise<Date | null> {
     const result = await this.pool.query<{ previous: Date | null }>(
-      "SELECT max(scheduled_for) AS previous FROM agent_schedule_runs WHERE schedule_id = $1 AND outcome = 'submitted' AND scheduled_for < $2", [scheduleId, scheduledFor]);
+      `SELECT max(scheduled_for) AS previous FROM agent_schedule_runs WHERE schedule_id = $1 AND scheduled_for < $2
+         AND ${countedOutcomesSql("(SELECT task->>'type' FROM agent_schedules WHERE schedule_id = $1)")}`, [scheduleId, scheduledFor]);
     return result.rows[0]?.previous ?? null;
   }
 

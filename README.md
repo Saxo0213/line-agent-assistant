@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.305 removes MCP tokens: Claude Desktop and Codex connect with no token, and any program on this computer can read stored LINE messages through the local endpoint (browser pages are blocked; sending is not possible). See the [v1.0.305 release notes](docs/releases/v1.0.305.md). Earlier changes are listed in [v1.0.303](docs/releases/v1.0.303.md), [v1.0.302](docs/releases/v1.0.302.md), and [v1.0.288](docs/releases/v1.0.288.md).
+v1.0.310 adds program schedules: the app lists new messages by itself with composable rules and uses an LLM only where a rule selects it, plus MCP queries across all chats and a fix for date-only queries. See the [v1.0.310 release notes](docs/releases/v1.0.310.md). Earlier changes are listed in [v1.0.305](docs/releases/v1.0.305.md), [v1.0.303](docs/releases/v1.0.303.md), and [v1.0.302](docs/releases/v1.0.302.md).
 
 ## Installation
 
