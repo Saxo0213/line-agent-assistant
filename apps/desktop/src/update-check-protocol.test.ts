@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { UpdateCheckRequestSchema, UpdateCheckStateSchema } from './update-check-protocol.js';
 
 const state = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: '1.0.280', releaseUrl: null, available: true,
-  ignoredVersion: null, download: { status: 'idle', percent: 0 }, canAutoInstall: true };
+  installedNotice: null, ignoredVersion: null, download: { status: 'idle', percent: 0 }, canAutoInstall: true };
 
 describe('update check protocol', () => {
   it('accepts a full state and rejects unknown, missing or out-of-range fields', () => {

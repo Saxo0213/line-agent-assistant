@@ -1,8 +1,9 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { isTrustedReleaseUrl, UPDATE_RELEASES_FALLBACK_URL, UPDATE_REPO_NAME, UPDATE_REPO_OWNER, type UpdateCheckState } from '../../update-check-protocol.js';
+import { isTrustedReleaseUrl, UPDATE_RELEASES_FALLBACK_URL, UPDATE_RELEASES_URL_PREFIX, UPDATE_REPO_NAME, UPDATE_REPO_OWNER, type UpdateCheckState } from '../../update-check-protocol.js';
 
 export const UPDATE_CHECK_API_URL = `https://api.github.com/repos/${UPDATE_REPO_OWNER}/${UPDATE_REPO_NAME}/releases/latest`;
+const releaseApiUrlForTag = (tag: string) => `https://api.github.com/repos/${UPDATE_REPO_OWNER}/${UPDATE_REPO_NAME}/releases/tags/${tag}`;
 export const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 export const UPDATE_CHECK_STARTUP_DELAY_MS = 60 * 1000;
 export const UPDATE_CHECK_ENABLE_DELAY_MS = 3 * 1000;
@@ -34,8 +35,10 @@ export type UpdateCheckPersisted = {
   releaseUrl: string | null;
   available: boolean;
   ignoredVersion: string | null;
+  pendingInstallTarget: { version: string; releaseUrl: string } | null;
+  installedNotice: { version: string; releaseUrl: string } | null;
 };
-export const DEFAULT_PERSISTED: UpdateCheckPersisted = { enabled: true, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, ignoredVersion: null };
+export const DEFAULT_PERSISTED: UpdateCheckPersisted = { enabled: true, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, ignoredVersion: null, pendingInstallTarget: null, installedNotice: null };
 
 /** The slice of electron-updater's AppUpdater that the service drives; injected so tests never touch the real updater. */
 export type AppUpdaterLike = {
@@ -125,6 +128,7 @@ export function createUpdateCheckService(options: Options) {
     latestVersion: persisted.enabled ? persisted.latestVersion : null,
     releaseUrl: persisted.enabled ? persisted.releaseUrl : null,
     available: persisted.enabled && persisted.available,
+    installedNotice: persisted.installedNotice,
     ignoredVersion: persisted.ignoredVersion,
     download: { ...download },
     canAutoInstall,
@@ -134,6 +138,12 @@ export function createUpdateCheckService(options: Options) {
     const snapshot = { ...persisted };
     saves = saves.then(() => options.store.save(snapshot)).catch(() => undefined);
     return saves;
+  };
+  const persistNow = async (): Promise<void> => {
+    const snapshot = { ...persisted };
+    const write = saves.then(() => options.store.save(snapshot));
+    saves = write.catch(() => undefined);
+    await write;
   };
   const clearTimer = () => { if (timer !== undefined) { clearTimeout(timer); timer = undefined; } };
   const schedule = (delay: number) => {
@@ -152,6 +162,19 @@ export function createUpdateCheckService(options: Options) {
     const url = state().available ? persisted.releaseUrl : null;
     if (!isTrustedReleaseUrl(url)) return false;
     try { await options.openExternal(url); return true; } catch { return false; }
+  }
+
+  async function openInstalledDetails(): Promise<UpdateCheckState> {
+    const notice = persisted.installedNotice;
+    if (!notice || !isTrustedReleaseUrl(notice.releaseUrl)) return state();
+    try {
+      await options.openExternal(notice.releaseUrl);
+      persisted = { ...persisted, installedNotice: null };
+      try { await persistNow(); }
+      catch { persisted = { ...persisted, installedNotice: notice }; }
+      publish();
+    } catch { /* Keep the notice so the user can retry. */ }
+    return state();
   }
 
   function ensureUpdater(): AppUpdaterLike {
@@ -196,6 +219,38 @@ export function createUpdateCheckService(options: Options) {
     } finally { clearTimeout(abort); }
   }
 
+  async function resolveReleaseUrl(version: string): Promise<string> {
+    const tagVersion = (url: unknown) => {
+      if (!isTrustedReleaseUrl(url)) return null;
+      const suffix = url.slice(UPDATE_RELEASES_URL_PREFIX.length);
+      return suffix.startsWith('tag/') ? parseReleaseVersion(suffix.slice(4))?.join('.') ?? null : null;
+    };
+    const cachedVersion = parseReleaseVersion(persisted.latestVersion)?.join('.');
+    if (cachedVersion === version && tagVersion(persisted.releaseUrl) === version) return persisted.releaseUrl!;
+    const cachedTag = isTrustedReleaseUrl(persisted.releaseUrl)
+      ? persisted.releaseUrl.slice(UPDATE_RELEASES_URL_PREFIX.length) : '';
+    const fallbackPrefix = cachedTag.startsWith('tag/v') ? 'v' : '';
+    const fallback = `${UPDATE_RELEASES_URL_PREFIX}tag/${fallbackPrefix}${version}`;
+    for (const tag of [`v${version}`, version]) {
+      const controller = new AbortController();
+      const abort = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
+      try {
+        const response = await options.fetch(releaseApiUrlForTag(tag), {
+          headers: { Accept: 'application/vnd.github+json', 'User-Agent': options.userAgent ?? 'LINE-Agent-Assistant-UpdateCheck' },
+          signal: controller.signal,
+        });
+        if (!response.ok) continue;
+        const body: unknown = JSON.parse(await readCappedText(response));
+        if (typeof body !== 'object' || body === null) continue;
+        const release = body as { tag_name?: unknown; html_url?: unknown };
+        if (parseReleaseVersion(release.tag_name)?.join('.') !== version || tagVersion(release.html_url) !== version) continue;
+        return release.html_url as string;
+      } catch { /* Try the other supported tag spelling, then use the trusted version-specific fallback. */ }
+      finally { clearTimeout(abort); }
+    }
+    return fallback;
+  }
+
   async function check(): Promise<UpdateCheckState> {
     if (checking) return state();
     checking = true;
@@ -230,9 +285,28 @@ export function createUpdateCheckService(options: Options) {
           releaseUrl: isTrustedReleaseUrl(saved.releaseUrl) ? saved.releaseUrl : null,
           available: saved.available === true,
           ignoredVersion: typeof saved.ignoredVersion === 'string' && parseReleaseVersion(saved.ignoredVersion) ? saved.ignoredVersion : null,
+          pendingInstallTarget: saved.pendingInstallTarget && typeof saved.pendingInstallTarget === 'object'
+            && parseReleaseVersion(saved.pendingInstallTarget.version) && isTrustedReleaseUrl(saved.pendingInstallTarget.releaseUrl)
+            ? { version: parseReleaseVersion(saved.pendingInstallTarget.version)!.join('.'), releaseUrl: saved.pendingInstallTarget.releaseUrl } : null,
+          installedNotice: saved.installedNotice && typeof saved.installedNotice === 'object'
+            && parseReleaseVersion(saved.installedNotice.version) && isTrustedReleaseUrl(saved.installedNotice.releaseUrl)
+            ? { version: parseReleaseVersion(saved.installedNotice.version)!.join('.'), releaseUrl: saved.installedNotice.releaseUrl } : null,
         };
         if (!persisted.latestVersion) persisted.available = false;
       }
+      if (persisted.pendingInstallTarget) {
+        if (current && parseReleaseVersion(persisted.pendingInstallTarget.version)?.join('.') === current.join('.')) {
+          persisted.installedNotice = persisted.pendingInstallTarget;
+        }
+        persisted.pendingInstallTarget = null;
+      }
+      if (!persisted.installedNotice && persisted.available && current && parseReleaseVersion(persisted.latestVersion)?.join('.') === current.join('.')
+        && isTrustedReleaseUrl(persisted.releaseUrl)) {
+        persisted.installedNotice = { version: current.join('.'), releaseUrl: persisted.releaseUrl! };
+      }
+      const latest = parseReleaseVersion(persisted.latestVersion);
+      if (!latest || !current || !isNewerVersion(latest, current)) persisted.available = false;
+      await save();
       scheduleFromLastCheck();
       publish();
       return state();
@@ -248,6 +322,7 @@ export function createUpdateCheckService(options: Options) {
     },
     checkNow: check,
     openReleasePage,
+    openInstalledDetails,
     async ignore(version: string): Promise<UpdateCheckState> {
       const parsed = parseReleaseVersion(version);
       if (!parsed) return state();
@@ -264,11 +339,21 @@ export function createUpdateCheckService(options: Options) {
       download = { status: 'downloading', percent: 0 };
       publish();
       let target: AppUpdaterLike;
+      let installerTarget: { readonly version: string; readonly releaseUrl: string };
       try {
         target = ensureUpdater();
         const result = await target.checkForUpdates();
         // Releases without latest.yml reject here (404); an updater that sees no newer build resolves without an update.
         if (!result || result.isUpdateAvailable === false) throw new Error('no updater metadata');
+        const updaterVersion = parseReleaseVersion(result.updateInfo?.version);
+        if (result.updateInfo?.version !== undefined && (!updaterVersion || !current || !isNewerVersion(updaterVersion, current))) throw new Error('invalid updater target');
+        const installerVersion = updaterVersion?.join('.') ?? persisted.latestVersion;
+        const installerParsed = parseReleaseVersion(installerVersion);
+        if (!installerVersion || !installerParsed || !current || !isNewerVersion(installerParsed, current)
+          || !isTrustedReleaseUrl(persisted.releaseUrl)) throw new Error('invalid installer target');
+        const releaseUrl = await resolveReleaseUrl(installerVersion);
+        if (!isTrustedReleaseUrl(releaseUrl)) throw new Error('invalid installer release URL');
+        installerTarget = Object.freeze({ version: installerVersion, releaseUrl });
       } catch {
         installing = false;
         download = { status: 'idle', percent: 0 };
@@ -280,7 +365,15 @@ export function createUpdateCheckService(options: Options) {
         await target.downloadUpdate();
         download = { status: 'ready', percent: 100 };
         publish();
-        if (!options.prepareInstall || !(await options.prepareInstall())) throw new Error('shutdown failed');
+        persisted = { ...persisted, pendingInstallTarget: installerTarget };
+        await persistNow();
+        try {
+          if (!options.prepareInstall || !(await options.prepareInstall())) throw new Error('shutdown failed');
+        } catch (error) {
+          persisted = { ...persisted, pendingInstallTarget: null };
+          await persistNow();
+          throw error;
+        }
         target.quitAndInstall(true, true);
       } catch {
         installing = false;

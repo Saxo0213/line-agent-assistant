@@ -971,6 +971,7 @@ export class LineWorkerLoop {
         identity: { ...conversation, messageId: command.messageId,
           externalAttachmentId: command.externalAttachmentId },
         occurredAt: command.occurredAt, originalFileName,
+        ...((command.senderId !== undefined) ? { sender: { id: command.senderId, displayName: command.senderDisplayName ?? null } } : {}),
         maxBytes: command.maxBytes, timeoutMs: remainingMs, signal: controller.signal,
         source,
       }, this.#attachmentRuntime);

@@ -2,7 +2,7 @@ import { UpdateCheckRequestSchema, type UpdateCheckState } from '../update-check
 import type { UpdateCheckService } from './services/update-check-service.js';
 
 type Sender = { senderId: number; url: string };
-export function createUpdateCheckIpcAdapter(options: { webContentsId: number; rendererUrl: string; service: Pick<UpdateCheckService, 'state' | 'setEnabled' | 'checkNow' | 'openReleasePage' | 'ignore' | 'install'> }) {
+export function createUpdateCheckIpcAdapter(options: { webContentsId: number; rendererUrl: string; service: Pick<UpdateCheckService, 'state' | 'setEnabled' | 'checkNow' | 'openReleasePage' | 'openInstalledDetails' | 'ignore' | 'install'> }) {
   return async (sender: Sender, payload: unknown): Promise<UpdateCheckState> => {
     if (sender.senderId !== options.webContentsId || sender.url !== options.rendererUrl) throw new Error('Renderer identity mismatch');
     const request = UpdateCheckRequestSchema.parse(payload);
@@ -11,6 +11,7 @@ export function createUpdateCheckIpcAdapter(options: { webContentsId: number; re
     if (request.type === 'ignore') return options.service.ignore(request.version);
     if (request.type === 'install') return options.service.install();
     if (request.type === 'openReleasePage') await options.service.openReleasePage();
+    if (request.type === 'openInstalledDetails') return options.service.openInstalledDetails();
     return options.service.state();
   };
 }

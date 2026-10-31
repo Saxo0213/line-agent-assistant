@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ATTACHMENT_BLOCK_REASONS, SafeDiagnosticSchema, isLineServerErrorCode, type LineServerErrorCode } from '@line-agent/contracts';
+import { ATTACHMENT_BLOCK_REASONS, SafeDiagnosticSchema, StoredAttachmentPageSchema, isLineServerErrorCode, type LineServerErrorCode } from '@line-agent/contracts';
 import { ConversationKeySchema, GeneratedPreviewSchema, MentionRangeSchema, MessageContentSchema, normalizeMentionRanges, SticonRangeSchema, StickerDescriptorSchema } from '@line-agent/contracts';
 
 const AttachmentBlockReasonSchema = z.enum(ATTACHMENT_BLOCK_REASONS);
@@ -94,6 +94,7 @@ export type SystemErrorsResult = z.infer<typeof SystemErrorsResultSchema>;
 export const DesktopReadRequestSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('listMessages'), key: ConversationKeySchema, cursor: z.string().nullable(), limit: z.number().int().min(1).max(100), messageId: z.string().min(1).optional() }),
   z.strictObject({ type: z.literal('listAttachmentStates'), key: ConversationKeySchema, attachmentIds: z.array(z.uuid()).max(225) }),
+  z.strictObject({ type: z.literal('listStoredAttachments'), key: ConversationKeySchema, cursor: z.string().max(2048).nullable(), limit: z.number().int().min(1).max(100).optional() }),
   z.strictObject({ type: z.literal('listAgentStatuses'), key: ConversationKeySchema, messageIds: z.array(z.string().min(1)).max(225) }),
   z.strictObject({ type: z.literal('listWorkRecords') }),
   z.strictObject({ type: z.literal('listFriends'), accountId: z.string().min(1) }),
@@ -106,6 +107,7 @@ export type DesktopReadRequest = z.infer<typeof DesktopReadRequestSchema>;
 export const DesktopReadResultSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('listMessages'), page: MessagePageSchema }),
   z.strictObject({ type: z.literal('listAttachmentStates'), attachments: AttachmentStateListSchema }),
+  z.strictObject({ type: z.literal('listStoredAttachments'), page: StoredAttachmentPageSchema }),
   z.strictObject({ type: z.literal('listAgentStatuses'), statuses: z.array(z.strictObject({ messageId: z.string(), jobId: z.string(), status: z.enum(['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted']), revision: z.string().regex(/^\d{1,20}$/) })).max(225) }),
   z.strictObject({ type: z.literal('listWorkRecords'), records: z.array(WorkRecordSchema) }),
   z.strictObject({ type: z.literal('listFriends'), friends: FriendListSchema }),

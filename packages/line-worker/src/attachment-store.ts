@@ -33,6 +33,8 @@ export interface StoreAttachmentInput {
   readonly identity: AttachmentIdentity;
   readonly occurredAt: Date | string;
   readonly originalFileName: string;
+  readonly sender?: { readonly id: string; readonly displayName: string | null };
+  readonly layout?: 'primary' | 'secondary';
   readonly source: AsyncIterable<Uint8Array>;
   readonly maxBytes: number;
   readonly timeoutMs: number;
@@ -211,6 +213,21 @@ function dateParts(input: Date | string): { year: string; month: string } {
   };
 }
 
+function localMessageSegment(input: Date | string, messageId: string): string {
+  const value = input instanceof Date ? new Date(input.getTime()) : new Date(input);
+  if (!Number.isFinite(value.getTime())) throw new AttachmentStoreError("INVALID_DATE", "Attachment occurrence date is invalid");
+  const pad = (number: number) => String(number).padStart(2, "0");
+  return `${String(value.getFullYear()).padStart(4, "0")}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}_${pad(value.getHours())}-${pad(value.getMinutes())}-${pad(value.getSeconds())}_${encodeStableId(messageId)}`;
+}
+
+function senderSegment(sender: { readonly id: string; readonly displayName: string | null } | undefined): string {
+  const id = sender?.id ?? "unknown";
+  const display = sender?.displayName?.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "_").normalize("NFKC").trim() || "未知發言人";
+  const safe = Array.from(display.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "")).slice(0, 48).join("") || "未知發言人";
+  const suffix = createHash("sha256").update(id, "utf8").digest("hex").slice(0, 12);
+  return `${safe}-${suffix}`;
+}
+
 function assertContained(root: string, candidate: string): void {
   const rel = relative(root, candidate);
   if (rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel))) return;
@@ -222,6 +239,8 @@ export function buildAttachmentLocation(input: {
   readonly identity: AttachmentIdentity;
   readonly occurredAt: Date | string;
   readonly originalFileName: string;
+  readonly sender?: { readonly id: string; readonly displayName: string | null };
+  readonly layout?: 'primary' | 'secondary';
 }): AttachmentLocation {
   const root = validateRoot(input.root);
   const { year, month } = dateParts(input.occurredAt);
@@ -239,13 +258,12 @@ export function buildAttachmentLocation(input: {
   const attachmentDigest = createHash("sha256").update(input.identity.externalAttachmentId, "utf8").digest("hex");
   const storedFileName = sanitizedDisplayFileName;
   const relativeSegments = [
-    "accounts",
-    account,
-    input.identity.chatType,
-    chat,
-    year,
-    month,
-    message,
+    ...(input.layout === 'secondary' ? [] : ["accounts", account, input.identity.chatType, chat]),
+    ...(input.layout === 'secondary'
+      ? [senderSegment(input.sender), localMessageSegment(input.occurredAt, input.identity.messageId)]
+      : input.identity.chatType === "direct"
+      ? [year, month, message]
+      : [senderSegment(input.sender), localMessageSegment(input.occurredAt, input.identity.messageId)]),
     attachmentDigest,
     storedFileName,
   ];
@@ -372,7 +390,7 @@ export async function storeAttachment(
   if (!Number.isSafeInteger(input.maxBytes) || input.maxBytes < 0 || !Number.isFinite(input.timeoutMs) || input.timeoutMs <= 0) {
     throw new AttachmentStoreError("INVALID_LIMIT", "Attachment byte and timeout limits must be positive finite values");
   }
-  const location = buildAttachmentLocation(input);
+  const location = buildAttachmentLocation({ ...input, ...(input.sender ? { sender: input.sender } : {}), ...(input.layout ? { layout: input.layout } : {}) });
   const root = validateRoot(input.root);
   const directorySegments = relative(root, location.directoryAbsolutePath).split(sep);
   const portableWindowsTestAllowed = runtime.unsafeAllowPortableFilesystemOnWindowsForTests === true

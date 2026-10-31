@@ -12,6 +12,7 @@ export * from './ipc.js';
 export * from './line-media-url.js';
 export * from './json.js';
 export * from './line.js';
+export * from './attachment-storage.js';
 export * from './line-server-error.js';
 export * from './local-route.js';
 export * from './mcp.js';

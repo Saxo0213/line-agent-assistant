@@ -14,7 +14,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
 import {
-  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, ProviderQuotaRepository, migrate, parseLineStickerDescriptor,
+  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, AttachmentStorageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, ProviderQuotaRepository, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
 import type { Attachment, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
@@ -49,6 +49,8 @@ import { createMcpChatResourceArchiveReader } from './services/mcp-chat-resource
 import { trackOperation, type TrackedOperationContext } from './tracked-operation.js';
 import { WorkspaceAuthority, InvalidWorkspaceError } from './services/workspace-authority.js';
 import { AttachmentService } from './services/attachment-service.js';
+import { AttachmentStorageService } from './services/attachment-storage-service.js';
+import { createWindowsAttachmentBroker, resolveWindowsAttachmentBrokerPath } from '@line-agent/line-worker/attachment-storage';
 import { DeliveryService } from './services/delivery-service.js';
 import { AgentLineSendService } from './services/agent-line-send-service.js';
 import { PermissionCommandService, type PermissionCommandTransport } from './services/permission-command.js';
@@ -183,6 +185,7 @@ export interface ConnectedFacadeOptions {
   /** Shelved: borrowing official LINE tokens for external downloads. Production never passes true. */
   externalDownloadTokenLookup?: boolean;
   attachmentRoot: string;
+  attachmentBrokerHelperPath?: string;
   /** App-managed empty directory used as the working directory of the free-mode judge. */
   freeModeJudgeDirectory?: string;
   previewCacheRoot?: string;
@@ -513,6 +516,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let stopLineSend: () => Promise<void> = async () => undefined;
   let attachmentService!: AttachmentService;
   let stopAttachmentService: () => Promise<void> = async () => undefined;
+  let stopAttachmentStorageService: () => Promise<void> = async () => undefined;
   let previewService: AttachmentPreviewService | null = null;
   let stopPreview: () => Promise<void> = async () => undefined;
   let attachmentOpenService: AttachmentOpenService | null = null;
@@ -537,7 +541,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     ]);
     const earlyOwners = await Promise.allSettled([
       stopMcpHttpServer, stopMcpService, stopLineSend, stopAgentService, stopDelivery,
-      stopAttachmentService, stopLineMedia, stopPreview, stopAttachmentOpen, stopPublishSnapshot, stopContentReprojection,
+      stopAttachmentService, stopAttachmentStorageService, stopLineMedia, stopPreview, stopAttachmentOpen, stopPublishSnapshot, stopContentReprojection,
     ].map((cleanup) => Promise.resolve().then(cleanup)));
     earlyErrors.push(...earlyOwners.filter((result): result is PromiseRejectedResult => result.status === 'rejected').map((result) => result.reason));
     while (inFlight.size) await Promise.allSettled([...inFlight]);
@@ -593,6 +597,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     return options.workers.send(command, signal);
   };
   const messages = new MessageRepository(options.pool);
+  const attachmentStorage = new AttachmentStorageRepository(options.pool);
   const agents = new AgentRepository(options.pool);
   const providerQuota = new ProviderQuotaRepository(options.pool);
   const settings = new SettingsRepository(options.pool);
@@ -611,6 +616,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const admins = new AdminRepository(options.pool);
   const permissionRepository = new AgentPermissionRepository(options.pool);
   const chatFolders = new ChatFolderService(permissionRepository, workspace);
+  const attachmentStorageService = new AttachmentStorageService({ repository: attachmentStorage, messages, attachmentRoot: options.attachmentRoot,
+    windowsSafetyBroker: createWindowsAttachmentBroker({ helperPath: options.attachmentBrokerHelperPath ?? resolveWindowsAttachmentBrokerPath() }),
+    protectedPaths: options.projectFolderProtectedPaths ?? [],
+    workspaceRoot: async () => { const inspection = await workspace.inspect(); return inspection.status === 'available' ? inspection.path : inspection.configuredPath; },
+    ownChatWorkspaceFolder: async (key) => (await chatFolders.resolveExisting(key.accountId,key.chatType,key.chatId))?.path ?? null,
+    onError: (error) => options.audit?.failure(diagnosticFailure('attachment','persist',error)) });
   const diagnostics = options.chatResourceDiagnosticsDirectory
     ? createChatResourceDiagnostics({ appDataDirectory: options.chatResourceDiagnosticsDirectory,
       onSinkFailure: (stage) => options.audit?.failure({ operation: 'chat_resource', stage,
@@ -1214,9 +1225,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   (accountId, reason) => options.audit?.failure({ operation: 'attachment', stage: 'queue', outcome: 'not_started', detail: reason,
     category: reason === 'ATTACHMENT_WORKER_UNAVAILABLE' ? 'authentication_required' : 'unavailable',
     recovery: reason === 'ATTACHMENT_WORKER_UNAVAILABLE' ? 'relogin' : reason === 'ATTACHMENT_WORKER_NOT_READY' ? 'wait' : 'none' },
-  { accountId, initiator: 'system' }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED'));
+  { accountId, initiator: 'system' }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED'),
+  (key, attachmentId) => attachmentStorageService.onPrimaryReady(key,attachmentId));
   stopAttachmentService = onceCleanup(() => attachmentService.shutdown());
   startupCleanup.add(stopAttachmentService);
+  stopAttachmentStorageService = onceCleanup(() => attachmentStorageService.shutdown());
+  startupCleanup.add(stopAttachmentStorageService);
+  attachmentStorageService.start();
   attachmentService.setAutomaticAttemptLimit(conversationSettings.attachmentAutoAttemptLimit);
   void attachmentService.backfillBlockReasons();
   previewService = options.previewPresenter ? new AttachmentPreviewService({ root: options.attachmentRoot,
@@ -1349,6 +1364,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     policy: defaultProjectPathPolicy({ homeDirectory: process.env.USERPROFILE ?? homedir(),
       protectedPaths: options.projectFolderProtectedPaths ?? [],
       workspace: async () => { const inspection = await workspace.inspect(); return inspection.status === 'available' ? inspection.path : inspection.configuredPath; } }),
+    secondaryStorage: attachmentStorageService,
     onError: (error) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); } });
   lineService = new LineService(accounts, messages, settings,
     { send: async (command) => { await sendLineCommand(command); } }, agentService, options.secretStore, attachmentService,
@@ -3547,6 +3563,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     async listAttachmentStates(key, attachmentIds) {
       return messages.listAttachmentStates(key, attachmentIds, conversationSettings.attachmentAutoAttemptLimit);
     },
+    async listStoredAttachments(key, cursor, limit) {
+      return attachmentStorage.listStoredAttachments(key, cursor, limit);
+    },
     async listAgentStatuses(key, messageIds) {
       if (!isWritableChatType(key.chatType)) return [];
       const rows = await agents.listLineJobStatus({ ...key, chatType: key.chatType }, messageIds);
@@ -3612,7 +3631,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const owners = Promise.allSettled([
           () => lineService.shutdownIngress(), () => permissionCommands.close(), () => options.agent.shutdown(),
           () => options.workers.shutdown(), stopAgentService,
-          stopDelivery, stopLineSend, stopAttachmentService, stopMcpHttpServer, stopMcpService,
+          stopDelivery, stopLineSend, stopAttachmentService, stopAttachmentStorageService, stopMcpHttpServer, stopMcpService,
         ].map((cleanup) => Promise.resolve().then(cleanup)));
         while (inFlight.size) await Promise.allSettled([...inFlight]);
 
@@ -3659,6 +3678,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     openChatAlbum: (...args) => admitted(() => chatResources.openAlbum(...args), { operation: 'chat_resource', identity: { accountId: args[0].accountId } }),
     openReadableChatAlbumFolder: (...args) => admitted(() => chatResources.openReadableAlbumFolder(...args), { operation: 'chat_resource', identity: { accountId: args[0].accountId } }),
     listAttachmentStates: (...args) => admitted(() => facade.listAttachmentStates(...args), { operation: 'attachment', identity: { accountId: args[0].accountId } }),
+    listStoredAttachments: (...args) => admitted(() => facade.listStoredAttachments!(...args), { operation: 'ipc', identity: { accountId: args[0].accountId } }),
     listAgentStatuses: (...args) => admitted(() => facade.listAgentStatuses(...args), { operation: 'agent', identity: { accountId: args[0].accountId } }),
     listWorkRecords: (...args) => admitted(() => facade.listWorkRecords(...args), { operation: 'agent' }),
     listFriends: (...args) => admitted(() => facade.listFriends!(...args), { operation: 'ipc', identity: { accountId: args[0] } }),

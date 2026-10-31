@@ -44,6 +44,7 @@ export interface ProjectFolderServiceOptions {
   sendSystemText(input: SystemTextInput): Promise<SystemTextResult>;
   /** Evaluated on every bind and every job start. */
   policy: ProjectPathPolicy;
+  secondaryStorage?: { executeFolderCommand(key: WritableConversationKey, actor: string, command: FolderCommand): Promise<string> };
   onError?(error: unknown): void;
 }
 
@@ -121,6 +122,8 @@ export class ProjectFolderService {
         await store.unbind(key, target.path, actor);
         return PROJECT_FOLDER_TEXT.removed(target.path);
       }
+      case 'temp_show': case 'temp_set': case 'temp_off': case 'temp_retry':
+        return this.options.secondaryStorage?.executeFolderCommand(key, actor, command) ?? PROJECT_FOLDER_TEXT.failed;
     }
   }
 

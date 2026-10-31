@@ -14,6 +14,11 @@ const MAX_OUTPUT = 16 * 1024;
 
 export interface WindowsAttachmentBrokerOptions { readonly helperPath?: string; }
 
+/** Resolves the packaged native helper beside this narrow storage module. */
+export function resolveWindowsAttachmentBrokerPath(): string {
+  return fileURLToPath(new URL("./native/AttachmentBroker.exe", import.meta.url));
+}
+
 type HelperResult =
   | { protocol: typeof PROTOCOL; ok: true; sha256: string; size: number; idempotent: boolean }
   | { protocol: typeof PROTOCOL; ok: false; code: string };
@@ -74,7 +79,7 @@ export class WindowsAttachmentBroker implements AttachmentFilesystemSafetyBroker
   constructor(options: WindowsAttachmentBrokerOptions = {}) {
     // The build places the helper beside either flattened `dist/*.js` or
     // preserved `dist/src/*.js` output, so the runtime lookup is layout-stable.
-    this.#helperPath = options.helperPath ?? fileURLToPath(new URL("./native/AttachmentBroker.exe", import.meta.url));
+    this.#helperPath = options.helperPath ?? resolveWindowsAttachmentBrokerPath();
   }
 
   async #resolveAndVerifyHelper(): Promise<string> {

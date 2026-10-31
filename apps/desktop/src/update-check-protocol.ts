@@ -18,7 +18,8 @@ export const UpdateCheckStateSchema = z.strictObject({
   latestVersion: z.string().nullable(),
   releaseUrl: z.string().nullable(),
   available: z.boolean(),
-  /** Version the user dismissed in the bottom-right prompt; a newer version prompts again. */
+  installedNotice: z.strictObject({ version: z.string(), releaseUrl: z.string() }).nullable(),
+  /** Version dismissed from the floating update prompt; a newer version prompts again. */
   ignoredVersion: z.string().nullable(),
   download: z.strictObject({ status: z.enum(['idle', 'downloading', 'ready', 'error']), percent: z.number().min(0).max(100) }),
   /** False when running unpackaged; 「更新」 then opens the release page. */
@@ -31,6 +32,7 @@ export const UpdateCheckRequestSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('setEnabled'), enabled: z.boolean() }),
   z.strictObject({ type: z.literal('checkNow') }),
   z.strictObject({ type: z.literal('openReleasePage') }),
+  z.strictObject({ type: z.literal('openInstalledDetails') }),
   z.strictObject({ type: z.literal('ignore'), version: z.string().min(1).max(32) }),
   z.strictObject({ type: z.literal('install') }),
 ]);

@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.314 archives startup catch-up messages without triggering automation, then resumes monitoring after storage and synchronization are acknowledged. It also includes system quota queries (`/額度` or `/quota`), quota reset tracking, and consented chat-wide Agent switching with a retry of the failed task. You can install it through the app's **Check for updates**. See the [v1.0.314 release notes](docs/releases/v1.0.314.md) for all changes since the previous public release, [v1.0.312](docs/releases/v1.0.312.md).
+v1.0.316 adds chat-scoped storage for group and room attachments, with sender and original filename details, plus `/folder` controls for temporary storage. It also fixes update notice and installed-version reconciliation across restarts. Install through the app's **Check for updates**. See the [v1.0.316 release notes](docs/releases/v1.0.316.md) for changes since public v1.0.314, including attachment features first included in local v1.0.315.
 
 ## Installation
 

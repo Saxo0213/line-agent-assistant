@@ -133,6 +133,38 @@ describe("stable attachment identity", () => {
     expect(new Set([sameAttachmentName.managedRelativePath, otherMessage.managedRelativePath, otherAttachment.managedRelativePath]).size).toBe(3);
   });
 
+  it("groups room attachments by stable sender and local dated message while preserving the filename", () => {
+    const input = { root: "C:\\managed", identity: { ...baseIdentity, chatType: "room" as const },
+      occurredAt: "2026-11-01T14:30:25.000Z", originalFileName: "photo original.JPG",
+      sender: { id: "u12345678901234567890123456789012", displayName: "Same Name" } };
+    const first = buildAttachmentLocation(input);
+    const sameNameOtherSender = buildAttachmentLocation({ ...input, sender: { id: "u22345678901234567890123456789012", displayName: "Same Name" } });
+    expect(first.managedRelativePath).toContain("/room/");
+    expect(first.managedRelativePath).toContain("/Same Name-");
+    const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Taipei", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(input.occurredAt));
+    expect(first.managedRelativePath).toContain(`/${localDate}_22-30-25_`);
+    expect(first.managedRelativePath).not.toMatch(/\/\d{4}\/\d{2}\//);
+    expect(first.managedRelativePath.split("/").at(-1)).toBe("photo original.JPG");
+    expect(first.managedRelativePath).not.toBe(sameNameOtherSender.managedRelativePath);
+  });
+
+  it("uses the exact sender/date-message/attachment/name secondary path for group and direct chats", () => {
+    const occurredAt = "2026-10-31T23:30:25.000Z";
+    const sender = { id: "sender-stable-id", displayName: "Display Name" };
+    const messageDate = new Date(occurredAt);
+    const pad = (part: number) => String(part).padStart(2,"0");
+    const dateMessage = `${messageDate.getFullYear()}-${pad(messageDate.getMonth()+1)}-${pad(messageDate.getDate())}_${pad(messageDate.getHours())}-${pad(messageDate.getMinutes())}-${pad(messageDate.getSeconds())}_${encodeStableId(baseIdentity.messageId)}`;
+    const senderSegment = `Display Name-${createHash("sha256").update(sender.id).digest("hex").slice(0,12)}`;
+    const attachmentSegment = createHash("sha256").update(baseIdentity.externalAttachmentId).digest("hex");
+    const expected = [senderSegment,dateMessage,attachmentSegment,"original file.pdf"].join("/");
+    for (const chatType of ["group","direct"] as const) {
+      const actual = buildAttachmentLocation({ root: "C:\\archive", identity: { ...baseIdentity, chatType }, occurredAt,
+        originalFileName: "original file.pdf", sender, layout: "secondary" });
+      expect(actual.managedRelativePath).toBe(expected);
+      expect(actual.managedRelativePath.split("/")).toHaveLength(4);
+    }
+  });
+
   it("emits a schema-valid POSIX managed path while retaining native absolute paths", () => {
     const location = buildAttachmentLocation({
       root: "C:\\managed",
@@ -188,8 +220,9 @@ describe("storeAttachment", () => {
     const imageBytes = await readFile(image.absolutePath);
     const documentBytes = await readFile(document.absolutePath);
 
-    expect(image.managedRelativePath).toBe(`accounts/${encodeStableId(baseIdentity.accountId)}/group/${encodeStableId(baseIdentity.chatId)}/2026/10/${encodeStableId(baseIdentity.messageId)}/${createHash("sha256").update(baseIdentity.externalAttachmentId).digest("hex")}/photo.jpg`);
-    expect(document.managedRelativePath).toBe(`accounts/${encodeStableId(baseIdentity.accountId)}/group/${encodeStableId(baseIdentity.chatId)}/2026/10/${encodeStableId(baseIdentity.messageId)}/${createHash("sha256").update("attachment-PDF").digest("hex")}/rules.pdf`);
+    const prefix = `accounts/${encodeStableId(baseIdentity.accountId)}/group/${encodeStableId(baseIdentity.chatId)}/未知發言人-${createHash("sha256").update("unknown").digest("hex").slice(0, 12)}/2026-10-15_09-02-03_${encodeStableId(baseIdentity.messageId)}`;
+    expect(image.managedRelativePath).toBe(`${prefix}/${createHash("sha256").update(baseIdentity.externalAttachmentId).digest("hex")}/photo.jpg`);
+    expect(document.managedRelativePath).toBe(`${prefix}/${createHash("sha256").update("attachment-PDF").digest("hex")}/rules.pdf`);
     expect(imageBytes).toEqual(jpeg);
     expect(documentBytes).toEqual(pdf);
     expect(image.sha256).toBe(createHash("sha256").update(jpeg).digest("hex"));
@@ -210,7 +243,7 @@ describe("storeAttachment", () => {
       timeoutMs: 2_000,
     })).rejects.toMatchObject({ code: "MAX_BYTES_EXCEEDED" });
 
-    const files = await readdir(join(root, "accounts", encodeStableId(baseIdentity.accountId), "group", encodeStableId(baseIdentity.chatId), "2026", "10", encodeStableId(baseIdentity.messageId), createHash("sha256").update(baseIdentity.externalAttachmentId).digest("hex")));
+    const files = await readdir(join(root, "accounts", encodeStableId(baseIdentity.accountId), "group", encodeStableId(baseIdentity.chatId), `未知發言人-${createHash("sha256").update("unknown").digest("hex").slice(0, 12)}`, `2026-10-15_09-02-03_${encodeStableId(baseIdentity.messageId)}`, createHash("sha256").update(baseIdentity.externalAttachmentId).digest("hex")));
     expect(files).toEqual([]);
   });
 
@@ -234,7 +267,7 @@ describe("storeAttachment", () => {
     setTimeout(() => controller.abort(), 20);
 
     await expect(storing).rejects.toMatchObject({ code: "ABORTED" });
-    const directory = join(root, "accounts", encodeStableId(baseIdentity.accountId), "group", encodeStableId(baseIdentity.chatId), "2026", "10", encodeStableId(baseIdentity.messageId), createHash("sha256").update(baseIdentity.externalAttachmentId).digest("hex"));
+    const directory = join(root, "accounts", encodeStableId(baseIdentity.accountId), "group", encodeStableId(baseIdentity.chatId), `未知發言人-${createHash("sha256").update("unknown").digest("hex").slice(0, 12)}`, `2026-10-15_09-02-03_${encodeStableId(baseIdentity.messageId)}`, createHash("sha256").update(baseIdentity.externalAttachmentId).digest("hex"));
     expect(await readdir(directory)).toEqual([]);
   });
 
@@ -418,7 +451,7 @@ describe("storeAttachment", () => {
 
     expect(request).toMatchObject({
       root,
-      directorySegments: expect.arrayContaining(["accounts", "group", "2026", "10"]),
+      directorySegments: expect.arrayContaining(["accounts", "group"]),
       targetFileName: "display.exe",
       requiredGuarantees: { rootHandleAnchored: true, rejectsReparsePoints: true, publishNoReplace: true },
     });

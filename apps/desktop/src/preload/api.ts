@@ -49,6 +49,7 @@ import {
   type AutoResponderRule,
   type AutoResponderSettings,
   type ConversationKey,
+  type StoredAttachmentPage,
   type WritableConversationKey,
   type IpcEvent,
   type IpcRequest,
@@ -66,6 +67,7 @@ import {
   type ChatResourcePhoto,
 } from '@line-agent/contracts';
 import { FriendListSchema, MessageReadersSchema, AttachmentStateListSchema, ControlStateSchema, DesktopReadResultSchema, MessagePageSchema, SystemActivityResultSchema, SystemErrorsResultSchema, WorkRecordSchema } from '../desktop-protocol.js';
+import { StoredAttachmentPageSchema } from '@line-agent/contracts';
 import { DatabaseSetupResultSchema, SETUP_PROGRESS_CHANNEL, SetupProgressEventSchema, type DatabaseConnectionInput, type DatabaseSetupStatus,
   type EmbeddedConnectionInfo, type SetupProgressEvent } from '../setup-protocol.js';
 import type { FriendRow, MessagePage, MessageReader, WorkRecord } from '../main/service-facade.js';
@@ -81,6 +83,7 @@ export type DesktopApi = {
   setUpdateCheckEnabled?(enabled: boolean): Promise<UpdateCheckState>;
   checkForUpdateNow?(): Promise<UpdateCheckState>;
   openUpdateReleasePage?(): Promise<UpdateCheckState>;
+  openInstalledUpdateDetails?(): Promise<UpdateCheckState>;
   ignoreUpdateVersion?(version: string): Promise<UpdateCheckState>;
   installUpdate?(): Promise<UpdateCheckState>;
   onUpdateCheckState?(callback: (state: UpdateCheckState) => void): () => void;
@@ -96,6 +99,7 @@ export type DesktopApi = {
   openReadableChatAlbumFolder(key: ConversationKey, albumId: string, requestId?: string): Promise<{ albumId: string; exportedCount: number; failedCount: number; totalCount: number; complete: boolean; failureCodes: string[]; folderName: string; opened: boolean }>;
   cancelChatResourceRequest(targetRequestId: string): Promise<boolean>;
   listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[]): Promise<ReturnType<typeof AttachmentStateListSchema.parse>>;
+  listStoredAttachments(key: ConversationKey, cursor: string | null, limit?: number): Promise<StoredAttachmentPage>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'; revision: string }>>;
   listWorkRecords(): Promise<WorkRecord[]>;
   listFriends(accountId: string): Promise<FriendRow[]>;
@@ -243,7 +247,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     if (result.requestId !== requestId) throw new Error('IPC correlation mismatch');
     return result;
   };
-  const read = async <T extends 'listMessages' | 'listAttachmentStates' | 'listAgentStatuses' | 'listWorkRecords' | 'listFriends' | 'listMessageReaders' | 'listSystemActivity' | 'listSystemErrors' | 'getControlState'>(body: { type: T; [key: string]: unknown }): Promise<Extract<ReturnType<typeof DesktopReadResultSchema.parse>, { type: T }>> => {
+  const read = async <T extends 'listMessages' | 'listAttachmentStates' | 'listStoredAttachments' | 'listAgentStatuses' | 'listWorkRecords' | 'listFriends' | 'listMessageReaders' | 'listSystemActivity' | 'listSystemErrors' | 'getControlState'>(body: { type: T; [key: string]: unknown }): Promise<Extract<ReturnType<typeof DesktopReadResultSchema.parse>, { type: T }>> => {
     const result = DesktopReadResultSchema.parse(await transport.invoke('line-agent:read', body));
     if (result.type !== body.type) throw new Error('IPC read response mismatch');
     return result as Extract<ReturnType<typeof DesktopReadResultSchema.parse>, { type: T }>;
@@ -263,6 +267,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     setUpdateCheckEnabled: (enabled) => updateCheck({ type: 'setEnabled', enabled }),
     checkForUpdateNow: () => updateCheck({ type: 'checkNow' }),
     openUpdateReleasePage: () => updateCheck({ type: 'openReleasePage' }),
+    openInstalledUpdateDetails: () => updateCheck({ type: 'openInstalledDetails' }),
     ignoreUpdateVersion: (version) => updateCheck({ type: 'ignore', version }),
     installUpdate: () => updateCheck({ type: 'install' }),
     onUpdateCheckState(callback) {
@@ -284,6 +289,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async openReadableChatAlbumFolder(key, albumId, requestId) { const result = await request({ type: 'openReadableChatAlbumFolder', ...key, albumId }, requestId); if (result.type !== 'openReadableChatAlbumFolder') throwIpcErrorOrUnexpected(result, 'Unexpected readable album folder response'); return { albumId: result.albumId, exportedCount: result.exportedCount, failedCount: result.failedCount, totalCount: result.totalCount, complete: result.complete, failureCodes: result.failureCodes, folderName: result.folderName, opened: result.opened }; },
     async cancelChatResourceRequest(targetRequestId) { const result = await request({ type: 'cancelChatResourceRequest', targetRequestId }); return result.type === 'cancelChatResourceRequest' && result.cancelled; },
     async listAttachmentStates(key, attachmentIds) { if (attachmentIds.length > 225) throw new Error('Attachment state lookup exceeds 225 IDs'); if (attachmentIds.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) throw new Error('Invalid attachment ID'); const result = await read({ type: 'listAttachmentStates', key, attachmentIds: [...new Set(attachmentIds)] }); return AttachmentStateListSchema.parse(result.attachments); },
+    async listStoredAttachments(key, cursor, limit = 50) { const result = await read({ type: 'listStoredAttachments', key, cursor, limit }); return StoredAttachmentPageSchema.parse(result.page); },
     async listAgentStatuses(key, messageIds) { if (messageIds.length > 225) throw new Error('Agent status lookup exceeds 225 IDs'); const result = await read({ type: 'listAgentStatuses', key, messageIds: [...new Set(messageIds)] }); return result.statuses; },
     async listWorkRecords() { const result = await read({ type: 'listWorkRecords' }); return WorkRecordSchema.array().parse(result.records); },
     async listFriends(accountId) { const result = await read({ type: 'listFriends', accountId }); return FriendListSchema.parse(result.friends); },

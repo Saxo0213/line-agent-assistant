@@ -88,6 +88,8 @@ export type FolderCommand =
   | { type: 'folder'; action: 'bind'; path: string; mode: FolderMode }
   | { type: 'folder'; action: 'list' }
   | { type: 'folder'; action: 'off'; path: string | null }
+  | { type: 'folder'; action: 'temp_show' | 'temp_off' | 'temp_retry' }
+  | { type: 'folder'; action: 'temp_set'; path: string }
   | { type: 'folder'; action: 'usage' };
 
 const QUOTE_PAIRS: Record<string, string> = { '"': '"', "'": "'", '“': '”', '‘': '’' };
@@ -107,6 +109,15 @@ export function parseFolderCommand(text: string): FolderCommand | null {
   if (!match) return null;
   const argument = (match[1] ?? '').trim();
   if (argument === '') return { type: 'folder', action: 'list' };
+  const temp = /^temp(?:\s+([\s\S]*))?$/i.exec(argument);
+  if (temp) {
+    const value = (temp[1] ?? '').trim();
+    if (!value) return { type: 'folder', action: 'temp_show' };
+    if (/^off$/i.test(value)) return { type: 'folder', action: 'temp_off' };
+    if (/^retry$/i.test(value)) return { type: 'folder', action: 'temp_retry' };
+    const path = unquotePath(value);
+    return path ? { type: 'folder', action: 'temp_set', path } : { type: 'folder', action: 'usage' };
+  }
   if (/^off$/i.test(argument)) return { type: 'folder', action: 'off', path: null };
   const off = /^off\s+([\s\S]+)$/i.exec(argument);
   if (off) { const path = unquotePath(off[1]!); return path ? { type: 'folder', action: 'off', path } : { type: 'folder', action: 'usage' }; }

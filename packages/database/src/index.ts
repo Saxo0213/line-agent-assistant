@@ -5,6 +5,7 @@ export * from './content-bridge/reproject.js';
 export * from './account-repository.js';
 export * from './migrate.js';
 export * from './message-repository.js';
+export * from './attachment-storage-repository.js';
 export * from './album-notification-task-repository.js';
 export * from './chat-album-catalog-repository.js';
 export * from './native-reactions.js';

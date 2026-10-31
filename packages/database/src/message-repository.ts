@@ -117,6 +117,9 @@ export interface Attachment {
   chatType: ConversationKey['chatType'];
   chatId: string;
   messageId: string;
+  /** Source message author read from the durable message row, never from a worker response. */
+  senderId?: string;
+  senderDisplayName?: string | null;
   kind: 'image' | 'video' | 'audio' | 'file';
   name: string | null;
   mimeType: string | null;
@@ -1370,8 +1373,9 @@ export class MessageRepository {
 
   async getAttachment(attachmentId: string): Promise<Attachment | null> {
     const result = await this.pool.query<{
-      attachment_id: string; external_attachment_id: string; account_id: string; chat_type: Attachment['chatType']; chat_id: string; message_id: string; kind: Attachment['kind']; name: string | null; mime_type: string | null; status: Attachment['status']; relative_path: string | null; sha256: string | null; size_bytes: string | null; error: string | null; occurred_at: Date; retry_count: number; retry_after: string | null; created_at: Date; expires_at: string | null; updated_at: Date; raw: JsonValue; external_source: boolean;
+      attachment_id: string; external_attachment_id: string; account_id: string; chat_type: Attachment['chatType']; chat_id: string; message_id: string; sender_id: string; sender_display_name: string | null; kind: Attachment['kind']; name: string | null; mime_type: string | null; status: Attachment['status']; relative_path: string | null; sha256: string | null; size_bytes: string | null; error: string | null; occurred_at: Date; retry_count: number; retry_after: string | null; created_at: Date; expires_at: string | null; updated_at: Date; raw: JsonValue; external_source: boolean;
     }>(`SELECT a.attachment_id, a.external_attachment_id, a.account_id, a.chat_type, a.chat_id, a.message_id,
+        m.sender_id, COALESCE(NULLIF(sender_contact.nickname, ''), NULLIF(sender_contact.display_name, '')) AS sender_display_name,
         a.kind, a.name, a.mime_type,
         CASE WHEN a.status <> 'ready' AND m.occurred_at < now() - interval '7 days'
           AND EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
@@ -1381,13 +1385,14 @@ export class MessageRepository {
         EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id AND p.message_id=a.message_id
           AND p.origin='EXTERNAL_MONITOR') AS external_source FROM attachments a JOIN messages m
         ON m.account_id = a.account_id AND m.chat_type = a.chat_type AND m.chat_id = a.chat_id AND m.message_id = a.message_id
+        LEFT JOIN line_contacts sender_contact ON sender_contact.account_id = m.account_id AND sender_contact.mid = m.sender_id
         WHERE a.attachment_id = $1`, [attachmentId]);
     const row = result.rows[0];
     if (!row) return null;
     const raw = row.raw && typeof row.raw === 'object' && !Array.isArray(row.raw)
       ? row.raw as Record<string, JsonValue> : {};
     const nativePayload = NativeSourceEnvelopeSchema.safeParse(raw.native);
-    return { attachmentId: row.attachment_id, externalAttachmentId: row.external_attachment_id, accountId: row.account_id, chatType: row.chat_type, chatId: row.chat_id, messageId: row.message_id, kind: row.kind, name: row.name, mimeType: row.mime_type, status: row.status, relativePath: row.relative_path, sha256: row.sha256, sizeBytes: row.size_bytes === null ? null : Number(row.size_bytes), error: row.error, occurredAt: row.occurred_at.toISOString(), retryCount: row.retry_count, retryAfter: row.retry_after, createdAt: row.created_at.toISOString(), expiresAt: row.expires_at, updatedAt: row.updated_at.toISOString(), lineMessage: raw.message ?? raw,
+    return { attachmentId: row.attachment_id, externalAttachmentId: row.external_attachment_id, accountId: row.account_id, chatType: row.chat_type, chatId: row.chat_id, messageId: row.message_id, senderId: row.sender_id, senderDisplayName: row.sender_display_name, kind: row.kind, name: row.name, mimeType: row.mime_type, status: row.status, relativePath: row.relative_path, sha256: row.sha256, sizeBytes: row.size_bytes === null ? null : Number(row.size_bytes), error: row.error, occurredAt: row.occurred_at.toISOString(), retryCount: row.retry_count, retryAfter: row.retry_after, createdAt: row.created_at.toISOString(), expiresAt: row.expires_at, updatedAt: row.updated_at.toISOString(), lineMessage: raw.message ?? raw,
       externalSource: row.external_source, ...(nativePayload.success && nativePayload.data.table === '_message' ? { nativePayload: nativePayload.data } : {}) };
   }
 

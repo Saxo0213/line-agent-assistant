@@ -197,7 +197,7 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Conversation.extend({ type: z.literal('unsendMessage'), requestId: Id, messageId: Decimal }),
   Bound.extend({ type: z.literal('checkFriendRelation'), requestId: Id, targetMid: UserMid }),
   Bound.extend({ type: z.literal('addFriendByMid'), requestId: Id, targetMid: UserMid, sourceChatMid: SourceChatMid.optional() }),
-  Conversation.extend({ type: z.literal('downloadAttachment'), requestId: Id, attemptToken: z.uuid(), messageId: Id, attachmentId: z.uuid(), externalAttachmentId: Id, kind: z.enum(['image', 'video', 'audio', 'file']), occurredAt: z.iso.datetime({ offset: true }), originalFileName: z.string(), lineMessage: JsonValueSchema, nativeAttachment: NativeAttachmentDownloadInputSchema.optional(), maxBytes: z.number().int().positive(), timeoutMs: z.number().int().positive() }),
+  Conversation.extend({ type: z.literal('downloadAttachment'), requestId: Id, attemptToken: z.uuid(), messageId: Id, attachmentId: z.uuid(), externalAttachmentId: Id, kind: z.enum(['image', 'video', 'audio', 'file']), occurredAt: z.iso.datetime({ offset: true }), originalFileName: z.string(), senderId: Id.optional(), senderDisplayName: z.string().max(256).nullable().optional(), lineMessage: JsonValueSchema, nativeAttachment: NativeAttachmentDownloadInputSchema.optional(), maxBytes: z.number().int().positive(), timeoutMs: z.number().int().positive() }),
   Bound.extend({ type: z.literal('cancelAttachmentDownload'), attachmentId: z.uuid(), attemptToken: z.uuid() }),
   Bound.extend({ type: z.literal('revokeControl') }),
   Bound.extend({ type: z.literal('stop') }),

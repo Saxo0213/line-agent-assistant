@@ -14,7 +14,7 @@ export function formatCheckedAt(iso: string): string {
 export function UpdateCheckSettings({ api }: { api: DesktopApi }) {
   const locale = useDesktopLocale();
   const text = (key: UpdateCopyKey, values?: Record<string, unknown>) => updateTextFor(locale, key, values);
-  const { state, setEnabled, checkNow, openReleasePage, install } = useUpdateCheck(api);
+  const { state, setEnabled, checkNow, openReleasePage, openInstalledDetails, install } = useUpdateCheck(api);
   if (!state) return null;
   const status = state.checking ? text('checking')
     : state.lastCheckFailed ? text('checkFailed')
@@ -35,6 +35,10 @@ export function UpdateCheckSettings({ api }: { api: DesktopApi }) {
         <button type="button" className="primary" disabled={state.download.status === 'downloading' || state.download.status === 'ready'} onClick={install}>{text('updateNow')}</button>
         <button type="button" onClick={openReleasePage}>{text('goDownload')}</button>
       </span>
+    </div>}
+    {state.installedNotice && <div className="update-check-row">
+      <strong>{text('installedTitle', { arg0: state.installedNotice.version })}</strong>
+      <button type="button" onClick={openInstalledDetails}>{text('details')}</button>
     </div>}
     {state.available && state.download.status === 'downloading' && <span className="muted" role="status">{text('downloading')} {state.download.percent}%</span>}
     {state.available && state.download.status === 'ready' && <span className="muted" role="status">{text('restarting')}</span>}

@@ -4,12 +4,18 @@ import { updateTextFor, type UpdateCopyKey } from '../desktop-update-copy.js';
 import { useDesktopLocale } from './desktop-i18n.js';
 import { useUpdateCheck } from './useUpdateCheck.js';
 
-/** Non-modal card at the bottom-right of the main window; hidden for the version the user ignored. */
+/** Floating non-modal card at the bottom-left; new updates can be ignored while install notices remain until details open. */
 export function UpdatePrompt({ api }: { api: DesktopApi }) {
   const locale = useDesktopLocale();
   const text = (key: UpdateCopyKey, values?: Record<string, unknown>) => updateTextFor(locale, key, values);
-  const { state, ignore, install, openReleasePage } = useUpdateCheck(api);
-  if (!state || !state.available || !state.latestVersion || state.ignoredVersion === state.latestVersion) return null;
+  const { state, ignore, install, openReleasePage, openInstalledDetails } = useUpdateCheck(api);
+  if (!state) return null;
+  const hasActionableUpdate = state.available && !!state.latestVersion && state.ignoredVersion !== state.latestVersion;
+  if (!hasActionableUpdate && state.installedNotice) return <div className="update-prompt" role="status" aria-live="polite">
+    <strong className="update-prompt-title">{text('installedTitle', { arg0: state.installedNotice.version })}</strong>
+    <div className="update-prompt-actions"><button type="button" className="primary" onClick={openInstalledDetails}>{text('details')}</button></div>
+  </div>;
+  if (!hasActionableUpdate || !state.latestVersion) return null;
   const version = state.latestVersion;
   const { status, percent } = state.download;
   return <div className="update-prompt" role="status" aria-live="polite">

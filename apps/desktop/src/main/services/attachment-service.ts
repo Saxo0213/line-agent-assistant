@@ -52,7 +52,8 @@ export class AttachmentService {
     private readonly isAccountConnected?: (accountId: string) => Promise<boolean>,
     private readonly random: () => number = Math.random,
     private readonly onServerRejection?: (result: Extract<AttachmentResult, { status: 'failed' | 'expired' }>) => void,
-    private readonly onBlockReasonChanged?: (accountId: string, reason: AttachmentBlockReason) => void) {
+    private readonly onBlockReasonChanged?: (accountId: string, reason: AttachmentBlockReason) => void,
+    private readonly onPrimaryReady?: (key: import('@line-agent/contracts').WritableConversationKey, attachmentId: string) => void | Promise<void>) {
     void maxConcurrent;
   }
 
@@ -229,6 +230,7 @@ export class AttachmentService {
         requestId: attachment.attachmentId, attemptToken, messageId: attachment.messageId, attachmentId: attachment.attachmentId,
         externalAttachmentId: attachment.externalAttachmentId, kind: attachment.kind,
         occurredAt: attachment.occurredAt, originalFileName: nativeAttachment?.fileName ?? attachment.name ?? 'attachment.bin',
+        ...(attachment.chatType !== 'direct' ? { senderId: attachment.senderId ?? 'unknown', senderDisplayName: attachment.senderDisplayName ?? null } : {}),
         lineMessage: attachment.lineMessage,
         ...(nativeAttachment ? { nativeAttachment } : {}),
         maxBytes: 100 * 1024 * 1024, timeoutMs: 120_000 };
@@ -253,6 +255,8 @@ export class AttachmentService {
           ? undefined : result.name;
         const ready = await this.messages.markAttachmentReady(attempt,
           { relativePath: result.relativePath, sha256: result.sha256, sizeBytes: result.sizeBytes, ...(name === undefined ? {} : { name }) });
+        if (ready) void Promise.resolve(this.onPrimaryReady?.({ accountId: attachment.accountId, chatType: attachment.chatType as import('@line-agent/contracts').WritableConversationKey['chatType'], chatId: attachment.chatId }, attachmentId))
+          .catch((error: unknown) => this.reportFailure('persist', error, identity));
         this.notifyChanged(attachmentId);
         return ready;
       }

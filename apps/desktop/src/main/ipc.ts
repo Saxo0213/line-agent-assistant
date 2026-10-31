@@ -101,6 +101,7 @@ export function createIpcAdapter(options: AdapterOptions) {
 }
 
 type ReadFacade = Pick<DesktopServiceFacade, 'listMessages' | 'listAttachmentStates' | 'listAgentStatuses' | 'listWorkRecords' | 'controlState'>
+  & Partial<Pick<DesktopServiceFacade, 'listStoredAttachments'>>
   & Partial<Pick<DesktopServiceFacade, 'listFriends' | 'listMessageReaders'>>
   & Partial<Pick<DesktopServiceFacade, 'listSystemActivity' | 'listSystemErrors'>>;
 export function createReadAdapter(options: { webContentsId: number; rendererUrl: string; service?: ReadFacade; resolveService?: () => ReadFacade;
@@ -115,6 +116,8 @@ export function createReadAdapter(options: { webContentsId: number; rendererUrl:
     let result: unknown;
     if (request.type === 'listMessages') result = { type: 'listMessages', page: await service.listMessages(request.key, request.cursor, request.limit, request.messageId) };
     else if (request.type === 'listAttachmentStates') result = { type: 'listAttachmentStates', attachments: await service.listAttachmentStates(request.key, request.attachmentIds) };
+    else if (request.type === 'listStoredAttachments') result = { type: 'listStoredAttachments', page: service.listStoredAttachments
+      ? await service.listStoredAttachments(request.key, request.cursor, request.limit) : { attachments: [], nextCursor: null } };
     else if (request.type === 'listAgentStatuses') result = { type: 'listAgentStatuses', statuses: await service.listAgentStatuses(request.key, request.messageIds) };
     else if (request.type === 'listWorkRecords') result = { type: 'listWorkRecords', records: await service.listWorkRecords() };
     else if (request.type === 'listFriends') result = { type: 'listFriends', friends: service.listFriends ? await service.listFriends(request.accountId) : [] };

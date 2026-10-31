@@ -1,4 +1,4 @@
-import type { IpcRequest, IpcResult, ConversationKey, WritableConversationKey, AppSnapshot, MessageContent, LineMediaTarget,
+import type { IpcRequest, IpcResult, ConversationKey, WritableConversationKey, AppSnapshot, MessageContent, LineMediaTarget, StoredAttachmentPage,
   ChatResourceNote, ChatResourceAlbum, ChatResourcePhoto } from '@line-agent/contracts';
 import type { SystemActivityResult, SystemErrorsResult } from '../desktop-protocol.js';
 import type { AttachmentBlockReason, SticonRange } from '@line-agent/contracts';
@@ -52,6 +52,7 @@ export type DesktopServiceFacade = {
   openChatAlbum(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<AlbumOpenResult>;
   openReadableChatAlbumFolder(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<import('./services/chat-resources.js').ReadableAlbumFolderResult>;
   listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[]): Promise<AttachmentState[]>;
+  listStoredAttachments?(key: ConversationKey, cursor: string | null, limit?: number): Promise<StoredAttachmentPage>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: NonNullable<TimelineMessage['agentJobStatus']>; revision: string }>>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: NonNullable<TimelineMessage['agentJobStatus']>; revision: string }>>;
   listWorkRecords(): Promise<WorkRecord[]>;
@@ -90,6 +91,7 @@ export function createDisconnectedFacade(reason = '服務尚未接入；請完�
     async openChatAlbum() { throw new Error(reason); },
     async openReadableChatAlbumFolder() { throw new Error(reason); },
     async listAttachmentStates() { return []; },
+    async listStoredAttachments() { return { attachments: [], nextCursor: null }; },
     async listAgentStatuses() { return []; },
     async openAttachment() { return false; },
     async downloadAttachment() { return false; },

@@ -159,6 +159,59 @@ describe('update check service', () => {
     second.service.stop();
   });
 
+  it.each(['1.0.275', '1.0.274'])('reconciles stale persisted availability at current version %s before publishing', async (version) => {
+    const initial = { ...DEFAULT_PERSISTED, latestVersion: version, releaseUrl: RELEASE_URL, available: true,
+      lastCheckedAt: new Date().toISOString() };
+    const { service, memory, states } = build({ initial, version: '1.0.275' });
+    const state = await service.start();
+    expect(state.available).toBe(false);
+    expect(memory.saved).toMatchObject({ available: false });
+    expect(states.at(-1)).toMatchObject({ available: false });
+    service.stop();
+  });
+
+  it('turns a legacy equal-version available cache into a persisted installed notice', async () => {
+    const initial = { ...DEFAULT_PERSISTED, latestVersion: '1.0.275', releaseUrl: RELEASE_URL, available: true,
+      lastCheckedAt: new Date().toISOString() };
+    const { service, memory } = build({ initial, version: '1.0.275' });
+    const state = await service.start();
+    expect(state).toMatchObject({ available: false, installedNotice: { version: '1.0.275', releaseUrl: RELEASE_URL } });
+    expect(memory.saved).toMatchObject({ available: false, installedNotice: { version: '1.0.275', releaseUrl: RELEASE_URL } });
+    service.stop();
+  });
+
+  it('acknowledges an installed notice only after the trusted details page opens', async () => {
+    const initial = { ...DEFAULT_PERSISTED, latestVersion: '1.0.275', releaseUrl: RELEASE_URL, available: false,
+      installedNotice: { version: '1.0.275', releaseUrl: RELEASE_URL } };
+    const { service, memory, openExternal } = build({ initial, version: '1.0.275' });
+    await service.start();
+    expect(await service.openInstalledDetails()).toMatchObject({ installedNotice: null });
+    expect(openExternal).toHaveBeenCalledWith(RELEASE_URL);
+    expect(memory.saved).toMatchObject({ installedNotice: null });
+    service.stop();
+    const restarted = build({ initial: memory.saved, version: '1.0.275' });
+    expect((await restarted.service.start()).installedNotice).toBeNull();
+    restarted.service.stop();
+  });
+
+  it('keeps an installed notice when opening its details page fails', async () => {
+    const initial = { ...DEFAULT_PERSISTED, installedNotice: { version: '1.0.275', releaseUrl: RELEASE_URL } };
+    const { service, memory } = build({ initial, version: '1.0.275', openExternal: () => { throw new Error('browser failed'); } });
+    await service.start();
+    expect(await service.openInstalledDetails()).toMatchObject({ installedNotice: { version: '1.0.275' } });
+    expect(memory.saved).toMatchObject({ installedNotice: { version: '1.0.275' } });
+    service.stop();
+  });
+
+  it('keeps the installed notice when its successful details opening cannot be durably acknowledged', async () => {
+    const initial = { ...DEFAULT_PERSISTED, installedNotice: { version: '1.0.275', releaseUrl: RELEASE_URL } };
+    const store: UpdateCheckStore = { load: async () => initial, save: async () => { throw new Error('disk full'); } };
+    const service = createUpdateCheckService({ currentVersion: '1.0.275', fetch: async () => jsonResponse(release()), store, openExternal: () => undefined });
+    await service.start();
+    expect(await service.openInstalledDetails()).toMatchObject({ installedNotice: { version: '1.0.275', releaseUrl: RELEASE_URL } });
+    service.stop();
+  });
+
   it('checks 60 seconds after start when the last check is older than 6 hours', async () => {
     const initial = { ...DEFAULT_PERSISTED, lastCheckedAt: new Date(Date.now() - UPDATE_CHECK_INTERVAL_MS - 1000).toISOString() };
     const { service, fetch } = build({ initial });

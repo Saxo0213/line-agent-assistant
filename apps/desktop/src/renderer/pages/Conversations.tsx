@@ -39,6 +39,7 @@ import { ConversationSortMenu, DEFAULT_SORT, type SortState } from './Conversati
 import { useFriends } from '../useFriends.js';
 import { MessageReadReceipt } from './MessageReadReceipt.js';
 import { ChatResources, type ChatResourceApi } from './ChatResources.js';
+import { ChatStoredFiles } from './ChatStoredFiles.js';
 
 const nameCompare = (left: string, right: string, locale: Locale) => left.localeCompare(right, locale, { sensitivity: 'base', numeric: true });
 
@@ -1109,7 +1110,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     </section>
     <section className="chat-panel" id="active-chat-panel"><button className="mobile-list-toggle" onClick={() => setListOpen(!listOpen)}>{desktopText('chatList')}</button>
       {route && account ? <>
-        <header className={`chat-header line-chat-header route-${account.mode}`} data-testid="address-plate"><div className="chat-title-wrap"><AvatarWithTypeBadge chatType={route.chatType}><LineMediaImage api={api} enabled={conversation!.avatarAvailable === true} target={{ type: 'conversation', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId }} fallbackKind={route.chatType === 'direct' ? 'person' : 'group'} className="chat-conversation-avatar" /></AvatarWithTypeBadge><h2>{conversation!.title || conversationFallbackTitle(route.chatType)}</h2></div><div className="chat-header-meta"><div className={`agent-trigger-status ${conversation!.agentEnabled ? 'enabled' : 'disabled'}`} role="status">{desktopText('agentTrigger')}{conversation!.agentEnabled ? desktopText('enabled') : desktopText('disabled')}</div><ChatResources key={`${routeKey}:${account.mode}:${account.status}`} api={api as DesktopApi & ChatResourceApi} route={route} accountStatus={account.status} accountMode={account.mode} /></div></header>
+        <header className={`chat-header line-chat-header route-${account.mode}`} data-testid="address-plate"><div className="chat-title-wrap"><AvatarWithTypeBadge chatType={route.chatType}><LineMediaImage api={api} enabled={conversation!.avatarAvailable === true} target={{ type: 'conversation', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId }} fallbackKind={route.chatType === 'direct' ? 'person' : 'group'} className="chat-conversation-avatar" /></AvatarWithTypeBadge><h2>{conversation!.title || conversationFallbackTitle(route.chatType)}</h2></div><div className="chat-header-meta"><div className={`agent-trigger-status ${conversation!.agentEnabled ? 'enabled' : 'disabled'}`} role="status">{desktopText('agentTrigger')}{conversation!.agentEnabled ? desktopText('enabled') : desktopText('disabled')}</div><ChatStoredFiles key={routeKey} api={api} route={route} /><ChatResources key={`${routeKey}:${account.mode}:${account.status}`} api={api as DesktopApi & ChatResourceApi} route={route} accountStatus={account.status} accountMode={account.mode} /></div></header>
         <div className="timeline-frame">
         <div className="timeline" id="timeline" tabIndex={-1} ref={timeline} onScroll={(event) => {
           const own = pinTop.current !== null && Math.abs(event.currentTarget.scrollTop - pinTop.current) < 1;
