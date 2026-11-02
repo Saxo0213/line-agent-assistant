@@ -45,6 +45,7 @@ export interface AgentScheduleTargetResolver {
   /** Returns the targets with a refreshed title; throws AgentScheduleError('SCHEDULE_INVALID_TARGET') for an unknown or forbidden one. */
   resolve(targets: readonly AgentScheduleTarget[], purpose?: AgentScheduleTargetPurpose): Promise<AgentScheduleTarget[]>;
   list(query: string | undefined, limit: number, purpose?: AgentScheduleTargetPurpose): Promise<AgentScheduleTargetOption[]>;
+  validateForward?(shape:Pick<AgentScheduleCreateInput,'targets'|'task'|'delivery'>):Promise<void>;
 }
 
 /** The Agent account's direct chat with the current Primary Admin, as the delivery target of a primary_admin schedule. */
@@ -378,6 +379,7 @@ export class AgentScheduleService {
       targets: await this.resolveTargets(input.targets),
       delivery: input.delivery.mode === 'line_target' ? { mode: 'line_target', target: await this.resolveSendTarget(await this.currentDeliveryTarget(input.delivery.target)) } : input.delivery,
     };
+    await this.options.targets?.validateForward?.(resolved);
     if (signal?.aborted) throw signal.reason ?? new Error('Schedule request cancelled before database mutation.');
     const schedule = await this.options.store.create(resolved, this.now(), accountScope);
     this.changed();
@@ -396,6 +398,7 @@ export class AgentScheduleService {
     if (patch.delivery?.mode === 'line_target') {
       resolved.delivery = { mode: 'line_target', target: await this.resolveSendTarget(await this.currentDeliveryTarget(patch.delivery.target)) };
     }
+    await this.options.targets?.validateForward?.({targets:resolved.targets??current.targets,task:resolved.task??current.task,delivery:resolved.delivery??current.delivery});
     const schedule = await this.options.store.update(scheduleId, resolved, this.now());
     this.changed();
     return schedule;
@@ -411,6 +414,8 @@ export class AgentScheduleService {
     if (patch.delivery?.mode === 'line_target') {
       resolved.delivery = { mode: 'line_target', target: await this.resolveSendTarget(await this.currentDeliveryTarget(patch.delivery.target)) };
     }
+    const current=await this.options.store.get(scheduleId);
+    if(current) await this.options.targets?.validateForward?.({targets:resolved.targets??current.targets,task:resolved.task??current.task,delivery:resolved.delivery??current.delivery});
     if (!this.options.store.updateExternalScoped) throw new AgentScheduleError('SCHEDULE_NOT_FOUND', 'Schedule not found.');
     if (signal?.aborted) throw signal.reason ?? new Error('Schedule request cancelled before database mutation.');
     const schedule = await this.options.store.updateExternalScoped(scheduleId, resolved, allowedAccountIds, required, this.now());

@@ -32,6 +32,7 @@ import type { PoolClient } from 'pg';
 import type { SendMediaRequest } from '../connected-facade.js';
 import { resolveManagedAttachment } from '../security.js';
 import { splitDeliveryText } from './delivery-service.js';
+import { openManagedBlob, readHeldBytes } from '../attachment-preview.js';
 import type { OperationalAudit } from './operational-audit.js';
 import { gatewayFault, recordSendFault, sendFaultDbCode, sendFaultDetail, workerFault, type SendFault } from './send-failure.js';
 
@@ -78,6 +79,7 @@ export interface AgentLineSendOptions {
 
 /** Audit principal of a message sent by Main itself for a system message schedule (no Agent job, no provider). */
 export const SYSTEM_SCHEDULE_PRINCIPAL = 'system:schedule';
+export const SYSTEM_FORWARD_PRINCIPAL = 'system:message_forward';
 /** Audit principal of a group free-mode notice (docs/architecture/group-free-mode.md). */
 export const FREE_MODE_PRINCIPAL = 'system:free_mode';
 /** Audit principal of a /folder reply (docs/architecture/project-folders.md). */
@@ -89,8 +91,10 @@ export interface SystemTextInput {
   runId: string;
   target: { accountId: string; chatType: SendChatType; chatId: string };
   text: string;
+  /** System forwarding persists one physical part; no markdown splitting is permitted. */
+  physicalPart?: boolean;
   /** Audit principal; defaults to the schedule principal. */
-  principalId?: typeof SYSTEM_SCHEDULE_PRINCIPAL | typeof FREE_MODE_PRINCIPAL | typeof PROJECT_FOLDER_PRINCIPAL | typeof PROVIDER_QUOTA_PRINCIPAL;
+  principalId?: typeof SYSTEM_SCHEDULE_PRINCIPAL | typeof SYSTEM_FORWARD_PRINCIPAL | typeof FREE_MODE_PRINCIPAL | typeof PROJECT_FOLDER_PRINCIPAL | typeof PROVIDER_QUOTA_PRINCIPAL;
   signal?: AbortSignal;
   /** Rechecked after FIFO wait and immediately before LINE send; false means a safely skipped write. */
   validateBeforeSend?: (binding: WorkerBinding) => Promise<boolean>;
@@ -118,6 +122,7 @@ export interface SendPlan {
   chatId: string;
   workspacePath: string | null;
   items: PlannedItem[];
+  managedForward?: { attachmentId: string; source: { accountId: string; chatType: string; chatId: string; messageId: string } };
 }
 export type AuthorizeOutcome = { kind: 'rejected'; output: McpSendToTargetOutput } | { kind: 'plan'; plan: SendPlan };
 
@@ -352,7 +357,8 @@ export class AgentLineSendService implements AgentLineSendHandler {
   async sendSystemText(input: SystemTextInput): Promise<SystemTextResult> {
     const principalId = input.principalId ?? SYSTEM_SCHEDULE_PRINCIPAL;
     const unavailable: SystemTextResult = { status: 'failed', code: 'send_line_unavailable' };
-    const parts = splitDeliveryText(input.text);
+    const parts = input.physicalPart && principalId === SYSTEM_FORWARD_PRINCIPAL
+      ? (input.text.length <= 4900 ? [input.text] : []) : splitDeliveryText(input.text);
     if (this.stopping || parts.length === 0) return unavailable;
     const messages = this.options.messages;
     const byteSize = utf8Length(input.text);
@@ -376,6 +382,29 @@ export class AgentLineSendService implements AgentLineSendHandler {
     if (result?.status === 'unknown') return { status: 'unknown', code: 'send_unknown' };
     if (result?.status === 'skipped') return { status: 'failed', code: 'send_line_unavailable' };
     return { status: 'failed', code: result?.status === 'failed' ? result.code ?? 'send_failed' : 'send_line_unavailable' };
+  }
+
+  async sendSystemAttachment(input: Omit<SystemTextInput,'text'> & { attachmentId:string;
+    source:{accountId:string;chatType:string;chatId:string;messageId:string} }):Promise<SystemTextResult> {
+    const fail: SystemTextResult={status:'failed',code:'send_attachment_unavailable'};
+    if(this.stopping || input.target.chatType==='room' || !input.validateBeforeSend) return fail;
+    const accountId=await this.options.messages.findAgentSendAccount();
+    if(accountId!==input.target.accountId || !accountId || !await this.options.canWriteLine(accountId)) return fail;
+    if(!await this.options.messages.getSendTarget(accountId,input.target.chatType,input.target.chatId)) return fail;
+    const source=await this.options.messages.resolveSendSourceMessage(input.source);
+    const attachment=source?.attachments.find((candidate)=>candidate.attachmentId===input.attachmentId);
+    if(!source || source.masked || !attachment || attachment.accountId!==input.source.accountId
+      || attachment.status!==ATTACHMENT_STORED_STATUS || !attachment.relativePath || !attachment.sha256 || attachment.sizeBytes===null) return fail;
+    const plan:SendPlan={jobId:input.runId,principalId:SYSTEM_FORWARD_PRINCIPAL,accountId,chatType:input.target.chatType,
+      chatId:input.target.chatId,workspacePath:null,managedForward:{attachmentId:input.attachmentId,source:input.source},
+      items:[{index:0,auditKind:'attachment',kind:'media',mediaKind:attachment.kind==='image'?'image':'file',
+        name:attachment.name??path.posix.basename(attachment.relativePath),source:{type:'stored',relativePath:attachment.relativePath,
+          sizeBytes:attachment.sizeBytes,sha256:attachment.sha256}}]};
+    const output=await this.run(plan,{signal:input.signal??this.controller.signal,isLive:()=>!this.stopping,validateBeforeSend:input.validateBeforeSend});
+    const result=output.results[0];
+    if(result?.status==='sent') return {status:'sent'};
+    if(result?.status==='unknown') return {status:'unknown',code:'send_unknown'};
+    return {status:'failed',code:result?.status==='failed'?result.code??'send_failed':'send_line_unavailable'};
   }
 
   private async currentBinding(accountId: string): Promise<ActiveBinding | null> {
@@ -539,6 +568,19 @@ export class AgentLineSendService implements AgentLineSendHandler {
     }
     const binding = await fresh();
     if (!binding) return unavailable(false);
+    if(plan.managedForward) {
+      const source=await this.options.messages.resolveSendSourceMessage(plan.managedForward.source);
+      const current=source?.attachments.find((candidate)=>candidate.attachmentId===plan.managedForward!.attachmentId);
+      if(!source || source.masked || !current || current.status!==ATTACHMENT_STORED_STATUS || current.relativePath!==
+        (item.source.type==='stored'?item.source.relativePath:null) || current.sha256!==hashed.sha256 || current.sizeBytes!==hashed.size) return unavailable(false);
+      const held=item.source.type==='stored' ? await openManagedBlob(this.options.attachmentRoot,item.source.relativePath,this.controller.signal).catch(()=>null) : null;
+      if(!held) return unavailable(false);
+      try {
+        const bytes=await readHeldBytes(held,item.mediaKind==='image'?SEND_IMAGE_MAX_BYTES:SEND_FILE_MAX_BYTES,this.controller.signal);
+        if(!bytes || createHash('sha256').update(bytes).digest('hex')!==hashed.sha256) return unavailable(false);
+      } finally { await held.close(); }
+    }
+    if(call.validateBeforeSend && !await call.validateBeforeSend(binding).catch(()=>false)) return unavailable(false);
     const requestId = randomUUID();
     let outcome: 'sent' | SendFault;
     try {

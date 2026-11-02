@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { AccountMode, ConversationKey, InboundEnvelope, WritableConversationKey, LineWorkerCommand, LineWorkerEvent, WorkerBinding } from '@line-agent/contracts';
-import { isWritableChatType, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+import { isWritableChatType, diagnosticFailure, InboundEnvelopeSchema, normalizeMentionRanges, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AccountRepository, AdminRepository, AgentJobStatusProjection, FriendWhitelistRepository, MessageRepository, RoutingDecision, SettingsRepository } from '@line-agent/database';
+import type { ExternalMonitorAgentReceipt } from '@line-agent/database';
+import { bridgeNativeEnvelope } from '@line-agent/database';
 import { hasOwnMention, isAgentSwitchText, isFolderCommandText, isFreeCommandText, isPersonaCommandText, routeTrigger, type FolderCommand, type FreeCommand, type PersonaCommand, type TriggerDecision } from './trigger-router.js';
 import { executePersonaCommand } from './agent-persona.js';
 import { classifyRoomControl, ownMentionBody, sanitizeRoomControlEnvelope, type RoomActivationCommand } from './room-control.js';
@@ -515,20 +517,55 @@ export class LineService {
 
   async handleWorkerEvent(processInstanceId: string, event: LineWorkerEvent): Promise<readonly string[] | undefined> {
     if (event.type !== 'batch') return this.handleWorkerEventInLane(processInstanceId, event);
+    return this.inAccountIngress(event.accountId, () => this.handleWorkerEventInLane(processInstanceId, event));
+  }
+
+  /** Explicit monitor execution origin: never participates in worker cursor, ACK or startup state. */
+  async handleMonitorReceipt(receipt: ExternalMonitorAgentReceipt): Promise<void> {
+    await this.inAccountIngress(receipt.agentAccountId, async () => {
+      const binding = this.binding(receipt.agentAccountId);
+      if (!binding || binding.controlEpoch !== receipt.controlEpoch) throw new Error('Monitor Agent is not ready');
+      await this.bindingReady.get(binding.workerInstanceId);
+      const observation = receipt.observation;
+      const mentionRanges = normalizeMentionRanges(observation.text, observation.mentionRanges);
+      const mentions = [...new Set([...(observation.mentionIds ?? []),...mentionRanges.map((range)=>range.userId)])];
+      const native = bridgeNativeEnvelope(observation.nativePayload);
+      const contact = native?.content?.type === 'contact' && native.content.mid && native.content.displayName
+        ? { mid:native.content.mid,displayName:native.content.displayName } : undefined;
+      const envelope = InboundEnvelopeSchema.parse({ eventId: `monitor:${receipt.sourceId}:${receipt.observationId}`,
+        accountId: receipt.agentAccountId, chatType: receipt.chatType, chatId: receipt.targetChatId,
+        senderId: receipt.senderId, messageId: receipt.messageId, kind: observation.kind === 'contact' && !contact ? 'rich' : observation.kind,
+        ...(contact ? {contact} : {}),
+        text: observation.text, mentionIds: mentions,
+        mentionRanges,
+        replyToMessageId: native?.replyToMessageId ?? null,
+        attachments: (observation.attachments ?? []).map(({expiresAt: _expiresAt,...descriptor}) => descriptor),
+        occurredAt: observation.occurredAt, raw: {},
+        // This is routing eligibility only; canonical storage retains native history provenance.
+        ingestion: { source: 'live', cursor: null } });
+      const cursor = { version: 1 as const, revision: '0', globalRev: '0', individualRev: '0' };
+      await this.handleWorkerEventInLane(binding.workerInstanceId, { type: 'batch', ...pickWorkerBinding(binding),
+        batchId: `monitor:${receipt.sourceId}:${receipt.observationId}`, cursorBefore: cursor, cursorAfter: cursor,
+        envelopes: [envelope] }, { recovered: true, receiptCurrent: true, sensitive: false, monitorReceipt: receipt });
+      if (this.bindings.get(binding.workerInstanceId) !== binding) throw new Error('Monitor Agent binding changed');
+    });
+  }
+
+  private async inAccountIngress<T>(accountId: string, work: () => Promise<T>): Promise<T> {
     if (this.ingressClosed) throw new Error('ACCOUNT_INGRESS_CLOSED');
-    const lane = this.ingressLanes.get(event.accountId) ?? { tail: Promise.resolve(), count: 0 };
+    const lane = this.ingressLanes.get(accountId) ?? { tail: Promise.resolve(), count: 0 };
     if (lane.count >= 2) throw new Error('ACCOUNT_INGRESS_CAPACITY');
-    this.ingressLanes.set(event.accountId, lane);
+    this.ingressLanes.set(accountId, lane);
     lane.count++;
     const operation = lane.tail.catch(() => undefined).then(() => {
       if (this.ingressClosed) throw new Error('ACCOUNT_INGRESS_CLOSED');
-      return this.handleWorkerEventInLane(processInstanceId, event);
+      return work();
     });
     lane.tail = operation;
     try { return await operation; }
     finally {
       lane.count--;
-      if (!lane.count && this.ingressLanes.get(event.accountId) === lane) this.ingressLanes.delete(event.accountId);
+      if (!lane.count && this.ingressLanes.get(accountId) === lane) this.ingressLanes.delete(accountId);
     }
   }
 
@@ -538,7 +575,7 @@ export class LineService {
   }
 
   private async handleWorkerEventInLane(processInstanceId: string, event: LineWorkerEvent,
-    recovered?: { recovered: true; receiptCurrent: boolean; sensitive: boolean }): Promise<readonly string[] | undefined> {
+    recovered?: { recovered: true; receiptCurrent: boolean; sensitive: boolean; monitorReceipt?: ExternalMonitorAgentReceipt }): Promise<readonly string[] | undefined> {
     const binding = this.bindings.get(processInstanceId);
     if (!binding || !this.isCurrentWorkerEvent(processInstanceId, event)) return;
     if (event.type === 'logoutResult') {
@@ -723,12 +760,12 @@ export class LineService {
         secretCandidate: original.accountId === binding.accountId && event.accountId === binding.accountId
           ? ingress.secretCandidate : null,
         ownMid, control: classifyRoomControl(ingress.envelope, ownMid, binding.accountId),
-        ...(recovered ? { sensitive: recovered.sensitive } : {}) };
+        ...(recovered && !recovered.monitorReceipt ? { sensitive: recovered.sensitive } : {}) };
     });
     const useIndependentIngest = typeof (this.messages as unknown as { ingestBatchSource?: unknown }).ingestBatchSource === 'function';
     if (useIndependentIngest && !recovered) await this.messages.prepareBatchConversations({ ...event, envelopes: prepared.map(({ envelope }) => envelope) });
     const sourceBatch = { ...event, envelopes: prepared.map(({ envelope }) => envelope) };
-    if (event.startupSync === true || (event.startupSync === undefined && this.isStartupSyncActive(binding))) {
+    if (!recovered?.monitorReceipt && (event.startupSync === true || (event.startupSync === undefined && this.isStartupSyncActive(binding)))) {
       const decisions: RoutingDecision[] = prepared.map(() => ({ eligible: false, action: 'ignore' }));
       let result: Awaited<ReturnType<MessageRepository['ingestBatchAndRoute']>>;
       if (useIndependentIngest && !recovered) {
@@ -762,7 +799,8 @@ export class LineService {
     }
     const workspacePromise = this.workspaceAuthority.inspect();
     const storagePromise = useIndependentIngest && !recovered
-      ? this.messages.ingestBatchSource(sourceBatch, new Set(prepared.filter((item) => item.sensitive).map((item) => item.envelope.messageId)))
+      ? this.messages.ingestBatchSource(sourceBatch, new Set(prepared.filter((item) => item.sensitive).map((item) => item.envelope.messageId)), true,
+        new Map(prepared.map((item)=>[item.envelope.messageId,item.forwardText])))
       : null;
     const existingRoutesPromise = useIndependentIngest
       ? this.messages.existingLiveRoutes(sourceBatch)
@@ -789,6 +827,7 @@ export class LineService {
     const personaAdminCommandIds = new Set<string>();
     const personaDispatches = new Map<string, PersonaCommand>();
     const primaryAdminLookupFailedIds = new Set<string>();
+    let monitorLiveFallback = false;
     for (const { envelope, ownMid, control, sensitive } of prepared) {
       const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
       const conversation = await this.settings.getConversationAgent(key);
@@ -828,6 +867,7 @@ export class LineService {
       const routed = permissionClaimed || primaryAdminLookupFailed ? { type: 'ignore' as const } : routeTrigger(envelope, { ownMid,
         agentEnabled: roomAgentEnabled, defaultProvider: await resolveChatProvider(this.settings, conversation?.provider),
         senderIsPrimaryAdmin, primaryAdmin: primaryAdmin === true, senderIsFolderAdmin: primaryAdmin, workspaceConfigured: true, freeModeActive: this.freeMode?.isActive(key) ?? false });
+      if (!['prompt','ignore','stop','new','status'].includes(routed.type)) monitorLiveFallback=true;
       // Free-mode decisions are applied after ingestion; for storage and admission they are plain ignored messages.
       const freeDispatch: FreeDispatch | null = !this.freeMode ? null : routed.type === 'free' || routed.type === 'free_range' ? { command: routed }
         : routed.type === 'free_message' ? { message: true } : null;
@@ -875,13 +915,18 @@ export class LineService {
           workspacePath: workspace.configuredPath, code: 'INVALID_WORKSPACE', reason: workspace.reason },
         ...primaryAdminAdmission });
     }
+    // Configuration/dialogue effects retain their existing live receiver. Do not close their canonical route.
+    if (recovered?.monitorReceipt && ((!existingRoutes.size && decisions.every((decision)=>!decision.eligible && !('workspaceFailure' in decision) && decision.action==='ignore'))
+      || monitorLiveFallback || primaryAdminLookupFailedIds.size || permissionTickets.size || freeDispatches.size || folderDispatches.size
+      || personaDispatches.size || agentDispatches.size || quotaDispatches.size || administrative.size
+      || prepared.some(({ control, sensitive }) => control.type !== 'none' || sensitive))) return [];
     const admissionPromise = useIndependentIngest
-      ? this.messages.admitLiveBatch(sourceBatch, decisions)
+      ? this.messages.admitLiveBatch(sourceBatch, decisions, recovered?.monitorReceipt)
       : null;
     if (admissionPromise) void admissionPromise.catch(() => undefined);
     // Auto-replies are an independent automation branch. Start the bounded effect
     // from the inbound routing decision, without waiting for canonical storage.
-    if (useIndependentIngest && this.roomControl?.respond) {
+    if (useIndependentIngest && !recovered?.monitorReceipt && this.roomControl?.respond) {
       for (const [index, { envelope, ownMid, control, sensitive }] of prepared.entries()) {
         const decision = decisions[index]!;
         const promptAdmitted = decision.eligible || 'workspaceFailure' in decision;
@@ -907,13 +952,18 @@ export class LineService {
     let admissionResult: Awaited<ReturnType<MessageRepository['admitLiveBatch']>> | null = null;
     if (useIndependentIngest && recovered) {
       const admittedBatch: AdmittedBatch = await admissionPromise!.catch((error: unknown) => {
+        if (recovered.monitorReceipt) throw error;
         this.reportFailure('admission', error);
         return { jobIds: [], jobMessageIds: [], jobStatuses: [], primaryAdminActionMessageIds: [], routeDecisions: decisions };
       });
       try { await this.messages.recordBatchRoutes(sourceBatch, admittedBatch.routeDecisions,
-        new Set(admittedBatch.jobStatuses.map((status) => status.sourceMessageId))); } catch (error) { this.reportFailure('persist', error); }
+        new Set(admittedBatch.jobStatuses.map((status) => status.sourceMessageId))); } catch (error) {
+        if (recovered.monitorReceipt) throw error;
+        this.reportFailure('persist', error);
+      }
       admissionResult = admittedBatch;
-      result = { inserted: 0, duplicate: 0, insertedMessageIds: [], changedMessageIds: [],
+      result = { inserted: 0, duplicate: 0,
+        insertedMessageIds: recovered.monitorReceipt ? prepared.map(({ envelope }) => envelope.messageId).filter((id) => !existingRoutes.has(id)) : [], changedMessageIds: [],
         readPositionsChanged: 0, readPositionChanges: [], ...admittedBatch };
     } else if (useIndependentIngest) {
       try { result = await storagePromise!; }
@@ -948,14 +998,14 @@ export class LineService {
       consumed.add(envelope.messageId);
       return envelope.accountId === binding.accountId && envelope.ingestion.source === 'live';
     });
-    for (const { envelope, secretCandidate, ownMid } of admitted) {
+    for (const { envelope, secretCandidate, ownMid } of recovered?.monitorReceipt ? [] : admitted) {
       if (!this.isCurrentWorkerEvent(processInstanceId, event)) break;
       if (primaryAdminLookupFailedIds.has(envelope.messageId)) continue;
       if (await this.onInboundEnvelope?.(envelope, secretCandidate, ownMid, binding)) administrative.add(envelope.messageId);
     }
     const queued = new Set(result.jobMessageIds);
     const attachmentIds: string[] = [];
-    if (this.attachments) {
+    if (this.attachments && !recovered?.monitorReceipt) {
       for (const envelope of prepared.map(({ envelope }) => envelope).filter((envelope) => inserted.has(envelope.messageId))) {
         for (const descriptor of envelope.attachments) {
           const attachment = await this.messages.getAttachmentBySource(
@@ -971,7 +1021,7 @@ export class LineService {
       if (queued.has(envelope.messageId)) this.agents.kick(action.key);
       await this.applyPendingAction(binding, action.key, envelope.messageId);
     }
-    if (!useIndependentIngest) {
+    if (!useIndependentIngest && !recovered?.monitorReceipt) {
       // Keep the legacy path for narrow service test doubles; production ACK is issued from storagePromise above.
       await this.worker.send({ type: 'ackBatch', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
         controlEpoch: binding.controlEpoch, batchId: event.batchId, cursorAfter: event.cursorAfter });

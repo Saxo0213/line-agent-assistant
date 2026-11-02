@@ -1,4 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
+import { ScheduleForwardRepository } from '@line-agent/database';
+import { ScheduleForwardService } from './services/schedule-forward-service.js';
 import type { Pool } from 'pg';
 import type {
   AgentEvent, AgentProvider, AgentRunRequest, ConversationKey, DiagnosticIdentity, DownloadAuthProbe, IpcEvent, IpcRequest, IpcResult, LineWorkerCommand,
@@ -528,6 +530,31 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let stopContentReprojection: () => Promise<void> = async () => undefined;
   let lineService!: LineService;
   let lineServiceReady = false;
+  let monitorDispatchFlight: Promise<void> | null = null;
+  function requestMonitorDispatch(): void {
+    if (closing || !lineServiceReady || monitorDispatchFlight) return;
+    monitorDispatchFlight = track(async () => {
+      const ready = await options.pool.query<{ account_id: string }>("SELECT account_id FROM line_accounts WHERE product_role='AGENT' AND mode='ACTIVE_CONTROL'");
+      for (const row of ready.rows) {
+        if (closing || !lineService.binding(row.account_id)) continue;
+        const receipts = await externalMonitor.listPendingAgentDispatchReceipts(row.account_id,50);
+        for (const receipt of receipts) {
+          if (closing) return;
+          try {
+            await lineService.handleMonitorReceipt(receipt);
+            await externalMonitor.finishAgentDispatchReceipt(receipt);
+          } catch (error) {
+            options.audit?.failure(diagnosticFailure('line_ingest','recover',error));
+            // One unavailable receipt cannot block independent later messages in this bounded pass.
+          }
+        }
+      }
+    }, { operation:'external_monitor',identity:{background:true} }).finally(() => { monitorDispatchFlight=null; });
+    void monitorDispatchFlight.catch(() => undefined);
+  }
+  const monitorDispatchTimer = setInterval(requestMonitorDispatch,1000);
+  monitorDispatchTimer.unref();
+  startupCleanup.add(() => clearInterval(monitorDispatchTimer));
   startupCleanup.beforeUnwind(async () => {
     closing = true;
     manualMediaAdmission.shutdown();
@@ -818,7 +845,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     readMessages: createScheduleMessageReader((tool, context) => mcpService.callInternalTool(tool, context ?? { sourceType: 'schedule', accountScope: null })),
     publish: () => { options.publish?.({ type: 'agentSchedulesChanged' }); },
     onError: (error) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); } });
-  stopAgentSchedules = onceCleanup(() => agentSchedules.stop());
+  const scheduleForward=new ScheduleForwardService({store:new ScheduleForwardRepository(options.pool),messages,sender:agentLineSend,
+    publish:()=>options.publish?.({type:'agentSchedulesChanged'}),onError:(error)=>options.audit?.failure(diagnosticFailure('agent','execute',error))});
+  stopAgentSchedules = onceCleanup(async () => { await scheduleForward.stop(); await agentSchedules.stop(); });
   startupCleanup.add(stopAgentSchedules);
   mcpService = new McpService({ pool: options.pool, tokens: mcpTokens, messages, approvalBroker, lineSend: agentLineSend, schedules: agentSchedules,
     onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
@@ -937,6 +966,34 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (projection.sourceType === 'line' && projection.sourceMessageId) options.publish?.({ type: 'agentJobStatusChanged',
       accountId: projection.accountId, chatType: projection.chatType, chatId: projection.chatId, sourceMessageId: projection.sourceMessageId,
       jobId: projection.jobId, status: projection.status, revision: projection.revision });
+    if (projection.sourceType === 'line' && projection.sourceMessageId) {
+      const messageId=projection.sourceMessageId;
+      void track(async () => {
+        const aliases=await externalMonitor.listAgentMessageAliases({accountId:projection.accountId,
+          messageIds:[messageId],direction:'agent'});
+        if (closing) return;
+        for (const alias of aliases) if (alias.chatType===projection.chatType && alias.targetChatId===projection.chatId) {
+          options.publish?.({type:'agentJobStatusChanged',accountId:alias.monitoredAccountId,chatType:alias.chatType,
+            chatId:alias.sourceChatId,sourceMessageId:alias.messageId,jobId:projection.jobId,status:projection.status,revision:projection.revision});
+        }
+      }, {operation:'line_ingest',identity:{accountId:projection.accountId,background:true}}).catch(() => undefined);
+    }
+  }
+  async function monitorAliasedStatuses(key: ConversationKey, messageIds: readonly string[]) {
+    const aliases = (await externalMonitor.listAgentMessageAliases({accountId:key.accountId,messageIds,direction:'monitor'}))
+      .filter((alias) => alias.chatType===key.chatType && alias.sourceChatId===key.chatId);
+    const statuses: Array<{messageId:string;jobId:string;status:AgentJobStatusProjection['status'];revision:string}> = [];
+    const targets = new Map<string,typeof aliases>();
+    for (const alias of aliases) {
+      const id=JSON.stringify([alias.agentAccountId,alias.chatType,alias.targetChatId]);
+      const group=targets.get(id) ?? []; group.push(alias); targets.set(id,group);
+    }
+    for (const group of targets.values()) {
+      const target=group[0]!;
+      const rows=await agents.listLineJobStatus({accountId:target.agentAccountId,chatType:target.chatType,chatId:target.targetChatId},group.map((a)=>a.messageId));
+      for (const row of rows) if(row.sourceMessageId) statuses.push({messageId:row.sourceMessageId,jobId:row.jobId,status:row.status,revision:row.revision});
+    }
+    return statuses;
   }
   unsubscribeAuth = options.agent.onAuthStatus?.((auth) => {
     if (closing) return;
@@ -2071,6 +2128,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (!importer) throw new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup');
     const committer: Pick<ExternalMonitorRepository, 'commitDirectPoll'> = externalMonitor;
     let checkpoint = input.checkpoint;
+    // The first complete native polling round establishes the monitor high-water mark.
+    // Pages within that round remain archive-only, even when the reader paginates.
+    let firstMonitorRoundComplete = false;
     const initialState = await repository(() => externalMonitor.getInitialImportState({ accountId: input.accountId, sourceId: input.sourceId,
       generation: input.generation, signal: input.signal }));
     if (!initialState?.initialImportComplete || initialState.sourceIdentityDigest !== input.sourceIdentityDigest) {
@@ -2133,11 +2193,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           ...(page.tailWindow === undefined ? {} : { tailWindow: { upper: page.tailWindow.upper, lower: page.tailWindow.lower,
             ids: [...page.tailWindow.ids] } }),
           ...(page.unreadCounts === undefined ? {} : { unreadCounts: { entries: page.unreadCounts.entries.map(([id, n]): [string, number] => [id, n]) } }),
+          dispatchEligible: firstMonitorRoundComplete,
           signal };
         const committed: ExternalDirectPollResult = await repository(() => committer.commitDirectPoll(poll));
+        requestMonitorDispatch();
         // The repository commits this cursor atomically with the page. Advance
         // the local predecessor only after that transaction resolves.
         checkpoint = poll.cursor;
+        if (!page.hasMore) firstMonitorRoundComplete = true;
         if (!committed.replayed && committed.changedMessages.length > 0) pendingMonitorRefresh!.pending = true;
         if (!committed.replayed && committed.unreadChanged > 0) pendingMonitorRefresh!.pending = true;
         if (!page.hasMore && pendingMonitorRefresh!.pending) {
@@ -3514,6 +3577,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
              AND source_type='line' AND source_message_id=ANY($4::text[]) ORDER BY source_message_id,(retry_of_job_id IS NOT NULL) DESC,updated_at DESC`,
             [key.accountId, key.chatType, key.chatId, page.messages.map((item) => item.messageId)]);
           for (const job of jobs.rows) agentStatuses.set(job.source_message_id, { jobId: job.job_id, status: job.status, revision: job.revision });
+          for (const job of await monitorAliasedStatuses(key,page.messages.map((item)=>item.messageId))) {
+            agentStatuses.set(job.messageId,{jobId:job.jobId,status:job.status,revision:job.revision});
+          }
         } catch { /* Agent projection is optional; message detail must remain available. */ }
       }
       const timeline: TimelineMessage[] = page.messages.map((item) => { const detail = byId.get(item.messageId);
@@ -3569,8 +3635,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     async listAgentStatuses(key, messageIds) {
       if (!isWritableChatType(key.chatType)) return [];
       const rows = await agents.listLineJobStatus({ ...key, chatType: key.chatType }, messageIds);
-      return rows.filter((row): row is typeof row & { sourceMessageId: string } => row.sourceMessageId !== null)
+      const statuses=rows.filter((row): row is typeof row & { sourceMessageId: string } => row.sourceMessageId !== null)
         .map((row) => ({ messageId: row.sourceMessageId, jobId: row.jobId, status: row.status, revision: row.revision }));
+      return [...statuses,...await monitorAliasedStatuses(key,messageIds)];
     },
     async listWorkRecords() {
       const result = await options.pool.query<{ work_record_id: string; title: string; status: WorkRecord['status']; account_id: string; chat_type: WorkRecord['key']['chatType']; chat_id: string; updated_at: Date }>(
@@ -3607,6 +3674,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     },
     shutdown() {
       closing = true;
+      clearInterval(monitorDispatchTimer);
       manualMediaAdmission.shutdown();
       return shutdownPromise ??= (async () => {
         const errors: unknown[] = [];
@@ -3652,6 +3720,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   await agentService.recoverQueued();
   await freeMode.start().catch((error: unknown) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); });
   await agentSchedules.start().catch((error: unknown) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); });
+  await scheduleForward.start().catch((error:unknown)=>options.audit?.failure(diagnosticFailure('agent','execute',error)));
   void track(() => resumeExternalMonitorOnStartup(), { operation: 'external_monitor', identity: { background: true }, reportFailure: false })
     .catch((error: unknown) => {
     const stage = error instanceof ExternalMonitorDiagnosticFailure ? error.stage : 'startup';

@@ -215,7 +215,7 @@ function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T | 
   });
 }
 
-async function openManagedBlob(root: string, relativePath: string, signal?: AbortSignal): Promise<{ handle: FileHandle; target: string; close(): Promise<void> } | null> {
+export async function openManagedBlob(root: string, relativePath: string, signal?: AbortSignal): Promise<{ handle: FileHandle; target: string; close(): Promise<void> } | null> {
   if (!path.isAbsolute(root) || root.includes('\0') || (process.platform === 'win32' && /^(?:\\\\|\\\\[.?]\\)/.test(root)) || !safeRelativePath(relativePath)) return null;
   const segments = relativePath.split('/');
   const filename = segments.at(-1)!;
@@ -270,7 +270,7 @@ async function openManagedBlob(root: string, relativePath: string, signal?: Abor
   }
 }
 
-async function readHeldBytes(source: { handle: FileHandle; target: string }, maxBytes: number, signal?: AbortSignal): Promise<Buffer | null> {
+export async function readHeldBytes(source: { handle: FileHandle; target: string }, maxBytes: number, signal?: AbortSignal): Promise<Buffer | null> {
   if (signal?.aborted) return null;
   const before = await source.handle.stat();
   if (signal?.aborted) return null;

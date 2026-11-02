@@ -70,6 +70,23 @@ export function createAgentScheduleTargetResolver(deps: {
   }
 
   return {
+    async validateForward(shape) {
+      if(shape.task.type!=='message_forward' || shape.delivery.mode!=='line_target') return;
+      const target=shape.delivery.target;
+      const accounts=(await deps.pool.query<{account_id:string;own_mid:string;product_role:string;mode:string}>(
+        'SELECT account_id,own_mid,product_role,mode FROM line_accounts WHERE account_id=ANY($1::text[])',
+        [[...shape.targets.map((source)=>source.accountId),target.accountId]])).rows;
+      const destination=accounts.find((account)=>account.account_id===target.accountId);
+      if(destination?.product_role!=='AGENT'||destination.mode==='PAUSED'||target.chatType==='room') throw invalid(target);
+      for(const source of shape.targets) {
+        const account=accounts.find((candidate)=>candidate.account_id===source.accountId);
+        if(!account||!['AGENT','PRIMARY_ADMIN'].includes(account.product_role)||account.mode==='PAUSED') throw invalid(source);
+        const same=source.chatType===target.chatType && (source.chatType==='direct'
+          ? JSON.stringify([account.own_mid,source.chatId].sort())===JSON.stringify([destination.own_mid,target.chatId].sort())
+          :source.chatId===target.chatId);
+        if(same) throw new AgentScheduleError('SCHEDULE_INVALID_TARGET','Forwarding source and destination must differ');
+      }
+    },
     list: (query, limit, purpose: AgentScheduleTargetPurpose = 'read') => purpose === 'delivery' ? listDelivery(query, limit) : listRead(query, limit),
     resolve: (targets, purpose: AgentScheduleTargetPurpose = 'read') => purpose === 'delivery' ? resolveDelivery(targets) : resolveRead(targets),
   };

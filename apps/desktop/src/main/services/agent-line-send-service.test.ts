@@ -144,6 +144,19 @@ afterEach(async () => {
 });
 
 describe('target and account authorization', () => {
+  it('forwards a system owned original attachment with source authority rechecked before media send', async () => {
+    const id=randomUUID(), hash=createHash('sha256').update('original-image').digest('hex');
+    const relativePath=`att-${hash}.blob`;
+    await writeFile(path.join(attachmentRoot,relativePath),'original-image');
+    repo.attachments.set(id,{ attachmentId:id,accountId:'admin',kind:'image',name:'原圖.png',status:'ready',relativePath,sha256:hash,sizeBytes:14,masked:false });
+    const input={ runId:randomUUID(),target:{accountId:ACCOUNT,chatType:'direct' as const,chatId:'u-friend'},
+      source:{accountId:'admin',chatType:'group',chatId:'source',messageId:'m1'},attachmentId:id,validateBeforeSend:async()=>true };
+    repo.messages.set('m1',{kind:'image',text:null,masked:false,attachments:[repo.attachments.get(id)!]});
+    expect(await service.sendSystemAttachment(input)).toEqual({status:'sent'});
+    expect(worker.sent).toMatchObject([{kind:'media',mediaKind:'image',fileName:'原圖.png',sha256:hash}]);
+    expect(await service.sendSystemAttachment({...input,validateBeforeSend:async()=>false})).toMatchObject({status:'failed'});
+    expect(worker.sent).toHaveLength(1);
+  });
   it('returns no Agent send targets when the current external account scope excludes a paused Agent', async () => {
     repo.account = ACCOUNT;
     const output = await service.listTargets(fakeClient(), { query: 'Alice' }, ['primary-admin']);

@@ -81,6 +81,36 @@ database('external monitor foundation', () => {
     await expect(repository.readBatchFence({ accountId, sourceId, generation })).rejects.toThrow('External source authority is stale');
   });
 
+  it('returns dispatch receipts only for newly observed forward rows, never tail repairs or replays', async () => {
+    const accountId = 'external-monitor-forward-receipts';
+    const { sourceId, generation, modeRevision } = await createSource(accountId);
+    const accounts = new AccountRepository(pool);
+    const control = await accounts.getControlState();
+    expect((await accounts.activateControl('external-test-agent', control.controlEpoch)).activated).toBe(true);
+    const observation = { observationId: 'monitor-receipt-observation', canonicalMessageId: '123456789', nativeMessageId: '123456789',
+      chatType: 'direct' as const, chatId: 'external-test-agent-mid', senderId: `verified-mid-${accountId}`,
+      kind: 'text', text: 'run this', occurredAt: '2026-11-02T00:00:00Z' };
+    const unrelated = { ...observation, observationId: 'monitor-unrelated-direct', canonicalMessageId: '123456790',
+      nativeMessageId: '123456790', chatId: 'unrelated-direct' };
+    const agentEcho = { ...observation, observationId: 'monitor-agent-echo', canonicalMessageId: '123456791',
+      nativeMessageId: '123456791', senderId: 'external-test-agent-mid' };
+    const archiveOnly = { ...observation, observationId: 'monitor-archive-only', canonicalMessageId: 'legacy-id', nativeMessageId: undefined };
+    const committed = await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
+      expectedCheckpoint: null, batchId: 'monitor-receipt-forward', cursor: { id: 'monitor-receipt-message' },
+      forwardObservations: [observation, unrelated, agentEcho, archiveOnly], tailObservations: [], dispatchEligible: true });
+    const canonicalMessageId = committed.dispatchReceipts[0]?.observation.canonicalMessageId;
+
+    expect(committed.dispatchReceipts).toMatchObject([{ chatType: 'direct', sourceChatId: 'external-test-agent-mid',
+      targetChatId: `verified-mid-${accountId}`, messageId: '123456789', controlEpoch: control.controlEpoch }]);
+    expect(canonicalMessageId).toBe('123456789');
+    expect(await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
+      expectedCheckpoint: { id: 'monitor-receipt-message' }, batchId: 'monitor-receipt-tail-repair', cursor: { id: 'monitor-receipt-message' },
+      forwardObservations: [], tailObservations: [observation], dispatchEligible: true }))
+      .toMatchObject({ dispatchReceipts: [] });
+    await expect(repository.listPendingAgentDispatchReceipts('external-test-agent'))
+      .resolves.toMatchObject([{ messageId: canonicalMessageId }]);
+  });
+
   it('commits strict initial pages once and replays a committed page without double-counting', async () => {
     const accountId = 'external-initial-replay';
     const { sourceId, generation, modeRevision } = await createSource(accountId, {

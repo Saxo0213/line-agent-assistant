@@ -7,6 +7,7 @@ const REDACTED = VERIFICATION_CODE_MARKER;
 
 export type SanitizedIngress = Readonly<{
   envelope: InboundEnvelope;
+  forwardText: string | null;
   sensitive: boolean;
   secretCandidate: Readonly<{ code: string; exact: boolean }> | null;
 }>;
@@ -88,5 +89,5 @@ export function sanitizeInbound(
       attachments,
       raw: redactRaw(envelope.raw, new WeakMap()) as InboundEnvelope['raw'],
     };
-  return { envelope: sanitized, sensitive: containsCode || isContact, secretCandidate };
+  return { envelope: sanitized, forwardText:redacted?.text??null,sensitive: containsCode || isContact, secretCandidate };
 }

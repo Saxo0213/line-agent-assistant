@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { captureScheduleForward } from './schedule-forward-repository.js';
 import { ContactDescriptorSchema, InboundEnvelopeSchema, JsonValueSchema, normalizeNativePicturePath, type ContactDescriptor, type InboundEnvelope, type JsonValue } from '@line-agent/contracts';
 import { Buffer } from 'node:buffer';
 import type { Pool, PoolClient } from 'pg';
@@ -185,7 +186,105 @@ export interface ExternalDirectPollInput {
   tailWindow?: ExternalTailWindow;
   /** LINE's own per-chat unread counts (counts above zero only). When present, this account's conversations mirror it. */
   unreadCounts?: { entries: [string, number][] };
+  /** True only after the first complete monitor polling round; startup catch-up pages remain archive-only. */
+  dispatchEligible?: boolean;
   signal?: AbortSignal;
+}
+
+export interface ExternalMonitorAgentReceipt {
+  sourceId: string;
+  generation: number;
+  observationId: string;
+  monitoredAccountId: string;
+  agentAccountId: string;
+  modeRevision: number;
+  adminBindingMid: string;
+  adminBindingVersion: number;
+  controlEpoch: number;
+  chatType: 'direct' | 'group' | 'room';
+  sourceChatId: string;
+  targetChatId: string;
+  senderId: string;
+  messageId: string;
+  observation: ExternalObservation;
+}
+
+/** Locks the durable origin and every authority row until admission commits. */
+export class MonitorDispatchAuthorityError extends Error {}
+export async function lockMonitorAgentReceipt(client: PoolClient, receipt: ExternalMonitorAgentReceipt): Promise<void> {
+  const valid = await client.query(`SELECT r.observation FROM external_monitor_agent_receipts r
+    JOIN line_accounts admin ON admin.account_id=r.monitored_account_id
+    JOIN line_account_sources s ON s.account_id=admin.account_id AND s.source_id=admin.selected_source_id
+      AND s.generation=admin.selected_source_generation
+    JOIN line_accounts agent ON agent.account_id=r.agent_account_id
+    JOIN account_administrators aa ON aa.account_id=agent.account_id AND aa.role='PRIMARY_ADMIN'
+    JOIN account_administrator_versions av ON av.account_id=agent.account_id
+    JOIN account_control ctl ON ctl.singleton=true
+    WHERE r.source_id=$1 AND r.generation=$2 AND r.observation_id=$3 AND r.state IN ('pending','completed')
+      AND r.agent_account_id=$4 AND r.control_epoch=$5 AND r.message_id=$6
+      AND r.chat_type=$7 AND r.source_chat_id=$8 AND r.target_chat_id=$9 AND r.sender_id=$10
+      AND r.monitored_account_id=$11 AND r.mode_revision=$12 AND r.admin_binding_mid=$13 AND r.admin_binding_version=$14
+      AND s.source_id=r.source_id AND s.generation=r.generation AND s.state='ACTIVE'
+      AND admin.connection_mode='EXTERNAL_MONITOR' AND admin.source_transition_state='STABLE'
+      AND admin.product_role='PRIMARY_ADMIN' AND admin.mode_revision=r.mode_revision
+      AND s.admin_binding_account_id=agent.account_id AND s.admin_binding_mid=r.admin_binding_mid
+      AND s.admin_binding_version::bigint=r.admin_binding_version AND av.version::bigint=r.admin_binding_version
+      AND admin.own_mid=r.admin_binding_mid AND aa.user_id=r.admin_binding_mid
+      AND agent.product_role='AGENT' AND agent.mode='ACTIVE_CONTROL'
+      AND ctl.control_epoch=r.control_epoch AND r.sender_id<>agent.own_mid
+      AND ((r.chat_type='direct' AND r.source_chat_id=agent.own_mid AND r.target_chat_id=admin.own_mid)
+        OR (r.chat_type IN ('group','room') AND r.source_chat_id=r.target_chat_id AND EXISTS (
+          SELECT 1 FROM conversations c JOIN conversation_members cm USING(account_id,chat_type,chat_id)
+          WHERE c.account_id=agent.account_id AND c.chat_type=r.chat_type AND c.chat_id=r.target_chat_id
+            AND cm.member_id=agent.own_mid)))
+    FOR SHARE OF r,admin,s,agent,aa,av,ctl`,
+  [receipt.sourceId,receipt.generation,receipt.observationId,receipt.agentAccountId,receipt.controlEpoch,receipt.messageId,
+    receipt.chatType,receipt.sourceChatId,receipt.targetChatId,receipt.senderId,receipt.monitoredAccountId,
+    receipt.modeRevision,receipt.adminBindingMid,receipt.adminBindingVersion]);
+  if (valid.rowCount !== 1 || stableJson(valid.rows[0].observation) !== stableJson(receipt.observation)) {
+    throw new MonitorDispatchAuthorityError('Stale monitor dispatch authority');
+  }
+  if (receipt.chatType !== 'direct') {
+    const member = await client.query(`SELECT cm.member_id FROM conversation_members cm JOIN line_accounts agent
+      ON agent.account_id=cm.account_id AND agent.own_mid=cm.member_id
+      WHERE cm.account_id=$1 AND cm.chat_type=$2 AND cm.chat_id=$3 FOR SHARE OF cm`,
+    [receipt.agentAccountId,receipt.chatType,receipt.targetChatId]);
+    if (member.rowCount !== 1) throw new MonitorDispatchAuthorityError('Stale monitor membership');
+  }
+}
+
+export async function lockMonitorRouteReceipt(client: PoolClient, accountId: string, messageId: string): Promise<boolean> {
+  const found = await client.query<{ receipt: ExternalMonitorAgentReceipt }>(`SELECT jsonb_build_object(
+    'sourceId',r.source_id,'generation',r.generation,'observationId',r.observation_id,
+    'monitoredAccountId',r.monitored_account_id,'agentAccountId',r.agent_account_id,'modeRevision',r.mode_revision,
+    'adminBindingMid',r.admin_binding_mid,'adminBindingVersion',r.admin_binding_version,'controlEpoch',r.control_epoch,
+    'chatType',r.chat_type,'sourceChatId',r.source_chat_id,'targetChatId',r.target_chat_id,'senderId',r.sender_id,
+    'messageId',r.message_id,'observation',r.observation) receipt
+    FROM message_routes route JOIN external_monitor_agent_receipts r ON r.source_id=route.monitor_source_id
+      AND r.generation=route.monitor_generation AND r.observation_id=route.monitor_observation_id
+    WHERE route.account_id=$1 AND route.message_id=$2`,[accountId,messageId]);
+  if (found.rows[0]) {
+    try { await lockMonitorAgentReceipt(client,found.rows[0].receipt); }
+    catch(error) { if(error instanceof MonitorDispatchAuthorityError) return false; throw error; }
+  }
+  else if ((await client.query(`SELECT 1 FROM message_routes WHERE account_id=$1 AND message_id=$2
+    AND monitor_origin AND effect_applied_at IS NULL AND action IN ('stop','new','status')`,[accountId,messageId])).rowCount) {
+    return false;
+  }
+  return true;
+}
+
+/** A monitor mirror has native history provenance; the separate receipt authorizes execution. */
+export async function projectMonitorAgentReceipt(client: PoolClient, receipt: ExternalMonitorAgentReceipt,
+  envelope: InboundEnvelope): Promise<void> {
+  const prior = await client.query('SELECT 1 FROM messages WHERE account_id=$1 AND message_id=$2 FOR UPDATE',
+    [receipt.agentAccountId,receipt.messageId]);
+  if (prior.rowCount) return; // Never weaken authoritative live content or a previous mirror.
+  const { conversationTitle: _sourceTitle, ...observation } = receipt.observation;
+  await upsertCanonicalLineMessage(client, receipt.agentAccountId, receipt.sourceId, {
+    ...observation, chatId: receipt.targetChatId,
+    text: envelope.text, mentionIds: envelope.mentionIds, mentionRanges: envelope.mentionRanges,
+  });
 }
 
 export interface ExternalTailCursor { createdTime: string; id: string }
@@ -200,6 +299,8 @@ export interface ExternalDirectPollResult extends ExternalBatchResult {
   tailRepaired: number;
   /** Conversations whose unread_count changed to mirror LINE. */
   unreadChanged: number;
+  /** Newly committed monitor receipts, returned after the same transaction commits the checkpoint. */
+  dispatchReceipts: ExternalMonitorAgentReceipt[];
 }
 
 function normalizeUnreadCounts(value: { entries: [string, number][] } | undefined): [string, number][] | undefined {
@@ -383,6 +484,13 @@ function canonicalDigest(observation: ExternalObservation): string {
     text: observation.text, occurredAt: observation.occurredAt }));
 }
 
+function hasNativeLineMessageIdentity(observation: ExternalObservation): boolean {
+  return observation.nativeMessageId !== undefined && observation.nativeMessageId !== null
+    && observation.canonicalMessageId === observation.nativeMessageId
+    && /^(?:0|[1-9][0-9]{0,18})$/.test(observation.nativeMessageId)
+    && BigInt(observation.nativeMessageId) <= 9223372036854775807n;
+}
+
 function isLoginRecallObservation(observation: ExternalObservation): boolean {
   if (observation.nativePayload && isRecalledNativeEnvelope(observation.nativePayload)) return true;
   if (!observation.livePayload) return false;
@@ -437,6 +545,90 @@ function nativeFieldsDiffer(left: ExternalObservation | null | undefined, right:
 export class ExternalMonitorRepository {
   private pendingImportAcquisitions = 0;
   constructor(private readonly pool: Pool) {}
+
+  async listAgentMessageAliases(input: { accountId: string; messageIds: readonly string[]; direction: 'monitor' | 'agent' }): Promise<Array<{
+    monitoredAccountId: string; agentAccountId: string; chatType: 'direct' | 'group' | 'room'; sourceChatId: string;
+    targetChatId: string; messageId: string;
+  }>> {
+    if (!input.messageIds.length) return [];
+    const rows = await this.pool.query<{ monitored_account_id: string; agent_account_id: string;
+      chat_type: 'direct' | 'group' | 'room'; source_chat_id: string; target_chat_id: string; message_id: string }>(
+      `SELECT DISTINCT r.monitored_account_id,r.agent_account_id,r.chat_type,r.source_chat_id,r.target_chat_id,r.message_id
+       FROM external_monitor_agent_receipts r
+       JOIN line_accounts admin ON admin.account_id=r.monitored_account_id
+       JOIN line_account_sources s ON s.account_id=admin.account_id AND s.source_id=admin.selected_source_id
+         AND s.generation=admin.selected_source_generation
+       JOIN line_accounts agent ON agent.account_id=r.agent_account_id
+       JOIN account_administrators aa ON aa.account_id=agent.account_id AND aa.role='PRIMARY_ADMIN'
+       JOIN account_administrator_versions av ON av.account_id=agent.account_id
+       JOIN account_control ctl ON ctl.singleton=true
+       WHERE ${input.direction === 'monitor' ? 'r.monitored_account_id' : 'r.agent_account_id'}=$1
+         AND r.message_id=ANY($2::text[]) AND r.state<>'cancelled'
+         AND s.source_id=r.source_id AND s.generation=r.generation AND s.state='ACTIVE'
+         AND admin.connection_mode='EXTERNAL_MONITOR' AND admin.source_transition_state='STABLE'
+         AND admin.product_role='PRIMARY_ADMIN' AND admin.mode_revision=r.mode_revision
+         AND s.admin_binding_account_id=agent.account_id AND s.admin_binding_mid=r.admin_binding_mid
+         AND s.admin_binding_version::bigint=r.admin_binding_version AND av.version::bigint=r.admin_binding_version
+         AND admin.own_mid=r.admin_binding_mid AND aa.user_id=r.admin_binding_mid
+         AND agent.product_role='AGENT' AND agent.mode='ACTIVE_CONTROL'
+         AND ctl.control_epoch=r.control_epoch AND r.sender_id<>agent.own_mid
+         AND ((r.chat_type='direct' AND r.source_chat_id=agent.own_mid AND r.target_chat_id=admin.own_mid)
+           OR (r.chat_type IN ('group','room') AND r.source_chat_id=r.target_chat_id AND EXISTS (
+             SELECT 1 FROM conversation_members cm WHERE cm.account_id=agent.account_id AND cm.chat_type=r.chat_type
+               AND cm.chat_id=r.target_chat_id AND cm.member_id=agent.own_mid)))`,[input.accountId,input.messageIds.slice(0,1000)]);
+    return rows.rows.map((r) => ({ monitoredAccountId:r.monitored_account_id,agentAccountId:r.agent_account_id,
+      chatType:r.chat_type,sourceChatId:r.source_chat_id,targetChatId:r.target_chat_id,messageId:r.message_id }));
+  }
+
+  async listPendingAgentDispatchReceipts(agentAccountId: string, limit = 50): Promise<ExternalMonitorAgentReceipt[]> {
+    requiredText(agentAccountId, 'Agent account ID', 512);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('Invalid monitor dispatch receipt limit');
+    return this.withImportOperation(undefined, true, async (client) => {
+      await client.query(`UPDATE external_monitor_agent_receipts r SET state='cancelled'
+        WHERE r.agent_account_id=$1 AND r.state='pending' AND NOT EXISTS (
+          SELECT 1 FROM line_accounts admin JOIN line_account_sources s
+            ON s.account_id=admin.account_id AND s.source_id=admin.selected_source_id AND s.generation=admin.selected_source_generation
+          JOIN line_accounts agent ON agent.account_id=s.admin_binding_account_id
+          JOIN account_administrators current_admin ON current_admin.account_id=agent.account_id AND current_admin.role='PRIMARY_ADMIN'
+          JOIN account_administrator_versions av ON av.account_id=agent.account_id
+          JOIN account_control ctl ON ctl.singleton=true
+          WHERE admin.account_id=r.monitored_account_id AND s.source_id=r.source_id AND s.generation=r.generation
+            AND s.state='ACTIVE' AND admin.connection_mode='EXTERNAL_MONITOR' AND admin.source_transition_state='STABLE'
+            AND admin.mode_revision=r.mode_revision AND admin.product_role='PRIMARY_ADMIN'
+            AND s.admin_binding_account_id=r.agent_account_id AND s.admin_binding_mid=r.admin_binding_mid
+            AND s.admin_binding_version::bigint=r.admin_binding_version AND agent.product_role='AGENT'
+            AND admin.own_mid=r.admin_binding_mid AND current_admin.user_id=r.admin_binding_mid
+            AND av.version::bigint=r.admin_binding_version AND r.sender_id<>agent.own_mid
+            AND agent.mode='ACTIVE_CONTROL' AND ctl.control_epoch=r.control_epoch
+            AND ((r.chat_type='direct' AND r.source_chat_id=agent.own_mid AND r.target_chat_id=admin.own_mid)
+              OR (r.chat_type IN ('group','room') AND r.source_chat_id=r.target_chat_id AND EXISTS (
+                SELECT 1 FROM conversations c JOIN conversation_members cm
+                  ON cm.account_id=c.account_id AND cm.chat_type=c.chat_type AND cm.chat_id=c.chat_id
+                WHERE c.account_id=agent.account_id AND c.chat_type=r.chat_type AND c.chat_id=r.target_chat_id
+                  AND cm.member_id=agent.own_mid))))`, [agentAccountId]);
+      const result = await client.query<{ source_id: string; generation: string; observation_id: string;
+        monitored_account_id: string; agent_account_id: string; mode_revision: string; admin_binding_mid: string;
+        admin_binding_version: string; control_epoch: string; chat_type: ExternalMonitorAgentReceipt['chatType'];
+        source_chat_id: string; target_chat_id: string; sender_id: string; message_id: string; observation: ExternalObservation }>(
+        `SELECT r.source_id,r.generation,r.observation_id,r.monitored_account_id,r.agent_account_id,r.mode_revision,
+          r.admin_binding_mid,r.admin_binding_version,r.control_epoch,r.chat_type,r.source_chat_id,r.target_chat_id,
+          r.sender_id,r.message_id,r.observation FROM external_monitor_agent_receipts r
+         WHERE r.agent_account_id=$1 AND r.state='pending'
+         ORDER BY r.created_at,r.source_id,r.observation_id LIMIT $2 FOR UPDATE`, [agentAccountId, limit]);
+      return result.rows.map((row) => ({ sourceId: row.source_id, generation: Number(row.generation), observationId: row.observation_id,
+        monitoredAccountId: row.monitored_account_id, agentAccountId: row.agent_account_id, modeRevision: Number(row.mode_revision),
+        adminBindingMid: row.admin_binding_mid, adminBindingVersion: Number(row.admin_binding_version),
+        controlEpoch: Number(row.control_epoch), chatType: row.chat_type, sourceChatId: row.source_chat_id,
+        targetChatId: row.target_chat_id, senderId: row.sender_id, messageId: row.message_id, observation: row.observation }));
+    });
+  }
+
+  async finishAgentDispatchReceipt(receipt: Pick<ExternalMonitorAgentReceipt, 'sourceId' | 'generation' | 'observationId'>): Promise<boolean> {
+    const result = await this.pool.query(`UPDATE external_monitor_agent_receipts SET state='completed',completed_at=now()
+      WHERE source_id=$1 AND generation=$2 AND observation_id=$3 AND state='pending'`,
+    [receipt.sourceId, receipt.generation, receipt.observationId]);
+    return result.rowCount === 1;
+  }
 
   private async withImportOperation<T>(signal: AbortSignal | undefined, transaction: boolean,
     operation: (client: PoolClient) => Promise<T>, enforceDeadline = true): Promise<T> {
@@ -1110,6 +1302,8 @@ export class ExternalMonitorRepository {
     if (!Array.isArray(input.tailObservations) || input.tailObservations.length > 50) throw new Error('External live tail exceeds limit');
     const tailWindow = input.tailWindow === undefined ? undefined : normalizeTailWindow(input.tailWindow);
     const forward = input.forwardObservations.map(normalizeObservation);
+    const forwardingText=new Map(input.forwardObservations.map((observation)=>[observation.observationId,
+      redactSensitiveText(observation.text??'').text]));
     const tail = input.tailObservations.map(normalizeObservation);
     if (forward.some((row) => row.canonicalMessageId === null) || tail.some((row) => row.canonicalMessageId === null)) {
       throw new Error('External direct poll contains a row without a canonical message ID');
@@ -1120,18 +1314,24 @@ export class ExternalMonitorRepository {
     const expectedCheckpointJson = input.expectedCheckpoint === null ? null : stableJson(input.expectedCheckpoint);
     const payloadJson = stableJson({ expectedModeRevision: input.expectedModeRevision, expectedCheckpoint: input.expectedCheckpoint,
       cursor: input.cursor, forwardObservations: forward, tailObservations: tail,
+      ...(input.dispatchEligible === true ? { dispatchEligible: true } : {}),
       ...(tailWindow === undefined ? {} : { tailWindow }),
       ...(unreadEntries === undefined ? {} : { unreadCounts: unreadEntries }) });
     if (Buffer.byteLength(payloadJson, 'utf8') > MAX_BATCH_BYTES) throw new Error('External observation batch exceeds limit');
     const payloadDigest = digest(payloadJson);
 
     return this.withImportOperation(input.signal, true, async (client) => {
+      const control = input.dispatchEligible === true
+        ? await client.query<{ control_epoch: string; active_account_id: string | null }>(
+          `SELECT c.control_epoch,a.account_id AS active_account_id FROM account_control c
+           LEFT JOIN line_accounts a ON a.mode='ACTIVE_CONTROL' WHERE c.singleton=true FOR SHARE OF c`)
+        : { rows: [] as Array<{ control_epoch: string; active_account_id: string | null }> };
       const binding = await client.query<{ own_mid: string | null; verified_account_mid: string; state: string;
         product_role: string | null; source_transition_state: string; connection_mode: string; mode_revision: string;
         admin_binding_account_id: string | null; admin_binding_mid: string | null; admin_binding_version: string | null;
-        agent_role: string | null; current_admin_mid: string | null; current_admin_version: string | null }>(
+        agent_role: string | null; agent_own_mid: string | null; current_admin_mid: string | null; current_admin_version: string | null }>(
         `SELECT a.own_mid,s.verified_account_mid,s.state,a.product_role,a.source_transition_state,a.connection_mode,a.mode_revision,
-          s.admin_binding_account_id,s.admin_binding_mid,s.admin_binding_version,agent.product_role AS agent_role,
+          s.admin_binding_account_id,s.admin_binding_mid,s.admin_binding_version,agent.product_role AS agent_role,agent.own_mid AS agent_own_mid,
           admin.user_id AS current_admin_mid,av.version AS current_admin_version
          FROM line_accounts a JOIN line_account_sources s
           ON s.account_id=a.account_id AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
@@ -1157,7 +1357,7 @@ export class ExternalMonitorRepository {
         [input.sourceId, input.generation, input.batchId]);
       if (priorBatch.rows[0]) {
         if (priorBatch.rows[0].payload_digest !== payloadDigest) throw new Error('External batch replay digest mismatch');
-        return { ...priorBatch.rows[0].result, changedMessages: [], unreadChanged: 0, replayed: true };
+        return { ...priorBatch.rows[0].result, changedMessages: [], unreadChanged: 0, dispatchReceipts: [], replayed: true };
       }
 
       const checkpoint = await client.query<{ account_id: string; generation: string; cursor: Record<string, unknown> }>(
@@ -1168,6 +1368,7 @@ export class ExternalMonitorRepository {
           || stableJson(checkpointRow.cursor) !== expectedCheckpointJson) throw new Error('External predecessor checkpoint mismatch');
 
       const changed = new Map<string, ExternalChangedMessage>();
+      const dispatchReceipts: ExternalMonitorAgentReceipt[] = [];
       let projected = 0;
       let conflicts = 0;
       let tailRepaired = 0;
@@ -1195,6 +1396,36 @@ export class ExternalMonitorRepository {
             ON CONFLICT (source_id,generation,observation_id) DO NOTHING RETURNING observation_id`,
           [input.sourceId, input.accountId, input.generation, observation.observationId, input.batchId, observation.canonicalMessageId,
             normalizedDigest, normalizedJson]);
+          const directMapping = hasNativeLineMessageIdentity(observation) && observation.chatType === 'direct' && authority.agent_own_mid
+            && observation.chatId === authority.agent_own_mid && observation.senderId === authority.own_mid;
+          const groupMapping = observation.chatType === 'group' || observation.chatType === 'room'
+            ? await client.query(`SELECT 1 FROM conversations c JOIN conversation_members cm
+                ON cm.account_id=c.account_id AND cm.chat_type=c.chat_type AND cm.chat_id=c.chat_id
+               WHERE c.account_id=$1 AND c.chat_type=$2 AND c.chat_id=$3 AND cm.member_id=$4`,
+              [authority.admin_binding_account_id, observation.chatType, observation.chatId, authority.agent_own_mid])
+            : null;
+          if (staged.rowCount === 1 && input.dispatchEligible === true && observation.senderId.length > 0
+            && ['text','image','video','audio','file','sticker','contact','event','location','rich'].includes(observation.kind)
+            && hasNativeLineMessageIdentity(observation) && authority.agent_own_mid
+            && control.rows[0]?.active_account_id === authority.admin_binding_account_id
+            && (directMapping || (groupMapping?.rowCount === 1 && observation.senderId !== authority.agent_own_mid))) {
+            const receipt: ExternalMonitorAgentReceipt = { sourceId: input.sourceId, generation: input.generation,
+              observationId: observation.observationId, monitoredAccountId: input.accountId,
+              agentAccountId: authority.admin_binding_account_id!, modeRevision: input.expectedModeRevision,
+              adminBindingMid: authority.admin_binding_mid!, adminBindingVersion: Number(authority.admin_binding_version),
+              controlEpoch: Number(control.rows[0]!.control_epoch), chatType: observation.chatType as ExternalMonitorAgentReceipt['chatType'], sourceChatId: observation.chatId,
+              targetChatId: observation.chatType === 'direct' ? authority.own_mid : observation.chatId,
+              senderId: observation.senderId, messageId: observation.canonicalMessageId!, observation };
+            await client.query(`INSERT INTO external_monitor_agent_receipts(source_id,generation,observation_id,monitored_account_id,
+              agent_account_id,mode_revision,admin_binding_mid,admin_binding_version,control_epoch,chat_type,source_chat_id,
+              target_chat_id,sender_id,message_id,observation)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
+              ON CONFLICT(source_id,generation,observation_id) DO NOTHING`,
+            [receipt.sourceId, receipt.generation, receipt.observationId, receipt.monitoredAccountId, receipt.agentAccountId,
+              receipt.modeRevision, receipt.adminBindingMid, receipt.adminBindingVersion, receipt.controlEpoch, receipt.chatType,
+              receipt.sourceChatId, receipt.targetChatId, receipt.senderId, receipt.messageId, stableJson(receipt.observation)]);
+            dispatchReceipts.push(receipt);
+          }
           if (!staged.rowCount) {
             const existing = await client.query<{ batch_id: string; normalized_digest: string; status: string;
               normalized_payload: ExternalObservation; canonical_message_id: string | null; raw_native_payload: unknown }>(
@@ -1239,6 +1470,9 @@ export class ExternalMonitorRepository {
           }
           nameCandidates.push(observation);
           if (await upsertCanonicalLineMessage(client, input.accountId, input.sourceId, observation)) rememberChanged(observation);
+          if (staged.rowCount === 1 && input.dispatchEligible === true) {
+            await captureScheduleForward(client,{ accountId:input.accountId,chatType:observation.chatType,chatId:observation.chatId,messageId:observation.canonicalMessageId!,attachmentOrder:observation.attachments?.map((item)=>item.id)??[] },forwardingText.get(observation.observationId));
+          }
           await client.query(`INSERT INTO message_source_provenance(account_id,message_id,source_id,generation,observation_id,origin,redacted)
             VALUES ($1,$2,$3,$4,$5,'EXTERNAL_MONITOR',true) ON CONFLICT DO NOTHING`,
           [input.accountId, observation.canonicalMessageId, input.sourceId, input.generation, observation.observationId]);
@@ -1333,7 +1567,7 @@ export class ExternalMonitorRepository {
       }
 
       const result: ExternalDirectPollResult = { staged: forward.length, projected, conflicts, replayed: false,
-        changedMessages: [...changed.values()], tailRepaired, unreadChanged };
+        changedMessages: [...changed.values()], tailRepaired, unreadChanged, dispatchReceipts };
       if (receiptWritten) await client.query('UPDATE external_source_batches SET result=$4::jsonb WHERE source_id=$1 AND generation=$2 AND batch_id=$3',
         [input.sourceId, input.generation, input.batchId, JSON.stringify(result)]);
       return result;
@@ -1526,7 +1760,7 @@ async function noAgentAuthority(client: PoolClient, accountId: string, sourceId:
      FOR UPDATE OF a,s`, [accountId, sourceId, generation]);
   const row = result.rows[0];
   if (!row) return undefined;
-  return { ...row, source_state: row.state, admin_binding_account_id: 'no-agent', admin_binding_mid: row.own_mid,
+  return { ...row, source_state: row.state, admin_binding_account_id: 'no-agent', admin_binding_mid: row.own_mid, agent_own_mid: null,
     admin_binding_version: '1', agent_role: 'AGENT', current_admin_mid: row.own_mid, current_admin_version: '1' };
 }
 

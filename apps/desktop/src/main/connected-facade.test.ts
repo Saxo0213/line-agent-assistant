@@ -1513,6 +1513,36 @@ database('connected facade account login semantics', () => {
     expect(commands.some((command) => command.type === 'loginQr' && command.accountId === 'direct-login-agent')).toBe(true);
   });
 
+  it('suppresses every page of the first monitor round and repeats the baseline after restart',async()=>{
+    await addStoredAccounts('baseline-agent','baseline-admin');
+    const accounts=new AccountRepository(pool); await accounts.activateControl('baseline-agent',1);
+    const repository=new ExternalMonitorRepository(pool);
+    const source=await repository.bindVerifiedExternalSource({accountId:'baseline-admin',ownMid:'own-baseline-admin',sourceIdentity:'baseline-source',
+      initialImport:{snapshotDigest:'a'.repeat(64),schemaVersion:'v1',highWater:null,eligibleCount:'0'}});
+    await repository.completeInitialImport({accountId:'baseline-admin',sourceId:source.sourceId,generation:source.generation,
+      expectedModeRevision:source.modeRevision,expectedCheckpoint:{},finalCursor:{},highWater:null});
+    let run=0; let finished:Promise<void>; let done!:()=>void;
+    const importer:NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']>={
+      async readOfficialSnapshot(){throw new Error('completed source');},
+      async readOfficialMonitor(input){
+        const round=++run;
+        for(let page=1;page<=3;page++){
+          const id=String(round*1000+page);
+          await input.onPage({pageNumber:page,batchDigest:String(page).repeat(64),rows:[{observationId:id,canonicalMessageId:null,
+            nativeMessageId:id,nativeConversationKind:'direct',nativeConversationId:'own-baseline-agent',chatType:'direct',chatId:'own-baseline-agent',
+            senderId:'own-baseline-admin',kind:'text',text:'new row',createdTime:id,readonlyForSending:false}],tailRows:[],
+            lastCursor:{createdTime:id,id},hasMore:page===1});
+        }
+        done(); await new Promise<void>((resolve)=>input.signal.addEventListener('abort',()=>resolve(),{once:true}));
+      }};
+    for(let pass=1;pass<=2;pass++){
+      finished=new Promise<void>((resolve)=>{done=resolve;});
+      await restartFacadeWithImporter(importer); await finished;
+      expect((await pool.query('SELECT message_id FROM external_monitor_agent_receipts ORDER BY message_id')).rows)
+        .toEqual(Array.from({length:pass},(_,index)=>({message_id:String((index+1)*1000+3)})));
+    }
+  });
+
   it('drains a startup-resumed monitor before the Primary Admin QR login worker starts', async () => {
     vi.useRealTimers();
     const accountId = 'startup-monitor-admin';
@@ -2095,6 +2125,35 @@ database('connected facade account login semantics', () => {
       occupied.close();
       await once(occupied, 'close');
     }
+  });
+
+  it('recovers monitor receipts without live batches and exposes initial, reloaded and pushed status aliases',async()=>{
+    const agentMid=`u${'a'.repeat(32)}`; const adminMid=`u${'b'.repeat(32)}`;
+    await addStoredAccounts('monitor-route-agent','monitor-route-admin');
+    await pool.query('UPDATE line_accounts SET own_mid=$2 WHERE account_id=$1',['monitor-route-agent',agentMid]);
+    await pool.query('UPDATE line_accounts SET own_mid=$2 WHERE account_id=$1',['monitor-route-admin',adminMid]);
+    await pool.query("UPDATE account_administrators SET user_id=$2,chat_id=$2 WHERE account_id=$1 AND role='PRIMARY_ADMIN'",['monitor-route-agent',adminMid]);
+    await loginReady('monitor-route-agent',agentMid);
+    const repository=new ExternalMonitorRepository(pool);
+    const source=await repository.bindVerifiedExternalSource({accountId:'monitor-route-admin',ownMid:adminMid,sourceIdentity:'monitor-route-native'});
+    const id='987654321';
+    await repository.commitDirectPoll({accountId:'monitor-route-admin',...source,expectedModeRevision:source.modeRevision,
+      expectedCheckpoint:null,batchId:'monitor-route',cursor:{id},dispatchEligible:true,tailObservations:[],forwardObservations:[{
+        observationId:id,canonicalMessageId:id,nativeMessageId:id,chatType:'direct',chatId:agentMid,senderId:adminMid,
+        kind:'text',text:'please work immediately',occurredAt:'2026-11-02T00:00:00Z'}]});
+    await waitForState(async()=>{
+      expect((await pool.query('SELECT state FROM external_monitor_agent_receipts WHERE message_id=$1',[id])).rows[0]?.state).toBe('completed');
+    });
+    const key={accountId:'monitor-route-admin',chatType:'direct' as const,chatId:agentMid};
+    const statuses=await facade.listAgentStatuses(key,[id]);
+    expect(statuses).toMatchObject([{messageId:id,status:'failed'}]);
+    expect((await facade.listMessages(key,null,20)).messages).toMatchObject([{messageId:id,agentJobStatus:'failed',agentJobId:statuses[0]!.jobId}]);
+    await waitForState(()=>expect(published).toContainEqual(expect.objectContaining({type:'agentJobStatusChanged',
+      accountId:key.accountId,chatId:agentMid,sourceMessageId:id,jobId:statuses[0]!.jobId,status:'failed'})));
+    expect(commands.filter((command)=>command.type==='ackBatch')).toEqual([]);
+    await facade.shutdown();
+    const count=(await pool.query('SELECT count(*)::int n FROM agent_jobs WHERE source_message_id=$1',[id])).rows[0].n;
+    expect(count).toBe(1);
   });
 
   async function addStoredAccounts(...accountIds: string[]) {

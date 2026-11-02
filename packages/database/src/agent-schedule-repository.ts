@@ -85,7 +85,7 @@ interface ScheduleRow {
   enabled: boolean; jitter_minutes: number; next_fire_at: Date | null; next_nominal_at: Date | null; last_fire_at: Date | null; last_outcome: AgentScheduleRunOutcome | null;
   created_at: Date; updated_at: Date;
 }
-interface RunRow { run_id: string; schedule_id: string; scheduled_for: Date; outcome: AgentScheduleRunOutcome; job_id: string | null; reply_preview: string | null; created_at: Date }
+interface RunRow { run_id: string; schedule_id: string; scheduled_for: Date; outcome: AgentScheduleRunOutcome; job_id: string | null; reply_preview: string | null; created_at: Date; forwarding?:AgentScheduleRun['forwarding'] }
 
 const COLUMNS = `schedule_id, title, prompt, provider, recurrence, timezone, targets, task, task_window, delivery, enabled, jitter_minutes, next_fire_at, next_nominal_at, last_fire_at, last_outcome, created_at, updated_at, external_account_scope`;
 
@@ -109,6 +109,7 @@ const toSchedule = (row: ScheduleRow): AgentSchedule => ({
 const toRun = (row: RunRow): AgentScheduleRun => ({
   runId: row.run_id, scheduleId: row.schedule_id, scheduledFor: iso(row.scheduled_for), outcome: row.outcome,
   jobId: row.job_id, replyPreview: row.reply_preview, createdAt: iso(row.created_at),
+  ...(row.forwarding?{forwarding:row.forwarding}:{}),
 });
 
 export class AgentScheduleRepository {
@@ -172,8 +173,10 @@ export class AgentScheduleRepository {
   }
 
   async create(input: AgentScheduleCreateInput, now: Date = new Date(), externalAccountScope: readonly string[] | null = null): Promise<AgentSchedule> {
+    const invalid = agentScheduleShapeError(input);
+    if (invalid) throw new AgentScheduleError('SCHEDULE_INVALID', invalid);
     const next = input.enabled ? planNextFire(input.recurrence, input.timezone, now, input.jitterMinutes, () => this.random()) : null;
-    if (input.enabled && next === null) throw new AgentScheduleError('SCHEDULE_NO_FUTURE_TIME', 'The schedule has no future fire time.');
+    if (input.enabled && next === null && input.recurrence.kind !== 'message') throw new AgentScheduleError('SCHEDULE_NO_FUTURE_TIME', 'The schedule has no future fire time.');
     return this.transaction(async (client) => {
       if (externalAccountScope !== null) await this.assertExternalAccountAuthority(client, externalAccountScope);
       if (input.enabled) await this.assertEnabledRoom(client, null);
@@ -198,6 +201,9 @@ export class AgentScheduleRepository {
   private async updateRow(client: PoolClient, scheduleId: string, patch: AgentScheduleUpdatePatch, now: Date,
     externalAccountScope: readonly string[] | null, current: ScheduleRow): Promise<AgentSchedule> {
     const recurrence = patch.recurrence ?? current.recurrence;
+    const invalid = agentScheduleShapeError({ prompt: patch.prompt ?? current.prompt, targets: patch.targets ?? current.targets,
+      task: patch.task ?? current.task, delivery: patch.delivery ?? current.delivery, recurrence });
+    if (invalid) throw new AgentScheduleError('SCHEDULE_INVALID', invalid);
     const timezone = patch.timezone ?? current.timezone;
     const enabled = patch.enabled ?? current.enabled;
     const jitterMinutes = patch.jitterMinutes ?? current.jitter_minutes;
@@ -206,12 +212,13 @@ export class AgentScheduleRepository {
     let next: { nominal: Date | null; fireAt: Date | null } | null = enabled ? { nominal: current.next_nominal_at ?? current.next_fire_at, fireAt: current.next_fire_at } : null;
     if (enabled && retime) {
       next = planNextFire(recurrence, timezone, now, jitterMinutes, () => this.random());
-      if (next === null) throw new AgentScheduleError('SCHEDULE_NO_FUTURE_TIME', 'The schedule has no future fire time.');
+      if (next === null && recurrence.kind !== 'message') throw new AgentScheduleError('SCHEDULE_NO_FUTURE_TIME', 'The schedule has no future fire time.');
     }
     const result = await client.query<ScheduleRow>(
       `UPDATE agent_schedules SET title = $2, prompt = $3, provider = $4, recurrence_kind = $5, recurrence = $6::jsonb, timezone = $7,
          targets = $8::jsonb, task = $9::jsonb, task_window = $10::jsonb, delivery = $11::jsonb,
          enabled = $12, next_fire_at = $13, next_nominal_at = $14, jitter_minutes = $15, external_account_scope = $16,
+         rule_revision = rule_revision + 1, receipt_baseline_at = clock_timestamp(),
          updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
        WHERE schedule_id = $1 RETURNING ${COLUMNS}`,
       [scheduleId, patch.title ?? current.title, patch.prompt ?? current.prompt, patch.provider ?? current.provider, recurrence.kind,
@@ -334,7 +341,8 @@ export class AgentScheduleRepository {
       const stale = await client.query<{ schedule_id: string; scheduled_for: Date; outcome: AgentScheduleRunOutcome }>(
         `UPDATE agent_schedule_runs r SET outcome = CASE WHEN COALESCE((SELECT s.task->>'type' FROM agent_schedules s WHERE s.schedule_id = r.schedule_id), '') IN ('message', 'new_messages')
              THEN 'send_unknown' ELSE 'missed' END
-         WHERE r.outcome = 'submitting' RETURNING r.schedule_id, r.scheduled_for, r.outcome`);
+         WHERE r.outcome = 'submitting' AND NOT EXISTS(SELECT 1 FROM agent_schedule_forward_work w WHERE w.run_id=r.run_id)
+         RETURNING r.schedule_id, r.scheduled_for, r.outcome`);
       for (const row of stale.rows) {
         await client.query(`UPDATE agent_schedules SET last_outcome = $3 WHERE schedule_id = $1 AND last_fire_at = $2 AND last_outcome = 'submitting'`,
           [row.schedule_id, row.scheduled_for, row.outcome]);
@@ -355,7 +363,10 @@ export class AgentScheduleRepository {
     const bounded = Math.max(1, Math.min(50, Math.floor(limit)));
     const result = await this.pool.query<RunRow>(
       `SELECT r.run_id, r.schedule_id, r.scheduled_for, r.outcome, r.job_id, r.created_at,
-         CASE WHEN char_length(o.final_text) > 200 THEN left(o.final_text, 199) || '…' ELSE o.final_text END AS reply_preview
+         CASE WHEN char_length(o.final_text) > 200 THEN left(o.final_text, 199) || '…' ELSE o.final_text END AS reply_preview,
+         (SELECT jsonb_build_object('sourceTitle',w.source_title,'accountId',w.account_id,'senderName',w.sender_name,'senderId',w.sender_id,
+           'parts',(SELECT jsonb_agg(jsonb_build_object('kind',p.kind,'filename',p.filename,'state',p.state,'errorCode',p.error_code) ORDER BY p.part_index)
+             FROM agent_schedule_forward_parts p WHERE p.work_id=w.work_id)) FROM agent_schedule_forward_work w WHERE w.run_id=r.run_id) forwarding
        FROM agent_schedule_runs r LEFT JOIN agent_outputs o ON o.job_id = r.job_id
        WHERE r.schedule_id = $1 ORDER BY r.scheduled_for DESC LIMIT $2`, [scheduleId, bounded]);
     return result.rows.map(toRun);

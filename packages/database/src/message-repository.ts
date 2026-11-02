@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { captureScheduleForward } from './schedule-forward-repository.js';
 import { InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpActiveChat, type McpMessageRecord, type McpTargetSummary, type MessageSearchScope, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { parseLineStickerDescriptor, type StickerDescriptor } from './sticker-descriptor.js';
@@ -10,7 +11,7 @@ import { loadChatEventNames } from './content-bridge/chat-event-names.js';
 import { nativeReactions, type MessageReaction } from './native-reactions.js';
 import { ensureLineageSessionRow, expandAgentLineage, mergeLineageConversations, resolveAgentLineage } from './agent-lineage.js';
 import { promptWithContactCards } from './agent-contact-cards.js';
-import { stageSystemLoginObservation, type ExternalObservation } from './external-monitor-repository.js';
+import { stageSystemLoginObservation, lockMonitorAgentReceipt, lockMonitorRouteReceipt, projectMonitorAgentReceipt, type ExternalMonitorAgentReceipt, type ExternalObservation } from './external-monitor-repository.js';
 
 export type ReadPositionChange = Readonly<{ key: ConversationKey; messageId: string }>;
 const ReadReceiptsSchema = ReadReceiptSchema.array().max(500);
@@ -480,6 +481,8 @@ export class MessageRepository {
   async ingestBatchSource(
     batch: Extract<LineWorkerEvent, { type: 'batch' }>,
     sensitiveMessageIds: ReadonlySet<string> = new Set(),
+    freshForForwarding = false,
+    forwardingText:ReadonlyMap<string,string|null> = new Map(),
   ): Promise<{ inserted: number; duplicate: number; insertedMessageIds: string[]; changedMessageIds: string[]; jobIds: string[]; jobMessageIds: string[]; primaryAdminActionMessageIds: string[]; jobStatuses: NonNullable<IngestResult['jobStatus']>[];
     readPositionsChanged: number; readPositionChanges: ReadPositionChange[] }> {
     const readReceipts = ReadReceiptsSchema.parse(batch.readReceipts ?? []);
@@ -563,6 +566,9 @@ export class MessageRepository {
         }
         inserted++;
         insertedMessageIds.push(envelope.messageId);
+        if (freshForForwarding && receiptMode !== 'PAUSED' && envelope.ingestion.source === 'live' && !sensitiveMessageIds.has(envelope.messageId)) {
+          await captureScheduleForward(client,{ accountId:envelope.accountId,chatType:envelope.chatType,chatId:envelope.chatId,messageId:envelope.messageId,attachmentOrder:envelope.attachments.map((item)=>item.id) },forwardingText.has(envelope.messageId)?forwardingText.get(envelope.messageId):envelope.text);
+        }
         if (staged.changed) changedMessageIds.push(envelope.messageId);
         if (envelope.ingestion.source === 'live' && envelope.kind !== 'event') await client.query(
           `UPDATE conversations c SET unread_count=unread_count+1, updated_at=now()
@@ -607,7 +613,7 @@ export class MessageRepository {
     }
   }
 
-  async admitLiveBatch(batch: Extract<LineWorkerEvent, { type: 'batch' }>, decisions: readonly RoutingDecision[]): Promise<{
+  async admitLiveBatch(batch: Extract<LineWorkerEvent, { type: 'batch' }>, decisions: readonly RoutingDecision[], monitorReceipt?: ExternalMonitorAgentReceipt): Promise<{
     jobIds: string[]; jobMessageIds: string[]; jobStatuses: NonNullable<IngestResult['jobStatus']>[]; primaryAdminActionMessageIds: string[];
     routeDecisions: RoutingDecision[];
   }> {
@@ -617,6 +623,14 @@ export class MessageRepository {
     const routeDecisions = [...decisions];
     try {
       await client.query('BEGIN');
+      if (monitorReceipt) {
+        if (batch.accountId !== monitorReceipt.agentAccountId || batch.controlEpoch !== monitorReceipt.controlEpoch
+          || batch.envelopes.length !== 1 || batch.envelopes[0]?.messageId !== monitorReceipt.messageId
+          || batch.envelopes[0]?.chatId !== monitorReceipt.targetChatId || batch.envelopes[0]?.chatType !== monitorReceipt.chatType
+          || batch.envelopes[0]?.senderId !== monitorReceipt.senderId || batch.envelopes[0]?.accountId !== monitorReceipt.agentAccountId) throw new Error('Invalid monitor ingress');
+        await lockMonitorAgentReceipt(client, monitorReceipt);
+        await projectMonitorAgentReceipt(client, monitorReceipt, batch.envelopes[0]!);
+      }
       const control = await client.query<{ control_epoch: string }>('SELECT control_epoch FROM account_control WHERE singleton=true FOR SHARE');
       const authority = await client.query<{ mode: string; worker_instance_id: string | null; worker_binding_epoch: string | null;
         connection_mode: string; own_mid: string | null; selected_source_id: string | null; selected_source_generation: string | null;
@@ -707,6 +721,18 @@ export class MessageRepository {
           sourceMessageId:envelope.messageId,jobId:job.job_id,status:job.status,revision:job.revision });
         if (job.status === 'queued') jobMessageIds.push(envelope.messageId);
       }
+      if (monitorReceipt) {
+        for (const [index,envelope] of batch.envelopes.entries()) {
+          const decision = routeDecisions[index]!;
+          const failure = !decision.eligible && 'workspaceFailure' in decision ? decision.workspaceFailure : undefined;
+          const action = decision.eligible || failure ? 'prompt' : ('action' in decision ? decision.action : 'ignore');
+          await client.query(`INSERT INTO message_routes(account_id,message_id,action,provider,creation_epoch,
+            monitor_source_id,monitor_generation,monitor_observation_id,monitor_origin)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,true) ON CONFLICT(account_id,message_id) DO NOTHING`,
+          [batch.accountId,envelope.messageId,action,decision.eligible ? decision.provider : failure?.provider ?? null,
+            action==='ignore' ? null : batch.controlEpoch,monitorReceipt.sourceId,monitorReceipt.generation,monitorReceipt.observationId]);
+        }
+      }
       await client.query('COMMIT');
       return { jobIds, jobMessageIds, jobStatuses, primaryAdminActionMessageIds, routeDecisions };
     } catch (error) { await client.query('ROLLBACK'); throw error; }
@@ -780,7 +806,7 @@ export class MessageRepository {
        FROM line_accounts a JOIN account_control c ON c.singleton=true
        WHERE r.account_id=$1 AND a.account_id=r.account_id AND a.worker_instance_id=$2
          AND a.worker_binding_epoch=$3 AND a.mode='ACTIVE_CONTROL' AND c.control_epoch=$3
-         AND r.action IN ('stop','new','status') AND r.effect_applied_at IS NULL AND r.creation_epoch=$3`,
+         AND r.action IN ('stop','new','status') AND r.effect_applied_at IS NULL AND r.creation_epoch=$3 AND NOT r.monitor_origin`,
       [input.accountId, input.workerInstanceId, input.controlEpoch],
     );
   }
@@ -902,6 +928,11 @@ export class MessageRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      if (!await lockMonitorRouteReceipt(client,key.accountId,messageId)) {
+        await client.query("UPDATE message_routes SET action='ignore',provider=NULL WHERE account_id=$1 AND message_id=$2 AND effect_applied_at IS NULL",
+          [key.accountId,messageId]);
+        await client.query('COMMIT'); return false;
+      }
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 2))', [`${key.accountId}:${messageId}`]);
       const pending = await client.query<{ action: PendingRouteAction }>(
         `SELECT r.action FROM message_routes r

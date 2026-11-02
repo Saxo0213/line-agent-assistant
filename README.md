@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.316 adds chat-scoped storage for group and room attachments, with sender and original filename details, plus `/folder` controls for temporary storage. It also fixes update notice and installed-version reconciliation across restarts. Install through the app's **Check for updates**. See the [v1.0.316 release notes](docs/releases/v1.0.316.md) for changes since public v1.0.314, including attachment features first included in local v1.0.315.
+v1.0.318 adds prompt routing for fresh monitored messages and event rules that can forward selected original messages and supported attachments to an Agent chat. Install through the app's **Check for updates**. See the [v1.0.316 → v1.0.318 release notes](docs/releases/v1.0.318.md) for the complete changes.
 
 ## Installation
 

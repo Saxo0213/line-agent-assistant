@@ -80,6 +80,7 @@ export function isValidTimeZone(timezone: string): boolean {
 export const AgentScheduleTimezoneSchema = z.string().min(1).max(64).refine(isValidTimeZone, 'Invalid IANA timezone');
 
 export const AgentScheduleRecurrenceSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('message') }),
   z.strictObject({ kind: z.literal('once'), at: TimestampSchema }),
   z.strictObject({ kind: z.literal('daily'), time: TimeOfDaySchema }),
   z.strictObject({
@@ -246,7 +247,26 @@ export const AgentScheduleNewMessagesTaskSchema = z.strictObject({
   if (leaves > AGENT_SCHEDULE_LEAVES_MAX) ctx.addIssue({ code: 'custom', message: `A task can have at most ${AGENT_SCHEDULE_LEAVES_MAX} conditions in messageFilter and rules together` });
 });
 
+export const AgentScheduleForwardTaskSchema = z.strictObject({
+  type: z.literal('message_forward'),
+  match: z.discriminatedUnion('mode', [
+    z.strictObject({ mode: z.literal('contains'), keywords: z.array(z.string().min(1).max(200).refine((s) => s.trim().length > 0)).min(1).max(20) }),
+    z.strictObject({ mode: z.literal('exact'), text: z.string().min(1).max(20000).refine((s) => s.trim().length > 0) }),
+    z.strictObject({ mode: z.literal('sender') }),
+  ]),
+  sender: z.strictObject({ accountId: z.string().min(1).max(256), mid: z.string().trim().min(1).max(256), label: z.string().max(200).default('') }).optional(),
+}).superRefine((task, ctx) => {
+  if (task.match.mode === 'sender' && !task.sender) ctx.addIssue({ code: 'custom', message: 'Sender matching requires an account and sender MID' });
+});
+export type AgentScheduleForwardTask = z.infer<typeof AgentScheduleForwardTaskSchema>;
+/** Literal, case-sensitive matching against the original text. */
+export function matchesScheduleForward(task: AgentScheduleForwardTask, source: { accountId: string; senderId: string; text: string }): boolean {
+  if (task.sender && (task.sender.accountId !== source.accountId || task.sender.mid !== source.senderId)) return false;
+  return task.match.mode === 'sender' || (task.match.mode === 'exact' ? source.text === task.match.text : task.match.keywords.some((keyword) => source.text.includes(keyword)));
+}
+
 export const AgentScheduleTaskSchema = z.discriminatedUnion('type', [
+  AgentScheduleForwardTaskSchema,
   z.strictObject({ type: z.literal('custom') }),
   /** A system message (alarm / reminder): Main sends `text` to LINE at fire time. No Agent job, no provider, no tokens. */
   z.strictObject({ type: z.literal('message'), text: z.string().trim().min(1).max(AGENT_SCHEDULE_MESSAGE_MAX) }),
@@ -263,11 +283,11 @@ export type AgentScheduleNewMessagesTask = Extract<AgentScheduleTask, { type: 'n
 /** program: Main does all the work (message, new_messages). agent: an Agent job does the work. */
 export type AgentScheduleExecution = 'program' | 'agent';
 export function scheduleExecutionKind(task: Pick<AgentScheduleTask, 'type'>): AgentScheduleExecution {
-  return task.type === 'message' || task.type === 'new_messages' ? 'program' : 'agent';
+  return task.type === 'message' || task.type === 'new_messages' || task.type === 'message_forward' ? 'program' : 'agent';
 }
 /** True when a run of the task can start an LLM: every Agent task, and a new_messages task with a rule that says llm. */
 export function scheduleMayUseLlm(task: AgentScheduleTask): boolean {
-  if (task.type === 'message') return false;
+  if (task.type === 'message' || task.type === 'message_forward') return false;
   if (task.type === 'new_messages') return (task.rules ?? []).some((rule) => rule.then === 'llm');
   return true;
 }
@@ -291,10 +311,21 @@ export type AgentScheduleDelivery = z.infer<typeof AgentScheduleDeliverySchema>;
 
 /** Cross-field rules shared by create, update (on the merged result) and the MCP tools. Returns an error message or null. */
 export function agentScheduleShapeError(shape: {
-  prompt: string; targets: readonly AgentScheduleTarget[]; task: AgentScheduleTask; delivery?: AgentScheduleDelivery | undefined;
+  prompt: string; targets: readonly AgentScheduleTarget[]; task: AgentScheduleTask; delivery?: AgentScheduleDelivery | undefined; recurrence?: AgentScheduleRecurrence | undefined;
 }): string | null {
   const keys = new Set(shape.targets.map(scheduleTargetKey));
   if (keys.size !== shape.targets.length) return 'Targets must be unique';
+  if (shape.recurrence && (shape.recurrence.kind === 'message') !== (shape.task.type === 'message_forward')) return 'Message event recurrence is only valid for message forwarding';
+  if (shape.task.type === 'message_forward') {
+    if (shape.targets.length === 0) return 'Message forwarding requires explicit source chats';
+    if (shape.delivery?.mode !== 'line_target') return 'Message forwarding requires an explicit LINE destination';
+    const destination = shape.delivery.target;
+    const sender = shape.task.sender;
+    if (destination.chatType === 'room') return 'Message forwarding requires a destination that supports original images and files';
+    if (shape.targets.some((source) => source.accountId === destination.accountId && source.chatType === destination.chatType && source.chatId === destination.chatId)) return 'Forwarding source and destination must differ';
+    if (sender && !shape.targets.some((source) => source.accountId === sender.accountId)) return 'Sender account must belong to the selected sources';
+    return null;
+  }
   if (shape.task.type === 'message') {
     if (shape.targets.length > 0) return 'A system message does not read chats';
     if (shape.delivery?.mode === 'record_only') return 'A system message must be delivered to LINE';
@@ -312,9 +343,10 @@ export function agentScheduleShapeError(shape: {
 const shapeRefine = (shape: {
   prompt?: string | undefined; targets?: readonly AgentScheduleTarget[] | undefined; task?: AgentScheduleTask | undefined;
   delivery?: AgentScheduleDelivery | undefined;
+  recurrence?: AgentScheduleRecurrence | undefined;
 }, ctx: z.RefinementCtx) => {
   const message = agentScheduleShapeError({ prompt: shape.prompt ?? '', targets: shape.targets ?? [], task: shape.task ?? { type: 'custom' },
-    delivery: shape.delivery ?? { mode: 'primary_admin' } });
+    delivery: shape.delivery ?? { mode: 'primary_admin' }, recurrence: shape.recurrence });
   if (message) ctx.addIssue({ code: 'custom', message });
 };
 
@@ -343,6 +375,8 @@ export const AgentScheduleSchema = z.strictObject({
 export type AgentSchedule = z.infer<typeof AgentScheduleSchema>;
 
 export const AgentScheduleRunSchema = z.strictObject({
+  forwarding:z.strictObject({sourceTitle:z.string(),accountId:z.string(),senderName:z.string(),senderId:z.string(),
+    parts:z.array(z.strictObject({kind:z.string(),filename:z.string().nullable(),state:z.string(),errorCode:z.string().nullable()})).max(101)}).optional(),
   runId: z.uuid(),
   scheduleId: z.uuid(),
   scheduledFor: TimestampSchema,
@@ -431,7 +465,8 @@ export const CreateScheduleToolInputSchema = z.strictObject({
   enabled: scheduleFields.enabled.optional(),
 }).superRefine((shape, ctx) => {
   // The tool defaults the task to summary when chats are given, else custom.
-  shapeRefine({ ...shape, task: shape.task ?? ((shape.targets ?? []).length > 0 ? { type: 'summary' } : { type: 'custom' }) }, ctx);
+  shapeRefine({ ...shape, recurrence: shape.recurrence.kind === 'once' && 'inMinutes' in shape.recurrence ? undefined : shape.recurrence,
+    task: shape.task ?? ((shape.targets ?? []).length > 0 ? { type: 'summary' } : { type: 'custom' }) }, ctx);
 });
 export const UpdateScheduleToolInputSchema = z.strictObject({
   scheduleId: z.uuid(),
@@ -568,6 +603,7 @@ function matchesCronDay(cron: ParsedCron, month: number, dayOfMonth: number, day
  * Times are evaluated in the schedule's IANA `timezone`.
  */
 export function nextFireAfter(recurrence: AgentScheduleRecurrence, timezone: string, after: Date): Date | null {
+  if (recurrence.kind === 'message') return null;
   const afterMs = after.getTime();
   if (!Number.isFinite(afterMs)) return null;
   if (recurrence.kind === 'once') {

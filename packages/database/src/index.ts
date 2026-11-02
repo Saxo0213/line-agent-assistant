@@ -29,3 +29,4 @@ export * from './mcp-token-repository.js';
 export * from './agent-permissions.js';
 export * from './agent-room-history.js';
 export * from './agent-lineage.js';
+export * from './schedule-forward-repository.js';

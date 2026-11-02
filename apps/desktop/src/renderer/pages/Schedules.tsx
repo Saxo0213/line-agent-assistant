@@ -11,7 +11,7 @@ const OUTCOME_KEYS: Record<AgentScheduleRunOutcome, ScheduleCopyKey> = {
   submitting: 'outcomeSubmitting', submitted: 'outcomeSubmitted', missed: 'outcomeMissed', skipped_overlap: 'outcomeSkippedOverlap', failed: 'outcomeFailed',
   sent: 'outcomeSent', send_failed: 'outcomeSendFailed', send_unknown: 'outcomeSendUnknown', no_messages: 'outcomeNoMessages',
 };
-const TASK_KEYS = { custom: 'taskCustom', summary: 'taskSummary', keyword_digest: 'taskKeywordDigest', message: 'taskMessage', new_messages: 'taskNewMessages' } as const satisfies Record<AgentSchedule['task']['type'], ScheduleCopyKey>;
+const TASK_KEYS = { message_forward:'taskForward',custom: 'taskCustom', summary: 'taskSummary', keyword_digest: 'taskKeywordDigest', message: 'taskMessage', new_messages: 'taskNewMessages' } as const satisfies Record<AgentSchedule['task']['type'], ScheduleCopyKey>;
 const EXECUTION_KEYS = { program: 'kindProgram', agent: 'kindAgent' } as const satisfies Record<AgentSchedule['execution'], ScheduleCopyKey>;
 const DAY_KEYS = ['day0', 'day1', 'day2', 'day3', 'day4', 'day5', 'day6'] as const;
 const ERROR_KEYS: Record<string, ScheduleCopyKey> = {
@@ -26,6 +26,7 @@ type Result = Awaited<ReturnType<DesktopApi['createAgentSchedule']>>;
 export function describeRecurrence(schedule: AgentSchedule, text: Text): string {
   const recurrence = schedule.recurrence;
   switch (recurrence.kind) {
+    case 'message': return text('forwardEvent');
     case 'once': return text('recurrenceOnce', { arg0: wallDisplay(recurrence.at, schedule.timezone) });
     case 'daily': return text('recurrenceDaily', { arg0: recurrence.time });
     case 'weekly': return text('recurrenceWeekly', { arg0: [...recurrence.days].sort((a, b) => a - b).map((day) => text(DAY_KEYS[day]!)).join(text('listSeparator')), arg1: recurrence.time });
@@ -180,6 +181,9 @@ export function Schedules({ api, defaultProvider, providers, headingRef, onNotic
       {runsState?.rows && runsState.rows.length === 0 && <p className="schedule-hint">{text('recentRunsEmpty')}</p>}
       {runsState?.rows && runsState.rows.length > 0 && <ul className="schedule-run-list">{runsState.rows.map((run) => <li key={run.runId}>
         <time dateTime={run.scheduledFor}>{shortWall(run.scheduledFor, schedule.timezone)}</time><span aria-hidden="true">·</span><span>{outcomeText(run.outcome)}</span>
+        {run.forwarding && <div className="schedule-hint">{run.forwarding.sourceTitle || run.forwarding.accountId} · {run.forwarding.senderName || run.forwarding.senderId}
+          {run.forwarding.parts.map((part,index)=><div key={index}>{part.filename || part.kind} · {text(part.errorCode==='unsupported_content'?'forwardUnsupported':part.errorCode==='download_failed'?'forwardDownloadFailed':part.state==='sent'?'forwardPartSent':part.state==='unknown'?'forwardPartUnknown':part.state==='waiting'?'forwardPartWaiting':part.state==='pending'||part.state==='sending'?'outcomeSubmitting':'forwardPartFailed')}</div>)}
+        </div>}
         {schedule.task.type !== 'message' && run.jobId && <><span aria-hidden="true">·</span><button type="button" className="schedule-link" disabled={busyReplies.has(run.jobId)} onClick={(event) => void openReply(run, event.currentTarget)}>{text('runViewReply')}</button></>}
       </li>)}</ul>}
     </section>;
@@ -218,7 +222,7 @@ export function Schedules({ api, defaultProvider, providers, headingRef, onNotic
               {schedule.execution === 'program' && schedule.mayUseLlm && <span className="badge">{text('llmBadge')}</span>}
             </div>
             {llmWhen && <div className="schedule-sub-line" title={text('llmWhen', { arg0: llmWhen })}>{text('llmWhen', { arg0: llmWhen })}</div>}</td>
-            <td className={runAt.past ? 'schedule-time-past' : undefined} title={timeTitle(schedule)}>{runAt.text}</td>
+            <td className={runAt.past ? 'schedule-time-past' : undefined} title={timeTitle(schedule)}>{schedule.enabled && schedule.task.type==='message_forward'?text('forwardWaiting'):runAt.text}</td>
             <td title={delivery}>{delivery}</td>
             <td className="schedule-status" title={statusTitle}>{!schedule.enabled ? <span className="muted">{text('disabledBadge')}</span>
               : lastOutcome ? <span className="schedule-outcome"><span className={`status-dot ${outcomeDot(lastOutcome)}`.trim()} aria-hidden="true" />{outcomeText(lastOutcome)}</span>

@@ -28,7 +28,7 @@ export const TEXT_CHARS_RANGE = { min: AGENT_SCHEDULE_NEW_MESSAGES_TEXT_CHARS_MI
 // ---- Schedule kind: derived from the task type, never stored ----
 export type ScheduleKind = AgentScheduleExecution;
 export const KIND_TASKS: Record<ScheduleKind, readonly AgentScheduleTask['type'][]> = {
-  program: ['message', 'new_messages'],
+  program: ['message', 'new_messages', 'message_forward'],
   agent: ['custom', 'summary', 'keyword_digest'],
 };
 export const kindOfTask = (type: AgentScheduleTask['type']): ScheduleKind => scheduleExecutionKind({ type });

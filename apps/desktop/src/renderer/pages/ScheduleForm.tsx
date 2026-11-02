@@ -14,6 +14,7 @@ import { readAgentProvider } from '../agentProviderMemory.js';
 import { KIND_TASKS, kindOfTask, type ScheduleKind } from '../scheduleRules.js';
 import { ScheduleRulesEditor } from './ScheduleRulesEditor.js';
 import { NewMessagesPreview } from './ScheduleNewMessagesPreview.js';
+import { ScheduleForwardSender } from './ScheduleForwardSender.js';
 
 /** Providers the Agent room can run a job with (signed in, or status not yet known); all of them while the status list is empty. */
 export function availableProviders(providers: readonly ProviderStatus[] | undefined): Array<'codex' | 'claude'> {
@@ -27,10 +28,10 @@ export function roomProvider(defaultProvider: 'codex' | 'claude', providers: rea
 }
 
 const KINDS: RecurrenceKind[] = ['once', 'daily', 'weekly', 'interval', 'cron'];
-const KIND_KEYS: Record<RecurrenceKind, ScheduleCopyKey> = { once: 'kindOnce', daily: 'kindDaily', weekly: 'kindWeekly', interval: 'kindInterval', cron: 'kindCron' };
+const KIND_KEYS: Record<RecurrenceKind, ScheduleCopyKey> = { message:'forwardEvent',once: 'kindOnce', daily: 'kindDaily', weekly: 'kindWeekly', interval: 'kindInterval', cron: 'kindCron' };
 const DAY_KEYS = ['day0', 'day1', 'day2', 'day3', 'day4', 'day5', 'day6'] as const;
 const TASKS = [['custom', 'taskCustom', 'taskHintCustom'], ['summary', 'taskSummary', 'taskHintSummary'], ['keyword_digest', 'taskKeywordDigest', 'taskHintKeywordDigest'],
-  ['message', 'taskMessage', 'taskHintMessage'], ['new_messages', 'taskNewMessages', 'taskHintNewMessages']] as const;
+  ['message', 'taskMessage', 'taskHintMessage'], ['new_messages', 'taskNewMessages', 'taskHintNewMessages'],['message_forward','taskForward','forwardHint']] as const;
 const SCHEDULE_KINDS = [['program', 'kindProgram', 'kindHintProgram'], ['agent', 'kindAgent', 'kindHintAgent']] as const satisfies ReadonlyArray<readonly [ScheduleKind, ScheduleCopyKey, ScheduleCopyKey]>;
 
 
@@ -94,10 +95,11 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
   // Only the providers the Agent room offers: signed in (or not yet known). A saved schedule keeps its own provider in the list.
   const providerOptions = (['claude', 'codex'] as const).filter((provider) => provider === form.provider || availableProviders(providers).includes(provider));
   const isMessage = form.taskType === 'message';
+  const isForward=form.taskType==='message_forward';
   const isNewMessages = form.taskType === 'new_messages';
   const isProgram = isProgramTask(form.taskType);
   const usesLlm = formUsesLlm(form);
-  const showsWindow = !isMessage && (form.taskType !== 'custom' || form.targets.length > 0);
+  const showsWindow = !isMessage && !isForward && (form.taskType !== 'custom' || form.targets.length > 0);
   const promptLength = form.prompt.trim().length;
   const messageLength = form.messageText.trim().length;
   const zone = form.timezone === AGENT_SCHEDULE_DEFAULT_TIMEZONE ? '' : form.timezone;
@@ -168,6 +170,23 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
           <ScheduleRulesEditor api={api} text={text} draft={form.newMessages} onChange={(newMessages) => set({ newMessages })} errors={ruleErrors} />
           {err('rules', errorIds.rules)}
         </>}
+        {isForward && <fieldset className="schedule-field">
+          <legend className="schedule-label">{text('forwardEvent')}</legend>
+          <label>{text('forwardMatch')}<select aria-label={text('forwardMatch')} value={form.forwardMode} onChange={(event)=>set({forwardMode:event.target.value as ScheduleFormState['forwardMode']})}>
+            <option value="contains">{text('forwardContains')}</option><option value="exact">{text('forwardExact')}</option><option value="sender">{text('forwardSender')}</option>
+          </select></label>
+          {form.forwardMode!=='sender' && <label>{text('forwardText')}<textarea aria-label={text('forwardText')} value={form.forwardText} onChange={(event)=>set({forwardText:event.target.value})}/></label>}
+          <ScheduleForwardSender api={api} targets={form.targets} accountId={form.senderAccount} mid={form.senderMid} savedLabel={form.senderLabel} text={text}
+            onSelect={(sender)=>set({senderAccount:sender?.accountId??'',senderMid:sender?.mid??'',senderLabel:sender?.label??''})}/>
+          <details><summary>{text('forwardAdvancedSender')}</summary>
+          <label>{text('forwardSenderAccount')}<select aria-label={text('forwardSenderAccount')} value={form.senderAccount} onChange={(event)=>set({senderAccount:event.target.value})}>
+            <option value="">—</option>{[...new Set(form.targets.map((target)=>target.accountId))].map((accountId)=><option key={accountId} value={accountId}>{form.targets.filter((target)=>target.accountId===accountId).map((target)=>target.title||target.chatId).join(' / ')}</option>)}
+          </select></label>
+          <label>{text('forwardSenderMid')}<input aria-label={text('forwardSenderMid')} value={form.senderMid} onChange={(event)=>set({senderMid:event.target.value})}/></label>
+          <label>{text('forwardSenderLabel')}<input aria-label={text('forwardSenderLabel')} value={form.senderLabel} onChange={(event)=>set({senderLabel:event.target.value})}/></label>
+          </details>
+          <p className="schedule-hint">{text('forwardLiteral')}</p><p className="schedule-hint">{text('forwardTextOnly')}</p>{err('rules',errorIds.rules)}
+        </fieldset>}
 
         {form.taskType === 'summary' && <div className="schedule-field">
           <label htmlFor={ids.focus} className="schedule-label">{text('fieldFocus')}</label>
@@ -193,7 +212,7 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
           {err('prompt', errorIds.prompt)}
         </div>}
 
-        <fieldset className="schedule-field">
+        {!isForward && <fieldset className="schedule-field">
           <legend className="schedule-label">{text('fieldRecurrence')}</legend>
           <div className="schedule-line">
             <div className="segmented schedule-segmented" role="radiogroup" aria-label={text('fieldRecurrence')}>
@@ -219,7 +238,7 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
               {Array.from({ length: AGENT_SCHEDULE_JITTER_MAX_MINUTES + 1 }, (_, minutes) => <option key={minutes} value={minutes}>{minutes === 0 ? text('jitterNone') : text('jitterUpTo', { arg0: minutes })}</option>)}
             </select>
           </div>
-        </fieldset>
+        </fieldset>}
 
         {showsWindow && <fieldset className="schedule-field">
           <legend className="schedule-label">{text('fieldWindow')}</legend>
@@ -236,7 +255,7 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
         <fieldset className="schedule-field">
           <legend className="schedule-label">{text('fieldDelivery')}</legend>
           <div className="segmented schedule-segmented" role="radiogroup" aria-label={text('fieldDelivery')}>
-            {choose(form.deliveryMode === 'primary_admin', 'deliveryOptionPrimaryAdmin', () => set({ deliveryMode: 'primary_admin' }))}
+            {!isForward && choose(form.deliveryMode === 'primary_admin', 'deliveryOptionPrimaryAdmin', () => set({ deliveryMode: 'primary_admin' }))}
             {!isProgram && choose(form.deliveryMode === 'record_only', 'deliveryOptionRecordOnly', () => set({ deliveryMode: 'record_only' }))}
             {choose(form.deliveryMode === 'line_target', 'deliveryOptionLine', () => set({ deliveryMode: 'line_target' }))}
           </div>
