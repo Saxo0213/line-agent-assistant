@@ -517,6 +517,8 @@ export const McpSendTargetSchema = z.strictObject({
 export type McpSendTarget = z.infer<typeof McpSendTargetSchema>;
 
 export const McpListSendTargetsOutputSchema = z.strictObject({
+  /** Bound Agent account used by every returned chat; null when this principal cannot send with that account. Optional for compatibility with older servers. */
+  accountId: z.string().min(1).nullable().optional(),
   targets: z.array(McpSendTargetSchema).max(20),
 });
 export type McpListSendTargetsOutput = z.infer<typeof McpListSendTargetsOutputSchema>;

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Pool } from 'pg';
-import { AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, McpInternalToolNameSchema, McpToolNameSchema, SCHEDULE_TOOL_NAMES } from '@line-agent/contracts';
+import { AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, McpInternalToolNameSchema, McpListSendTargetsOutputSchema, McpToolNameSchema, SCHEDULE_TOOL_NAMES } from '@line-agent/contracts';
 import { AgentRepository, AgentScheduleRepository, McpDomainError, McpTokenRepository, allPermissions, type MessageRepository } from '@line-agent/database';
 import { createTestDatabase } from '../../../../../packages/database/src/test-database.js';
 import { AgentScheduleService } from './agent-schedule-service.js';
@@ -61,6 +61,66 @@ describe('schedule tools (mocked repository)', () => {
     const absent = harness({ withHandler: false });
     for (const name of SCHEDULE_TOOL_NAMES) expect(await toolNames(absent.rpc)).not.toContain(name);
     await absent.service.shutdown();
+  });
+
+  it('advertises exact message-forward fields and creates sender, contains and exact rules', async () => {
+    const h = harness();
+    const listed = (await h.rpc('tools/list')).body as { result: { tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> } };
+    const create = listed.result.tools.find((tool) => tool.name === 'create_schedule')!;
+    const update = listed.result.tools.find((tool) => tool.name === 'update_schedule')!;
+    expect(create.description).toContain('match:{mode:"sender"}');
+    expect(create.description).toContain('sender:{accountId:"<source-accountId>",mid:"<sender-MID>"}');
+    expect(create.description).toContain('accountId:"<list_send_targets.accountId>"');
+    expect(create.description).toContain('chatType:"direct"');
+    expect(update.description).toContain('match:{mode:"sender"}');
+    expect(update.description).toContain('sender:{accountId:"<source-accountId>",mid:"<sender-MID>"}');
+
+    const task = create.inputSchema.properties as { task: { oneOf: Array<{ properties?: { match?: { oneOf: Array<{ required: string[] }> }; sender?: { required: string[] } } }> } };
+    const forward = task.task.oneOf[0]!;
+    expect(forward.properties?.match?.oneOf.map((variant) => variant.required)).toEqual([
+      ['mode', 'keywords'], ['mode', 'text'], ['mode'],
+    ]);
+    expect(forward.properties?.sender?.required).toEqual(['accountId', 'mid']);
+
+    const source = { accountId: 'source-account', chatType: 'direct', chatId: 'source-chat', title: 'Source' };
+    const listedDestinations = McpListSendTargetsOutputSchema.parse({ accountId: 'destination-account', targets: [
+      { no: 1, chatType: 'direct', chatId: 'destination-chat', title: 'Destination', members: ['Destination'], memberCount: 1 },
+    ] });
+    const destination = { accountId: listedDestinations.accountId!, chatType: listedDestinations.targets[0]!.chatType, chatId: listedDestinations.targets[0]!.chatId };
+    const sender = { accountId: 'source-account', mid: 'sender-mid', label: 'Sender' };
+    for (const forwardTask of [
+      { type: 'message_forward', match: { mode: 'sender' }, sender },
+      { type: 'message_forward', match: { mode: 'contains', keywords: ['hello'] } },
+      { type: 'message_forward', match: { mode: 'exact', text: 'hello' } },
+    ]) {
+      const response = resultOf(await h.call('create_schedule', { title: 'Forward', recurrence: { kind: 'message' }, targets: [source], task: forwardTask,
+        delivery: { mode: 'line_target', target: destination } }));
+      expect(response.isError).toBe(false);
+    }
+    expect(h.handler.create).toHaveBeenCalledTimes(3);
+    await h.service.shutdown();
+  });
+
+  it('keeps a forwarding rule intact when changing only its title and enabled state', async () => {
+    const h = harness();
+    const response = resultOf(await h.call('update_schedule', { scheduleId: SCHEDULE_ID, title: 'Renamed forward', enabled: false }));
+    expect(response.isError).toBe(false);
+    expect(h.handler.update).toHaveBeenCalledWith(SCHEDULE_ID, { title: 'Renamed forward', enabled: false });
+    await h.service.shutdown();
+  });
+
+  it('returns every useful field path for malformed message-forward arguments', async () => {
+    const h = harness();
+    const malformed = resultOf(await h.call('create_schedule', { title: 'Forward', recurrence: { kind: 'message' },
+      targets: [{ accountId: 'source-account', chatType: 'direct', chatId: 'source-chat', title: 'Source' }],
+      task: { type: 'message_forward', match: { kind: 'all' }, sender: { accountId: 'source-account', senderId: 'sender-mid' } },
+      delivery: { mode: 'line_target', target: { accountId: 'destination-account', chatType: 'direct', chatId: 'destination-chat', title: 'Destination' } } }));
+    expect(malformed.isError).toBe(true);
+    expect(malformed.content[0]!.text).toContain('task.match');
+    expect(malformed.content[0]!.text).toContain('task.sender.mid');
+    expect(malformed.content[0]!.text).toContain('task.sender');
+    expect(h.handler.create).not.toHaveBeenCalled();
+    await h.service.shutdown();
   });
 
   it('passes jitterMinutes through create and update and rejects values outside 0..5', async () => {

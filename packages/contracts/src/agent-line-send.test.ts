@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  MCP_TOOL_NAMES, McpInternalToolNameSchema, McpListSendTargetsInputSchema, McpListSendTargetsOutputSchema, McpSendToTargetInputSchema,
+  MCP_TOOL_NAMES, AgentScheduleCreateInputSchema, McpInternalToolNameSchema, McpListSendTargetsInputSchema, McpListSendTargetsOutputSchema, McpSendToTargetInputSchema,
   McpSendToTargetOutputSchema, McpToolNameSchema, SendErrorCodeSchema, LineWorkerEventSchema, lineResultErrorMessage,
 } from './index.js';
 
@@ -20,8 +20,17 @@ describe('Agent LINE send contract', () => {
     for (const bad of [{}, { query: '' }, { query: 'x'.repeat(101) }, { query: 'a', extra: 1 }]) {
       expect(McpListSendTargetsInputSchema.safeParse(bad).success).toBe(false);
     }
-    expect(McpListSendTargetsOutputSchema.safeParse({ targets: [{ no: 1, chatType: 'group', chatId: 'g', title: null, members: ['a'], memberCount: 1 }] }).success).toBe(true);
-    expect(McpListSendTargetsOutputSchema.safeParse({ targets: [{ no: 1, chatType: 'community', chatId: 'g', title: null, members: [], memberCount: 0 }] }).success).toBe(false);
+    const target = { no: 1, chatType: 'direct', chatId: 'u-destination', title: 'Destination', members: ['a'], memberCount: 1 };
+    const output = McpListSendTargetsOutputSchema.parse({ accountId: 'agent-account', targets: [target] });
+    expect(output.accountId).toBe('agent-account');
+    const schedule = AgentScheduleCreateInputSchema.safeParse({ title: 'Forward', provider: 'codex', recurrence: { kind: 'message' },
+      targets: [{ accountId: 'source-account', chatType: 'direct', chatId: 'u-source', title: 'Source' }],
+      task: { type: 'message_forward', match: { mode: 'sender' }, sender: { accountId: 'source-account', mid: 'sender-mid' } },
+      delivery: { mode: 'line_target', target: { accountId: output.accountId!, chatType: output.targets[0]!.chatType, chatId: output.targets[0]!.chatId } } });
+    expect(schedule.success, JSON.stringify(schedule.error?.issues)).toBe(true);
+    expect(McpListSendTargetsOutputSchema.safeParse({ targets: [target] }).success).toBe(true); // legacy output remains readable
+    expect(McpListSendTargetsOutputSchema.safeParse({ accountId: null, targets: [] }).success).toBe(true);
+    expect(McpListSendTargetsOutputSchema.safeParse({ accountId: 'agent-account', targets: [{ ...target, chatType: 'community' }] }).success).toBe(false);
   });
 
   it('accepts all four item types and bounds', () => {

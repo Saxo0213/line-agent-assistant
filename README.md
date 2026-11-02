@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.318 adds prompt routing for fresh monitored messages and event rules that can forward selected original messages and supported attachments to an Agent chat. Install through the app's **Check for updates**. See the [v1.0.316 → v1.0.318 release notes](docs/releases/v1.0.318.md) for the complete changes.
+v1.0.319 adds explicit parameter examples for the nested match and sender fields used by Agent schedule tools to create or update forwarding rules. Validation errors also identify the relevant input path. Install through the app's **Check for updates**. See the [v1.0.318 → v1.0.319 release notes](docs/releases/v1.0.319.md) for the complete changes.
 
 ## Installation
 

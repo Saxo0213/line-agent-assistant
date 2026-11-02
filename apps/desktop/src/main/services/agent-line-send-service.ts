@@ -206,7 +206,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     const parsed = McpListSendTargetsInputSchema.safeParse(rawInput);
     if (!parsed.success) throw new McpDomainError('INVALID_INPUT', parsed.error.issues[0]?.message ?? 'Invalid list_send_targets arguments.');
     const accountId = await this.options.messages.findAgentSendAccount(client);
-    if (!accountId || (accountScope !== undefined && accountScope !== null && !accountScope.includes(accountId))) return { targets: [] };
+    if (!accountId || (accountScope !== undefined && accountScope !== null && !accountScope.includes(accountId))) return { accountId: null, targets: [] };
     const admin = await findSharedAdminChat(client).catch(() => null);
     const adminId = admin !== null && admin.accountId === accountId ? admin.adminMid : null;
     let rows = await this.options.messages.listSendTargets({ accountId, query: parsed.data.query, limit: 20 }, client);
@@ -218,7 +218,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     }
     const targets = rows.filter((row) => row.chatId !== LOCAL_AGENT_ROOM_CHAT_ID).slice(0, 20)
       .map((row, index) => ({ ...row, no: index + 1, ...(adminId !== null && row.chatType === 'direct' && row.chatId === adminId ? { role: 'primary_admin' as const } : {}) }));
-    return McpListSendTargetsOutputSchema.parse({ targets });
+    return McpListSendTargetsOutputSchema.parse({ accountId, targets });
   }
 
   /** Runs inside the short MCP transaction: principal is already verified; checks the Agent account, target, caps and sources. */

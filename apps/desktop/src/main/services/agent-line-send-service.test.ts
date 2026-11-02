@@ -160,8 +160,14 @@ describe('target and account authorization', () => {
   it('returns no Agent send targets when the current external account scope excludes a paused Agent', async () => {
     repo.account = ACCOUNT;
     const output = await service.listTargets(fakeClient(), { query: 'Alice' }, ['primary-admin']);
-    expect(output).toEqual({ targets: [] });
+    expect(output).toEqual({ accountId: null, targets: [] });
     expect(repo.listSendTargets).not.toHaveBeenCalled();
+  });
+
+  it('returns the authorized Agent account alongside send target rows', async () => {
+    repo.listSendTargets.mockResolvedValue([{ chatType: 'direct', chatId: 'u-friend', title: 'Friend', members: ['Friend'], memberCount: 1 }] as never);
+    const output = await service.listTargets(fakeClient(), { query: 'Friend' }, [ACCOUNT]);
+    expect(output).toEqual({ accountId: ACCOUNT, targets: [{ no: 1, chatType: 'direct', chatId: 'u-friend', title: 'Friend', members: ['Friend'], memberCount: 1 }] });
   });
 
   it('rejects community and thread targets without touching LINE', async () => {
