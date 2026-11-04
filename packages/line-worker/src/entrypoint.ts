@@ -130,7 +130,11 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
   let sendPending = 0;
   let pollPending = false;
   let reactionActive = false;
-  let reactionPending: Extract<LineWorkerCommand, { type: 'reactMessage' }> | undefined;
+  // A LINE reaction is a state per message, so pending commands coalesce per message (insertion-ordered).
+  const reactionPending = new Map<string, Extract<LineWorkerCommand, { type: 'reactMessage' }>>();
+  const MAX_REACTION_PENDING = 16;
+  const reactionKey = (command: Extract<LineWorkerCommand, { type: 'reactMessage' }>) =>
+    `${command.chatType}\u0000${command.chatId}\u0000${command.messageId}`;
   let urgentFence = false;
   const urgentTasks = new Map<string, Promise<void>>();
   const capabilityPending = new Map<string, number>();
@@ -222,10 +226,10 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
   };
   const runReaction = (command: Extract<LineWorkerCommand, { type: 'reactMessage' }>): void => {
     void execute(command, command).finally(() => {
-      const next = reactionPending;
-      if (next) {
-        reactionPending = undefined;
-        runReaction(next);
+      const oldest = reactionPending.entries().next();
+      if (!oldest.done) {
+        reactionPending.delete(oldest.value[0]);
+        runReaction(oldest.value[1]);
       } else reactionActive = false;
     });
   };
@@ -289,8 +293,13 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
       return;
     }
     if (command.type === 'reactMessage') {
-      if (reactionActive) reactionPending = command;
-      else { reactionActive = true; runReaction(command); }
+      if (reactionActive) {
+        const key = reactionKey(command);
+        if (!reactionPending.has(key) && reactionPending.size >= MAX_REACTION_PENDING) {
+          reactionPending.delete(reactionPending.keys().next().value!);
+        }
+        reactionPending.set(key, command); // Map.set keeps the position of an existing key.
+      } else { reactionActive = true; runReaction(command); }
       return;
     }
 

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
+import { SENDER_NAME_SQL, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN } from './name-resolution.js';
 import { matchesScheduleForward, redactSensitiveString, type AgentScheduleForwardTask, type AgentScheduleSendTarget } from '@line-agent/contracts';
 
 type Queryable = Pick<PoolClient, 'query'>;
@@ -28,15 +29,28 @@ async function authority(client: Queryable, accountId: string): Promise<Record<s
   return result.rows[0]?.snapshot ?? null;
 }
 
+/** Single-line, at most 100 UTF-16 units without splitting a surrogate pair, redacted. */
+function cleanSenderName(value:string|null|undefined):string {
+  let name=(value??'').replace(/[\r\n\t]+/g,' ').trim();
+  if(name.length>100) name=name.slice(0,/[\uD800-\uDBFF]/.test(name[99]!)?99:100);
+  return redactSensitiveString(name).trim();
+}
+/** Chat-view name on the source account, else the rule label, else the sender id. */
+function forwardSenderName(resolved:string|null,label:string|undefined,senderId:string):string {
+  return [resolved,label,senderId].map(cleanSenderName).find((name)=>name.length>0) ?? '';
+}
+
 /** Called only inside a fresh, authorized ingress transaction after original attachment projection. */
 export async function captureScheduleForward(client: Queryable, source: ForwardSource, originalText?:string|null): Promise<number> {
   if(!(await client.query("SELECT 1 FROM agent_schedules WHERE enabled AND task->>'type'='message_forward' LIMIT 1")).rowCount) return 0;
   const message = (await client.query<{ text: string; sender: string; own_mid: string; agent_mid: string;
-    kind: string; occurred_at: Date; title: string; name: string }>(`SELECT COALESCE(m.text_content,'') text,m.sender_id sender,
-      a.own_mid,(SELECT own_mid FROM line_accounts WHERE product_role='AGENT') agent_mid,m.kind,m.occurred_at,
-      COALESCE(c.title,'') title,COALESCE(ct.display_name,m.sender_id) name FROM messages m
-      JOIN line_accounts a ON a.account_id=m.account_id JOIN conversations c ON c.account_id=m.account_id AND c.chat_type=m.chat_type AND c.chat_id=m.chat_id
-      LEFT JOIN line_contacts ct ON ct.account_id=m.account_id AND ct.mid=m.sender_id
+    kind: string; occurred_at: Date; title: string; name: string | null }>(`SELECT COALESCE(m.text_content,'') text,m.sender_id sender,
+      la.own_mid,(SELECT own_mid FROM line_accounts WHERE product_role='AGENT') agent_mid,m.kind,m.occurred_at,
+      COALESCE(c.title,'') title,${SENDER_NAME_SQL} name FROM messages m
+      JOIN line_accounts la ON la.account_id=m.account_id JOIN conversations c ON c.account_id=m.account_id AND c.chat_type=m.chat_type AND c.chat_id=m.chat_id
+      LEFT JOIN conversation_members cm ON cm.account_id=m.account_id AND cm.chat_type=m.chat_type AND cm.chat_id=m.chat_id AND cm.member_id=m.sender_id
+      ${SENDER_CONTACT_JOIN}
+      ${PEER_CONTACT_JOIN}
       WHERE m.account_id=$1 AND m.chat_type=$2 AND m.chat_id=$3 AND m.message_id=$4
         AND COALESCE(m.content->>'type','')<>'unsent' AND NOT(m.raw ? 'sourceDeleted')`,
   [source.accountId,source.chatType,source.chatId,source.messageId])).rows[0];
@@ -69,23 +83,26 @@ export async function captureScheduleForward(client: Queryable, source: ForwardS
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,72))',[`${rule.schedule_id}:${logicalMessage}`]);
     if ((await client.query('SELECT 1 FROM agent_schedule_forward_work WHERE schedule_id=$1 AND revision=$2 AND logical_message=$3',
       [rule.schedule_id,rule.rule_revision,logicalMessage])).rowCount) continue;
+    const senderName=forwardSenderName(message.name,rule.task.sender?.label,message.sender);
     const runId=randomUUID(), workId=randomUUID();
     await client.query(`INSERT INTO agent_schedule_runs(run_id,schedule_id,scheduled_for,outcome) VALUES($1,$2,clock_timestamp(),'submitting')`,[runId,rule.schedule_id]);
     await client.query(`INSERT INTO agent_schedule_forward_work(work_id,schedule_id,revision,logical_message,account_id,chat_type,chat_id,message_id,sender_id,sender_name,source_title,authority,run_id,selected_source)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb)`,
-    [workId,rule.schedule_id,rule.rule_revision,logicalMessage,source.accountId,source.chatType,source.chatId,source.messageId,message.sender,redactSensitiveString(rule.task.sender?.label||message.name),redactSensitiveString(selected.title||message.title),JSON.stringify(snapshot),runId,
+    [workId,rule.schedule_id,rule.rule_revision,logicalMessage,source.accountId,source.chatType,source.chatId,source.messageId,message.sender,senderName,redactSensitiveString(selected.title||message.title),JSON.stringify(snapshot),runId,
       JSON.stringify({...selected,ownMid:selected.accountId===source.accountId?message.own_mid:message.agent_mid})]);
+    const attachments=await client.query<{ attachment_id:string;kind:string;name:string|null }>(`SELECT attachment_id,kind,name FROM attachments
+      WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND message_id=$4 ORDER BY array_position($5::text[],external_attachment_id),created_at,attachment_id LIMIT 20`,[source.accountId,source.chatType,source.chatId,source.messageId,source.attachmentOrder??[]]);
+    // The sender name leads the first text part; a text-less media message gets a name-only part before its attachments.
+    const forwardText=message.text.length>0 ? `${senderName}: ${message.text}` : attachments.rowCount ? `${senderName}:` : '';
     let index=0;
     // One persisted part is one physical text send; concatenating these chunks preserves every original code unit.
-    for (let start=0;start<message.text.length;) {
-      let end=Math.min(start+4900,message.text.length);
-      if(end<message.text.length && /[\uD800-\uDBFF]/.test(message.text[end-1]!)) end--;
-      await client.query(`INSERT INTO agent_schedule_forward_parts(work_id,part_index,kind,text,state) VALUES($1,$2,'text',$3,'pending')`,[workId,index++,message.text.slice(start,end)]);
+    for (let start=0;start<forwardText.length;) {
+      let end=Math.min(start+4900,forwardText.length);
+      if(end<forwardText.length && /[\uD800-\uDBFF]/.test(forwardText[end-1]!)) end--;
+      await client.query(`INSERT INTO agent_schedule_forward_parts(work_id,part_index,kind,text,state) VALUES($1,$2,'text',$3,'pending')`,[workId,index++,forwardText.slice(start,end)]);
       start=end;
       if(index>=80) break;
     }
-    const attachments=await client.query<{ attachment_id:string;kind:string;name:string|null }>(`SELECT attachment_id,kind,name FROM attachments
-      WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND message_id=$4 ORDER BY array_position($5::text[],external_attachment_id),created_at,attachment_id LIMIT 20`,[source.accountId,source.chatType,source.chatId,source.messageId,source.attachmentOrder??[]]);
     for(const attachment of attachments.rows) await client.query(`INSERT INTO agent_schedule_forward_parts(work_id,part_index,kind,attachment_id,filename,state)
       VALUES($1,$2,$3,$4,$5,'waiting')`,[workId,index++,attachment.kind==='image'?'image':'file',attachment.attachment_id,attachment.name]);
     if(index===0 || (!attachments.rowCount && message.kind!=='text')) await client.query(`INSERT INTO agent_schedule_forward_parts(work_id,part_index,kind,state,error_code)

@@ -177,11 +177,21 @@ export const NEW_MESSAGES_CHAT_SEPARATOR = '\n\n';
 /** The chat that receives the list of the schedule. */
 export interface ScheduleOwnDelivery { accountId: string; chatType: ScheduleMessage['chatType']; chatId: string }
 
+const isBlank = (value: string | null | undefined): boolean => value == null || value.trim().length === 0;
+
+/** The kept copy of a merged message; its blank title or sender name comes from the other copy. The input objects stay unchanged. */
+function fillBlankFields(kept: ScheduleMessage, other: ScheduleMessage): ScheduleMessage {
+  const title = isBlank(kept.conversationTitle) && !isBlank(other.conversationTitle) ? other.conversationTitle : kept.conversationTitle;
+  const sender = isBlank(kept.senderName) && !isBlank(other.senderName) ? other.senderName : kept.senderName;
+  if (title === kept.conversationTitle && sender === kept.senderName) return kept;
+  return { ...kept, conversationTitle: title, senderName: sender };
+}
+
 /**
  * Evaluates one run. `ownDelivery` is the delivery chat: the outbound messages of this chat in this account are the lists that the
  * schedule sent, so every message with one of their ids (in all accounts and chats) is dropped before any other step. A message of a
  * group, room or community that several accounts store has the same message id in each copy: one copy stays, and the outbound copy
- * wins (a message from an account of the user is outbound). Direct chats are never merged.
+ * wins (a message from an account of the user is outbound). The kept copy takes a blank title or sender name from the other copy. Direct chats are never merged.
  */
 export function evaluateNewMessages(input: {
   task: NewMessagesConfig; messages: readonly ScheduleMessage[]; window: ScheduleTimeWindow; ownDelivery?: ScheduleOwnDelivery | null;
@@ -197,7 +207,9 @@ export function evaluateNewMessages(input: {
     const key = message.chatType === 'direct' ? JSON.stringify([message.accountId, message.chatType, message.chatId, message.messageId])
       : JSON.stringify([message.chatType, message.chatId, message.messageId]);
     const first = unique.get(key);
-    if (!first || (first.direction !== 'outbound' && message.direction === 'outbound')) unique.set(key, message);
+    if (!first) unique.set(key, message);
+    else unique.set(key, fillBlankFields(first.direction !== 'outbound' && message.direction === 'outbound' ? message : first,
+      first.direction !== 'outbound' && message.direction === 'outbound' ? first : message));
   }
   const kept = [...unique.values()].filter((message) => messagePasses(input.task.messageFilter, message));
   const sorted = kept.map((message, index) => ({ message, index }))

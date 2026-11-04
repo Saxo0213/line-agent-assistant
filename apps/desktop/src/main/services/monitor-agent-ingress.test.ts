@@ -116,12 +116,12 @@ database('monitor Agent real ingress',()=>{
       async send(command){sent.push(command.text);return {type:'sendResult',...binding,requestId:command.requestId,status:'sent',messageId:'forwarded',error:null};}}});
     const forward=new ScheduleForwardService({store,messages,sender,publish(){},onError(error){throw error;}});
     await forward.drain();
-    expect(sent).toEqual([original]);
+    expect(sent).toEqual([`Admin: ${original}`]);
     expect((await schedules.listRuns(schedule.scheduleId))[0]!.outcome).toBe('sent');
     const {instance}=await service();
     await liveReceive(instance,r);
     await forward.drain();
-    expect(sent).toEqual([original]);
+    expect(sent).toEqual([`Admin: ${original}`]);
     expect((await pool.query('SELECT count(*) FROM agent_schedule_forward_work WHERE schedule_id=$1',[schedule.scheduleId])).rows[0].count).toBe('1');
     await instance.shutdownIngress();await forward.stop();await sender.shutdown();await schedules.delete(schedule.scheduleId);
   });
@@ -179,7 +179,7 @@ database('monitor Agent real ingress',()=>{
         {id:'original-image',kind:'image',name:'原圖.png',mimeType:'image/png',sizeBytes:8,expiresAt:null},
         {id:'original-file',kind:'file',name:'原檔.pdf',mimeType:'application/pdf',sizeBytes:8,expiresAt:null}]});
       await forward.drain();expect(sent).toEqual([]);
-      expect(texts).toEqual([]);
+      expect(texts).toEqual([`${adminMid}:`]);
       const attachments=await pool.query<{attachment_id:string;external_attachment_id:string}>('SELECT attachment_id,external_attachment_id FROM attachments WHERE account_id=$1 AND message_id=$2',['admin',r.messageId]);
       for(const attachment of attachments.rows) {
         const bytes=attachment.external_attachment_id==='original-image'?'IMAGE123':'FILE1234';
@@ -190,15 +190,15 @@ database('monitor Agent real ingress',()=>{
       const first=(await store.pending())[0]!;
       const claims=await Promise.all([store.mark(first,'sending'),store.mark(first,'sending')]);
       expect(claims.sort()).toEqual([false,true]);
-      await pool.query("UPDATE agent_schedule_forward_parts SET state='waiting' WHERE work_id=$1 AND part_index=0",[first.workId]);
+      await pool.query("UPDATE agent_schedule_forward_parts SET state='waiting' WHERE work_id=$1 AND part_index=1",[first.workId]);
       await forward.drain();
       expect(sent).toEqual([{kind:'image',name:'原圖.png',bytes:'IMAGE123'},{kind:'file',name:'原檔.pdf',bytes:'FILE1234'}]);
-      expect((await schedules.listRuns(schedule.scheduleId))[0]).toMatchObject({outcome:'send_unknown',forwarding:{accountId:'admin',senderId:adminMid,parts:[{state:'sent'},{state:'unknown'}]}});
+      expect((await schedules.listRuns(schedule.scheduleId))[0]).toMatchObject({outcome:'send_unknown',forwarding:{accountId:'admin',senderId:adminMid,parts:[{state:'sent'},{state:'sent'},{state:'unknown'}]}});
       await store.recover();await forward.drain();expect(sent).toHaveLength(2);
       for(let index=0;index<32;index++) await receipt('',{kind:'image',occurredAt:new Date(Date.now()+1000).toISOString(),
         attachments:[{id:`waiting-${index}`,kind:'image',name:'waiting.png',mimeType:'image/png',sizeBytes:8,expiresAt:null}]});
       await receipt('fair-ready',{occurredAt:new Date(Date.now()+1000).toISOString()});
-      await forward.drain();expect(texts).toEqual(['fair-ready']);expect(sent).toHaveLength(2);
+      await forward.drain();expect(texts.at(-1)).toBe(`${adminMid}: fair-ready`);expect(sent).toHaveLength(2);
       await schedules.update(schedule.scheduleId,{targets:[{accountId:'agent',chatType:'group',chatId:'forward-revoke',title:'Group'}]});
       await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id) VALUES('agent','group','forward-revoke')");
       await pool.query("INSERT INTO conversation_members(account_id,chat_type,chat_id,member_id) VALUES('agent','group','forward-revoke',$1)",[agentMid]);
@@ -208,7 +208,7 @@ database('monitor Agent real ingress',()=>{
       const imageHash=createHash('sha256').update('IMAGE123').digest('hex');
       await pool.query("UPDATE attachments SET status='ready',relative_path=$2,sha256=$3,size_bytes=8 WHERE account_id='admin' AND message_id=$1",[blocked.messageId,`att-${imageHash}.blob`,imageHash]);
       await forward.drain();expect(sent).toHaveLength(2);
-      expect((await pool.query('SELECT p.state FROM agent_schedule_forward_parts p JOIN agent_schedule_forward_work w USING(work_id) WHERE w.message_id=$1',[blocked.messageId])).rows).toEqual([{state:'cancelled'}]);
+      expect((await pool.query('SELECT p.state FROM agent_schedule_forward_parts p JOIN agent_schedule_forward_work w USING(work_id) WHERE w.message_id=$1 ORDER BY p.part_index',[blocked.messageId])).rows).toEqual([{state:'cancelled'},{state:'cancelled'}]);
     } finally {await forward.stop();await sender.shutdown();await schedules.delete(schedule.scheduleId);await rm(root,{recursive:true,force:true});}
   });
   it('requires current group membership before admission and preserves mentions',async()=>{

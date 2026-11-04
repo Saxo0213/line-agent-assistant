@@ -155,7 +155,52 @@ it('cancels a resource read without fencing later authorized sends', async () =>
   expect(channel.events).toContainEqual(expect.objectContaining({ type: 'sendResult', requestId: 'after-cancel', status: 'sent' }));
 });
 
-it('bounds Reaction work to one active and one coalesced pending command per worker', async () => {
+async function reactionHarness() {
+  const channel = port();
+  let releaseFirst!: () => void;
+  let active = 0;
+  let maximumActive = 0;
+  const seen: string[] = [];
+  const reactions: string[] = [];
+  const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+  Object.defineProperty(transport, 'react', { value: async (_chat: unknown, messageId: string, reaction: string) => {
+    active += 1; maximumActive = Math.max(maximumActive, active); seen.push(messageId); reactions.push(reaction);
+    if (messageId === '9') await new Promise<void>((resolve) => { releaseFirst = resolve; });
+    active -= 1;
+  } });
+  runWorkerLoopOnPort(channel, async () => transport);
+  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  const react = (requestId: string, messageId: string, reaction = 'AMAZING') => channel.send({ type: 'reactMessage', ...binding,
+    chatType: 'direct', chatId: 'u-peer', requestId, messageId, reaction });
+  return { seen, reactions, react, release: () => releaseFirst(), maximumActive: () => maximumActive };
+}
+
+it('coalesces pending Reactions of one message to the newest value and keeps the order of messages', async () => {
+  const { seen, reactions, react, release } = await reactionHarness();
+  await react('r-1', '9');
+  await react('r-2', '10', 'AMAZING');
+  await react('r-3', '10', 'LOVE');
+  await react('r-4', '11', 'NICE');
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(seen).toEqual(['9', '10', '11']);
+  expect(reactions).toEqual(['AMAZING', 'LOVE', 'NICE']);
+});
+
+it('drops the oldest pending Reaction when more than 16 different messages wait', async () => {
+  const { seen, react, release, maximumActive } = await reactionHarness();
+  await react('r-0', '9');
+  for (let index = 1; index <= 17; index += 1) await react(`r-${index}`, String(100 + index));
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await vi.waitFor(() => expect(seen).toHaveLength(17));
+
+  expect(seen).toEqual(['9', ...Array.from({ length: 16 }, (_, index) => String(102 + index))]);
+  expect(maximumActive()).toBe(1);
+});
+
+it('keeps one active Reaction and coalesces pending Reactions per message', async () => {
   const channel = port();
   let releaseFirst!: () => void;
   let active = 0;
@@ -180,7 +225,7 @@ it('bounds Reaction work to one active and one coalesced pending command per wor
   releaseFirst();
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  expect(seen).toEqual(['9', '11']);
+  await vi.waitFor(() => expect(seen).toEqual(['9', '10', '11']));
   expect(maximumActive).toBe(1);
 });
 

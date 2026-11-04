@@ -4,8 +4,22 @@ import { pathToFileURL } from 'node:url';
 
 const MAX_LINE_BYTES = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * A send_to_target call waits for the paced send queue. The send service budget is 600 s and the HTTP backstop is 605 s, so the
+ * bridge waits a little longer and the server's own answer arrives first. Every other request keeps the short timeout.
+ */
+export const SEND_REQUEST_TIMEOUT_MS = 610_000;
+const SEND_TOOL_NAME = 'send_to_target';
 type JsonRpcId = string | number | null;
-type JsonRpcRequest = { jsonrpc?: unknown; id?: JsonRpcId; method?: unknown };
+type JsonRpcRequest = { jsonrpc?: unknown; id?: JsonRpcId; method?: unknown; params?: unknown };
+
+/** The timeout of one request: long only for a tools/call of send_to_target. */
+export function requestTimeoutMs(request: JsonRpcRequest): number {
+  const params = request.params;
+  const isSend = request.method === 'tools/call' && !!params && typeof params === 'object' && !Array.isArray(params)
+    && (params as { name?: unknown }).name === SEND_TOOL_NAME;
+  return isSend ? SEND_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+}
 
 function responseError(id: JsonRpcId, message: string): string {
   return JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32000, message } });
@@ -26,6 +40,8 @@ export async function runBridge(env: NodeJS.ProcessEnv, input = stdin, output = 
   let line = Buffer.alloc(0);
   let overLimit = false;
   let ended = false;
+  /** Sends in progress; the process waits for them after stdin ends (each one ends by its own timeout). */
+  const sends = new Set<Promise<void>>();
 
   const processLine = async (bytes: Buffer, tooLong: boolean): Promise<void> => {
     const text = bytes.toString('utf8');
@@ -38,8 +54,10 @@ export async function runBridge(env: NodeJS.ProcessEnv, input = stdin, output = 
       return;
     }
     const hasId = Object.hasOwn(request, 'id');
+    const timeoutMs = requestTimeoutMs(request);
+    const forward = async (): Promise<void> => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('Request timed out.')), REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(new Error('Request timed out.')), timeoutMs);
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -62,6 +80,15 @@ export async function runBridge(env: NodeJS.ProcessEnv, input = stdin, output = 
       clearTimeout(timer);
       controller.abort();
     }
+    };
+    if (timeoutMs === SEND_REQUEST_TIMEOUT_MS) {
+      // A send waits for the paced send queue (up to 600 s). It must not block the line loop: later requests go on while it runs.
+      // Each answer is one synchronous write of one whole line, so lines from parallel requests never interleave.
+      const running = forward().catch(() => undefined).finally(() => { sends.delete(running); });
+      sends.add(running);
+      return;
+    }
+    await forward();
   };
   const enqueueLine = (bytes: Buffer, tooLong: boolean) => {
     queued = queued.then(() => processLine(bytes, tooLong)).catch(() => undefined);
@@ -101,6 +128,7 @@ export async function runBridge(env: NodeJS.ProcessEnv, input = stdin, output = 
     input.once('end', () => resolve());
   });
   await queued;
+  while (sends.size > 0) await Promise.allSettled([...sends]);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

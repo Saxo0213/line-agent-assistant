@@ -1,7 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { PassThrough } from 'node:stream';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { requestTimeoutMs, runBridge, SEND_REQUEST_TIMEOUT_MS } from './index.js';
 
 const bridgePath = path.resolve(import.meta.dirname, '../../dist/mcp-stdio-bridge.js');
 const children: ChildProcess[] = [];
@@ -127,5 +129,132 @@ describe('stdio MCP bridge', () => {
     const stderr = new Promise<string>((resolve) => { let text = ''; invalid.stderr!.setEncoding('utf8'); invalid.stderr!.on('data', (chunk: string) => { text += chunk; }); invalid.once('exit', () => resolve(text)); });
     await closeChild(invalid);
     expect(await stderr).toContain('127.0.0.1');
+  });
+});
+
+describe('stdio MCP bridge request timeout', () => {
+  const SEND_CALL_BUDGET_MS = 600_000;
+  it('keeps 10 s for every request except a tools/call of send_to_target, which waits longer than the 600 s send budget', () => {
+    expect(SEND_REQUEST_TIMEOUT_MS).toBeGreaterThan(SEND_CALL_BUDGET_MS);
+    expect(requestTimeoutMs({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'send_to_target', arguments: {} } })).toBe(SEND_REQUEST_TIMEOUT_MS);
+    for (const request of [
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_send_targets' } },
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'query_target_messages' } },
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: null },
+      { jsonrpc: '2.0', id: 1, method: 'tools/call' },
+      { jsonrpc: '2.0', id: 1, method: 'tools/list', params: { name: 'send_to_target' } },
+      { jsonrpc: '2.0', id: 1, method: 'ping' },
+    ]) expect(requestTimeoutMs(request)).toBe(10_000);
+  });
+
+  it('arms the long timer only for the send call when it runs', async () => {
+    const { url } = await listen((request, response) => {
+      request.resume();
+      request.on('end', () => { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} })); });
+    });
+    const delays: number[] = [];
+    const real = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+      if (delay === 10_000 || delay === SEND_REQUEST_TIMEOUT_MS) delays.push(delay);
+      return real(handler as () => void, delay, ...args);
+    }) as typeof setTimeout);
+    try {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const done = runBridge({ LINEJS_MCP_URL: url }, input as never, output as never);
+      for (const name of ['query_target_messages', 'send_to_target']) {
+        input.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } }) + '\n');
+      }
+      input.end();
+      await done;
+    } finally { spy.mockRestore(); }
+    expect(delays).toEqual([10_000, SEND_REQUEST_TIMEOUT_MS]);
+  });
+});
+
+describe('stdio MCP bridge does not block on a send', () => {
+  /** Fake server: send_to_target waits until `releaseSend()`; every other method answers at once. */
+  async function slowSendServer() {
+    let releaseSend!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    const seen: string[] = [];
+    const { url } = await listen((request, response) => {
+      let body = '';
+      request.setEncoding('utf8'); request.on('data', (chunk) => { body += chunk; });
+      request.on('end', () => {
+        const parsed = JSON.parse(body);
+        const isSend = parsed.method === 'tools/call' && parsed.params?.name === 'send_to_target';
+        seen.push(isSend ? 'send' : parsed.method);
+        void (isSend ? gate : Promise.resolve()).then(() => {
+          response.setHeader('Content-Type', 'application/json');
+          response.end(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: { method: parsed.method, ...(isSend ? { results: [{ index: 0, status: 'sent' }] } : {}) } }));
+        });
+      });
+    });
+    return { url, releaseSend, seen };
+  }
+  function streams() {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const lines: string[] = [];
+    const waiters: Array<() => void> = [];
+    let buffer = '';
+    output.setEncoding('utf8');
+    output.on('data', (chunk: string) => {
+      buffer += chunk;
+      for (let index = buffer.indexOf('\n'); index >= 0; index = buffer.indexOf('\n')) { lines.push(buffer.slice(0, index)); buffer = buffer.slice(index + 1); }
+      waiters.splice(0).forEach((wake) => wake());
+    });
+    const waitFor = async (count: number) => { while (lines.length < count) await new Promise<void>((resolve) => { waiters.push(resolve); }); };
+    return { input, output, lines, waitFor };
+  }
+  const send = { jsonrpc: '2.0', id: 'send-1', method: 'tools/call', params: { name: 'send_to_target', arguments: {} } };
+
+  it('answers a ping sent during a slow send first, keeps the other requests in order, and answers the send later with its own id', async () => {
+    const server = await slowSendServer();
+    const { input, output, lines, waitFor } = streams();
+    const done = runBridge({ LINEJS_MCP_URL: server.url }, input as never, output as never);
+    input.write(JSON.stringify(send) + '\n');
+    input.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'ping' }) + '\n');
+    input.write(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list' }) + '\n');
+    await waitFor(2);
+    expect(lines.map((line) => JSON.parse(line).id)).toEqual([2, 3]);
+    expect(lines.length).toBe(2);
+    server.releaseSend();
+    await waitFor(3);
+    const last = JSON.parse(lines[2]!);
+    expect(last).toMatchObject({ id: 'send-1', result: { results: [{ index: 0, status: 'sent' }] } });
+    for (const line of lines) expect(() => JSON.parse(line)).not.toThrow();
+    input.end();
+    await done;
+  });
+
+  it('waits for the send in progress when stdin ends, and only then finishes', async () => {
+    const server = await slowSendServer();
+    const { input, output, lines, waitFor } = streams();
+    let finished = false;
+    const done = runBridge({ LINEJS_MCP_URL: server.url }, input as never, output as never).then(() => { finished = true; });
+    input.write(JSON.stringify(send) + '\n');
+    input.end();
+    await vi.waitFor(() => expect(server.seen).toEqual(['send']));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(finished).toBe(false);
+    expect(lines).toEqual([]);
+    server.releaseSend();
+    await done;
+    expect(finished).toBe(true);
+    await waitFor(1);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ id: 'send-1', result: { results: [{ status: 'sent' }] } });
+  });
+
+  it('keeps FIFO order for requests that are not a send', async () => {
+    const server = await slowSendServer();
+    const { input, output, lines, waitFor } = streams();
+    const done = runBridge({ LINEJS_MCP_URL: server.url }, input as never, output as never);
+    for (const id of [1, 2, 3, 4]) input.write(JSON.stringify({ jsonrpc: '2.0', id, method: id % 2 ? 'ping' : 'tools/list' }) + '\n');
+    input.end();
+    await done;
+    await waitFor(4);
+    expect(lines.map((line) => JSON.parse(line).id)).toEqual([1, 2, 3, 4]);
   });
 });

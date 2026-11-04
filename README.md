@@ -19,7 +19,7 @@
 </tr>
 </table>
 
-v1.0.319 adds explicit parameter examples for the nested match and sender fields used by Agent schedule tools to create or update forwarding rules. Validation errors also identify the relevant input path. Install through the app's **Check for updates**. See the [v1.0.318 → v1.0.319 release notes](docs/releases/v1.0.319.md) for the complete changes.
+v1.0.323 lets Claude Desktop wait for LINE sends through the external MCP bridge, starts forwarded messages with the sender name, fills group and sender names in new-message schedules from other accounts, and keeps the Agent status icons of consecutive messages from overwriting each other. Install through the app's **Check for updates**. See the [v1.0.319 → v1.0.323 release notes](docs/releases/v1.0.323.md) for the complete changes.
 
 ## Installation
 

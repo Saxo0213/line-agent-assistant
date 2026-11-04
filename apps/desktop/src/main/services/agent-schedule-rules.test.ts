@@ -385,6 +385,62 @@ describe('copies of a group message in several accounts', () => {
   });
 });
 
+describe('merged copies fill a blank title and sender name', () => {
+  const dir = (value: string) => ({ metric: 'message.direction', op: '==', value }) as never;
+  const base = () => msg('g1', 1, { messageId: 'x1', senderId: 'u9' });
+
+  it('lists the title and sender of the second inbound copy when the first copy has none', () => {
+    const agent = { ...base(), accountId: 'agent', conversationTitle: null, senderName: null };
+    const admin = { ...base(), accountId: 'admin', conversationTitle: '範例群組', senderName: 'Member𓅪' };
+    const result = run([agent, admin], { messageFilter: dir('inbound') });
+    expect(result.messageCount).toBe(1);
+    expect(result.chats[0]!.text).toContain('【範例群組】');
+    expect(result.chats[0]!.text).toContain('[Member𓅪]');
+    expect(result.chats[0]!.text).not.toContain('g1');
+    expect(result.chats[0]!.text).not.toContain('未知');
+    expect(result.chats[0]!.title).toBe('範例群組');
+    expect(result.chats[0]!.accountId).toBe('agent');
+  });
+
+  it('keeps the outbound copy and gives it the title and sender of the inbound copy', () => {
+    const inbound = { ...base(), accountId: 'a', conversationTitle: '範例群組', senderName: 'Member', text: 'in' };
+    const outbound = { ...base(), accountId: 'b', direction: 'outbound' as const, conversationTitle: null, senderName: '  ', text: 'out' };
+    for (const order of [[inbound, outbound], [outbound, inbound]]) {
+      const result = run(order);
+      expect(result.messageCount).toBe(1);
+      expect(result.chats[0]!.accountId).toBe('b');
+      expect(result.chats[0]!.title).toBe('範例群組');
+      expect(result.chats[0]!.text).toContain('[Member]：out');
+      expect(run(order, { messageFilter: dir('outbound') }).messageCount).toBe(1);
+      expect(run(order, { messageFilter: dir('inbound') }).messageCount).toBe(0);
+    }
+  });
+
+  it('never overwrites a non-empty value and never changes the input objects', () => {
+    const first = { ...base(), accountId: 'a', conversationTitle: '甲群', senderName: '甲' };
+    const second = { ...base(), accountId: 'b', conversationTitle: '乙群', senderName: '乙' };
+    const blank = { ...base(), accountId: 'c', conversationTitle: null, senderName: null };
+    const snapshot = JSON.stringify([first, second, blank]);
+    const result = run([first, second]);
+    expect(result.chats[0]!.title).toBe('甲群');
+    expect(result.chats[0]!.text).toContain('[甲]');
+    const mixed = run([blank, first]);
+    expect(mixed.chats[0]!.title).toBe('甲群');
+    run([first, second, blank]);
+    expect(JSON.stringify([first, second, blank])).toBe(snapshot);
+  });
+
+  it('keeps direct chats with the same message id in two accounts as two messages', () => {
+    const one = msg('d1', 1, { accountId: 'one', chatType: 'direct', messageId: 'x1', conversationTitle: null, senderName: null });
+    const two = { ...one, accountId: 'two', conversationTitle: '小明', senderName: '小明' };
+    const result = run([one, two]);
+    expect(result.messageCount).toBe(2);
+    expect(result.chatCount).toBe(2);
+    expect(result.chats.map((chat) => chat.title).sort()).toEqual(['d1', '小明'].sort());
+    expect(result.chats.find((chat) => chat.accountId === 'one')!.text).toContain('[未知]');
+  });
+});
+
 describe('cap of one list', () => {
   // 20 chats, 20 messages each, 200 characters each: one chat is about 4.5k characters.
   const manyChats = (count: number): ScheduleMessage[] => Array.from({ length: count }, (_, index) => Array.from({ length: 20 }, (_, i) =>
