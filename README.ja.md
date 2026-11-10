@@ -2,6 +2,10 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
+[![Latest release](https://img.shields.io/github/v/release/Saxo0213/line-agent-assistant)](https://github.com/Saxo0213/line-agent-assistant/releases/latest) [![Downloads](https://img.shields.io/github/downloads/Saxo0213/line-agent-assistant/total)](https://github.com/Saxo0213/line-agent-assistant/releases) ![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6) [![License: MIT](https://img.shields.io/github/license/Saxo0213/line-agent-assistant)](LICENSE)
+
+**Claude や Codex に LINE のトークを任せましょう。** AI エージェントが LINE で指示を受け取り、トーク履歴を検索・要約し、ローカルの MCP bridge を通じて Claude Desktop や Codex から LINE を使えるようにする Windows デスクトップアプリです。
+
 ## 機能
 
 <table>
@@ -13,6 +17,7 @@
 <li><strong>管理者アカウント：</strong> ログインモードと監視モードを選べます。監視モードでは、LINE がローカルに保存したメッセージの記録を読み取ります。</li>
 <li><strong>メッセージアシスタント：</strong> 両アカウントの会話と添付ファイルをまとめて確認し、過去のメッセージを検索できます。管理者は Agent に会話の要約も依頼できます。</li>
 <li><strong>会話アシスタント：</strong> Agent を会話に参加させ、ファイルや画像のダウンロードを支援させたり、自動返信ルールを設定したりできます。</li>
+<li><strong>MCP bridge：</strong> Claude Desktop と Codex から会話の一覧表示、ノートとアルバムの読み取り、設定したアカウント権限の範囲内でのメッセージ送信や予約ができます。エンドポイントはこの PC（127.0.0.1）でのみ待ち受けます。</li>
 </ul>
 </td>
 <td width="40%" valign="top"><img src="docs/images/agent-line-conversation.png" alt="LINE の会話で Agent がユーザーの指示に応答する例" width="320"></td>
@@ -22,6 +27,9 @@
 v1.0.323 では、Claude Desktop が外部 MCP bridge 経由の LINE 送信を最後まで待機でき、転送メッセージに送信者名が付き、新着メッセージのスケジュールが別のアカウントからグループ名と送信者名を補い、連続したメッセージの Agent ステータスアイコンが互いに上書きされなくなりました。アプリの「更新を確認」からインストールできます。詳細は [v1.0.319 → v1.0.323 リリースノート](docs/releases/v1.0.323.md)をご覧ください。
 
 ## インストール
+
+> [!WARNING]
+> Agent には個人のメインアカウントではなく、専用の LINE アカウントを使用してください。本アプリは非公式の LINE プロトコルで接続するため、LINE 側の変更、端末認証、アカウントポリシーの適用によって利用できなくなる場合があります。ローカルの MCP エンドポイントにはトークン認証がなく、この PC 上のどのプログラムからでも保存済みの LINE メッセージを読み取れます。信頼できない人と共有している PC では使用しないでください。
 
 ### Windows インストーラー
 

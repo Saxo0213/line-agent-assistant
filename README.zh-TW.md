@@ -2,6 +2,10 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
+[![Latest release](https://img.shields.io/github/v/release/Saxo0213/line-agent-assistant)](https://github.com/Saxo0213/line-agent-assistant/releases/latest) [![Downloads](https://img.shields.io/github/downloads/Saxo0213/line-agent-assistant/total)](https://github.com/Saxo0213/line-agent-assistant/releases) ![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6) [![License: MIT](https://img.shields.io/github/license/Saxo0213/line-agent-assistant)](LICENSE)
+
+**讓 Claude 或 Codex 幫你處理 LINE 對話。** 這是一套 Windows 桌面程式：AI Agent 可以透過 LINE 接收指令、搜尋並摘要你的聊天紀錄，還能經由本機 MCP bridge 讓 Claude Desktop 與 Codex 直接使用 LINE。
+
 ## 功能
 
 <table>
@@ -13,6 +17,7 @@
 <li><strong>管理者帳號：</strong> 可選擇登入或監控模式；監控模式讀取 LINE 本機儲存的訊息紀錄。</li>
 <li><strong>訊息助理：</strong> 集中查看兩個帳號的對話與附件、搜尋歷史訊息，並請 Agent 協助摘要對話內容。</li>
 <li><strong>對話助理：</strong> 讓 Agent 參與對話，協助下載檔案與圖片，並設定自動回覆規則。</li>
+<li><strong>MCP bridge：</strong> 讓 Claude Desktop 與 Codex 列出對話、讀取記事本與相簿，並在你設定的帳號權限內傳送或排程訊息；端點只在本機（127.0.0.1）監聽。</li>
 </ul>
 </td>
 <td width="40%" valign="top"><img src="docs/images/agent-line-conversation.png" alt="Agent 在 LINE 對話中回應使用者指令的畫面" width="320"></td>
@@ -22,6 +27,9 @@
 v1.0.323 讓 Claude Desktop 可透過外部 MCP bridge 完整等候 LINE 傳送，訊息轉發會帶傳送者名稱，新訊息排程會從其他帳號補上群組與傳送者名稱，連續訊息的 Agent 狀態圖示也不再互相覆蓋。可透過 App「檢查更新」安裝。完整變更請見 [v1.0.319 → v1.0.323 版本說明](docs/releases/v1.0.323.md)。
 
 ## 安裝
+
+> [!WARNING]
+> 請為 Agent 準備專用的 LINE 帳號，不要使用你的個人主要帳號。本程式透過非官方的 LINE 協定連線，LINE 變更協定、要求裝置驗證或執行帳號政策時，都可能導致無法使用。本機 MCP 端點沒有 Token 驗證，這台電腦上的任何程式都能透過它讀取已儲存的 LINE 訊息，因此請勿在與不信任的人共用的電腦上使用。
 
 ### Windows 安裝檔
 
