@@ -10,7 +10,7 @@ function row(id: string, overrides: Record<string, unknown> = {}): Attachment {
     messageId: `message-${id}`, kind: 'file', name: `${id}.bin`, mimeType: null, status: 'queued', relativePath: null,
     sha256: null, sizeBytes: null, error: null, occurredAt: new Date(Date.now() - 60_000).toISOString(), retryCount: 0,
     retryAfter: null, createdAt: new Date(Date.now() - 11_000).toISOString(), expiresAt: null, updatedAt: new Date().toISOString(),
-    lineMessage: {}, externalSource: false, ...overrides } as Attachment;
+    lineMessage: {}, nativeEnvelope: null, externalSource: false, ...overrides } as Attachment;
 }
 
 type Binding = { accountId: string; workerInstanceId: string; controlEpoch: number; mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED' };
@@ -39,7 +39,7 @@ function harness(attachment: Attachment, options: { binding: (accountId: string)
     async binding(accountId) { return options.binding(accountId); },
     async isReady() { return options.ready ?? true; },
     download,
-  }, undefined, 4, (id) => { changed.push(id); }, undefined, undefined, undefined, () => 0, undefined,
+  }, undefined, 4, (id) => { changed.push(id); }, undefined, undefined, () => 0, undefined,
   (accountId, reason) => audits.push([accountId, reason]));
   (service as unknown as { randomGapMs(): number }).randomGapMs = () => 0;
   return { service, writes, audits, claims, download, changed };
@@ -111,14 +111,14 @@ describe('AttachmentService block reasons', () => {
     } finally { await h.service.shutdown(); }
   });
 
-  it('keeps the External Monitor reason on the row when a manual attempt finds no worker', async () => {
+  it('keeps the External Monitor reason on the row and refuses a manual attempt without a worker check', async () => {
     const attachment = row('external-manual', { externalSource: true, error: 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' });
     const h = harness(attachment, { binding: () => null });
     try {
       await expect(h.service.downloadManually({ accountId: 'a', chatType: 'group', chatId: 'g' }, attachment.attachmentId)).resolves.toBe(false);
       expect(h.writes).toEqual([]);
       expect(attachment.error).toBe('EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE');
-      expect(h.audits).toEqual([['a', 'ATTACHMENT_WORKER_UNAVAILABLE']]);
+      expect(h.audits).toEqual([]);
     } finally { await h.service.shutdown(); }
   });
 

@@ -27,6 +27,7 @@ import { createIpcAdapter } from './ipc.js';
 import { createDesktopApi } from '../preload/api.js';
 import { ExternalMonitorDiagnosticFailure } from './services/external-monitor-diagnostics.js';
 import { ChatResourceAccountAdmission } from './services/chat-resource-admission.js';
+import { PRIMARY_ADMIN_LINE_LOGIN_ENABLED } from '../primary-admin-line-login.js';
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 const MEDIA_PNG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
@@ -215,9 +216,6 @@ database('connected facade account login semantics', () => {
   let stops: string[];
   let stoppedWorkerInstances: string[];
   let bindings: Map<string, TestBinding>;
-  let downloadReadyBindings: Set<string>;
-  let acceptedDownloadToken = 'candidate-two';
-  let markDownloadReadyOnAccept = true;
   let qrError: Error | null;
   let failedLoginTokenAccount: string | null;
   let lineLogoutFailure = false;
@@ -231,7 +229,6 @@ database('connected facade account login semantics', () => {
   let refreshedOwnProfile: { ownMid: string; displayName: string; picturePath: string } | null;
   let profileFailure: string | null;
   let monitorAckFailures = new Set<string>();
-  let failDownloadOnlyStart = false;
   let workerEventHandler: ((workerInstanceId: string, event: LineWorkerEvent) => Promise<void>) | undefined;
   let workerBindingHandler: ((binding: TestBinding, signal: AbortSignal) => Promise<void> | void) | undefined;
   let workerRestartBindingHandler: ((binding: TestBinding, signal: AbortSignal) => Promise<void> | void) | undefined;
@@ -306,9 +303,6 @@ database('connected facade account login semantics', () => {
     stops = [];
     stoppedWorkerInstances = [];
     bindings = new Map();
-    downloadReadyBindings = new Set();
-    acceptedDownloadToken = 'candidate-two';
-    markDownloadReadyOnAccept = true;
     qrError = null;
     failedLoginTokenAccount = null;
     lineLogoutFailure = false;
@@ -320,7 +314,6 @@ database('connected facade account login semantics', () => {
     refreshedOwnProfile = null;
     profileFailure = null;
     monitorAckFailures = new Set();
-    failDownloadOnlyStart = false;
     published = [];
     let onBinding: ((binding: TestBinding, signal: AbortSignal) => Promise<void> | void) | undefined;
     workers = {
@@ -342,7 +335,6 @@ database('connected facade account login semantics', () => {
       },
       async start(accountId, binding) {
         starts.push({ accountId, mode: binding.mode, controlEpoch: binding.controlEpoch });
-        if (binding.purpose === 'DOWNLOAD_ONLY' && failDownloadOnlyStart) throw new Error('simulated optional download worker start failure');
         bindings.set(accountId, binding);
         await onBinding?.(binding, new AbortController().signal);
         return binding;
@@ -355,16 +347,6 @@ database('connected facade account login semantics', () => {
           await gate.wait;
         }
         return bindings.get(accountId) ?? null;
-      },
-      isDownloadReady(binding) { return downloadReadyBindings.has(binding.workerInstanceId); },
-      async adoptDownloadAuth(command) {
-        commands.push(command);
-        const accepted = command.token === acceptedDownloadToken;
-        if (accepted && markDownloadReadyOnAccept) downloadReadyBindings.add(command.workerInstanceId);
-        return { type: 'downloadAuthResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId,
-          controlEpoch: command.controlEpoch, transportOwnerId: command.transportOwnerId, transportGeneration: command.transportGeneration,
-          writeGrantVersion: command.writeGrantVersion, requestId: command.requestId, accepted,
-          error: accepted ? null : 'PROFILE_MISMATCH' };
       },
       isCurrentActiveControlBinding(binding) {
         const current = bindings.get(binding.accountId);
@@ -481,7 +463,7 @@ database('connected facade account login semantics', () => {
       async stopBinding(binding) {
         const gate = pendingWorkerStop;
         if (gate) { pendingWorkerStop = null; gate.started(); await gate.wait; }
-        stoppedWorkerInstances.push(binding.workerInstanceId); downloadReadyBindings.delete(binding.workerInstanceId); if (bindings.get(binding.accountId)?.workerInstanceId === binding.workerInstanceId) {
+        stoppedWorkerInstances.push(binding.workerInstanceId); if (bindings.get(binding.accountId)?.workerInstanceId === binding.workerInstanceId) {
         stops.push(binding.accountId); bindings.delete(binding.accountId);
       } },
       async shutdown() { bindings.clear(); pendingWelcomeSend?.release?.(); },
@@ -635,33 +617,12 @@ database('connected facade account login semantics', () => {
     }
   });
 
-  async function seedExternalProbeAttachment(accountId: string, chatId: string, messageId: string, name: string, sizeBytes = 2, ageHours = 1) {
-    const capability = await new AccountRepository(pool).resolveCapabilities(accountId);
-    const sourceId = capability!.selectedSourceId!;
-    const generation = capability!.selectedSourceGeneration!;
-    const observationId = `${messageId}-obs`;
-    await pool.query('INSERT INTO conversations(account_id, chat_id, chat_type) VALUES ($1,$2,\'group\') ON CONFLICT DO NOTHING', [accountId, chatId]);
-    await pool.query(`INSERT INTO messages(account_id,message_id,event_id,chat_type,chat_id,sender_id,kind,ingestion_source,occurred_at,raw)
-      VALUES ($1,$2,$3,'group',$4,'person','file','live',now() - make_interval(hours => $6),$5::jsonb)`,
-    [accountId, messageId, `${messageId}-event`, chatId,
-      JSON.stringify({ native: { format: 1, table: '_message', sourceDigest: 'c'.repeat(64), encoding: 'dpapi', data: 'AQID' } }), ageHours]);
-    await pool.query(`INSERT INTO attachments(external_attachment_id, account_id, message_id, chat_type, chat_id, kind, name, size_bytes)
-      VALUES ($1,$2,$1,'group',$3,'file',$4,$5)`, [messageId, accountId, chatId, name, sizeBytes]);
-    await pool.query(`INSERT INTO external_source_batches(source_id,account_id,generation,batch_id,payload_digest,result)
-      VALUES ($1,$2,$3,$4,repeat('b',64),'{}'::jsonb)`, [sourceId, accountId, generation, `${messageId}-batch`]);
-    await pool.query(`INSERT INTO external_source_observations(source_id,account_id,generation,observation_id,batch_id,canonical_message_id,normalized_digest,normalized_payload,status)
-      VALUES ($1,$2,$3,$4,$5,$6,repeat('c',64),'{}'::jsonb,'PROJECTED')`,
-    [sourceId, accountId, generation, observationId, `${messageId}-batch`, messageId]);
-    await pool.query(`INSERT INTO message_source_provenance(account_id, message_id, source_id, generation, observation_id, origin, redacted)
-      VALUES ($1,$2,$3,$4,$5,'EXTERNAL_MONITOR',true)`, [accountId, messageId, sourceId, generation, observationId]);
-  }
-
   async function restartFacadeWithImporter(importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']>,
-    publish?: (event: IpcEvent) => void, externalImportProgressPath?: string, externalDownloadTokenLookup = false,
+    publish?: (event: IpcEvent) => void, externalImportProgressPath?: string,
     externalMonitorDiagnosticPath?: string) {
     await facade.shutdown();
     facade = await createConnectedFacade({ pool, workers, agent, attachmentRoot: 'C:\\attachments', secretStore, audit,
-      runMigrations: false, officialSnapshotImporter: importer, externalDownloadTokenLookup,
+      runMigrations: false, officialSnapshotImporter: importer,
       ...(externalImportProgressPath ? { externalImportProgressPath } : {}),
       ...(externalMonitorDiagnosticPath ? { externalMonitorDiagnosticPath } : {}),
       publish(event) { published.push(event); publish?.(event); } });
@@ -940,8 +901,6 @@ database('connected facade account login semantics', () => {
         generation: capability.selectedSourceGeneration }) : null;
     expect(unfinished).toMatchObject({ initialImportComplete: false, committedCount: '2' });
 
-    await seedExternalProbeAttachment('resume-admin', 'resume-chat', 'resume-probe-message', 'probe.bin');
-
     const finishFromCommittedHighWater: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
       async readOfficialSnapshot(input) {
         const resume = await input.onReady(ready);
@@ -950,228 +909,20 @@ database('connected facade account login semantics', () => {
           highWatermark: ready.highWatermark };
       },
       async readOfficialMonitor(input) {
-        input.onReady?.({
-          async acquireAuthCandidates() { return { candidates: [
-            { token: 'candidate-one', application: 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64' },
-            { token: 'candidate-two', application: 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64' },
-          ], errorCode: null }; },
-          async decodeAttachment() {
-            return {
-              metadata: {
-                messageId: 'resume-probe-message',
-                chatId: 'resume-chat',
-                from: null,
-                to: null,
-                toType: null,
-                contentType: 14,
-                contentMetadata: { OID: 'OID_123', SID: 'emf', OBS_POP: null, FILE_SIZE: '2', MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null },
-                keyMaterial: Buffer.alloc(32, 7).toString('base64'),
-                fileName: 'probe.bin',
-                sizeBytes: 2,
-              },
-              errorCode: null,
-            };
-          },
-        }, input.signal);
+        input.onReady?.(input.signal);
         await new Promise<void>((resolve) => {
           if (input.signal.aborted) resolve();
           else input.signal.addEventListener('abort', () => resolve(), { once: true });
         });
       },
     };
-    await restartFacadeWithImporter(finishFromCommittedHighWater, undefined, undefined, true);
+    await restartFacadeWithImporter(finishFromCommittedHighWater);
     await facade.dispatch({ type: 'externalImportStart', requestId: 'resume-finish-run', accountId: 'resume-admin' });
     await waitForState(async () => {
       const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'resume-finish-state' });
       if (snapshot.type !== 'getSnapshot' || !snapshot.ok) throw new Error('snapshot unavailable');
       expect(snapshot.snapshot.accounts.find((item) => item.accountId === 'resume-admin')?.externalImportProgress?.stage).toBe('monitoring');
     }, { timeout: 10_000, interval: 100 });
-    await waitForState(() => {
-      expect(commands.filter((command) => command.type === 'adoptDownloadAuth').map((command) => [command.token, command.application])).toEqual([
-        ['candidate-one', 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64'],
-        ['candidate-two', 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64'],
-      ]);
-      expect(commands.find((command) => command.type === 'adoptDownloadAuth')).toMatchObject({
-        probe: expect.objectContaining({ messageId: 'resume-probe-message', externalAttachmentId: 'resume-probe-message' }),
-      });
-    });
-    expect(starts).toContainEqual(expect.objectContaining({ accountId: 'resume-admin', mode: 'MONITOR_ONLY' }));
-  });
-
-  it('does not retry later auth candidates after accepted adoption while restart readiness is still settling', async () => {
-    await addStoredAccounts('auth-ready-agent', 'auth-ready-admin');
-    acceptedDownloadToken = 'candidate-one';
-    markDownloadReadyOnAccept = false;
-    const ready = { sourceIdentityDigest: '3'.repeat(64), snapshotDigest: '4'.repeat(64), schemaVersion: 'line-schema-v1',
-      highWatermark: null, eligibleCount: '0' };
-    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
-      async readOfficialSnapshot(input) {
-        await input.onReady(ready);
-        await seedExternalProbeAttachment('auth-ready-admin', 'auth-ready-chat', 'auth-ready-small-message', 'small.bin', 2, 3);
-        await seedExternalProbeAttachment('auth-ready-admin', 'auth-ready-chat', 'auth-ready-probe-message', 'probe.bin', 209715200, 1);
-        return { sourceIdentityDigest: ready.sourceIdentityDigest, snapshotDigest: ready.snapshotDigest,
-          pageCount: 0, rowCount: 0, highWatermark: null };
-      },
-      async readOfficialMonitor(input) {
-        const callbackLifetime = new AbortController();
-        const callbackResult = input.onReady?.({ async acquireAuthCandidates() { return { candidates: [
-          { token: 'candidate-one', application: 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64' },
-          { token: 'candidate-two', application: 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64' },
-        ], errorCode: null }; }, async decodeAttachment() {
-          return {
-            metadata: {
-              messageId: 'auth-ready-probe-message',
-              chatId: 'auth-ready-chat',
-              from: null,
-              to: null,
-              toType: null,
-              contentType: 14,
-              contentMetadata: { OID: 'OID_123', SID: 'emf', OBS_POP: null, FILE_SIZE: '209715200', MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null },
-              keyMaterial: Buffer.alloc(32, 7).toString('base64'),
-              fileName: 'probe.bin',
-              sizeBytes: 209715200,
-            },
-            errorCode: null,
-          };
-        } }, callbackLifetime.signal);
-        expect(callbackResult).toBeUndefined();
-        callbackLifetime.abort();
-        await new Promise<void>((resolve) => input.signal.addEventListener('abort', () => resolve(), { once: true }));
-      },
-    };
-    await restartFacadeWithImporter(importer, undefined, undefined, true);
-    expect(await facade.dispatch({ type: 'externalImportStart', requestId: 'auth-ready-run', accountId: 'auth-ready-admin' }))
-      .toMatchObject({ ok: true });
-    await waitForState(() => expect(commands.filter((command) => command.type === 'adoptDownloadAuth')
-      .map((command) => command.token)).toEqual(['candidate-one']), { timeout: 10_000, interval: 100 });
-    expect(downloadReadyBindings.size).toBe(0);
-    // The newest probe attachment is 200 MiB; adoption must not be gated by the download byte cap.
-    expect(commands.find((command) => command.type === 'adoptDownloadAuth')).toMatchObject({
-      probe: expect.objectContaining({ messageId: 'auth-ready-probe-message' }) });
-    expect((commands.find((command) => command.type === 'adoptDownloadAuth') as any).probe).not.toHaveProperty('maxBytes');
-  });
-
-  it('skips scraping and testing download auth candidates when no recent external attachment exists in the database', async () => {
-    await addStoredAccounts('no-probe-agent', 'no-probe-admin');
-    let acquireAuthCalled = 0;
-    const ready = { sourceIdentityDigest: '5'.repeat(64), snapshotDigest: '6'.repeat(64), schemaVersion: 'line-schema-v1',
-      highWatermark: null, eligibleCount: '0' };
-    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
-      async readOfficialSnapshot(input) {
-        await input.onReady(ready);
-        return { sourceIdentityDigest: ready.sourceIdentityDigest, snapshotDigest: ready.snapshotDigest,
-          pageCount: 0, rowCount: 0, highWatermark: null };
-      },
-      async readOfficialMonitor(input) {
-        input.onReady?.({
-          async acquireAuthCandidates() {
-            acquireAuthCalled += 1;
-            return { candidates: [{ token: 'candidate-one', application: 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64' }], errorCode: null };
-          },
-          async decodeAttachment() { return { metadata: null, errorCode: 'not_requested' }; },
-        }, input.signal);
-        await new Promise<void>((resolve) => input.signal.addEventListener('abort', () => resolve(), { once: true }));
-      },
-    };
-    await restartFacadeWithImporter(importer, undefined, undefined, true);
-    expect(await facade.dispatch({ type: 'externalImportStart', requestId: 'no-probe-run', accountId: 'no-probe-admin' }))
-      .toMatchObject({ ok: true });
-    await waitForState(async () => {
-      const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'no-probe-state' });
-      if (snapshot.type !== 'getSnapshot' || !snapshot.ok) throw new Error('snapshot unavailable');
-      expect(snapshot.snapshot.accounts.find((item) => item.accountId === 'no-probe-admin')?.externalImportProgress?.stage).toBe('monitoring');
-    }, { timeout: 10_000, interval: 100 });
-    await waitForState(() => expect(stoppedWorkerInstances.length).toBeGreaterThanOrEqual(1));
-    expect(acquireAuthCalled).toBe(0);
-    expect(commands.filter((command) => command.type === 'adoptDownloadAuth')).toEqual([]);
-  });
-
-  it('does not request official auth candidates or adopt a download token when monitoring becomes ready', async () => {
-    await addStoredAccounts('auth-ready-agent', 'auth-ready-admin');
-    acceptedDownloadToken = 'candidate-one';
-    const ready = { sourceIdentityDigest: '3'.repeat(64), snapshotDigest: '4'.repeat(64), schemaVersion: 'line-schema-v1',
-      highWatermark: null, eligibleCount: '0' };
-    let authRequests = 0;
-    let readyCalled = false;
-    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
-      async readOfficialSnapshot(input) {
-        await input.onReady(ready);
-        return { sourceIdentityDigest: ready.sourceIdentityDigest, snapshotDigest: ready.snapshotDigest,
-          pageCount: 0, rowCount: 0, highWatermark: null };
-      },
-      async readOfficialMonitor(input) {
-        const callbackLifetime = new AbortController();
-        const callbackResult = input.onReady?.({ async acquireAuthCandidates() { authRequests++; return { candidates: [
-          { token: 'candidate-one', application: 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64' },
-        ], errorCode: null }; }, async decodeAttachment() { return { metadata: null, errorCode: 'not_requested' }; } }, callbackLifetime.signal);
-        expect(callbackResult).toBeUndefined();
-        readyCalled = true;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        callbackLifetime.abort();
-        await new Promise<void>((resolve) => {
-          if (input.signal.aborted) resolve();
-          else input.signal.addEventListener('abort', () => resolve(), { once: true });
-        });
-      },
-    };
-    await restartFacadeWithImporter(importer);
-    expect(await facade.dispatch({ type: 'externalImportStart', requestId: 'auth-ready-run', accountId: 'auth-ready-admin' }))
-      .toMatchObject({ ok: true });
-    await waitForState(() => expect(readyCalled).toBe(true), { timeout: 10_000, interval: 100 });
-    expect(authRequests).toBe(0);
-    expect(commands.filter((command) => command.type === 'adoptDownloadAuth')).toEqual([]);
-    expect(downloadReadyBindings.size).toBe(0);
-  });
-
-  it('does not start a download-only worker or adopt official tokens when an external attachment download is requested', async () => {
-    await addStoredAccounts('auth-off-agent', 'auth-off-admin');
-    const repository = new ExternalMonitorRepository(pool);
-    const accountId = 'auth-off-admin';
-    const cursor = { createdTime: '1792000000000', id: 'auth-off-message' };
-    const source = await repository.bindVerifiedExternalSource({ accountId, ownMid: `own-${accountId}`,
-      sourceIdentity: 'auth-off-source', initialImport: { snapshotDigest: 'b'.repeat(64), schemaVersion: 'line-schema-v1',
-        highWater: cursor, eligibleCount: '1' } });
-    await repository.stageAndProjectBatch({ accountId, sourceId: source.sourceId, generation: source.generation,
-      expectedModeRevision: source.modeRevision, expectedCheckpoint: {}, batchId: 'auth-off-initial-page', cursor,
-      initialImport: true, observations: [{ observationId: 'auth-off-observation', canonicalMessageId: 'auth-off-message',
-        nativeConversationKind: 'group', nativeConversationId: 'auth-off-chat', nativeMessageId: 'auth-off-message',
-        chatType: 'group', chatId: 'auth-off-chat', senderId: 'person', kind: 'file', text: null,
-        occurredAt: '2026-10-18T00:00:00.000Z', nativePayload: { format: 1, table: '_message', sourceDigest: 'c'.repeat(64),
-          encoding: 'dpapi', data: 'AQID' }, attachments: [{ id: 'auth-off-message', kind: 'file', name: 'retry.txt',
-          mimeType: null, sizeBytes: 2, expiresAt: null }] }] });
-    await repository.completeInitialImport({ accountId, sourceId: source.sourceId, generation: source.generation,
-      expectedModeRevision: source.modeRevision, expectedCheckpoint: cursor, finalCursor: cursor, highWater: cursor });
-
-    let monitorStarted!: () => void; const monitorStartedPromise = new Promise<void>((resolve) => { monitorStarted = resolve; });
-    let authRequests = 0;
-    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
-      async readOfficialSnapshot() { throw new Error('completed source must skip history import'); },
-      async readOfficialMonitor(input) {
-        input.onReady?.({ async acquireAuthCandidates() { authRequests++; return { candidates: [
-          { token: 'candidate-one', application: 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64' },
-        ], errorCode: null }; }, async decodeAttachment() { return { metadata: null, errorCode: null }; } }, input.signal);
-        monitorStarted();
-        await new Promise<void>((resolve) => {
-          if (input.signal.aborted) resolve();
-          else input.signal.addEventListener('abort', () => resolve(), { once: true });
-        });
-      },
-    };
-    await restartFacadeWithImporter(importer);
-    try {
-      await monitorStartedPromise;
-      const attachment = await new MessageRepository(pool).getAttachmentBySource({ accountId, chatType: 'group', chatId: 'auth-off-chat' },
-        'auth-off-message', 'auth-off-message');
-      expect(attachment).toMatchObject({ status: 'queued', externalSource: true });
-      await facade.downloadAttachment({ accountId, chatType: 'group', chatId: 'auth-off-chat' }, attachment!.attachmentId);
-      expect(authRequests).toBe(0);
-      expect(commands.filter((command) => command.type === 'adoptDownloadAuth')).toEqual([]);
-      expect(bindings.get(accountId)?.purpose).not.toBe('DOWNLOAD_ONLY');
-      expect(await facade.dispatch({ type: 'getSnapshot', requestId: 'auth-off-monitor-snapshot' }))
-        .toMatchObject({ type: 'getSnapshot', ok: true });
-    } finally {
-      await facade.dispatch({ type: 'externalImportStop', requestId: 'auth-off-monitor-stop', accountId });
-    }
   });
 
   it('completes a nonempty partial resume followed by the native empty terminal page shape', async () => {
@@ -1430,6 +1181,17 @@ database('connected facade account login semantics', () => {
       expect((await secretStore.load('auto-off-agent'))?.token).toBe('token-auto-off-agent');
     });
 
+    it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('never starts the Primary Admin at startup even when a stale auto-login flag is set', async () => {
+      await addStoredAccounts('auto-agent-a', 'auto-admin-b');
+      await storeToken('auto-admin-b');
+      await pool.query("UPDATE line_accounts SET auto_login_on_startup=true,status='connected' WHERE account_id='auto-admin-b'");
+      await restartFacade();
+      expect(starts.filter((item) => item.accountId === 'auto-admin-b')).toEqual([]);
+      expect(commands.some((command) => command.type === 'loginToken' && command.accountId === 'auto-admin-b')).toBe(false);
+      expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='auto-admin-b'")).rows[0]).toEqual({ status: 'disconnected' });
+      expect((await secretStore.load('auto-admin-b'))?.token).toBe('token-auto-admin-b');
+    });
+
     it('keeps the existing startup login path for opted-in accounts', async () => {
       await addStoredAccounts('auto-on-agent');
       await storeToken('auto-on-agent');
@@ -1543,7 +1305,7 @@ database('connected facade account login semantics', () => {
     }
   });
 
-  it('drains a startup-resumed monitor before the Primary Admin QR login worker starts', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('drains a startup-resumed monitor before the Primary Admin QR login worker starts', async () => {
     vi.useRealTimers();
     const accountId = 'startup-monitor-admin';
     await addStoredAccounts('startup-monitor-agent', accountId);
@@ -1584,172 +1346,6 @@ database('connected facade account login semantics', () => {
     expect(starts.at(-1)?.accountId).toBe(accountId);
   }, 45_000);
 
-  it('keeps the database monitor running when the optional download-only worker cannot start', async () => {
-    const accountId = 'monitor-without-download-worker';
-    await addStoredAccounts('monitor-without-download-agent', accountId);
-    const repository = new ExternalMonitorRepository(pool);
-    const source = await repository.bindVerifiedExternalSource({ accountId, ownMid: `own-${accountId}`,
-      sourceIdentity: 'monitor-without-download-source', initialImport: { snapshotDigest: 'a'.repeat(64),
-        schemaVersion: 'line-schema-v1', highWater: null, eligibleCount: '0' } });
-    await repository.completeInitialImport({ accountId, sourceId: source.sourceId, generation: source.generation,
-      expectedModeRevision: source.modeRevision, expectedCheckpoint: {}, finalCursor: {}, highWater: null });
-    failDownloadOnlyStart = true;
-    let monitorRuns = 0;
-    let observedSignal: AbortSignal | undefined;
-    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
-      async readOfficialSnapshot() { throw new Error('completed source must skip history import'); },
-      async readOfficialMonitor(input) {
-        monitorRuns++;
-        observedSignal = input.signal;
-        input.onReady?.({ async acquireAuthCandidates() { return { candidates: [], errorCode: null }; },
-          async decodeAttachment() { return { metadata: null, errorCode: null }; } }, input.signal);
-        await input.onPage({ pageNumber: 1, batchDigest: 'e'.repeat(64), rows: [{ observationId: 'monitor-row', canonicalMessageId: null,
-          nativeConversationKind: 'group', nativeConversationId: 'monitor-chat', nativeMessageId: 'monitor-message',
-          chatType: 'group', chatId: 'monitor-chat', senderId: 'person', kind: 'text', createdTime: '1792000000000',
-          text: 'saved while download worker is unavailable', readonlyForSending: true }], tailRows: [],
-          lastCursor: { createdTime: '1792000000000', id: 'monitor-message' }, hasMore: false });
-        await new Promise<void>((resolve) => {
-          if (input.signal.aborted) resolve();
-          else input.signal.addEventListener('abort', () => resolve(), { once: true });
-        });
-      },
-    };
-    await restartFacadeWithImporter(importer);
-    await waitForState(async () => {
-      expect(monitorRuns).toBe(1);
-      const row = await pool.query('SELECT text_content FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, 'monitor-message']);
-      expect(row.rows).toEqual([{ text_content: 'saved while download worker is unavailable' }]);
-    }, { timeout: 2_000, interval: 20 });
-    expect(observedSignal?.aborted).toBe(false);
-    expect(await facade.dispatch({ type: 'externalImportStop', requestId: 'monitor-without-download-stop', accountId }))
-      .toMatchObject({ type: 'accepted', ok: true });
-  });
-
-  it('stops a timed-out download-auth owner before an explicit retry creates a fresh worker', async () => {
-    await addStoredAccounts('auth-timeout-agent', 'auth-timeout-admin');
-    const repository = new ExternalMonitorRepository(pool);
-    const accountId = 'auth-timeout-admin';
-    const cursor = { createdTime: '1792000000000', id: 'auth-timeout-message' };
-    const source = await repository.bindVerifiedExternalSource({ accountId, ownMid: `own-${accountId}`,
-      sourceIdentity: 'auth-timeout-source', initialImport: { snapshotDigest: 'b'.repeat(64), schemaVersion: 'line-schema-v1',
-        highWater: cursor, eligibleCount: '1' } });
-    await repository.stageAndProjectBatch({ accountId, sourceId: source.sourceId, generation: source.generation,
-      expectedModeRevision: source.modeRevision, expectedCheckpoint: {}, batchId: 'auth-timeout-initial-page', cursor,
-      initialImport: true, observations: [{ observationId: 'auth-timeout-observation', canonicalMessageId: 'auth-timeout-message',
-        nativeConversationKind: 'group', nativeConversationId: 'auth-timeout-chat', nativeMessageId: 'auth-timeout-message',
-        chatType: 'group', chatId: 'auth-timeout-chat', senderId: 'person', kind: 'file', text: null,
-        occurredAt: '2026-10-18T00:00:00.000Z', nativePayload: { format: 1, table: '_message', sourceDigest: 'c'.repeat(64),
-          encoding: 'dpapi', data: 'AQID' }, attachments: [{ id: 'auth-timeout-message', kind: 'file', name: 'retry.txt',
-          mimeType: null, sizeBytes: 2, expiresAt: null }] }] });
-    await repository.completeInitialImport({ accountId, sourceId: source.sourceId, generation: source.generation,
-      expectedModeRevision: source.modeRevision, expectedCheckpoint: cursor, finalCursor: cursor, highWater: cursor });
-
-    let monitorStarted!: () => void; const monitorStartedPromise = new Promise<void>((resolve) => { monitorStarted = resolve; });
-    let authStarted!: () => void; const authStartedPromise = new Promise<void>((resolve) => { authStarted = resolve; });
-    let releaseTimedOutAuth!: () => void; const timedOutAuth = new Promise<void>((resolve) => { releaseTimedOutAuth = resolve; });
-    const authCalls: Array<{ workerInstanceId: string; token: string }> = [];
-    const activeDownloadWorkers = new Set<string>();
-    let firstWorkerId = '';
-    let overlappingDownloadWorkers = false;
-    workers.start = async (id, binding) => {
-      starts.push({ accountId: id, mode: binding.mode, controlEpoch: binding.controlEpoch });
-      if (binding.purpose === 'DOWNLOAD_ONLY') {
-        if (activeDownloadWorkers.size > 0) overlappingDownloadWorkers = true;
-        activeDownloadWorkers.add(binding.workerInstanceId);
-      }
-      bindings.set(id, binding);
-      await workerBindingHandler?.(binding, new AbortController().signal);
-      return binding;
-    };
-    workers.stopBinding = async (binding) => {
-      stoppedWorkerInstances.push(binding.workerInstanceId);
-      downloadReadyBindings.delete(binding.workerInstanceId);
-      activeDownloadWorkers.delete(binding.workerInstanceId);
-      if (bindings.get(binding.accountId)?.workerInstanceId === binding.workerInstanceId) bindings.delete(binding.accountId);
-    };
-    workers.adoptDownloadAuth = async (command) => {
-      commands.push(command);
-      authCalls.push({ workerInstanceId: command.workerInstanceId, token: command.token });
-      if (!firstWorkerId) firstWorkerId = command.workerInstanceId;
-      if (command.workerInstanceId === firstWorkerId) {
-        if (command.token === 'candidate-one') { authStarted(); await timedOutAuth; }
-        return { type: 'downloadAuthResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId,
-          controlEpoch: command.controlEpoch, transportOwnerId: command.transportOwnerId, transportGeneration: command.transportGeneration,
-          writeGrantVersion: command.writeGrantVersion, requestId: command.requestId, accepted: false, error: 'AUTH_UNAVAILABLE' };
-      }
-      downloadReadyBindings.add(command.workerInstanceId);
-      return { type: 'downloadAuthResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId,
-        controlEpoch: command.controlEpoch, transportOwnerId: command.transportOwnerId, transportGeneration: command.transportGeneration,
-        writeGrantVersion: command.writeGrantVersion, requestId: command.requestId, accepted: true, error: null };
-    };
-    workers.download = async (command) => ({ type: 'attachmentResult', accountId: command.accountId, chatType: command.chatType,
-      chatId: command.chatId, workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
-      attachmentId: command.attachmentId, attemptToken: command.attemptToken, status: 'ready',
-      relativePath: `managed/${command.attachmentId}.txt`, sha256: 'd'.repeat(64), sizeBytes: 2, name: 'retry.txt' });
-    const importer: NonNullable<ConnectedFacadeOptions['officialSnapshotImporter']> = {
-      async readOfficialSnapshot() { throw new Error('completed source must skip history import'); },
-      async readOfficialMonitor(input) {
-        input.onReady?.({ async acquireAuthCandidates() { return { candidates: [
-          { token: 'candidate-one', application: 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64' },
-          { token: 'candidate-two', application: 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64' },
-        ], errorCode: null }; }, async decodeAttachment() {
-          return {
-            metadata: {
-              messageId: 'auth-timeout-message',
-              chatId: 'auth-timeout-chat',
-              from: null,
-              to: null,
-              toType: null,
-              contentType: 14,
-              contentMetadata: { OID: 'OID_123', SID: 'emf', OBS_POP: null, FILE_SIZE: '2', MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null },
-              keyMaterial: Buffer.alloc(32, 7).toString('base64'),
-              fileName: 'retry.txt',
-              sizeBytes: 2,
-            },
-            errorCode: null,
-          };
-        } }, input.signal);
-        monitorStarted();
-        await new Promise<void>((resolve) => {
-          if (input.signal.aborted) resolve();
-          else input.signal.addEventListener('abort', () => resolve(), { once: true });
-        });
-      },
-    };
-    await restartFacadeWithImporter(importer, undefined, undefined, true);
-    try {
-      await monitorStartedPromise;
-      await authStartedPromise;
-      const oldWorkerId = firstWorkerId;
-      releaseTimedOutAuth();
-      await waitForState(() => expect(stoppedWorkerInstances).toContain(oldWorkerId));
-      expect(activeDownloadWorkers.size).toBe(0);
-      expect(overlappingDownloadWorkers).toBe(false);
-
-      const attachment = await new MessageRepository(pool).getAttachmentBySource({ accountId, chatType: 'group', chatId: 'auth-timeout-chat' },
-        'auth-timeout-message', 'auth-timeout-message');
-      expect(attachment).toMatchObject({ status: 'queued', externalSource: true });
-      await pool.query("UPDATE line_accounts SET status='connected' WHERE account_id=$1", [accountId]);
-      await expect(facade.downloadAttachment({ accountId, chatType: 'group', chatId: 'auth-timeout-chat' },
-        attachment!.attachmentId)).resolves.toBe(true);
-      const retryWorkerId = authCalls.find((call) => call.workerInstanceId !== oldWorkerId)?.workerInstanceId;
-      expect(retryWorkerId).toBeTruthy();
-      expect(retryWorkerId).not.toBe(oldWorkerId);
-      expect(authCalls.filter((call) => call.workerInstanceId === oldWorkerId).map((call) => call.token))
-        .toEqual(['candidate-one', 'candidate-two']);
-      expect(authCalls.filter((call) => call.workerInstanceId === retryWorkerId).map((call) => call.token))
-        .toEqual(['candidate-one']);
-      expect(overlappingDownloadWorkers).toBe(false);
-      expect((await new MessageRepository(pool).getAttachmentBySource({ accountId, chatType: 'group', chatId: 'auth-timeout-chat' },
-        'auth-timeout-message', 'auth-timeout-message'))?.status).toBe('ready');
-      expect(await facade.dispatch({ type: 'getSnapshot', requestId: 'auth-timeout-monitor-snapshot' }))
-        .toMatchObject({ type: 'getSnapshot', ok: true });
-    } finally {
-      releaseTimedOutAuth();
-      await facade.dispatch({ type: 'externalImportStop', requestId: 'auth-timeout-monitor-stop', accountId });
-    }
-  });
-
   it('projects and safely records startup authority-read failures', async () => {
     const accountId = 'monitor-startup-diagnostic-admin';
     await addStoredAccounts('monitor-startup-diagnostic-agent', accountId);
@@ -1767,7 +1363,7 @@ database('connected facade account login semantics', () => {
       async readOfficialMonitor() { throw new Error('must not reach reader before state verification'); },
     };
     try {
-      await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+      await restartFacadeWithImporter(importer, undefined, undefined, diagnosticPath);
       await waitForState(async () => {
         const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'monitor-startup-diagnostic-state' });
         expect(snapshot.type === 'getSnapshot' && snapshot.ok
@@ -1790,7 +1386,7 @@ database('connected facade account login semantics', () => {
       async readOfficialSnapshot() { throw new Error('completed source must skip snapshot import'); },
       async readOfficialMonitor() { throw new Error('monitor reader must not start after failed fence'); },
     };
-    await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+    await restartFacadeWithImporter(importer, undefined, undefined, diagnosticPath);
     const repository = new ExternalMonitorRepository(pool);
     const source = await repository.bindVerifiedExternalSource({ accountId, ownMid: `own-${accountId}`,
       sourceIdentity: 'monitor-restart-diagnostic-source', initialImport: { snapshotDigest: 'b'.repeat(64),
@@ -1842,7 +1438,7 @@ database('connected facade account login semantics', () => {
       async readOfficialMonitor() { readerLaunches += 1; throw new Error('reader must not start after state fence fails'); },
     };
     try {
-      await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+      await restartFacadeWithImporter(importer, undefined, undefined, diagnosticPath);
       await waitForState(async () => {
         const record = JSON.parse(await readFile(diagnosticPath, 'utf8')) as Record<string, unknown>;
         expect(record).toMatchObject({ stage: 'startup', code: 'external_monitor_checkpoint_changed',
@@ -1873,7 +1469,7 @@ database('connected facade account login semantics', () => {
           'private_directory_acl_command_timeout', 'private_directory_preparation');
       },
     };
-    await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+    await restartFacadeWithImporter(importer, undefined, undefined, diagnosticPath);
     await waitForState(async () => {
       const record = JSON.parse(await readFile(diagnosticPath, 'utf8')) as Record<string, unknown>;
       expect(record).toMatchObject({ stage: 'startup', code: 'external_monitor_reader_startup_failed',
@@ -1901,7 +1497,7 @@ database('connected facade account login semantics', () => {
       },
     };
     try {
-      await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+      await restartFacadeWithImporter(importer, undefined, undefined, diagnosticPath);
       await waitForState(async () => {
         const snapshot = await facade.dispatch({ type: 'getSnapshot', requestId: 'monitor-runtime-diagnostic-state' });
         expect(snapshot.type === 'getSnapshot' && snapshot.ok
@@ -1949,7 +1545,7 @@ database('connected facade account login semantics', () => {
         });
       },
     };
-    await restartFacadeWithImporter(importer, undefined, undefined, false, diagnosticPath);
+    await restartFacadeWithImporter(importer, undefined, undefined, diagnosticPath);
     await started;
     await vi.waitFor(async () => expect(readFile(diagnosticPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' }));
 
@@ -2306,13 +1902,11 @@ database('connected facade account login semantics', () => {
     ['paused account', { accountMode: 'PAUSED' as const }],
     ['disconnected account', { status: 'disconnected' as const }],
     ['external monitor source', { connectionMode: 'EXTERNAL_MONITOR' as const }],
-    ['download-only binding', { purpose: 'DOWNLOAD_ONLY' as const }],
-  ] as [string, { accountMode?: 'PAUSED'; status?: 'disconnected'; connectionMode?: 'EXTERNAL_MONITOR'; purpose?: 'DOWNLOAD_ONLY' }][])('does not issue a profile read for a %s', async (_label, excluded) => {
+  ] as [string, { accountMode?: 'PAUSED'; status?: 'disconnected'; connectionMode?: 'EXTERNAL_MONITOR' }][])('does not issue a profile read for a %s', async (_label, excluded) => {
     const accountId = `avatar-refresh-skip-${String(_label).replaceAll(' ', '-')}`;
     const ownMid = `u${'e'.repeat(32)}`;
     await addStoredAccounts(accountId);
-    const binding: TestBinding = { accountId, workerInstanceId: `${accountId}-worker`, controlEpoch: 0, mode: 'MONITOR_ONLY',
-      ...(excluded.purpose ? { purpose: excluded.purpose } : {}) };
+    const binding: TestBinding = { accountId, workerInstanceId: `${accountId}-worker`, controlEpoch: 0, mode: 'MONITOR_ONLY' };
     await workers.start(accountId, binding);
     await pool.query(`UPDATE line_accounts SET own_mid=$2,status=$3,mode=$4,connection_mode=$5,
       worker_instance_id=$6,worker_binding_epoch=$7 WHERE account_id=$1`,
@@ -2380,7 +1974,7 @@ database('connected facade account login semantics', () => {
   }
 
   async function deliverPairing(accountId: string, binding: TestBinding, token: string, batchId: string) {
-    await workerEventHandler?.(binding.workerInstanceId, { type: 'batch', ...binding, batchId,
+    await workerEventHandler?.(binding.workerInstanceId, { type: 'batch', ...binding, batchId, startupSync: false,
       cursorBefore: { version: 1, revision: '0', globalRev: '0', individualRev: '0' },
       cursorAfter: { version: 1, revision: '1', globalRev: '1', individualRev: '0' }, envelopes: [{
         eventId: `${batchId}-event`, messageId: `${batchId}-message`, accountId, chatType: 'direct',
@@ -2437,7 +2031,8 @@ database('connected facade account login semantics', () => {
     return { binding, attempt: loginCommand.loginAttemptId };
   }
 
-  it('stops only the invalidated account, clears its secret, and persists reauth_required', async () => {
+
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('stops only the invalidated account, clears its secret, and persists reauth_required', async () => {
     await addStoredAccounts('account-a', 'account-b');
     await activate('account-a');
     await facade.dispatch({ type: 'lineLoginQr', requestId: 'start-qr-account-a', accountId: 'account-a' });
@@ -2454,6 +2049,60 @@ database('connected facade account login semantics', () => {
       ['account-b', accountB, 'attempt-account-b']] as const) {
       secretStore.beginLogin(accountId, binding.workerInstanceId, attempt);
       await secretStore.saveRotation(accountId, binding.workerInstanceId, attempt,
+        { token: `token-${accountId}`, qrCert: null, e2eeStorage: null });
+    }
+    stops.length = 0;
+    const commandsBeforeInvalidation = commands.length;
+    const { RequestClient } = await import(new URL('./request/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
+      RequestClient: { prototype: { request: (...args: any[]) => Promise<unknown> } };
+    };
+    const { InternalError } = await import(new URL('./core/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
+      InternalError: new (type: string, message: string, data: Record<string, unknown>) => Error;
+    };
+    const authError = new InternalError('RequestError', 'Request internal failed', { code: 'NOT_AUTHORIZED_DEVICE' });
+    const request = vi.spyOn(RequestClient.prototype, 'request').mockRejectedValue(authError);
+    let invalidation = Promise.resolve();
+    const adapter = await createLinejsAdapter({ accountId: accountA.accountId, workerInstanceId: accountA.workerInstanceId,
+      controlEpoch: accountA.controlEpoch, mode: 'ACTIVE_CONTROL', validateLease: () => true,
+      physicalTransport: async () => new Response() });
+    await adapter.installSecrets({ token: [Buffer.from('{"alg":"HS256"}').toString('base64url'),
+      Buffer.from('{"sub":"u-self"}').toString('base64url'), 'signature'].join('.'), qrCert: null, e2eeStorage: null });
+    adapter.on('authInvalidated', () => {
+      invalidation = workerEventHandler!(accountA.workerInstanceId, { type: 'authInvalidated', ...accountA });
+    });
+    try {
+      await expect(adapter.sync({ version: 1, revision: '0', globalRev: '0', individualRev: '0' })).rejects.toBe(authError);
+      await invalidation;
+    } finally { request.mockRestore(); }
+    const statuses = await pool.query('SELECT account_id,status FROM line_accounts ORDER BY account_id');
+    expect(stops).toEqual(['account-a']);
+    expect(statuses.rows).toEqual([{ account_id: 'account-a', status: 'reauth_required' },
+      { account_id: 'account-b', status: 'disconnected' }]);
+    expect(await secretStore.load('account-a')).toBeNull();
+    expect((await secretStore.load('account-b'))?.token).toBe('token-account-b');
+    expect(published).toContainEqual(expect.objectContaining({ type: 'lineLoginState', accountId: 'account-a', state: 'reauth_required' }));
+    expect(await facade.dispatch({ type: 'sendText', requestId: 'after-auth-invalidation', accountId: 'account-a',
+      chatType: 'direct', chatId: 'chat-a', text: 'must be blocked' })).toMatchObject({ ok: false });
+    expect(commands.some((command) => command.type === 'manualSendText' && command.requestId === 'after-auth-invalidation')).toBe(false);
+    expect(commands.slice(commandsBeforeInvalidation).some((command) => command.type === 'loginToken' || command.type === 'loginQr')).toBe(false);
+  });
+
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('stops only the invalidated account, clears its secret, and persists reauth_required', async () => {
+    await addStoredAccounts('account-a', 'account-b');
+    await activate('account-a');
+    await facade.dispatch({ type: 'lineLoginQr', requestId: 'start-qr-account-a', accountId: 'account-a' });
+    const accountA = bindings.get('account-a')!;
+    const accountAAttempt = latestLoginAttempt('account-a');
+    await workerEventHandler?.(accountA.workerInstanceId, { type: 'login', ...accountA, loginAttemptId: accountAAttempt,
+      ownMid: 'own-account-a', displayName: 'Agent' });
+    await workerEventHandler?.(accountA.workerInstanceId, { type: 'status', ...accountA, state: 'ready', message: null });
+    expect(await facade.dispatch({ type: 'sendText', requestId: 'before-auth-invalidation', accountId: 'account-a',
+      chatType: 'direct', chatId: 'chat-a', text: 'valid before invalidation' })).toMatchObject({ ok: true });
+    // The Primary Admin has no LINE worker. Its stored secret must stay as it is when the Agent is invalidated.
+    for (const [accountId, instanceId, attempt] of [['account-a', accountA.workerInstanceId, latestLoginAttempt('account-a')],
+      ['account-b', 'seed-instance-b', 'attempt-account-b']] as const) {
+      secretStore.beginLogin(accountId, instanceId, attempt);
+      await secretStore.saveRotation(accountId, instanceId, attempt,
         { token: `token-${accountId}`, qrCert: null, e2eeStorage: null });
     }
     stops.length = 0;
@@ -2780,7 +2429,7 @@ database('connected facade account login semantics', () => {
     expect(stateEvents.at(-1)).toMatchObject({ loginAttemptId: currentAttempt, state: 'connecting' });
   });
 
-  it('holds lineStart token restore behind invalidation clear and preserves the next credential', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('holds lineStart token restore behind invalidation clear and preserves the next credential', async () => {
     await addStoredAccounts('account-a', 'account-b');
     await activate('account-a');
     await facade.dispatch({ type: 'lineLoginQr', requestId: 'start-qr-a', accountId: 'account-a' });
@@ -2793,6 +2442,63 @@ database('connected facade account login semantics', () => {
     const accountB = bindings.get('account-b')!;
     secretStore.beginLogin('account-b', accountB.workerInstanceId, 'account-b-attempt');
     expect(await secretStore.saveRotation('account-b', accountB.workerInstanceId, 'account-b-attempt',
+      { token: 'account-b-token', qrCert: null, e2eeStorage: null })).toBe(true);
+
+    const gate = holdNextSecretProtect();
+    const oldSave = secretStore.saveRotation('account-a', old.workerInstanceId, oldAttempt,
+      { token: 'held-old-token', qrCert: null, e2eeStorage: null });
+    await gate.entered;
+    stops.length = 0;
+    const invalidation = workerEventHandler!(old.workerInstanceId, { type: 'authInvalidated', ...old });
+    await waitForState(() => expect(stops).toContain('account-a'));
+
+    const startsBeforeReplacement = starts.length;
+    const commandsBeforeReplacement = commands.length;
+    const replacement = facade.dispatch({ type: 'lineStart', requestId: 'line-start-replacement-a', accountId: 'account-a' });
+    let noEarlyStart = false;
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      noEarlyStart = starts.length === startsBeforeReplacement
+        && !commands.slice(commandsBeforeReplacement).some((command) => command.type === 'loginToken');
+    } finally { gate.release(); }
+    await expect(oldSave).resolves.toBe(false);
+    await invalidation;
+    expect(noEarlyStart).toBe(true);
+    await expect(replacement).resolves.toMatchObject({ ok: true });
+    expect((await secretStore.load('account-a'))?.token).toBeUndefined();
+    expect((await secretStore.load('account-b'))?.token).toBe('account-b-token');
+    const lineStartBinding = bindings.get('account-a')!;
+
+    await facade.dispatch({ type: 'lineLoginQr', requestId: 'qr-after-line-start-a', accountId: 'account-a' });
+    const qrBinding = bindings.get('account-a')!;
+    const newAttempt = latestLoginAttempt('account-a');
+    expect(qrBinding.workerInstanceId).not.toBe(lineStartBinding.workerInstanceId);
+    expect(await secretStore.saveRotation('account-a', qrBinding.workerInstanceId, newAttempt,
+      { token: 'new-after-invalidation-token', qrCert: null, e2eeStorage: null })).toBe(true);
+    expect((await secretStore.load('account-a'))?.token).toBe('new-after-invalidation-token');
+    const stateEvents = published.filter((event) => event.type === 'lineLoginState' && event.accountId === 'account-a');
+    const oldTerminalIndex = stateEvents.findIndex((event) => event.type === 'lineLoginState'
+      && event.loginAttemptId === oldAttempt && event.state === 'reauth_required');
+    const newConnectingIndex = stateEvents.findIndex((event) => event.type === 'lineLoginState'
+      && event.loginAttemptId === newAttempt && event.state === 'connecting');
+    expect(oldTerminalIndex).toBeGreaterThanOrEqual(0);
+    expect(newConnectingIndex).toBeGreaterThan(oldTerminalIndex);
+    expect(stateEvents.slice(newConnectingIndex + 1).some((event) => event.type === 'lineLoginState'
+      && event.loginAttemptId === oldAttempt && event.state === 'reauth_required')).toBe(false);
+  });
+
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('holds lineStart token restore behind invalidation clear and preserves the next credential', async () => {
+    await addStoredAccounts('account-a', 'account-b');
+    await activate('account-a');
+    await facade.dispatch({ type: 'lineLoginQr', requestId: 'start-qr-a', accountId: 'account-a' });
+    const old = bindings.get('account-a')!;
+    const oldAttempt = latestLoginAttempt('account-a');
+    expect(await secretStore.saveRotation('account-a', old.workerInstanceId, oldAttempt,
+      { token: 'saved-old-token', qrCert: null, e2eeStorage: null })).toBe(true);
+
+    // Account B is the Primary Admin. It has no worker, so only its stored secret is seeded.
+    secretStore.beginLogin('account-b', 'seed-instance-b', 'account-b-attempt');
+    expect(await secretStore.saveRotation('account-b', 'seed-instance-b', 'account-b-attempt',
       { token: 'account-b-token', qrCert: null, e2eeStorage: null })).toBe(true);
 
     const gate = holdNextSecretProtect();
@@ -3039,7 +2745,7 @@ database('connected facade account login semantics', () => {
       diagnostic: { operation: 'loginToken', stage: 'execute', category: 'transport_failed', recovery: 'retry', outcome: 'failed' } }));
   });
 
-  it('allows a natively logged-in Primary Admin to send while remaining monitor-only', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('allows a natively logged-in Primary Admin to send while remaining monitor-only', async () => {
     const { binding, attempt } = await prepareAdminQrLogin();
     await workerEventHandler?.(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: attempt,
       ownMid: 'expected-admin-mid', displayName: 'Primary Admin' });
@@ -3080,7 +2786,7 @@ database('connected facade account login semantics', () => {
     expect(await facade.dispatch({ ...request, requestId: 'after-cancel-manual-media' })).toMatchObject({ ok: true });
   });
 
-  it('keeps a rejected Primary Admin MID unable to send manually', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('keeps a rejected Primary Admin MID unable to send manually', async () => {
     const { binding, attempt } = await prepareAdminQrLogin();
     await workerEventHandler?.(binding.workerInstanceId, { type: 'login', ...binding, loginAttemptId: attempt,
       ownMid: 'wrong-admin-mid', displayName: 'Wrong Admin' });
@@ -3271,7 +2977,7 @@ database('connected facade account login semantics', () => {
       chatType: 'direct' as const, chatId: pairedAdminMid, senderId: pairedAdminMid, kind: 'text' as const,
       text: challenge.token, mentionIds: [], mentionRanges: [], replyToMessageId: null,
       ingestion: { source: 'live' as const, cursor: null }, occurredAt: new Date().toISOString(), attachments: [], raw: {} };
-    await workerEventHandler?.(binding.workerInstanceId, { type: 'batch', ...binding, batchId: 'pairing-feedback-batch',
+    await workerEventHandler?.(binding.workerInstanceId, { type: 'batch', ...binding, batchId: 'pairing-feedback-batch', startupSync: false,
       cursorBefore: { version: 1, revision: '0', globalRev: '0', individualRev: '0' },
       cursorAfter: { version: 1, revision: '1', globalRev: '1', individualRev: '0' }, envelopes: [envelope] });
     await sendStarted;
@@ -3505,7 +3211,7 @@ database('connected facade account login semantics', () => {
     expect((await pool.query("SELECT value FROM app_settings WHERE key='workspace_path'")).rows[0].value).toBe(await realpath(tmpdir()));
   });
 
-  it('reserves the Primary Admin slot in monitor mode while the Agent keeps control', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('reserves the Primary Admin slot in monitor mode while the Agent keeps control', async () => {
     await addStoredAccounts('account-a');
     await activate('account-a');
     const before = await control();
@@ -3521,7 +3227,7 @@ database('connected facade account login semantics', () => {
     expect(starts).toContainEqual(expect.objectContaining({ accountId: added?.account_id, mode: 'MONITOR_ONLY' }));
   });
 
-  it('starts QR relogin for a non-control account while preserving both account workers', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('starts QR relogin for a non-control account while preserving both account workers', async () => {
     await addStoredAccounts('account-a', 'account-b');
     await facade.dispatch({ type: 'lineStart', requestId: 'start-b', accountId: 'account-b' });
     await activate('account-a');
@@ -3540,7 +3246,7 @@ database('connected facade account login semantics', () => {
     expect(commands.some((command) => command.type === 'revokeControl')).toBe(false);
   });
 
-  it('rejects a Primary Admin QR MID that differs from the Agent binding before saving credentials', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('rejects a Primary Admin QR MID that differs from the Agent binding before saving credentials', async () => {
     const { binding, attempt } = await prepareAdminQrLogin();
     const saveRotation = vi.spyOn(secretStore, 'saveRotation');
     await workerEventHandler?.(binding.workerInstanceId, { type: 'secretRotation', ...binding, loginAttemptId: attempt,
@@ -3557,7 +3263,7 @@ database('connected facade account login semantics', () => {
     expect(bindings.has('account-b')).toBe(false);
   });
 
-  it('rejects a Primary Admin MID when the Agent binding changes during QR login', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('rejects a Primary Admin MID when the Agent binding changes during QR login', async () => {
     const { binding, attempt } = await prepareAdminQrLogin();
     const saveRotation = vi.spyOn(secretStore, 'saveRotation');
     await pool.query("UPDATE account_administrators SET user_id='changed-admin-mid' WHERE account_id='account-a'");
@@ -3575,7 +3281,7 @@ database('connected facade account login semantics', () => {
     expect(bindings.has('account-b')).toBe(false);
   });
 
-  it('persists a matching Primary Admin QR identity and pending secret on the current binding', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('persists a matching Primary Admin QR identity and pending secret on the current binding', async () => {
     const { binding, attempt } = await prepareAdminQrLogin();
     await pool.query("UPDATE line_accounts SET own_mid=NULL WHERE account_id='account-b'");
     const saveRotation = vi.spyOn(secretStore, 'saveRotation');
@@ -3593,7 +3299,7 @@ database('connected facade account login semantics', () => {
     expect(stoppedWorkerInstances).not.toContain(binding.workerInstanceId);
   });
 
-  it('does not persist Admin identity when saving a matching QR secret fails', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('does not persist Admin identity when saving a matching QR secret fails', async () => {
     const { binding, attempt } = await prepareAdminQrLogin();
     await pool.query("UPDATE line_accounts SET own_mid=NULL WHERE account_id='account-b'");
     const saveRotation = vi.spyOn(secretStore, 'saveRotation').mockResolvedValue(false);
@@ -3614,7 +3320,7 @@ database('connected facade account login semantics', () => {
     expect(bindings.has('account-b')).toBe(false);
   });
 
-  it('continues persisting inbound messages from the monitor-only Primary Admin worker', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('continues persisting inbound messages from the monitor-only Primary Admin worker', async () => {
     await addStoredAccounts('account-a', 'account-b');
     await facade.dispatch({ type: 'lineStart', requestId: 'start-monitor', accountId: 'account-b' });
     const binding = bindings.get('account-b')!;
@@ -3638,6 +3344,49 @@ database('connected facade account login semantics', () => {
     expect(await facade.listMessages(key, null, 1, 'monitor-message')).toEqual(beforeUnsend);
     expect(commands.some((command) => command.type === 'ackBatch' && command.batchId === 'monitor-batch')).toBe(true);
     expect(await control()).toMatchObject({ activeAccountId: null });
+  });
+
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('refuses LINE login for the Primary Admin slot and reserves no account', async () => {
+    await addStoredAccounts('account-a');
+    await activate('account-a');
+    const before = await control();
+    const rows = async () => (await pool.query('SELECT account_id FROM line_accounts ORDER BY account_id')).rows;
+    const accountsBefore = await rows();
+
+    const result = await facade.dispatch({ type: 'lineAddAccountQr', requestId: 'add-account' });
+
+    expect(result).toMatchObject({ ok: false, code: 'ADMIN_MONITOR_ONLY' });
+    expect(await rows()).toEqual(accountsBefore);
+    expect(await control()).toMatchObject({ activeAccountId: 'account-a', epoch: before.epoch });
+    expect(commands.some((command) => command.type === 'loginQr')).toBe(false);
+  });
+
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('rejects LINE login, restart, logout and auto-login enabling for the Primary Admin without touching its worker', async () => {
+    await addStoredAccounts('account-a', 'account-b');
+    await activate('account-a');
+    const commandCount = commands.length;
+    const startCount = starts.length;
+    const stopCount = stops.length;
+
+    for (const request of [
+      { type: 'lineLoginQr' as const, requestId: 'admin-guard-qr', accountId: 'account-b' },
+      { type: 'lineLoginQr' as const, requestId: 'admin-guard-qr-chrome', accountId: 'account-b', lineTransport: 'CHROMEOS' as const },
+      { type: 'lineStart' as const, requestId: 'admin-guard-start', accountId: 'account-b' },
+      { type: 'lineLogout' as const, requestId: 'admin-guard-logout', accountId: 'account-b' },
+      { type: 'lineSetAutoLogin' as const, requestId: 'admin-guard-auto-on', accountId: 'account-b', enabled: true },
+    ]) {
+      expect(await facade.dispatch(request)).toMatchObject({ ok: false, code: 'ADMIN_MONITOR_ONLY' });
+    }
+    expect(commands.length).toBe(commandCount);
+    expect(starts.length).toBe(startCount);
+    expect(stops.length).toBe(stopCount);
+    expect(bindings.has('account-b')).toBe(false);
+    expect((await pool.query("SELECT auto_login_on_startup FROM line_accounts WHERE account_id='account-b'")).rows[0].auto_login_on_startup).toBe(false);
+
+    await pool.query("UPDATE line_accounts SET auto_login_on_startup=true WHERE account_id='account-b'");
+    expect(await facade.dispatch({ type: 'lineSetAutoLogin', requestId: 'admin-guard-auto-off', accountId: 'account-b', enabled: false }))
+      .toMatchObject({ ok: true });
+    expect((await pool.query("SELECT auto_login_on_startup FROM line_accounts WHERE account_id='account-b'")).rows[0].auto_login_on_startup).toBe(false);
   });
 
   it('denies unsend from an external-monitor-only account before worker RPC or database mutation', async () => {
@@ -4113,13 +3862,13 @@ database('connected facade account login semantics', () => {
 
   it('projects real reaction samples through repository, facade mapping and the strict MessagePageSchema, and serves only present paid icons', async () => {
     const samples = [
-      '{"reactionList":[{"PaidType":{},"PredefinedType":2,"createdAt":1792277695027,"reactor":"ub6f5a192eaf1fc1acc3c61508b4fd6da","type":1,"updatedAt":1792277695027,"cancel":false}],"totalCount":0,"countByType":{}}',
-      '{"reactionList":[{"reactor":"ufaeaefdf10160b3aa1f38d2f57e68736","type":1,"createdAt":1792635926799,"updatedAt":1792635926799,"PredefinedType":4,"PaidType":{}}],"totalCount":0,"countByType":{}}',
-      '{"reactionList":[{"reactor":"ub254b3c8c4fc001b1862a8eef68f4f00","type":2,"createdAt":1792638565546,"updatedAt":1792638565546,"PredefinedType":0,"PaidType":{"emojiId":"004","productId":"60ebfdc03cc24041bb139cf5","resourceType":1,"version":2}}],"totalCount":0,"countByType":{}}',
+      '{"reactionList":[{"PaidType":{},"PredefinedType":2,"createdAt":1792277695027,"reactor":"u1f2e3d4c5b6a79880123456789abcdef","type":1,"updatedAt":1792277695027,"cancel":false}],"totalCount":0,"countByType":{}}',
+      '{"reactionList":[{"reactor":"u2e3d4c5b6a7988012345678900fedcba","type":1,"createdAt":1792635926799,"updatedAt":1792635926799,"PredefinedType":4,"PaidType":{}}],"totalCount":0,"countByType":{}}',
+      '{"reactionList":[{"reactor":"u3d4c5b6a798801234567890abcdef123","type":2,"createdAt":1792638565546,"updatedAt":1792638565546,"PredefinedType":0,"PaidType":{"emojiId":"004","productId":"60ebfdc03cc24041bb139cf5","resourceType":1,"version":2}}],"totalCount":0,"countByType":{}}',
     ];
     await pool.query("INSERT INTO line_accounts(account_id,display_name,own_mid) VALUES ('rx-a','rx-a','own-rx-a')");
     await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id) VALUES ('rx-a','group','rx-group')");
-    await pool.query("INSERT INTO line_contacts(account_id,mid,display_name) VALUES ('rx-a','ub6f5a192eaf1fc1acc3c61508b4fd6da','Nice Person')");
+    await pool.query("INSERT INTO line_contacts(account_id,mid,display_name) VALUES ('rx-a','u1f2e3d4c5b6a79880123456789abcdef','Nice Person')");
     const insert = (id: string, minute: number, raw: unknown) => pool.query(
       `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, ingestion_source, occurred_at, raw)
        VALUES ('rx-a',$1,$2,'rx-group','group','rx-other','text','t','live','2026-10-22T00:00:00Z'::timestamptz + ($3 || ' minutes')::interval,$4::jsonb)`,
@@ -4132,8 +3881,8 @@ database('connected facade account login semantics', () => {
     const page = MessagePageSchema.parse(await facade.listMessages(key, null, 10));
     expect(page.messages.map((message) => message.reactions)).toEqual([
       [{ kind: 'NICE', count: 1, reactorNames: ['Nice Person'] }],
-      [{ kind: 'FUN', count: 1, reactorNames: ['…8736'] }],
-      [{ kind: 'PAID', productId: '60ebfdc03cc24041bb139cf5', emojiId: '004', count: 1, reactorNames: ['…4f00'] }],
+      [{ kind: 'FUN', count: 1, reactorNames: ['…dcba'] }],
+      [{ kind: 'PAID', productId: '60ebfdc03cc24041bb139cf5', emojiId: '004', count: 1, reactorNames: ['…f123'] }],
       undefined,
     ]);
     const paid = { type: 'reaction' as const, ...key, productId: '60ebfdc03cc24041bb139cf5', emojiId: '004' };
@@ -4312,7 +4061,7 @@ database('connected facade account login semantics', () => {
     } finally { query.mockRestore(); }
   });
 
-  it('keeps current control unchanged when a new account QR command fails', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('keeps current control unchanged when a new account QR command fails', async () => {
     await addStoredAccounts('account-a');
     await activate('account-a');
     const before = await control();
@@ -4359,7 +4108,7 @@ database('connected facade account login semantics', () => {
     expect(modes.find((account) => account.account_id === 'account-b')?.mode).toBe('MONITOR_ONLY');
   });
 
-  it('keeps the Primary Admin monitor-only when a switch request is forged', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('keeps the Primary Admin monitor-only when a switch request is forged', async () => {
     await addStoredAccounts('account-a', 'account-b');
     await activate('account-a');
     await facade.dispatch({ type: 'lineStart', requestId: 'start-b-monitor', accountId: 'account-b' });
@@ -4376,10 +4125,32 @@ database('connected facade account login semantics', () => {
     expect(commands.some((command) => command.type === 'loginToken' && command.accountId === 'account-b')).toBe(false);
   });
 
-  it('does not replace the Agent worker to force a control transfer', async () => {
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('keeps the Primary Admin monitor-only when a switch request is forged', async () => {
+    await addStoredAccounts('account-a', 'account-b');
+    await activate('account-a');
+    const before = await control();
+    expect((await facade.dispatch({ type: 'switchControl', requestId: 'switch-b-with-token', accountId: 'account-b',
+      expectedEpoch: before.epoch })).ok).toBe(false);
+    expect(bindings.has('account-b')).toBe(false);
+    expect(commands.some((command) => command.type === 'loginToken' && command.accountId === 'account-b')).toBe(false);
+  });
+
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('does not replace the Agent worker to force a control transfer', async () => {
     await addStoredAccounts('account-a', 'account-b');
     await activate('account-a');
     await facade.dispatch({ type: 'lineStart', requestId: 'start-b-monitor', accountId: 'account-b' });
+    const oldActive = bindings.get('account-a')!;
+
+    const before = await control();
+    expect((await facade.dispatch({ type: 'switchControl', requestId: 'force-monitor-a-switch-b', accountId: 'account-b',
+      expectedEpoch: before.epoch })).ok).toBe(false);
+    expect(bindings.get('account-a')?.workerInstanceId).toBe(oldActive.workerInstanceId);
+    expect(bindings.get('account-a')?.mode).toBe('ACTIVE_CONTROL');
+  });
+
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('does not replace the Agent worker to force a control transfer', async () => {
+    await addStoredAccounts('account-a', 'account-b');
+    await activate('account-a');
     const oldActive = bindings.get('account-a')!;
 
     const before = await control();
@@ -4394,7 +4165,7 @@ database('connected facade account login semantics', () => {
     await activate('account-a');
     const startCount = starts.length;
     const result = await facade.dispatch({ type: 'lineAddAccountQr', requestId: 'third-account' });
-    expect(result).toMatchObject({ ok: false, code: 'SERVICE_ERROR' });
+    expect(result).toMatchObject({ ok: false, code: PRIMARY_ADMIN_LINE_LOGIN_ENABLED ? 'SERVICE_ERROR' : 'ADMIN_MONITOR_ONLY' });
     expect(starts).toHaveLength(startCount);
     expect((await pool.query('SELECT count(*) FROM line_accounts')).rows[0].count).toBe('2');
   });

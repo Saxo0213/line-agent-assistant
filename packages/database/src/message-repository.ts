@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { captureScheduleForward } from './schedule-forward-repository.js';
-import { InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpActiveChat, type McpMessageRecord, type McpTargetSummary, type MessageSearchScope, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
+import { InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, UnsendSchema, type UnsendDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpActiveChat, type McpMessageRecord, type McpTargetSummary, type MessageSearchScope, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { parseLineStickerDescriptor, type StickerDescriptor } from './sticker-descriptor.js';
 import { CONVERSATION_TITLE_SQL, MEMBER_NAME_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nameFragments, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, upsertLineContacts, type LineContactInput } from './name-resolution.js';
@@ -15,6 +15,7 @@ import { stageSystemLoginObservation, lockMonitorAgentReceipt, lockMonitorRouteR
 
 export type ReadPositionChange = Readonly<{ key: ConversationKey; messageId: string }>;
 const ReadReceiptsSchema = ReadReceiptSchema.array().max(500);
+const UnsendsSchema = UnsendSchema.array().max(500);
 
 /** Upper bound for a stored pre-recall native envelope returned to the desktop timeline. */
 const RECALL_ORIGINAL_MAX_BYTES = 262144;
@@ -136,8 +137,14 @@ export interface Attachment {
   expiresAt: string | null;
   updatedAt: string;
   lineMessage: JsonValue;
+  /** Native extension row envelope (raw.native) of an External Monitor message. Null for any other source. */
+  nativeEnvelope: JsonValue | null;
   externalSource: boolean;
-  nativePayload?: NativeSourceEnvelope;
+}
+
+/** Splits the stored `raw` of an attachment message into the worker message and the native envelope. */
+export function attachmentRawFields(raw: Record<string, JsonValue>): { lineMessage: JsonValue; nativeEnvelope: JsonValue | null } {
+  return { lineMessage: raw.message ?? raw, nativeEnvelope: raw.native ?? null };
 }
 
 /** Display-only attachment name fallback; provider and database IDs are never labels. */
@@ -153,6 +160,17 @@ export type AttachmentMutation = ConversationKey & {
 };
 
 export type AttachmentAttemptMutation = Omit<AttachmentMutation, 'controlEpoch'> & { attemptToken: string; ownerId: string };
+
+/** Fixed execution owner of the Primary Admin download bridge. The bridge has no worker binding. */
+export const OFFICIAL_BRIDGE_OWNER_ID = '5f0e9a52-8c1d-4b6e-9a47-0d1b7c3a2f10';
+/** Fixed value of `download_worker_instance_id` for a row that the download bridge holds. */
+export const OFFICIAL_BRIDGE_WORKER_ID = 'official-download-bridge';
+/** Count of attachments of one kind by the latest bridge verification result. */
+export interface BridgeVerificationKindCounts { match: number; mismatch: number; notInStore: number; nativeIncomplete: number }
+export interface BridgeVerificationCounts { image: BridgeVerificationKindCounts; file: BridgeVerificationKindCounts }
+/** Lease of a bridge claim. A large file read over the debugging pipe can last several minutes. */
+const OFFICIAL_BRIDGE_LEASE_INTERVAL = '15 minutes';
+export type ExternalBridgeAttempt = { attachmentId: string; accountId: string; attemptToken: string };
 
 export type AttachmentActivityRecord = {
   accountId: string; chatType: ConversationKey['chatType']; chatId: string;
@@ -174,8 +192,9 @@ export type ConversationCatalogEntry = Readonly<{
   members: readonly Readonly<{ memberId: string; displayName: string | null; nickname?: string | null; picturePath?: string | null }>[];
 }>;
 
-/** Agent/MCP-visible messages hide recalled and source-deleted content in projections and in every filter predicate. */
+/** Recalled and source-deleted messages: MCP reads return their stored content with recalled: true; send and forward sources are masked with these predicates. */
 const AGENT_MASKED_SQL = "(m.content->>'type' = 'unsent' OR m.raw ? 'sourceDeleted')";
+/** Send and forward sources only. MCP reads use the stored m.text_content. */
 const AGENT_VISIBLE_TEXT_SQL = `CASE WHEN ${AGENT_MASKED_SQL} THEN NULL ELSE m.text_content END`;
 
 /** The direction of a stored message as an MCP record reports it; the direction filter compares against this same expression. */
@@ -486,6 +505,7 @@ export class MessageRepository {
   ): Promise<{ inserted: number; duplicate: number; insertedMessageIds: string[]; changedMessageIds: string[]; jobIds: string[]; jobMessageIds: string[]; primaryAdminActionMessageIds: string[]; jobStatuses: NonNullable<IngestResult['jobStatus']>[];
     readPositionsChanged: number; readPositionChanges: ReadPositionChange[] }> {
     const readReceipts = ReadReceiptsSchema.parse(batch.readReceipts ?? []);
+    const unsends = UnsendsSchema.parse(batch.unsends ?? []);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -521,7 +541,8 @@ export class MessageRepository {
       if (!['ACTIVE_CONTROL', 'MONITOR_ONLY', 'PAUSED'].includes(account.mode)) throw new Error('Invalid login receipt mode');
       const receiptMode = account.mode as 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED';
       const batchDigest = createHash('sha256').update(JSON.stringify({ cursorBefore: batch.cursorBefore,
-        cursorAfter: batch.cursorAfter, envelopes: batch.envelopes, readReceipts }), 'utf8').digest('hex');
+        cursorAfter: batch.cursorAfter, envelopes: batch.envelopes, readReceipts,
+        ...(unsends.length === 0 ? {} : { unsends }) }), 'utf8').digest('hex');
       const priorSourceBatch = await client.query<{ payload_digest: string }>(
         'SELECT payload_digest FROM external_source_batches WHERE source_id=$1 AND generation=$2 AND batch_id=$3 FOR UPDATE',
         [sourceId, sourceGeneration, batch.batchId]);
@@ -575,6 +596,15 @@ export class MessageRepository {
            WHERE c.account_id=$1 AND c.chat_type=$2 AND c.chat_id=$3 AND EXISTS
              (SELECT 1 FROM line_accounts la WHERE la.account_id=$1 AND la.own_mid IS DISTINCT FROM $4)`,
           [envelope.accountId, envelope.chatType, envelope.chatId, envelope.senderId]);
+      }
+      // Unsends run after the envelopes of the batch are stored, so an unsend that arrives with its message still applies.
+      // A replayed batch was already applied in full, so it is not applied again.
+      if (!sourceBatchReplay) {
+        for (const unsend of unsends) {
+          const unsent = await this.applyObservedUnsend(client, { accountId: batch.accountId, sourceId, generation: sourceGeneration,
+            batchId: batch.batchId, unsend });
+          if (unsent === 'unsent') changedMessageIds.push(unsend.messageId);
+        }
       }
       const { readPositionsChanged, readPositionChanges } = await this.upsertReadPositions(client, batch.accountId, readReceipts);
       const source = 'live';
@@ -996,39 +1026,66 @@ export class MessageRepository {
       }
       if (current.content?.type === 'unsent') { await client.query('COMMIT'); return false; }
 
-      const source = await client.query<{ normalized_payload: ExternalObservation }>(
-        `SELECT normalized_payload FROM external_source_observations
-         WHERE source_id=$1 AND account_id=$2 AND generation=$3 AND canonical_message_id=$4 AND status='PROJECTED'
-         ORDER BY observation_id LIMIT 1`, [account.source_id, key.accountId, Number(account.generation), messageId]);
-      const prior = source.rows[0]?.normalized_payload;
-      if (!prior?.livePayload) throw new Error('Message source copy is unavailable for unsend reconciliation');
-      const raw = prior.livePayload.raw;
-      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Message source copy is unavailable for unsend reconciliation');
-      const rawRecord = raw as Record<string, JsonValue>;
-      const nativeMessage = rawRecord.message;
-      if (nativeMessage === null || typeof nativeMessage !== 'object' || Array.isArray(nativeMessage)) {
-        throw new Error('Message source copy is unavailable for unsend reconciliation');
-      }
-      const nativeRecord = nativeMessage as Record<string, JsonValue>;
-      const metadata = nativeRecord.contentMetadata;
-      const metadataRecord = metadata !== null && typeof metadata === 'object' && !Array.isArray(metadata)
-        ? metadata as Record<string, JsonValue> : {};
-      const observation: ExternalObservation = { ...prior, text: null, livePayload: { ...prior.livePayload,
-        raw: { ...rawRecord, message: { ...nativeRecord, text: '', contentMetadata: { ...metadataRecord, UNSENT: true } } } } };
-      const batchId = `manual-unsend:${randomUUID()}`;
-      const payloadDigest = createHash('sha256').update(JSON.stringify(observation), 'utf8').digest('hex');
-      await client.query(`INSERT INTO external_source_batches(source_id,account_id,generation,batch_id,payload_digest,result)
-        VALUES ($1,$2,$3,$4,$5,'{}'::jsonb)`,
-      [account.source_id, key.accountId, Number(account.generation), batchId, payloadDigest]);
-      const staged = await stageSystemLoginObservation(client, { accountId: key.accountId, sourceId: account.source_id,
-        generation: Number(account.generation), batchId, origin: 'SYSTEM_LOGIN_LIVE', observation });
-      if (staged.conflict) throw new Error('Message source copy changed while reconciling unsend');
+      const outcome = await this.reconcileUnsendThroughSource(client, { accountId: key.accountId, sourceId: account.source_id,
+        generation: Number(account.generation), messageId, batchId: `manual-unsend:${randomUUID()}` });
+      if (outcome === 'source_unavailable') throw new Error('Message source copy is unavailable for unsend reconciliation');
       await client.query('COMMIT');
-      return staged.changed;
+      return outcome === 'changed';
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally { client.release(); }
+  }
+
+  /**
+   * Shared unsend projection: rewrite the stored source copy of one message with UNSENT metadata and stage it again,
+   * so the canonical projector sets content to unsent, sets recalled_at and keeps the original in raw.recall.original.
+   * The caller owns the transaction, the source authority check and the message ownership check.
+   */
+  private async reconcileUnsendThroughSource(client: PoolClient, input: { accountId: string; sourceId: string; generation: number;
+    messageId: string; batchId: string }): Promise<'changed' | 'unchanged' | 'source_unavailable'> {
+    const source = await client.query<{ normalized_payload: ExternalObservation }>(
+      `SELECT normalized_payload FROM external_source_observations
+       WHERE source_id=$1 AND account_id=$2 AND generation=$3 AND canonical_message_id=$4 AND status='PROJECTED'
+       ORDER BY observation_id LIMIT 1`, [input.sourceId, input.accountId, input.generation, input.messageId]);
+    const prior = source.rows[0]?.normalized_payload;
+    if (!prior?.livePayload) return 'source_unavailable';
+    const raw = prior.livePayload.raw;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return 'source_unavailable';
+    const rawRecord = raw as Record<string, JsonValue>;
+    const nativeMessage = rawRecord.message;
+    if (nativeMessage === null || typeof nativeMessage !== 'object' || Array.isArray(nativeMessage)) return 'source_unavailable';
+    const nativeRecord = nativeMessage as Record<string, JsonValue>;
+    const metadata = nativeRecord.contentMetadata;
+    const metadataRecord = metadata !== null && typeof metadata === 'object' && !Array.isArray(metadata)
+      ? metadata as Record<string, JsonValue> : {};
+    const observation: ExternalObservation = { ...prior, text: null, livePayload: { ...prior.livePayload,
+      raw: { ...rawRecord, message: { ...nativeRecord, text: '', contentMetadata: { ...metadataRecord, UNSENT: true } } } } };
+    const payloadDigest = createHash('sha256').update(JSON.stringify(observation), 'utf8').digest('hex');
+    await client.query(`INSERT INTO external_source_batches(source_id,account_id,generation,batch_id,payload_digest,result)
+      VALUES ($1,$2,$3,$4,$5,'{}'::jsonb)`,
+    [input.sourceId, input.accountId, input.generation, input.batchId, payloadDigest]);
+    const staged = await stageSystemLoginObservation(client, { accountId: input.accountId, sourceId: input.sourceId,
+      generation: input.generation, batchId: input.batchId, origin: 'SYSTEM_LOGIN_LIVE', observation });
+    if (staged.conflict) throw new Error('Message source copy changed while reconciling unsend');
+    return staged.changed ? 'changed' : 'unchanged';
+  }
+
+  /**
+   * Apply one LINE unsend seen on the login source inside the batch transaction. The message must exist for the account
+   * in the named chat. Unknown messages, other chats, messages already unsent and messages without a source copy are skipped.
+   */
+  private async applyObservedUnsend(client: PoolClient, input: { accountId: string; sourceId: string; generation: number;
+    batchId: string; unsend: UnsendDto }): Promise<'unsent' | 'skipped_unknown' | 'skipped_already_unsent' | 'skipped_no_source'> {
+    const message = await client.query<{ chat_id: string; content: MessageContent | null }>(
+      'SELECT chat_id,content FROM messages WHERE account_id=$1 AND message_id=$2 FOR UPDATE', [input.accountId, input.unsend.messageId]);
+    const current = message.rows[0];
+    if (!current || current.chat_id !== input.unsend.chatId) return 'skipped_unknown';
+    if (current.content?.type === 'unsent') return 'skipped_already_unsent';
+    const outcome = await this.reconcileUnsendThroughSource(client, { accountId: input.accountId, sourceId: input.sourceId,
+      generation: input.generation, messageId: input.unsend.messageId, batchId: `observed-unsend:${input.batchId}:${input.unsend.messageId}` });
+    if (outcome === 'source_unavailable') return 'skipped_no_source';
+    return outcome === 'changed' ? 'unsent' : 'skipped_already_unsent';
   }
 
   async ingestAndRoute(envelope: InboundEnvelope, routingDecision: RoutingDecision): Promise<IngestResult> {
@@ -1314,13 +1371,17 @@ export class MessageRepository {
              AND NOT EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
                AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR')
            THEN 'queued' ELSE a.status END AS status,
-         COALESCE(la.status='connected' AND (m.occurred_at >= now() - interval '7 days' OR NOT EXISTS (SELECT 1 FROM message_source_provenance p
+         COALESCE((la.status='connected' AND (m.occurred_at >= now() - interval '7 days' OR NOT EXISTS (SELECT 1 FROM message_source_provenance p
              WHERE p.account_id=a.account_id AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR'))
            AND (a.status='expired' OR (a.status='failed' AND (a.retry_count >= $5 OR a.retry_after='infinity'::timestamptz
              OR EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
                AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR')))
            OR (a.status='queued' AND EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
-             AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR'))), FALSE) AS can_retry_manually,
+             AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR'))))
+           -- An External Monitor row that the bridge can download does not need a connected account. The bridge login is the gate.
+           OR (a.status IN ('queued','failed') AND a.kind IN ('image','file') AND a.chat_type IN ('direct','group','room')
+             AND m.occurred_at >= now() - interval '7 days' AND EXISTS (SELECT 1 FROM message_source_provenance p
+               WHERE p.account_id=a.account_id AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR')), FALSE) AS can_retry_manually,
          CASE WHEN a.status='queued' AND a.error = ANY($6::text[]) THEN a.error END AS block_reason
        FROM attachments a JOIN messages m ON m.account_id=a.account_id AND m.chat_type=a.chat_type
          AND m.chat_id=a.chat_id AND m.message_id=a.message_id
@@ -1422,45 +1483,8 @@ export class MessageRepository {
     if (!row) return null;
     const raw = row.raw && typeof row.raw === 'object' && !Array.isArray(row.raw)
       ? row.raw as Record<string, JsonValue> : {};
-    const nativePayload = NativeSourceEnvelopeSchema.safeParse(raw.native);
-    return { attachmentId: row.attachment_id, externalAttachmentId: row.external_attachment_id, accountId: row.account_id, chatType: row.chat_type, chatId: row.chat_id, messageId: row.message_id, senderId: row.sender_id, senderDisplayName: row.sender_display_name, kind: row.kind, name: row.name, mimeType: row.mime_type, status: row.status, relativePath: row.relative_path, sha256: row.sha256, sizeBytes: row.size_bytes === null ? null : Number(row.size_bytes), error: row.error, occurredAt: row.occurred_at.toISOString(), retryCount: row.retry_count, retryAfter: row.retry_after, createdAt: row.created_at.toISOString(), expiresAt: row.expires_at, updatedAt: row.updated_at.toISOString(), lineMessage: raw.message ?? raw,
-      externalSource: row.external_source, ...(nativePayload.success && nativePayload.data.table === '_message' ? { nativePayload: nativePayload.data } : {}) };
-  }
-
-  async getRecentExternalAttachmentsForDownloadProbe(accountId: string, limit = 5): Promise<Attachment[]> {
-    const boundedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(16, Math.trunc(limit))) : 5;
-    const result = await this.pool.query<{
-      attachment_id: string; external_attachment_id: string; account_id: string; chat_type: Attachment['chatType']; chat_id: string; message_id: string; kind: Attachment['kind']; name: string | null; mime_type: string | null; status: Attachment['status']; relative_path: string | null; sha256: string | null; size_bytes: string | null; error: string | null; occurred_at: Date; retry_count: number; retry_after: string | null; created_at: Date; expires_at: string | null; updated_at: Date; raw: JsonValue;
-    }>(`SELECT a.attachment_id, a.external_attachment_id, a.account_id, a.chat_type, a.chat_id, a.message_id,
-        a.kind, a.name, a.mime_type, a.status, a.relative_path, a.sha256, a.size_bytes, a.error,
-        m.occurred_at, a.retry_count, a.retry_after::text AS retry_after, a.created_at, a.expires_at::text AS expires_at, a.updated_at, m.raw
-        FROM attachments a JOIN messages m
-        ON m.account_id = a.account_id AND m.chat_type = a.chat_type AND m.chat_id = a.chat_id AND m.message_id = a.message_id
-        WHERE a.account_id = $1
-          AND a.chat_type IN ('direct', 'group', 'room')
-          AND m.occurred_at >= now() - interval '7 days'
-          AND jsonb_typeof(m.raw -> 'native') = 'object'
-          AND EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id = a.account_id
-            AND p.message_id = a.message_id AND p.origin = 'EXTERNAL_MONITOR')
-        ORDER BY m.occurred_at DESC, a.created_at DESC, a.attachment_id DESC
-        LIMIT $2`, [accountId, boundedLimit]);
-    const items: Attachment[] = [];
-    for (const row of result.rows) {
-      const raw = row.raw && typeof row.raw === 'object' && !Array.isArray(row.raw)
-        ? row.raw as Record<string, JsonValue> : {};
-      const nativePayload = NativeSourceEnvelopeSchema.safeParse(raw.native);
-      if (!nativePayload.success || nativePayload.data.table !== '_message') continue;
-      items.push({
-        attachmentId: row.attachment_id, externalAttachmentId: row.external_attachment_id, accountId: row.account_id,
-        chatType: row.chat_type, chatId: row.chat_id, messageId: row.message_id, kind: row.kind, name: row.name,
-        mimeType: row.mime_type, status: row.status, relativePath: row.relative_path, sha256: row.sha256,
-        sizeBytes: row.size_bytes === null ? null : Number(row.size_bytes), error: row.error,
-        occurredAt: row.occurred_at.toISOString(), retryCount: row.retry_count, retryAfter: row.retry_after,
-        createdAt: row.created_at.toISOString(), expiresAt: row.expires_at, updatedAt: row.updated_at.toISOString(),
-        lineMessage: raw.message ?? raw, externalSource: true, nativePayload: nativePayload.data,
-      });
-    }
-    return items;
+    return { attachmentId: row.attachment_id, externalAttachmentId: row.external_attachment_id, accountId: row.account_id, chatType: row.chat_type, chatId: row.chat_id, messageId: row.message_id, senderId: row.sender_id, senderDisplayName: row.sender_display_name, kind: row.kind, name: row.name, mimeType: row.mime_type, status: row.status, relativePath: row.relative_path, sha256: row.sha256, sizeBytes: row.size_bytes === null ? null : Number(row.size_bytes), error: row.error, occurredAt: row.occurred_at.toISOString(), retryCount: row.retry_count, retryAfter: row.retry_after, createdAt: row.created_at.toISOString(), expiresAt: row.expires_at, updatedAt: row.updated_at.toISOString(), ...attachmentRawFields(raw),
+      externalSource: row.external_source };
   }
 
   async claimAttachmentDownload(mutation: AttachmentMutation & { ownerId: string }, options: { manual?: boolean; expected?: AttachmentPriorState; automaticAttemptLimit?: number } = {}): Promise<string | null> {
@@ -1553,11 +1577,11 @@ export class MessageRepository {
          download_lease_expires_at = NULL, updated_at = now()
        WHERE ($1::text IS NULL OR a.account_id = $1) AND a.status = 'downloading'
          AND (a.download_attempt_token IS NULL OR a.download_owner_id IS NULL OR a.download_lease_expires_at IS NULL
-           OR a.download_lease_expires_at <= now() OR NOT EXISTS (
+           OR a.download_lease_expires_at <= now() OR (a.download_worker_instance_id IS DISTINCT FROM '${OFFICIAL_BRIDGE_WORKER_ID}' AND NOT EXISTS (
            SELECT 1 FROM line_accounts owner
            WHERE owner.account_id = a.account_id AND owner.worker_instance_id = a.download_worker_instance_id
              AND owner.worker_binding_epoch = a.download_worker_binding_epoch
-         ) OR NOT EXISTS (SELECT 1 FROM attachment_execution_owners attempt_owner
+         )) OR NOT EXISTS (SELECT 1 FROM attachment_execution_owners attempt_owner
            WHERE attempt_owner.owner_id = a.download_owner_id AND attempt_owner.revoked_at IS NULL))`, [accountId ?? null, automaticAttemptLimit],
     );
   }
@@ -1637,6 +1661,32 @@ export class MessageRepository {
   }
 
   /**
+   * Counts the latest download bridge verification result of each attachment of one account, per kind (image, file).
+   * The audit row `request_id` is the attachment id. Rows of other attachment kinds are not counted.
+   */
+  async countBridgeVerification(accountId: string): Promise<BridgeVerificationCounts> {
+    const result = await this.pool.query<{ kind: string; result_code: string; total: number }>(
+      `SELECT a.kind, l.result_code, count(*)::int AS total
+         FROM (SELECT DISTINCT ON (details->>'request_id') details->>'request_id' AS request_id, details->>'result_code' AS result_code
+                 FROM audit_logs
+                WHERE action = 'bridge_message_verify' AND details->>'account_id' = $1 AND details ? 'request_id'
+                ORDER BY details->>'request_id', created_at DESC, audit_id DESC) l
+         JOIN attachments a ON a.attachment_id::text = l.request_id AND a.account_id = $1 AND a.kind IN ('image', 'file')
+        GROUP BY a.kind, l.result_code`, [accountId]);
+    const counts: BridgeVerificationCounts = {
+      image: { match: 0, mismatch: 0, notInStore: 0, nativeIncomplete: 0 },
+      file: { match: 0, mismatch: 0, notInStore: 0, nativeIncomplete: 0 },
+    };
+    for (const row of result.rows) {
+      const kind = row.kind === 'image' || row.kind === 'file' ? row.kind : undefined;
+      const field = row.result_code === 'BRIDGE_VERIFY_MATCH' ? 'match' : row.result_code === 'BRIDGE_VERIFY_MISMATCH' ? 'mismatch'
+        : row.result_code === 'BRIDGE_VERIFY_NOT_IN_STORE' ? 'notInStore' : row.result_code === 'BRIDGE_VERIFY_NATIVE_INCOMPLETE' ? 'nativeIncomplete' : undefined;
+      if (kind && field) counts[kind][field] += row.total;
+    }
+    return counts;
+  }
+
+  /**
    * One bounded backfill for old External Monitor rows. No scan selects them, so they keep no reason.
    * It returns the number of rows changed. The caller repeats it while the count equals the limit.
    */
@@ -1702,19 +1752,19 @@ export class MessageRepository {
     });
   }
 
-  async markAttachmentReady(mutation: AttachmentAttemptMutation, data: { relativePath: string; sha256: string; sizeBytes: number; name?: string }): Promise<boolean> {
+  async markAttachmentReady(mutation: AttachmentAttemptMutation, data: { relativePath: string; sha256: string; sizeBytes: number; name?: string; mimeType?: string }): Promise<boolean> {
     return this.attachmentAttemptUpdate(mutation,
       `UPDATE attachments SET status = 'ready', relative_path = $6, sha256 = $7, size_bytes = $8,
          download_lease_expires_at = NULL, download_attempt_token = NULL, download_owner_id = NULL, download_worker_binding_epoch = NULL,
          retry_after = NULL,
-         name = COALESCE($9, name), error = NULL, updated_at = now()
+         name = COALESCE($9, name), mime_type = COALESCE(mime_type, $12), error = NULL, updated_at = now()
        WHERE attachment_id = $1 AND account_id = $2 AND chat_type = $3 AND chat_id = $4
          AND download_worker_instance_id = $5 AND status = 'downloading'
          AND download_attempt_token = $10 AND download_owner_id = $11
-         AND download_worker_binding_epoch = $12
+         AND download_worker_binding_epoch = $13
        RETURNING attachment_id`,
       [mutation.attachmentId, mutation.accountId, mutation.chatType, mutation.chatId, mutation.workerInstanceId, data.relativePath,
-        data.sha256, data.sizeBytes, data.name ?? null, mutation.attemptToken, mutation.ownerId],
+        data.sha256, data.sizeBytes, data.name ?? null, mutation.attemptToken, mutation.ownerId, data.mimeType ?? null],
     );
   }
 
@@ -1745,6 +1795,67 @@ export class MessageRepository {
       [mutation.attachmentId, mutation.accountId, mutation.chatType, mutation.chatId, mutation.workerInstanceId, error,
         mutation.attemptToken, mutation.ownerId],
     );
+  }
+
+  /**
+   * Claims an External Monitor attachment for the download bridge. The bridge has no worker binding, so this claim does not
+   * use one. Only a row of the Primary Admin account, with origin EXTERNAL_MONITOR, kind image or file, chat type direct, group
+   * or room, and status queued or failed, and a message time that is not older than 7 days. The caller gives the attempt token.
+   */
+  async claimExternalAttachmentForBridge(input: ExternalBridgeAttempt): Promise<boolean> {
+    return this.withAttachmentTransaction(async (client) => {
+      await client.query('INSERT INTO attachment_execution_owners(owner_id) VALUES ($1) ON CONFLICT (owner_id) DO NOTHING', [OFFICIAL_BRIDGE_OWNER_ID]);
+      const owner = await client.query<{ revoked_at: Date | null }>(
+        'SELECT revoked_at FROM attachment_execution_owners WHERE owner_id = $1 FOR SHARE', [OFFICIAL_BRIDGE_OWNER_ID]);
+      if (!owner.rows[0] || owner.rows[0].revoked_at) return false;
+      const result = await client.query(
+        `UPDATE attachments SET status = 'downloading', download_worker_instance_id = $3, download_worker_binding_epoch = 0,
+           download_lease_expires_at = now() + interval '${OFFICIAL_BRIDGE_LEASE_INTERVAL}', download_attempt_token = $4, download_owner_id = $5,
+           retry_count = retry_count + 1, retry_after = NULL, error = NULL, updated_at = now()
+         WHERE attachment_id = $1 AND account_id = $2 AND kind IN ('image', 'file') AND chat_type IN ('direct', 'group', 'room')
+           AND status IN ('queued', 'failed')
+           AND EXISTS (SELECT 1 FROM messages m WHERE m.account_id=attachments.account_id AND m.chat_type=attachments.chat_type
+             AND m.chat_id=attachments.chat_id AND m.message_id=attachments.message_id AND m.occurred_at >= now() - interval '7 days')
+           AND EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=attachments.account_id
+             AND p.message_id=attachments.message_id AND p.origin='EXTERNAL_MONITOR')
+           AND EXISTS (SELECT 1 FROM line_accounts la WHERE la.account_id=attachments.account_id AND la.product_role='PRIMARY_ADMIN')
+         RETURNING attachment_id`,
+        [input.attachmentId, input.accountId, OFFICIAL_BRIDGE_WORKER_ID, input.attemptToken, OFFICIAL_BRIDGE_OWNER_ID]);
+      return result.rowCount === 1;
+    });
+  }
+
+  /** Runs one fenced update of a bridge claim. The row must still hold this attempt token. */
+  private async bridgeAttemptUpdate(input: ExternalBridgeAttempt, setClause: string, values: unknown[]): Promise<boolean> {
+    return this.withAttachmentTransaction(async (client) => {
+      const owner = await client.query<{ revoked_at: Date | null }>(
+        'SELECT revoked_at FROM attachment_execution_owners WHERE owner_id = $1 FOR SHARE', [OFFICIAL_BRIDGE_OWNER_ID]);
+      if (!owner.rows[0] || owner.rows[0].revoked_at) return false;
+      const result = await client.query(
+        `UPDATE attachments SET ${setClause}, download_lease_expires_at = NULL, download_attempt_token = NULL, download_owner_id = NULL,
+           download_worker_instance_id = NULL, download_worker_binding_epoch = NULL, retry_after = NULL, updated_at = now()
+         WHERE attachment_id = $1 AND account_id = $2 AND status = 'downloading'
+           AND download_worker_instance_id = $3 AND download_attempt_token = $4 AND download_owner_id = $5
+         RETURNING attachment_id`,
+        [input.attachmentId, input.accountId, OFFICIAL_BRIDGE_WORKER_ID, input.attemptToken, OFFICIAL_BRIDGE_OWNER_ID, ...values]);
+      return result.rowCount === 1;
+    });
+  }
+
+  async markExternalAttachmentReadyByBridge(input: ExternalBridgeAttempt,
+    data: { relativePath: string; sha256: string; sizeBytes: number; name?: string; mimeType?: string }): Promise<boolean> {
+    return this.bridgeAttemptUpdate(input,
+      `status = 'ready', relative_path = $6, sha256 = $7, size_bytes = $8, name = COALESCE($9, name),
+         mime_type = COALESCE(mime_type, $10), error = NULL`,
+      [data.relativePath, data.sha256, data.sizeBytes, data.name ?? null, data.mimeType ?? null]);
+  }
+
+  async markExternalAttachmentFailedByBridge(input: ExternalBridgeAttempt, error: string): Promise<boolean> {
+    return this.bridgeAttemptUpdate(input, `status = 'failed', error = $6`, [error.slice(0, 200)]);
+  }
+
+  async markExternalAttachmentExpiredByBridge(input: ExternalBridgeAttempt, error: string): Promise<boolean> {
+    return this.bridgeAttemptUpdate(input, `status = 'expired', error = $6`, [error.slice(0, 200)]);
   }
 
   async cancelAttachmentDownload(mutation: AttachmentAttemptMutation, automaticAttemptLimit = 3): Promise<boolean> {
@@ -2204,6 +2315,7 @@ export class MessageRepository {
       kind: McpMessageRecord['kind'];
       text_content: string | null;
       recalled: boolean;
+      recalled_at: Date | null;
       occurred_at: Date;
       occurred_key: string;
       attachments: McpMessageRecord['attachments'];
@@ -2219,10 +2331,14 @@ export class MessageRepository {
               ${MESSAGE_DIRECTION_SQL} AS direction,
               m.kind,
               COALESCE(${AGENT_MASKED_SQL}, false) AS recalled,
-              ${AGENT_VISIBLE_TEXT_SQL} AS text_content,
+              -- recalled_at is the time the system first stored the recall (detection time), not a LINE server time; a row first stored already recalled has no time.
+              CASE WHEN m.content->>'type' = 'unsent' THEN m.recalled_at
+                   WHEN m.raw ? 'sourceDeleted' THEN (m.raw->'sourceDeleted'->>'detectedAt')::timestamptz
+                   ELSE NULL END AS recalled_at,
+              m.text_content,
               m.occurred_at,
               to_char(m.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS occurred_key,
-              CASE WHEN ${AGENT_MASKED_SQL} THEN '[]'::jsonb ELSE COALESCE(
+              COALESCE(
                 jsonb_agg(
                   jsonb_build_object(
                     'attachmentId', a.attachment_id,
@@ -2234,7 +2350,7 @@ export class MessageRepository {
                   ) ORDER BY a.created_at ASC, a.attachment_id ASC
                 ) FILTER (WHERE a.attachment_id IS NOT NULL),
                 '[]'::jsonb
-              ) END AS attachments
+              ) AS attachments
        FROM messages m
        JOIN line_accounts la ON la.account_id = m.account_id
        LEFT JOIN conversations c
@@ -2290,9 +2406,9 @@ export class MessageRepository {
                )
            )
          )
-         AND ($8::text IS NULL OR position(lower($8) in lower(coalesce(${AGENT_VISIBLE_TEXT_SQL}, ''))) > 0)
+         AND ($8::text IS NULL OR position(lower($8) in lower(coalesce(m.text_content, ''))) > 0)
          AND ($17::timestamptz IS NULL OR (m.occurred_at, m.message_id) ${ascending ? '>' : '<'} ($17::timestamptz, $18::text))
-       GROUP BY m.account_id, m.chat_type, m.chat_id, m.message_id, m.sender_id, m.kind, m.content, m.text_content, m.occurred_at, m.raw, la.own_mid,
+       GROUP BY m.account_id, m.chat_type, m.chat_id, m.message_id, m.sender_id, m.kind, m.content, m.text_content, m.occurred_at, m.raw, m.recalled_at, la.own_mid,
                 ${NAME_RESOLUTION_GROUP_COLUMNS}
        ORDER BY m.occurred_at ${ascending ? 'ASC' : 'DESC'}, m.message_id ${ascending ? 'ASC' : 'DESC'}
        LIMIT $11`,
@@ -2328,6 +2444,7 @@ export class MessageRepository {
       kind: row.kind,
       text: row.text_content,
       recalled: row.recalled,
+      recalledAt: row.recalled && row.recalled_at ? row.recalled_at.toISOString() : null,
       occurredAt: row.occurred_at.toISOString(),
       attachments: (row.attachments ?? []).map((att) => ({
         attachmentId: att.attachmentId,

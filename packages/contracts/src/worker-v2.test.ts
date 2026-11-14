@@ -268,6 +268,24 @@ it('accepts batches with valid read receipts and batches from older workers with
   expect(LineWorkerEventSchema.parse(receiptBatch)).not.toHaveProperty('readReceipts');
 });
 
+const validUnsend = { chatId: `c${'1'.repeat(32)}`, messageId: '640083256712626194', kind: 'self', observedAt: '2026-11-11T01:02:03.000Z' };
+
+it('accepts batches with valid unsends and batches without the field', () => {
+  expect(LineWorkerEventSchema.parse({ ...receiptBatch, unsends: [validUnsend, { ...validUnsend, kind: 'notified' }] }))
+    .toMatchObject({ unsends: [validUnsend, { kind: 'notified' }] });
+  expect(LineWorkerEventSchema.parse(receiptBatch)).not.toHaveProperty('unsends');
+});
+
+it('rejects oversize or malformed unsends', () => {
+  const many = Array.from({ length: 501 }, () => validUnsend);
+  expect(LineWorkerEventSchema.safeParse({ ...receiptBatch, unsends: many }).success).toBe(false);
+  expect(LineWorkerEventSchema.safeParse({ ...receiptBatch, unsends: many.slice(0, 500) }).success).toBe(true);
+  for (const bad of [{ chatId: 'u-admin' }, { chatId: `m${'1'.repeat(32)}` }, { messageId: 'abc' }, { messageId: '' },
+    { messageId: '9223372036854775808' }, { kind: 'other' }, { observedAt: 'yesterday' }, { extra: true }]) {
+    expect(LineWorkerEventSchema.safeParse({ ...receiptBatch, unsends: [{ ...validUnsend, ...bad }] }).success).toBe(false);
+  }
+});
+
 it('rejects oversize or malformed read receipts', () => {
   const many = Array.from({ length: 501 }, () => validReceipt);
   expect(LineWorkerEventSchema.safeParse({ ...receiptBatch, readReceipts: many }).success).toBe(false);
@@ -311,18 +329,16 @@ describe('sendText mentions', () => {
 
 describe('lineTransport on init', () => {
   const init = { type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor };
-  const CHROME_APPLICATION = 'CHROMEOS\t3.7.2\tChrome_OS\t';
   it('defaults to DESKTOPWIN and keeps every existing init valid', () => {
     const parsed = LineWorkerCommandSchema.parse(init);
     expect(parsed).not.toHaveProperty('lineTransport');
     expect(resolveLineTransport(parsed.type === 'init' ? parsed.lineTransport : undefined)).toBe('DESKTOPWIN');
     expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'DESKTOPWIN' }).success).toBe(true);
-    expect(LineWorkerCommandSchema.safeParse({ ...init, purpose: 'DOWNLOAD_ONLY',
-      application: 'DESKTOPWIN\t9.9.9\tWINDOWS\t10.0' }).success).toBe(true);
+    // The download-only purpose is removed, so the strict init schema rejects it.
+    expect(LineWorkerCommandSchema.safeParse({ ...init, purpose: 'DOWNLOAD_ONLY' }).success).toBe(false);
   });
-  it('accepts CHROMEOS with no application, or exactly the pinned one, plus an absolute ltsm directory', () => {
+  it('accepts CHROMEOS with an absolute ltsm directory', () => {
     expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS' }).success).toBe(true);
-    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', application: CHROME_APPLICATION }).success).toBe(true);
     expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', chromeLtsmDir: 'C:/Users/u/AppData/Roaming/app/line-chrome/ltsm' }).success).toBe(true);
     expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', chromeLtsmDir: '/home/u/app/line-chrome/ltsm' }).success).toBe(true);
   });

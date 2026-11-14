@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { mkdir, realpath, rm, stat, lstat, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import { AGENT_ATTACHMENT_LIMITS, type AgentAttachmentUpload, type AgentProvider, type AgentStoredAttachment } from '@line-agent/contracts';
+import { AGENT_ATTACHMENT_LIMITS, sniffImageMimeType, type AgentAttachmentUpload, type AgentProvider, type AgentStoredAttachment } from '@line-agent/contracts';
 
 /**
  * Files attached in the local Agent room. Main owns the bytes: they are written under
@@ -59,7 +59,7 @@ export function sanitizeAttachmentName(value: string, index = 0): string {
   return name;
 }
 
-function uniqueName(name: string, used: Set<string>): string {
+export function uniqueName(name: string, used: Set<string>): string {
   const dot = name.lastIndexOf('.');
   const stem = dot > 0 ? name.slice(0, dot) : name;
   const extension = dot > 0 ? name.slice(dot) : '';
@@ -71,21 +71,18 @@ function uniqueName(name: string, used: Set<string>): string {
 
 /** Type from magic bytes only; the client's mime is never consulted. */
 export function sniffAttachment(bytes: Uint8Array, name: string): { kind: 'image' | 'file'; mime: string } {
-  const startsWith = (...signature: number[]) => signature.every((value, index) => bytes[index] === value);
-  if (bytes.length >= 8 && startsWith(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return { kind: 'image', mime: 'image/png' };
-  if (bytes.length >= 3 && startsWith(0xff, 0xd8, 0xff)) return { kind: 'image', mime: 'image/jpeg' };
-  if (bytes.length >= 6 && (startsWith(0x47, 0x49, 0x46, 0x38, 0x37, 0x61) || startsWith(0x47, 0x49, 0x46, 0x38, 0x39, 0x61))) return { kind: 'image', mime: 'image/gif' };
-  if (bytes.length >= 12 && startsWith(0x52, 0x49, 0x46, 0x46) && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return { kind: 'image', mime: 'image/webp' };
+  const image = sniffImageMimeType(bytes);
+  if (image) return { kind: 'image', mime: image };
   const extension = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
   return { kind: 'file', mime: SAFE_TEXT_MIME[extension] ?? 'application/octet-stream' };
 }
 
-function assertWithin(root: string, candidate: string): void {
+export function assertWithin(root: string, candidate: string): void {
   const rel = relative(root, candidate);
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) throw new AgentAttachmentError('ATTACHMENT_INVALID', '附件路徑無效。');
 }
 
-function jobDirectory(workspace: string, jobId: string): string {
+export function jobDirectory(workspace: string, jobId: string): string {
   if (!UUID.test(jobId)) throw new AgentAttachmentError('ATTACHMENT_INVALID', '附件資料無效。');
   return join(workspace, ATTACHMENT_DIRECTORY, jobId);
 }
@@ -154,7 +151,7 @@ export async function resolveStoredAttachments(workspace: string, jobId: string,
   } catch { throw missing(); }
 }
 
-function humanSize(bytes: number): string {
+export function humanSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;

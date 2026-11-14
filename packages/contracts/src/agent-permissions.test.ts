@@ -115,5 +115,9 @@ describe('Agent approval IPC', () => {
     expect(IpcEventSchema.safeParse({ type: 'agentApprovalResolved', approvalId: 'appr-1', jobId: 'job-1', outcome: 'maybe' }).success).toBe(false);
     expect(IpcEventSchema.safeParse({ type: 'agentExecutionPolicyChanged' }).success).toBe(true);
     expect(IpcEventSchema.safeParse({ type: 'agentExecutionPolicyChanged', policy: {} }).success).toBe(false);
+    expect(IpcEventSchema.safeParse({ type: 'openConversation', accountId: 'a', chatType: 'group', chatId: 'g' }).success).toBe(true);
+    expect(IpcEventSchema.safeParse({ type: 'openConversation', accountId: 'a', chatType: 'channel', chatId: 'g' }).success).toBe(false);
+    expect(IpcEventSchema.safeParse({ type: 'openConversation', accountId: 'a', chatType: 'group' }).success).toBe(false);
+    expect(IpcEventSchema.safeParse({ type: 'openConversation', accountId: 'a', chatType: 'group', chatId: 'g', extra: 1 }).success).toBe(false);
   });
 });

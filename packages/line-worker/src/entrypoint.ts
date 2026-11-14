@@ -374,7 +374,6 @@ export function createTransportFactory(deps: TransportFactoryDeps = {}): (init: 
     return (deps.createLinejs ?? createLinejsAdapter)({
       accountId: init.accountId, workerInstanceId: init.workerInstanceId,
       controlEpoch: init.controlEpoch, mode: init.mode,
-      ...(init.purpose === 'DOWNLOAD_ONLY' && init.application ? { application: init.application } : {}),
       validateLease: () => true,
       physicalTransport: fetchLineRequest,
     });

@@ -16,6 +16,38 @@ export type FileAttachmentCardData = {
   durationMs?: number | null | undefined;
 };
 
+/**
+ * Display state of an attachment of the Primary Admin account. That account has no worker, so every row is an External Monitor row.
+ * Only the download bridge can get its file. Community and thread chats are not supported by the Chrome extension.
+ * Rows of other accounts, ready rows and downloading rows are not changed.
+ */
+export function externalAttachmentView(
+  attachment: { kind: string; status: string; canRetryManually?: boolean | undefined; blockReason?: AttachmentBlockReason | undefined },
+  chatType: string,
+  bridge: { state: string; downloadEnabled?: boolean | undefined; identity?: string | undefined } | undefined,
+): { status: string; canRetryManually: boolean | undefined; blockReason: AttachmentBlockReason | undefined; bridgeDownload: boolean } {
+  const unchanged = { status: attachment.status, canRetryManually: attachment.canRetryManually, blockReason: attachment.blockReason, bridgeDownload: false };
+  if (!bridge || attachment.status === 'ready' || attachment.status === 'downloading') return unchanged;
+  if (chatType === 'community' || chatType === 'thread') return { status: 'queued', canRetryManually: false, blockReason: 'BRIDGE_CHAT_TYPE_UNSUPPORTED', bridgeDownload: false };
+  // An expired row shows the expired text and has no button. Only a queued or failed row (not older than 7 days) can download.
+  if (attachment.status !== 'queued' && attachment.status !== 'failed') return { ...unchanged, canRetryManually: false };
+  if (attachment.kind !== 'image' && attachment.kind !== 'file') return { ...unchanged, canRetryManually: false };
+  if (bridge.state !== 'logged_in') {
+    return { status: attachment.status, canRetryManually: false, blockReason: attachment.status === 'queued' ? 'BRIDGE_NOT_LOGGED_IN' : attachment.blockReason, bridgeDownload: false };
+  }
+  // The bridge is logged in but the download is not allowed: no button. A queued row shows the reason. A failed row keeps its own display.
+  if (bridge.downloadEnabled !== true) {
+    return { status: attachment.status, canRetryManually: false, blockReason: attachment.status === 'queued' ? 'BRIDGE_DOWNLOAD_DISABLED' : attachment.blockReason, bridgeDownload: false };
+  }
+  // The Chrome account is not proven yet: no button. A queued row shows the reason. A failed row keeps its own display.
+  if (bridge.identity !== 'verified') {
+    return { status: attachment.status, canRetryManually: false, blockReason: attachment.status === 'queued' ? 'BRIDGE_IDENTITY_PENDING' : attachment.blockReason, bridgeDownload: false };
+  }
+  // The download is allowed: the button shows. A stored reason must not hide the button, but a pending verification reason stays visible.
+  // The button then does not depend on the connection of the account. The bridge login is its gate.
+  return { ...unchanged, blockReason: attachment.blockReason === 'BRIDGE_VERIFICATION_PENDING' ? attachment.blockReason : undefined, bridgeDownload: true };
+}
+
 function extensionOf(name: string): string | null {
   const basename = name.split(/[\\/]/).at(-1) ?? '';
   const dot = basename.lastIndexOf('.');

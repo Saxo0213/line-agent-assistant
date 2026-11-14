@@ -153,18 +153,18 @@ describe('content bridge rules', () => {
         _contentMetadata: JSON.stringify({ LOC_KEY: locKey, LOC_ARGS: locArgs, NOTIFICATION_DISABLED: 'true' }) }),
       undefined, names ? new Map(Object.entries(names)) : undefined);
     const text = (result: ReturnType<typeof chatEvent>) => (result?.content && 'text' in result.content ? result.content.text : undefined);
-    const names = { [A]: '小薪', [B]: '徐佳誠', [C]: '黃英智' };
+    const names = { [A]: '小薪', [B]: '林曉安', [C]: '陳大文' };
 
     it('renders the four known keys with LINE wording', () => {
       expect(chatEvent('C_MI', `${A}\u001e${B}`, names)).toMatchObject({ version: 2, kind: 'event',
-        content: { format: 1, type: 'event', nativeContentType: 18, text: '小薪已新增徐佳誠至群組。' } });
-      expect(text(chatEvent('C_GI', `${A}\u001e${B}`, names))).toBe('小薪已邀請徐佳誠加入群組，等對方加入再一起聊天吧！');
+        content: { format: 1, type: 'event', nativeContentType: 18, text: '小薪已新增林曉安至群組。' } });
+      expect(text(chatEvent('C_GI', `${A}\u001e${B}`, names))).toBe('小薪已邀請林曉安加入群組，等對方加入再一起聊天吧！');
       expect(text(chatEvent('C_MJ', A, names))).toBe('小薪已加入群組。');
-      expect(text(chatEvent('A_MC', `${A}\u001e${B}\u001f${C}`, names))).toBe('小薪已新增徐佳誠, 黃英智至群組。');
+      expect(text(chatEvent('A_MC', `${A}\u001e${B}\u001f${C}`, names))).toBe('小薪已新增林曉安, 陳大文至群組。');
     });
     it('falls back to 成員 for unresolved or blank names', () => {
       expect(text(chatEvent('C_MI', `${A}\u001e${B}`))).toBe('成員已新增成員至群組。');
-      expect(text(chatEvent('A_MC', `${A}\u001e${B}\u001f${C}`, { [A]: '  ', [B]: '徐佳誠' }))).toBe('成員已新增徐佳誠, 成員至群組。');
+      expect(text(chatEvent('A_MC', `${A}\u001e${B}\u001f${C}`, { [A]: '  ', [B]: '林曉安' }))).toBe('成員已新增林曉安, 成員至群組。');
     });
     it('bounds names to 128 characters and targets to 20', () => {
       const mids = Array.from({ length: 30 }, (_, index) => `u${index.toString(16).padStart(32, '0')}`);

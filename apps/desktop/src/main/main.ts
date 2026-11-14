@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, protocol, screen, session, shell, Tray, utilityProcess } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, Notification, protocol, screen, session, shell, Tray, utilityProcess } from 'electron';
 import { randomBytes } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { access, mkdir } from 'node:fs/promises';
@@ -8,9 +8,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createIpcAdapter, createReadAdapter } from './ipc.js';
 import { createDisconnectedFacade } from './service-facade.js';
 import type { DesktopServiceFacade } from './service-facade.js';
+import { createForwardNotifier } from './services/forward-notifier.js';
 import { createConnectedFacade, type OfficialSnapshotImporter } from './connected-facade.js';
 import { createUtilityWorkerGateway, MAX_UTILITY_WORKERS } from './utility-worker-gateway.js';
-import { createDesktopLifecycle, parseDesktopCommand, routeSecondInstance, shutdownServices, type DesktopLifecycleFailure } from './desktop-lifecycle.js';
+import { createDesktopLifecycle, parseDesktopCommand, routeSecondInstance, runSessionEndSteps, shutdownServices, type DesktopLifecycleFailure } from './desktop-lifecycle.js';
 import { createElectronPreviewPresenter } from './electron-preview-presenter.js';
 import { createDomainEventPublisher } from './domain-event-publisher.js';
 import { APP_USER_MODEL_ID, resolveDefaultAppIcon } from './app-icon.js';
@@ -26,7 +27,7 @@ import { ChromeLtsmService } from './services/chrome-ltsm-service.js';
 import { createOperationalAuditRuntime } from './services/operational-audit-runtime.js';
 import { createOperationalAudit, type OperationalAudit } from './services/operational-audit.js';
 import { OperationalAuditFallback } from './services/operational-audit-fallback.js';
-import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+import { diagnosticFailure, IpcEventSchema, type SafeDiagnostic } from '@line-agent/contracts';
 import { DatabaseSetupService } from './services/database-setup.js';
 import { createAttachmentRootChange } from './services/attachment-root-change.js';
 import { WorkspaceAuthority } from './services/workspace-authority.js';
@@ -50,6 +51,7 @@ import { OfficialBuildTrustService } from './services/official-build-trust.js';
 import { mainExternalSourceProbeAdmission } from './services/external-source-probe-admission.js';
 import { CHROME_EXTENSION_STORE_URL, parseLineMediaUrl } from '@line-agent/contracts';
 import { createLocaleSettings, getEffectiveLocale, setEffectiveLocaleReader } from './locale-settings.js';
+import { installEditContextMenu } from './edit-context-menu.js';
 import { nativeDesktopText } from '../desktop-system-copy.js';
 import { createLocaleIpcAdapter } from './locale-ipc.js';
 import { createFileUpdateCheckStore, createUpdateCheckService, type UpdateCheckService } from './services/update-check-service.js';
@@ -121,6 +123,12 @@ async function stopEmbeddedServer(): Promise<void> {
   if (!server) return;
   await server.stop();
   embeddedServer = undefined;
+}
+/** Synchronous fast stop for the Windows session end; Windows can kill the process once the handler returns. */
+function stopEmbeddedServerForSessionEnd(): void {
+  const server = embeddedServer;
+  if (!server) return;
+  if (server.stopForSessionEnd() && embeddedServer === server) embeddedServer = undefined;
 }
 
 let window: BrowserWindow | null = null;
@@ -265,6 +273,15 @@ async function initializeServices(): Promise<void> {
   });
   const publish = createDomainEventPublisher((channel, event) => window?.webContents.send(channel, event));
   const connected = await createConnectedFacade({ pool, workers, agent: bridge, workspaceAuthority, attachmentRoot: bootstrap.attachmentRoot,
+    // A click on a message-rule notification shows and focuses the main window, then asks the renderer to open the chat.
+    forwardNotify: createForwardNotifier({ Notification, onError: (error) => audit.failure(diagnosticFailure('agent', 'execute', error)),
+      focusWindow: (notice) => {
+        if (!window) return;
+        if (window.isMinimized()) window.restore();
+        window.show(); window.focus();
+        const event = IpcEventSchema.safeParse({ type: 'openConversation', accountId: notice.accountId, chatType: notice.chatType, chatId: notice.chatId });
+        if (event.success) publish(event.data);
+      } }),
     attachmentBrokerHelperPath: path.join(path.dirname(workerEntry), 'native', 'AttachmentBroker.exe'),
     freeModeJudgeDirectory: path.join(app.getPath('userData'), 'free-mode-judge'),
     chatResourceDiagnosticsDirectory: app.getPath('userData'),
@@ -275,6 +292,7 @@ async function initializeServices(): Promise<void> {
     mcpLocalClientAppPath: app.getAppPath(), mcpLocalClientPackaged: app.isPackaged,
     previewCacheRoot: path.join(app.getPath('userData'), 'cache', 'line-image-previews'),
     mediaCacheRoot: path.join(app.getPath('userData'), 'avatar-cache'),
+    downloadBridgeRoot: path.join(app.getPath('userData'), 'official-download-bridge'),
     openAttachmentPath: (file) => shell.openPath(file), openFolderPath: (folder) => shell.openPath(folder), secretStore, audit, previewPresenter,
     chromeLogin: {
       ltsm: chromeLtsm,
@@ -326,6 +344,7 @@ function installSecurity() {
     callback({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [csp] } });
   });
   app.on('web-contents-created', (_event, contents) => {
+    if (contents.getType() === 'window') installEditContextMenu(contents);
     contents.on('will-navigate', (event, target) => { if (!isAllowedNavigation(target, rendererUrl)) event.preventDefault(); });
     contents.setWindowOpenHandler(() => ({ action: 'deny' }));
     contents.on('will-attach-webview', (event) => event.preventDefault());
@@ -451,6 +470,13 @@ async function createWindow(setupOnly = false) {
   });
   if (setupSession) window.on('close', () => { void setupSession.windowClosed().catch(() => undefined); });
   else window.on('close', (event) => { windowGeometryPersistence?.flush(); if (!lifecycle.onClose()) event.preventDefault(); });
+  if (process.platform === 'win32') {
+    window.on('session-end', () => runSessionEndSteps([
+      () => console.info('[desktop-lifecycle] session_end'),
+      () => windowGeometryPersistence?.flush(),
+      stopEmbeddedServerForSessionEnd,
+    ]));
+  }
   if (rendererUrl.startsWith('file:')) await window.loadFile(rendererFile);
   else await window.loadURL(rendererUrl);
 }

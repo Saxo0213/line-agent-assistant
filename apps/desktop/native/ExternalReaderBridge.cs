@@ -22,7 +22,6 @@ internal static class ExternalReaderBridge {
   const int MaxInitFrameBytes = 16 * 1024;
   const int MaxPageFrameBytes = 1024 * 1024;
   const int MaxInitialImportPageFrameBytes = 8 * 1024 * 1024;
-  const int MaxNativeAuxiliaryResultFrameBytes = 32 * 1024;
 #if READER_OFFICIAL_SOURCE_TEST
   // Fixture builds scale the idle window so progressing and frozen scans can
   // exercise the same watchdog behavior without two-minute test sleeps.
@@ -180,8 +179,6 @@ internal static class ExternalReaderBridge {
         lock (sync) { if (!disposed) { failure = error; eof = true; Cancellation.Cancel(); try { available.Set(); } catch { } } }
       } finally { Array.Clear(buffer, 0, buffer.Length); }
     }
-    // True when bytes that no frame read has consumed yet are queued (a frame that arrived during wait_change).
-    internal bool HasBufferedInput { get { lock (sync) { return chunks.Count > 0 || (current != null && currentOffset < current.Length); } } }
     internal void CancelForTimeout() {
       lock (sync) { if (disposed) return; timedOut = true; eof = true; Cancellation.Cancel(); available.Set(); }
     }
@@ -521,7 +518,7 @@ internal static class ExternalReaderBridge {
     for (;;) {
       cancellation.ThrowIfCancellationRequested();
       ArmWatchdog(FirstImportIdleWatchdogMs);
-      Dictionary<string, object> poll = ReadNextDirectMonitorRequest(input, output, expectedMid, sourceIdentity, initial, cancellation);
+      Dictionary<string, object> poll = ReadNextDirectMonitorRequest(input, output, initial, cancellation);
       if (poll.ContainsKey("type") && Convert.ToString(poll["type"]) == "close") {
         RequireFrame(poll, "close", new string[] { "reason" });
         if (Convert.ToString(poll["reason"]) != "monitor_stop") throw new InvalidDataException("protocol_invalid");
@@ -670,68 +667,25 @@ internal static class ExternalReaderBridge {
       SameCursor(ack["lastCursor"], cursor);
   }
 
-  // Auxiliary work is admitted only between acknowledged pages. The caller
-  // enters this loop after the prior page ACK and resumes normal polling only
-  // when a poll/close frame is returned.
+  // Reads the next request frame. A wait_change request is answered here. The caller
+  // resumes normal polling only when a poll/close frame is returned.
   static Dictionary<string, object> ReadNextDirectMonitorRequest(Stream input, Stream output,
-      string expectedMid, string sourceIdentity, OfficialSourceInventoryResult pinned, CancellationToken cancellation) {
+      OfficialSourceInventoryResult pinned, CancellationToken cancellation) {
     for (;;) {
       cancellation.ThrowIfCancellationRequested();
       int bodyBytes;
-      Dictionary<string, object> request = ReadFrame(input, NativeAttachmentOperations.MaxRequestFrameBytes, out bodyBytes);
+      Dictionary<string, object> request = ReadFrame(input, MaxControlFrameBytes, out bodyBytes);
       string type = Convert.ToString(request.ContainsKey("type") ? request["type"] : null);
-      if (String.Equals(type, "auth_candidates", StringComparison.Ordinal)) {
-        if (bodyBytes > MaxControlFrameBytes) throw new InvalidDataException("protocol_invalid");
-        RequireFrame(request, "auth_candidates", new string[0]);
-        Dictionary<string, object> response = new Dictionary<string, object> {
-          { "candidates", new object[0] }, { "errorCode", "auth_probe_disabled" }
-        };
-        EmitAuxiliary(output, "auth_candidates", response);
-        continue;
-      }
-      if (String.Equals(type, "wake", StringComparison.Ordinal)) {
-        if (bodyBytes > MaxControlFrameBytes) throw new InvalidDataException("protocol_invalid");
-        RequireFrame(request, "wake", new string[0]);
-        continue;
-      }
       if (String.Equals(type, "wait_change", StringComparison.Ordinal)) {
         if (bodyBytes > MaxControlFrameBytes) throw new InvalidDataException("protocol_invalid");
         RequireFrame(request, "wait_change", new string[] { "timeoutMs" });
         if (!(request["timeoutMs"] is int) || (int)request["timeoutMs"] < 1000 || (int)request["timeoutMs"] > 60000)
           throw new InvalidDataException("protocol_invalid");
         // The idle watchdog is re-armed on every check, so a wait never trips it.
-        // Queued input (a wake frame sent by the controller for auxiliary work) ends the wait with changed=false.
         bool changed = OfficialChangeSignal.WaitForChange(pinned.DatabasePath, (int)request["timeoutMs"], cancellation,
-          delegate() { ArmWatchdog(FirstImportIdleWatchdogMs); },
-          delegate() { return protocolInput != null && protocolInput.HasBufferedInput; });
+          delegate() { ArmWatchdog(FirstImportIdleWatchdogMs); });
         ArmWatchdog(FirstImportIdleWatchdogMs);
         Emit(output, "change", new Dictionary<string, object> { { "changed", changed } });
-        continue;
-      }
-      if (String.Equals(type, "attachment_metadata", StringComparison.Ordinal)) {
-        RequireFrame(request, "attachment_metadata", new string[] { "envelope", "expectedMessageId", "expectedChatId" });
-        Dictionary<string, object> response;
-        try {
-          string expectedMessageId = request["expectedMessageId"] as string;
-          string expectedChatId = request["expectedChatId"] as string;
-          object envelopeValue = request["envelope"];
-          IDictionary envelopeObject = envelopeValue as IDictionary;
-          if (envelopeObject == null)
-            throw new InvalidDataException("attachment_metadata_too_large");
-          string envelope = InitialImportJson.Serialize(envelopeValue);
-          if (Encoding.UTF8.GetByteCount(envelope) > NativeAttachmentOperations.MaxRequestFrameBytes)
-            throw new InvalidDataException("attachment_metadata_too_large");
-          OfficialSourceInventoryResult current = RefreshDirectMonitorSource(pinned);
-          string currentIdentity = DigestText(expectedMid + "\n" + Path.GetFullPath(current.DatabasePath).ToLowerInvariant() + "\n" + current.DatabaseIdentity.FileId);
-          if (!String.Equals(sourceIdentity, currentIdentity, StringComparison.Ordinal)) throw new InvalidDataException("source_changed");
-          response = NativeAttachmentOperations.DecodeAttachmentEnvelope(envelope, expectedMessageId, expectedChatId, cancellation);
-        } catch (OperationCanceledException) { throw; }
-        catch (Exception error) {
-          response = new Dictionary<string, object> {
-            { "metadata", null }, { "errorCode", SafeInventoryErrorCode(error) }
-          };
-        }
-        EmitAuxiliary(output, "attachment_metadata", response);
         continue;
       }
       if (bodyBytes > MaxControlFrameBytes) throw new InvalidDataException("protocol_invalid");
@@ -749,31 +703,6 @@ internal static class ExternalReaderBridge {
 #else
     return new WindowsOfficialSourceInventoryEnvironment();
 #endif
-  }
-
-  static void EmitAuxiliary(Stream output, string type, Dictionary<string, object> fields) {
-    Dictionary<string, object> value = new Dictionary<string, object> {
-      { "version", 1 }, { "requestId", requestId }, { "sequence", outputSequence + 1 }, { "type", type }
-    };
-    foreach (KeyValuePair<string, object> item in fields) value.Add(item.Key, item.Value);
-    byte[] body = Encoding.UTF8.GetBytes(InitialImportJson.Serialize(value));
-    if (body.Length > MaxNativeAuxiliaryResultFrameBytes) {
-      Array.Clear(body, 0, body.Length);
-      value = new Dictionary<string, object> {
-        { "version", 1 }, { "requestId", requestId }, { "sequence", outputSequence + 1 }, { "type", type }
-      };
-      if (String.Equals(type, "auth_candidates", StringComparison.Ordinal)) {
-        value.Add("candidates", new object[0]); value.Add("errorCode", "auth_candidates_unavailable");
-      } else {
-        value.Add("metadata", null); value.Add("errorCode", "attachment_metadata_unavailable");
-      }
-      body = Encoding.UTF8.GetBytes(InitialImportJson.Serialize(value));
-    }
-    try {
-      if (body.Length < 1 || body.Length > MaxNativeAuxiliaryResultFrameBytes) throw new InvalidDataException("protocol_invalid");
-      outputSequence++;
-      WriteFrame(output, body);
-    } finally { Array.Clear(body, 0, body.Length); }
   }
 
   static bool TryReadNativeCursor(Dictionary<string, object> row, out string createdTime, out string id) {
@@ -1209,53 +1138,6 @@ internal static class ExternalReaderBridge {
   }
 #endif
 
-#if READER_ATTACHMENT_AUX_TEST && READER_OFFICIAL_SOURCE_TEST
-  internal static string[] FixtureRunDirectMonitorAuxWire(string fixtureRequestId, string fixtureRoot,
-      IOfficialSourceInventoryEnvironment environment, string expectedMid, byte[] requests,
-      int expectedAckPage, string expectedAckDigest, object expectedAckCursor) {
-    string priorRequestId = requestId;
-    int priorInputSequence = inputSequence, priorOutputSequence = outputSequence;
-    string priorRoot = TestOfficialSourceRoot;
-    IOfficialSourceInventoryEnvironment priorEnvironment = TestOfficialSourceEnvironment;
-    try {
-      requestId = fixtureRequestId; inputSequence = 0; outputSequence = 0;
-      TestOfficialSourceRoot = fixtureRoot; TestOfficialSourceEnvironment = environment;
-      OfficialSourceInventoryResult source = ReadOfficialSourceInventory(true);
-      string sourceIdentity = DigestText(expectedMid + "\n" + Path.GetFullPath(source.DatabasePath).ToLowerInvariant() + "\n" + source.DatabaseIdentity.FileId);
-      using (MemoryStream input = new MemoryStream(requests, false))
-      using (MemoryStream output = new MemoryStream()) {
-        Dictionary<string, object> poll = ReadNextDirectMonitorRequest(input, output, expectedMid, sourceIdentity, source, CancellationToken.None);
-        if (Convert.ToString(poll["type"]) != "poll") throw new InvalidDataException("protocol_invalid");
-        Dictionary<string, object> ack = ReadFrame(input);
-        RequireFrame(ack, "ack", new string[] { "pageNumber", "batchDigest", "lastCursor" });
-        bool accepted = DirectAckMatches(ack, expectedAckPage, expectedAckDigest, expectedAckCursor);
-        if (input.Position != input.Length) throw new InvalidDataException("protocol_invalid");
-        byte[] emitted = output.ToArray();
-        try { return new string[] { String.Join("\n", ReadFixtureProtocolBodies(emitted)), InitialImportJson.Serialize(poll), accepted ? "1" : "0" }; }
-        finally { Array.Clear(emitted, 0, emitted.Length); }
-      }
-    } finally {
-      requestId = priorRequestId; inputSequence = priorInputSequence; outputSequence = priorOutputSequence;
-      TestOfficialSourceRoot = priorRoot; TestOfficialSourceEnvironment = priorEnvironment;
-    }
-  }
-
-  internal static string FixtureRunOversizedAuxiliaryEmission(string fixtureRequestId) {
-    string priorRequestId = requestId; int priorOutputSequence = outputSequence;
-    try {
-      requestId = fixtureRequestId; outputSequence = 0;
-      using (MemoryStream output = new MemoryStream()) {
-        EmitAuxiliary(output, "attachment_metadata", new Dictionary<string, object> {
-          { "metadata", new string('x', MaxNativeAuxiliaryResultFrameBytes + 1) }, { "errorCode", null }
-        });
-        byte[] framed = output.ToArray();
-        try { return ReadFixtureProtocolBodies(framed)[0]; }
-        finally { Array.Clear(framed, 0, framed.Length); }
-      }
-    } finally { requestId = priorRequestId; outputSequence = priorOutputSequence; }
-  }
-#endif
-
   static void DrainPrefetchProgress(Sqlite3Mc.InitialImportPrefetcher prefetch, Stream output) {
     string phase; long steps;
     if (!prefetch.TryTakeProgress(out phase, out steps)) return;
@@ -1363,9 +1245,6 @@ internal static class ExternalReaderBridge {
       case "official_account_not_active":
       case "deadline_invalid":
       case "protocol_invalid":
-      case "attachment_metadata_too_large":
-      case "attachment_metadata_invalid":
-      case "attachment_identity_mismatch":
         return message;
       case "SOURCE_ROW_INVALID":
         return "source_row_invalid";
@@ -1931,18 +1810,16 @@ internal static class OfficialChangeSignal {
     return before;
   }
 
-  // True when the database changed since Baseline, false when timeoutMs passed without a change
-  // or when interrupted() reports queued input.
+  // True when the database changed since Baseline, false when timeoutMs passed without a change.
   // An unreadable -shm after a readable baseline is a change. While -shm stays unreadable and the
   // baseline is unknown, the answer is "changed" only after the old 5000 ms poll period, so a
   // missing sidecar never makes a tight read loop.
-  internal static bool WaitForChange(string databasePath, int timeoutMs, CancellationToken cancellation, Action rearm, Func<bool> interrupted) {
+  internal static bool WaitForChange(string databasePath, int timeoutMs, CancellationToken cancellation, Action rearm) {
     Stopwatch clock = Stopwatch.StartNew();
     int unreadableAfterMs = Math.Min(timeoutMs, 5000);
     for (;;) {
       cancellation.ThrowIfCancellationRequested();
       if (rearm != null) rearm();
-      if (interrupted != null && interrupted()) return false;
       string current = Read(databasePath);
       string baseline = Baseline;
       if (current == null) {

@@ -63,6 +63,70 @@ function keyedDigest(token: string, key: Buffer): Buffer {
   return createHmac('sha256', key).update(token, 'utf8').digest();
 }
 
+/**
+ * First part of an administrator replacement: the room-activation locks of one account.
+ * A caller that owns a larger transaction runs this before it locks the administrator rows,
+ * so that its lock order is the same as the room-activation writers.
+ */
+export async function lockAccountForAdministratorChange(client: PoolClient, accountId: string): Promise<void> {
+  await lock(client, `room-activation:account-capacity:${accountId}`);
+  await client.query(
+    `SELECT request_id FROM room_activation_requests WHERE account_id = $1
+      AND state IN ('WAITING_TO_SEND', 'PENDING_CONFIRMATION', 'DELIVERY_UNKNOWN') ORDER BY request_id FOR UPDATE`, [accountId],
+  );
+  await client.query(
+    'SELECT chat_type, chat_id FROM room_agent_policies WHERE account_id = $1 ORDER BY chat_type, chat_id FOR UPDATE', [accountId],
+  );
+}
+
+/**
+ * Second part: compare the administrator version, replace the administrator row, and clean up
+ * the room authority that the old administrator gave. The caller owns the transaction and has
+ * run lockAccountForAdministratorChange. Returns the new version, or null if the version differs.
+ */
+export async function replacePrimaryAdministratorRow(client: PoolClient, accountId: string, chatId: string, userId: string,
+  expectedVersion: number | null): Promise<number | null> {
+  await lock(client, `room-activation-admin:${accountId}`);
+  const current = await client.query<{ version: string }>(
+    'SELECT version FROM account_administrator_versions WHERE account_id = $1 FOR UPDATE', [accountId],
+  );
+  if (expectedVersion === null ? current.rowCount !== 0 : Number(current.rows[0]?.version) !== expectedVersion) return null;
+  if (current.rowCount) await client.query('DELETE FROM account_administrators WHERE account_id = $1 AND role = $2', [accountId, 'PRIMARY_ADMIN']);
+  await client.query(
+    `INSERT INTO account_administrators(account_id, chat_type, chat_id, user_id, role)
+     VALUES ($1, 'direct', $2, $3, 'PRIMARY_ADMIN')`, [accountId, chatId, userId],
+  );
+  await client.query(
+    `UPDATE room_activation_requests SET state = 'CANCELLED', request_version = request_version + 1, updated_at = clock_timestamp()
+     WHERE account_id = $1 AND state IN ('WAITING_TO_SEND', 'PENDING_CONFIRMATION', 'DELIVERY_UNKNOWN')`, [accountId],
+  );
+  await client.query(
+    `UPDATE room_activation_challenges c SET invalidated_at = clock_timestamp()
+     FROM room_activation_requests r WHERE r.request_id = c.request_id AND r.account_id = $1
+      AND c.consumed_at IS NULL AND c.invalidated_at IS NULL`, [accountId],
+  );
+  const changedPolicies = await client.query<{ chat_type: RoomActivationScope['chatType']; chat_id: string; authority_version: string }>(
+    `UPDATE room_agent_policies SET state = 'DISABLED', authority_version = authority_version + 1,
+      confirmed_request_id = NULL, authorizing_admin_user_id = NULL, authorizing_admin_version = NULL, updated_at = clock_timestamp()
+     WHERE account_id = $1 AND state <> 'DISABLED' RETURNING chat_type, chat_id, authority_version`, [accountId],
+  );
+  await client.query(
+    `UPDATE room_agent_grants SET state = 'REVOKED', revoked_at = clock_timestamp()
+     WHERE account_id = $1 AND state = 'ACTIVE'`, [accountId],
+  );
+  for (const item of changedPolicies.rows) {
+    await client.query(
+      `INSERT INTO room_activation_audit(account_id, chat_type, chat_id, event, authority_version)
+       VALUES ($1,$2,$3,'ADMIN_CHANGED',$4)`,
+      [accountId, item.chat_type, item.chat_id, item.authority_version],
+    );
+  }
+  const updated = await client.query<{ version: string }>(
+    'SELECT version FROM account_administrator_versions WHERE account_id = $1', [accountId],
+  );
+  return Number(updated.rows[0]?.version);
+}
+
 export class RoomActivationRepository {
   constructor(private readonly pool: Pool) {}
 
@@ -70,57 +134,10 @@ export class RoomActivationRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      await lock(client, `room-activation:account-capacity:${accountId}`);
-      await client.query(
-        `SELECT request_id FROM room_activation_requests WHERE account_id = $1
-          AND state IN ('WAITING_TO_SEND', 'PENDING_CONFIRMATION', 'DELIVERY_UNKNOWN') ORDER BY request_id FOR UPDATE`, [accountId],
-      );
-      await client.query(
-        'SELECT chat_type, chat_id FROM room_agent_policies WHERE account_id = $1 ORDER BY chat_type, chat_id FOR UPDATE', [accountId],
-      );
-      await lock(client, `room-activation-admin:${accountId}`);
-      const current = await client.query<{ version: string }>(
-        'SELECT version FROM account_administrator_versions WHERE account_id = $1 FOR UPDATE', [accountId],
-      );
-      if (expectedVersion === null ? current.rowCount !== 0 : Number(current.rows[0]?.version) !== expectedVersion) {
-        await client.query('COMMIT');
-        return null;
-      }
-      if (current.rowCount) await client.query('DELETE FROM account_administrators WHERE account_id = $1 AND role = $2', [accountId, 'PRIMARY_ADMIN']);
-      await client.query(
-        `INSERT INTO account_administrators(account_id, chat_type, chat_id, user_id, role)
-         VALUES ($1, 'direct', $2, $3, 'PRIMARY_ADMIN')`, [accountId, chatId, userId],
-      );
-      await client.query(
-        `UPDATE room_activation_requests SET state = 'CANCELLED', request_version = request_version + 1, updated_at = clock_timestamp()
-         WHERE account_id = $1 AND state IN ('WAITING_TO_SEND', 'PENDING_CONFIRMATION', 'DELIVERY_UNKNOWN')`, [accountId],
-      );
-      await client.query(
-        `UPDATE room_activation_challenges c SET invalidated_at = clock_timestamp()
-         FROM room_activation_requests r WHERE r.request_id = c.request_id AND r.account_id = $1
-          AND c.consumed_at IS NULL AND c.invalidated_at IS NULL`, [accountId],
-      );
-      const changedPolicies = await client.query<{ chat_type: RoomActivationScope['chatType']; chat_id: string; authority_version: string }>(
-        `UPDATE room_agent_policies SET state = 'DISABLED', authority_version = authority_version + 1,
-          confirmed_request_id = NULL, authorizing_admin_user_id = NULL, authorizing_admin_version = NULL, updated_at = clock_timestamp()
-         WHERE account_id = $1 AND state <> 'DISABLED' RETURNING chat_type, chat_id, authority_version`, [accountId],
-      );
-      await client.query(
-        `UPDATE room_agent_grants SET state = 'REVOKED', revoked_at = clock_timestamp()
-         WHERE account_id = $1 AND state = 'ACTIVE'`, [accountId],
-      );
-      for (const item of changedPolicies.rows) {
-        await client.query(
-          `INSERT INTO room_activation_audit(account_id, chat_type, chat_id, event, authority_version)
-           VALUES ($1,$2,$3,'ADMIN_CHANGED',$4)`,
-          [accountId, item.chat_type, item.chat_id, item.authority_version],
-        );
-      }
-      const updated = await client.query<{ version: string }>(
-        'SELECT version FROM account_administrator_versions WHERE account_id = $1', [accountId],
-      );
+      await lockAccountForAdministratorChange(client, accountId);
+      const version = await replacePrimaryAdministratorRow(client, accountId, chatId, userId, expectedVersion);
       await client.query('COMMIT');
-      return Number(updated.rows[0]?.version);
+      return version;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;

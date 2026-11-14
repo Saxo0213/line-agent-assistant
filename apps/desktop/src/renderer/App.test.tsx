@@ -14,6 +14,7 @@ import { DEFAULT_AGENT_STATUS_ICONS, lineMediaUrl, type AppSnapshot, type Conver
 import { createCoalescedSnapshotPublisher } from '../main/domain-event-publisher.js';
 import { LINE_REACTION_GLYPHS } from './AgentStatusMarker.js';
 import { desktopTextFor, extraTextFor } from './desktop-i18n.js';
+import { PRIMARY_ADMIN_LINE_LOGIN_ENABLED } from '../primary-admin-line-login.js';
 
 const testLocaleState = (locale: NonNullable<LocaleState['effectiveLocale']>): LocaleState => ({
   status: 'loaded', effectiveLocale: locale, preference: locale, busy: false, error: null, restartChoice: false, restartPending: false,
@@ -232,6 +233,13 @@ function fakeApi(): DesktopApi {
     chooseChromeLtsmFolder: vi.fn(async () => accepted),
     openChromeExtensionStore: vi.fn(async () => accepted),
     lineBeginAdminPairing: vi.fn(async () => ({ token: '123456', expiresAt: '2026-10-16T06:00:00.000Z' })),
+    lineBeginAdminChange: vi.fn(async () => ({ token: '123456', expiresAt: '2026-10-16T06:00:00.000Z', stage: 'confirm_current' as const })),
+    lineCancelAdminChange: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'cancel-1', ok: true as const })),
+    adminDownloadBridgeStart: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-1', ok: true as const })),
+    adminDownloadBridgeRefreshQr: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-1', ok: true as const })),
+    adminDownloadBridgeSetAutoDownload: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-2', ok: true as const })),
+    adminDownloadBridgeSetDownloadEnabled: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-3', ok: true as const })),
+    adminDownloadBridgeClear: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-1', ok: true as const })),
     lineStart: vi.fn(async () => accepted),
     externalImportStart: vi.fn(async () => accepted),
     externalImportStop: vi.fn(async () => accepted),
@@ -1176,7 +1184,7 @@ describe('operator console', () => {
       { ...message('account-A', 'content-chatevent'), text: null, kind: 'event' as const,
         content: { format: 1 as const, type: 'event' as const, nativeContentType: 18, text: null } },
       { ...message('account-A', 'content-chatevent-text'), text: null, kind: 'event' as const,
-        content: { format: 1 as const, type: 'event' as const, nativeContentType: 18, text: '小薪已新增徐佳誠至群組。' } },
+        content: { format: 1 as const, type: 'event' as const, nativeContentType: 18, text: '小薪已新增林曉安至群組。' } },
       { ...message('account-A', 'content-event-plain'), text: null, kind: 'event' as const,
         content: { format: 1 as const, type: 'event' as const, nativeContentType: null, text: null } },
       { ...message('account-A', 'content-unsupported'), text: null, kind: 'event' as const,
@@ -1198,7 +1206,7 @@ describe('operator console', () => {
     expect(screen.queryByText('貼文通知 POSTNOTIFICATION')).toBeNull();
     expect(screen.getByText('貼文通知 有人在貼文中提及你')).toBeTruthy();
     expect(screen.getByText('聊天事件')).toBeTruthy();
-    expect(screen.getByText('小薪已新增徐佳誠至群組。')).toBeTruthy();
+    expect(screen.getByText('小薪已新增林曉安至群組。')).toBeTruthy();
     expect(screen.getByText('系統訊息')).toBeTruthy();
     expect(screen.getByText('此訊息類型尚未支援（類型 42）')).toBeTruthy();
     expect(container.querySelector('#message-content-media')?.textContent).toContain('0:12');
@@ -1419,9 +1427,9 @@ describe('operator console', () => {
       ...snapshot,
       control: { ...snapshot.control, activeAccountId: currentAgentId },
       accounts: [
-        { ...snapshot.accounts[0]!, accountId: 'account-retired-agent', displayName: 'saxoAgent', mode: 'MONITOR_ONLY' as const, productRole: null, agentLineage: 'former' as const },
-        { ...snapshot.accounts[1]!, accountId: 'account-admin', displayName: '徐佳誠', productRole: 'PRIMARY_ADMIN' as const },
-        { ...snapshot.accounts[0]!, accountId: currentAgentId, displayName: 'Agentsaxo', mode: 'ACTIVE_CONTROL' as const, productRole: 'AGENT' as const, agentLineage: 'current' as const },
+        { ...snapshot.accounts[0]!, accountId: 'account-retired-agent', displayName: 'demoAgent', mode: 'MONITOR_ONLY' as const, productRole: null, agentLineage: 'former' as const },
+        { ...snapshot.accounts[1]!, accountId: 'account-admin', displayName: '林曉安', productRole: 'PRIMARY_ADMIN' as const },
+        { ...snapshot.accounts[0]!, accountId: currentAgentId, displayName: 'AgentDemo', mode: 'ACTIVE_CONTROL' as const, productRole: 'AGENT' as const, agentLineage: 'current' as const },
       ],
       conversations: [
         { ...snapshot.conversations[0]!, accountId: 'account-retired-agent', chatId: 'retired-chat', title: '舊 Agent 聊天' },
@@ -1436,7 +1444,7 @@ describe('operator console', () => {
     const agentTab = await tabs.findByRole('tab', { name: 'Agent' });
     const adminTab = await tabs.findByRole('tab', { name: '主要管理者' });
     expect(tabs.getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['全部帳號', 'Agent', '主要管理者']);
-    expect(tabs.queryByRole('tab', { name: 'saxoAgent' })).toBeNull();
+    expect(tabs.queryByRole('tab', { name: 'demoAgent' })).toBeNull();
     expect(document.querySelector('[data-account-id="account-retired-agent"]')).toBeNull();
 
     fireEvent.click(adminTab);
@@ -1593,14 +1601,14 @@ describe('operator console', () => {
 
   it('places chat type before the name and shows the latest message in the former type row', async () => {
     const api = fakeApi();
-    const direct = { accountId: 'account-A', chatType: 'direct' as const, chatId: 'direct-1', title: '徐佳誠', unreadCount: 0, agentEnabled: false, defaultProvider: 'claude' as const, latestMessagePreview: '嗨，明天見', latestMessageAt: '2026-10-15T10:00:00.000Z', latestAttachmentStatus: null };
+    const direct = { accountId: 'account-A', chatType: 'direct' as const, chatId: 'direct-1', title: '林曉安', unreadCount: 0, agentEnabled: false, defaultProvider: 'claude' as const, latestMessagePreview: '嗨，明天見', latestMessageAt: '2026-10-15T10:00:00.000Z', latestAttachmentStatus: null };
     api.getSnapshot = vi.fn(async () => ({ ...snapshot, conversations: [snapshot.conversations[0]!, direct] }));
     api.listMessages = vi.fn(async (key) => ({ messages: [{ ...message(key.accountId, key.chatId === 'direct-1' ? '嗨，明天見' : '群組最新訊息'), chatType: key.chatType, chatId: key.chatId, text: key.chatId === 'direct-1' ? '嗨，明天見' : '群組最新訊息' }], olderCursor: null }));
     await renderLineApp(api);
     const groupRow = await screen.findByRole('button', { name: '同名群組 群組' });
-    const directRow = screen.getByRole('button', { name: '徐佳誠 個人' });
+    const directRow = screen.getByRole('button', { name: '林曉安 個人' });
     expect(groupRow.querySelector('strong')?.textContent).toBe('同名群組');
-    expect(directRow.querySelector('strong')?.textContent).toBe('徐佳誠');
+    expect(directRow.querySelector('strong')?.textContent).toBe('林曉安');
     expect(groupRow.querySelector('.avatar-badge-wrap .chat-type-badge svg[role="img"]')?.getAttribute('aria-label')).toBe('群組');
     expect(directRow.querySelector('.avatar-badge-wrap .chat-type-badge svg[role="img"]')?.getAttribute('aria-label')).toBe('個人');
     expect(groupRow.querySelector('strong svg')).toBeNull();
@@ -1612,13 +1620,13 @@ describe('operator console', () => {
 
   it('renders chat-list preview sticons as inline images without private-use characters', async () => {
     const api = fakeApi();
-    const sticonChat = { accountId: 'account-A', chatType: 'group' as const, chatId: 'sticon-chat', title: '千年沉睡之旅', unreadCount: 0, agentEnabled: false, defaultProvider: 'claude' as const,
+    const sticonChat = { accountId: 'account-A', chatType: 'group' as const, chatId: 'sticon-chat', title: '範例旅行團', unreadCount: 0, agentEnabled: false, defaultProvider: 'claude' as const,
       latestMessagePreview: '小密秘￼￼快樂', latestMessageAt: '2026-10-22T10:00:00.000Z', latestAttachmentStatus: null, latestMessageId: 'latest-sticon',
       latestSticonRanges: [3, 4].map((start) => ({ start, end: start + 1, productId: '0123456789abcdef01234567', sticonId: String(start), animated: false })) };
     const stray = { ...sticonChat, chatId: 'stray-chat', title: '殘留字元', latestMessageId: 'latest-stray', latestSticonRanges: [], latestMessagePreview: `hi ${String.fromCodePoint(0x100103)}` };
     api.getSnapshot = vi.fn(async () => ({ ...snapshot, conversations: [snapshot.conversations[0]!, sticonChat, stray] }));
     await renderLineApp(api);
-    const row = await screen.findByRole('button', { name: '千年沉睡之旅 群組' });
+    const row = await screen.findByRole('button', { name: '範例旅行團 群組' });
     const preview = row.querySelector('.list-preview')!;
     const images = [...preview.querySelectorAll('.list-sticon')] as HTMLElement[];
     expect(images).toHaveLength(2);
@@ -2123,11 +2131,14 @@ describe('operator console', () => {
   });
   it('starts a distinct account login and renders only the current attempt QR, PIN, and status', async () => {
     const api = fakeApi(); const listeners: Parameters<DesktopApi['onEvent']>[0][] = [];
-    api.getSnapshot = vi.fn(async () => ({ ...snapshot, accounts: [{ ...snapshot.accounts[0]!, hasPrimaryAdmin: true, status: 'reauth_required' as const }] }));
+    const loginLabel = PRIMARY_ADMIN_LINE_LOGIN_ENABLED ? '登入管理者帳號' : '登入 Agent LINE 帳號';
+    api.getSnapshot = vi.fn(async () => ({ ...snapshot, accounts: [PRIMARY_ADMIN_LINE_LOGIN_ENABLED
+      ? { ...snapshot.accounts[0]!, hasPrimaryAdmin: true, status: 'reauth_required' as const }
+      : { ...snapshot.accounts[1]!, status: 'reauth_required' as const }] }));
     api.onEvent = vi.fn((next) => { listeners.push(next); return () => undefined; });
     await renderLineApp(api);
     await openSystemTab();
-    fireEvent.click(screen.getByRole('button', { name: '登入管理者帳號' }));
+    fireEvent.click(screen.getByRole('button', { name: loginLabel }));
     await waitFor(() => expect(api.lineAddAccountQr).toHaveBeenCalledOnce());
     act(() => listeners.forEach((listener) => listener({ type: 'lineLoginState', accountId: 'account-new',
       loginAttemptId: 'attempt-2', state: 'connecting', message: null })));
@@ -2144,14 +2155,14 @@ describe('operator console', () => {
     expect(screen.queryByRole('img', { name: 'LINE QR 登入碼' })).toBeNull();
     expect(screen.getByRole('heading', { name: '在手機輸入認證碼' })).toBeTruthy();
     expect(screen.getByLabelText('LINE 6 位數認證碼').textContent).toBe('020824');
-    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('.app-shell button')).find((button) => button.textContent?.includes('登入管理者帳號'))?.disabled).toBe(true);
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('.app-shell button')).find((button) => button.textContent?.includes(loginLabel))?.disabled).toBe(true);
     expect(screen.getByText('LINE 登入中', { selector: '.system-toast' })).toBeTruthy();
 
     act(() => listeners.forEach((listener) => listener({ type: 'lineLoginState', accountId: 'account-new',
       loginAttemptId: 'attempt-2', state: 'connected', message: null })));
     expect(screen.queryByRole('heading', { name: '在手機輸入認證碼' })).toBeNull();
     expect(screen.getByText(/登入成功/)).toBeTruthy();
-    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('.app-shell button')).find((button) => button.textContent?.includes('登入管理者帳號'))?.disabled).toBe(false);
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('.app-shell button')).find((button) => button.textContent?.includes(loginLabel))?.disabled).toBe(false);
 
     act(() => listeners.forEach((listener) => listener({ type: 'lineLoginState', accountId: 'account-new',
       loginAttemptId: 'attempt-2', state: 'degraded', message: 'Worker command rejected' })));
@@ -2209,8 +2220,14 @@ describe('operator console', () => {
     expect(screen.getByText('888888')).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: '關閉' }));
-    fireEvent.click(screen.getByRole('button', { name: '登入 工作' }));
-    await waitFor(() => expect(api.lineLoginQr).toHaveBeenCalledWith('account-A'));
+    if (PRIMARY_ADMIN_LINE_LOGIN_ENABLED) {
+      fireEvent.click(screen.getByRole('button', { name: '登入 工作' }));
+      await waitFor(() => expect(api.lineLoginQr).toHaveBeenCalledWith('account-A'));
+    } else {
+      // The Primary Admin card never offers a LINE login.
+      expect(screen.queryByRole('button', { name: '登入 觀察' })).toBeNull();
+      expect(api.lineLoginQr).not.toHaveBeenCalled();
+    }
   });
 
   it('refreshes the active timeline from typed message events even when unread does not change', async () => {
@@ -3026,7 +3043,7 @@ describe('operator console', () => {
 
   it('shows a compact LINE-style reply preview and clears it from the close control', async () => {
     const api = fakeApi();
-    api.listMessages = vi.fn(async () => ({ messages: [{ ...message('account-A', 'reply-source'), senderName: '徐佳誠', text: '這是要回覆的原始內容' }], olderCursor: null }));
+    api.listMessages = vi.fn(async () => ({ messages: [{ ...message('account-A', 'reply-source'), senderName: '林曉安', text: '這是要回覆的原始內容' }], olderCursor: null }));
     await renderLineApp(api);
     await screen.findByText('這是要回覆的原始內容');
 
@@ -3044,7 +3061,7 @@ describe('operator console', () => {
 
     const preview = document.querySelector('.reply-preview');
     expect(preview?.querySelector('.reply-avatar[data-avatar-placeholder="person"]')).toBeTruthy();
-    expect(preview?.querySelector('.reply-name')?.textContent).toBe('徐佳誠');
+    expect(preview?.querySelector('.reply-name')?.textContent).toBe('林曉安');
     expect(preview?.querySelector('.reply-quote')?.textContent).toBe('這是要回覆的原始內容');
     const close = screen.getByRole('button', { name: '取消回覆' });
     expect(close.textContent).toBe('×');
@@ -3887,15 +3904,16 @@ describe('operator console', () => {
     expect(agentSlot.compareDocumentPosition(adminSlot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(agentSlot.querySelector('[data-account-id="account-A"]')).toBeTruthy();
     expect(adminSlot.querySelector('[data-account-id="account-pending-admin"]')).toBeTruthy();
-    // A logged-out slot offers 登入, not 重新登入.
-    expect(screen.getByRole('button', { name: '登入 Primary Admin' })).toBeTruthy();
+    // A logged-out slot offers 登入, not 重新登入. The Primary Admin card has a LINE login control only when the switch allows it.
+    if (PRIMARY_ADMIN_LINE_LOGIN_ENABLED) expect(screen.getByRole('button', { name: '登入 Primary Admin' })).toBeTruthy();
+    else expect(screen.queryByRole('button', { name: '登入 Primary Admin' })).toBeNull();
     expect(screen.queryByRole('button', { name: '重新登入 Primary Admin' })).toBeNull();
     expect(screen.queryByRole('region', { name: 'Unclassified legacy accounts' })).toBeNull();
     expect(document.querySelector('[data-account-id="account-legacy"]')).toBeNull();
     expect(screen.queryByRole('button', { name: /切換為主操作|設為主操作/ })).toBeNull();
   });
 
-  it('shows the startup auto-login checkbox per account, calls the IPC, and reports failure', async () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('shows the startup auto-login checkbox per account, calls the IPC, and reports failure', async () => {
     const api = fakeApi();
     const onNotice = vi.fn();
     const accounts = [
@@ -3913,7 +3931,27 @@ describe('operator console', () => {
     await waitFor(() => expect(onNotice).toHaveBeenCalledWith(extraTextFor('zh-TW', 'operationFailed')));
   });
 
-  it('disables logout for a logged-out Primary Admin while connected Agent logout remains usable', async () => {
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('shows the startup auto-login checkbox per account, calls the IPC, and reports failure', async () => {
+    const api = fakeApi();
+    const onNotice = vi.fn();
+    const accounts = [
+      { ...snapshot.accounts[0]!, displayName: 'Agent', productRole: 'AGENT' as const, autoLoginOnStartup: false },
+      { ...snapshot.accounts[1]!, displayName: 'Primary Admin', productRole: 'PRIMARY_ADMIN' as const, autoLoginOnStartup: true },
+    ];
+    render(<LineLogin api={api} accounts={accounts} headingRef={React.createRef<HTMLHeadingElement>()} onNotice={onNotice} />);
+    // Only the Agent card has the checkbox. The Primary Admin card has none.
+    const boxes = screen.getAllByRole('checkbox', { name: '啟動時自動登入' }) as HTMLInputElement[];
+    expect(boxes.map((box) => box.checked)).toEqual([false]);
+    fireEvent.click(boxes[0]!);
+    await waitFor(() => expect(api.lineSetAutoLogin).toHaveBeenCalledWith(accounts[0]!.accountId, true));
+    (api.lineSetAutoLogin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ type: 'error', requestId: 'x', ok: false, code: 'SERVICE_ERROR', message: '儲存失敗', retryable: true });
+    fireEvent.click(boxes[0]!);
+    await waitFor(() => expect(api.lineSetAutoLogin).toHaveBeenCalledTimes(2));
+    expect(api.lineSetAutoLogin).not.toHaveBeenCalledWith(accounts[1]!.accountId, expect.anything());
+    await waitFor(() => expect(onNotice).toHaveBeenCalledWith(extraTextFor('zh-TW', 'operationFailed')));
+  });
+
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('disables logout for a logged-out Primary Admin while connected Agent logout remains usable', async () => {
     const api = fakeApi();
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     try {
@@ -3944,7 +3982,35 @@ describe('operator console', () => {
     }
   });
 
-  it('offers adding an Agent in its vacant slot and keeps Primary Admin gated until Agent binding', () => {
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('has no logout control for the Primary Admin while Agent logout remains usable', async () => {
+    const api = fakeApi();
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    try {
+      const accounts = [
+        { ...snapshot.accounts[0]!, displayName: 'Agent', productRole: 'AGENT' as const },
+        { ...snapshot.accounts[1]!, displayName: 'Primary Admin', productRole: 'PRIMARY_ADMIN' as const, status: 'disconnected' as const },
+      ];
+      const { rerender } = render(<LineLogin api={api} accounts={accounts} headingRef={React.createRef<HTMLHeadingElement>()} />);
+      expect(screen.queryByRole('button', { name: '登出 Primary Admin' })).toBeNull();
+      expect(api.lineLogout).not.toHaveBeenCalled();
+
+      const agentLogout = screen.getByRole('button', { name: '登出 Agent' });
+      expect(agentLogout).toHaveProperty('disabled', false);
+      fireEvent.click(agentLogout);
+      await waitFor(() => expect(api.lineLogout).toHaveBeenCalledWith(accounts[0]!.accountId));
+      expect(confirm).toHaveBeenCalledOnce();
+
+      for (const status of ['connected', 'degraded', 'reauth_required', 'disconnected'] as const) {
+        rerender(<LineLogin api={api} accounts={accounts.map((account) => ({ ...account, status }))} headingRef={React.createRef<HTMLHeadingElement>()} />);
+        expect(screen.getByRole('button', { name: '登出 Agent' })).toHaveProperty('disabled', status === 'disconnected');
+        expect(screen.queryByRole('button', { name: '登出 Primary Admin' })).toBeNull();
+      }
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('offers adding an Agent in its vacant slot and keeps Primary Admin gated until Agent binding', () => {
     const api = fakeApi();
     const headingRef = React.createRef<HTMLHeadingElement>();
     const { rerender } = render(<LineLogin api={api} accounts={[]} headingRef={headingRef} />);
@@ -3958,6 +4024,21 @@ describe('operator console', () => {
 
     rerender(<LineLogin api={api} accounts={[{ ...snapshot.accounts[0]!, hasPrimaryAdmin: true }]} headingRef={headingRef} />);
     expect((screen.getByRole('button', { name: '登入管理者帳號' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText('Agent 已完成管理者綁定，可以登入 Primary Admin。')).toBeNull();
+  });
+
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('offers adding an Agent in its vacant slot and never offers a LINE login for the vacant Primary Admin slot', () => {
+    const api = fakeApi();
+    const headingRef = React.createRef<HTMLHeadingElement>();
+    const { rerender } = render(<LineLogin api={api} accounts={[]} headingRef={headingRef} />);
+    expect((screen.getByRole('button', { name: '登入 Agent LINE 帳號' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByRole('button', { name: '登入管理者帳號' })).toBeNull();
+    expect(screen.queryByText('Agent 帳號槽位待登入')).toBeNull();
+    expect(screen.queryByText('Primary Admin 帳號槽位待登入')).toBeNull();
+    expect(screen.queryByText('請先完成 Agent 管理者綁定，之後才能登入 Primary Admin。')).toBeNull();
+
+    rerender(<LineLogin api={api} accounts={[{ ...snapshot.accounts[0]!, hasPrimaryAdmin: true }]} headingRef={headingRef} />);
+    expect(screen.queryByRole('button', { name: '登入管理者帳號' })).toBeNull();
     expect(screen.queryByText('Agent 已完成管理者綁定，可以登入 Primary Admin。')).toBeNull();
   });
 

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   isLineServerErrorCode, isLocalAgentRoom, talkServerError, MEDIA_FILE_MAX_BYTES, MEDIA_IMAGE_MAX_BYTES, LineWorkerCommandSchema, LineWorkerEventSchema,
-  WORKER_PROTOCOL_VERSION, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue as ContractJsonValue, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto,
+  WORKER_PROTOCOL_VERSION, type ConversationCatalogItem, type JsonValue as ContractJsonValue, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto,
   type ChatResourceReadCommand, type OutgoingMention, type ChatResourcePhotoPageShape,
 } from '@line-agent/contracts';
 import { DurableCursorSession, cursorsEqual, decodeHistoryCursor, encodeHistoryCursor,
@@ -10,8 +10,9 @@ import { EffectDeniedError, type ControlLease } from './mutation-gate.js';
 import { normalizeOperation, type DecryptionFailure } from './normalizer.js';
 import { mkdir, open, statfs } from 'node:fs/promises';
 import { sanitizeAttachmentFilename, storeAttachment, type AttachmentStoreRuntime } from './attachment-store.js';
+import { IMAGE_SNIFF_PREFIX_BYTES, fallbackAttachmentFileName, peekAttachmentSource } from './attachment-peek.js';
 import { SafeAttachmentError } from './attachment-error.js';
-import { validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
+import { validateAttachmentMessage, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { isChatResourceFailure, isChatResourceUnsupported, safeChatResourceFailureDetails, type ChatResourceFailureKind, type ChatResourceResponseCode } from './chat-resource-error.js';
 import { isLineServerRejection } from './line-server-error.js';
 import { tagLoginStage } from './login-failure-detail.js';
@@ -23,13 +24,16 @@ export type SyncItem = unknown | Readonly<{
 export type SyncResult = Readonly<{ cursorAfter: TalkCursorV1Dto; operations: readonly SyncItem[];
   /** Number of raw Talk.sync operations before adapters append bounded recent-history catch-up items. */
   rawOperationCount?: number; hasMoreStartupItems?: boolean;
-  readReceipts?: readonly Readonly<{ chatId: string; readerMid: string; messageId: string; readAt: string }>[] }>;
+  readReceipts?: readonly Readonly<{ chatId: string; readerMid: string; messageId: string; readAt: string }>[];
+  /** LINE unsend operations (OpType 64 and 65) observed in this sync response. */
+  unsends?: readonly Readonly<{ chatId: string; messageId: string; kind: 'self' | 'notified'; observedAt: string }>[] }>;
 export type FriendRelation = 'friend' | 'not_friend' | 'unknown';
 export type FriendRelationDiagnostic = Readonly<{ status: FriendRelation; error: string | null; failureKind?: ChatResourceFailureKind;
   upstreamStatus?: number; upstreamCode?: ChatResourceResponseCode }>;
 export type FriendAddResult = Readonly<{ status: 'added' | 'failed' | 'unknown'; error: string | null }>;
 
 const FRIEND_ADD_LOCAL_FAILURES = new Set(['SIDE_EFFECT_DENIED', 'NOT_STARTED', 'NOT_READY', 'REQUEST_ID_CONFLICT', 'QUEUE_FULL']);
+const CHAT_DETAIL_BATCH_LIMIT = 100;
 export const LOGOUT_DEADLINE_MS = 10_000;
 export const SYNC_CONFIRMED_INTERVAL_MS = 60_000;
 function safeFriendAddResult(result: FriendAddResult): FriendAddResult {
@@ -43,13 +47,12 @@ export type RelationCancellation = Readonly<{ aborted: boolean }>;
 export interface LineTransport {
   on(event: 'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated' | 'refreshFailure', listener: (value?: any) => void): void;
   installSecrets(secrets: { token: string | null; qrCert: string | null; e2eeStorage: ContractJsonValue | null }): Promise<void>;
-  adoptDownloadAuth?(token: string, application: string,
-    options?: Readonly<{ expectedMid?: string; probe?: DownloadAuthProbe; signal?: AbortSignal }>): Promise<TransportIdentity>;
-  clearDownloadAuth?(): void;
   loginQr(): Promise<TransportIdentity>;
   loginToken(token: string): Promise<TransportIdentity>;
   logoutServer?(signal?: AbortSignal): Promise<void>;
   listConversations(): Promise<readonly ConversationCatalogItem[]>;
+  /** Group ('c') and room ('r') ids that the catalog has not seen, at most 100. Same item shape as `listConversations`. */
+  listConversationDetails?(chatIds: readonly string[]): Promise<readonly ConversationCatalogItem[]>;
   refreshOwnProfile?(): Promise<TransportIdentity>;
   sync(cursor: TalkCursorV1Dto): Promise<SyncResult>;
   history(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string },
@@ -60,8 +63,7 @@ export interface LineTransport {
   }>>;
   download(kind: 'image' | 'video' | 'audio' | 'file', messageId: string,
     externalAttachmentId: string, lineMessage: ContractJsonValue,
-    options: Readonly<{ signal: AbortSignal; maxBytes: number; identity: AttachmentDownloadIdentity;
-      nativeAttachment?: Extract<LineWorkerCommand, { type: 'downloadAttachment' }>['nativeAttachment'] }>): Promise<{
+    options: Readonly<{ signal: AbortSignal; maxBytes: number; identity: AttachmentDownloadIdentity }>): Promise<{
       name: string | null; source: AsyncIterable<Uint8Array>;
     }>;
   send(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string }, text: string,
@@ -170,60 +172,6 @@ function attachmentFailureCode(error: unknown, stage: 'PREPARE' | 'LINE_DOWNLOAD
   return stage === 'PREPARE' ? 'ATTACHMENT_PREPARE_FAILED' : 'ATTACHMENT_STORE_FAILED';
 }
 
-function nativeMediaExtension(kind: 'image' | 'video' | 'audio' | 'file', bytes: Buffer): string | null {
-  if (kind === 'image') {
-    if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) && bytes.length >= 8) return '.png';
-    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return '.jpg';
-    if (bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('ascii'))) return '.gif';
-    if (bytes.length >= 12 && bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP') return '.webp';
-    if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d) return '.bmp';
-    if (bytes.length >= 4 && (bytes.subarray(0, 4).equals(Buffer.from([0x49, 0x49, 0x2a, 0x00]))
-      || bytes.subarray(0, 4).equals(Buffer.from([0x4d, 0x4d, 0x00, 0x2a])))) return '.tif';
-  }
-  if (kind === 'video') {
-    if (bytes.length >= 8 && bytes.subarray(4, 8).toString('ascii') === 'ftyp') return '.mp4';
-    if (bytes.length >= 4 && bytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) return '.webm';
-  }
-  if (kind === 'audio') {
-    if (bytes.length >= 3 && bytes.subarray(0, 3).toString('ascii') === 'ID3') return '.mp3';
-    if (bytes.length >= 4 && bytes.subarray(0, 4).toString('ascii') === 'OggS') return '.ogg';
-    if (bytes.length >= 12 && bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WAVE') return '.wav';
-    if (bytes.length >= 4 && bytes.subarray(0, 4).toString('ascii') === 'fLaC') return '.flac';
-  }
-  return null;
-}
-
-async function peekNativeMediaExtension(source: AsyncIterable<Uint8Array>, kind: 'image' | 'video' | 'audio' | 'file'):
-  Promise<Readonly<{ extension: string | null; source: AsyncIterable<Uint8Array> }>> {
-  const iterator = source[Symbol.asyncIterator]();
-  const buffered: Uint8Array[] = [];
-  let prefixBytes = 0;
-  let ended = false;
-  while (prefixBytes < 12) {
-    const next = await iterator.next();
-    if (next.done) { ended = true; break; }
-    buffered.push(next.value);
-    prefixBytes += next.value.byteLength;
-  }
-  const prefix = Buffer.allocUnsafe(Math.min(16, buffered.reduce((sum, part) => sum + part.byteLength, 0)));
-  let offset = 0;
-  for (const part of buffered) {
-    const length = Math.min(part.byteLength, prefix.length - offset);
-    if (length > 0) Buffer.from(part.buffer, part.byteOffset, length).copy(prefix, offset);
-    offset += Math.max(length, 0);
-    if (offset >= prefix.length) break;
-  }
-  const replay: AsyncIterable<Uint8Array> = { async *[Symbol.asyncIterator]() {
-    yield* buffered;
-    if (!ended) for (;;) {
-      const next = await iterator.next();
-      if (next.done) break;
-      yield next.value;
-    }
-  } };
-  return { extension: nativeMediaExtension(kind, prefix), source: replay };
-}
-
 export class LineWorkerLoop {
   readonly #transport: LineTransport;
   readonly #emitEvent: LineWorkerOptions['emit'];
@@ -272,6 +220,12 @@ export class LineWorkerLoop {
   #catalogRequested = false;
   #catalogFailureReported = false;
   #catalogRefreshComplete = false;
+  // Chats that arrived after the full catalog are read once per session (official talkChat/fetchTalkChats: getChats for unknown mids).
+  readonly #knownChatIds = new Set<string>();
+  readonly #pendingDetailIds = new Set<string>();
+  #detailFlight: Promise<void> | undefined;
+  #detailRetryAttempt = 0;
+  #detailRetryAtTick = 0;
   readonly #transportDrainWaiters: Array<() => void> = [];
   readonly #activeAttachments = new Map<string, { attachmentId: string; controller: AbortController; finished: Promise<void>; finish(): void }>();
   readonly #activeChatResourceReads = new Map<string, AbortController>();
@@ -288,12 +242,6 @@ export class LineWorkerLoop {
     this.#minFreeBytes = options.minFreeBytes ?? 512 * 1024 * 1024;
     this.#transport.on('authInvalidated', () => {
       if (this.#authInvalidated || !this.#binding) return;
-      if (this.#binding.purpose === 'DOWNLOAD_ONLY') {
-        this.#ownMid = undefined;
-        this.#transport.clearDownloadAuth?.();
-        void this.#emit({ type: 'downloadAuthInvalidated', ...this.#identity() }).catch(() => undefined);
-        return;
-      }
       this.#authInvalidated = true;
       this.#receiveGeneration += 1;
       this.#catalogRefreshGeneration += 1;
@@ -305,7 +253,6 @@ export class LineWorkerLoop {
     this.#transport.on('pin', (pin: string) => { if (!this.#stopped) this.#emitLoginEvent('pin', { pin }); });
     this.#transport.on('token', (token: string) => {
       if (this.#stopped) return;
-      if (this.#binding?.purpose === 'DOWNLOAD_ONLY') return;
       this.#secrets = { ...this.#secrets, token };
       this.#emitSecretRotation();
     });
@@ -320,7 +267,7 @@ export class LineWorkerLoop {
       this.#emitSecretRotation();
     });
     this.#transport.on('credentials', (credentials: { token: string; e2eeStorage: ContractJsonValue }) => {
-      if (this.#stopped || this.#binding?.purpose === 'DOWNLOAD_ONLY') return;
+      if (this.#stopped) return;
       this.#secrets = { ...this.#secrets, token: credentials.token, e2eeStorage: credentials.e2eeStorage };
       this.#emitSecretRotation();
     });
@@ -377,9 +324,6 @@ export class LineWorkerLoop {
       command.transportOwnerId !== binding.transportOwnerId ||
       command.transportGeneration !== binding.transportGeneration ||
       command.writeGrantVersion !== binding.writeGrantVersion) throw new Error('worker binding mismatch');
-    if (binding.purpose === 'DOWNLOAD_ONLY' && !['adoptDownloadAuth', 'downloadAttachment', 'cancelAttachmentDownload', 'revokeControl', 'stop'].includes(command.type)) {
-      throw new EffectDeniedError('download-only worker rejects non-download command');
-    }
     if (this.#authInvalidated && command.type !== 'stop' && command.type !== 'revokeControl' && command.type !== 'logout') {
       if (command.type === 'poll') return;
       throw new Error('LINE authentication is invalidated');
@@ -388,41 +332,6 @@ export class LineWorkerLoop {
       throw new Error('paused worker cannot access LINE');
     }
     switch (command.type) {
-      case 'adoptDownloadAuth': {
-        if (binding.purpose !== 'DOWNLOAD_ONLY' || !binding.expectedMid || command.expectedMid !== binding.expectedMid) {
-          await this.#emit({ type: 'downloadAuthResult', ...this.#identity(), requestId: command.requestId,
-            accepted: false, error: 'APPLICATION_MISMATCH' });
-          return;
-        }
-        try {
-          const result = await this.#withCredentialSwap(() => {
-            if (this.#stopped || this.#revoked) throw new Error('download-only worker is stopping');
-            return this.#transport.adoptDownloadAuth
-              ? this.#transport.adoptDownloadAuth(command.token, command.application, {
-                  expectedMid: command.expectedMid,
-                  ...(command.probe ? { probe: command.probe } : {}),
-                })
-              : Promise.reject(new Error('download auth unavailable'));
-          });
-          if (result.ownMid !== binding.expectedMid) {
-            this.#transport.clearDownloadAuth?.();
-            this.#ownMid = undefined;
-            await this.#emit({ type: 'downloadAuthResult', ...this.#identity(), requestId: command.requestId,
-              accepted: false, error: 'PROFILE_MISMATCH' });
-            return;
-          }
-          this.#ownMid = result.ownMid;
-          await this.#emit({ type: 'downloadReady', ...this.#identity(), ownMid: result.ownMid });
-          await this.#emit({ type: 'downloadAuthResult', ...this.#identity(), requestId: command.requestId,
-            accepted: true, error: null });
-        } catch {
-          this.#transport.clearDownloadAuth?.();
-          this.#ownMid = undefined;
-          await this.#emit({ type: 'downloadAuthResult', ...this.#identity(), requestId: command.requestId,
-            accepted: false, error: 'AUTH_UNAVAILABLE' });
-        }
-        return;
-      }
       case 'setSecretState':
         if (this.#loginAttemptId && this.#loginAttemptId !== command.loginAttemptId) {
           throw new Error('login attempt mismatch');
@@ -477,6 +386,7 @@ export class LineWorkerLoop {
       case 'poll':
         if (!this.#ownMid || this.#loginInFlight || this.#secretRestoreInFlight) return;
         this.#catalogRefreshPollTick();
+        this.#detailRefreshPollTick();
         await this.#withTransportCall(() => this.#poll());
         return;
       case 'ackBatch':
@@ -686,6 +596,54 @@ export class LineWorkerLoop {
     this.#catalogRequested = false;
     this.#catalogFailureReported = false;
     this.#catalogRefreshComplete = false;
+    this.#knownChatIds.clear();
+    this.#pendingDetailIds.clear();
+    this.#detailRetryAttempt = 0;
+    this.#detailRetryAtTick = this.#catalogPollTicks;
+  }
+
+  #noteUnknownChats(envelopes: readonly Readonly<{ chatType: string; chatId: string }>[]): void {
+    for (const { chatType, chatId } of envelopes) {
+      if (chatType !== 'group' && chatType !== 'room') continue;
+      if (this.#knownChatIds.has(chatId) || this.#pendingDetailIds.has(chatId)) continue;
+      if (this.#pendingDetailIds.size >= CHAT_DETAIL_BATCH_LIMIT) return;
+      this.#pendingDetailIds.add(chatId);
+    }
+  }
+
+  #detailRefreshPollTick(): void {
+    if (!this.#catalogRefreshComplete || this.#catalogRefreshFlight || this.#detailFlight || !this.#ownMid
+      || this.#revoked || this.#authInvalidated || !this.#transport.listConversationDetails) return;
+    if (this.#catalogPollTicks < this.#detailRetryAtTick) return;
+    for (const chatId of this.#pendingDetailIds) if (this.#knownChatIds.has(chatId)) this.#pendingDetailIds.delete(chatId);
+    const chatIds = [...this.#pendingDetailIds].slice(0, CHAT_DETAIL_BATCH_LIMIT);
+    if (chatIds.length === 0) return;
+    const generation = this.#catalogRefreshGeneration;
+    const receiveGeneration = this.#receiveGeneration;
+    const transportGeneration = this.#transportGeneration;
+    const listDetails = this.#transport.listConversationDetails.bind(this.#transport);
+    let task!: Promise<void>;
+    task = (async () => {
+      try {
+        const conversations = await this.#withTransportCall(() => listDetails(chatIds));
+        if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
+        if (conversations.length > 0) await this.#emit({ type: 'conversationCatalog', ...this.#identity(), conversations });
+        if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
+        // Ids that LINE did not return count as known too, so this session does not ask again.
+        for (const chatId of chatIds) { this.#knownChatIds.add(chatId); this.#pendingDetailIds.delete(chatId); }
+        for (const item of conversations) this.#knownChatIds.add(item.chatId);
+        this.#detailRetryAttempt = 0;
+      } catch {
+        // Ids stay pending; no status event for detail failures.
+        if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
+        this.#detailRetryAttempt = Math.min(this.#detailRetryAttempt + 1, 6);
+        this.#detailRetryAtTick = this.#catalogPollTicks + [1, 2, 4, 8, 16, 32][this.#detailRetryAttempt - 1]!;
+      } finally {
+        if (this.#detailFlight === task) this.#detailFlight = undefined;
+      }
+    })();
+    this.#detailFlight = task;
+    void task.catch(() => undefined);
   }
 
   #catalogRefreshPollTick(): void {
@@ -721,6 +679,7 @@ export class LineWorkerLoop {
         await this.#emit({ type: 'conversationCatalog', ...this.#identity(), conversations });
         this.#catalogRefreshComplete = true;
         this.#catalogRetryAttempt = 0;
+        for (const item of conversations) this.#knownChatIds.add(item.chatId);
       } catch (error) {
         if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
         this.#catalogRetryAttempt = Math.min(this.#catalogRetryAttempt + 1, 6);
@@ -825,7 +784,9 @@ export class LineWorkerLoop {
       if (!Number.isSafeInteger(rawOperationCount) || rawOperationCount < 0) throw new Error('sync response has invalid raw operation count');
       const readReceipts = result.readReceipts ?? [];
       if (readReceipts.length > 500) throw new Error('sync response exceeds bounded read receipt limit');
-      if (result.operations.length === 0 && readReceipts.length === 0 && JSON.stringify(before) === JSON.stringify(result.cursorAfter)
+      const unsends = result.unsends ?? [];
+      if (unsends.length > 500) throw new Error('sync response exceeds bounded unsend limit');
+      if (result.operations.length === 0 && readReceipts.length === 0 && unsends.length === 0 && JSON.stringify(before) === JSON.stringify(result.cursorAfter)
         && !this.#startupSync) return;
       const context = { accountId: this.#binding!.accountId, ownMid: this.#ownMid ?? '',
         source: 'live' as const, cursor: null };
@@ -836,7 +797,8 @@ export class LineWorkerLoop {
         }
         return normalizeOperation(item, context);
       });
-      const batch = this.#cursor!.stage(randomUUID(), result.cursorAfter, envelopes as unknown as readonly JsonValue[], readReceipts);
+      this.#noteUnknownChats(envelopes);
+      const batch = this.#cursor!.stage(randomUUID(), result.cursorAfter, envelopes as unknown as readonly JsonValue[], readReceipts, unsends);
       const startupFinal = this.#startupSync && rawOperationCount < 100 && result.hasMoreStartupItems !== true;
       if (startupFinal) this.#startupFinalBatchId = batch.batchId;
       await this.#emit({ type: 'batch', ...this.#identity(), ...batch,
@@ -943,30 +905,28 @@ export class LineWorkerLoop {
       const identity: AttachmentDownloadIdentity = { accountId: command.accountId, chatType: command.chatType,
         chatId: command.chatId, ownMid: this.#ownMid, messageId: command.messageId,
         kind: command.kind, externalAttachmentId: command.externalAttachmentId };
-      if (command.nativeAttachment) validateNativeAttachment(command.nativeAttachment, identity, command.maxBytes);
-      else validateAttachmentMessage(command.lineMessage, identity, command.maxBytes);
+      validateAttachmentMessage(command.lineMessage, identity, command.maxBytes);
       const download = await this.#transport.download(command.kind, command.messageId,
-        command.externalAttachmentId, command.lineMessage, { signal: controller.signal, maxBytes: command.maxBytes, identity,
-          ...(command.nativeAttachment ? { nativeAttachment: command.nativeAttachment } : {}) });
+        command.externalAttachmentId, command.lineMessage, { signal: controller.signal, maxBytes: command.maxBytes, identity });
       if (controller.signal.aborted) throw controller.signal.reason;
       const safeName = (name: string | null | undefined): string | undefined => {
         if (name == null) return undefined;
         try { return sanitizeAttachmentFilename(name); } catch { return undefined; }
       };
-      let originalFileName = safeName(download.name) ?? safeName(command.originalFileName) ?? 'attachment.blob';
+      const namedByLine = safeName(download.name);
+      let originalFileName = namedByLine ?? safeName(command.originalFileName) ?? 'attachment.blob';
       let source = download.source;
-      if (command.nativeAttachment && !command.nativeAttachment.fileName && !download.name) {
-        const peeked = await peekNativeMediaExtension(source, command.kind);
+      if (deadline - Date.now() <= 0) throw timeoutError;
+      stage = 'STORE';
+      // LINE image messages have no file name. The desktop sends the placeholder attachment.bin for them.
+      // Choose the extension from the first bytes so that the stored file opens with the correct program.
+      if (command.kind === 'image' && namedByLine === undefined && (originalFileName === 'attachment.bin' || originalFileName === 'attachment.blob')) {
+        const peeked = await peekAttachmentSource(source, IMAGE_SNIFF_PREFIX_BYTES, controller.signal);
         source = peeked.source;
-        if (peeked.extension) {
-          const base = safeName(command.originalFileName) ?? 'attachment';
-          const dot = base.lastIndexOf('.');
-          originalFileName = dot > 0 ? `${base.slice(0, dot)}${peeked.extension}` : `${base}${peeked.extension}`;
-        }
+        originalFileName = fallbackAttachmentFileName(peeked.prefix);
       }
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) throw timeoutError;
-      stage = 'STORE';
       const stored = await storeAttachment({ root: this.#attachmentRoot,
         identity: { ...conversation, messageId: command.messageId,
           externalAttachmentId: command.externalAttachmentId },

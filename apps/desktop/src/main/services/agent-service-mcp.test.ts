@@ -80,7 +80,7 @@ describe('built-in Agent MCP launch', () => {
   };
 
   it('puts the main-generated identity block into the run prompt only, and omits it when the lookup fails', async () => {
-    const identity: JobIdentity = { agent: { accountId: 'a', name: 'Agentsaxo' }, admin: { accountId: 'a', chatId: 'uadmin', name: '徐佳誠' }, current: null };
+    const identity: JobIdentity = { agent: { accountId: 'a', name: 'AgentDemo' }, admin: { accountId: 'a', chatId: 'uadmin', name: '林曉安' }, current: null };
     const f = fixture({ identity });
     const request = await runWith(f);
     expect(request.prompt).toBe(withMcpSkill(SKILL, withOutputChannel(withIdentityBlock(withAgentRoomHistoryHint('summarise'), formatIdentityBlock(identity)), 'ui')));

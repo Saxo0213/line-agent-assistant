@@ -254,7 +254,7 @@ describe('snapshot hot path', () => {
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [
         conversation('g-removal', { format: 1, type: 'event', nativeContentType: 0, text: '甲已將乙強制退出社群。' }),
-        conversation('g-chat-event', { format: 1, type: 'event', nativeContentType: 18, text: '小薪已新增徐佳誠至群組。' }),
+        conversation('g-chat-event', { format: 1, type: 'event', nativeContentType: 18, text: '小薪已新增林曉安至群組。' }),
         conversation('g-chat-event-bare', { format: 1, type: 'event', nativeContentType: 18, text: null }),
         conversation('g-gift', { format: 1, type: 'event', nativeContentType: 9, text: null }),
         conversation('g-empty', { format: 1, type: 'event', nativeContentType: 0, text: null })] })
@@ -266,7 +266,7 @@ describe('snapshot hot path', () => {
 
     const preview = (chatId: string) => snapshot.conversations.find((item) => item.chatId === chatId)?.latestMessagePreview;
     expect(preview('g-removal')).toBe('甲已將乙強制退出社群。');
-    expect(preview('g-chat-event')).toBe('小薪已新增徐佳誠至群組。');
+    expect(preview('g-chat-event')).toBe('小薪已新增林曉安至群組。');
     expect(preview('g-chat-event-bare')).toBe('聊天事件');
     expect(preview('g-gift')).toBe('禮物');
     expect(preview('g-empty')).toBe('系統訊息');
@@ -290,7 +290,7 @@ describe('snapshot hot path', () => {
 
 const SICON_PRODUCT = '0123456789abcdef01234567';
 const privateUse = (...codePoints: number[]) => String.fromCodePoint(...codePoints);
-/** The 「小密秘🥰」 latest message of 千年沉睡之旅: text 5c0f 5bc6 79d8 100103 1001c5 5feb 6a02 10ffff. */
+/** The 「小密秘🥰」 latest message of 範例旅行團: text 5c0f 5bc6 79d8 100103 1001c5 5feb 6a02 10ffff. */
 const SICON_TEXT = `小密秘${privateUse(0x100103, 0x1001c5)}快樂${privateUse(0x10ffff)}`;
 const sicon = (start: number, end: number, sticonId: string) => ({ S: start, E: end, productId: SICON_PRODUCT, sticonId, resourceType: 'STATIC' });
 const sticonRaw = (text: string, resources: unknown[]) => ({ message: { text, contentMetadata: { REPLACE: JSON.stringify({ sticon: { resources } }) } } });

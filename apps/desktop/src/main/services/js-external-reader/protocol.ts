@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
-import type { NativeAttachmentDescriptor, NativeAttachmentMetadata, NativeCatalogRecord, NativeDirectoryRow, NativeSourceEnvelope,
-  NativeStickerMetadata, OfficialAuthCandidate } from '@line-agent/contracts';
+import type { NativeAttachmentDescriptor, NativeCatalogRecord, NativeDirectoryRow, NativeSourceEnvelope,
+  NativeStickerMetadata } from '@line-agent/contracts';
 
 export const FRAME_LIMITS = Object.freeze({ controlBytes: 4096, initBytes: 16 * 1024, pageBytes: 1024 * 1024, initialImportPageBytes: 8 * 1024 * 1024 });
 
@@ -98,11 +98,6 @@ export type DirectTailWindow = Readonly<{
   lower: ImportCursor | null;
   complete: true;
   ids: readonly string[];
-}>;
-export type NativeMonitorAccess = Readonly<{
-  acquireAuthCandidates(signal?: AbortSignal): Promise<Readonly<{ candidates: readonly OfficialAuthCandidate[]; errorCode: string | null }>>;
-  decodeAttachment(input: Readonly<{ envelope: NativeSourceEnvelope; expectedMessageId: string; expectedChatId: string }>,
-    signal?: AbortSignal): Promise<Readonly<{ metadata: NativeAttachmentMetadata | null; errorCode: string | null }>>;
 }>;
 export type ImportProgress = Readonly<{
   phase: 'source_check' | 'close_line_window' | 'key_scan' | 'snapshot_copy' | 'snapshot_hash' | 'snapshot_reread' | 'count' | 'page_read';

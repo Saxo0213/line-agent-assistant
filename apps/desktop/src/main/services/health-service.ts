@@ -225,8 +225,20 @@ export class HealthService {
         `SELECT c.control_epoch, a.account_id AS active_account_id FROM account_control c
          LEFT JOIN line_accounts a ON a.mode = 'ACTIVE_CONTROL' WHERE c.singleton = true`,
       ),
-      this.pool.query<{ account_id: string; display_name: string | null; status: 'connected' | 'disconnected' | 'degraded' | 'reauth_required'; last_synced_at: Date | null; mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; product_role: 'AGENT' | 'PRIMARY_ADMIN' | null; has_primary_admin: boolean; auto_login_on_startup: boolean; picture_path: string | null }>(
-        `SELECT la.account_id,la.display_name,la.status,
+      this.pool.query<{ account_id: string; display_name: string | null; status: 'connected' | 'disconnected' | 'degraded' | 'reauth_required'; last_synced_at: Date | null; mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; product_role: 'AGENT' | 'PRIMARY_ADMIN' | null; has_primary_admin: boolean; auto_login_on_startup: boolean; picture_path: string | null;
+        connection_mode: 'SYSTEM_LOGIN' | 'EXTERNAL_MONITOR' | 'OFFLINE'; admin_former: boolean }>(
+        `SELECT la.account_id,
+         -- A placeholder name is replaced by the name that the Agent account knows for this MID (contact, then member name).
+         CASE WHEN la.display_name='Primary Admin' AND la.own_mid IS NOT NULL THEN COALESCE(
+           (SELECT COALESCE(ct.nickname,ct.display_name) FROM line_contacts ct
+              JOIN line_accounts ag ON ag.account_id=ct.account_id AND ag.product_role='AGENT' WHERE ct.mid=la.own_mid LIMIT 1),
+           (SELECT cm.display_name FROM conversation_members cm
+              JOIN line_accounts ag ON ag.account_id=cm.account_id AND ag.product_role='AGENT'
+              WHERE cm.member_id=la.own_mid AND cm.display_name IS NOT NULL ORDER BY cm.updated_at DESC LIMIT 1),
+           la.display_name) ELSE la.display_name END AS display_name,la.status,la.connection_mode,
+         -- Former administrator: role removed by an administrator change (revision >= 1), verified MID, and never an Agent.
+         (la.product_role IS NULL AND la.role_revision>=1 AND la.own_mid IS NOT NULL
+           AND NOT EXISTS(SELECT 1 FROM agent_account_lineage l WHERE l.account_id=la.account_id)) AS admin_former,
          CASE WHEN la.product_role='PRIMARY_ADMIN' AND la.connection_mode='EXTERNAL_MONITOR'
            THEN monitor_checkpoint.updated_at ELSE la.last_synced_at END AS last_synced_at,
          la.mode,la.picture_path,la.product_role,la.auto_login_on_startup,
@@ -288,6 +300,8 @@ export class HealthService {
       accounts: accounts.rows.map((row) => ({ accountId: row.account_id, displayName: row.display_name ?? row.account_id,
         status: row.status, lastSyncedAt: row.last_synced_at?.toISOString() ?? null, mode: row.mode, hasPrimaryAdmin: row.has_primary_admin, autoLoginOnStartup: row.auto_login_on_startup,
         productRole: row.product_role, avatarAvailable: Boolean(row.picture_path),
+        ...(row.product_role === 'PRIMARY_ADMIN' ? { connectionMode: row.connection_mode } : {}),
+        ...(row.admin_former ? { adminLineage: 'former' as const } : {}),
         ...(lineage.accountIds.includes(row.account_id) ? { agentLineage: row.account_id === lineage.currentAccountId ? 'current' as const : 'former' as const } : {}) })),
       conversations: conversations.rows.map(mapConversation),
       jobs: jobs.rows.map((row) => ({ jobId: row.job_id, accountId: row.account_id, chatType: row.chat_type,

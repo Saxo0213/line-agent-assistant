@@ -4,8 +4,7 @@
 // Reads (login, catalog, profile, sync, history) came with step 5; step 6 adds the writes and the OBS media paths: send,
 // sendMedia, download, react, unsend, checkFriendRelation and addFriendByMid. Step 7 adds `readChatResource`: only the album
 // photo download exists (line-cli has no album or photo list, and no notes API exists in any reference); every other action
-// raises `ChatResourceUnsupportedError`, which the worker loop reports as `UNSUPPORTED`. `adoptDownloadAuth` and
-// `clearDownloadAuth` stay undefined (DESKTOPWIN-only download auth does not exist here).
+// raises `ChatResourceUnsupportedError`, which the worker loop reports as `UNSUPPORTED`.
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -33,14 +32,22 @@ import {
 import type { HistoryCursorV1 } from './cursor.js';
 import { SafeAttachmentError } from './attachment-error.js';
 import { ChatResourceFailure, ChatResourceUnsupportedError, safeChatResourceUpstreamCode, safeChatResourceUpstreamNumber } from './chat-resource-error.js';
-import { validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
+import { validateAttachmentMessage, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { decodeChromeFriendAddRejection, decodeChromeServerRejection } from './chrome-server-error.js';
 import { isLineServerRejection } from './line-server-error.js';
-import { decryptLinejsHistoryMessages, fetchLinejsConversationCatalog, normalizeLinePicturePath, type DownloadedAttachment } from './linejs-adapter.js';
+import { decryptLinejsHistoryMessages, fetchLinejsConversationCatalog, fetchLinejsConversationDetails, normalizeLinePicturePath, type DownloadedAttachment } from './linejs-adapter.js';
 
 /** `SyncReason` values from the Chrome registry notes: catalog reads use 4, the message box list uses 2. */
 const CATALOG_SYNC_REASON = 4;
 const MESSAGE_BOX_SYNC_REASON = 2;
+/**
+ * Detail read for chats the catalog has not seen. Official ext 3.7.2: thunk talkChat/fetchTalkChats calls
+ * getChats({ chatMids, withMembers, withInvitees }, syncReason) in chunks of limit.sync.groups (100); its debounced
+ * unknown-chat helper uses UNKNOWN (1). Thunk contact/fetchContacts calls getContactsV2 in chunks of limit.sync.contacts (100);
+ * its debounced unknown-contact helper uses INITIALIZATION (2).
+ */
+const DETAIL_CHATS_SYNC_REASON = 1;
+const DETAIL_CONTACTS_SYNC_REASON = 2;
 /** `getPreviousMessagesV2WithRequest` sync reason (OkLine `SyncReason.OPERATION`). */
 const HISTORY_SYNC_REASON = 3;
 const CATALOG_BATCH_SIZE = 100;
@@ -366,6 +373,17 @@ export class ChromeAdapter implements LineTransport {
     return this.#run(this.#readContext(), () => fetchLinejsConversationCatalog(talk as Parameters<typeof fetchLinejsConversationCatalog>[0], (call) => call()));
   }
 
+  async listConversationDetails(chatIds: readonly string[]): Promise<readonly ConversationCatalogItem[]> {
+    this.#assertUsable();
+    const talk = {
+      getChats: ({ chatMids }: { chatMids: string[] }) => this.#gateway.call<{ chats?: readonly never[] }>('Talk.TalkService.getChats',
+        [{ chatMids, withMembers: true, withInvitees: true }, DETAIL_CHATS_SYNC_REASON], { mode: 'read' }),
+      getContactsV2: ({ mids }: { mids: string[] }) => this.#gateway.call<{ contacts?: unknown }>('Talk.TalkService.getContactsV2',
+        [{ targetUserMids: mids, neededContactCalendarEvents: [] }, DETAIL_CONTACTS_SYNC_REASON], { mode: 'read' }),
+    };
+    return this.#run(this.#readContext(), () => fetchLinejsConversationDetails(talk as Parameters<typeof fetchLinejsConversationDetails>[0], (call) => call(), chatIds));
+  }
+
   /** `getMessageBoxes [{...}, 2]` page by page (`minChatId` cursor, `hasNext`), as OkLine's chat list does. */
   async #readMessageBoxes(): Promise<{ messageBoxes: readonly { id?: unknown }[] }> {
     const boxes: { id?: unknown }[] = [];
@@ -624,20 +642,17 @@ export class ChromeAdapter implements LineTransport {
   // -- download --------------------------------------------------------------------------------------------------------
 
   async download(_kind: 'image' | 'video' | 'audio' | 'file', _messageId: string, _externalAttachmentId: string,
-    lineMessage: JsonValue, options: Readonly<{ signal: AbortSignal; maxBytes: number; identity: AttachmentDownloadIdentity;
-      nativeAttachment?: Extract<LineWorkerCommand, { type: 'downloadAttachment' }>['nativeAttachment'] }>): Promise<DownloadedAttachment> {
+    lineMessage: JsonValue, options: Readonly<{ signal: AbortSignal; maxBytes: number; identity: AttachmentDownloadIdentity }>): Promise<DownloadedAttachment> {
     if (this.#revoked || !this.#state.accessToken) throw new EffectDeniedError('OBS download requires login');
     const context = this.#readContext();
     try {
       return await this.#run(context, async () => {
         if (options.signal.aborted) throw options.signal.reason;
-        const native = options.nativeAttachment;
-        const nativeParsed = native ? validateNativeAttachment(native, options.identity, options.maxBytes) : null;
-        const parsed = nativeParsed ?? validateAttachmentMessage(lineMessage, options.identity, options.maxBytes);
-        let keyMaterial: Buffer | null = nativeParsed?.keyMaterial ?? null;
-        let name: string | null = nativeParsed?.fileName ?? null;
+        const parsed = validateAttachmentMessage(lineMessage, options.identity, options.maxBytes);
+        let keyMaterial: Buffer | null = null;
+        let name: string | null = null;
         let sealedKeyText: unknown;
-        if (parsed.encrypted && !native) {
+        if (parsed.encrypted) {
           // The sealed chunks carry ENC_KM / FILE_NAME; decrypting them is the only way to learn the file key.
           let decrypted: ChromeMessage;
           try { decrypted = await this.#e2ee.decrypt(parsed.message); }

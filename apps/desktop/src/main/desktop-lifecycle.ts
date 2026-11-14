@@ -24,6 +24,11 @@ export async function shutdownServices(steps: readonly (() => Promise<void>)[]):
     `Desktop shutdown failed: ${failures.map((error) => error instanceof Error ? error.message : String(error)).join('; ')}`);
 }
 
+/** Runs synchronous steps in order; a throwing step does not stop the next ones. Never throws. */
+export function runSessionEndSteps(steps: readonly (() => void)[]): void {
+  for (const step of steps) { try { step(); } catch { /* the next step must still run */ } }
+}
+
 export function createDesktopLifecycle(options: {
   starting?: boolean; hide: () => void; closeServices: () => Promise<void>; exit: () => void;
   relaunch?: () => void; reportFailure?: (failure: DesktopLifecycleFailure) => void | Promise<void>;

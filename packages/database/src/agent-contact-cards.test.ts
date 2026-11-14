@@ -28,16 +28,16 @@ const stored = (messageId: string, at: string, raw: unknown, content: unknown = 
 
 describe('contact card parsing', () => {
   it('reads the projected content and the live loginContact raw; unreadable rows are not cards', () => {
-    expect(parseStoredContact({ format: 1, type: 'contact', mid: MID, displayName: '徐佳誠' }, {})).toEqual({ mid: MID, displayName: '徐佳誠' });
-    expect(parseStoredContact(null, { loginContact: { mid: MID, displayName: '徐佳誠' } })).toEqual({ mid: MID, displayName: '徐佳誠' });
-    const native = plainEnvelope({ _id: 'x', _contentType: 13, _contentMetadata: JSON.stringify({ mid: MID, displayName: '徐佳誠' }) });
-    expect(parseStoredContact(null, { message: { id: 'x', contentType: 13 }, native })).toEqual({ mid: MID, displayName: '徐佳誠' });
-    expect(parseStoredContact(null, native)).toEqual({ mid: MID, displayName: '徐佳誠' });
+    expect(parseStoredContact({ format: 1, type: 'contact', mid: MID, displayName: '林曉安' }, {})).toEqual({ mid: MID, displayName: '林曉安' });
+    expect(parseStoredContact(null, { loginContact: { mid: MID, displayName: '林曉安' } })).toEqual({ mid: MID, displayName: '林曉安' });
+    const native = plainEnvelope({ _id: 'x', _contentType: 13, _contentMetadata: JSON.stringify({ mid: MID, displayName: '林曉安' }) });
+    expect(parseStoredContact(null, { message: { id: 'x', contentType: 13 }, native })).toEqual({ mid: MID, displayName: '林曉安' });
+    expect(parseStoredContact(null, native)).toEqual({ mid: MID, displayName: '林曉安' });
     expect(parseStoredContact(null, { format: 2, encoding: 'plain', table: '_message' })).toBeNull();
     expect(parseStoredContact(null, {})).toBeNull();
   });
   it('formats one line per card', () => {
-    expect(formatContactCardBlock([{ mid: MID, displayName: '徐佳誠' }, { mid: null, displayName: 'A' }])).toBe(`[聯絡人卡片] 徐佳誠（mid: ${MID}）\n[聯絡人卡片] A`);
+    expect(formatContactCardBlock([{ mid: MID, displayName: '林曉安' }, { mid: null, displayName: 'A' }])).toBe(`[聯絡人卡片] 林曉安（mid: ${MID}）\n[聯絡人卡片] A`);
   });
 });
 
@@ -45,9 +45,9 @@ describe('contact cards in the job prompt (query results)', () => {
   const current = text('m-text', '2026-10-28T02:10:00.000Z');
   it('adds the cards shared after the previous Agent job, oldest first', async () => {
     const db = fakeDb('2026-10-28T02:00:00.000Z', [
-      stored('c2', '2026-10-28T02:08:00.000Z', { loginContact: { mid: MID, displayName: '徐佳誠' } }),
+      stored('c2', '2026-10-28T02:08:00.000Z', { loginContact: { mid: MID, displayName: '林曉安' } }),
       stored('c1', '2026-10-28T02:05:00.000Z', { loginContact: { mid: 'u2', displayName: '王小明' } })]);
-    expect(await promptWithContactCards(db, current, 'ask')).toBe(`ask\n\n[聯絡人卡片] 王小明（mid: u2）\n[聯絡人卡片] 徐佳誠（mid: ${MID}）`);
+    expect(await promptWithContactCards(db, current, 'ask')).toBe(`ask\n\n[聯絡人卡片] 王小明（mid: u2）\n[聯絡人卡片] 林曉安（mid: ${MID}）`);
   });
   it('excludes a card older than the previous job or the 30 minute window', async () => {
     const db = fakeDb('2026-10-28T02:07:00.000Z', [stored('old', '2026-10-28T02:05:00.000Z', { loginContact: { mid: MID, displayName: '舊' } })]);
@@ -80,7 +80,7 @@ database('contact cards on PostgreSQL', () => {
        VALUES ('acc',$1,$2,'direct','uadmin',$3,$4,NULL,'live',$5,$6)`, [id, `ev-${id}`, sender, kind, at, JSON.stringify(raw)]);
     await insert('card-old', 'contact', '2026-10-28T02:01:00.000Z', 'uadmin', { loginContact: { mid: 'u-old', displayName: '舊卡' } });
     await insert('ask-1', 'text', '2026-10-28T02:03:00.000Z', 'uadmin', {});
-    await insert('card-new', 'contact', '2026-10-28T02:05:00.000Z', 'uadmin', { loginContact: { mid: MID, displayName: '徐佳誠' } });
+    await insert('card-new', 'contact', '2026-10-28T02:05:00.000Z', 'uadmin', { loginContact: { mid: MID, displayName: '林曉安' } });
     await insert('card-other', 'contact', '2026-10-28T02:06:00.000Z', 'someone-else', { loginContact: { mid: 'u-x', displayName: '別人' } });
     await pool.query(`INSERT INTO agent_jobs(job_id,account_id,chat_type,chat_id,provider,source_type,source_message_id,prompt,workspace_path,generation,status,creation_epoch)
       VALUES (gen_random_uuid(),'acc','direct','uadmin','codex','line','ask-1','ask','C:\\w',1,'completed',0)`);
@@ -89,6 +89,6 @@ database('contact cards on PostgreSQL', () => {
   it('returns only the sender cards that arrived after the previous job of the chat', async () => {
     const next = text('ask-2', '2026-10-28T02:10:00.000Z');
     expect((await recentContactCards(pool, next)).map((card) => card.messageId)).toEqual(['card-new']);
-    expect(await promptWithContactCards(pool, next, '我有修改他的暱稱了')).toBe(`我有修改他的暱稱了\n\n[聯絡人卡片] 徐佳誠（mid: ${MID}）`);
+    expect(await promptWithContactCards(pool, next, '我有修改他的暱稱了')).toBe(`我有修改他的暱稱了\n\n[聯絡人卡片] 林曉安（mid: ${MID}）`);
   });
 });

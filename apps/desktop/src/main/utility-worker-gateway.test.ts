@@ -317,53 +317,6 @@ describe('utility worker gateway', () => {
     }
   });
 
-  it('keeps a replacement download worker unready until restart adoption completes after auth events', async () => {
-    vi.useFakeTimers();
-    const children: FakeChild[] = [];
-    const gateway = createUtilityWorkerGateway({ spawn: () => { const child = new FakeChild(); children.push(child); return child; },
-      restartDelayMs: 5, pollIntervalMs: 60_000 });
-    const initial = { accountId: 'download-restart-ready', workerInstanceId: 'download-old', controlEpoch: 1,
-      mode: 'MONITOR_ONLY' as const, purpose: 'DOWNLOAD_ONLY' as const, expectedMid: 'verified-mid' };
-    let releaseRestart!: () => void;
-    let restartStarted!: () => void;
-    const restartStart = new Promise<void>((resolve) => { restartStarted = resolve; });
-    const restartHold = new Promise<void>((resolve) => { releaseRestart = resolve; });
-    gateway.onRestartBinding!(async () => { restartStarted(); await restartHold; });
-    try {
-      const started = await gateway.start(initial.accountId, initial);
-      children[0]!.emit({ type: 'modeAck', accountId: started.accountId, workerInstanceId: started.workerInstanceId,
-        controlEpoch: started.controlEpoch, transportOwnerId: started.transportOwnerId,
-        transportGeneration: started.transportGeneration, writeGrantVersion: started.writeGrantVersion,
-        mode: 'MONITOR_ONLY', drained: true });
-      children[0]!.crash();
-      await vi.advanceTimersByTimeAsync(5);
-      const restarted = await gateway.binding(initial.accountId);
-      expect(restarted).toMatchObject({ purpose: 'DOWNLOAD_ONLY', expectedMid: 'verified-mid' });
-      children[1]!.emit({ type: 'modeAck', accountId: initial.accountId, workerInstanceId: restarted!.workerInstanceId,
-        controlEpoch: initial.controlEpoch, mode: 'MONITOR_ONLY', drained: true });
-      await restartStart;
-      const { mode: _mode, purpose: _purpose, expectedMid: _expectedMid, application: _application, ...fields } = restarted!;
-      const command = { type: 'adoptDownloadAuth' as const, ...fields, requestId: 'restart-auth', token: 'verified-token',
-        application: 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64', expectedMid: 'verified-mid' };
-      const adopted = gateway.adoptDownloadAuth!(command);
-      children[1]!.emitRaw({ type: 'downloadAuthResult', accountId: command.accountId, workerInstanceId: command.workerInstanceId,
-        controlEpoch: command.controlEpoch, transportOwnerId: command.transportOwnerId, transportGeneration: command.transportGeneration,
-        writeGrantVersion: command.writeGrantVersion, requestId: command.requestId, accepted: true, error: null });
-      await expect(adopted).resolves.toMatchObject({ accepted: true });
-      children[1]!.emitRaw({ type: 'downloadReady', accountId: command.accountId, workerInstanceId: command.workerInstanceId,
-        controlEpoch: command.controlEpoch, transportOwnerId: command.transportOwnerId, transportGeneration: command.transportGeneration,
-        writeGrantVersion: command.writeGrantVersion, ownMid: 'verified-mid' });
-      expect(gateway.isDownloadReady!(restarted!)).toBe(false);
-      releaseRestart();
-      await vi.waitFor(() => expect(gateway.isDownloadReady!(restarted!)).toBe(true));
-    } finally {
-      releaseRestart();
-      for (const child of children) child.crash();
-      await gateway.shutdown();
-      vi.useRealTimers();
-    }
-  });
-
   it.each([
     ['welcome Agent', false, 'ACTIVE_CONTROL', 'sendText'],
     ['manual Agent', true, 'ACTIVE_CONTROL', 'manualSendText'],
@@ -775,16 +728,6 @@ describe('utility worker gateway', () => {
     expect(Object.hasOwn(children[2]!.posted[0] as object, 'trafficLogDir')).toBe(false);
     await logging.shutdown();
     await plain.shutdown();
-  });
-
-  it('refuses a CHROMEOS download-only worker before spawning', async () => {
-    const children: FakeChild[] = [];
-    const gateway = createUtilityWorkerGateway({ durableCursor: async () => null, chromeLtsmDir: 'C:/ltsm',
-      spawn: () => { const child = new FakeChild(); children.push(child); return child; } });
-    await expect(gateway.start('x', { accountId: 'x', workerInstanceId: 'w', controlEpoch: 1, mode: 'MONITOR_ONLY', purpose: 'DOWNLOAD_ONLY',
-      expectedMid: 'u0', lineTransport: 'CHROMEOS' })).rejects.toThrow(/download-only/);
-    expect(children).toHaveLength(0);
-    await gateway.shutdown();
   });
 
   it('preserves a newer explicit start intent when a stale stop targets the old child', async () => {
@@ -2001,6 +1944,32 @@ describe('utility worker gateway', () => {
     expect(catalogTitles).toEqual(['slow-first', 'latest-second']);
     expect(await gateway.binding(binding.accountId)).not.toBeNull();
     expect(child.killCount).toBe(0);
+    await gateway.shutdown();
+  });
+
+  it('merges a pending full catalog with a later detail catalog into one event', async () => {
+    const child = new FakeChild();
+    const gateway = createUtilityWorkerGateway({ spawn: () => child, pollIntervalMs: 60_000 });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const seen: string[][] = [];
+    gateway.onEvent(async (_instance, event) => {
+      if (event.type !== 'conversationCatalog') return;
+      seen.push(event.conversations.map((item) => `${item.chatId}:${item.title}`));
+      if (seen.length === 1) await firstGate;
+    });
+    const binding = { accountId: 'catalog-merge', workerInstanceId: 'merge-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' as const };
+    await gateway.start(binding.accountId, binding);
+    const eventBase = { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch };
+    const catalog = (items: readonly (readonly [string, string])[]) => ({ type: 'conversationCatalog', ...eventBase,
+      conversations: items.map(([chatId, title]) => ({ chatType: 'group', chatId, title, members: [] })) });
+    child.emit(catalog([['c0', 'blocker']]));
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    child.emit(catalog([['c1', 'one'], ['c2', 'two']]));
+    child.emit(catalog([['c2', 'two-new'], ['c3', 'three']]));
+    releaseFirst();
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    expect(seen[1]).toEqual(['c1:one', 'c2:two-new', 'c3:three']);
     await gateway.shutdown();
   });
 

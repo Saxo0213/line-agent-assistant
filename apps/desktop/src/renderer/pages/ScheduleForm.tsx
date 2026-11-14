@@ -9,12 +9,13 @@ import {
   buildPreviewInput, buildScheduleInput, defaultFormState, formStateFromSchedule, formUsesLlm, isProgramTask, previewNextFire, recurrenceFromForm, shortWall, targetKeyOf, taskChangePatch,
   type FormError, type FormErrors, type RecurrenceKind, type ScheduleFormState,
 } from '../scheduleForm.js';
-import { AGENT_ROOM_ID, AGENT_SCHEDULE_DEFAULT_TIMEZONE, AGENT_SCHEDULE_JITTER_MAX_MINUTES, type AgentScheduleCreateInput } from '@line-agent/contracts';
+import { AGENT_ROOM_ID, AGENT_SCHEDULE_DEFAULT_TIMEZONE, AGENT_SCHEDULE_JITTER_MAX_MINUTES, AGENT_SCHEDULE_MENTION_MEMBERS_MAX, type AgentScheduleCreateInput } from '@line-agent/contracts';
 import { readAgentProvider } from '../agentProviderMemory.js';
 import { KIND_TASKS, kindOfTask, type ScheduleKind } from '../scheduleRules.js';
 import { ScheduleRulesEditor } from './ScheduleRulesEditor.js';
 import { NewMessagesPreview } from './ScheduleNewMessagesPreview.js';
 import { ScheduleForwardSender } from './ScheduleForwardSender.js';
+import { ScheduleMentionMembers } from './ScheduleMentionMembers.js';
 
 /** Providers the Agent room can run a job with (signed in, or status not yet known); all of them while the status list is empty. */
 export function availableProviders(providers: readonly ProviderStatus[] | undefined): Array<'codex' | 'claude'> {
@@ -62,8 +63,8 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
   const dialogRef = useRef<HTMLElement>(null);
   const [initialJson] = useState(() => JSON.stringify(form));
   const [failTick, setFailTick] = useState(0);
-  const ids = { messageText: useId(), title: useId(), prompt: useId(), focus: useId(), time: useId(), once: useId(), minutes: useId(), anchor: useId(), cron: useId(), lookback: useId(), provider: useId(), jitter: useId(), heading: useId(), enabled: useId() };
-  const errorIds = { messageText: useId(), title: useId(), prompt: useId(), targets: useId(), keywords: useId(), rules: useId(), focus: useId(), recurrence: useId(), window: useId(), delivery: useId() };
+  const ids = { messageText: useId(), title: useId(), prompt: useId(), focus: useId(), time: useId(), once: useId(), minutes: useId(), anchor: useId(), cron: useId(), lookback: useId(), provider: useId(), jitter: useId(), heading: useId(), enabled: useId(), agentPrompt: useId() };
+  const errorIds = { messageText: useId(), title: useId(), prompt: useId(), targets: useId(), keywords: useId(), rules: useId(), focus: useId(), recurrence: useId(), window: useId(), delivery: useId(), mention: useId(), actions: useId(), agentPrompt: useId(), agentTarget: useId() };
   const set = (patch: Partial<ScheduleFormState>) => { setForm((current) => ({ ...current, ...patch })); setServerError(''); };
 
   useEffect(() => { titleRef.current?.focus(); }, []);
@@ -102,12 +103,22 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
   const showsWindow = !isMessage && !isForward && (form.taskType !== 'custom' || form.targets.length > 0);
   const promptLength = form.prompt.trim().length;
   const messageLength = form.messageText.trim().length;
+  const agentPromptLength = form.agentPrompt.trim().length;
   const zone = form.timezone === AGENT_SCHEDULE_DEFAULT_TIMEZONE ? '' : form.timezone;
   const nextLine = next ? (zone ? text('nextPreviewZone', { arg0: shortWall(next.toISOString(), form.timezone), arg1: zone }) : text('nextPreview', { arg0: shortWall(next.toISOString(), form.timezone) }))
     : 'recurrence' in liveRecurrence ? text('nextPreviewNone') : '';
   const choose = (value: boolean, label: ScheduleCopyKey, onClick: () => void, extra?: string) => <button type="button" role="radio" aria-checked={value} className={value ? 'active' : undefined} onClick={onClick}>{text(label)}{extra}</button>;
   const onceDate = form.onceAt.slice(0, 10);
   const onceTime = form.onceAt.slice(11, 16);
+
+  /** First use of the Agent action: the administrator's direct chat is the output chat, when the list has it. A chat that the user picked first is kept. */
+  function defaultAgentTarget() {
+    if (form.agentTarget) return;
+    void api.listAgentScheduleTargets('', 20, 'delivery').then((items) => {
+      const admin = items.find((item) => item.role === 'primary_admin');
+      if (admin) setForm((current) => current.agentTarget ? current : { ...current, agentTarget: toSendTarget(admin) });
+    }, () => undefined);
+  }
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -173,9 +184,14 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
         {isForward && <fieldset className="schedule-field">
           <legend className="schedule-label">{text('forwardEvent')}</legend>
           <label>{text('forwardMatch')}<select aria-label={text('forwardMatch')} value={form.forwardMode} onChange={(event)=>set({forwardMode:event.target.value as ScheduleFormState['forwardMode']})}>
-            <option value="contains">{text('forwardContains')}</option><option value="exact">{text('forwardExact')}</option><option value="sender">{text('forwardSender')}</option>
+            <option value="contains">{text('forwardContains')}</option><option value="exact">{text('forwardExact')}</option><option value="sender">{text('forwardSender')}</option><option value="mention">{text('forwardMention')}</option>
           </select></label>
-          {form.forwardMode!=='sender' && <label>{text('forwardText')}<textarea aria-label={text('forwardText')} value={form.forwardText} onChange={(event)=>set({forwardText:event.target.value})}/></label>}
+          {(form.forwardMode==='contains'||form.forwardMode==='exact') && <label>{text('forwardText')}<textarea aria-label={text('forwardText')} value={form.forwardText} onChange={(event)=>set({forwardText:event.target.value})}/></label>}
+          {form.forwardMode==='mention' && <>
+            <label className="schedule-check"><input type="checkbox" checked={form.mentionAdmin} onChange={(event)=>set({mentionAdmin:event.target.checked})}/>{text('mentionAdmin')}</label>
+            <ScheduleMentionMembers api={api} text={text} members={form.mentionMembers} max={AGENT_SCHEDULE_MENTION_MEMBERS_MAX} onChange={(mentionMembers)=>set({mentionMembers})} error={visible.mention} errorId={errorIds.mention}/>
+            <label className="schedule-check"><input type="checkbox" checked={form.mentionAll} onChange={(event)=>set({mentionAll:event.target.checked})}/>{text('mentionAll')}</label>
+          </>}
           <ScheduleForwardSender api={api} targets={form.targets} accountId={form.senderAccount} mid={form.senderMid} savedLabel={form.senderLabel} text={text}
             onSelect={(sender)=>set({senderAccount:sender?.accountId??'',senderMid:sender?.mid??'',senderLabel:sender?.label??''})}/>
           <details><summary>{text('forwardAdvancedSender')}</summary>
@@ -185,7 +201,7 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
           <label>{text('forwardSenderMid')}<input aria-label={text('forwardSenderMid')} value={form.senderMid} onChange={(event)=>set({senderMid:event.target.value})}/></label>
           <label>{text('forwardSenderLabel')}<input aria-label={text('forwardSenderLabel')} value={form.senderLabel} onChange={(event)=>set({senderLabel:event.target.value})}/></label>
           </details>
-          <p className="schedule-hint">{text('forwardLiteral')}</p><p className="schedule-hint">{text('forwardTextOnly')}</p>{err('rules',errorIds.rules)}
+          <p className="schedule-hint">{text('forwardLiteral')}</p>{form.forwardMode!=='mention' && <p className="schedule-hint">{text('forwardTextOnly')}</p>}{err('rules',errorIds.rules)}
         </fieldset>}
 
         {form.taskType === 'summary' && <div className="schedule-field">
@@ -203,7 +219,7 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
           {err('messageText', errorIds.messageText)}
         </div>}
 
-        {!isMessage && <ChatCombobox api={api} text={text} label={text('fieldTargets')} purpose="read" selected={form.targets} max={AGENT_SCHEDULE_MAX_TARGETS} onChange={(targets) => set({ targets })} error={visible.targets} errorId={errorIds.targets} hint={form.taskType === 'custom' ? text('targetsOptionalHint') : isNewMessages ? text('newMessagesTargetsHint') : undefined} />}
+        {!isMessage && <ChatCombobox api={api} text={text} label={text('fieldTargets')} purpose="read" selected={form.targets} max={AGENT_SCHEDULE_MAX_TARGETS} onChange={(targets) => set({ targets })} error={visible.targets} errorId={errorIds.targets} hint={form.taskType === 'custom' ? text('targetsOptionalHint') : isForward ? text('forwardSourcesAllHint') : isNewMessages ? text('newMessagesTargetsHint') : undefined} />}
 
         {usesLlm && <div className="schedule-field">
           <label htmlFor={ids.prompt} className="schedule-label">{form.taskType === 'custom' ? text('fieldPromptCustom') : text('fieldPromptExtra')}</label>
@@ -252,22 +268,42 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
           {err('window', errorIds.window)}
         </fieldset>}
 
-        <fieldset className="schedule-field">
+        {isForward && <fieldset className="schedule-field">
+          <legend className="schedule-label">{text('fieldActions')}</legend>
+          <label className="schedule-check"><input type="checkbox" checked={form.actForward} onChange={(event)=>set({actForward:event.target.checked,...(event.target.checked?{deliveryMode:'line_target' as const}:{})})}/>{text('actionForward')}</label>
+          {form.actForward && <ChatCombobox api={api} text={text} label={text('fieldDeliveryTarget')} purpose="delivery" selected={form.deliveryTarget ? [form.deliveryTarget] : []} max={1}
+            onChange={(targets) => set({ deliveryTarget: targets[0] ? toSendTarget(targets[0]) : null })} error={visible.delivery} errorId={errorIds.delivery} />}
+          <label className="schedule-check"><input type="checkbox" checked={form.actNotify} onChange={(event)=>set({actNotify:event.target.checked})}/>{text('actionNotify')}</label>
+          <label className="schedule-check"><input type="checkbox" checked={form.actAgent} onChange={(event)=>{ set({actAgent:event.target.checked}); if(event.target.checked) defaultAgentTarget(); }}/>{text('actionAgent')}</label>
+          {form.actAgent && <>
+            <div className="schedule-field">
+              <label htmlFor={ids.agentPrompt} className="schedule-label">{text('fieldAgentPrompt')}</label>
+              <textarea name="agent-prompt" autoComplete="off" id={ids.agentPrompt} value={form.agentPrompt} onChange={(event) => set({ agentPrompt: event.target.value })} {...invalid('agentPrompt', errorIds.agentPrompt)} />
+              <p className={agentPromptLength > AGENT_SCHEDULE_PROMPT_MAX ? 'schedule-hint schedule-error' : 'schedule-hint'} aria-live={agentPromptLength > AGENT_SCHEDULE_PROMPT_MAX ? 'polite' : undefined}>{text('promptCounter', { arg0: agentPromptLength, arg1: AGENT_SCHEDULE_PROMPT_MAX })}</p>
+              {err('agentPrompt', errorIds.agentPrompt)}
+            </div>
+            <ChatCombobox api={api} text={text} label={text('fieldAgentTarget')} purpose="delivery" selected={form.agentTarget ? [form.agentTarget] : []} max={1}
+              onChange={(targets) => set({ agentTarget: targets[0] ? toSendTarget(targets[0]) : null })} error={visible.agentTarget} errorId={errorIds.agentTarget} />
+          </>}
+          {err('actions', errorIds.actions)}
+        </fieldset>}
+
+        {!isForward && <fieldset className="schedule-field">
           <legend className="schedule-label">{text('fieldDelivery')}</legend>
           <div className="segmented schedule-segmented" role="radiogroup" aria-label={text('fieldDelivery')}>
-            {!isForward && choose(form.deliveryMode === 'primary_admin', 'deliveryOptionPrimaryAdmin', () => set({ deliveryMode: 'primary_admin' }))}
+            {choose(form.deliveryMode === 'primary_admin', 'deliveryOptionPrimaryAdmin', () => set({ deliveryMode: 'primary_admin' }))}
             {!isProgram && choose(form.deliveryMode === 'record_only', 'deliveryOptionRecordOnly', () => set({ deliveryMode: 'record_only' }))}
             {choose(form.deliveryMode === 'line_target', 'deliveryOptionLine', () => set({ deliveryMode: 'line_target' }))}
           </div>
           {form.deliveryMode === 'line_target' && <ChatCombobox api={api} text={text} label={text('fieldDeliveryTarget')} purpose="delivery" selected={form.deliveryTarget ? [form.deliveryTarget] : []} max={1}
             onChange={(targets) => set({ deliveryTarget: targets[0] ? toSendTarget(targets[0]) : null })} error={visible.delivery} errorId={errorIds.delivery} />}
-        </fieldset>
+        </fieldset>}
 
         {isNewMessages && <NewMessagesPreview api={api} text={text} timezone={form.timezone} formKey={JSON.stringify(form)}
           buildInput={() => buildPreviewInput(form).input ?? null} onInvalid={() => { setPreviewTried(true); setFailTick((tick) => tick + 1); }} />}
 
         <div className="schedule-settings">
-          {usesLlm && <><label htmlFor={ids.provider} className="schedule-label">{text('fieldProvider')}</label>
+          {(usesLlm || (isForward && form.actAgent)) && <><label htmlFor={ids.provider} className="schedule-label">{text('fieldProvider')}</label>
             <select name="provider" id={ids.provider} value={form.provider} onChange={(event) => set({ provider: event.target.value as 'codex' | 'claude' })}>{providerOptions.map((provider) => <option key={provider} value={provider}>{provider === 'claude' ? 'Claude' : 'Codex'}</option>)}</select></>}
           <span className="schedule-label" id={ids.enabled}>{text('fieldEnabled')}</span>
           <button type="button" role="switch" aria-checked={form.enabled} aria-labelledby={ids.enabled} className="schedule-switch" onClick={() => set({ enabled: !form.enabled })}><span className="schedule-switch-thumb" /></button>

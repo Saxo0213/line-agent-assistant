@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
 import type { LineWorkerEvent } from '@line-agent/contracts';
@@ -174,6 +175,80 @@ database('atomic batch ingestion on PostgreSQL', () => {
       WHERE a.account_id='batch-account' AND m.message_id=$1`, [messageId]);
     expect(projected.rows[0]).toMatchObject({ text_content: 'before', content: { type: 'unsent' },
       metadata: { UNSENT: true }, observation_id: messageId, batch_id: expect.stringMatching(/^manual-unsend:/), observations: '1', batches: '1' });
+  });
+
+  describe('observed LINE unsend operations', () => {
+    const DIRECT = `u${'1'.repeat(32)}`;
+    const OTHER_DIRECT = `u${'3'.repeat(32)}`;
+    const GROUP = `c${'2'.repeat(32)}`;
+    const stateOf = async (messageId: string) => (await pool.query(`SELECT content,text_content,(recalled_at IS NOT NULL) AS recalled,
+      raw->'recall'->'original' AS original FROM messages WHERE account_id='batch-account' AND message_id=$1`, [messageId])).rows[0];
+    const stored = (messageId: string, chatType: 'direct' | 'group', chatId: string, senderId: string) => ({
+      ...batch(messageId, '1').envelopes[0]!, messageId, accountId: 'batch-account', chatType, chatId, senderId, text: 'before',
+      ingestion: { source: 'history' as const, cursor: null },
+      raw: { revision: 1, message: { id: messageId, contentType: 0, text: 'before' } } });
+    const nextBatch = async (envelopes: Batch['envelopes'], unsends: NonNullable<Batch['unsends']>): Promise<Batch> => {
+      const row = await pool.query<{ cursor: { revision: string } }>(
+        "SELECT cursor FROM external_source_checkpoints WHERE account_id='batch-account'");
+      const before = row.rows[0]!.cursor.revision;
+      const revision = String(Number(before) + 1);
+      return { ...batch('unused', revision), batchId: `observed-unsend-${randomUUID()}`, cursorBefore: cursor(before),
+        cursorAfter: cursor(revision), envelopes, ...(unsends.length === 0 ? {} : { unsends }) };
+    };
+    const unsend = (chatId: string, messageId: string, kind: 'self' | 'notified' = 'self') =>
+      ({ chatId, messageId, kind, observedAt: '2026-11-11T01:02:03.000Z' });
+
+    it('gives an own message the same row state as the manual unsend path', async () => {
+      const manualId = '640083256712626001';
+      const observedId = '640083256712626002';
+      await repo.ingestAndRoute(stored(manualId, 'direct', DIRECT, 'batch-own-mid'), { eligible: false });
+      await repo.ingestAndRoute(stored(observedId, 'direct', DIRECT, 'batch-own-mid'), { eligible: false });
+      expect(await repo.recordManualUnsend({ accountId: 'batch-account', chatType: 'direct', chatId: DIRECT }, manualId, 'batch-own-mid')).toBe(true);
+      const result = await repo.ingestBatchAndRoute(await nextBatch([], [unsend(DIRECT, observedId)]), []);
+      expect(result.changedMessageIds).toEqual([observedId]);
+      const manual = await stateOf(manualId);
+      const observed = await stateOf(observedId);
+      expect(observed).toEqual(manual);
+      expect(observed).toMatchObject({ content: { type: 'unsent', format: 1 }, recalled: true });
+    });
+
+    it('unsends another member message in a group and treats a repeat as a no-op', async () => {
+      const messageId = '640083256712626003';
+      await repo.ingestAndRoute(stored(messageId, 'group', GROUP, 'someone-else'), { eligible: false });
+      const first = await repo.ingestBatchAndRoute(await nextBatch([], [unsend(GROUP, messageId, 'notified')]), []);
+      expect(first.changedMessageIds).toEqual([messageId]);
+      const afterFirst = await stateOf(messageId);
+      expect(afterFirst).toMatchObject({ content: { type: 'unsent', format: 1 }, recalled: true });
+      const repeat = await repo.ingestBatchAndRoute(await nextBatch([], [unsend(GROUP, messageId, 'notified')]), []);
+      expect(repeat.changedMessageIds).toEqual([]);
+      expect(await stateOf(messageId)).toEqual(afterFirst);
+    });
+
+    it('skips an unknown message and a message in another chat without failing the batch', async () => {
+      const messageId = '640083256712626004';
+      await repo.ingestAndRoute(stored(messageId, 'direct', DIRECT, 'batch-own-mid'), { eligible: false });
+      const before = await stateOf(messageId);
+      const input = await nextBatch([], [unsend(DIRECT, '640083256712626999'), unsend(OTHER_DIRECT, messageId)]);
+      const result = await repo.ingestBatchAndRoute(input, []);
+      expect(result.changedMessageIds).toEqual([]);
+      expect(await stateOf(messageId)).toEqual(before);
+      const checkpoint = await pool.query("SELECT cursor FROM external_source_checkpoints WHERE account_id='batch-account'");
+      expect(checkpoint.rows[0]!.cursor.revision).toBe(input.cursorAfter.revision);
+    });
+
+    it('applies an unsend that arrives in the same batch as its message and replays idempotently', async () => {
+      const messageId = '640083256712626005';
+      const live = { ...stored(messageId, 'direct', DIRECT, 'batch-own-mid'), ingestion: { source: 'live' as const, cursor: null } };
+      const input = await nextBatch([live], [unsend(DIRECT, messageId)]);
+      const result = await repo.ingestBatchAndRoute(input, [{ eligible: false }]);
+      expect(result).toMatchObject({ inserted: 1 });
+      expect(result.changedMessageIds).toEqual([messageId]);
+      const applied = await stateOf(messageId);
+      expect(applied).toMatchObject({ content: { type: 'unsent', format: 1 }, recalled: true });
+      const replay = await repo.ingestBatchAndRoute(input, [{ eligible: false }]);
+      expect(replay.changedMessageIds).toEqual([]);
+      expect(await stateOf(messageId)).toEqual(applied);
+    });
   });
 
   it('serializes manual unsend before concurrent recall and stale login observations', async () => {

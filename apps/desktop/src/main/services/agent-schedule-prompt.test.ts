@@ -84,7 +84,7 @@ describe('visible schedule card', () => {
 describe('hidden schedule run context', () => {
   it('states the paging rule and keeps the no-retry rule for sending only', () => {
     const input = { title: '社群', prompt: '', task: { type: 'summary' as const }, targets: [community], delivery: { mode: 'primary_admin' as const }, window: range };
-    const context = composeScheduleRunContext({ ...input, adminChat: { accountId: 'acc-1', chatId: 'uadmin', title: '徐佳誠' } });
+    const context = composeScheduleRunContext({ ...input, adminChat: { accountId: 'acc-1', chatId: 'uadmin', title: '林曉安' } });
     expect(context).toContain('每頁最多 200 則');
     expect(context).toContain('hasMore');
     expect(context).toContain('cursor=nextCursor');
@@ -95,7 +95,7 @@ describe('hidden schedule run context', () => {
 
   it('summary of a community, delivered to the administrator', () => {
     const input = { title: '社群', prompt: '', task: { type: 'summary' as const }, targets: [community], delivery: { mode: 'primary_admin' as const }, window: range };
-    const context = composeScheduleRunContext({ ...input, adminChat: { accountId: 'acc-1', chatId: 'uadmin', title: '徐佳誠' } });
+    const context = composeScheduleRunContext({ ...input, adminChat: { accountId: 'acc-1', chatId: 'uadmin', title: '林曉安' } });
     expect(context).toMatchInlineSnapshot(`
       "【排程規則】無人值守：不要提問或等待確認；資訊不足就盡力完成並註明缺少什麼。
       時間：10/28 01:15–07:15（台灣時間）；查詢用 UTC from=2026-10-27T17:15:00.000Z to=2026-10-27T23:15:00.000Z
@@ -108,7 +108,7 @@ describe('hidden schedule run context', () => {
       決議／待辦：• [名稱]－事項－期限（沒有就省略）
       未解問題：• …（沒有就省略）
       每區塊最多 15 行；沒有訊息時只寫一行「<名稱>：此時段無訊息」。
-      人名規則：結果中每個人的顯示名稱一律寫成 [名稱]（半形方括號），例如「• 01:31 [紅點點] 分享因搬出國與規則限制而停卡」；不明發言者寫 [未知]；非人名的詞不加括號；聊天室標題維持【】，人名不用【】。
+      人名規則：結果中每個人的顯示名稱一律寫成 [名稱]（半形方括號），例如「• 01:31 [小藍點] 分享因搬出國與規則限制而停卡」；不明發言者寫 [未知]；非人名的詞不加括號；聊天室標題維持【】，人名不用【】。
       輸出：用 send_to_target 傳給管理員（accountId=acc-1，chatType=direct，chatId=uadmin）。只傳結果本身（純文字、不要 Markdown、不加說明）；你的回覆貼同一份文字。傳送失敗或結果不明時不要重試，在回覆說明原因（此規則只適用於傳送與真正的錯誤，分頁不算錯誤，必須繼續查下一頁）。"
     `);
     expect(context.length).toBeLessThanOrEqual(1200);
@@ -124,7 +124,7 @@ describe('hidden schedule run context', () => {
       來源（用 query_target_messages_by_time 逐一查到 hasMore=false，只查上述時間）：
       • 專案群（accountId=acc-1，chatType=group，chatId=c0123）
       任務：關鍵字彙整（不分大小寫）：「請款」。每個來源一個區塊，標題「【<名稱>】」，其下每則一行「• HH:mm [發言者]：內容」（台灣時間），最多 20 則，超過寫「另有 N 則」；沒有符合時寫「<名稱>：此時段無符合訊息」。純文字。
-      人名規則：結果中每個人的顯示名稱一律寫成 [名稱]（半形方括號），例如「• 01:31 [紅點點] 分享因搬出國與規則限制而停卡」；不明發言者寫 [未知]；非人名的詞不加括號；聊天室標題維持【】，人名不用【】。
+      人名規則：結果中每個人的顯示名稱一律寫成 [名稱]（半形方括號），例如「• 01:31 [小藍點] 分享因搬出國與規則限制而停卡」；不明發言者寫 [未知]；非人名的詞不加括號；聊天室標題維持【】，人名不用【】。
       輸出：結果直接作為回覆，只保存在排程紀錄，不傳送到任何聊天室。
       補充：只看昨天的"
     `);

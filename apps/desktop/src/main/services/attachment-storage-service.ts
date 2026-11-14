@@ -234,11 +234,14 @@ export class AttachmentStorageService {
     const root=job.targetKind==='secondary'?setting!.secondaryRoot!:this.options.attachmentRoot;
     const identity={accountId:attachment.accountId,chatType:job.chatType,chatId:attachment.chatId,messageId:attachment.messageId,externalAttachmentId:attachment.externalAttachmentId};
     const sender={id:attachment.senderId??'unknown',displayName:attachment.senderDisplayName??null};
-    const target=buildAttachmentLocation({root,identity,occurredAt:attachment.occurredAt,originalFileName:attachment.name??'attachment.bin',sender,
+    // An unnamed attachment keeps the file name it already has, so a copy keeps the extension chosen from its bytes.
+    const storedName=attachment.relativePath.split('/').at(-1)??'';
+    const originalFileName=attachment.name??(/^attachment\.(?:jpg|png|gif|webp)$/.test(storedName)?storedName:'attachment.bin');
+    const target=buildAttachmentLocation({root,identity,occurredAt:attachment.occurredAt,originalFileName,sender,
       ...(job.targetKind==='secondary'?{layout:'secondary' as const}:{layout:'primary' as const})});
     const source=await this.openManagedSource(attachment.relativePath);
     try{
-      const copied=await storeAttachment({root,identity,occurredAt:attachment.occurredAt,originalFileName:attachment.name??'attachment.bin',sender,
+      const copied=await storeAttachment({root,identity,occurredAt:attachment.occurredAt,originalFileName,sender,
         ...(job.targetKind==='secondary'?{layout:'secondary' as const}:{layout:'primary' as const}),source:this.verifiedSource(source,attachment,signal),
         maxBytes:Math.max(attachment.sizeBytes,1),timeoutMs:120_000,signal},
         this.options.windowsSafetyBroker?{windowsSafetyBroker:this.options.windowsSafetyBroker}:{});

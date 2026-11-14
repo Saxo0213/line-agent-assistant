@@ -1,7 +1,6 @@
 import { z } from 'zod';
 import { DIAGNOSTIC_DETAIL_PATTERN, SafeDiagnosticSchema, SendDetailSchema } from './diagnostics.js';
-import { AccountModeSchema, CHROMEOS_APPLICATION, resolveLineTransport, WritableConversationKeySchema, WorkerBindingSchema } from './account.js';
-import { NativeAttachmentDownloadInputSchema } from './native-source.js';
+import { AccountModeSchema, resolveLineTransport, WritableConversationKeySchema, WorkerBindingSchema } from './account.js';
 import { JsonValueSchema } from './json.js';
 import { AttachmentResultSchema, InboundEnvelopeSchema, OutgoingMentionSchema, OUTGOING_MENTIONS_MAX, outgoingMentionsIssue } from './line.js';
 import { lineServerErrorMessage, type LineServerErrorCode } from './line-server-error.js';
@@ -23,6 +22,15 @@ export const ReadReceiptSchema = z.strictObject({
 });
 export type ReadReceiptDto = z.infer<typeof ReadReceiptSchema>;
 
+/** A LINE unsend operation (OpType 64 or 65) seen by the login source. messageId is a signed 64-bit decimal. */
+export const UnsendSchema = z.strictObject({
+  chatId: z.string().regex(/^[ucr][0-9a-f]{32}$/),
+  messageId: Decimal,
+  kind: z.enum(['self', 'notified']),
+  observedAt: z.iso.datetime({ offset: true }),
+});
+export type UnsendDto = z.infer<typeof UnsendSchema>;
+
 const Bound = WorkerBindingSchema;
 export const WORKER_PROTOCOL_VERSION = 4 as const;
 export const WORKER_ERROR_CODES = ['INVALID_COMMAND', 'QUEUE_FULL', 'CATALOG_REFRESH_FAILED', 'WORKER_OPERATION_FAILED',
@@ -36,8 +44,6 @@ const UserMid = z.string().regex(/^u[0-9a-fA-F]{32}$/);
 const SourceChatMid = z.string().regex(/^[ucr][0-9a-fA-F]{32}$/);
 const Conversation = Bound.merge(WritableConversationKeySchema);
 const LoginAttempt = Bound.extend({ loginAttemptId: Id });
-export const WorkerPurposeSchema = z.enum(['STANDARD', 'DOWNLOAD_ONLY']);
-export type WorkerPurpose = z.infer<typeof WorkerPurposeSchema>;
 export const LOGIN_FAILURES = {
   LOGIN_TIMEOUT: 'LINE login timed out. Try again.',
   LOGIN_IN_PROGRESS: 'A LINE login is already in progress.',
@@ -67,17 +73,6 @@ export const ConversationCatalogItemSchema = z.strictObject({
   members: z.array(ConversationCatalogMemberSchema),
 });
 export type ConversationCatalogItem = z.infer<typeof ConversationCatalogItemSchema>;
-
-export const DownloadAuthProbeSchema = z.strictObject({
-  chatType: z.enum(['direct', 'group', 'room']),
-  chatId: Id,
-  messageId: Id,
-  externalAttachmentId: Id,
-  kind: z.enum(['image', 'video', 'audio', 'file']),
-  lineMessage: JsonValueSchema,
-  nativeAttachment: NativeAttachmentDownloadInputSchema.optional(),
-});
-export type DownloadAuthProbe = z.infer<typeof DownloadAuthProbeSchema>;
 
 export const MEDIA_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 export const MEDIA_FILE_MAX_BYTES = 100 * 1024 * 1024;
@@ -146,7 +141,6 @@ export const ChatResourceReadResultSchema = Conversation.extend({ type: z.litera
 
 export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Bound.extend({ type: z.literal('init'), protocolVersion: z.literal(WORKER_PROTOCOL_VERSION), mode: AccountModeSchema, durableCursor: TalkCursorV1Schema,
-    purpose: WorkerPurposeSchema.optional(), expectedMid: Id.optional(), application: z.string().min(1).max(512).optional(),
     /** Absolute path of the ltsm store root under app userData. Only meaningful (and only allowed) for CHROMEOS. */
     chromeLtsmDir: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/).optional(),
     /** Absolute path of the LINE traffic log directory under app userData. A worker without it does not log. */
@@ -155,15 +149,7 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
       if (command.chromeLtsmDir !== undefined) context.addIssue({ code: 'custom', path: ['chromeLtsmDir'], message: 'chromeLtsmDir requires lineTransport CHROMEOS' });
       return;
     }
-    if (command.application !== undefined && command.application !== CHROMEOS_APPLICATION) {
-      context.addIssue({ code: 'custom', path: ['application'], message: 'CHROMEOS application must be absent or the pinned CHROMEOS value' });
-    }
-    if (command.purpose === 'DOWNLOAD_ONLY') {
-      context.addIssue({ code: 'custom', path: ['purpose'], message: 'CHROMEOS has no download-only auth' });
-    }
   }),
-  Bound.extend({ type: z.literal('adoptDownloadAuth'), requestId: Id, token: z.string().min(1).max(1024),
-    application: z.string().min(1).max(512), expectedMid: Id, probe: DownloadAuthProbeSchema.optional() }),
   LoginAttempt.extend({ type: z.literal('loginQr') }),
   LoginAttempt.extend({ type: z.literal('loginToken') }),
   LoginAttempt.extend({ type: z.literal('setSecretState'), secrets: Secrets }),
@@ -197,7 +183,7 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Conversation.extend({ type: z.literal('unsendMessage'), requestId: Id, messageId: Decimal }),
   Bound.extend({ type: z.literal('checkFriendRelation'), requestId: Id, targetMid: UserMid }),
   Bound.extend({ type: z.literal('addFriendByMid'), requestId: Id, targetMid: UserMid, sourceChatMid: SourceChatMid.optional() }),
-  Conversation.extend({ type: z.literal('downloadAttachment'), requestId: Id, attemptToken: z.uuid(), messageId: Id, attachmentId: z.uuid(), externalAttachmentId: Id, kind: z.enum(['image', 'video', 'audio', 'file']), occurredAt: z.iso.datetime({ offset: true }), originalFileName: z.string(), senderId: Id.optional(), senderDisplayName: z.string().max(256).nullable().optional(), lineMessage: JsonValueSchema, nativeAttachment: NativeAttachmentDownloadInputSchema.optional(), maxBytes: z.number().int().positive(), timeoutMs: z.number().int().positive() }),
+  Conversation.extend({ type: z.literal('downloadAttachment'), requestId: Id, attemptToken: z.uuid(), messageId: Id, attachmentId: z.uuid(), externalAttachmentId: Id, kind: z.enum(['image', 'video', 'audio', 'file']), occurredAt: z.iso.datetime({ offset: true }), originalFileName: z.string(), senderId: Id.optional(), senderDisplayName: z.string().max(256).nullable().optional(), lineMessage: JsonValueSchema, maxBytes: z.number().int().positive(), timeoutMs: z.number().int().positive() }),
   Bound.extend({ type: z.literal('cancelAttachmentDownload'), attachmentId: z.uuid(), attemptToken: z.uuid() }),
   Bound.extend({ type: z.literal('revokeControl') }),
   Bound.extend({ type: z.literal('stop') }),
@@ -215,9 +201,6 @@ export const LineWorkerEventSchema = z.union([
   Bound.extend({ type: z.literal('workerProtocolAck'), protocolVersion: z.literal(WORKER_PROTOCOL_VERSION), manualSend: z.literal(true) }),
   Bound.extend({ type: z.literal('authInvalidated') }),
   Bound.extend({ type: z.literal('syncConfirmed') }),
-  Bound.extend({ type: z.literal('downloadAuthResult'), requestId: Id, accepted: z.boolean(), error: z.enum(['PROFILE_MISMATCH', 'AUTH_UNAVAILABLE', 'APPLICATION_MISMATCH']).nullable() }),
-  Bound.extend({ type: z.literal('downloadAuthInvalidated') }),
-  Bound.extend({ type: z.literal('downloadReady'), ownMid: Id }),
   Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('degraded'), code: z.literal('CATALOG_REFRESH_FAILED'),
     serverError: z.string().max(80).refine((value) => lineServerErrorMessage(value) !== null).optional() }),
   Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('ready'), code: z.literal('CATALOG_REFRESH_RECOVERED') }),
@@ -233,7 +216,8 @@ export const LineWorkerEventSchema = z.union([
   Bound.extend({ type: z.literal('batch'), batchId: Id, cursorBefore: TalkCursorV1Schema, cursorAfter: TalkCursorV1Schema, envelopes: z.array(InboundEnvelopeSchema),
     /** Startup sync batches are archived without inbound automation. */
     startupSync: z.boolean().optional(), startupFinal: z.boolean().optional(),
-    readReceipts: z.array(ReadReceiptSchema).max(500).optional() }),
+    readReceipts: z.array(ReadReceiptSchema).max(500).optional(),
+    unsends: z.array(UnsendSchema).max(500).optional() }),
   Bound.extend({ type: z.literal('startupSyncComplete'), batchId: Id }),
   Bound.extend({ type: z.literal('conversationCatalog'), conversations: z.array(ConversationCatalogItemSchema) }),
   Conversation.extend({ type: z.literal('historyResult'), requestId: Id, nextCursor: Id.nullable(), envelopes: z.array(InboundEnvelopeSchema) }),

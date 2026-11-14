@@ -12,7 +12,7 @@ function queuedAttachment(id: string, createdAt = new Date(Date.now() - 11_000),
     chatId: 'g', messageId: `message-${id}`, kind: 'file' as const, name: `${id}.bin`, mimeType: null,
     status: 'queued' as const, relativePath: null, sha256: null, sizeBytes: null, error: null,
     occurredAt: new Date(Date.now() - 60_000).toISOString(), retryCount: 0, retryAfter: null,
-    createdAt: createdAt.toISOString(), expiresAt: null, lineMessage: {}, ...overrides };
+    createdAt: createdAt.toISOString(), expiresAt: null, lineMessage: {}, nativeEnvelope: null, ...overrides };
 }
 
 // Tests that exercise queue order rather than pacing remove the random gap.
@@ -44,7 +44,7 @@ describe('AttachmentService queued automatic downloads', () => {
       upstreamCode: 84 }));
     const service = new AttachmentService(repository, { async binding(accountId) {
       return { accountId, workerInstanceId: 'worker', controlEpoch: 1, mode: 'MONITOR_ONLY' as const };
-    }, async isReady() { return true; }, download }, undefined, 4, undefined, undefined, undefined, undefined,
+    }, async isReady() { return true; }, download }, undefined, 4, undefined, undefined, undefined,
     () => 0, (result) => observed.push(result));
     try {
       await expect(service.downloadById(row.attachmentId)).resolves.toBe(false);
@@ -74,6 +74,30 @@ describe('AttachmentService queued automatic downloads', () => {
     try {
       await expect(service.downloadById(row.attachmentId)).resolves.toBe(true);
       expect(readyName).toBe(expectedName);
+    } finally { await service.shutdown(); }
+  });
+
+  it.each([
+    ['attachment.jpg', 'image', null, 'image/jpeg'],
+    ['attachment.png', 'image', null, 'image/png'],
+    ['attachment.bin', 'image', null, undefined],
+    ['attachment.jpg', 'file', null, undefined],
+    ['photo.jpg', 'image', 'photo.jpg', undefined],
+  ])('sets the MIME type from the sniffed worker file name (%s, %s, name %s)', async (workerName, kind, sourceName, expectedMime) => {
+    const row = queuedAttachment('sniffed-mime', undefined, { name: sourceName, kind });
+    let readyValue: { name?: string; mimeType?: string } | undefined;
+    const repository = { async getAttachment() { return row; }, async claimAttachmentDownload() { return randomUUID(); },
+      async markAttachmentReady(_mutation: unknown, value: { name?: string; mimeType?: string }) { readyValue = value; return true; },
+      async recoverAttachmentPage() { return { items: [], hasMore: false }; }, async recoverAttachments() { return []; },
+      async revokeAttachmentOwner() {} } as unknown as MessageRepository;
+    const service = new AttachmentService(repository, { async binding(accountId) {
+      return { accountId, workerInstanceId: 'worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' as const };
+    }, async isReady() { return true; }, async download(command) {
+      return { ...readyAttachmentResult(command), name: workerName };
+    } });
+    try {
+      await expect(service.downloadById(row.attachmentId)).resolves.toBe(true);
+      expect(readyValue?.mimeType).toBe(expectedMime);
     } finally { await service.shutdown(); }
   });
 
@@ -129,7 +153,7 @@ describe('AttachmentService queued automatic downloads', () => {
         if (command.attachmentId === 'burst-one') await firstGate;
         active -= 1;
         return readyAttachmentResult(command);
-      } }, undefined, 4, undefined, undefined, undefined, undefined, () => 0);
+      } }, undefined, 4, undefined, undefined, undefined, () => 0);
     const first = service.downloadById('burst-one');
     const second = service.downloadById('burst-two');
     try {
@@ -167,7 +191,7 @@ describe('AttachmentService queued automatic downloads', () => {
     const repository = { async getAttachment() { return row; }, async claimAttachmentDownload() { claims += 1; return randomUUID(); },
       async recoverAttachmentPage() { return { items: [], hasMore: false }; }, async recoverAttachments() { return []; }, async revokeAttachmentOwner() {} } as unknown as MessageRepository;
     const service = new AttachmentService(repository, { async binding(accountId) { return { accountId, workerInstanceId: 'worker', controlEpoch: 1, mode: 'MONITOR_ONLY' as const }; },
-      async isReady() { return true; }, async download(command) { return readyAttachmentResult(command); } }, undefined, 4, undefined, undefined, undefined,
+      async isReady() { return true; }, async download(command) { return readyAttachmentResult(command); } }, undefined, 4, undefined, undefined,
       async () => false);
     try {
       await expect(service.downloadManually({ accountId: 'a', chatType: 'group', chatId: 'g' }, row.attachmentId)).resolves.toBe(false);
@@ -175,85 +199,20 @@ describe('AttachmentService queued automatic downloads', () => {
     } finally { await service.shutdown(); }
   });
 
-  it('allows an explicit retry for a recent external attachment after its first failed attempt', async () => {
-    const row = queuedAttachment('external-first-failure', undefined, { externalSource: true,
+  it('returns false from a manual download of an External Monitor row without claiming or dispatching', async () => {
+    const row = queuedAttachment('external-manual', undefined, { externalSource: true,
       status: 'failed', retryCount: 1 }) as unknown as Attachment;
-    row.retryAfter = new Date(Date.now() + 60_000).toISOString();
-    let downloads = 0;
-    const repository = { async getAttachment() { return row; }, async claimAttachmentDownload() {
-      row.status = 'downloading' as never; return randomUUID();
-    }, async markAttachmentFailed() { row.status = 'failed' as never; row.retryCount += 1;
-      row.retryAfter = new Date(Date.now() + 60_000).toISOString(); return true; },
-      async markAttachmentReady() { row.status = 'ready' as never; return true; },
+    let claims = 0; let workerChecks = 0; let downloads = 0;
+    const repository = { async getAttachment() { return row; }, async claimAttachmentDownload() { claims += 1; return randomUUID(); },
       async recoverAttachmentPage() { return { items: [], hasMore: false }; }, async recoverAttachments() { return []; },
       async revokeAttachmentOwner() {} } as unknown as MessageRepository;
     const service = new AttachmentService(repository, { async binding(accountId) {
-      return { accountId, workerInstanceId: 'worker', controlEpoch: 1, mode: 'MONITOR_ONLY' as const };
-    }, async isReady() { return true; }, async download(command) {
-      downloads += 1;
-      return downloads === 1 ? { ...readyAttachmentResult(command), status: 'failed' as const, error: 'retryable' }
-        : readyAttachmentResult(command);
-    } });
+      workerChecks += 1; return { accountId, workerInstanceId: 'worker', controlEpoch: 1, mode: 'MONITOR_ONLY' as const };
+    }, async isReady() { workerChecks += 1; return true; }, async download(command) { downloads += 1; return readyAttachmentResult(command); } });
     try {
       await expect(service.downloadManually({ accountId: 'a', chatType: 'group', chatId: 'g' }, row.attachmentId)).resolves.toBe(false);
-      await expect(service.downloadManually({ accountId: 'a', chatType: 'group', chatId: 'g' }, row.attachmentId)).resolves.toBe(true);
-      expect(downloads).toBe(2);
-      expect(row.status).toBe('ready');
+      expect({ claims, workerChecks, downloads }).toEqual({ claims: 0, workerChecks: 0, downloads: 0 });
     } finally { await service.shutdown(); }
-  });
-
-  it('rechecks the seven-day cutoff after readiness before claiming a native attachment', async () => {
-    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-18T00:00:00.000Z'));
-    const row = queuedAttachment('cutoff-after-ready', undefined, { externalSource: true,
-      occurredAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1_000 + 1_000).toISOString() }) as unknown as Attachment;
-    let releaseReady!: () => void; let readinessStarted!: () => void; let claims = 0; let authAcquisitions = 0; let decodes = 0; let downloads = 0;
-    const readyGate = new Promise<void>((resolve) => { releaseReady = resolve; });
-    const readyStarted = new Promise<void>((resolve) => { readinessStarted = resolve; });
-    const repository = { async getAttachment() { return row; }, async claimAttachmentDownload() { claims++; return randomUUID(); },
-      async recoverAttachmentPage() { return { items: [], hasMore: false }; }, async recoverAttachments() { return []; },
-      async revokeAttachmentOwner() {} } as unknown as MessageRepository;
-    const service = new AttachmentService(repository, { async binding(accountId) {
-      return { accountId, workerInstanceId: 'worker', controlEpoch: 1, mode: 'MONITOR_ONLY' as const };
-    }, async isReady(_binding, canAcquireAuth) {
-      readinessStarted(); await readyGate;
-      if (!canAcquireAuth?.()) return false;
-      authAcquisitions++; return true;
-    }, async download(command) {
-      downloads++; return readyAttachmentResult(command);
-    } }, undefined, 4, undefined, undefined, async () => { decodes++; return null; });
-    const attempt = service.downloadManually({ accountId: 'a', chatType: 'group', chatId: 'g' }, row.attachmentId);
-    try {
-      await readyStarted;
-      await vi.advanceTimersByTimeAsync(2_000);
-      releaseReady();
-      await expect(attempt).resolves.toBe(false);
-      expect({ claims, authAcquisitions, decodes, downloads }).toEqual({ claims: 0, authAcquisitions: 0, decodes: 0, downloads: 0 });
-    } finally { releaseReady(); await service.shutdown(); vi.useRealTimers(); }
-  });
-
-  it('cancels a claimed external attempt when native metadata decoding crosses the seven-day cutoff', async () => {
-    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-18T00:00:00.000Z'));
-    const row = queuedAttachment('cutoff-after-decode', undefined, { externalSource: true,
-      occurredAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1_000 + 1_000).toISOString() }) as unknown as Attachment;
-    let releaseDecode!: () => void; let decodeStarted!: () => void; let claims = 0; let cancelled = 0; let downloads = 0;
-    const decodeGate = new Promise<void>((resolve) => { releaseDecode = resolve; });
-    const decodeBegan = new Promise<void>((resolve) => { decodeStarted = resolve; });
-    const repository = { async getAttachment() { return row; }, async claimAttachmentDownload() { claims++; return randomUUID(); },
-      async cancelAttachmentDownloadBeforeDispatch() { cancelled++; row.status = 'queued' as never; return true; },
-      async recoverAttachmentPage() { return { items: [], hasMore: false }; }, async recoverAttachments() { return []; },
-      async revokeAttachmentOwner() {} } as unknown as MessageRepository;
-    const service = new AttachmentService(repository, { async binding(accountId) {
-      return { accountId, workerInstanceId: 'worker', controlEpoch: 1, mode: 'MONITOR_ONLY' as const };
-    }, async isReady() { return true; }, async download(command) { downloads++; return readyAttachmentResult(command); } },
-    undefined, 4, undefined, undefined, async () => { decodeStarted(); await decodeGate; return null; });
-    const attempt = service.downloadManually({ accountId: 'a', chatType: 'group', chatId: 'g' }, row.attachmentId);
-    try {
-      await decodeBegan;
-      await vi.advanceTimersByTimeAsync(2_000);
-      releaseDecode();
-      await expect(attempt).resolves.toBe(false);
-      expect({ claims, cancelled, downloads, status: row.status }).toEqual({ claims: 1, cancelled: 1, downloads: 0, status: 'queued' });
-    } finally { releaseDecode(); await service.shutdown(); vi.useRealTimers(); }
   });
 
   it('stores a fixed safe code when the worker transport rejects with sensitive details', async () => {
@@ -382,41 +341,21 @@ describe('AttachmentService queued automatic downloads', () => {
       expect(maximumActive).toBe(1);
     } finally { await service.shutdown(); vi.useRealTimers(); }
   });
-  it('uses the decoded native filename when the imported attachment has no filename', async () => {
-    const row = { ...queuedAttachment('native-no-name', undefined, { name: null, externalSource: true,
-      nativePayload: { format: 1, table: 'message', sourceDigest: 'a'.repeat(64), encoding: 'dpapi', data: 'AQ==' } }),
-      messageId: 'native-message', chatId: 'g' } as unknown as Attachment;
-    let dispatched: Extract<LineWorkerCommand, { type: 'downloadAttachment' }> | null = null;
-    const repository = { async getAttachment() { return row; }, async claimAttachmentDownload() { return randomUUID(); },
-      async markAttachmentReady() { return true; }, async recoverAttachmentPage() { return { items: [], hasMore: false }; },
-      async recoverAttachments() { return []; }, async revokeAttachmentOwner() {} } as unknown as MessageRepository;
-    const service = new AttachmentService(repository, { async binding() { return { accountId: 'a', workerInstanceId: 'worker', controlEpoch: 1, mode: 'MONITOR_ONLY' as const }; },
-      async isReady() { return true; }, async download(command) { dispatched = command; return readyAttachmentResult(command); } },
-    undefined, 1, undefined, undefined, async () => ({ messageId: 'native-message', chatId: 'g', from: null, to: null,
-      toType: null, contentType: 1, contentMetadata: { OID: 'oid', SID: null, OBS_POP: null, FILE_SIZE: null,
-        MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null }, keyMaterial: null, fileName: 'photo.png', sizeBytes: null }));
-    try {
-      await expect(service.downloadManually({ accountId: row.accountId, chatType: row.chatType, chatId: row.chatId }, row.attachmentId)).resolves.toBe(true);
-      expect(dispatched).toMatchObject({ originalFileName: 'photo.png', nativeAttachment: { fileName: 'photo.png' } });
-    } finally { await service.shutdown(); }
-  });
-
-  it('rejects an old external attachment before checking worker readiness or decoding metadata', async () => {
+  it('rejects an old external attachment before checking worker readiness', async () => {
     const row = { ...queuedAttachment('old-native', undefined, { externalSource: true,
       occurredAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000).toISOString() }) };
-    let workerChecks = 0; let claims = 0; let metadataReads = 0;
+    let workerChecks = 0; let claims = 0;
     const repository = { async getAttachment() { return row; }, async claimAttachmentDownload() { claims++; return randomUUID(); },
       async markAttachmentReady() { return true; }, async recoverAttachmentPage() { return { items: [], hasMore: false }; },
       async recoverAttachments() { return []; }, async revokeAttachmentOwner() {} } as unknown as MessageRepository;
     const service = new AttachmentService(repository, { async binding() { workerChecks++; return { accountId: 'a', workerInstanceId: 'worker', controlEpoch: 1, mode: 'MONITOR_ONLY' as const }; },
       async isReady() { workerChecks++; return true; }, async download(command) { return readyAttachmentResult(command); } },
-    undefined, 1, undefined, undefined, async () => { metadataReads++; return null; });
+    undefined, 1);
     try {
       await expect(service.downloadManually({ accountId: 'a', chatType: 'group', chatId: 'g' }, row.attachmentId)).resolves.toBe(false);
       await expect(service.downloadById(row.attachmentId)).resolves.toBe(false);
       expect(workerChecks).toBe(0);
       expect(claims).toBe(0);
-      expect(metadataReads).toBe(0);
     } finally { await service.shutdown(); }
   });
 });
@@ -952,7 +891,7 @@ database('AttachmentService on PostgreSQL', () => {
   it('caps explicit request admission and clears all queued waiters on shutdown', async () => {
     const attachment = { attachmentId: 'memory-0', externalAttachmentId: 'external', accountId: 'a', chatType: 'group' as const,
       chatId: 'g', messageId: 'm', kind: 'file' as const, name: 'x', mimeType: null, status: 'queued' as const,
-      relativePath: null, sha256: null, sizeBytes: null, error: null, occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {} };
+      relativePath: null, sha256: null, sizeBytes: null, error: null, occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {}, nativeEnvelope: null };
     const fakeMessages = {
       async getAttachment(id: string) { return { ...attachment, attachmentId: id }; },
       async claimAttachmentDownload() { return 'b7c252f7-8b1e-4fac-a9cc-69bc206c09a1'; },
@@ -987,7 +926,7 @@ database('AttachmentService on PostgreSQL', () => {
     const attachment = (attachmentId: string, accountId: string) => ({ attachmentId, externalAttachmentId: 'external', accountId,
       chatType: 'group' as const, chatId: 'chat', messageId: 'message', kind: 'file' as const, name: 'x', mimeType: null,
       status: 'queued' as const, relativePath: null, sha256: null, sizeBytes: null, error: null,
-      occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {} });
+      occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {}, nativeEnvelope: null });
     const rows = new Map(ids.map((id, index) => [id, attachment(id, [...accounts, onlineAccount][index]!)]));
     const pageCalls: string[] = [];
     const messages = {
@@ -1022,7 +961,7 @@ database('AttachmentService on PostgreSQL', () => {
       attachmentId: `attachment-${accountId}`, externalAttachmentId: 'external', accountId,
       chatType: 'group' as const, chatId: 'chat', messageId: 'message', kind: 'file' as const, name: accountId, mimeType: null,
       status: 'queued' as 'queued' | 'ready', relativePath: null, sha256: null, sizeBytes: null, error: null,
-      occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {},
+      occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {}, nativeEnvelope: null,
     }]));
     const pageCursors: Array<string | null> = [];
     let releaseFirstPage!: () => void;
@@ -1080,7 +1019,7 @@ database('AttachmentService on PostgreSQL', () => {
       attachmentId: `terminal-attachment-${accountId}`, externalAttachmentId: 'external', accountId,
       chatType: 'group' as const, chatId: 'chat', messageId: 'message', kind: 'file' as const, name: accountId, mimeType: null,
       status: 'queued' as 'queued' | 'ready', relativePath: null, sha256: null, sizeBytes: null, error: null,
-      occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {},
+      occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {}, nativeEnvelope: null,
     }]));
     const pageCursors: Array<string | null> = [];
     let releaseFirstPage!: () => void;
@@ -1141,7 +1080,7 @@ database('AttachmentService on PostgreSQL', () => {
     const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
     const attachment = { attachmentId: 'queued-second', externalAttachmentId: 'external', accountId: 'second', chatType: 'group' as const,
       chatId: 'chat', messageId: 'message', kind: 'file' as const, name: 'x', mimeType: null, status: 'queued' as 'queued' | 'ready',
-      relativePath: null, sha256: null, sizeBytes: null, error: null, occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {} };
+      relativePath: null, sha256: null, sizeBytes: null, error: null, occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {}, nativeEnvelope: null };
     let ready = false;
     const messages = {
       async recoverAttachments(accountId: string) {
@@ -1182,7 +1121,7 @@ database('AttachmentService on PostgreSQL', () => {
     const globalGate = new Promise<void>((resolve) => { releaseGlobal = resolve; });
     const attachment = { attachmentId: 'concurrent-second', externalAttachmentId: 'external', accountId: 'second', chatType: 'group' as const,
       chatId: 'chat', messageId: 'message', kind: 'file' as const, name: 'x', mimeType: null, status: 'queued' as 'queued' | 'ready',
-      relativePath: null, sha256: null, sizeBytes: null, error: null, occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {} };
+      relativePath: null, sha256: null, sizeBytes: null, error: null, occurredAt: '2026-10-15T00:00:00.000Z', retryCount: 0, lineMessage: {}, nativeEnvelope: null };
     let ready = false;
     let scopedScans = 0;
     let globalScans = 0;
@@ -1291,7 +1230,7 @@ describe('AttachmentService random gap between automatic downloads', () => {
       if (gateFirst && sent.length === 1) await new Promise<void>((resolve) => { releaseGate = resolve; });
       active -= 1;
       return readyAttachmentResult(command);
-    } }, undefined, 4, undefined, undefined, undefined, undefined, random);
+    } }, undefined, 4, undefined, undefined, undefined, random);
     const add = (id: string, overrides: Record<string, unknown> = {}) => { rows.set(id, queuedAttachment(id, undefined, overrides)); };
     return { service, rows, sent, add, maximumActive: () => maximumActive,
       holdFirst: () => { gateFirst = true; }, release: () => releaseGate?.() };

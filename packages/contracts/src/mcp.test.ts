@@ -228,6 +228,7 @@ describe('MCP contracts and IPC schemas', () => {
       kind: 'text' as const,
       text: 'Hello team',
       recalled: false,
+      recalledAt: null,
       occurredAt: '2026-10-17T10:00:00.000Z',
       attachments: [],
     };

@@ -18,11 +18,13 @@ export async function normalizeManagedMcpScopes(client: PoolClient): Promise<voi
   const holders = await client.query<{ account_id: string; product_role: ProductRole }>(
     `SELECT account_id,COALESCE(product_role,'AGENT') product_role FROM line_accounts
      WHERE product_role=ANY($1::text[]) OR (product_role IS NULL AND role_revision>=1 AND own_mid IS NOT NULL
+       AND EXISTS (SELECT 1 FROM agent_account_lineage l WHERE l.account_id=line_accounts.account_id)
        AND mode='MONITOR_ONLY' AND status='disconnected' AND connection_mode='OFFLINE'
        AND worker_instance_id IS NULL AND worker_binding_epoch IS NULL
        AND selected_source_id IS NULL AND selected_source_generation IS NULL)
      ORDER BY account_id`, [[...PRODUCT_ROLES]]);
-  // Only Agent replacement clears a product role and increments its revision. Fresh role rows start at zero;
+  // Agent replacement and a Primary Administrator change clear a product role and increment its revision. Only a row with an
+  // agent_account_lineage row is a former Agent; an archived administrator has none. Fresh role rows start at zero;
   // migration-026 holders start at one. An arbitrary historical administrator binding supplies no role provenance.
   const roles = new Map(holders.rows.map((holder) => [holder.account_id, holder.product_role]));
   for (const token of tokens.rows) {

@@ -1,7 +1,7 @@
 /** Fixed request discriminants only; never request payloads or renderer labels. */
 export const IPC_ACTION_CODES = [
   'getSnapshot', 'reportRendererFailure', 'searchAgentJobs', 'lineAddAccountQr', 'lineLoginQr', 'lineReplaceAgentQr', 'lineLogout',
-  'refreshLineAvatar', 'lineSetAutoLogin', 'lineBeginAdminPairing', 'lineStart', 'getChromeLoginAvailability', 'detectChromeLtsm',
+  'refreshLineAvatar', 'lineSetAutoLogin', 'lineBeginAdminPairing', 'lineBeginAdminChange', 'lineCancelAdminChange', 'adminDownloadBridgeStart', 'adminDownloadBridgeRefreshQr', 'adminDownloadBridgeClear', 'adminDownloadBridgeSetAutoDownload', 'adminDownloadBridgeSetDownloadEnabled', 'lineStart', 'getChromeLoginAvailability', 'detectChromeLtsm',
   'chooseChromeLtsmFolder', 'openChromeExtensionStore', 'externalImportStart',
   'externalImportStop', 'previewExternalAdminBinding', 'startExternalMonitorAsAdmin', 'officialLineApproveSigner',
   'lineSyncHistory', 'submitAgentRoomPrompt', 'stopAgentRoomJob', 'retryAgentRoomJob', 'getAgentRoomJobEvents',

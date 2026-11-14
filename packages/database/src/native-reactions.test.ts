@@ -9,9 +9,9 @@ const statusOf = (...entries: unknown[]) => JSON.stringify({ reactionList: entri
 
 describe('nativeReactions', () => {
   it('parses the real predefined and paid samples', () => {
-    expect(nativeReactions(rawWith(SAMPLE_NICE))).toEqual([{ kind: 'NICE', count: 1, reactorIds: ['ub6f5a192eaf1fc1acc3c61508b4fd6da'] }]);
-    expect(nativeReactions(rawWith(SAMPLE_FUN))).toEqual([{ kind: 'FUN', count: 1, reactorIds: ['ufaeaefdf10160b3aa1f38d2f57e68736'] }]);
-    expect(nativeReactions(rawWith(SAMPLE_PAID))).toEqual([{ kind: 'PAID', productId: '60ebfdc03cc24041bb139cf5', emojiId: '004', count: 1, reactorIds: ['ub254b3c8c4fc001b1862a8eef68f4f00'] }]);
+    expect(nativeReactions(rawWith(SAMPLE_NICE))).toEqual([{ kind: 'NICE', count: 1, reactorIds: ['u1f2e3d4c5b6a79880123456789abcdef'] }]);
+    expect(nativeReactions(rawWith(SAMPLE_FUN))).toEqual([{ kind: 'FUN', count: 1, reactorIds: ['u2e3d4c5b6a7988012345678900fedcba'] }]);
+    expect(nativeReactions(rawWith(SAMPLE_PAID))).toEqual([{ kind: 'PAID', productId: '60ebfdc03cc24041bb139cf5', emojiId: '004', count: 1, reactorIds: ['u3d4c5b6a798801234567890abcdef123'] }]);
   });
 
   it('accepts the { value, sqliteType } cell wrapper', () => {

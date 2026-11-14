@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { describe, expect, it } from 'vitest';
-import { parseEncryptedAccessToken, validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
+import { parseEncryptedAccessToken, validateAttachmentMessage, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { normalizeOperation } from './normalizer.js';
 
 describe('encrypted OBS access token', () => {
@@ -86,35 +86,3 @@ describe('native LINE destination type binding', () => {
   });
 });
 
-describe('native source attachment validation', () => {
-  const ownMid = `u${'a'.repeat(32)}`;
-  const directMid = `u${'b'.repeat(32)}`;
-  const encrypted = Buffer.alloc(32, 0x41).toString('base64');
-  const metadata = { messageId: '9', chatId: directMid, from: null, to: null, toType: null, contentType: 1,
-    contentMetadata: { OID: 'OID_123', SID: 'emi', OBS_POP: null, FILE_SIZE: '4', MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null },
-    keyMaterial: encrypted, fileName: 'native.png', sizeBytes: 4 } as const;
-  it('accepts associated direct metadata with absent from/to and native key material without E2EE chunks', () => {
-    const identity: AttachmentDownloadIdentity = { accountId: 'a', chatType: 'direct', chatId: directMid, ownMid,
-      messageId: '9', kind: 'image', externalAttachmentId: '9' };
-    const result = validateNativeAttachment(metadata, identity, 1024);
-    expect(result.oid).toBe('OID_123');
-    expect(result.sid).toBe('emi');
-    expect(result.keyMaterial?.toString('base64')).toBe(encrypted);
-  });
-  it('validates native group and room routing from the source conversation association', () => {
-    for (const [chatType, prefix, toType] of [['group', 'c', 2], ['room', 'r', 1]] as const) {
-      const chatId = `${prefix}${'c'.repeat(32)}`;
-      const input = { ...metadata, chatId, to: chatId, toType };
-      expect(validateNativeAttachment(input, { accountId: 'a', chatType, chatId, ownMid, messageId: '9',
-        kind: 'image', externalAttachmentId: '9' }, 1024).oid).toBe('OID_123');
-    }
-  });
-  it('rejects source identity, destination, content kind, and unproven DOWNLOAD_URL routes', () => {
-    const identity: AttachmentDownloadIdentity = { accountId: 'a', chatType: 'direct', chatId: directMid, ownMid,
-      messageId: '9', kind: 'image', externalAttachmentId: '9' };
-    expect(() => validateNativeAttachment({ ...metadata, messageId: '10' }, identity, 1024)).toThrow();
-    expect(() => validateNativeAttachment({ ...metadata, chatId: `u${'c'.repeat(32)}` }, identity, 1024)).toThrow();
-    expect(() => validateNativeAttachment({ ...metadata, contentType: 2 }, identity, 1024)).toThrow();
-    expect(() => validateNativeAttachment({ ...metadata, contentMetadata: { ...metadata.contentMetadata, DOWNLOAD_URL: 'https://example.invalid' } }, identity, 1024)).toThrow();
-  });
-});

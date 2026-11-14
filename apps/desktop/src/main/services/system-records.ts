@@ -26,6 +26,7 @@ const actionLabels: Record<AuditAction, SystemActionLabel> = {
   friend_authorization_precheck: '新增使用者：授權預檢', friend_grant_commit: '新增使用者：寫入白名單',
   album_photo_download: '相簿照片下載',
   free_mode_judge: '自由模式回覆判斷', free_mode_interrupt: '自由模式中斷回覆',
+  bridge_message_verify: '下載橋接訊息驗證',
   line_ingest_slow_upstream: 'LINE 訊息延遲（LINE 至本機）', line_ingest_slow_main: 'LINE 訊息延遲（本機佇列／寫入）',
 };
 const phaseLabels: Record<SafeAuditRecord['phase'], Extract<SystemActivity, { kind: 'audit' }>['phase']> = {

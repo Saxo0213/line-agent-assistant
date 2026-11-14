@@ -1,4 +1,4 @@
-import { AgentScheduleForwardTaskSchema, agentScheduleShapeError, type AgentScheduleForwardTask } from '@line-agent/contracts';
+import { AgentScheduleForwardTaskSchema, agentScheduleShapeError, scheduleForwardActions, type AgentScheduleForwardTask } from '@line-agent/contracts';
 import {
   AGENT_SCHEDULE_DEFAULT_TIMEZONE, AGENT_SCHEDULE_FOCUS_MAX, AGENT_SCHEDULE_JITTER_MAX_MINUTES, AGENT_SCHEDULE_INTERVAL_MAX_MINUTES, AGENT_SCHEDULE_INTERVAL_MIN_MINUTES,
   AGENT_SCHEDULE_KEYWORDS_MAX, AGENT_SCHEDULE_KEYWORD_MAX, AGENT_SCHEDULE_LOOKBACK_MAX_MINUTES, AGENT_SCHEDULE_LOOKBACK_MIN_MINUTES,
@@ -10,6 +10,7 @@ import {
   buildNewMessagesTask, defaultNewMessagesDraft, draftFromTask, hasLlmRule, type NewMessagesDraft, type RuleErrors,
 } from './scheduleRules.js';
 
+export type MentionMember = { accountId: string; mid: string; label: string };
 export type RecurrenceKind = AgentScheduleRecurrence['kind'];
 export type ScheduleFormState = {
   title: string;
@@ -17,11 +18,21 @@ export type ScheduleFormState = {
   focus: string;
   /** Text of a system message task (task type 'message'). */
   messageText: string;
-  forwardMode:'contains'|'exact'|'sender';
+  forwardMode:'contains'|'exact'|'sender'|'mention';
   forwardText:string;
   senderAccount:string;
   senderMid:string;
   senderLabel:string;
+  /** Mention mode: the Primary Admin, the chosen members (at most 20) and everyone (@all). */
+  mentionAdmin:boolean;
+  mentionMembers:MentionMember[];
+  mentionAll:boolean;
+  /** Actions after a match: forward to a chat, desktop notification, hand to an Agent job. */
+  actForward:boolean;
+  actNotify:boolean;
+  actAgent:boolean;
+  agentPrompt:string;
+  agentTarget:AgentScheduleSendTarget | null;
   keywords: string[];
   /** Draft of a new_messages task (message filter, rules, parameters). */
   newMessages: NewMessagesDraft;
@@ -46,7 +57,7 @@ export type ScheduleFormState = {
   enabled: boolean;
 };
 export type FormError = { key: ScheduleCopyKey; values?: Record<string, unknown> };
-export type FormErrors = Partial<Record<'title' | 'rules' | 'prompt' | 'messageText' | 'targets' | 'keywords' | 'focus' | 'recurrence' | 'window' | 'delivery' | 'timezone', FormError>>;
+export type FormErrors = Partial<Record<'title' | 'mention' | 'actions' | 'agentPrompt' | 'agentTarget' | 'rules' | 'prompt' | 'messageText' | 'targets' | 'keywords' | 'focus' | 'recurrence' | 'window' | 'delivery' | 'timezone', FormError>>;
 
 const dateTimeParts = (instant: Date, timezone: string) => {
   const out: Record<string, string> = {};
@@ -92,7 +103,9 @@ export function defaultFormState(provider: 'codex' | 'claude', now = new Date())
   const timezone = AGENT_SCHEDULE_DEFAULT_TIMEZONE;
   const nextHour = new Date(Math.ceil((now.getTime() + 60_000) / 3_600_000) * 3_600_000);
   return {
-    title: '', taskType: 'custom', focus: '', messageText: '', forwardMode:'contains',forwardText:'',senderAccount:'',senderMid:'',senderLabel:'',keywords: [], newMessages: defaultNewMessagesDraft(), targets: [], prompt: '',
+    title: '', taskType: 'custom', focus: '', messageText: '', forwardMode:'contains',forwardText:'',senderAccount:'',senderMid:'',senderLabel:'',
+    mentionAdmin: false, mentionMembers: [], mentionAll: false, actForward: true, actNotify: false, actAgent: false, agentPrompt: '', agentTarget: null,
+    keywords: [], newMessages: defaultNewMessagesDraft(), targets: [], prompt: '',
     kind: 'daily', onceAt: isoToWall(nextHour, timezone), time: '09:00', days: [1, 2, 3, 4, 5], everyMinutes: '60',
     anchorAt: isoToWall(now, timezone), cron: '0 9 * * 1-5', windowMode: 'since_last_run', lookbackMinutes: '1440',
     deliveryMode: 'primary_admin', deliveryTarget: null, provider, timezone, jitterMinutes: AGENT_SCHEDULE_JITTER_MAX_MINUTES, enabled: true,
@@ -114,6 +127,14 @@ export function formStateFromSchedule(schedule: AgentSchedule): ScheduleFormStat
     next.forwardMode=schedule.task.match.mode;
     next.forwardText=schedule.task.match.mode==='contains'?schedule.task.match.keywords.join('\n'):schedule.task.match.mode==='exact'?schedule.task.match.text:'';
     next.senderAccount=schedule.task.sender?.accountId??'';next.senderMid=schedule.task.sender?.mid??'';next.senderLabel=schedule.task.sender?.label??'';
+    if(schedule.task.match.mode==='mention') {
+      next.mentionAdmin=schedule.task.match.admin;next.mentionAll=schedule.task.match.all;
+      next.mentionMembers=schedule.task.match.members.map((member)=>({accountId:member.accountId,mid:member.mid,label:member.label}));
+    }
+    // A rule without `actions` only forwards.
+    const actions=scheduleForwardActions(schedule.task);
+    next.actForward=actions.forward;next.actNotify=actions.notify;next.actAgent=actions.agent!==null;
+    next.agentPrompt=actions.agent?.prompt??'';next.agentTarget=actions.agent ? {...actions.agent.target} : null;
   }
   if (schedule.task.type === 'keyword_digest') next.keywords = [...schedule.task.keywords];
   if (schedule.task.type === 'new_messages') next.newMessages = draftFromTask(schedule.task, schedule.targets);
@@ -210,13 +231,25 @@ export function buildScheduleInput(form: ScheduleFormState): { input: AgentSched
   let newMessagesTask: AgentScheduleNewMessagesTask | undefined;
   let forwardTask:AgentScheduleForwardTask|undefined;
   if(isForward) {
-    const parsed=AgentScheduleForwardTaskSchema.safeParse({type:'message_forward',match:form.forwardMode==='contains'
-      ?{mode:'contains',keywords:form.forwardText.split('\n').filter((s)=>s.trim().length>0)}:form.forwardMode==='exact'?{mode:'exact',text:form.forwardText}:{mode:'sender'},
-      ...(form.senderMid.trim()||form.senderAccount.trim()?{sender:{accountId:form.senderAccount.trim(),mid:form.senderMid.trim(),label:form.senderLabel}}:{})});
-    if(parsed.success) forwardTask=parsed.data; else errors.rules={key:'forwardInvalid'};
-    if(!form.targets.length) errors.targets={key:'forwardInvalid'};
-    if(form.deliveryMode!=='line_target'||!form.deliveryTarget||form.deliveryTarget.chatType==='room') errors.delivery={key:'forwardInvalid'};
-    if(forwardTask && form.deliveryTarget && agentScheduleShapeError({prompt:'',targets:form.targets,task:forwardTask,recurrence:{kind:'message'},delivery:{mode:'line_target',target:form.deliveryTarget}})) errors.rules={key:'forwardInvalid'};
+    const agentPrompt=form.agentPrompt.trim();
+    // An empty list of source chats means all readable chats. A rule that does not forward is record-only.
+    const forwardDelivery:AgentScheduleCreateInput['delivery']=form.actForward&&form.deliveryTarget ? {mode:'line_target',target:form.deliveryTarget} : {mode:'record_only'};
+    if(form.forwardMode==='mention'&&!form.mentionAdmin&&!form.mentionAll&&form.mentionMembers.length===0) errors.mention={key:'mentionNone'};
+    if(!form.actForward&&!form.actNotify&&!form.actAgent) errors.actions={key:'errActionNone'};
+    if(form.actAgent&&agentPrompt.length>AGENT_SCHEDULE_PROMPT_MAX) errors.agentPrompt={key:'errPromptTooLong'};
+    if(form.actAgent&&!form.agentTarget) errors.agentTarget={key:'errDeliveryTarget'};
+    if(form.actForward&&(!form.deliveryTarget||form.deliveryTarget.chatType==='room')) errors.delivery={key:'forwardInvalid'};
+    if(!errors.mention&&!errors.actions&&!errors.agentPrompt&&!errors.agentTarget) {
+      // Mention rules always store their actions; the other modes store them only when they differ from the old forward-only default.
+      const storeActions=form.forwardMode==='mention'||form.actNotify||form.actAgent||!form.actForward;
+      const parsed=AgentScheduleForwardTaskSchema.safeParse({type:'message_forward',match:form.forwardMode==='contains'
+        ?{mode:'contains',keywords:form.forwardText.split('\n').filter((s)=>s.trim().length>0)}:form.forwardMode==='exact'?{mode:'exact',text:form.forwardText}
+        :form.forwardMode==='mention'?{mode:'mention',admin:form.mentionAdmin,members:form.mentionMembers.map(({accountId,mid,label})=>({accountId,mid,label})),all:form.mentionAll}:{mode:'sender'},
+        ...(form.senderMid.trim()||form.senderAccount.trim()?{sender:{accountId:form.senderAccount.trim(),mid:form.senderMid.trim(),label:form.senderLabel}}:{}),
+        ...(storeActions?{actions:{forward:form.actForward,notify:form.actNotify,agent:form.actAgent&&form.agentTarget?{prompt:agentPrompt,target:{accountId:form.agentTarget.accountId,chatType:form.agentTarget.chatType,chatId:form.agentTarget.chatId,title:form.agentTarget.title}}:null}}:{})});
+      if(parsed.success) forwardTask=parsed.data; else errors.rules={key:'forwardInvalid'};
+      if(forwardTask&&!errors.delivery&&agentScheduleShapeError({prompt:'',targets:form.targets,task:forwardTask,recurrence:{kind:'message'},delivery:forwardDelivery})) errors.rules={key:'forwardInvalid'};
+    }
   }
   if (isNewMessages) {
     const built = buildNewMessagesTask(form.newMessages);
@@ -231,7 +264,7 @@ export function buildScheduleInput(form: ScheduleFormState): { input: AgentSched
     const result = windowFromForm(form);
     if ('error' in result) errors.window = result.error; else window = result.window;
   }
-  if (form.deliveryMode === 'line_target' && !form.deliveryTarget) errors.delivery = { key: 'errDeliveryTarget' };
+  if (!isForward && form.deliveryMode === 'line_target' && !form.deliveryTarget) errors.delivery = { key: 'errDeliveryTarget' };
   if (Object.keys(errors).length > 0 || 'error' in recurrence) return { errors, ...(ruleErrors ? { ruleErrors } : {}) };
   const task: AgentScheduleTask = forwardTask ?? newMessagesTask ?? (form.taskType === 'custom' ? { type: 'custom' }
     : isMessage ? { type: 'message', text: messageText }
@@ -241,7 +274,8 @@ export function buildScheduleInput(form: ScheduleFormState): { input: AgentSched
     input: {
       title, prompt, provider: form.provider, recurrence: recurrence.recurrence, timezone: form.timezone, targets: isMessage ? [] : form.targets,
       task, window,
-      delivery: form.deliveryMode === 'line_target' && form.deliveryTarget ? { mode: 'line_target', target: form.deliveryTarget }
+      delivery: isForward ? (form.actForward && form.deliveryTarget ? { mode: 'line_target', target: form.deliveryTarget } : { mode: 'record_only' })
+        : form.deliveryMode === 'line_target' && form.deliveryTarget ? { mode: 'line_target', target: form.deliveryTarget }
         : form.deliveryMode === 'record_only' && !isProgramTask(form.taskType) ? { mode: 'record_only' } : { mode: 'primary_admin' },
       jitterMinutes: isForward?0:Math.max(0, Math.min(AGENT_SCHEDULE_JITTER_MAX_MINUTES, Math.floor(form.jitterMinutes))),
       enabled: form.enabled,

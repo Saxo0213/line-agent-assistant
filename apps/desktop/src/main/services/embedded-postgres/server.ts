@@ -1,10 +1,11 @@
 import { dirname, join, normalize } from 'node:path';
 import { EmbeddedPgError } from './errors.js';
 import { chooseFreePort, type BindPort } from './port.js';
-import type { RunProcess } from './process.js';
+import type { RunProcess, RunProcessSync } from './process.js';
 
 export type ServerDeps = {
   run: RunProcess;
+  runSync: RunProcessSync;
   bindPort: BindPort;
   readFile: (path: string) => Promise<string>;
   mkdir: (path: string) => Promise<unknown>;
@@ -41,6 +42,11 @@ export class EmbeddedPostgresServer {
 
   private pgCtl(args: string[], timeoutMs: number) {
     return this.deps.run(join(this.options.binDirectory, 'pg_ctl.exe'), ['-D', this.options.dataDirectory, ...args],
+      { timeoutMs, env: minimalEnv(this.deps.env, this.options.binDirectory) });
+  }
+
+  private pgCtlSync(args: string[], timeoutMs: number) {
+    return this.deps.runSync(join(this.options.binDirectory, 'pg_ctl.exe'), ['-D', this.options.dataDirectory, ...args],
       { timeoutMs, env: minimalEnv(this.deps.env, this.options.binDirectory) });
   }
 
@@ -92,6 +98,20 @@ export class EmbeddedPostgresServer {
     }
     this.usedPort = port;
     this.started = true;
+  }
+
+  /**
+   * Blocking `fast` stop for the Windows session-end handler. It never escalates to `immediate`: an immediate stop
+   * also leaves the next start in crash recovery, so it gives no benefit here. Never throws.
+   */
+  stopForSessionEnd(): boolean {
+    if (!this.started) return true;
+    try {
+      const result = this.pgCtlSync(['stop', '-m', 'fast', '-w', '-t', '15'], 17_000);
+      if (result.code === 0 && !result.timedOut) { this.started = false; return true; }
+    } catch { /* fall through to the failure log */ }
+    try { this.deps.log('pg_session_end_stop_failed'); } catch { /* logging must not throw here */ }
+    return false;
   }
 
   /** `fast` first, `immediate` on timeout; bounded at 45 s in total. */

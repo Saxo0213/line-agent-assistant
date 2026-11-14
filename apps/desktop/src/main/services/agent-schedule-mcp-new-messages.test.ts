@@ -31,7 +31,7 @@ function harness(handlerOverride?: Partial<AgentScheduleToolHandler>) {
     create: vi.fn(async (input: { task: AgentSchedule['task'] }) => schedule(input.task)),
     update: vi.fn(async (_id: string, patch: { task?: AgentSchedule['task'] }) => schedule(patch.task ?? { type: 'custom' })),
     delete: vi.fn(async () => true),
-    primaryAdminChat: vi.fn(async () => ({ accountId: 'acc', chatId: 'uadmin', title: '徐佳誠' })),
+    primaryAdminChat: vi.fn(async () => ({ accountId: 'acc', chatId: 'uadmin', title: '林曉安' })),
     ...handlerOverride,
   } satisfies AgentScheduleToolHandler;
   const tokens = {
@@ -56,7 +56,7 @@ describe('new_messages through the schedule tools', () => {
     expect(response.isError).toBe(false);
     expect(h.handler.create).toHaveBeenCalledWith({ title: '新訊息', prompt: '', recurrence, provider: 'codex', timezone: 'Asia/Taipei', targets: [],
       task: { ...task, maxMessagesPerChat: 20, maxTextChars: 200, sendWhenEmpty: false }, window: { mode: 'since_last_run' }, delivery: { mode: 'primary_admin' }, enabled: true, jitterMinutes: 0 });
-    expect(response.structuredContent).toMatchObject({ toolName: 'create_schedule', schedule: { execution: 'program', mayUseLlm: true }, deliveryLabel: '管理員（徐佳誠）' });
+    expect(response.structuredContent).toMatchObject({ toolName: 'create_schedule', schedule: { execution: 'program', mayUseLlm: true }, deliveryLabel: '管理員（林曉安）' });
     await h.service.shutdown();
   });
 

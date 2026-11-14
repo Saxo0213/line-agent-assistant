@@ -43,7 +43,7 @@ export function parseStoredContact(content: unknown, raw: unknown): { mid: strin
   return null;
 }
 
-/** One line per card, oldest first: `[聯絡人卡片] 徐佳誠（mid: u…）`. */
+/** One line per card, oldest first: `[聯絡人卡片] 林曉安（mid: u…）`. */
 export function formatContactCardBlock(cards: readonly Pick<ContactCard, 'mid' | 'displayName'>[]): string {
   return cards.map((card) => `${AGENT_CONTACT_CARD_PREFIX} ${card.displayName ?? '（未命名）'}${card.mid ? `（mid: ${card.mid}）` : ''}`).join('\n');
 }

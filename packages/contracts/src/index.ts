@@ -18,6 +18,7 @@ export * from './local-route.js';
 export * from './mcp.js';
 export * from './native-source.js';
 export * from './content-type.js';
+export * from './image-sniff.js';
 export * from './redaction.js';
 export * from './worker-v2.js';
 export * from './diagnostics.js';

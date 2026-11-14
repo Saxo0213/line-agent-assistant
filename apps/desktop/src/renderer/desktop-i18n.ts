@@ -71,15 +71,33 @@ export function safeErrorTextFor(locale: Locale, error: unknown, fallback?: stri
   const errorCopy = desktopErrorText(locale, code);
   if (errorCopy) return errorCopy;
   const keys: Record<string, PlainCopyKey> = {
-    EXTERNAL_MONITOR_READ_ONLY: 'agentJobsCannotBeCreatedInExternalMonitoringMode', PERMISSION_VERSION_CONFLICT: 'settingsChangedElsewhereAndHaveBeenReloaded',
+    EXTERNAL_MONITOR_READ_ONLY: 'agentJobsCannotBeCreatedInExternalMonitoringMode', ADMIN_MONITOR_ONLY: 'administratorUsesExternalMonitoringOnly',
+    PERMISSION_VERSION_CONFLICT: 'settingsChangedElsewhereAndHaveBeenReloaded',
     AGENT_ACCOUNT_REQUIRED: 'logInToTheAgentAccountFirst', PRIMARY_ADMIN_ALREADY_BOUND: 'aPrimaryAdministratorIsAlreadyConfigured',
     EXTERNAL_IMPORT_BUSY: 'lineIsBeingReadTryAgainShortly', OFFICIAL_IDENTITY_UNAVAILABLE: 'unableToReadTheCurrentLineAccountOpenLine',
     OFFICIAL_IDENTITY_CHANGED: 'theCurrentLineAccountChangedTryAgain', ADMIN_SLOT_CONFLICT: 'theCurrentLineAccountCannotBeThePrimaryAdministrator',
+    ADMIN_IDENTITY_MISMATCH: 'adminIdentityMismatch', ADMIN_NOT_SET: 'adminNotSet', ADMIN_CHANGE_STALE: 'adminChangeStale',
+    ADMIN_VERSION_CHANGED: 'adminVersionChanged', ADMIN_IDENTITY_INVALID: 'adminIdentityInvalid', ADMIN_CHANGE_FAILED: 'adminChangeFailed',
     QUEUE_FULL: 'lineWorkerQueueFull', AUTH_INVALIDATED: 'lineLoginIsNoLongerValid', ATTACHMENT_EXPIRED: 'attachmentExpired',
     PERMISSION_TARGET_NOT_ELIGIBLE: 'thisChatOrAllowlistedUserIsNoLongerEligible', INVALID_CHAT: 'thisChatOrAllowlistedUserIsNoLongerEligible',
   };
   const key = typeof code === 'string' && Object.hasOwn(keys, code) ? keys[code] : undefined;
   return key ? desktopTextFor(locale, key) : fallback ?? extraTextFor(locale, 'operationFailed');
+}
+/** Text of a download bridge error code. A code without its own text is shown as the code itself. */
+export function downloadBridgeErrorTextFor(locale: Locale, code: string | undefined): string {
+  const keys: Record<string, PlainCopyKey> = {
+    ADMIN_IDENTITY_MISMATCH: 'downloadBridgeErrorMismatch', QR_EXPIRED: 'downloadBridgeErrorQrExpired', LOGIN_TIMEOUT: 'downloadBridgeErrorLoginTimeout',
+    ADMIN_NOT_SET: 'downloadBridgeErrorAdminNotSet', CHROME_NOT_FOUND: 'downloadBridgeErrorChromeNotFound', EXTENSION_NOT_FOUND: 'downloadBridgeErrorExtensionNotFound',
+    EXTENSION_VERSION_MISMATCH: 'downloadBridgeErrorExtensionVersion',
+    QR_FLOW_ERROR: 'downloadBridgeErrorQrFlow', PIN_CODE_TIMEOUT: 'downloadBridgeErrorPinTimeout', BRIDGE_SESSION_EXPIRED: 'downloadBridgeErrorSessionExpired',
+  };
+  const key = code !== undefined && Object.hasOwn(keys, code) ? keys[code] : undefined;
+  return key ? desktopTextFor(locale, key) : desktopTextFor(locale, 'downloadBridgeErrorArg0', { arg0: code ?? '' });
+}
+export function useDownloadBridgeErrorText() {
+  const locale = useDesktopLocale();
+  return useCallback((code: string | undefined) => downloadBridgeErrorTextFor(locale, code), [locale]);
 }
 export function useSafeErrorText() {
   const locale = useDesktopLocale();
@@ -130,7 +148,13 @@ const PREVIEW_KEYS: Record<GeneratedPreview['kind'], PlainCopyKey> = {
 /** Copy key of the cause text for a queued attachment that cannot download now. */
 export function attachmentBlockReasonKey(reason: AttachmentBlockReason): PlainCopyKey {
   return reason === 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' ? 'attachmentBlockExternalSource'
-    : reason === 'ATTACHMENT_WORKER_UNAVAILABLE' ? 'attachmentBlockWorkerUnavailable' : 'attachmentBlockWorkerNotReady';
+    : reason === 'ATTACHMENT_WORKER_UNAVAILABLE' ? 'attachmentBlockWorkerUnavailable'
+    : reason === 'BRIDGE_CHAT_TYPE_UNSUPPORTED' ? 'attachmentBlockBridgeChatTypeUnsupported'
+    : reason === 'BRIDGE_NOT_LOGGED_IN' ? 'attachmentBlockBridgeNotLoggedIn'
+    : reason === 'BRIDGE_DOWNLOAD_DISABLED' ? 'attachmentBlockBridgeDownloadDisabled'
+    : reason === 'BRIDGE_IDENTITY_PENDING' ? 'attachmentBlockBridgeIdentityPending'
+    : reason === 'BRIDGE_VERIFICATION_PENDING' ? 'attachmentBlockBridgeVerificationPending'
+    : reason === 'BRIDGE_MESSAGE_MISMATCH' ? 'attachmentBlockBridgeMessageMismatch' : 'attachmentBlockWorkerNotReady';
 }
 
 /** Call text shared by the chat timeline and the chat-list preview: same wording and duration format in every locale. */

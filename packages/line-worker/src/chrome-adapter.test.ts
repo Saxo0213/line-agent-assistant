@@ -316,13 +316,12 @@ describe('ChromeAdapter login and credentials', () => {
     expect(server.to(tp('getProfile'))).toHaveLength(1);
   });
 
-  it('implements the write operations and leaves the DESKTOPWIN-only optional ones undefined', async () => {
+  it('implements the write operations', async () => {
     const { adapter } = await build();
     const loose = adapter as unknown as Record<string, unknown>;
     for (const name of ['send', 'sendMedia', 'download', 'react', 'unsend', 'checkFriendRelation', 'checkFriendRelationDiagnostic', 'addFriendByMid', 'readChatResource']) {
       expect(typeof loose[name]).toBe('function');
     }
-    for (const name of ['adoptDownloadAuth', 'clearDownloadAuth']) expect(loose[name]).toBeUndefined();
   });
 });
 
@@ -393,6 +392,61 @@ describe('ChromeAdapter.listConversations', () => {
     expect(chatPages.map((page) => page.length)).toEqual([100, 1]);
     const contactPages = (server.bodies(tp('getContactsV2')) as Array<[{ targetUserMids: string[] }]>).map((body) => body[0].targetUserMids.length);
     expect(contactPages).toEqual([100, 1]);
+  });
+});
+
+describe('ChromeAdapter.listConversationDetails', () => {
+  const U1 = `u${'1'.repeat(32)}`;
+  const U2 = `u${'2'.repeat(32)}`;
+  const GROUP1 = `c${'3'.repeat(32)}`;
+  const ROOM1 = `r${'4'.repeat(32)}`;
+  const contacts = {
+    [U1]: { contact: { displayName: 'Alice', displayNameOverridden: 'Ali', picturePath: '/0hAlice' } },
+    [U2]: { contact: { displayName: 'Bob' } },
+  };
+  const chats = [
+    { chatMid: GROUP1, chatName: 'The Group', picturePath: '/0hGroup', extra: { groupExtra: { memberMids: { [U2]: 1, [U1]: 2 } } } },
+    { chatMid: ROOM1, chatName: '', extra: { groupExtra: { memberMids: { [U2]: 1 } } } },
+  ];
+
+  it('sends only getChats [.., 1] and getContactsV2 [.., 2] and maps items like the catalog', async () => {
+    const { adapter, server } = await build();
+    await adapter.installSecrets({ token: 'tok', qrCert: null, e2eeStorage: snapshot() });
+    server.on(tp('getChats'), ok({ chats }));
+    server.on(tp('getContactsV2'), ok({ contacts }));
+
+    const actual = await adapter.listConversationDetails([GROUP1, ROOM1]);
+
+    const reference = await fetchLinejsConversationCatalog({
+      ownMid: SELF,
+      getAllChatMids: async () => ({ memberChatMids: [GROUP1, ROOM1] }),
+      getMessageBoxes: async () => ({ messageBoxes: [] }),
+      getChats: async () => ({ chats }),
+      getContactsV2: async () => ({ contacts }),
+    }, (call) => call());
+    expect(actual).toEqual(reference);
+    expect(server.bodies(tp('getChats'))).toEqual([[{ chatMids: [GROUP1, ROOM1], withMembers: true, withInvitees: true }, 1]]);
+    expect(server.bodies(tp('getContactsV2'))).toEqual([[{ targetUserMids: [U1, U2], neededContactCalendarEvents: [] }, 2]]);
+    expect(server.bodies(tp('getAllChatMids'))).toEqual([]);
+    expect(server.bodies(tp('getMessageBoxes'))).toEqual([]);
+  });
+
+  it('chunks chats and contacts by 100', async () => {
+    const { adapter, server } = await build();
+    await adapter.installSecrets({ token: 'tok', qrCert: null, e2eeStorage: snapshot() });
+    const hex = (n: number): string => n.toString(16).padStart(32, '0');
+    const groups = Array.from({ length: 101 }, (_, index) => `c${hex(index)}`);
+    server.always(tp('getChats'), async () => {
+      const mids = (JSON.parse(server.requests.at(-1)!.body!) as [{ chatMids: string[] }, number])[0].chatMids;
+      return ok({ chats: mids.map((chatMid) => ({ chatMid, chatName: 'G', extra: { groupExtra: { memberMids: { [`u${hex(Number.parseInt(chatMid.slice(1), 16) + 1000)}`]: 1 } } } })) });
+    });
+    server.always(tp('getContactsV2'), () => ok({ contacts: {} }));
+
+    const result = await adapter.listConversationDetails(groups);
+
+    expect(result).toHaveLength(101);
+    expect((server.bodies(tp('getChats')) as Array<[{ chatMids: string[] }, number]>).map((body) => [body[0].chatMids.length, body[1]])).toEqual([[100, 1], [1, 1]]);
+    expect((server.bodies(tp('getContactsV2')) as Array<[{ targetUserMids: string[] }, number]>).map((body) => [body[0].targetUserMids.length, body[1]])).toEqual([[100, 2], [1, 2]]);
   });
 });
 

@@ -1,6 +1,6 @@
 import type { WorkerBinding } from '@line-agent/contracts';
 
-/** Copies exactly the strict WorkerBinding wire fields, dropping runtime extras such as mode/purpose/expectedMid. */
+/** Copies exactly the strict WorkerBinding wire fields, dropping runtime extras such as mode. */
 export function pickWorkerBinding(binding: WorkerBinding): WorkerBinding {
   return {
     accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch,

@@ -4,12 +4,12 @@ export type EffectPhase = "AUTH_BOOTSTRAP" | "MONITOR_READ" | "CONTROL_READ" | "
 export type ControlLeasePhase = "CONTROL_READ" | "CONTROL_SEND" | "MANUAL_SEND";
 export type ControlLease = Readonly<{ accountId: string; workerInstanceId: string; controlEpoch: number }>;
 export type RpcTransportState =
-  | Readonly<{ mode: "direct"; tokenState: "none" | "v3-jwt" | "legacy-opaque" }>
+  | Readonly<{ mode: "direct"; tokenState: "none" | "v3-jwt" }>
   | Readonly<{ mode: "legy-encrypted"; tokenState: "v3-jwt" }>
   | Readonly<{ mode: "unsupported"; tokenState: "legacy-opaque" }>;
 export type ChatResourceChannelBootstrap = Readonly<{ accountId: string; workerInstanceId: string; controlEpoch: number;
   channelId: '1341209850' | '1375220249'; signal: AbortSignal; maxBytes: number }>;
-export type RpcCallContext = Readonly<{ phase: EffectPhase; lease?: ControlLease; allowLegacyOpaqueDirect?: boolean;
+export type RpcCallContext = Readonly<{ phase: EffectPhase; lease?: ControlLease;
   chatResourceBootstrap?: ChatResourceChannelBootstrap }>;
 export type DirectFetchEffect = Readonly<{ phase: "MONITOR_READ" | "CONTROL_READ"; lease?: ControlLease }>;
 export type ChatResourceFetchEffect = Readonly<{ accountId: string; workerInstanceId: string; controlEpoch: number;
@@ -172,7 +172,6 @@ export class MutationGate<Call, RpcResult, TransportResult> {
           logicalPath,
           invocation.actualMethodName,
           invocation.logicalRequest.url,
-          context.allowLegacyOpaqueDirect === true,
         ),
         logicalRequest: invocation.logicalRequest,
         writeConsumed: false,
@@ -325,12 +324,6 @@ export class MutationGate<Call, RpcResult, TransportResult> {
       return invocation.actualPath;
     }
     if (resourceBootstrap) return deny("resource channel-token context requires CHAT_RESOURCE_BOOTSTRAP phase");
-    const opaqueDownloadRead = context.allowLegacyOpaqueDirect === true && context.phase === "MONITOR_READ" &&
-      invocation.actualPath === "/S4" &&
-      (invocation.actualMethodName === "getProfile" || invocation.actualMethodName === "acquireEncryptedAccessToken");
-    if (context.allowLegacyOpaqueDirect === true && !opaqueDownloadRead) {
-      return deny("opaque direct access is restricted to native download profile/token reads");
-    }
     let allowed: boolean;
     switch (context.phase) {
       case "AUTH_BOOTSTRAP": allowed = AUTH_BOOTSTRAP_RPC.has(key); break;
@@ -356,14 +349,8 @@ export class MutationGate<Call, RpcResult, TransportResult> {
     logicalPath: string,
     methodName: string,
     logicalUrl: string,
-    allowLegacyOpaqueDirect: boolean,
   ): PhysicalBinding {
     if (transport.mode === "unsupported") return deny("legacy opaque token transport is unsupported");
-    const opaqueDownloadRead = allowLegacyOpaqueDirect && phase === "MONITOR_READ" && logicalPath === "/S4" &&
-      (methodName === "getProfile" || methodName === "acquireEncryptedAccessToken");
-    if (transport.tokenState === "legacy-opaque" && !opaqueDownloadRead) {
-      return deny("legacy opaque token transport is unsupported");
-    }
     const talk = logicalPath === "/S4" || logicalPath === "/SYNC4";
     if (transport.mode === "legy-encrypted") {
       if (transport.tokenState !== "v3-jwt" || !talk) return deny("LEGY encrypted mode/token/path mismatch");
@@ -374,10 +361,6 @@ export class MutationGate<Call, RpcResult, TransportResult> {
       if (logicalPath === "/S4" && methodName !== "registerE2EEPublicKey") {
         return deny("tokenless Talk bootstrap is restricted to QR public-key registration");
       }
-      return { url: logicalUrl, sameAsLogical: true };
-    }
-    if (transport.tokenState === "legacy-opaque") {
-      if (!opaqueDownloadRead || phase !== "MONITOR_READ" || !talk) return deny("opaque direct RPC is restricted to native download reads");
       return { url: logicalUrl, sameAsLogical: true };
     }
     if (talk) return deny("V3 Talk RPC must use the verified LEGY outer transport");

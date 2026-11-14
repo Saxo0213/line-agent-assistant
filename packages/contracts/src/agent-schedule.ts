@@ -107,7 +107,7 @@ export type AgentScheduleRecurrence = z.infer<typeof AgentScheduleRecurrenceSche
  * Agent runs end as submitted / failed / missed / skipped_overlap. System message runs (no Agent job) end as sent / send_failed /
  * send_unknown; `send_unknown` is never retried. A new_messages run that finds nothing to list ends as no_messages.
  */
-export const AgentScheduleRunOutcomeSchema = z.enum(['submitting', 'submitted', 'missed', 'skipped_overlap', 'failed', 'sent', 'send_failed', 'send_unknown', 'no_messages']);
+export const AgentScheduleRunOutcomeSchema = z.enum(['submitting', 'submitted', 'missed', 'skipped_overlap', 'failed', 'sent', 'send_failed', 'send_unknown', 'no_messages', 'notified']);
 export type AgentScheduleRunOutcome = z.infer<typeof AgentScheduleRunOutcomeSchema>;
 
 export const AGENT_SCHEDULE_MAX_TARGETS = 20;
@@ -247,22 +247,57 @@ export const AgentScheduleNewMessagesTaskSchema = z.strictObject({
   if (leaves > AGENT_SCHEDULE_LEAVES_MAX) ctx.addIssue({ code: 'custom', message: `A task can have at most ${AGENT_SCHEDULE_LEAVES_MAX} conditions in messageFilter and rules together` });
 });
 
+export const AGENT_SCHEDULE_MENTION_MEMBERS_MAX = 20;
+export const AgentScheduleForwardActionsSchema = z.strictObject({
+  forward: z.boolean().default(true),
+  notify: z.boolean().default(false),
+  agent: z.strictObject({ prompt: z.string().max(4000).default(''), target: AgentScheduleSendTargetSchema }).nullable().default(null),
+});
+export type AgentScheduleForwardActions = z.infer<typeof AgentScheduleForwardActionsSchema>;
 export const AgentScheduleForwardTaskSchema = z.strictObject({
   type: z.literal('message_forward'),
   match: z.discriminatedUnion('mode', [
     z.strictObject({ mode: z.literal('contains'), keywords: z.array(z.string().min(1).max(200).refine((s) => s.trim().length > 0)).min(1).max(20) }),
     z.strictObject({ mode: z.literal('exact'), text: z.string().min(1).max(20000).refine((s) => s.trim().length > 0) }),
     z.strictObject({ mode: z.literal('sender') }),
+    /** A new message that mentions the Primary Admin (admin), one of the members, or everyone (all). */
+    z.strictObject({
+      mode: z.literal('mention'),
+      admin: z.boolean().default(false),
+      members: z.array(z.strictObject({ accountId: z.string().min(1).max(256), mid: z.string().trim().min(1).max(256), label: z.string().max(200).default('') }))
+        .max(AGENT_SCHEDULE_MENTION_MEMBERS_MAX).default([]),
+      all: z.boolean().default(false),
+    }),
   ]),
   sender: z.strictObject({ accountId: z.string().min(1).max(256), mid: z.string().trim().min(1).max(256), label: z.string().max(200).default('') }).optional(),
+  /** Missing means the old behavior: forward only. */
+  actions: AgentScheduleForwardActionsSchema.optional(),
 }).superRefine((task, ctx) => {
   if (task.match.mode === 'sender' && !task.sender) ctx.addIssue({ code: 'custom', message: 'Sender matching requires an account and sender MID' });
+  if (task.match.mode === 'mention') {
+    const mids = task.match.members.map((member) => member.mid);
+    if (new Set(mids).size !== mids.length) ctx.addIssue({ code: 'custom', message: 'Mention members must be unique' });
+    if (!task.match.admin && !task.match.all && mids.length === 0) ctx.addIssue({ code: 'custom', message: 'A mention rule needs at least one mention target' });
+  }
+  if (task.actions && !task.actions.forward && !task.actions.notify && !task.actions.agent) ctx.addIssue({ code: 'custom', message: 'A forwarding rule needs at least one action' });
 });
 export type AgentScheduleForwardTask = z.infer<typeof AgentScheduleForwardTaskSchema>;
-/** Literal, case-sensitive matching against the original text. */
-export function matchesScheduleForward(task: AgentScheduleForwardTask, source: { accountId: string; senderId: string; text: string }): boolean {
+/** The actions of a forward task; a task without `actions` only forwards. */
+export function scheduleForwardActions(task: AgentScheduleForwardTask): AgentScheduleForwardActions {
+  return task.actions ?? { forward: true, notify: false, agent: null };
+}
+/** Literal, case-sensitive matching against the original text. The mention mode reads the stored mention MIDs ('@all' = everyone). */
+export function matchesScheduleForward(task: AgentScheduleForwardTask,
+  source: { accountId: string; senderId: string; text: string; mentionIds?: readonly string[]; adminMid?: string | null }): boolean {
   if (task.sender && (task.sender.accountId !== source.accountId || task.sender.mid !== source.senderId)) return false;
-  return task.match.mode === 'sender' || (task.match.mode === 'exact' ? source.text === task.match.text : task.match.keywords.some((keyword) => source.text.includes(keyword)));
+  const match = task.match;
+  if (match.mode === 'mention') {
+    const mentioned = new Set(source.mentionIds ?? []);
+    return match.members.some((member) => mentioned.has(member.mid))
+      || (match.admin && !!source.adminMid && mentioned.has(source.adminMid))
+      || (match.all && mentioned.has('@all'));
+  }
+  return match.mode === 'sender' || (match.mode === 'exact' ? source.text === match.text : match.keywords.some((keyword) => source.text.includes(keyword)));
 }
 
 export const AgentScheduleTaskSchema = z.discriminatedUnion('type', [
@@ -317,13 +352,16 @@ export function agentScheduleShapeError(shape: {
   if (keys.size !== shape.targets.length) return 'Targets must be unique';
   if (shape.recurrence && (shape.recurrence.kind === 'message') !== (shape.task.type === 'message_forward')) return 'Message event recurrence is only valid for message forwarding';
   if (shape.task.type === 'message_forward') {
-    if (shape.targets.length === 0) return 'Message forwarding requires explicit source chats';
-    if (shape.delivery?.mode !== 'line_target') return 'Message forwarding requires an explicit LINE destination';
-    const destination = shape.delivery.target;
+    // Empty targets mean all readable chats of the Agent and Primary Admin accounts.
+    const actions = scheduleForwardActions(shape.task);
+    if (actions.forward) {
+      if (shape.delivery?.mode !== 'line_target') return 'Message forwarding requires an explicit LINE destination';
+      const destination = shape.delivery.target;
+      if (destination.chatType === 'room') return 'Message forwarding requires a destination that supports original images and files';
+      if (shape.targets.some((source) => source.accountId === destination.accountId && source.chatType === destination.chatType && source.chatId === destination.chatId)) return 'Forwarding source and destination must differ';
+    } else if (shape.delivery?.mode !== 'record_only') return 'A rule without forwarding must use record-only delivery';
     const sender = shape.task.sender;
-    if (destination.chatType === 'room') return 'Message forwarding requires a destination that supports original images and files';
-    if (shape.targets.some((source) => source.accountId === destination.accountId && source.chatType === destination.chatType && source.chatId === destination.chatId)) return 'Forwarding source and destination must differ';
-    if (sender && !shape.targets.some((source) => source.accountId === sender.accountId)) return 'Sender account must belong to the selected sources';
+    if (sender && shape.targets.length > 0 && !shape.targets.some((source) => source.accountId === sender.accountId)) return 'Sender account must belong to the selected sources';
     return null;
   }
   if (shape.task.type === 'message') {
@@ -376,6 +414,8 @@ export type AgentSchedule = z.infer<typeof AgentScheduleSchema>;
 
 export const AgentScheduleRunSchema = z.strictObject({
   forwarding:z.strictObject({sourceTitle:z.string(),accountId:z.string(),senderName:z.string(),senderId:z.string(),
+    /** Mention rules only: state of the notification and of the Agent job, and the safe error code of a failed or skipped Agent job. */
+    notifyState:z.string().nullable().optional(),agentState:z.string().nullable().optional(),agentError:z.string().nullable().optional(),
     parts:z.array(z.strictObject({kind:z.string(),filename:z.string().nullable(),state:z.string(),errorCode:z.string().nullable()})).max(101)}).optional(),
   runId: z.uuid(),
   scheduleId: z.uuid(),

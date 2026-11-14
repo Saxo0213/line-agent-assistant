@@ -7,6 +7,7 @@ import type { AgentRepository, AgentJobStatusProjection, AgentQueueKey, SessionK
 import type { WorkspaceAuthority } from './workspace-authority.js';
 import { splitDeliveryText } from './delivery-service.js';
 import { personaPromptSection } from './agent-persona.js';
+import type { ReplyContextResolver } from './agent-reply-context.js';
 import { formatIdentityBlock, withAgentRoomHistoryHint, withIdentityBlock, withMcpSkill, withOutputChannel } from './mcp-skill.js';
 import { isScheduledRunRequestId } from './agent-schedule-service.js';
 import type { AgentJobEnvironment, AgentJobPlan } from './agent-job-environment.js';
@@ -147,6 +148,8 @@ export class AgentService {
     /** The persona description in force for a LINE chat (docs/architecture/agent-persona.md); blank adds nothing to the prompt. */
     private readonly resolvePersonaDescription?: (chat: { accountId: string; chatType: string; chatId: string }) => Promise<string>,
     private readonly quotaGate?: (provider: AgentProvider) => Promise<{ blocked: boolean; recoveryAt: string | null } | null>,
+    /** The quoted message of a LINE reply and its ready files (run request only); null when the trigger message is no reply. */
+    private readonly resolveReplyContext?: ReplyContextResolver,
   ) {}
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown, jobId?: string): void {
@@ -560,6 +563,8 @@ export class AgentService {
         deadlineAt: 0, nextHeartbeatAt: 0, deadlineExceeded: false,
         heartbeatPhase: 0, reactionInFlight: false, terminalPending: false, terminal: false };
       let timeoutPersisted = false;
+      // Set when quoted files were copied into the job directory; the directory is removed when the job ends.
+      let replyFilesWorkspace: string | null = null;
       const source: AgentRunRequest['source'] = job.sourceType === 'line'
         ? { type: 'line', accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, messageId: job.sourceMessageId! }
         : { type: job.sourceType, requestId: job.sourceRequestId! };
@@ -713,6 +718,17 @@ ${scheduleContext}` : request.prompt;
             .then(personaPromptSection).catch(() => '');
           if (personaSection) runRequest = { ...runRequest, prompt: `${runRequest.prompt}${personaSection}` };
         }
+        // The quoted message of a LINE reply: run request only, before the attachment section. A failure never fails the job.
+        if (job.sourceType === 'line' && job.accountId && job.chatType && job.chatId && job.sourceMessageId && this.resolveReplyContext) {
+          try {
+            const reply = await this.resolveReplyContext({ jobId: job.jobId, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId,
+              messageId: job.sourceMessageId, workspacePath: plan.workspacePath, provider: job.provider });
+            if (reply) {
+              runRequest = { ...runRequest, prompt: `${runRequest.prompt}${reply.section}` };
+              if (reply.files.length > 0) { attachmentFiles = [...attachmentFiles, ...reply.files]; replyFilesWorkspace = plan.workspacePath; }
+            }
+          } catch (replyError) { this.reportFailure('prepare', replyError, job.jobId); }
+        }
         if (attachmentFiles.length > 0) {
           // Added last and to the run request only: the stored job prompt never carries the section or any path.
           const imagePaths = job.provider === 'codex' ? attachmentFiles.filter((item) => item.kind === 'image').map((item) => item.absolutePath) : [];
@@ -800,6 +816,8 @@ ${scheduleContext}` : request.prompt;
           }
         }
       } finally {
+        // Best effort: quoted files of a LINE job are deleted at the end of the job and never change its result.
+        if (replyFilesWorkspace) await removeJobAttachments(replyFilesWorkspace, job.jobId).catch(() => undefined);
         const current = await this.agents.getJob(job.jobId).catch(() => null);
         if (current && !execution.terminal) {
           if (current.status === 'cancelled') {

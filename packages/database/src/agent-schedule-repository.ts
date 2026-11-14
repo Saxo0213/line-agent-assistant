@@ -361,13 +361,17 @@ export class AgentScheduleRepository {
 
   async listRuns(scheduleId: string, limit = 20): Promise<AgentScheduleRun[]> {
     const bounded = Math.max(1, Math.min(50, Math.floor(limit)));
+    // A forward run has no job of its own; the Agent job of a mention rule is stored on its work row, so that job is the job of the run.
     const result = await this.pool.query<RunRow>(
-      `SELECT r.run_id, r.schedule_id, r.scheduled_for, r.outcome, r.job_id, r.created_at,
+      `SELECT r.run_id, r.schedule_id, r.scheduled_for, r.outcome, COALESCE(r.job_id, f.agent_job_id) AS job_id, r.created_at,
          CASE WHEN char_length(o.final_text) > 200 THEN left(o.final_text, 199) || '…' ELSE o.final_text END AS reply_preview,
-         (SELECT jsonb_build_object('sourceTitle',w.source_title,'accountId',w.account_id,'senderName',w.sender_name,'senderId',w.sender_id,
-           'parts',(SELECT jsonb_agg(jsonb_build_object('kind',p.kind,'filename',p.filename,'state',p.state,'errorCode',p.error_code) ORDER BY p.part_index)
-             FROM agent_schedule_forward_parts p WHERE p.work_id=w.work_id)) FROM agent_schedule_forward_work w WHERE w.run_id=r.run_id) forwarding
-       FROM agent_schedule_runs r LEFT JOIN agent_outputs o ON o.job_id = r.job_id
+         CASE WHEN f.work_id IS NULL THEN NULL ELSE jsonb_build_object('sourceTitle',f.source_title,'accountId',f.account_id,'senderName',f.sender_name,'senderId',f.sender_id,
+           'notifyState',f.notify_state,'agentState',f.agent_state,'agentError',f.agent_error,
+           'parts',COALESCE((SELECT jsonb_agg(jsonb_build_object('kind',p.kind,'filename',p.filename,'state',p.state,'errorCode',p.error_code) ORDER BY p.part_index)
+             FROM agent_schedule_forward_parts p WHERE p.work_id=f.work_id),'[]'::jsonb)) END AS forwarding
+       FROM agent_schedule_runs r
+       LEFT JOIN agent_schedule_forward_work f ON f.run_id = r.run_id
+       LEFT JOIN agent_outputs o ON o.job_id = COALESCE(r.job_id, f.agent_job_id)
        WHERE r.schedule_id = $1 ORDER BY r.scheduled_for DESC LIMIT $2`, [scheduleId, bounded]);
     return result.rows.map(toRun);
   }

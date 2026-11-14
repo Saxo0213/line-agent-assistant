@@ -64,6 +64,18 @@ describe("TalkCursorV1", () => {
 });
 
 describe("durable envelope batch acknowledgement", () => {
+  it("stages unsends, keeps them in the pending copy and omits an empty list", () => {
+    const unsend = { chatId: "c" + "1".repeat(32), messageId: "640083256712626194", kind: "self" as const,
+      observedAt: "2026-11-11T00:00:00.000Z" };
+    const session = new DurableCursorSession<string>("account-a", before);
+    const batch = session.stage("batch-1", after, [], [], [unsend]);
+    expect(batch.unsends).toEqual([unsend]);
+    expect(Object.isFrozen(batch.unsends)).toBe(true);
+    expect(session.pendingBatch?.unsends).toEqual([unsend]);
+    session.acknowledge({ accountId: "account-a", batchId: "batch-1", cursorBefore: batch.cursorBefore, cursorAfter: batch.cursorAfter });
+    expect(session.stage("batch-2", after, [], [], []).unsends).toBeUndefined();
+  });
+
   it("does not advance before an exact account/batch/before/after acknowledgement", () => {
     const session = new DurableCursorSession<string>("account-a", before);
     const batch = session.stage("batch-1", after, ["message-1"]);

@@ -24,7 +24,7 @@ await mkdir(outputRoot, { recursive: true });
 const output = path.join(outputRoot, 'OfficialSchemaNamesTool.exe');
 execFileSync(compiler, ['/nologo', '/target:exe', '/platform:x64', '/optimize+', '/main:OfficialSchemaNamesTool', `/out:${output}`,
   `/reference:${path.join(frameworkRoot, 'System.Web.Extensions.dll')}`,
-  ...['OfficialSchemaNamesTool.cs','Sqlite3McSchemaNames.cs','ExternalReaderBridge.cs','OfficialLineMainWindowCloser.cs','Sqlite3Mc.cs','NativeSourceArchive.cs','LineEncryptedPageValidator.cs','OfficialSourceInventory.cs','OfficialSourceHeaderProbe.cs','NativeAttachmentOperations.cs','OfficialSourceKeyProbe.cs','LineEncryptedSnapshot.cs'].map((file) => path.join(desktopRoot, 'native', file))],
+  ...['OfficialSchemaNamesTool.cs','Sqlite3McSchemaNames.cs','ExternalReaderBridge.cs','OfficialLineMainWindowCloser.cs','Sqlite3Mc.cs','NativeSourceArchive.cs','LineEncryptedPageValidator.cs','OfficialSourceInventory.cs','OfficialSourceKeyProbe.cs','LineEncryptedSnapshot.cs'].map((file) => path.join(desktopRoot, 'native', file))],
 { shell: false, windowsHide: true, stdio: 'inherit', env: { SystemRoot: systemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP } });
 await copyFile(sqliteSource, path.join(outputRoot, 'sqlite3mc_x64.dll'));
 process.stdout.write(`${output}\n`);

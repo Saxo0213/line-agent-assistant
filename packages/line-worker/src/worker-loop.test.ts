@@ -8,6 +8,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SafeAttachmentError } from './attachment-error.js';
+import { isPrimaryAttachmentRelativePath } from './attachment-store.js';
 import { InternalError } from '@evex/linejs/base';
 import { ChatResourceFailure } from './chat-resource-error.js';
 import { LineWorkerEventSchema } from '@line-agent/contracts';
@@ -216,119 +217,6 @@ describe('one-account worker loop', () => {
       error: 'LINE_TALK_NOT_FOUND' });
   });
 
-  it('adopts official auth via download probe in download-only purpose without login events or receive', async () => {
-    const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Official' });
-    const adoptionCalls: unknown[] = [];
-    Object.assign(transport, { async adoptDownloadAuth(token: string, application: string, options?: { expectedMid?: string; probe?: unknown }) {
-      adoptionCalls.push({ token, application, expectedMid: options?.expectedMid, probe: options?.probe });
-      return { ownMid: token === 'right-token' ? selfMid : `u${'b'.repeat(32)}`, displayName: null };
-    }, clearDownloadAuth() {} });
-    const events: any[] = [];
-    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => false });
-    const downloadPurpose = { ...binding, purpose: 'DOWNLOAD_ONLY' as const, expectedMid: selfMid,
-      application: 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64' };
-    const probe = {
-      chatType: 'group' as const,
-      chatId: attachmentChat,
-      messageId: '9',
-      externalAttachmentId: 'OID_123',
-      kind: 'image' as const,
-      lineMessage: workerAttachmentMessage(),
-    };
-    await worker.handle({ type: 'init', ...downloadPurpose, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
-    await expect(worker.handle({ type: 'poll', ...binding })).rejects.toThrow(/download-only/i);
-    await worker.handle({ type: 'adoptDownloadAuth', ...binding, requestId: 'auth-1', token: 'wrong-token',
-      application: downloadPurpose.application, expectedMid: selfMid, probe });
-    await worker.handle({ type: 'adoptDownloadAuth', ...binding, requestId: 'auth-2', token: 'right-token',
-      application: 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64', expectedMid: selfMid, probe });
-    expect(adoptionCalls).toHaveLength(2);
-    expect(adoptionCalls).toContainEqual({ token: 'right-token',
-      application: 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64', expectedMid: selfMid, probe });
-    expect(events).toContainEqual(expect.objectContaining({ type: 'downloadAuthResult', requestId: 'auth-1', accepted: false, error: 'PROFILE_MISMATCH' }));
-    expect(events).toContainEqual(expect.objectContaining({ type: 'downloadAuthResult', requestId: 'auth-2', accepted: true, error: null }));
-    expect(events).toContainEqual(expect.objectContaining({ type: 'downloadReady', ownMid: selfMid }));
-    expect(events.map((event) => event.type)).not.toContain('login');
-    expect(events.map((event) => event.type)).not.toContain('status');
-    expect(events.map((event) => event.type)).not.toContain('secretRotation');
-    expect(transport.loginCalls).toEqual([]);
-  });
-
-  it('keeps a timed-out download-auth transport quarantined until its owner is replaced', async () => {
-    vi.useFakeTimers();
-    let releaseAdoption!: () => void;
-    let adoptionStarted!: () => void;
-    const started = new Promise<void>((resolve) => { adoptionStarted = resolve; });
-    const pending = new Promise<void>((resolve) => { releaseAdoption = resolve; });
-    const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Official' });
-    let adoptionCalls = 0;
-    Object.assign(transport, { async adoptDownloadAuth() { adoptionCalls++; adoptionStarted(); await pending;
-      return { ownMid: selfMid, displayName: null }; }, clearDownloadAuth() {} });
-    const events: any[] = [];
-    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => false });
-    const downloadBinding = { ...binding, purpose: 'DOWNLOAD_ONLY' as const, expectedMid: selfMid,
-      application: 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64' };
-    try {
-      await worker.handle({ type: 'init', ...downloadBinding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
-      const timedOut = worker.handle({ type: 'adoptDownloadAuth', ...binding, requestId: 'auth-timeout', token: 'candidate-one',
-        application: downloadBinding.application, expectedMid: selfMid });
-      await started;
-      await vi.advanceTimersByTimeAsync(10_000);
-      await timedOut;
-      await worker.handle({ type: 'adoptDownloadAuth', ...binding, requestId: 'auth-after-timeout', token: 'candidate-two',
-        application: downloadBinding.application, expectedMid: selfMid });
-      expect(adoptionCalls).toBe(1);
-      expect(events).toContainEqual(expect.objectContaining({ type: 'downloadAuthResult', requestId: 'auth-timeout',
-        accepted: false, error: 'AUTH_UNAVAILABLE' }));
-      expect(events).toContainEqual(expect.objectContaining({ type: 'downloadAuthResult', requestId: 'auth-after-timeout',
-        accepted: false, error: 'AUTH_UNAVAILABLE' }));
-      expect(events).toContainEqual(expect.objectContaining({ type: 'status', state: 'degraded' }));
-    } finally { releaseAdoption(); vi.useRealTimers(); }
-  });
-
-  it('serializes candidate adoption behind a pending download and rejects adoption after stop', async () => {
-    const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Official' });
-    let releaseDownload!: (value: { name: string; source: AsyncIterable<Uint8Array> }) => void;
-    let signalDownloadStarted!: () => void;
-    const downloadStarted = new Promise<void>((resolve) => { signalDownloadStarted = resolve; });
-    const credentialAdoptions: string[] = [];
-    Object.assign(transport, {
-      async adoptDownloadAuth(token: string) {
-        credentialAdoptions.push(token);
-        if (token !== 'initial') throw new Error('stopped adoption must not touch transport credentials');
-        return { ownMid: selfMid, displayName: null };
-      },
-      async download() { signalDownloadStarted(); return await new Promise<{ name: string; source: AsyncIterable<Uint8Array> }>((resolve) => { releaseDownload = resolve; }); },
-      clearDownloadAuth() {}, revoke() {},
-    });
-    const events: any[] = [];
-    const root = await mkdtemp(join(tmpdir(), 'line-worker-download-adoption-race-'));
-    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => false,
-      attachmentRoot: root, minFreeBytes: 0,
-      attachmentRuntime: { unsafeAllowPortableFilesystemOnWindowsForTests: true } });
-    const extBinding = { ...binding, purpose: 'DOWNLOAD_ONLY' as const, expectedMid: selfMid,
-      application: 'DESKTOPWIN\t26.4.2.3957\tWINDOWS\t10.0.0-NT-x64' };
-    try {
-      await worker.handle({ type: 'init', ...extBinding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
-      await worker.handle({ type: 'adoptDownloadAuth', ...binding, requestId: 'initial-auth', token: 'initial',
-        application: extBinding.application, expectedMid: selfMid });
-      const download = worker.handle({ type: 'downloadAttachment', ...binding, requestId: 'download-race',
-        attemptToken: '22222222-2222-4222-8222-222222222222', attachmentId: '33333333-3333-4333-8333-333333333333',
-        messageId: '9', externalAttachmentId: 'OID_123', kind: 'image', occurredAt: '2026-10-18T00:00:00.000Z',
-        originalFileName: 'image.png', chatType: 'group', chatId: attachmentChat,
-        lineMessage: workerAttachmentMessage(), maxBytes: 1024, timeoutMs: 5000 });
-      const started = await Promise.race([downloadStarted.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250))]);
-      if (!started) throw new Error(`download did not start: ${events.map((event) => event.type + ':' + (event.error ?? '')).join(',')}`);
-      const adoption = worker.handle({ type: 'adoptDownloadAuth', ...binding, requestId: 'racing-auth', token: 'next',
-        application: 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64', expectedMid: selfMid });
-      await worker.handle({ type: 'stop', ...binding });
-      releaseDownload({ name: 'image.png', source: (async function* () { yield new Uint8Array([1]); })() });
-      await Promise.all([download, adoption]);
-      expect(credentialAdoptions).toEqual(['initial']);
-      expect(events).toContainEqual(expect.objectContaining({ type: 'downloadAuthResult', requestId: 'racing-auth',
-        accepted: false, error: 'AUTH_UNAVAILABLE' }));
-    } finally { await rm(root, { recursive: true, force: true }); }
-  });
-
   it('reports an uncoded preparation failure with a fixed safe stage code', async () => {
     const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
     const result = await runAttachmentAttempt(transport);
@@ -390,31 +278,6 @@ describe('one-account worker loop', () => {
       const result = await runAttachmentAttempt(transport, root);
       expect(result).toMatchObject({ type: 'attachmentResult', status: 'failed', error: 'ATTACHMENT_STORE_FAILED' });
       expect(JSON.stringify(result)).not.toContain('sensitive store source detail');
-    } finally { await rm(root, { recursive: true, force: true }); }
-  });
-
-  it('uses the detected native image format when source metadata has no original filename', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'line-worker-native-image-extension-'));
-    const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
-    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
-    Object.defineProperty(transport, 'download', { value: async () => ({ name: null, source: (async function* () { yield png; })() }) });
-    const events: any[] = [];
-    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => false,
-      attachmentRoot: root, minFreeBytes: 0,
-      attachmentRuntime: { unsafeAllowPortableFilesystemOnWindowsForTests: true } });
-    try {
-      await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
-      await worker.handle({ type: 'loginQr', ...binding, loginAttemptId: 'native-image-login' });
-      await worker.handle({ type: 'downloadAttachment', ...binding, requestId: 'native-image-download',
-        attemptToken: '44444444-4444-4444-8444-444444444444', attachmentId: '55555555-5555-4555-8555-555555555555',
-        messageId: '9', externalAttachmentId: '9', kind: 'image', occurredAt: '2026-10-18T00:00:00.000Z',
-        originalFileName: '9', chatType: 'group', chatId: attachmentChat, lineMessage: {},
-        nativeAttachment: { messageId: '9', chatId: attachmentChat, from: null, to: null, toType: 2, contentType: 1,
-          contentMetadata: { OID: null, SID: null, OBS_POP: null, FILE_SIZE: null, MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null },
-          keyMaterial: null, fileName: null, sizeBytes: null }, maxBytes: 1024, timeoutMs: 5000 });
-      const result = events.find((event) => event.type === 'attachmentResult');
-      expect(result).toMatchObject({ status: 'ready', name: '9.png' });
-      expect(await readFile(join(root, result.relativePath))).toEqual(png);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
@@ -632,6 +495,32 @@ describe('one-account worker loop', () => {
     expect(LineWorkerEventSchema.safeParse(result).success).toBe(true);
     expect(transport.logoutCalls).toHaveLength(0);
   });
+  it.each([
+    { label: 'JPEG', bytes: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 16, 74, 70, 73, 70, 0, 1, 1, 2, 3]), file: 'attachment.jpg' },
+    { label: 'PNG', bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 1]), file: 'attachment.png' },
+    { label: 'unknown bytes', bytes: Buffer.from('not an image at all'), file: 'attachment.bin' },
+  ])('stores an unnamed image download as $file for $label', async ({ bytes, file }) => {
+    const root = await mkdtemp(join(tmpdir(), 'line-worker-unnamed-image-'));
+    try {
+      const transport = new FakeLineTransport({ ownMid: selfMid, displayName: 'Agent' });
+      transport.enqueueDownload(bytes, null);
+      const events: any[] = [];
+      const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => false,
+        attachmentRoot: root, minFreeBytes: 0, attachmentRuntime: { unsafeAllowPortableFilesystemOnWindowsForTests: true } });
+      await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
+      await worker.handle({ type: 'loginQr', ...binding, loginAttemptId: 'unnamed-image-login' });
+      await worker.handle({ type: 'downloadAttachment', ...binding, chatType: 'group', chatId: attachmentChat,
+        requestId: 'unnamed-image', attemptToken: 'b7c252f7-8b1e-4fac-a9cc-69bc206c09a1', messageId: '9', senderId: senderMid,
+        senderDisplayName: 'Ivy', attachmentId: '11111111-1111-4111-8111-111111111111', externalAttachmentId: 'OID_123', kind: 'image',
+        occurredAt: '2026-10-15T10:00:00.000Z', originalFileName: 'attachment.bin', lineMessage: workerAttachmentMessage(),
+        maxBytes: 1024, timeoutMs: 1000 });
+      const result = events.at(-1);
+      expect(result).toMatchObject({ type: 'attachmentResult', status: 'ready', name: file });
+      expect(result.relativePath.endsWith(`/${file}`)).toBe(true);
+      expect(await readFile(join(root, ...result.relativePath.split('/')))).toEqual(bytes);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it('propagates the attachment deadline into LINEJS acquisition and stays responsive when it stalls', async () => {
     const root = await mkdtemp(join(tmpdir(), 'line-worker-stalled-download-'));
     try {
@@ -751,6 +640,28 @@ describe('one-account worker loop', () => {
     await init;
     await worker.handle({ type: 'poll', ...binding });
     expect(transport.syncCalls).toHaveLength(0);
+  });
+
+  it('stages unsends from an unsends-only sync, rejects more than 500 and keeps the batch valid', async () => {
+    const { worker, transport, events, init } = setup();
+    await init;
+    await authenticate(worker);
+    const unsend = (index: number) => ({ chatId: `c${'1'.repeat(32)}`, messageId: String(index + 1), kind: 'notified' as const,
+      observedAt: '2026-11-11T00:00:00.000Z' });
+    transport.enqueueSync({ cursorAfter: cursor, operations: [], unsends: [unsend(0)] });
+    await worker.handle({ type: 'poll', ...binding });
+    const batch = events.find((event) => event.type === 'batch') as any;
+    expect(batch.envelopes).toEqual([]);
+    expect(batch.unsends).toEqual([unsend(0)]);
+    expect(LineWorkerEventSchema.safeParse(batch).success).toBe(true);
+
+    const second = setup();
+    await second.init;
+    await authenticate(second.worker);
+    second.transport.enqueueSync({ cursorAfter: next, operations: [],
+      unsends: Array.from({ length: 501 }, (_, index) => unsend(index)) });
+    await expect(second.worker.handle({ type: 'poll', ...binding })).rejects.toThrow('bounded unsend limit');
+    expect(second.events.some((event) => event.type === 'batch')).toBe(false);
   });
 
   it('preserves catch-up history provenance through the worker batch so routing ignores commands', async () => {
@@ -1683,7 +1594,12 @@ describe('one-account worker loop', () => {
         chatType: 'group', chatId: attachmentChat, attachmentId: '11111111-1111-4111-8111-111111111111',
         status: 'ready', sizeBytes: 3, name: '原始附件.txt' });
       expect(events.at(-1).relativePath).not.toContain('\\');
-      expect(events.at(-1).relativePath).toBe(`accounts/id-6163636f756e742d41/group/id-${Buffer.from(attachmentChat).toString('hex')}/2026/10/id-39/${createHash('sha256').update('OID_123').digest('hex')}/${events.at(-1).name}`);
+      expect(isPrimaryAttachmentRelativePath(events.at(-1).relativePath)).toBe(true);
+      const segments = (events.at(-1).relativePath as string).split('/');
+      expect(segments).toHaveLength(8);
+      expect(segments.slice(0, 4)).toEqual(['accounts', 'id-6163636f756e742d41', 'group', `id-${Buffer.from(attachmentChat).toString('hex')}`]);
+      expect(segments[5]).toMatch(/^2026-10-15_\d{2}-\d{2}-\d{2}_id-39$/);
+      expect(segments.slice(6)).toEqual([createHash('sha256').update('OID_123').digest('hex'), events.at(-1).name]);
       expect(transport.downloadCalls).toEqual([{ kind, messageId: '9', externalAttachmentId: 'OID_123',
         lineMessage: message }]);
     } finally { await rm(root, { recursive: true, force: true }); }

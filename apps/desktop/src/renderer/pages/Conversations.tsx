@@ -34,7 +34,7 @@ import { chatTypeLabel as chatTypeLabelFor, conversationFallbackTitle as convers
 import { AvatarWithTypeBadge } from '../ChatTypeIcon.js';
 import { toWritableConversationKey } from '../writableChatRoute.js';
 import { addManualSendFeedback, MANUAL_SEND_FEEDBACK_LIMIT, type ManualSendFeedback } from '../manual-send-feedback.js';
-import { FileAttachmentCard } from '../FileAttachmentCard.js';
+import { FileAttachmentCard, externalAttachmentView } from '../FileAttachmentCard.js';
 import { ConversationSortMenu, DEFAULT_SORT, type SortState } from './ConversationSortMenu.js';
 import { useFriends } from '../useFriends.js';
 import { MessageReadReceipt } from './MessageReadReceipt.js';
@@ -355,6 +355,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   const [manualUnsendWindow, setManualUnsendWindow] = useState<'1h' | '7d'>('1h');
   useEffect(() => { if (typeof api.getManualUnsendWindow !== 'function') return; let live = true; void api.getManualUnsendWindow().then((window) => { if (live) setManualUnsendWindow(window); }).catch(() => undefined); return () => { live = false; }; }, [api]);
   const requestGeneration = useRef(0);
+  const latestRequest = useRef<number | null>(null);
   useEffect(() => () => { requestGeneration.current += 1; }, []);
   const draftRevisions = useRef<Record<string, number>>({});
   const replyRevision = useRef(0);
@@ -884,8 +885,9 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     if (pane.scrollTop < AUTO_LOAD_EDGE_PX) {
       if (visibleStart > 0) shiftWindow(visibleStart - WINDOW_STEP);
       else if (cursor) void older();
-    } else if (hasNewerLoaded && pane.scrollHeight - pane.scrollTop - pane.clientHeight < AUTO_LOAD_EDGE_PX) {
-      shiftWindow(visibleStart + WINDOW_STEP);
+    } else if (pane.scrollHeight - pane.scrollTop - pane.clientHeight < AUTO_LOAD_EDGE_PX) {
+      if (hasNewerLoaded) shiftWindow(visibleStart + WINDOW_STEP);
+      else if (newCount > 0 && latestRequest.current !== requestGeneration.current) void loadLatest();
     }
   };
   function handleTimelineScroll() {
@@ -912,12 +914,14 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   async function loadLatest() {
     if (!route) return;
     const generation = requestGeneration.current;
+    latestRequest.current = generation;
     try {
       const { page } = await fetchPage(route, null, 75, generation);
       if (generation !== requestGeneration.current || currentRoute.current !== routeKey) return;
       setMessages((current) => { const latest = mergePage(scopedMessages(page.messages, route), current); return chronological([...current.filter((item) => !latest.some((fresh) => fresh.messageId === item.messageId && fresh.accountId === item.accountId)), ...latest]); });
       setWindowStart(Number.MAX_SAFE_INTEGER); nearBottom.current = true; jumpToBottom.current = true; setNewCount(0);
     } catch { if (generation === requestGeneration.current && currentRoute.current === routeKey) notify(desktopText('latestMessagesHaveNotLoadedTryAgain')); }
+    finally { if (latestRequest.current === generation) latestRequest.current = null; }
   }
 
   function jumpToLatest() {
@@ -980,6 +984,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
       setSendFeedback(nextEntries);
       scrollOnSend.current = true; jumpToBottom.current = true; setWindowStart(Number.MAX_SAFE_INTEGER);
     }
+    if (!text) jumpToLatest(); else if (newCount > 0) void loadLatest();
     pendingSubmitRoutes.current.add(routeKey);
     setSending(true); clearComposerStatus();
     try {
@@ -1199,7 +1204,8 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
                   {attachment.kind === 'image' && attachment.status === 'ready' && <LineMediaImage api={api} enabled attachment={{ key: route, attachmentId: attachment.id }} fallback={desktopText('imagePreviewUnavailable')} className="inline-attachment-image" alt={attachment.name || desktopText('imageAttachment')} />}
                   {attachment.kind === 'image' && attachment.status === 'ready'
                     ? null
-                    : <FileAttachmentCard attachment={{ ...attachment, durationMs: message.content?.type === 'media' ? message.content.durationMs : null, canRetryManually: attachment.canRetryManually === true && writableRoute !== null }} accountConnected={account.status === 'connected'} api={api}
+                    : <FileAttachmentCard attachment={(() => { const view = externalAttachmentView(attachment, route?.chatType ?? '', account.downloadBridge);
+                      return { ...attachment, status: view.status, blockReason: view.blockReason, durationMs: message.content?.type === 'media' ? message.content.durationMs : null, canRetryManually: view.canRetryManually === true && writableRoute !== null }; })()} accountConnected={account.status === 'connected' || externalAttachmentView(attachment, route?.chatType ?? '', account.downloadBridge).bridgeDownload} api={api}
                       onDownload={() => void downloadAttachment(attachment.id)} onOpen={() => void openAttachment(attachment.id)} showOpenAction={false} />}
                 </div>)}
               </article>

@@ -8,9 +8,9 @@ import { SAMPLE_FUN, SAMPLE_NICE, SAMPLE_PAID } from './native-reactions.fixture
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 const GROUP = `c${'7'.repeat(32)}`;
 const OWN = `u${'0'.repeat(32)}`;
-const NICE_REACTOR = 'ub6f5a192eaf1fc1acc3c61508b4fd6da';
-const FUN_REACTOR = 'ufaeaefdf10160b3aa1f38d2f57e68736';
-const PAID_REACTOR = 'ub254b3c8c4fc001b1862a8eef68f4f00';
+const NICE_REACTOR = 'u1f2e3d4c5b6a79880123456789abcdef';
+const FUN_REACTOR = 'u2e3d4c5b6a7988012345678900fedcba';
+const PAID_REACTOR = 'u3d4c5b6a798801234567890abcdef123';
 
 database('timeline message reactions', () => {
   let pool: Pool; let close: (() => Promise<void>) | undefined; let repository: MessageRepository;

@@ -41,8 +41,6 @@ execFileSync(compiler, [
   path.join(desktopRoot, 'native', 'NativeSourceArchive.cs'),
   path.join(desktopRoot, 'native', 'LineEncryptedPageValidator.cs'),
   path.join(desktopRoot, 'native', 'OfficialSourceInventory.cs'),
-  path.join(desktopRoot, 'native', 'OfficialSourceHeaderProbe.cs'),
-  path.join(desktopRoot, 'native', 'NativeAttachmentOperations.cs'),
   path.join(desktopRoot, 'native', 'OfficialSourceKeyProbe.cs'),
   path.join(desktopRoot, 'native', 'LineEncryptedSnapshot.cs'),
 ], { shell: false, windowsHide: true, stdio: 'inherit', env: { SystemRoot: systemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP } });

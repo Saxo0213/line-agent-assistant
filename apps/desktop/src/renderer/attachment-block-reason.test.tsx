@@ -49,7 +49,7 @@ describe('queued attachment cause text', () => {
     for (const locale of ['en', 'zh-TW', 'ja', 'ko'] as const) {
       const plain = desktopTextFor(locale, 'notDownloaded');
       const texts = ATTACHMENT_BLOCK_REASONS.map((reason) => desktopTextFor(locale, attachmentBlockReasonKey(reason)));
-      expect(new Set(texts).size, locale).toBe(3);
+      expect(new Set(texts).size, locale).toBe(ATTACHMENT_BLOCK_REASONS.length);
       for (const text of texts) { expect(text, locale).toBeTruthy(); expect(text, locale).not.toBe(plain); }
     }
     expect(desktopTextFor('en', 'attachmentBlockWorkerUnavailable')).toBe(ENGLISH_DESKTOP_COPY.attachmentBlockWorkerUnavailable);

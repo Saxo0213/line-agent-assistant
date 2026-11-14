@@ -1,10 +1,25 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 
 export type RunOptions = { timeoutMs: number; env?: Record<string, string>; input?: string; cwd?: string; signal?: AbortSignal | undefined };
 export type RunResult = { code: number | null; stdout: string; stderr: string; timedOut: boolean };
 export type RunProcess = (file: string, args: readonly string[], options: RunOptions) => Promise<RunResult>;
 
+export type RunProcessSync = (file: string, args: readonly string[], options: { timeoutMs: number; env?: Record<string, string> }) => RunResult;
+
 const OUTPUT_LIMIT = 16 * 1024 * 1024;
+
+/** Blocking variant for the Windows session-end handler, where async work cannot finish. Never throws. */
+export const runProcessSync: RunProcessSync = (file, args, options) => {
+  try {
+    const result = spawnSync(file, [...args], { shell: false, windowsHide: true, env: options.env ?? {}, timeout: options.timeoutMs,
+      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', maxBuffer: OUTPUT_LIMIT });
+    const errorCode = result.error ? (result.error as NodeJS.ErrnoException).code : undefined;
+    if (result.error && errorCode !== 'ETIMEDOUT') return { code: null, stdout: '', stderr: errorCode ?? 'spawn_failed', timedOut: false };
+    return { code: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', timedOut: errorCode === 'ETIMEDOUT' };
+  } catch (error) {
+    return { code: null, stdout: '', stderr: (error as NodeJS.ErrnoException | undefined)?.code ?? 'spawn_failed', timedOut: false };
+  }
+};
 
 /** Spawns with an argument array (no shell), hidden window, a hard timeout that kills the child, and awaits exit. */
 export const runProcess: RunProcess = (file, args, options) => new Promise<RunResult>((resolve, reject) => {

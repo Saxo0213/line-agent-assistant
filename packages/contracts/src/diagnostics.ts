@@ -13,6 +13,7 @@ export const SEND_DETAIL_MAX_CHARS = 120;
 export const SendDetailSchema = z.string().min(1).max(SEND_DETAIL_MAX_CHARS).regex(SEND_DETAIL_PATTERN);
 
 /** Operational evidence only. Never add caller-controlled text or error objects here. */
+// The operation 'adoptDownloadAuth' is kept for stored rows. No code emits it.
 export const DIAGNOSTIC_OPERATIONS = [
   'init', 'adoptDownloadAuth', 'loginQr', 'loginToken', 'setSecretState', 'poll', 'ackBatch', 'history',
   'chatResourceRead', 'refreshOwnProfile', 'cancelChatResourceRead', 'sendText', 'manualSendText', 'sendMedia',

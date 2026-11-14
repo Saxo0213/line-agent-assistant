@@ -2,11 +2,11 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { lstat, open, realpath, type FileHandle, mkdir, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { ChatType } from '@line-agent/contracts';
+import { isPrimaryAttachmentRelativePath } from '@line-agent/line-worker/attachment-storage';
+import { sniffImageMimeType, type ChatType } from '@line-agent/contracts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OPAQUE_BLOB = /^att-([0-9a-f]{64})\.blob$/i;
-const ATTACHMENT_HASH_DIRECTORY = /^[0-9a-f]{64}$/i;
 const DANGEROUS_EXTENSION = new Set(['exe', 'com', 'bat', 'cmd', 'ps1', 'vbs', 'js', 'jse', 'mjs', 'cjs', 'msi', 'scr', 'lnk', 'url', 'hta', 'html', 'htm', 'svg', 'svgz', 'xhtml', 'xml']);
 
 type RendererKind = 'image' | 'video' | 'audio' | 'text' | 'pdf';
@@ -32,10 +32,10 @@ function rejectsActivePrefix(bytes: Buffer): boolean {
 
 const FORMATS: readonly Format[] = [
   { mimeType: 'application/pdf', extensions: ['pdf'], attachmentKinds: ['file'], renderer: 'pdf', signature: (bytes) => bytes.subarray(0, 5).toString('ascii') === '%PDF-' },
-  { mimeType: 'image/png', extensions: ['png'], attachmentKinds: ['image'], renderer: 'image', signature: (bytes) => starts(bytes, [137, 80, 78, 71, 13, 10, 26, 10]) },
-  { mimeType: 'image/jpeg', extensions: ['jpg', 'jpeg'], attachmentKinds: ['image'], renderer: 'image', signature: (bytes) => starts(bytes, [0xff, 0xd8, 0xff]) },
-  { mimeType: 'image/gif', extensions: ['gif'], attachmentKinds: ['image'], renderer: 'image', signature: (bytes) => ['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('ascii')) },
-  { mimeType: 'image/webp', extensions: ['webp'], attachmentKinds: ['image'], renderer: 'image', signature: (bytes) => bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP' },
+  { mimeType: 'image/png', extensions: ['png'], attachmentKinds: ['image'], renderer: 'image', signature: (bytes) => sniffImageMimeType(bytes) === 'image/png' },
+  { mimeType: 'image/jpeg', extensions: ['jpg', 'jpeg'], attachmentKinds: ['image'], renderer: 'image', signature: (bytes) => sniffImageMimeType(bytes) === 'image/jpeg' },
+  { mimeType: 'image/gif', extensions: ['gif'], attachmentKinds: ['image'], renderer: 'image', signature: (bytes) => sniffImageMimeType(bytes) === 'image/gif' },
+  { mimeType: 'image/webp', extensions: ['webp'], attachmentKinds: ['image'], renderer: 'image', signature: (bytes) => sniffImageMimeType(bytes) === 'image/webp' },
   { mimeType: 'video/mp4', extensions: ['mp4'], attachmentKinds: ['video'], renderer: 'video', signature: (bytes) => bytes.subarray(4, 8).toString('ascii') === 'ftyp' },
   { mimeType: 'video/webm', extensions: ['webm'], attachmentKinds: ['video'], renderer: 'video', signature: (bytes) => starts(bytes, [0x1a, 0x45, 0xdf, 0xa3]) },
   { mimeType: 'audio/mpeg', extensions: ['mp3'], attachmentKinds: ['audio'], renderer: 'audio', signature: (bytes) => bytes.subarray(0, 3).toString('ascii') === 'ID3' || (bytes[0] === 0xff && (bytes[1]! & 0xe0) === 0xe0) },
@@ -172,6 +172,17 @@ function declaredFormat(record: PreviewRecord): Format | null {
     && candidate.attachmentKinds.includes(record.kind)) ?? null;
 }
 
+/**
+ * An image record that has no name or no MIME type (LINE image messages carry none) is shown by its content.
+ * Returns the display name for such a record, or null when the record must not be shown by content sniffing.
+ */
+function sniffedImageDisplayName(record: PreviewRecord): string | null {
+  if (record.kind !== 'image' || (record.name && record.mimeType)) return null;
+  if (!record.name) return '';
+  if (/[\\/:<>"|?*\u0000-\u001f]/.test(record.name)) return null;
+  return record.name.toLowerCase().split('.').some((part) => DANGEROUS_EXTENSION.has(part)) ? null : record.name;
+}
+
 function imageFormat(bytes: Buffer): Format | null {
   return FORMATS.find((candidate) => candidate.renderer === 'image' && candidate.signature(bytes)) ?? null;
 }
@@ -218,18 +229,8 @@ function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T | 
 export async function openManagedBlob(root: string, relativePath: string, signal?: AbortSignal): Promise<{ handle: FileHandle; target: string; close(): Promise<void> } | null> {
   if (!path.isAbsolute(root) || root.includes('\0') || (process.platform === 'win32' && /^(?:\\\\|\\\\[.?]\\)/.test(root)) || !safeRelativePath(relativePath)) return null;
   const segments = relativePath.split('/');
-  const filename = segments.at(-1)!;
-  const legacy = OPAQUE_BLOB.test(filename);
-  const nativeNamed = segments.length === 9 && segments[0] === 'accounts'
-    && /^id-(?:[0-9a-f]{2})+$/i.test(segments[1]!)
-    && ['direct', 'group', 'room'].includes(segments[2]!)
-    && /^id-(?:[0-9a-f]{2})+$/i.test(segments[3]!)
-    && /^\d{4}$/.test(segments[4]!) && /^(?:0[1-9]|1[0-2])$/.test(segments[5]!)
-    && /^id-(?:[0-9a-f]{2})+$/i.test(segments[6]!)
-    && ATTACHMENT_HASH_DIRECTORY.test(segments[7]!)
-    && Buffer.byteLength(filename, 'utf8') <= 180 && Buffer.from(filename, 'utf8').toString('utf8') === filename
-    && !/[<>"|?*\u0000-\u001f]/.test(filename)
-    && !/[. ]$/.test(filename) && !/^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(filename);
+  const legacy = OPAQUE_BLOB.test(segments.at(-1)!);
+  const nativeNamed = isPrimaryAttachmentRelativePath(relativePath);
   if (!legacy && !nativeNamed) return null;
   const rootStat = await lstat(root);
   const canonicalRoot = await realpath(root);
@@ -452,9 +453,10 @@ export class AttachmentPreviewService {
     try {
       const record = await this.#authority.lookup(attachmentId, requester);
       if (!this.#isCurrent(generation)) return false;
-      const format = record ? declaredFormat(record) : null;
+      const declared = record ? declaredFormat(record) : null;
+      const sniffedName = record && !declared ? sniffedImageDisplayName(record) : null;
       if (!record || record.attachmentId !== attachmentId || record.status !== 'ready' || !record.relativePath || !record.sha256
-        || !/^[0-9a-f]{64}$/i.test(record.sha256) || !format || record.sizeBytes === null || record.sizeBytes <= 0
+        || !/^[0-9a-f]{64}$/i.test(record.sha256) || (!declared && sniffedName === null) || record.sizeBytes === null || record.sizeBytes <= 0
         || !Number.isSafeInteger(record.sizeBytes) || record.sizeBytes > this.#limits.maxFileBytes) return false;
       const source = await openManagedBlob(this.#root, record.relativePath);
       if (!source) return false;
@@ -463,11 +465,14 @@ export class AttachmentPreviewService {
       try { bytes = await readHeldBytes(source, this.#limits.maxFileBytes); }
       finally { await closeQuietly(source.handle); }
       if (!this.#isCurrent(generation)) return false;
-      if (!bytes || bytes.byteLength !== record.sizeBytes || rejectsActivePrefix(bytes) || !format.signature(bytes)
+      const format = declared ?? (bytes ? imageFormat(bytes) : null);
+      if (!bytes || !format || bytes.byteLength !== record.sizeBytes || rejectsActivePrefix(bytes) || !format.signature(bytes)
+        || (!declared && !imageDimensionsAreSafe(bytes, format))
         || createHash('sha256').update(bytes).digest('hex') !== record.sha256.toLowerCase()) return false;
+      const displayName = declared ? record.name! : (sniffedName || `圖片.${format.extensions[0]}`);
 
       let issued = false;
-      const payload: PreviewPayload = { displayName: record.name!, mimeType: format.mimeType, renderer: format.renderer, bytes };
+      const payload: PreviewPayload = { displayName, mimeType: format.mimeType, renderer: format.renderer, bytes };
       const presented = await this.#presenter.present({
         displayName: payload.displayName,
         mimeType: payload.mimeType,

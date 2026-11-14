@@ -1,15 +1,15 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { NativeAttachmentDescriptorSchema, NativeAttachmentMetadataSchema, NativeCatalogRecordSchema, NativeConversationMetadataSchema, NativeDirectoryRowSchema,
-  NativeSourceEnvelopeSchema, NativeStickerMetadataSchema, OfficialAuthCandidateSchema } from '@line-agent/contracts';
+import { NativeAttachmentDescriptorSchema, NativeCatalogRecordSchema, NativeConversationMetadataSchema, NativeDirectoryRowSchema,
+  NativeSourceEnvelopeSchema, NativeStickerMetadataSchema } from '@line-agent/contracts';
 import path from 'node:path';
 import { lstat, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import type { Readable, Writable } from 'node:stream';
 import { FRAME_LIMITS, FrameDecoder, encodeFrame, validateFrameEnvelope, type DirectMonitorPage, type DirectTailWindow, type DirectUnreadCounts, type ImportCatalogPage, type ImportCursor, type ImportDirectoryPage,
   type ImportProgress, type ImportRow, type ImportSnapshotCompletion, type ImportSnapshotMetadata, type ImportSnapshotPage,
-  type NativeMonitorAccess, type OfficialIdentity, type ProtocolFrame } from './protocol.js';
+  type OfficialIdentity, type ProtocolFrame } from './protocol.js';
 import { verifyJsExternalReaderResources } from './resources.js';
 import { BuildTrustSession, FAILURE_BUILD_KEYS, INVENTORY_BUILD_KEYS } from './build-trust-session.js';
 import type { OfficialBuildTrustPort } from '../official-build-trust.js';
@@ -652,7 +652,7 @@ export class JsExternalReaderController {
     signal?: AbortSignal;
     // Validated only (1000..60000). It is no longer the idle delay: the bridge wakes the loop on a database change.
     pollIntervalMs?: number;
-    onReady?(access: NativeMonitorAccess, signal?: AbortSignal): Promise<void> | void;
+    onReady?(signal?: AbortSignal): Promise<void> | void;
     onPhase?(phase: ExternalMonitorFailurePhase): void;
   }): Promise<void> {
     input.onPhase?.('reader_resource_verification');
@@ -675,7 +675,6 @@ export class JsExternalReaderController {
     let frames: FrameStream | undefined;
     let closed: Promise<number | null> | undefined;
     let child: FixtureChild | undefined;
-    let cancelAuxiliary: (() => void) | undefined;
     try {
       return await runOwnerReadySession({
         requestRoot: input.requestRoot, requestId: input.requestId, deadlineUnixMs: input.deadlineUnixMs,
@@ -776,94 +775,11 @@ export class JsExternalReaderController {
             throw new Error('reader_monitor_ready_invalid');
           }
           await trustSession.validated();
-          type AuxiliaryRequest = { type: 'auth_candidates' | 'attachment_metadata'; fields: Record<string, unknown>;
-            resolve(value: any): void; reject(error: Error): void; active: boolean };
-          const auxiliary: AuxiliaryRequest[] = [];
-          // True while a wait_change request is open. Auxiliary work that arrives then sends a wake frame,
-          // so the bridge ends the wait at once and the loop serves the request before the next poll.
-          let waitingForChange = false;
-          const enqueueAuxiliary = <T>(type: AuxiliaryRequest['type'], fields: Record<string, unknown>, requestSignal?: AbortSignal): Promise<T> => {
-            if (signal.aborted || requestSignal?.aborted) return Promise.reject(new Error('reader_cancelled'));
-            if (auxiliary.length >= 2) return Promise.reject(new Error('reader_auxiliary_queue_full'));
-            return new Promise<T>((resolve, reject) => {
-              const item: AuxiliaryRequest = { type, fields, resolve, reject, active: false };
-              const onAbort = () => {
-                const index = auxiliary.indexOf(item);
-                if (index >= 0) auxiliary.splice(index, 1);
-                reject(new Error('reader_cancelled'));
-              };
-              requestSignal?.addEventListener('abort', onAbort, { once: true });
-              const settle = (action: () => void) => {
-                requestSignal?.removeEventListener('abort', onAbort);
-                action();
-              };
-              item.resolve = (value) => settle(() => resolve(value));
-              item.reject = (error) => settle(() => reject(error));
-              auxiliary.push(item);
-              if (waitingForChange && child) {
-                void writeFrame(child, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'wake' }).catch(() => undefined);
-              }
-            });
-          };
-          const access: NativeMonitorAccess = Object.freeze({
-            acquireAuthCandidates: (requestSignal) => {
-              // Official-app token lookup is shelved: never ask the native reader.
-              if (signal.aborted || requestSignal?.aborted) return Promise.reject(new Error('reader_cancelled'));
-              return Promise.resolve({ candidates: [], errorCode: 'auth_probe_disabled' });
-            },
-            decodeAttachment: (request, requestSignal) => {
-              const envelope = NativeSourceEnvelopeSchema.parse(request.envelope);
-              if (envelope.table !== '_message' || !request.expectedMessageId || request.expectedMessageId.length > 512
-                || !request.expectedChatId || request.expectedChatId.length > 512) {
-                return Promise.reject(new Error('reader_attachment_request_invalid'));
-              }
-              return enqueueAuxiliary('attachment_metadata', { envelope, expectedMessageId: request.expectedMessageId,
-                expectedChatId: request.expectedChatId }, requestSignal);
-            },
-          });
           if (input.onReady) {
-            const readyWork = Promise.resolve().then(() => input.onReady!(access, signal));
+            const readyWork = Promise.resolve().then(() => input.onReady!(signal));
             trackSettlement(readyWork);
             void readyWork.catch(() => undefined);
-            // Let synchronous work in onReady enqueue its first auxiliary
-            // request before the monitor loop can issue a page poll.
-            await Promise.resolve();
           }
-          cancelAuxiliary = () => {
-            for (const item of auxiliary.splice(0)) item.reject(new Error('reader_cancelled'));
-          };
-          const processAuxiliary = async (): Promise<void> => {
-            while (auxiliary.length > 0) {
-              const item = auxiliary.shift()!;
-              item.active = true;
-              try {
-                await writeFrame(child!, { version: 1, requestId: input.requestId, sequence: ++inSeq,
-                  type: item.type, ...item.fields }, FRAME_LIMITS.initialImportPageBytes);
-                const response = await nextValid(Date.now() + 30_000);
-                if (item.type === 'auth_candidates') {
-                  if (!validateFrameEnvelope(response, { requestId: input.requestId, expectedSequence: outSeq++,
-                    allowedKeys: ['candidates', 'errorCode'] }) || response.type !== 'auth_candidates'
-                    || !Array.isArray(response.candidates) || response.candidates.length > 16
-                    || !response.candidates.every((candidate) => OfficialAuthCandidateSchema.safeParse(candidate).success)
-                    || !(response.errorCode === null || (typeof response.errorCode === 'string' && /^[a-z0-9_]{1,64}$/.test(response.errorCode)))) {
-                    throw new Error('reader_auth_candidates_invalid');
-                  }
-                  item.resolve({ candidates: response.candidates, errorCode: response.errorCode });
-                } else {
-                  if (!validateFrameEnvelope(response, { requestId: input.requestId, expectedSequence: outSeq++,
-                    allowedKeys: ['metadata', 'errorCode'] }) || response.type !== 'attachment_metadata'
-                    || !(response.metadata === null || NativeAttachmentMetadataSchema.safeParse(response.metadata).success)
-                    || !(response.errorCode === null || (typeof response.errorCode === 'string' && /^[a-z0-9_]{1,64}$/.test(response.errorCode)))) {
-                    throw new Error('reader_attachment_metadata_invalid');
-                  }
-                  item.resolve({ metadata: response.metadata, errorCode: response.errorCode });
-                }
-              } catch (error) {
-                item.reject(error instanceof Error ? error : new Error('reader_auxiliary_failed'));
-                throw error;
-              }
-            }
-          };
           // One directory pass per reader session, before the first message poll.
           let directoryPageNumber = 0;
           for (;;) {
@@ -890,7 +806,6 @@ export class JsExternalReaderController {
           for (;;) {
             input.onPhase?.('first_poll_callback_ack');
             if (signal.aborted) throw new Error('reader_cancelled');
-            await processAuxiliary();
             await writeFrame(child!, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'poll',
               pageNumber: pageNumber + 1, cursor });
             const pageFrame = await stream.next(Date.now() + 120_000, signal);
@@ -927,10 +842,7 @@ export class JsExternalReaderController {
               // Either answer leads to the next poll, so a missed signal costs at most CHANGE_WAIT_TIMEOUT_MS.
               await writeFrame(child!, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'wait_change',
                 timeoutMs: CHANGE_WAIT_TIMEOUT_MS });
-              waitingForChange = auxiliary.length === 0;
-              if (!waitingForChange) await writeFrame(child!, { version: 1, requestId: input.requestId, sequence: ++inSeq, type: 'wake' });
-              let changeFrame: ProtocolFrame;
-              try { changeFrame = await stream.next(Date.now() + 120_000, signal); } finally { waitingForChange = false; }
+              const changeFrame: ProtocolFrame = await stream.next(Date.now() + 120_000, signal);
               if (!validateFrameEnvelope(changeFrame, { requestId: input.requestId, expectedSequence: outSeq++,
                     allowedKeys: ['changed'] }) || changeFrame.type !== 'change' || typeof changeFrame.changed !== 'boolean') {
                 throw new Error('reader_change_invalid');
@@ -940,7 +852,6 @@ export class JsExternalReaderController {
         },
       });
     } finally {
-      cancelAuxiliary?.();
       frames?.close();
       this.#active = false;
     }

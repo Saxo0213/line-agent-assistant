@@ -359,26 +359,35 @@ database('MCP token & audit repository and target/time message queries', () => {
     });
     expect(msg1.attachments).toHaveLength(1);
     expect(msg1.recalled).toBe(false);
+    expect(msg1.recalledAt).toBeNull();
     expect('relativePath' in (msg1.attachments[0] as Record<string, unknown>)).toBe(false);
     expect('raw' in (msg1 as Record<string, unknown>)).toBe(false);
     await pool.query("UPDATE messages SET content='{\"format\":1,\"type\":\"unsent\"}'::jsonb WHERE account_id='account-admin' AND message_id='msg-admin-1'");
     const recalled = (await messages.queryTargetMessages({ accountIds: ['account-admin'], target: 'Alice' }))
       .find((item) => item.messageId === 'msg-admin-1');
-    expect(recalled).toMatchObject({ recalled: true, text: null, attachments: [] });
-    // A message deleted at the LINE source is masked exactly like a recalled one.
+    expect(recalled).toMatchObject({ recalled: true, text: 'Alpha milestone report from Alice on Oct 15' });
+    expect(recalled?.recalledAt).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+    expect(Number.isNaN(Date.parse(recalled!.recalledAt!))).toBe(false);
+    expect(recalled?.attachments).toHaveLength(1);
+    expect(recalled?.attachments[0]).toMatchObject({ kind: 'file', name: 'spec.pdf', mimeType: 'application/pdf', sizeBytes: 2048, status: 'ready' });
+    // A message deleted at the LINE source is read like a recalled one: stored text and recalled: true.
     await pool.query(`UPDATE messages SET raw=COALESCE(raw,'{}'::jsonb) || '{"sourceDeleted":{"detectedAt":"2026-10-22T00:00:00.000Z"}}'::jsonb
       WHERE account_id='account-admin' AND message_id='msg-admin-2'`);
     const sourceDeleted = (await messages.queryTargetMessages({ accountIds: ['account-admin'], target: 'Alice' }))
       .find((item) => item.messageId === 'msg-admin-2');
-    expect(sourceDeleted).toMatchObject({ recalled: true, text: null, attachments: [] });
-    // The text filter must not confirm hidden content: masked rows never match their original text.
+    expect(sourceDeleted).toMatchObject({ recalled: true, text: 'Admin outbound reply on Oct 16', attachments: [] });
+    expect(sourceDeleted?.recalledAt).toBe('2026-10-22T00:00:00.000Z');
+    // The text filter matches the stored text of recalled and source-deleted rows.
     await pool.query(`INSERT INTO messages(account_id,message_id,event_id,chat_type,chat_id,sender_id,kind,text_content,ingestion_source,occurred_at,raw)
       SELECT account_id,'msg-admin-visible-copy','evt-visible-copy',chat_type,chat_id,sender_id,kind,text_content,ingestion_source,occurred_at,'{}'::jsonb
       FROM messages WHERE account_id='account-admin' AND message_id='msg-admin-1'`);
     const recalledHit = await messages.queryTargetMessages({ accountIds: ['account-admin'], target: 'Alice', text: 'milestone report' });
-    expect(recalledHit.map((item) => item.messageId)).toEqual(['msg-admin-visible-copy']);
-    expect(recalledHit[0]?.text).toContain('milestone report');
-    expect(await messages.queryTargetMessages({ accountIds: ['account-admin'], target: 'Alice', text: 'outbound reply' })).toEqual([]);
+    expect(recalledHit.map((item) => item.messageId).sort()).toEqual(['msg-admin-1', 'msg-admin-visible-copy']);
+    expect(recalledHit.find((item) => item.messageId === 'msg-admin-1')?.recalled).toBe(true);
+    expect(recalledHit.find((item) => item.messageId === 'msg-admin-visible-copy')?.recalled).toBe(false);
+    const deletedHit = await messages.queryTargetMessages({ accountIds: ['account-admin'], target: 'Alice', text: 'outbound reply' });
+    expect(deletedHit.map((item) => item.messageId)).toEqual(['msg-admin-2']);
+    expect(deletedHit[0]?.recalled).toBe(true);
     await pool.query("DELETE FROM messages WHERE account_id='account-admin' AND message_id='msg-admin-visible-copy'");
     expect(msg2.direction).toBe('outbound');
     expect(msg2.senderName).toBe('Admin Monitored LINE');

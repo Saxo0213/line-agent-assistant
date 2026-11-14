@@ -139,6 +139,15 @@ export type DesktopApi = {
   refreshLineAvatar(accountId: string): Promise<IpcResult>;
   lineSetAutoLogin(accountId: string, enabled: boolean): Promise<IpcResult>;
   lineBeginAdminPairing(accountId: string): Promise<{ token: string; expiresAt: string }>;
+  /** Starts the administrator change for the Agent account; resolves with code 1. Later stages arrive as `adminChangeProgress` events. */
+  lineBeginAdminChange(accountId: string): Promise<{ token: string; expiresAt: string; stage: 'confirm_current' }>;
+  lineCancelAdminChange(accountId: string): Promise<IpcResult>;
+  /** Primary Admin download bridge. Progress arrives as `adminDownloadBridgeStatus` events. */
+  adminDownloadBridgeStart(accountId: string): Promise<IpcResult>;
+  adminDownloadBridgeRefreshQr(accountId: string): Promise<IpcResult>;
+  adminDownloadBridgeClear(accountId: string): Promise<IpcResult>;
+  adminDownloadBridgeSetAutoDownload(accountId: string, enabled: boolean): Promise<IpcResult>;
+  adminDownloadBridgeSetDownloadEnabled(accountId: string, enabled: boolean): Promise<IpcResult>;
   lineStart(accountId: string): Promise<IpcResult>;
   externalImportStart(accountId: string): Promise<IpcResult>;
   externalImportStop(accountId: string): Promise<IpcResult>;
@@ -328,6 +337,13 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     refreshLineAvatar: (accountId) => request({ type: 'refreshLineAvatar', accountId }),
     lineSetAutoLogin: (accountId, enabled) => request({ type: 'lineSetAutoLogin', accountId, enabled }),
     async lineBeginAdminPairing(accountId) { const result = await request({ type: 'lineBeginAdminPairing', accountId }); if (result.type !== 'lineAdminPairing') throw new Error(result.type === 'error' ? result.message : 'Unexpected pairing response'); return { token: result.token, expiresAt: result.expiresAt }; },
+    async lineBeginAdminChange(accountId) { const result = await request({ type: 'lineBeginAdminChange', accountId }); if (result.type !== 'lineBeginAdminChange') throw new Error(result.type === 'error' ? result.message : 'Unexpected administrator change response'); return { token: result.token, expiresAt: result.expiresAt, stage: result.stage }; },
+    lineCancelAdminChange: (accountId) => request({ type: 'lineCancelAdminChange', accountId }),
+    adminDownloadBridgeStart: (accountId) => request({ type: 'adminDownloadBridgeStart', accountId }),
+    adminDownloadBridgeRefreshQr: (accountId) => request({ type: 'adminDownloadBridgeRefreshQr', accountId }),
+    adminDownloadBridgeClear: (accountId) => request({ type: 'adminDownloadBridgeClear', accountId }),
+    adminDownloadBridgeSetAutoDownload: (accountId, enabled) => request({ type: 'adminDownloadBridgeSetAutoDownload', accountId, enabled }),
+    adminDownloadBridgeSetDownloadEnabled: (accountId, enabled) => request({ type: 'adminDownloadBridgeSetDownloadEnabled', accountId, enabled }),
     lineStart: (accountId) => request({ type: 'lineStart', accountId }),
     externalImportStart: (accountId) => request({ type: 'externalImportStart', accountId }),
     externalImportStop: (accountId) => request({ type: 'externalImportStop', accountId }),

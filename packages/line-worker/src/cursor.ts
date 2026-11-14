@@ -37,10 +37,15 @@ export type EnvelopeBatch<T extends JsonValue = JsonValue> = Readonly<{
   cursorAfter: TalkCursorV1;
   envelopes: readonly T[];
   readReceipts?: readonly ReadReceipt[];
+  unsends?: readonly Unsend[];
 }>;
 
 export type ReadReceipt = Readonly<{
   chatId: string; readerMid: string; messageId: string; readAt: string;
+}>;
+
+export type Unsend = Readonly<{
+  chatId: string; messageId: string; kind: "self" | "notified"; observedAt: string;
 }>;
 
 export type EnvelopeBatchAck = Readonly<{
@@ -290,6 +295,7 @@ export function createEnvelopeBatch<T extends JsonValue>(input: {
   cursorAfter: TalkCursorV1;
   envelopes: readonly T[];
   readReceipts?: readonly ReadReceipt[];
+  unsends?: readonly Unsend[];
 }): EnvelopeBatch<T> {
   assertId(input.accountId, "accountId");
   assertId(input.batchId, "batchId");
@@ -307,6 +313,9 @@ export function createEnvelopeBatch<T extends JsonValue>(input: {
     ...(input.readReceipts === undefined ? {} : {
       readReceipts: Object.freeze(input.readReceipts.map((receipt) => Object.freeze({ ...receipt }))),
     }),
+    ...(input.unsends === undefined ? {} : {
+      unsends: Object.freeze(input.unsends.map((unsend) => Object.freeze({ ...unsend }))),
+    }),
   });
 }
 
@@ -320,6 +329,7 @@ function cloneEnvelopeBatch<T extends JsonValue>(
     cursorAfter: batch.cursorAfter,
     envelopes: batch.envelopes,
     ...(batch.readReceipts === undefined ? {} : { readReceipts: batch.readReceipts }),
+    ...(batch.unsends === undefined ? {} : { unsends: batch.unsends }),
   });
 }
 
@@ -377,6 +387,7 @@ export class DurableCursorSession<T extends JsonValue = JsonValue> {
     cursorAfter: TalkCursorV1,
     envelopes: readonly T[],
     readReceipts?: readonly ReadReceipt[],
+    unsends?: readonly Unsend[],
   ): EnvelopeBatch<T> {
     if (this.#pendingBatch !== undefined) {
       throw new Error("Cannot stage a second batch before acknowledgement");
@@ -388,6 +399,7 @@ export class DurableCursorSession<T extends JsonValue = JsonValue> {
       cursorAfter,
       envelopes,
       ...(readReceipts === undefined || readReceipts.length === 0 ? {} : { readReceipts }),
+      ...(unsends === undefined || unsends.length === 0 ? {} : { unsends }),
     });
     this.#pendingBatch = batch;
     return cloneEnvelopeBatch(batch);

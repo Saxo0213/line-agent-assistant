@@ -4,7 +4,7 @@ import { isLocalAgentRoom, LineWorkerCommandSchema, LineWorkerEventSchema, WORKE
 import type { IntegratedWorkerGateway, SendMediaRequest } from './connected-facade.js';
 import { ManualSendNotStartedError } from './services/manual-send-errors.js';
 
-type Bound = WorkerBinding & { mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; purpose?: 'DOWNLOAD_ONLY'; expectedMid?: string; application?: string };
+type Bound = WorkerBinding & { mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED' };
 type AccountAuthority = Readonly<{ intentGeneration: number; controlEpoch: number; mode: Bound['mode'];
   readGrantVersion: number; writeGrantVersion: number; downloadGrantVersion: number }>;
 type Child = { postMessage(value: unknown): void; kill(): void; on(event: 'message' | 'exit', listener: (value?: unknown) => void): void;
@@ -39,8 +39,6 @@ type State = { binding: Bound; child: Child; poll: ReturnType<typeof setInterval
   catalogEvents: Map<'conversationCatalog' | 'catalogRefreshStatus', Extract<LineWorkerEvent, { type: 'conversationCatalog' | 'catalogRefreshStatus' }>>;
   processingCatalogEvents: boolean; retired: boolean;
   protocolVerified: boolean; protocolTimer: ReturnType<typeof setTimeout>;
-  downloadReady: boolean;
-  downloadAuthRequests: Map<string, Pending<Extract<LineWorkerEvent, { type: 'downloadAuthResult' }>>>;
   sends: Map<string, Pending<Extract<LineWorkerEvent, { type: 'sendResult' }>>>;
   unsends: Map<string, Pending<Extract<LineWorkerEvent, { type: 'unsendResult' }>>>;
   sendQueue: string[]; activeSendId: string | undefined;
@@ -172,7 +170,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     for (const pending of state.chatResources.values()) { pending.cleanup?.(); if (pending.timer) clearTimeout(pending.timer);
       pending.reject(chatResourceGatewayError(reason, 'pending_request', 'pending_stopped')); }
     for (const pending of state.ownProfiles.values()) { if (pending.timer) clearTimeout(pending.timer); pending.reject(new Error(reason)); }
-    for (const pending of state.downloadAuthRequests.values()) { pending.cleanup?.(); if (pending.timer) clearTimeout(pending.timer); pending.reject(new Error(reason)); }
     for (const pending of state.relations.values()) {
       if (pending.timer) clearTimeout(pending.timer);
       const command = pending.command as Extract<LineWorkerCommand, { type: 'addFriendByMid' }> | undefined;
@@ -186,7 +183,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     }
     state.sends.clear(); state.sendQueue.length = 0; state.activeSendId = undefined;
     cancelPacing(state.binding.accountId);
-    state.uncertainSends.clear(); state.downloads.clear(); state.chatResources.clear(); state.ownProfiles.clear(); state.downloadAuthRequests.clear(); state.downloadReady = false; state.relations.clear();
+    state.uncertainSends.clear(); state.downloads.clear(); state.chatResources.clear(); state.ownProfiles.clear(); state.relations.clear();
     for (const waiters of state.modeWaiters.values()) for (const resolve of waiters) resolve(false);
     state.modeWaiters.clear();
     for (const waiters of state.rawModeWaiters.values()) for (const resolve of waiters) resolve(false);
@@ -398,6 +395,9 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
   };
   const catalogEvent = (event: LineWorkerEvent): event is Extract<LineWorkerEvent, { type: 'conversationCatalog' | 'catalogRefreshStatus' }> =>
     event.type === 'conversationCatalog' || event.type === 'catalogRefreshStatus';
+  const sameCatalogIdentity = (a: LineWorkerEvent & { type: 'conversationCatalog' }, b: LineWorkerEvent & { type: 'conversationCatalog' }) =>
+    a.accountId === b.accountId && a.workerInstanceId === b.workerInstanceId && a.controlEpoch === b.controlEpoch
+    && a.transportOwnerId === b.transportOwnerId && a.transportGeneration === b.transportGeneration && a.writeGrantVersion === b.writeGrantVersion;
   const drainCatalogEvents = async (accountId: string, state: State) => {
     if (state.processingCatalogEvents) return;
     state.processingCatalogEvents = true;
@@ -505,7 +505,13 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       || event.writeGrantVersion !== state.binding.writeGrantVersion
       || ((state.stopping || state.retired) && !cancellationEvent)) return;
     if (catalogEvent(event)) {
-      state.catalogEvents.set(event.type, event);
+      const pending = state.catalogEvents.get(event.type);
+      // A partial detail catalog must not drop a pending full catalog: merge by chatType+chatId, the newer entry wins.
+      if (event.type === 'conversationCatalog' && pending?.type === 'conversationCatalog' && sameCatalogIdentity(pending, event)) {
+        const merged = new Map(pending.conversations.map((item) => [`${item.chatType}:${item.chatId}`, item] as const));
+        for (const item of event.conversations) merged.set(`${item.chatType}:${item.chatId}`, item);
+        state.catalogEvents.set(event.type, { ...event, conversations: [...merged.values()] });
+      } else state.catalogEvents.set(event.type, event);
       void drainCatalogEvents(accountId, state);
       return;
     }
@@ -523,7 +529,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     if (event.type !== 'sendResult' && event.type !== 'unsendResult' && event.type !== 'attachmentResult' && event.type !== 'attachmentCancelAck'
       && event.type !== 'friendRelationResult' && event.type !== 'addFriendResult'
       && event.type !== 'chatResourceResult' && event.type !== 'ownProfileResult'
-      && event.type !== 'downloadAuthResult' && event.type !== 'downloadReady' && event.type !== 'downloadAuthInvalidated'
       && event.type !== 'modeAck' && event.type !== 'workerProtocolAck') {
       if (event.type === 'batch' && trackBatch(state, event)) return;
       if (state.domainEvents.length + Number(state.processingDomainEvents) >= maxQueuedDomainEvents) {
@@ -591,17 +596,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
         state.child.kill();
         void state.exited.then(() => pending.reject(new Error('Worker exited before confirming attachment cancellation')));
       }
-    } else if (event.type === 'downloadAuthResult') {
-      const pending = state.downloadAuthRequests.get(event.requestId);
-      if (!pending || !sameWorkerBinding(state.binding, event)) return;
-      state.downloadReady = event.accepted;
-      pending.resolve(event);
-    } else if (event.type === 'downloadReady') {
-      if (event.ownMid !== state.binding.expectedMid || !sameWorkerBinding(state.binding, event)) return;
-      state.downloadReady = true;
-    } else if (event.type === 'downloadAuthInvalidated') {
-      if (!sameWorkerBinding(state.binding, event)) return;
-      state.downloadReady = false;
     }
     else if (event.type === 'workerProtocolAck') {
       if (event.protocolVersion !== WORKER_PROTOCOL_VERSION) {
@@ -811,7 +805,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
         const bindingCompletePromise = new Promise<void>((resolve) => { resolveBindingComplete = resolve; });
         state = { binding: effective, child, generation: intent.generation, bindingComplete: false, bindingCompletePromise, resolveBindingComplete,
           exitConfirmed: false, stopping: false, modeRevision: 0, modeTask: undefined, restartTask: undefined,
-          acknowledgedMode: null, modeAckReady: false, bindingReady: !restarting, downloadReady: false, downloadAuthRequests: new Map(),
+          acknowledgedMode: null, modeAckReady: false, bindingReady: !restarting,
           domainEvents: [], processingDomainEvents: false, batches: new Map(), catalogEvents: new Map(), processingCatalogEvents: false,
           retired: false, protocolVerified: false,
           protocolTimer: setTimeout(() => {
@@ -819,7 +813,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
             state!.stopping = true; lifecycle.phase = 'retiring'; child.kill();
           }, responseTimeoutMs),
           sends: new Map(), unsends: new Map(), sendQueue: [], activeSendId: undefined, uncertainSends: new Map(), downloads: new Map(), relations: new Map(), chatResources: new Map(), ownProfiles: new Map(), usedRelationRequests: new Map(), modeWaiters: new Map(), rawModeWaiters: new Map(), exited, resolveExited,
-          poll: effective.purpose === 'DOWNLOAD_ONLY' ? undefined : setInterval(() => { if (stateFor(effective.accountId) === state) child.postMessage({ type: 'poll', ...ownerFields(effective), accountId: effective.accountId,
+          poll: setInterval(() => { if (stateFor(effective.accountId) === state) child.postMessage({ type: 'poll', ...ownerFields(effective), accountId: effective.accountId,
             workerInstanceId: state!.binding.workerInstanceId, controlEpoch: state!.binding.controlEpoch }); }, options.pollIntervalMs ?? 1500) };
         lifecycle.child = state;
         child.on('message', (value) => {
@@ -1022,9 +1016,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     onModeChange(next) { return installListener(() => modeListener, (value) => { modeListener = value; }, next); },
     async start(accountId, binding) {
       if (closing) throw new Error('Worker gateway is closing');
-      if (resolveLineTransport(binding.lineTransport) === 'CHROMEOS' && binding.purpose === 'DOWNLOAD_ONLY') {
-        throw new Error('CHROMEOS has no download-only worker');
-      }
       const occupied = occupiedAccounts();
       if (!occupied.has(accountId) && occupied.size >= maxWorkers) {
         throw new Error(`Global worker limit reached (${maxWorkers})`);
@@ -1070,40 +1061,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       const state = stateFor(accountId);
       if (!state) return null;
       return state.retired && !state.stopping ? { ...state.binding, mode: 'MONITOR_ONLY' } : state.binding;
-    },
-    isDownloadReady(binding) {
-      const state = stateFor(binding.accountId);
-      return !!state && state.binding.purpose === 'DOWNLOAD_ONLY' && state.downloadReady
-        && sameWorkerBinding(state.binding, binding) && state.bindingReady && !state.stopping && !state.retired;
-    },
-    async adoptDownloadAuth(command, signal) {
-      const state = currentFor(command);
-      if (state.binding.purpose !== 'DOWNLOAD_ONLY' || command.expectedMid !== state.binding.expectedMid
-        || state.downloadAuthRequests.size > 0) {
-        throw new Error('Download-only credential adoption is not available');
-      }
-      if (signal?.aborted) throw new Error('Download-only credential adoption cancelled');
-      const timeoutMs = Math.max(1, Math.min(20_000, options.responseTimeoutMs ?? 20_000));
-      return await new Promise<Extract<LineWorkerEvent, { type: 'downloadAuthResult' }>>((resolve, reject) => {
-        const requestId = command.requestId;
-        let pending!: Pending<Extract<LineWorkerEvent, { type: 'downloadAuthResult' }>>;
-        const settle = (fn: () => void) => {
-          if (state.downloadAuthRequests.get(requestId) !== pending) return;
-          state.downloadAuthRequests.delete(requestId);
-          if (pending.timer) clearTimeout(pending.timer);
-          pending.cleanup?.(); fn();
-        };
-        const timer = setTimeout(() => pending.reject(new Error('Download-only credential adoption timed out')), timeoutMs);
-        pending = { timer, resolve: (value) => settle(() => resolve(value)), reject: (error) => settle(() => reject(error)) };
-        state.downloadAuthRequests.set(requestId, pending);
-        if (signal) {
-          const onAbort = () => pending.reject(new Error('Download-only credential adoption cancelled'));
-          signal.addEventListener('abort', onAbort, { once: true });
-          pending.cleanup = () => signal.removeEventListener('abort', onAbort);
-        }
-        try { state.child.postMessage({ ...command, ...ownerFields(state.binding) }); }
-        catch (error) { pending.reject(error instanceof Error ? error : new Error('Download-only credential adoption failed')); }
-      });
     },
     isCurrentActiveControlBinding(binding) {
       if (typeof binding.transportOwnerId !== 'string' || typeof binding.transportGeneration !== 'number'
@@ -1208,7 +1165,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     },
     async download(command, signal) {
       const state = currentFor(command); if (!state.protocolVerified || state.acknowledgedMode === null || state.acknowledgedMode === 'PAUSED') throw new Error('Worker protocol/mode not acknowledged for attachment download');
-      if (state.binding.purpose === 'DOWNLOAD_ONLY' && !state.downloadReady) throw new Error('Download-only worker has no verified account credential');
       if (signal?.aborted) throw new Error('Worker download cancelled');
       if (state.downloads.has(command.attemptToken)) throw new Error('Duplicate attachment attempt');
       return new Promise((resolve, reject) => {

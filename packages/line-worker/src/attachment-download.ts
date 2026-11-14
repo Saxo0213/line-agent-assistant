@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import type { JsonValue, NativeAttachmentDownloadInput } from '@line-agent/contracts';
+import type { JsonValue } from '@line-agent/contracts';
 import { SafeAttachmentError } from './attachment-error.js';
 
 export type AttachmentDownloadIdentity = Readonly<{
@@ -143,67 +143,4 @@ export function validateAttachmentMessage(value: JsonValue, identity: Attachment
   }
   return { message, metadata, encrypted, sid: encrypted ? sid : 'm', oid, tid,
     obsPop: typeof popValue === 'string' ? popValue : null, advertisedSize };
-}
-
-export function validateNativeAttachment(input: NativeAttachmentDownloadInput, identity: AttachmentDownloadIdentity,
-  maxBytes: number): ValidatedAttachmentMessage & Readonly<{ keyMaterial: Buffer | null; fileName: string | null }> {
-  if (!input || input.messageId !== identity.messageId || input.chatId !== identity.chatId
-    || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || !/^u[0-9A-Fa-f]{32}$/.test(identity.ownMid)) return failure();
-  const expectedType = TYPE_BY_KIND[identity.kind];
-  if (input.contentType !== expectedType) return failure();
-  const chatPrefix = identity.chatType === 'direct' ? 'u' : identity.chatType === 'group' ? 'c' : 'r';
-  if (!new RegExp(`^${chatPrefix}[0-9A-Fa-f]{32}$`).test(identity.chatId)) return failure();
-  if (identity.chatType === 'direct') {
-    if ((input.from !== null && input.from !== identity.ownMid && input.from !== identity.chatId)
-      || (input.to !== null && input.to !== identity.ownMid && input.to !== identity.chatId)
-      || (input.from !== null && input.to !== null && !((input.from === identity.ownMid && input.to === identity.chatId)
-        || (input.to === identity.ownMid && input.from === identity.chatId)))
-      || (input.toType !== null && input.toType !== 0)) return failure();
-  } else {
-    if ((input.to !== null && input.to !== identity.chatId)
-      || (input.from !== null && !/^u[0-9A-Fa-f]{32}$/.test(input.from))
-      || (input.toType !== null && input.toType !== (identity.chatType === 'group' ? 2 : 1))) return failure();
-  }
-  const source = input.contentMetadata;
-  if (source.DOWNLOAD_URL !== null) return failure();
-  const oidValue = source.OID;
-  const sidValue = source.SID;
-  const encrypted = oidValue !== null && oidValue.length > 0;
-  const expectedSid = SID_BY_KIND[identity.kind];
-  let oid = identity.messageId;
-  let sid: string = 'm';
-  if (encrypted) {
-    if (!/^(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(oidValue)
-      || (identity.externalAttachmentId !== oidValue && identity.externalAttachmentId !== identity.messageId)
-      || sidValue !== expectedSid || input.keyMaterial === null) return failure();
-    oid = oidValue;
-    sid = expectedSid;
-  } else if ((identity.externalAttachmentId !== identity.messageId) || (sidValue !== null && sidValue !== 'm')
-    || input.keyMaterial !== null) return failure();
-  const mediaInfo = source.MEDIA_CONTENT_INFO;
-  let tid: string | null = null;
-  if (mediaInfo !== null) {
-    let parsed: unknown;
-    try { parsed = JSON.parse(mediaInfo); } catch { parsed = undefined; }
-    if (parsed !== undefined) {
-      if (!isRecord(parsed) || (parsed.category !== undefined && typeof parsed.category !== 'string')) return failure();
-      if (parsed.category === 'original') tid = 'original';
-    }
-  }
-  const obsPop = source.OBS_POP;
-  if (obsPop !== null && (obsPop.length === 0 || /[\u0000-\u001f\u007f/\\]/.test(obsPop))) return failure();
-  let advertisedSize: number | null = null;
-  if (source.FILE_SIZE !== null) {
-    if (!/^(?:0|[1-9][0-9]*)$/.test(source.FILE_SIZE)) return failure();
-    advertisedSize = Number(source.FILE_SIZE);
-    if (!Number.isSafeInteger(advertisedSize) || advertisedSize > maxBytes + (encrypted ? 32 : 0)) return failure();
-  }
-  let keyMaterial: Buffer | null = null;
-  if (input.keyMaterial !== null) {
-    keyMaterial = Buffer.from(input.keyMaterial, 'base64');
-    if (keyMaterial.length !== 32 || keyMaterial.toString('base64') !== input.keyMaterial) return failure();
-  }
-  const metadata = Object.fromEntries(Object.entries(source).filter((entry): entry is [string, string] => entry[1] !== null));
-  return { message: { id: input.messageId }, metadata, encrypted, sid, oid, tid, obsPop, advertisedSize,
-    keyMaterial, fileName: input.fileName };
 }

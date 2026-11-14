@@ -105,48 +105,6 @@ export const NativeAttachmentDescriptorSchema = z.strictObject({
 });
 export type NativeAttachmentDescriptor = z.infer<typeof NativeAttachmentDescriptorSchema>;
 
-export const NativeAttachmentDownloadInputSchema = z.strictObject({
-  messageId: z.string().min(1).max(512),
-  chatId: z.string().min(1).max(512),
-  from: z.string().min(1).max(512).nullable(),
-  to: z.string().min(1).max(512).nullable(),
-  toType: z.number().int().min(0).max(7).nullable(),
-  contentType: z.number().int().min(0).max(255).nullable(),
-  contentMetadata: z.strictObject({
-    OID: z.string().max(128).nullable(), SID: z.string().max(32).nullable(),
-    OBS_POP: z.string().max(256).nullable(), FILE_SIZE: z.string().max(20).nullable(),
-    MEDIA_CONTENT_INFO: z.string().max(4096).nullable(), DOWNLOAD_URL: z.string().max(8192).nullable(),
-  }),
-  keyMaterial: z.string().regex(/^[A-Za-z0-9+/]{43}=$/).nullable(),
-  fileName: z.string().max(1024).nullable(),
-  sizeBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
-});
-export type NativeAttachmentDownloadInput = z.infer<typeof NativeAttachmentDownloadInputSchema>;
-
-export const OfficialAuthCandidateSchema = z.strictObject({
-  token: z.string().min(1).max(1024),
-  application: z.string().min(1).max(512),
-});
-export type OfficialAuthCandidate = z.infer<typeof OfficialAuthCandidateSchema>;
-
-export const NativeAttachmentMetadataSchema = z.strictObject({
-  messageId: z.string().min(1).max(512),
-  chatId: z.string().min(1).max(512),
-  from: z.string().min(1).max(512).nullable(),
-  to: z.string().min(1).max(512).nullable(),
-  toType: z.number().int().min(0).max(7).nullable(),
-  contentType: z.number().int().min(0).max(255).nullable(),
-  contentMetadata: z.strictObject({
-    OID: z.string().max(128).nullable(), SID: z.string().max(32).nullable(),
-    OBS_POP: z.string().max(256).nullable(), FILE_SIZE: z.string().max(20).nullable(),
-    MEDIA_CONTENT_INFO: z.string().max(4096).nullable(), DOWNLOAD_URL: z.string().max(8192).nullable(),
-  }),
-  keyMaterial: z.string().regex(/^[A-Za-z0-9+/]{43}=$/).nullable(),
-  fileName: z.string().max(1024).nullable(),
-  sizeBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
-});
-export type NativeAttachmentMetadata = z.infer<typeof NativeAttachmentMetadataSchema>;
-
 /** One friend row from the official `_contact` table (names and picture path; no phone or status text). */
 export const NativeDirectoryContactSchema = z.strictObject({
   kind: z.literal('contact'),

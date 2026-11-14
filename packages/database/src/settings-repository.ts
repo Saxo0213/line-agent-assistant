@@ -19,6 +19,11 @@ function validateConversationSettings(settings: ConversationSettings): void {
 }
 
 export const OFFICIAL_LINE_BUILD_TRUST_KEY = 'official_line_build_trust';
+/** Toggle of the automatic download of new External Monitor attachments through the download bridge. Value: {"enabled": boolean}. */
+export const EXTERNAL_BRIDGE_AUTO_DOWNLOAD_KEY = 'external_bridge_auto_download';
+
+/** Switch that allows every Chrome extension download of the bridge. Value: {"enabled": boolean}. A missing row means false. */
+export const EXTERNAL_BRIDGE_DOWNLOAD_ENABLED_KEY = 'external_bridge_download_enabled';
 
 export class SettingsRepository {
   constructor(private readonly pool: Pool) {}
@@ -33,6 +38,36 @@ export class SettingsRepository {
     await this.pool.query(
       'INSERT INTO app_settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
       [OFFICIAL_LINE_BUILD_TRUST_KEY, JSON.stringify(value)],
+    );
+  }
+
+  /** A missing or malformed row means false. */
+  async getExternalBridgeAutoDownload(): Promise<boolean> {
+    const result = await this.pool.query<{ value: unknown }>('SELECT value FROM app_settings WHERE key = $1', [EXTERNAL_BRIDGE_AUTO_DOWNLOAD_KEY]);
+    const value = result.rows[0]?.value;
+    return typeof value === 'object' && value !== null && (value as { enabled?: unknown }).enabled === true;
+  }
+
+  async setExternalBridgeAutoDownload(enabled: boolean): Promise<void> {
+    if (typeof enabled !== 'boolean') throw new Error('External bridge auto download must be a boolean');
+    await this.pool.query(
+      'INSERT INTO app_settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
+      [EXTERNAL_BRIDGE_AUTO_DOWNLOAD_KEY, JSON.stringify({ enabled })],
+    );
+  }
+
+  /** A missing or malformed row means false. */
+  async getExternalBridgeDownloadEnabled(): Promise<boolean> {
+    const result = await this.pool.query<{ value: unknown }>('SELECT value FROM app_settings WHERE key = $1', [EXTERNAL_BRIDGE_DOWNLOAD_ENABLED_KEY]);
+    const value = result.rows[0]?.value;
+    return typeof value === 'object' && value !== null && (value as { enabled?: unknown }).enabled === true;
+  }
+
+  async setExternalBridgeDownloadEnabled(enabled: boolean): Promise<void> {
+    if (typeof enabled !== 'boolean') throw new Error('External bridge download enabled must be a boolean');
+    await this.pool.query(
+      'INSERT INTO app_settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
+      [EXTERNAL_BRIDGE_DOWNLOAD_ENABLED_KEY, JSON.stringify({ enabled })],
     );
   }
 

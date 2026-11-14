@@ -677,6 +677,25 @@ database('MessageRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () 
     expect(results[0]).toMatchObject({ senderName: '王小明', conversationTitle: '工程群組' });
   });
 
+  it('fills a missing MIME type when an attachment becomes ready and keeps a known one', async () => {
+    const input = envelope({ attachments: [
+      { id: 'mime-unknown', kind: 'image', name: null, mimeType: null, sizeBytes: null },
+      { id: 'mime-known', kind: 'image', name: 'photo.png', mimeType: 'image/png', sizeBytes: null },
+    ] });
+    await repository.ingestAndRoute(input, { eligible: false });
+    const key = { accountId: input.accountId, chatType: input.chatType, chatId: input.chatId };
+    await new AccountRepository(pool).bindWorker({ accountId: 'account-A', workerInstanceId: 'worker-mime', controlEpoch: 1 });
+    for (const [externalId, expected] of [['mime-unknown', 'image/jpeg'], ['mime-known', 'image/png']] as const) {
+      const row = await repository.getAttachmentBySource(key, input.messageId, externalId);
+      const owner = { ...key, attachmentId: row!.attachmentId, workerInstanceId: 'worker-mime', controlEpoch: 1, ownerId: randomUUID() };
+      await pool.query("UPDATE attachments SET created_at = now() - interval '11 seconds' WHERE attachment_id = $1", [owner.attachmentId]);
+      const token = await repository.claimAttachmentDownload(owner);
+      expect(await repository.markAttachmentReady({ ...owner, attemptToken: token! },
+        { relativePath: `stored/${externalId}/attachment.jpg`, sha256: 'c'.repeat(64), sizeBytes: 5, mimeType: 'image/jpeg' })).toBe(true);
+      expect((await repository.getAttachment(row!.attachmentId))?.mimeType).toBe(expected);
+    }
+  });
+
   it('persists attachment state transitions and metadata', async () => {
     const input = envelope({ attachments: [{ id: 'attachment-A', kind: 'image', name: 'photo.png', mimeType: 'image/png', sizeBytes: null }] });
     const storedPath = `accounts/id-${Buffer.from(input.accountId).toString('hex')}/${input.chatType}/id-${Buffer.from(input.chatId).toString('hex')}/2026/10/id-${Buffer.from(input.messageId).toString('hex')}/${createHash('sha256').update('attachment-A').digest('hex')}/photo.png`;
@@ -1019,100 +1038,6 @@ database('MessageRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () 
       if (!page.hasMore) break;
     }
     expect(found).toBe(true);
-  });
-
-  it('returns recent external-monitor attachments with native envelopes in newest-first order regardless of download status', async () => {
-    const accountId = 'probe-account';
-    const now = Date.now();
-    const nativePayload = {
-      format: 1 as const,
-      table: '_message' as const,
-      sourceDigest: 'd'.repeat(64),
-      encoding: 'dpapi' as const,
-      data: 'AQID',
-    };
-    const olderEvent = {
-      ...envelope({
-        accountId,
-        messageId: 'msg-older',
-        eventId: 'evt-older',
-        occurredAt: new Date(now - 60_000).toISOString(),
-        attachments: [{ id: 'att-older-ready', kind: 'file', name: 'older.bin', mimeType: null, sizeBytes: 12 }],
-      }),
-      raw: { native: nativePayload },
-    };
-    const newerEvent = {
-      ...envelope({
-        accountId,
-        messageId: 'msg-newer',
-        eventId: 'evt-newer',
-        occurredAt: new Date(now - 5_000).toISOString(),
-        attachments: [{ id: 'att-newer-pending', kind: 'image', name: 'newer.png', mimeType: 'image/png', sizeBytes: 24 }],
-      }),
-      raw: { native: nativePayload },
-    };
-    const liveEvent = envelope({
-      accountId,
-      messageId: 'msg-live',
-      eventId: 'evt-live',
-      occurredAt: new Date(now - 1_000).toISOString(),
-      attachments: [{ id: 'att-live', kind: 'file', name: 'live.bin', mimeType: null, sizeBytes: 8 }],
-    });
-    await repository.ingestAndRoute(olderEvent, { eligible: false });
-    await repository.ingestAndRoute(newerEvent, { eligible: false });
-    await repository.ingestAndRoute(liveEvent, { eligible: false });
-    const sourceId = randomUUID();
-    const staleEvent = {
-      ...envelope({
-        accountId,
-        messageId: 'msg-stale',
-        eventId: 'evt-stale',
-        occurredAt: new Date(now - 8 * 24 * 60 * 60 * 1_000).toISOString(),
-        attachments: [{ id: 'att-stale', kind: 'file', name: 'stale.bin', mimeType: null, sizeBytes: 3 }],
-      }),
-      raw: { native: nativePayload },
-    };
-    await repository.ingestAndRoute(staleEvent, { eligible: false });
-    await pool.query(
-      `INSERT INTO line_account_sources(account_id, source_id, generation, source_type, state, identity_digest, verified_account_mid)
-       VALUES ($1, $2, 1, 'EXTERNAL_MONITOR', 'ACTIVE', repeat('a', 64), 'own-probe')`,
-      [accountId, sourceId],
-    );
-    await pool.query(
-      `INSERT INTO external_source_batches(source_id,account_id,generation,batch_id,payload_digest,result)
-       VALUES ($1,$2,1,'probe-batch',repeat('b',64),'{}'::jsonb)`, [sourceId, accountId]);
-    await pool.query(
-      `INSERT INTO external_source_observations(source_id,account_id,generation,observation_id,batch_id,canonical_message_id,normalized_digest,normalized_payload,status)
-       SELECT $1,$2,1,o.obs,'probe-batch',o.msg,repeat('c',64),'{}'::jsonb,'PROJECTED'
-       FROM (VALUES ('obs-older','msg-older'),('obs-newer','msg-newer'),('obs-stale','msg-stale')) AS o(obs,msg)`, [sourceId, accountId]);
-    await pool.query(
-      `INSERT INTO message_source_provenance(account_id, message_id, source_id, generation, observation_id, origin, redacted)
-       VALUES ($1, 'msg-older', $2, 1, 'obs-older', 'EXTERNAL_MONITOR', true),
-              ($1, 'msg-newer', $2, 1, 'obs-newer', 'EXTERNAL_MONITOR', true),
-              ($1, 'msg-stale', $2, 1, 'obs-stale', 'EXTERNAL_MONITOR', true)`,
-      [accountId, sourceId],
-    );
-    await pool.query("UPDATE attachments SET status = 'ready', relative_path = 'safe/older', sha256 = repeat('d', 64) WHERE external_attachment_id = 'att-older-ready'");
-
-    const probes = await repository.getRecentExternalAttachmentsForDownloadProbe(accountId, 5);
-    expect(probes.map((item) => item.externalAttachmentId)).toEqual(['att-newer-pending', 'att-older-ready']);
-    expect(await repository.getRecentExternalAttachmentsForDownloadProbe(accountId, 0)).toHaveLength(1);
-    expect(await repository.getRecentExternalAttachmentsForDownloadProbe(accountId, 1000)).toHaveLength(2);
-    await pool.query("INSERT INTO conversations(account_id, chat_id, chat_type) VALUES ($1,'community-chat','community')", [accountId]);
-    await pool.query(`INSERT INTO messages(account_id,message_id,event_id,chat_type,chat_id,sender_id,kind,ingestion_source,occurred_at,raw)
-      VALUES ($1,'msg-community','evt-community','community','community-chat','person','file','live',now(),$2::jsonb)`,
-    [accountId, JSON.stringify({ native: nativePayload })]);
-    await pool.query(`INSERT INTO attachments(external_attachment_id, account_id, message_id, chat_type, chat_id, kind)
-      VALUES ('att-community',$1,'msg-community','community','community-chat','file')`, [accountId]);
-    await pool.query(`INSERT INTO external_source_observations(source_id,account_id,generation,observation_id,batch_id,canonical_message_id,normalized_digest,normalized_payload,status)
-      VALUES ($1,$2,1,'obs-community','probe-batch','msg-community',repeat('c',64),'{}'::jsonb,'PROJECTED')`, [sourceId, accountId]);
-    await pool.query(`INSERT INTO message_source_provenance(account_id,message_id,source_id,generation,observation_id,origin,redacted)
-      VALUES ($1,'msg-community',$2,1,'obs-community','EXTERNAL_MONITOR',true)`, [accountId, sourceId]);
-    expect((await repository.getRecentExternalAttachmentsForDownloadProbe(accountId, 5)).map((item) => item.externalAttachmentId))
-      .toEqual(['att-newer-pending', 'att-older-ready']);
-    expect(await repository.getRecentExternalAttachmentsForDownloadProbe(accountId, Number.NaN)).toHaveLength(2);
-    expect(probes[0]?.nativePayload).toEqual(nativePayload);
-    expect(probes[1]?.status).toBe('ready');
   });
 
   it('reapplies migrations safely and rejects changed history', async () => {

@@ -66,11 +66,11 @@ database('schedule targets (real database)', () => {
   });
 
   it('resolves a delivery target given by a friend mid when the Agent account has that direct chat', async () => {
-    await pool.query("INSERT INTO line_contacts (account_id, mid, display_name) VALUES ('acc-agent', 'u-friend', '徐佳誠') ON CONFLICT DO NOTHING");
-    await pool.query("INSERT INTO conversations (account_id, chat_type, chat_id, title) VALUES ('acc-agent', 'direct', 'u-friend', '徐佳誠') ON CONFLICT DO NOTHING");
+    await pool.query("INSERT INTO line_contacts (account_id, mid, display_name) VALUES ('acc-agent', 'u-friend', '林曉安') ON CONFLICT DO NOTHING");
+    await pool.query("INSERT INTO conversations (account_id, chat_type, chat_id, title) VALUES ('acc-agent', 'direct', 'u-friend', '林曉安') ON CONFLICT DO NOTHING");
     try {
       const [resolved] = await createAgentScheduleTargetResolver({ messages: new MessageRepository(pool), pool }).resolve([{ accountId: 'acc-agent', chatType: 'direct', chatId: 'u-friend', title: '' }], 'delivery');
-      expect(resolved).toEqual({ accountId: 'acc-agent', chatType: 'direct', chatId: 'u-friend', title: '徐佳誠' });
+      expect(resolved).toEqual({ accountId: 'acc-agent', chatType: 'direct', chatId: 'u-friend', title: '林曉安' });
     } finally {
       await pool.query("DELETE FROM conversations WHERE account_id = 'acc-agent' AND chat_id = 'u-friend'");
       await pool.query("DELETE FROM line_contacts WHERE account_id = 'acc-agent' AND mid IN ('u-friend')");
@@ -120,5 +120,23 @@ database('schedule targets (real database)', () => {
     await expect(service.update(created.scheduleId, { task: { type: 'custom' } })).rejects.toMatchObject({ code: 'SCHEDULE_INVALID' });
     const ok = await service.update(created.scheduleId, { task: { type: 'keyword_digest', keywords: ['a'] }, window: { mode: 'lookback', minutes: 60 } });
     expect(ok).toMatchObject({ task: { type: 'keyword_digest', keywords: ['a'] }, window: { mode: 'lookback', minutes: 60 } });
+  });
+
+  it('stores a mention rule with empty sources, record-only delivery and a checked Agent target', async () => {
+    const mention = { type: 'message_forward' as const, match: { mode: 'mention' as const, admin: true, members: [], all: false } };
+    const rule = (actions: object) => ({ ...base, prompt: '', recurrence: { kind: 'message' as const }, task: { ...mention, actions } as never, targets: [],
+      window: { mode: 'since_last_run' as const }, delivery: { mode: 'record_only' as const }, timezone: 'Asia/Taipei', enabled: true });
+    const agent = { prompt: '看一下', target: { accountId: 'acc-agent', chatType: 'direct' as const, chatId: 'u-alice', title: 'old title' } };
+    const created = await service.create(rule({ forward: false, notify: true, agent }));
+    expect(created).toMatchObject({ targets: [], delivery: { mode: 'record_only' },
+      task: { actions: { forward: false, notify: true, agent: { prompt: '看一下', target: { chatId: 'u-alice', title: 'Alice' } } } } });
+    const bad = { ...agent, target: { ...agent.target, chatId: 'u-nobody' } };
+    await expect(service.create(rule({ forward: false, notify: false, agent: bad }))).rejects.toMatchObject({ code: 'SCHEDULE_INVALID_TARGET' });
+    await expect(service.update(created.scheduleId, { task: { ...mention, actions: { forward: false, notify: false, agent: bad } } as never }))
+      .rejects.toMatchObject({ code: 'SCHEDULE_INVALID_TARGET' });
+    await expect(service.update(created.scheduleId, { targets: [{ ...group, accountId: 'acc-other', chatId: 'g-other' }] }))
+      .rejects.toMatchObject({ code: 'SCHEDULE_INVALID_TARGET' });
+    const ok = await service.update(created.scheduleId, { targets: [group] });
+    expect(ok.targets).toHaveLength(1);
   });
 });

@@ -5,7 +5,7 @@ import { EmbeddedPgError } from './errors.js';
 import { httpGet } from './http.js';
 import { resolveEmbeddedRoot } from './root.js';
 import { bindPort } from './port.js';
-import { runProcess } from './process.js';
+import { runProcess, runProcessSync } from './process.js';
 import type { ProvisionerDeps } from './provisioner.js';
 import { minimalEnv, type ServerDeps } from './server.js';
 
@@ -39,7 +39,7 @@ export function createProcessImage(env: Record<string, string | undefined>): Ser
 }
 
 export function createServerDeps(env: Record<string, string | undefined>, log: (message: string) => void): ServerDeps {
-  return { run: runProcess, bindPort, env, log, readFile: (path) => fs.readFile(path, 'utf8'),
+  return { run: runProcess, runSync: runProcessSync, bindPort, env, log, readFile: (path) => fs.readFile(path, 'utf8'),
     mkdir: (path) => fs.mkdir(path, { recursive: true }), processImage: createProcessImage(env) };
 }
 
@@ -63,7 +63,7 @@ export async function resolveCurrentEmbeddedRoot(env: Record<string, string | un
 export function createNodeProvisionerDeps(options: Pick<ProvisionerDeps, 'ensureDatabase' | 'saveBootstrap' | 'registerServer' | 'log'>
   & { env?: Record<string, string | undefined> }): ProvisionerDeps {
   const env = options.env ?? process.env;
-  return { programData: env.ProgramData ?? env.PROGRAMDATA, getSid: createSidReader(env), fs, run: runProcess, httpGet, bindPort, now: () => Date.now(), env, log: options.log,
+  return { programData: env.ProgramData ?? env.PROGRAMDATA, getSid: createSidReader(env), fs, run: runProcess, runSync: runProcessSync, httpGet, bindPort, now: () => Date.now(), env, log: options.log,
     randomBytes, randomUUID, fileVersions: createFileVersions(env), processImage: createProcessImage(env),
     ensureDatabase: options.ensureDatabase, saveBootstrap: options.saveBootstrap, registerServer: options.registerServer };
 }

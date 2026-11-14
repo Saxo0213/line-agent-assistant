@@ -211,7 +211,7 @@ describe('AgentScheduleService', () => {
       delivery: { mode: 'primary_admin' as const }, enabled: true, nextFireAt: null, lastFireAt: null, lastOutcome: null, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z' };
     store.get.mockResolvedValue(schedule as never);
     store.previousSubmittedFor.mockResolvedValue(new Date('2026-10-01T01:00:00.000Z'));
-    const service = new AgentScheduleService({ store, submit: async () => ({ jobId: 'j' }), primaryAdminChat: async () => ({ accountId: 'acc-1', chatId: 'uadmin', title: '徐佳誠' }) });
+    const service = new AgentScheduleService({ store, submit: async () => ({ jobId: 'j' }), primaryAdminChat: async () => ({ accountId: 'acc-1', chatId: 'uadmin', title: '林曉安' }) });
     const context = await service.runContext(`schedule:${SCHEDULE_ID}:2026-10-02T01:00:00.000Z`);
     expect(context).toMatchInlineSnapshot(`
       "【排程規則】無人值守：不要提問或等待確認；資訊不足就盡力完成並註明缺少什麼。
@@ -225,7 +225,7 @@ describe('AgentScheduleService', () => {
       決議／待辦：• [名稱]－事項－期限（沒有就省略）
       未解問題：• …（沒有就省略）
       每區塊最多 15 行；沒有訊息時只寫一行「<名稱>：此時段無訊息」。
-      人名規則：結果中每個人的顯示名稱一律寫成 [名稱]（半形方括號），例如「• 01:31 [紅點點] 分享因搬出國與規則限制而停卡」；不明發言者寫 [未知]；非人名的詞不加括號；聊天室標題維持【】，人名不用【】。
+      人名規則：結果中每個人的顯示名稱一律寫成 [名稱]（半形方括號），例如「• 01:31 [小藍點] 分享因搬出國與規則限制而停卡」；不明發言者寫 [未知]；非人名的詞不加括號；聊天室標題維持【】，人名不用【】。
       輸出：用 send_to_target 傳給管理員（accountId=acc-1，chatType=direct，chatId=uadmin）。只傳結果本身（純文字、不要 Markdown、不加說明）；你的回覆貼同一份文字。傳送失敗或結果不明時不要重試，在回覆說明原因（此規則只適用於傳送與真正的錯誤，分頁不算錯誤，必須繼續查下一頁）。"
     `);
     expect(await service.runContext('ui:something')).toBeNull();
@@ -278,7 +278,7 @@ describe('AgentScheduleService', () => {
     const NOON = new Date('2026-10-04T04:00:00.000Z');
     const message = (overrides: Partial<AgentScheduleClaim> = {}) => claim({
       runId: 'run-m', scheduledFor: NOON, prompt: '', task: { type: 'message', text: '{{date}} {{weekday}} {{time}} 吃藥' }, delivery: { mode: 'primary_admin' }, ...overrides });
-    const admin = async () => ({ accountId: 'acc-1', chatId: 'uadmin', title: '徐佳誠' });
+    const admin = async () => ({ accountId: 'acc-1', chatId: 'uadmin', title: '林曉安' });
 
     it('sends the resolved text itself, records sent, and never creates an Agent job', async () => {
       const store = fakeStore([[message()]]);
@@ -289,7 +289,7 @@ describe('AgentScheduleService', () => {
       await service.tick();
       expect(sendSystemText).toHaveBeenCalledTimes(1);
       expect(sendSystemText).toHaveBeenCalledWith({ runId: 'run-m', text: '2026-10-04 星期日 12:00 吃藥',
-        target: { accountId: 'acc-1', chatType: 'direct', chatId: 'uadmin', title: '徐佳誠' } });
+        target: { accountId: 'acc-1', chatType: 'direct', chatId: 'uadmin', title: '林曉安' } });
       expect(store.markSent).toHaveBeenCalledWith('run-m');
       expect(submit).not.toHaveBeenCalled();
       expect(store.markSubmitted).not.toHaveBeenCalled();

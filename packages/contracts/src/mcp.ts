@@ -94,6 +94,7 @@ export const McpMessageRecordSchema = z.strictObject({
   kind: McpMessageKindSchema,
   text: z.string().nullable(),
   recalled: z.boolean(),
+  recalledAt: z.iso.datetime({ offset: true }).nullable(),
   occurredAt: z.iso.datetime({ offset: true }),
   attachments: z.array(McpMessageAttachmentSchema),
 });

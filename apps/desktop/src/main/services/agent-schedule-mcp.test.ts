@@ -29,7 +29,7 @@ function fakeHandler() {
     listExternal: vi.fn(async () => [schedule]),
     createExternal: vi.fn(async (input: { delivery?: unknown }, _scope: readonly string[] = []) => ({ ...schedule, ...(input.delivery ? { delivery: input.delivery } : {}) }) as typeof schedule),
     updateExternal: vi.fn(async () => schedule), deleteExternal: vi.fn(async () => true),
-    primaryAdminChat: vi.fn(async () => ({ accountId: 'acc', chatId: 'uadmin', title: '徐佳誠' })),
+    primaryAdminChat: vi.fn(async () => ({ accountId: 'acc', chatId: 'uadmin', title: '林曉安' })),
   } satisfies AgentScheduleToolHandler;
 }
 
@@ -78,7 +78,7 @@ describe('schedule tools (mocked repository)', () => {
     const task = create.inputSchema.properties as { task: { oneOf: Array<{ properties?: { match?: { oneOf: Array<{ required: string[] }> }; sender?: { required: string[] } } }> } };
     const forward = task.task.oneOf[0]!;
     expect(forward.properties?.match?.oneOf.map((variant) => variant.required)).toEqual([
-      ['mode', 'keywords'], ['mode', 'text'], ['mode'],
+      ['mode', 'keywords'], ['mode', 'text'], ['mode'], ['mode'],
     ]);
     expect(forward.properties?.sender?.required).toEqual(['accountId', 'mid']);
 
@@ -98,6 +98,37 @@ describe('schedule tools (mocked repository)', () => {
       expect(response.isError).toBe(false);
     }
     expect(h.handler.create).toHaveBeenCalledTimes(3);
+    await h.service.shutdown();
+  });
+
+  it('documents the mention mode and the actions, and no longer asks for explicit source chats', async () => {
+    const h = harness();
+    const listed = (await h.rpc('tools/list')).body as { result: { tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> } };
+    const create = listed.result.tools.find((tool) => tool.name === 'create_schedule')!;
+    const update = listed.result.tools.find((tool) => tool.name === 'update_schedule')!;
+    for (const tool of [create, update]) {
+      expect(tool.description).toContain('match:{mode:"mention"');
+      expect(tool.description).toContain('task.actions');
+      expect(tool.description).toContain('empty targets array means every readable chat');
+      expect(tool.description).toContain('{mode:"record_only"}');
+    }
+    expect(create.description).not.toContain('explicit selected source chats');
+    expect(update.description).toContain('task.actions');
+    const properties = create.inputSchema.properties as { task: { oneOf: Array<{ properties?: { match?: { oneOf: Array<{ properties: { mode: { const: string } } }> }; actions?: { properties: Record<string, unknown> } } }> } };
+    const forward = properties.task.oneOf[0]!;
+    expect(forward.properties?.match?.oneOf.map((variant) => variant.properties.mode.const)).toEqual(['contains', 'exact', 'sender', 'mention']);
+    expect(Object.keys(forward.properties?.actions?.properties ?? {})).toEqual(['forward', 'notify', 'agent']);
+    await h.service.shutdown();
+  });
+
+  it('accepts a mention rule with empty targets and record-only delivery through create_schedule', async () => {
+    const h = harness();
+    const agent = { accountId: 'agent-account', chatType: 'direct', chatId: 'admin-chat', title: 'Admin' };
+    const response = resultOf(await h.call('create_schedule', { title: 'Mention', recurrence: { kind: 'message' }, targets: [],
+      task: { type: 'message_forward', match: { mode: 'mention', admin: true, members: [], all: false }, actions: { forward: false, notify: true, agent: { prompt: 'Reply', target: agent } } },
+      delivery: { mode: 'record_only' } }));
+    expect(response.isError).toBe(false);
+    expect(h.handler.create).toHaveBeenCalledTimes(1);
     await h.service.shutdown();
   });
 
@@ -162,7 +193,7 @@ describe('schedule tools (mocked repository)', () => {
     expect(resultOf(response).isError).toBe(false);
     expect(h.handler.create).toHaveBeenCalledWith({ title: '鬧鐘', prompt: '', recurrence, provider: 'codex', timezone: 'Asia/Taipei', targets: [],
       task: { type: 'message', text: '現在 {{time}}，起床了' }, window: { mode: 'since_last_run' }, delivery: { mode: 'primary_admin' }, enabled: true, jitterMinutes: 0 });
-    expect(resultOf(response).structuredContent).toMatchObject({ toolName: 'create_schedule', deliveryLabel: '管理員（徐佳誠）' });
+    expect(resultOf(response).structuredContent).toMatchObject({ toolName: 'create_schedule', deliveryLabel: '管理員（林曉安）' });
     await h.service.shutdown();
   });
 
@@ -218,7 +249,7 @@ describe('schedule tools (mocked repository)', () => {
     expect(resultOf(response).isError).toBe(false);
     expect(h.handler.create).toHaveBeenCalledWith({ title: '社群摘要', prompt: '', recurrence, provider: 'codex', timezone: 'Asia/Taipei', targets: [community],
       task: { type: 'summary' }, window: { mode: 'since_last_run' }, delivery: { mode: 'primary_admin' }, enabled: true, jitterMinutes: 0 });
-    expect(resultOf(response).structuredContent).toMatchObject({ toolName: 'create_schedule', nextFireAtTaipei: '2026-10-02 09:00', deliveryLabel: '管理員（徐佳誠）' });
+    expect(resultOf(response).structuredContent).toMatchObject({ toolName: 'create_schedule', nextFireAtTaipei: '2026-10-02 09:00', deliveryLabel: '管理員（林曉安）' });
     await h.service.shutdown();
   });
 

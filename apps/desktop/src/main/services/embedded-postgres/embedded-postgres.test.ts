@@ -8,7 +8,7 @@ import type { HttpGet, HttpResponse } from './http.js';
 import { PINNED_ARTIFACT, resolveArtifact } from './manifest.js';
 import { EMBEDDED_PG_PIN, MANAGED_CONF_MARKER } from './pin.js';
 import { chooseFreePort } from './port.js';
-import { runProcess, type RunProcess, type RunResult } from './process.js';
+import { runProcess, runProcessSync, type RunProcess, type RunProcessSync, type RunResult } from './process.js';
 import { createProgressCoalescer, EmbeddedPostgresProvisioner, type ProvisionerDeps, type ProvisionProgress } from './provisioner.js';
 import { EmbeddedPostgresServer } from './server.js';
 import { deriveEmbeddedRoot, ensurePrivateRoot, resolveEmbeddedRoot } from './root.js';
@@ -158,8 +158,10 @@ describe('progress coalescing', () => {
 
 describe('server lifecycle', () => {
   const options = { binDirectory: 'C:\\pg\\18.6\\bin', dataDirectory: 'C:\\pg\\data', logFile: 'C:\\pg\\logs\\postgresql.log', port: 55432 };
-  function harness(overrides: { status?: number; image?: string | null; pidPort?: number; bound?: boolean; stopFast?: RunResult; startResult?: RunResult } = {}) {
+  function harness(overrides: { status?: number; image?: string | null; pidPort?: number; bound?: boolean; stopFast?: RunResult; startResult?: RunResult; syncResult?: RunResult } = {}) {
     const calls: string[] = [];
+    const syncCalls: string[] = [];
+    const runSync: RunProcessSync = (_file, args, syncOptions) => { syncCalls.push(`${args.join(' ')}@${syncOptions.timeoutMs}`); return overrides.syncResult ?? ok(); };
     const run: RunProcess = async (_file, args) => {
       const verb = args.includes('status') ? 'status' : args.includes('start') ? 'start' : `stop:${args[args.indexOf('-m') + 1]}`;
       calls.push(verb);
@@ -168,11 +170,37 @@ describe('server lifecycle', () => {
       if (verb === 'stop:fast') return overrides.stopFast ?? ok();
       return ok();
     };
-    const server = new EmbeddedPostgresServer(options, { run, bindPort: async () => overrides.bound ?? true, env: {}, log: noLog,
+    const logs: string[] = [];
+    const server = new EmbeddedPostgresServer(options, { run, runSync, bindPort: async () => overrides.bound ?? true, env: {}, log: (message) => { logs.push(message); },
       readFile: async () => `4242\n${options.dataDirectory}\n1\n${overrides.pidPort ?? 55432}\n`, mkdir: async () => undefined,
       processImage: async () => (overrides.image === undefined ? 'C:\\pg\\18.6\\bin\\postgres.exe' : overrides.image) });
-    return { server, calls };
+    return { server, calls, syncCalls, logs };
   }
+  it('stopForSessionEnd returns true and runs nothing when not started', () => {
+    const { server, calls, syncCalls } = harness();
+    expect(server.stopForSessionEnd()).toBe(true);
+    expect(calls).toEqual([]); expect(syncCalls).toEqual([]);
+  });
+  it('stopForSessionEnd sends one fast stop through runSync and marks the server stopped', async () => {
+    const { server, calls, syncCalls } = harness();
+    await server.start();
+    expect(server.stopForSessionEnd()).toBe(true);
+    expect(syncCalls).toEqual(['-D C:\\pg\\data stop -m fast -w -t 15@17000']);
+    expect(server.isStarted).toBe(false);
+    await server.stop();
+    expect(calls).toEqual(['status', 'start']);
+  });
+  it.each([['non-zero code', failed()], ['timeout', { code: null, stdout: '', stderr: '', timedOut: true } as RunResult]])(
+    'stopForSessionEnd returns false on %s, logs, and never escalates to immediate', async (_name, syncResult) => {
+      const { server, calls, syncCalls, logs } = harness({ syncResult });
+      await server.start();
+      expect(server.stopForSessionEnd()).toBe(false);
+      expect(logs).toContain('pg_session_end_stop_failed');
+      expect(syncCalls).toHaveLength(1);
+      expect(syncCalls.join()).not.toContain('immediate');
+      expect(calls).toEqual(['status', 'start']);
+      expect(server.isStarted).toBe(true);
+    });
   it('starts a stopped server and stops it fast', async () => {
     const { server, calls } = harness();
     await server.start(); await server.stop(); await server.stop();
@@ -198,7 +226,7 @@ describe('server lifecycle', () => {
     await expect(harness({ startResult: failed() }).server.start()).rejects.toMatchObject({ code: 'pg_start_failed' });
     const calls: string[] = [];
     const nonAscii = new EmbeddedPostgresServer({ ...options, dataDirectory: 'C:\\使用者\\data' }, { run: async (_f, args) => { calls.push(args.join(' ')); return args.includes('status') ? { ...ok(), code: 3 } : failed(); },
-      bindPort: async () => true, env: {}, log: noLog, readFile: async () => '', mkdir: async () => undefined, processImage: async () => null });
+      runSync: () => ok(), bindPort: async () => true, env: {}, log: noLog, readFile: async () => '', mkdir: async () => undefined, processImage: async () => null });
     await expect(nonAscii.start()).rejects.toMatchObject({ code: 'pg_path_unsupported' });
   });
   it('escalates to immediate on a fast-stop timeout and reports pg_stop_timeout when that fails too', async () => {
@@ -206,7 +234,7 @@ describe('server lifecycle', () => {
     await slow.server.start(); await slow.server.stop();
     expect(slow.calls).toEqual(['status', 'start', 'stop:fast', 'stop:immediate']);
     const broken: RunProcess = async (_f, args) => (args.includes('status') ? { ...ok(), code: 3 } : args.includes('start') ? ok() : failed());
-    const server = new EmbeddedPostgresServer(options, { run: broken, bindPort: async () => true, env: {}, log: noLog, readFile: async () => '', mkdir: async () => undefined, processImage: async () => null });
+    const server = new EmbeddedPostgresServer(options, { run: broken, runSync: () => ok(), bindPort: async () => true, env: {}, log: noLog, readFile: async () => '', mkdir: async () => undefined, processImage: async () => null });
     await server.start();
     await expect(server.stop()).rejects.toMatchObject({ code: 'pg_stop_timeout' });
   });
@@ -220,6 +248,14 @@ describe('process runner', () => {
   it('passes stdin and captures output without a shell', async () => {
     const result = await runProcess(process.execPath, ['-e', 'process.stdin.pipe(process.stdout)'], { timeoutMs: 10_000, env: {}, input: 'hello' });
     expect(result).toMatchObject({ code: 0, stdout: 'hello', timedOut: false });
+  });
+  it('runProcessSync captures output and the exit code', () => {
+    const result = runProcessSync(process.execPath, ['-e', 'process.stdout.write("hi");process.exit(3)'], { timeoutMs: 10_000, env: {} });
+    expect(result).toMatchObject({ code: 3, stdout: 'hi', timedOut: false });
+  });
+  it('runProcessSync reports a timeout and does not throw for a missing file', () => {
+    expect(runProcessSync(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { timeoutMs: 300, env: {} }).timedOut).toBe(true);
+    expect(runProcessSync('C:\\no-such-dir\\missing.exe', [], { timeoutMs: 1000 })).toMatchObject({ code: null, timedOut: false });
   });
 });
 
@@ -267,7 +303,7 @@ describe('provisioner', () => {
       return ok();
     };
     let clock = 0;
-    const deps: ProvisionerDeps = { programData: root, getSid: async () => SID, fs, run, httpGet, bindPort: async (port) => port !== 45432, now: () => (clock += 1000),
+    const deps: ProvisionerDeps = { programData: root, getSid: async () => SID, fs, run, runSync: () => ok(), httpGet, bindPort: async (port) => port !== 45432, now: () => (clock += 1000),
       env: { SystemRoot: 'C:\\Windows' }, log: (message) => state.logs.push(message), randomBytes: (size) => Buffer.alloc(size, 7), randomUUID: () => crypto.randomUUID(),
       fileVersions: async (paths) => overrides.vc ?? paths.map(() => '14.38'), processImage: async () => join(base, '18.7', 'bin', 'postgres.exe'),
       ensureDatabase: async (_url, name) => { state.databases.push(name); },
@@ -405,7 +441,7 @@ describe('ASCII ProgramData root and private ACL', () => {
     const calls: string[] = [];
     const run: RunProcess = async (file) => { calls.push(basename(file).toLowerCase()); return basename(file).toLowerCase() === 'icacls.exe' ? icacls : ok(); };
     const requests: string[] = [];
-    const deps: ProvisionerDeps = { programData, getSid: async () => SID, fs, run, httpGet: async (url) => { requests.push(url); return response([]); },
+    const deps: ProvisionerDeps = { programData, getSid: async () => SID, fs, run, runSync: () => ok(), httpGet: async (url) => { requests.push(url); return response([]); },
       bindPort: async () => true, now: () => 0, env: { SystemRoot: 'C:\\Windows' }, log: noLog, randomBytes: (size) => Buffer.alloc(size, 1), randomUUID: () => crypto.randomUUID(),
       fileVersions: async (paths) => paths.map(() => '14.38'), processImage: async () => null, ensureDatabase: async () => undefined,
       saveBootstrap: async () => undefined, registerServer: () => undefined, manifestUrl: 'https://example.invalid/manifest.json' };

@@ -13,7 +13,7 @@ const TO = new Date('2026-10-30T12:00:00Z');
 
 const record = (n: number, chatId = 'g1'): McpMessageRecord => ({
   accountId: 'acc', accountDisplayName: null, chatType: 'group', chatId, conversationTitle: chatId, messageId: `m${chatId}-${n}`, senderId: 'u', senderName: 'U',
-  direction: 'inbound', kind: 'text', text: `t${n}`, recalled: false, occurredAt: '2026-10-30T01:00:00.000Z', attachments: [],
+  direction: 'inbound', kind: 'text', text: `t${n}`, recalled: false, recalledAt: null, occurredAt: '2026-10-30T01:00:00.000Z', attachments: [],
 });
 type Timed = Extract<McpToolOutputUnion, { toolName: 'query_target_messages_by_time' }>;
 const page = (messages: McpMessageRecord[], next: string | null): Timed => ({ toolName: 'query_target_messages_by_time', messages, hasMore: next !== null, nextCursor: next,

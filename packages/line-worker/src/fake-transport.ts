@@ -17,6 +17,8 @@ export class FakeLineTransport implements LineTransport {
     photos?: readonly unknown[]; photoPageShape?: ChatResourcePhotoPageShape; bytes?: Uint8Array }>> = [];
   catalogCalls = 0;
   catalogError?: Error;
+  readonly detailCalls: (readonly string[])[] = [];
+  detailError?: Error;
   readonly #historyQueue: (readonly unknown[])[] = [];
   readonly #downloadQueue: Array<{ bytes: Uint8Array; name: string | null }> = [];
   sendError?: Error;
@@ -31,6 +33,7 @@ export class FakeLineTransport implements LineTransport {
   readonly #identity: TransportIdentity;
   readonly #syncQueue: SyncResult[] = [];
   readonly #catalogQueue: (readonly ConversationCatalogItem[])[] = [];
+  readonly #detailQueue: (readonly ConversationCatalogItem[])[] = [];
   #listeners: Partial<Record<'qr' | 'pin' | 'token' | 'qrCert' | 'storage' | 'credentials' | 'authInvalidated' | 'refreshFailure', (value?: any) => void>> = {};
   logoutError?: Error;
   logoutHold?: Promise<void>;
@@ -72,6 +75,14 @@ export class FakeLineTransport implements LineTransport {
     this.catalogCalls += 1;
     if (this.catalogError) throw this.catalogError;
     return this.#catalogQueue.shift() ?? [];
+  }
+  enqueueConversationDetails(conversations: readonly ConversationCatalogItem[]): void {
+    this.#detailQueue.push(conversations);
+  }
+  async listConversationDetails(chatIds: readonly string[]): Promise<readonly ConversationCatalogItem[]> {
+    this.detailCalls.push([...chatIds]);
+    if (this.detailError) throw this.detailError;
+    return this.#detailQueue.shift() ?? [];
   }
   enqueueSync(result: SyncResult): void { this.#syncQueue.push(result); }
   async sync(cursor: unknown): Promise<SyncResult> {

@@ -59,6 +59,8 @@ export function Search({ api, accounts, conversations, accountScopeId, onAccount
     if (hasSearched.current) runSearch(accountId);
   };
 
+  const formerAdminIds = new Set(accounts.filter((account) => account.adminLineage === 'former').map((account) => account.accountId));
+  const withAdminLineage = (id: string, name: string) => formerAdminIds.has(id) ? `${name} · ${desktopText('formerAdministratorAccount')}` : name;
   const accountName = (id: string) => {
     const name = accounts.find((account) => account.accountId === id)?.displayName ?? desktopText('lineAccount');
     if (accounts.filter((account) => account.displayName === name).length < 2) return name;
@@ -111,7 +113,7 @@ export function Search({ api, accounts, conversations, accountScopeId, onAccount
       {lineageIds.length > 0 && <button type="button" role="tab" aria-selected={agentTabActive} className={agentTabActive ? 'active' : ''}
         onClick={() => selectAccount(currentAgentId ?? lineageIds[0]!)}>{extraText('searchAgentTab')}</button>}
       {accounts.filter((item) => !isLineage(item.accountId)).map((item) => <button type="button" role="tab" key={item.accountId} aria-selected={accountScopeId === item.accountId}
-        className={accountScopeId === item.accountId ? 'active' : ''} onClick={() => selectAccount(item.accountId)}>{item.productRole === 'PRIMARY_ADMIN' ? extraText('searchPrimaryAdminTab') : accountName(item.accountId)}</button>)}
+        className={accountScopeId === item.accountId ? 'active' : ''} onClick={() => selectAccount(item.accountId)}>{item.productRole === 'PRIMARY_ADMIN' ? extraText('searchPrimaryAdminTab') : withAdminLineage(item.accountId, accountName(item.accountId))}</button>)}
     </div>
     {error && <p role="alert" className="error-banner">{error}</p>}
     {attachments && <p className="inline-notice">{desktopText('attachmentFilteringIsNotYetConnectedToDatabaseSearch')}</p>}
@@ -119,7 +121,7 @@ export function Search({ api, accounts, conversations, accountScopeId, onAccount
       {accountGroups.map(([accountId, rawItems]) => {
         const agentGroup = accountId === AGENT_GROUP;
         const accountItems = agentGroup ? dedupeAgentItems(rawItems) : rawItems;
-        const groupLabel = agentGroup ? extraText('searchAgentTab') : accountName(accountId);
+        const groupLabel = agentGroup ? extraText('searchAgentTab') : withAdminLineage(accountId, accountName(accountId));
         return <section className="search-account-group" key={accountId}>
         <h2>{groupLabel}</h2>
         {conversationGroups(accountItems, agentGroup).map(([groupKey, items], index) => {

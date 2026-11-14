@@ -90,7 +90,7 @@ export async function projectStagedSourceObservation(client: PoolClient, input: 
   const observation = input.observation;
   if (!observation.canonicalMessageId) return false;
   const changed = await upsertCanonicalLineMessage(client, input.accountId, input.sourceId, observation,
-    input.origin === 'SYSTEM_LOGIN_LIVE' ? 'live' : 'history');
+    input.origin === 'SYSTEM_LOGIN_LIVE' ? 'live' : 'history', input.origin === 'EXTERNAL_MONITOR');
   await client.query(`INSERT INTO message_source_provenance(account_id,message_id,source_id,generation,observation_id,origin,redacted)
     VALUES ($1,$2,$3,$4,$5,$6,true) ON CONFLICT(source_id,generation,observation_id)
     DO UPDATE SET origin=CASE WHEN message_source_provenance.origin='SYSTEM_LOGIN_LIVE'
@@ -1471,7 +1471,7 @@ export class ExternalMonitorRepository {
           nameCandidates.push(observation);
           if (await upsertCanonicalLineMessage(client, input.accountId, input.sourceId, observation)) rememberChanged(observation);
           if (staged.rowCount === 1 && input.dispatchEligible === true) {
-            await captureScheduleForward(client,{ accountId:input.accountId,chatType:observation.chatType,chatId:observation.chatId,messageId:observation.canonicalMessageId!,attachmentOrder:observation.attachments?.map((item)=>item.id)??[] },forwardingText.get(observation.observationId));
+            await captureScheduleForward(client,{ accountId:input.accountId,chatType:observation.chatType,chatId:observation.chatId,messageId:observation.canonicalMessageId!,attachmentOrder:observation.attachments?.map((item)=>item.id)??[],externalMonitor:true },forwardingText.get(observation.observationId));
           }
           await client.query(`INSERT INTO message_source_provenance(account_id,message_id,source_id,generation,observation_id,origin,redacted)
             VALUES ($1,$2,$3,$4,$5,'EXTERNAL_MONITOR',true) ON CONFLICT DO NOTHING`,
@@ -1968,7 +1968,8 @@ async function upsertExternalMessagePage(client: PoolClient, accountId: string, 
   return writes.map((row) => ({ chatType: row.chat_type, chatId: row.chat_id, messageId: row.message_id! }));
 }
 
-async function upsertExternalAttachments(client: PoolClient, accountId: string, observations: ExternalObservation[]): Promise<void> {
+async function upsertExternalAttachments(client: PoolClient, accountId: string, observations: ExternalObservation[],
+  externalSource = true): Promise<void> {
   const rows = observations.flatMap((row) => row.canonicalMessageId && row.attachments
     ? row.attachments.map((attachment) => ({ message_id: row.canonicalMessageId!, chat_type: row.chatType,
       chat_id: row.chatId, external_attachment_id: attachment.id, kind: attachment.kind,
@@ -1976,7 +1977,7 @@ async function upsertExternalAttachments(client: PoolClient, accountId: string, 
   if (rows.length === 0) return;
   await client.query(`INSERT INTO attachments(external_attachment_id,account_id,chat_type,chat_id,message_id,kind,name,mime_type,size_bytes,error)
     SELECT row.external_attachment_id,$1,row.chat_type,row.chat_id,row.message_id,row.kind,row.name,row.mime_type,row.size_bytes,
-      'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE'
+      CASE WHEN $3::boolean THEN 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' END
       FROM jsonb_to_recordset($2::jsonb) AS row(external_attachment_id text,chat_type text,chat_id text,message_id text,
         kind text,name text,mime_type text,size_bytes bigint)
     ON CONFLICT(account_id,chat_type,chat_id,message_id,external_attachment_id) DO UPDATE SET
@@ -1985,7 +1986,7 @@ async function upsertExternalAttachments(client: PoolClient, accountId: string, 
     WHERE attachments.kind IS DISTINCT FROM EXCLUDED.kind OR (EXCLUDED.name IS NOT NULL AND attachments.name IS DISTINCT FROM EXCLUDED.name)
       OR (EXCLUDED.mime_type IS NOT NULL AND attachments.mime_type IS DISTINCT FROM EXCLUDED.mime_type)
       OR (EXCLUDED.size_bytes IS NOT NULL AND attachments.size_bytes IS DISTINCT FROM EXCLUDED.size_bytes)`,
-  [accountId, JSON.stringify(rows)]);
+  [accountId, JSON.stringify(rows), externalSource]);
 }
 
 function communityMemberKey(observation: ExternalObservation): string | null {
@@ -2065,7 +2066,7 @@ function addUniqueChangedMessages(target: ExternalChangedMessage[], additions: E
 }
 
 async function upsertCanonicalLineMessage(client: PoolClient, accountId: string, sourceId: string,
-  observation: ExternalObservation, ingestionSource: 'live' | 'history' = 'history'): Promise<boolean> {
+  observation: ExternalObservation, ingestionSource: 'live' | 'history' = 'history', externalSource = true): Promise<boolean> {
   if (!observation.canonicalMessageId) throw new Error('External observation has no canonical message ID');
   const conversation = await client.query(`INSERT INTO conversations(account_id,chat_type,chat_id,title,native_metadata)
     VALUES ($1,$2,$3,COALESCE($4,''),COALESCE($5::jsonb,'{"midType":null,"parentChatId":null,"communityId":null}'::jsonb))
@@ -2081,7 +2082,7 @@ async function upsertCanonicalLineMessage(client: PoolClient, accountId: string,
     observation.nativeMetadata === undefined ? null : JSON.stringify(observation.nativeMetadata)]);
   const conversationChanged = (conversation.rowCount ?? 0) > 0;
   if (await canonicalLineMessageMatches(client, accountId, observation)) {
-    await upsertExternalAttachments(client, accountId, [observation]);
+    await upsertExternalAttachments(client, accountId, [observation], externalSource);
     const mentionChanged = await updateExternalMentionRanges(client, accountId, [observation]);
     return conversationChanged || mentionChanged.length > 0;
   }
@@ -2103,7 +2104,7 @@ async function upsertCanonicalLineMessage(client: PoolClient, accountId: string,
     observation.chatType, observation.chatId, observation.senderId, projection.kind, observation.text,
     projection.content === null ? null : JSON.stringify(projection.content), projection.version, projection.replyToMessageId,
     observation.occurredAt, JSON.stringify(raw), ingestionSource]);
-  await upsertExternalAttachments(client, accountId, [observation]);
+  await upsertExternalAttachments(client, accountId, [observation], externalSource);
   await updateExternalMentionRanges(client, accountId, [observation]);
   return true;
 }

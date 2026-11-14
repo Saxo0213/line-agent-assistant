@@ -216,7 +216,7 @@ database('content bridge write-time conversion and re-projection (PostgreSQL)', 
     const friend = 'ub'.padEnd(33, 'b');
     const stranger = 'uc'.padEnd(33, 'c');
     await pool.query("UPDATE line_accounts SET own_mid=$2, display_name='小薪' WHERE account_id=$1", [ACCOUNT, owner]);
-    await pool.query("INSERT INTO line_contacts(account_id,mid,display_name,nickname) VALUES ($1,$2,'徐佳誠 (profile)','徐佳誠')", [ACCOUNT, friend]);
+    await pool.query("INSERT INTO line_contacts(account_id,mid,display_name,nickname) VALUES ($1,$2,'林曉安 (profile)','林曉安')", [ACCOUNT, friend]);
     const event = (locKey: string, locArgs: string) => nativeRaw({ _contentType: 18, _text: '', _contentMetadata: JSON.stringify({ LOC_KEY: locKey, LOC_ARGS: locArgs }) });
     const oldContent: MessageContent = { format: 1, type: 'event', nativeContentType: 18, text: null };
     await insertRow('ce-added', event('C_MI', owner + '' + friend + '' + stranger), { version: 1, content: oldContent });
@@ -225,7 +225,7 @@ database('content bridge write-time conversion and re-projection (PostgreSQL)', 
     const hashBefore = await layerOneHash();
     await reprojectContent(pool);
     expect(await byId('ce-added')).toMatchObject({ content_rule_version: 2,
-      content: { type: 'event', nativeContentType: 18, text: '小薪已新增徐佳誠, 成員至群組。' } });
+      content: { type: 'event', nativeContentType: 18, text: '小薪已新增林曉安, 成員至群組。' } });
     expect(await byId('ce-unknown')).toMatchObject({ content_rule_version: 2, content: { type: 'event', nativeContentType: 18, text: null } });
     expect(await byId('ce-current')).toMatchObject({ content_rule_version: 2, content: { text: null } });
     expect(await layerOneHash()).toBe(hashBefore);

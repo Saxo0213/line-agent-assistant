@@ -127,6 +127,17 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('refreshLineAvatar'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('lineSetAutoLogin'), accountId: IdSchema, enabled: z.boolean() }),
   RequestIdSchema.extend({ type: z.literal('lineBeginAdminPairing'), accountId: IdSchema }),
+  /** Starts the two-stage administrator change. `accountId` is the Agent account. */
+  RequestIdSchema.extend({ type: z.literal('lineBeginAdminChange'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('lineCancelAdminChange'), accountId: IdSchema }),
+  /** Primary Admin download bridge. `accountId` is the Primary Admin account. */
+  RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeStart'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeRefreshQr'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeClear'), accountId: IdSchema }),
+  /** Turns the automatic download of new External Monitor attachments on or off. */
+  RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeSetAutoDownload'), accountId: IdSchema, enabled: z.boolean() }),
+  /** Allows or blocks every Chrome extension download of the bridge. Off by default. */
+  RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeSetDownloadEnabled'), accountId: IdSchema, enabled: z.boolean() }),
   RequestIdSchema.extend({ type: z.literal('lineStart'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('getChromeLoginAvailability') }),
   RequestIdSchema.extend({ type: z.literal('detectChromeLtsm') }),
@@ -246,6 +257,15 @@ export const ComponentHealthSchema = z.strictObject({
 });
 export type ComponentHealth = z.infer<typeof ComponentHealthSchema>;
 
+/** Counts of the latest verification result of each attachment of one kind. `open` is the old-message gate. */
+export const DownloadBridgeVerificationKindSchema = z.strictObject({
+  match: z.number().int().nonnegative(), mismatch: z.number().int().nonnegative(),
+  notInStore: z.number().int().nonnegative(), nativeIncomplete: z.number().int().nonnegative(),
+  threshold: z.number().int().positive(), open: z.boolean(),
+});
+export const DownloadBridgeStateSchema = z.enum(['not_configured', 'starting', 'waiting_qr', 'waiting_pin', 'logged_in', 'error']);
+export type DownloadBridgeState = z.infer<typeof DownloadBridgeStateSchema>;
+
 export const LineAccountSummarySchema = z.strictObject({
   accountId: IdSchema,
   displayName: z.string(),
@@ -255,6 +275,10 @@ export const LineAccountSummarySchema = z.strictObject({
   productRole: z.enum(['AGENT', 'PRIMARY_ADMIN']).nullable().optional(),
   /** Agent lineage membership: the current Agent account or a former Agent account; absent for every other account. */
   agentLineage: z.enum(['current', 'former']).optional(),
+  /** Archived former Primary Administrator account (role removed by an administrator change); absent for every other account. */
+  adminLineage: z.literal('former').optional(),
+  /** How this account is connected: system login, external monitoring, or not connected. */
+  connectionMode: z.enum(['SYSTEM_LOGIN', 'EXTERNAL_MONITOR', 'OFFLINE']).optional(),
   hasPrimaryAdmin: z.boolean().optional(),
   autoLoginOnStartup: z.boolean().optional(),
   /** Login method of this account. If absent (older payloads), it means DESKTOPWIN. */
@@ -268,6 +292,12 @@ export const LineAccountSummarySchema = z.strictObject({
     version: z.string().regex(/^\d{1,5}(\.\d{1,5}){3}$/).nullable(),
     status: z.enum(['accepted', 'candidate', 'key_scan_failed', 'schema_changed', 'rotation', 'untrusted']),
   }).nullable().optional(),
+  /** Primary Admin only: state of the download bridge. `code` is the real error code when the state is error. */
+  downloadBridge: z.strictObject({ state: DownloadBridgeStateSchema, code: z.string().max(64).optional(),
+    detail: z.string().max(200).regex(/^[A-Za-z0-9_.:/|=,-]*$/).optional(), autoDownload: z.boolean().optional(),
+    downloadEnabled: z.boolean().optional(), qrExpiresAt: z.number().int().positive().optional(),
+    identity: z.enum(['pending', 'verified']).optional(),
+    verification: z.strictObject({ image: DownloadBridgeVerificationKindSchema, file: DownloadBridgeVerificationKindSchema }).optional() }).optional(),
   externalImportProgress: z.strictObject({
     stage: z.enum(['checking_source', 'closing_line_window', 'copying_snapshot', 'counting_rows', 'importing_history', 'syncing', 'monitoring', 'complete', 'failed']),
     copiedBytes: z.string().regex(/^\d+$/).nullable(),
@@ -371,6 +401,18 @@ export const IpcEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('lineAvatarRefreshed'), accountId: IdSchema, ownMid: IdSchema }),
   /** Reading phase of the official-LINE identity read behind the external-monitor dialog. */
   z.strictObject({ type: z.literal('externalAdminBindingProgress'), phase: z.enum(['locating', 'reading_identity']) }),
+  /** Stage of the administrator change flow. `token` is the code for the stage; the renderer shows it and the Agent sends no LINE message. */
+  z.strictObject({ type: z.literal('adminChangeProgress'), accountId: IdSchema,
+    stage: z.enum(['confirm_current', 'await_new', 'completed', 'expired', 'failed']),
+    token: z.string().regex(/^\d{6}$/).optional(), expiresAt: TimestampSchema.optional(),
+    newAdminName: z.string().max(256).optional(), code: z.string().max(64).optional() }),
+  /** State of the Primary Admin download bridge. The QR image and the PIN exist only in the matching state. */
+  z.strictObject({ type: z.literal('adminDownloadBridgeStatus'), accountId: IdSchema, state: DownloadBridgeStateSchema,
+    code: z.string().max(64).optional(),
+    detail: z.string().max(200).regex(/^[A-Za-z0-9_.:/|=,-]*$/).optional(),
+    qrImageDataUrl: z.string().max(256_000).regex(/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/).optional(),
+    pin: IdSchema.optional(), qrExpiresAt: z.number().int().positive().optional(),
+    identity: z.enum(['pending', 'verified']).optional() }),
   z.strictObject({ type: z.literal('attachmentChanged'), attachmentId: IdSchema }),
   z.strictObject({ type: z.literal('controlChanged'), control: ControlSnapshotSchema }),
   z.strictObject({ type: z.literal('healthChanged'), component: ComponentHealthSchema }),
@@ -389,6 +431,8 @@ export const IpcEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('agentExecutionPolicyChanged') }),
   /** A schedule or a schedule run changed (UI, Agent tool or the trigger tick); subscribers re-read. Carries no schedule data. */
   z.strictObject({ type: z.literal('agentSchedulesChanged') }),
+  /** The user clicked a desktop notification: the renderer opens this chat when it is in its list. */
+  z.strictObject({ type: z.literal('openConversation'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema }),
 ]);
 export type IpcEvent = z.infer<typeof IpcEventSchema>;
 
@@ -453,6 +497,8 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('setAutoResponderSettings'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().positive() }),
     z.strictObject({ type: z.literal('accepted'), requestId: IdSchema, ok: z.literal(true), ownMid: z.string().regex(/^u[0-9a-fA-F]{32}$/).optional() }),
     z.strictObject({ type: z.literal('lineAdminPairing'), requestId: IdSchema, ok: z.literal(true), token: z.string().regex(/^\d{6}$/), expiresAt: TimestampSchema }),
+    z.strictObject({ type: z.literal('lineBeginAdminChange'), requestId: IdSchema, ok: z.literal(true), token: z.string().regex(/^\d{6}$/), expiresAt: TimestampSchema,
+      stage: z.literal('confirm_current') }),
     z.strictObject({ type: z.literal('submitAgentRoomPrompt'), requestId: IdSchema, ok: z.literal(true), jobId: IdSchema }),
     z.strictObject({ type: z.literal('getAgentRoomJobEvents'), requestId: IdSchema, ok: z.literal(true), events: z.array(AgentEventSchema) }),
     z.strictObject({ type: z.literal('previewExternalAdminBinding'), requestId: IdSchema, ok: z.literal(true),

@@ -77,16 +77,16 @@ describe('schedule tool guidance', () => {
 });
 
 describe('identity block', () => {
-  const agent = { accountId: 'acc-1', name: 'Agentsaxo' };
-  const admin = { accountId: 'acc-1', chatId: 'uadmin', name: '徐佳誠' };
+  const agent = { accountId: 'acc-1', name: 'AgentDemo' };
+  const admin = { accountId: 'acc-1', chatId: 'uadmin', name: '林曉安' };
 
   it('LINE job in the administrator direct chat: the speaker is the administrator', () => {
-    const block = formatIdentityBlock({ agent, admin, current: { accountId: 'acc-1', chatType: 'direct', chatId: 'uadmin', title: '徐佳誠', isAdmin: true } });
+    const block = formatIdentityBlock({ agent, admin, current: { accountId: 'acc-1', chatType: 'direct', chatId: 'uadmin', title: '林曉安', isAdmin: true } });
     expect(block).toMatchInlineSnapshot(`
       "【身分】
-      Agent 帳號：Agentsaxo（accountId=acc-1）
-      管理員（主要管理者）：徐佳誠；與 Agent 的私訊 accountId=acc-1，chatType=direct，chatId=uadmin
-      目前對話：徐佳誠（accountId=acc-1，chatType=direct，chatId=uadmin）；目前對話者就是管理員
+      Agent 帳號：AgentDemo（accountId=acc-1）
+      管理員（主要管理者）：林曉安；與 Agent 的私訊 accountId=acc-1，chatType=direct，chatId=uadmin
+      目前對話：林曉安（accountId=acc-1，chatType=direct，chatId=uadmin）；目前對話者就是管理員
       「我／給我／管理員／主要管理者」都指上述管理員；要傳給他時直接用上述 key。"
     `);
     expect(block.length).toBeLessThanOrEqual(600);
@@ -96,8 +96,8 @@ describe('identity block', () => {
     const block = formatIdentityBlock({ agent, admin, current: { accountId: 'acc-1', chatType: 'group', chatId: 'g1', title: '專案群', isAdmin: false } });
     expect(block).toMatchInlineSnapshot(`
       "【身分】
-      Agent 帳號：Agentsaxo（accountId=acc-1）
-      管理員（主要管理者）：徐佳誠；與 Agent 的私訊 accountId=acc-1，chatType=direct，chatId=uadmin
+      Agent 帳號：AgentDemo（accountId=acc-1）
+      管理員（主要管理者）：林曉安；與 Agent 的私訊 accountId=acc-1，chatType=direct，chatId=uadmin
       目前對話：專案群（accountId=acc-1，chatType=group，chatId=g1）
       要指名回覆某位成員時，請寫 @成員名稱（名稱需與聊天紀錄顯示的一致），系統會轉成 LINE 標註；沒有對應成員時維持原文。
       「我／給我／管理員／主要管理者」都指上述管理員；要傳給他時直接用上述 key。"
@@ -121,8 +121,8 @@ describe('identity block', () => {
     const block = formatIdentityBlock({ agent, admin, current: null });
     expect(block).toMatchInlineSnapshot(`
       "【身分】
-      Agent 帳號：Agentsaxo（accountId=acc-1）
-      管理員（主要管理者）：徐佳誠；與 Agent 的私訊 accountId=acc-1，chatType=direct，chatId=uadmin
+      Agent 帳號：AgentDemo（accountId=acc-1）
+      管理員（主要管理者）：林曉安；與 Agent 的私訊 accountId=acc-1，chatType=direct，chatId=uadmin
       「我／給我／管理員／主要管理者」都指上述管理員；要傳給他時直接用上述 key。"
     `);
     expect(block).not.toContain('目前對話');

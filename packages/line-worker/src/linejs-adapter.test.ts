@@ -1,9 +1,9 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createLinejsAdapter, downloadLinejsE2eeAttachment } from './linejs-adapter.js';
-import { fetchLinejsConversationCatalog } from './linejs-adapter.js';
+import { fetchLinejsConversationCatalog, fetchLinejsConversationDetails } from './linejs-adapter.js';
 import { BaseClient, InternalError } from '@evex/linejs/base';
 import { Protocols, Thrift as LineThrift } from '@evex/linejs/thrift';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
@@ -956,272 +956,6 @@ it.each(['image', 'file'].flatMap((kind) => [false, true].map((archived) => ({ k
   } finally { selfLookup.mockRestore(); localLookup.mockRestore(); token.mockRestore(); }
 });
 
-it('downloads native encrypted metadata with its decoded key material, skips E2EE chunk lookup, and never calls TalkService.getProfile', async () => {
-  const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
-    E2EE: { prototype: { decryptE2EEDataMessage: (...args: any[]) => Promise<unknown>; encryptByKeyMaterial: (...args: any[]) => Promise<any> } };
-  };
-  const decryptEnvelope = vi.spyOn(E2EE.prototype, 'decryptE2EEDataMessage').mockRejectedValue(new Error('must not look up native chunks'));
-  const token = await mockEncryptedObsToken();
-  const { TalkService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/talk/mod.js', import.meta.url).href) as {
-    TalkService: { prototype: { getProfile: (...args: any[]) => Promise<unknown> } };
-  };
-  const getProfile = vi.spyOn(TalkService.prototype, 'getProfile').mockRejectedValue(new Error('must never call TalkService.getProfile'));
-  const keyMaterial = Buffer.alloc(32, 0x41);
-  const plaintext = Buffer.from('native encrypted attachment');
-  const crypto = Object.create(E2EE.prototype) as { encryptByKeyMaterial(data: Buffer, key: Buffer): Promise<{ encryptedData: Buffer }> };
-  const ciphertext = (await crypto.encryptByKeyMaterial(plaintext, keyMaterial)).encryptedData;
-  const requests: Request[] = [];
-  const identity = { ...attachmentIdentity, kind: 'file' as const };
-  const nativeAttachment = { messageId: '9', chatId: identity.chatId, from: null, to: null, toType: null, contentType: 14,
-    contentMetadata: { OID: 'OID_123', SID: 'emf', OBS_POP: 'pop-presence-fixture', FILE_SIZE: String(ciphertext.length),
-      MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null }, keyMaterial: keyMaterial.toString('base64'), fileName: 'native.bin', sizeBytes: plaintext.length };
-  const probe = {
-    chatType: identity.chatType,
-    chatId: identity.chatId,
-    messageId: '9',
-    externalAttachmentId: 'OID_123',
-    kind: 'file' as const,
-    lineMessage: {},
-    nativeAttachment,
-    maxBytes: 1024,
-  };
-  try {
-    const capturedApplication = 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64';
-    // Direct OBS token fails 401 on object_info.obs, fallback to acquireEncryptedAccessToken({ featureType: 2 }) succeeds:
-    const adapterWithFallback = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
-      physicalTransport: async (request) => {
-        requests.push(request);
-        if (new URL(request.url).pathname.endsWith('/object_info.obs')) {
-          if (request.headers.get('x-line-access') === 'fixture-auth') {
-            return new Response('Unauthorized', { status: 401 });
-          }
-          return new Response(JSON.stringify({ status: 'exist', encodeStatus: 'done' }));
-        }
-        return new Response(ciphertext);
-      } });
-    await adapterWithFallback.adoptDownloadAuth('fixture-auth', capturedApplication, { expectedMid: identity.ownMid, probe });
-    const result = await adapterWithFallback.download('file', '9', '9', {}, { signal: new AbortController().signal, maxBytes: 1024,
-      identity, nativeAttachment });
-    const chunks: Buffer[] = [];
-    for await (const chunk of result.source) chunks.push(Buffer.from(chunk));
-    expect(Buffer.concat(chunks)).toEqual(plaintext);
-    expect(result.name).toBe('native.bin');
-    expect(getProfile).not.toHaveBeenCalled();
-    expect(requests.some((request) => request.url.includes('legy.line-apps.com/S4'))).toBe(false);
-    expect(requests[0]!.headers.get('x-line-application')).toBe(capturedApplication);
-    expect(requests[0]!.headers.get('user-agent')).toBe('Line/26.5.1.4180');
-    expect(new URL(requests.at(-1)!.url).pathname).toBe('/r/talk/emf/OID_123');
-    expect(requests.at(-1)!.url).toContain('p=pop-presence-fixture');
-    expect(decryptEnvelope).not.toHaveBeenCalled();
-    // acquireEncryptedAccessToken called once during adoptDownloadAuth fallback, and reused in download() without calling again!
-    expect(token).toHaveBeenCalledTimes(1);
-    expect(token).toHaveBeenCalledWith({ featureType: 2 });
-    adapterWithFallback.revoke();
-  } finally { decryptEnvelope.mockRestore(); token.mockRestore(); getProfile.mockRestore(); }
-});
-
-it('adopts a direct OBS candidate token via object_info.obs probe and downloads with zero /S4 RPC calls', async () => {
-  const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
-    E2EE: { prototype: { encryptByKeyMaterial: (...args: any[]) => Promise<any> } };
-  };
-  const { TalkService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/talk/mod.js', import.meta.url).href) as {
-    TalkService: { prototype: { getProfile: (...args: any[]) => Promise<unknown>; acquireEncryptedAccessToken: (...args: any[]) => Promise<unknown> } };
-  };
-  const getProfile = vi.spyOn(TalkService.prototype, 'getProfile').mockRejectedValue(new Error('must not call getProfile'));
-  const acquireToken = vi.spyOn(TalkService.prototype, 'acquireEncryptedAccessToken').mockRejectedValue(new Error('must not call acquireEncryptedAccessToken for direct OBS token'));
-  const keyMaterial = Buffer.alloc(32, 0x42);
-  const plaintext = Buffer.from('direct obs token payload');
-  const crypto = Object.create(E2EE.prototype) as { encryptByKeyMaterial(data: Buffer, key: Buffer): Promise<{ encryptedData: Buffer }> };
-  const ciphertext = (await crypto.encryptByKeyMaterial(plaintext, keyMaterial)).encryptedData;
-  const requests: Request[] = [];
-  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
-    physicalTransport: async (request) => {
-      requests.push(request);
-      if (new URL(request.url).pathname.endsWith('/object_info.obs')) {
-        return new Response(JSON.stringify({ status: 'exist', encodeStatus: 'done' }));
-      }
-      return new Response(ciphertext);
-    } });
-  const identity = { ...attachmentIdentity, kind: 'file' as const };
-  const nativeAttachment = { messageId: '9', chatId: identity.chatId, from: null, to: null, toType: null, contentType: 14,
-    contentMetadata: { OID: 'OID_123', SID: 'emf', OBS_POP: null, FILE_SIZE: String(ciphertext.length),
-      MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null }, keyMaterial: keyMaterial.toString('base64'), fileName: 'direct.bin', sizeBytes: plaintext.length };
-  const probe = {
-    chatType: identity.chatType,
-    chatId: identity.chatId,
-    messageId: '9',
-    externalAttachmentId: 'OID_123',
-    kind: 'file' as const,
-    lineMessage: {},
-    nativeAttachment,
-    maxBytes: 1024,
-  };
-  try {
-    const adopted = await adapter.adoptDownloadAuth('direct-obs-token', 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64', {
-      expectedMid: identity.ownMid,
-      probe,
-    });
-    expect(adopted).toEqual({ ownMid: identity.ownMid, displayName: null });
-    const result = await adapter.download('file', '9', '9', {}, {
-      signal: new AbortController().signal,
-      maxBytes: 1024,
-      identity,
-      nativeAttachment,
-    });
-    const chunks: Buffer[] = [];
-    for await (const chunk of result.source) chunks.push(Buffer.from(chunk));
-    expect(Buffer.concat(chunks)).toEqual(plaintext);
-    expect(getProfile).not.toHaveBeenCalled();
-    expect(acquireToken).not.toHaveBeenCalled();
-    expect(requests.every((request) => new URL(request.url).hostname === 'obs.line-apps.com')).toBe(true);
-    expect(requests.every((request) => request.headers.get('x-line-access') === 'direct-obs-token')).toBe(true);
-  } finally {
-    getProfile.mockRestore();
-    acquireToken.mockRestore();
-    adapter.revoke();
-  }
-});
-
-it('rejects a JWT download-auth candidate with a mismatched MID offline with zero network calls', async () => {
-  const requests: Request[] = [];
-  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
-    physicalTransport: async (request) => { requests.push(request); return new Response(new Uint8Array(), { status: 200 }); } });
-  const mismatchedMid = `u${'f'.repeat(32)}`;
-  const mismatchedJwt = [
-    Buffer.from('{"alg":"HS256"}').toString('base64url'),
-    Buffer.from(JSON.stringify({ sub: mismatchedMid })).toString('base64url'),
-    'signature',
-  ].join('.');
-  const probe = {
-    chatType: attachmentIdentity.chatType,
-    chatId: attachmentIdentity.chatId,
-    messageId: '9',
-    externalAttachmentId: 'OID_123',
-    kind: 'file' as const,
-    lineMessage: {},
-    nativeAttachment: { messageId: '9', chatId: attachmentIdentity.chatId, from: null, to: null, toType: null, contentType: 14,
-      contentMetadata: { OID: 'OID_123', SID: 'emf', OBS_POP: null, FILE_SIZE: '16',
-        MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null }, keyMaterial: Buffer.alloc(32, 1).toString('base64'), fileName: 'native.bin', sizeBytes: 16 },
-    maxBytes: 1024,
-  };
-  try {
-    const result = await adapter.adoptDownloadAuth(mismatchedJwt, 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64', {
-      expectedMid: attachmentIdentity.ownMid,
-      probe,
-    });
-    expect(result).toEqual({ ownMid: mismatchedMid, displayName: null });
-    expect(requests).toHaveLength(0);
-  } finally { adapter.revoke(); }
-});
-
-async function downloadAuthFixture(respond: (token: string, path: string) => Response | null) {
-  const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
-    E2EE: { prototype: { encryptByKeyMaterial: (...args: any[]) => Promise<any> } };
-  };
-  const { TalkService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/talk/mod.js', import.meta.url).href) as {
-    TalkService: { prototype: { acquireEncryptedAccessToken: (...args: any[]) => Promise<string> } };
-  };
-  const acquireToken = vi.spyOn(TalkService.prototype, 'acquireEncryptedAccessToken').mockResolvedValue('3600\u001eobs-fixture-token');
-  const keyMaterial = Buffer.alloc(32, 0x42);
-  const plaintext = Buffer.from('download auth fixture payload');
-  const crypto = Object.create(E2EE.prototype) as { encryptByKeyMaterial(data: Buffer, key: Buffer): Promise<{ encryptedData: Buffer }> };
-  const ciphertext = (await crypto.encryptByKeyMaterial(plaintext, keyMaterial)).encryptedData;
-  const seen: Array<{ token: string | null; path: string }> = [];
-  const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => false,
-    physicalTransport: async (request) => {
-      const path = new URL(request.url).pathname;
-      const token = request.headers.get('x-line-access');
-      seen.push({ token, path });
-      return respond(token ?? '', path) ?? (path.endsWith('/object_info.obs')
-        ? new Response(JSON.stringify({ status: 'exist', encodeStatus: 'done' })) : new Response(ciphertext));
-    } });
-  const identity = { ...attachmentIdentity, kind: 'file' as const };
-  const nativeAttachment = { messageId: '9', chatId: identity.chatId, from: null, to: null, toType: null, contentType: 14,
-    contentMetadata: { OID: 'OID_123', SID: 'emf', OBS_POP: null, FILE_SIZE: String(ciphertext.length),
-      MEDIA_CONTENT_INFO: null, DOWNLOAD_URL: null }, keyMaterial: keyMaterial.toString('base64'), fileName: 'f.bin', sizeBytes: plaintext.length };
-  const probe = { chatType: identity.chatType, chatId: identity.chatId, messageId: '9', externalAttachmentId: 'OID_123',
-    kind: 'file' as const, lineMessage: {}, nativeAttachment, maxBytes: 1024 };
-  const application = 'DESKTOPWIN\t26.5.1.4180\tWINDOWS\t10.0.0-NT-x64';
-  const download = async () => {
-    const result = await adapter.download('file', '9', '9', {}, { signal: new AbortController().signal, maxBytes: 1024, identity, nativeAttachment });
-    const chunks: Buffer[] = [];
-    for await (const chunk of result.source) chunks.push(Buffer.from(chunk));
-    return Buffer.concat(chunks);
-  };
-  return { adapter, acquireToken, seen, identity, probe, application, plaintext, download, cleanup: () => { acquireToken.mockRestore(); adapter.revoke(); } };
-}
-const unauthorized = () => new Response('', { status: 401 });
-
-it('falls back to a featureType 2 OBS token when the direct opaque preflight is rejected with 401', async () => {
-  const fx = await downloadAuthFixture((token, path) => (token === 'opaque-token' && path.endsWith('/object_info.obs') ? unauthorized() : null));
-  try {
-    await fx.adapter.adoptDownloadAuth('opaque-token', fx.application, { expectedMid: fx.identity.ownMid, probe: fx.probe });
-    expect(fx.seen.map((entry) => entry.token)).toEqual(['opaque-token', 'obs-fixture-token']);
-    expect(fx.acquireToken).toHaveBeenCalledTimes(1);
-    expect(fx.acquireToken).toHaveBeenCalledWith({ featureType: 2 });
-    expect(await fx.download()).toEqual(fx.plaintext);
-    expect(fx.acquireToken).toHaveBeenCalledTimes(1);
-  } finally { fx.cleanup(); }
-});
-
-it('acquires a featureType 2 OBS token for a V3 JWT without trying it directly as the OBS token', async () => {
-  const fx = await downloadAuthFixture(() => null);
-  const v3 = [Buffer.from('{"alg":"HS256"}').toString('base64url'),
-    Buffer.from(JSON.stringify({ sub: fx.identity.ownMid })).toString('base64url'), 'signature'].join('.');
-  try {
-    await fx.adapter.adoptDownloadAuth(v3, fx.application, { expectedMid: fx.identity.ownMid, probe: fx.probe });
-    expect(fx.acquireToken).toHaveBeenCalledWith({ featureType: 2 });
-    expect(fx.seen.map((entry) => entry.token)).toEqual(['obs-fixture-token']);
-  } finally { fx.cleanup(); }
-});
-
-it('clears adopted auth and the cached OBS token when preflight fails, so a later download cannot use them', async () => {
-  const fx = await downloadAuthFixture((_token, path) => (path.endsWith('/object_info.obs') ? unauthorized() : null));
-  try {
-    await expect(fx.adapter.adoptDownloadAuth('opaque-token', fx.application, { expectedMid: fx.identity.ownMid, probe: fx.probe }))
-      .rejects.toMatchObject({ code: 'LINE_OBS_HTTP_401' });
-    const before = fx.seen.length;
-    await expect(fx.download()).rejects.toBeTruthy();
-    // No cached OBS token and no adopted auth: the old token is never replayed as a bearer.
-    expect(fx.seen.slice(before).some((entry) => entry.token === 'opaque-token')).toBe(false);
-  } finally { fx.cleanup(); }
-});
-
-it('reacquires the OBS token exactly once when the cached adopted token is rejected with 401', async () => {
-  let rejectOpaque = false;
-  const fx = await downloadAuthFixture((token) => (rejectOpaque && token === 'opaque-token' ? unauthorized() : null));
-  try {
-    await fx.adapter.adoptDownloadAuth('opaque-token', fx.application, { expectedMid: fx.identity.ownMid, probe: fx.probe });
-    expect(fx.acquireToken).not.toHaveBeenCalled();
-    rejectOpaque = true;
-    expect(await fx.download()).toEqual(fx.plaintext);
-    expect(fx.acquireToken).toHaveBeenCalledTimes(1);
-  } finally { fx.cleanup(); }
-});
-
-it('treats a second 401 after the single reacquire as a normal attachment failure', async () => {
-  let rejectAll = false;
-  const fx = await downloadAuthFixture(() => (rejectAll ? unauthorized() : null));
-  try {
-    await fx.adapter.adoptDownloadAuth('opaque-token', fx.application, { expectedMid: fx.identity.ownMid, probe: fx.probe });
-    rejectAll = true;
-    await expect(fx.download()).rejects.toMatchObject({ code: 'LINE_OBS_HTTP_401' });
-    expect(fx.acquireToken).toHaveBeenCalledTimes(1);
-  } finally { fx.cleanup(); }
-});
-
-it('adopts with a 200 MiB probe attachment and only issues the object_info preflight, never a body GET', async () => {
-  const fx = await downloadAuthFixture(() => null);
-  const bigProbe = { ...fx.probe, nativeAttachment: { ...fx.probe.nativeAttachment,
-    contentMetadata: { ...fx.probe.nativeAttachment.contentMetadata, FILE_SIZE: '209715200' }, sizeBytes: 209715200 } };
-  try {
-    await expect(fx.adapter.adoptDownloadAuth('opaque-token', fx.application, { expectedMid: fx.identity.ownMid, probe: bigProbe }))
-      .resolves.toEqual({ ownMid: fx.identity.ownMid, displayName: null });
-    expect(fx.seen).toHaveLength(1);
-    expect(fx.seen[0]!.path.endsWith('/object_info.obs')).toBe(true);
-  } finally { fx.cleanup(); }
-});
-
 it('classifies a real pinned LINEJS OBS 404 response without treating its body as expiry proof', async () => {
   const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
     E2EE: { prototype: { decryptE2EEDataMessage: (...args: any[]) => Promise<unknown> } };
@@ -1907,6 +1641,75 @@ it('drains supplemental history on a real empty HTTP 410 sync before marking sta
     adapter.revoke();
     sync.mockRestore(); recent.mockRestore(); decrypt.mockRestore();
   }
+});
+
+describe('unsend operations in sync', () => {
+  const CHAT = `u${'1'.repeat(32)}`;
+  const GROUP = `c${'2'.repeat(32)}`;
+  const T = 1_760_522_400_000;
+  const unsendOp = (over: Record<string, unknown>) => ({ revision: 9n, type: 'DESTROY_MESSAGE', param1: CHAT,
+    param2: '640083256712626194', createdTime: T, ...over });
+  async function syncWith(operations: unknown[]) {
+    const { TalkService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/talk/mod.js', import.meta.url).href) as {
+      TalkService: { prototype: { sync: (...args: any[]) => Promise<unknown>; getRecentMessagesV2: (...args: any[]) => Promise<unknown> } };
+    };
+    const sync = vi.spyOn(TalkService.prototype, 'sync').mockResolvedValueOnce({
+      operationResponse: { operations, globalEvents: { lastRevision: '100' } },
+    });
+    const recent = vi.spyOn(TalkService.prototype, 'getRecentMessagesV2').mockResolvedValue([]);
+    const physicalTransport = vi.fn(async () => new Response(null, { status: 410 }));
+    const adapter = await monitorAdapter(physicalTransport);
+    try {
+      const result = await adapter.sync(cursor);
+      return { adapter, result, sync, recent, physicalTransport };
+    } finally { adapter.revoke(); }
+  }
+
+  it('returns unsends for DESTROY_MESSAGE and NOTIFIED_DESTROY_MESSAGE by name and by number without another RPC', async () => {
+    const { result, sync, recent, physicalTransport } = await syncWith([
+      unsendOp({ revision: 1n }),
+      unsendOp({ revision: 2n, type: 'NOTIFIED_DESTROY_MESSAGE', param1: GROUP, param2: '11' }),
+      unsendOp({ revision: 3n, type: 64, param1: GROUP, param2: '12' }),
+      unsendOp({ revision: 4n, type: 65, param1: GROUP, param2: '13' }),
+    ]);
+    const observedAt = new Date(T).toISOString();
+    expect(result.unsends).toEqual([
+      { chatId: CHAT, messageId: '640083256712626194', kind: 'self', observedAt },
+      { chatId: GROUP, messageId: '11', kind: 'notified', observedAt },
+      { chatId: GROUP, messageId: '12', kind: 'self', observedAt },
+      { chatId: GROUP, messageId: '13', kind: 'notified', observedAt },
+    ]);
+    expect(result.operations).toEqual([]);
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(recent).not.toHaveBeenCalled();
+    expect(physicalTransport).not.toHaveBeenCalled();
+    sync.mockRestore(); recent.mockRestore();
+  });
+
+  it('drops invalid parameters, counts them, and deduplicates by chat and message', async () => {
+    const { adapter, result, sync, recent } = await syncWith([
+      unsendOp({ param1: 'u-admin' }), unsendOp({ param1: undefined }), unsendOp({ param2: 'abc' }),
+      unsendOp({ param2: '9223372036854775808' }), unsendOp({ param2: 7 }), unsendOp({ param2: undefined }),
+      unsendOp({ param2: '01' }), unsendOp({ param2: '5' }), unsendOp({ param2: '5', type: 'NOTIFIED_DESTROY_MESSAGE' }),
+    ]);
+    expect(adapter.unsendCounters).toEqual({ unsendShapeDropped: 7, unsendOverflowDropped: 0 });
+    expect(result.unsends).toEqual([{ chatId: CHAT, messageId: '5', kind: 'self', observedAt: new Date(T).toISOString() }]);
+    sync.mockRestore(); recent.mockRestore();
+  });
+
+  it('uses the current time for an invalid createdTime, omits the field when empty and caps at 500', async () => {
+    const before = Date.now();
+    const first = await syncWith([unsendOp({ createdTime: 'x' })]);
+    expect(Date.parse(first.result.unsends![0]!.observedAt)).toBeGreaterThanOrEqual(before);
+    first.sync.mockRestore(); first.recent.mockRestore();
+    const none = await syncWith([]);
+    expect(none.result).not.toHaveProperty('unsends');
+    none.sync.mockRestore(); none.recent.mockRestore();
+    const many = await syncWith(Array.from({ length: 501 }, (_, index) => unsendOp({ param2: String(index + 1), revision: BigInt(index + 1) })));
+    expect(many.result.unsends).toHaveLength(500);
+    expect(many.adapter.unsendCounters.unsendOverflowDropped).toBe(1);
+    many.sync.mockRestore(); many.recent.mockRestore();
+  });
 });
 
 it('treats an empty HTTP 410 sync long poll as a normal empty result after one physical request', async () => {
@@ -2930,4 +2733,62 @@ it('builds an explicitly encrypted LINEJS text message without retaining plainte
     relatedMessageId: '42', e2ee: true, chunks,
   });
   expect(options).not.toHaveProperty('text');
+});
+
+it('reads conversation details with getChats then getContactsV2 in chunks of 100 and maps items like the catalog', async () => {
+  const calls: Array<{ method: string; mids: string[] }> = [];
+  const ids = Array.from({ length: 101 }, (_, index) => `c-new-${index}`);
+  const talk = {
+    getChats: async ({ chatMids }: { chatMids: string[] }) => {
+      calls.push({ method: 'getChats', mids: chatMids });
+      return { chats: chatMids.filter((id) => id !== 'c-new-5').map((chatMid) => ({ chatMid, chatName: `Name ${chatMid}`, picturePath: '/0hGroup',
+        extra: { groupExtra: { memberMids: { 'u-self': 0, [`u-${chatMid}`]: 0 } } } })) };
+    },
+    getContactsV2: async ({ mids }: { mids: string[] }) => {
+      calls.push({ method: 'getContactsV2', mids });
+      return { contacts: Object.fromEntries(mids.map((mid) => [mid, { contact: { displayName: `D ${mid}`,
+        ...(mid === 'u-self' ? { displayNameOverridden: 'Me' } : {}) } }])) };
+    },
+  };
+  const details = await fetchLinejsConversationDetails(talk, async (call) => await call(), [...ids, 'r-room', 'u-direct', 'c-new-0']);
+  expect(calls.filter((call) => call.method === 'getChats').map((call) => call.mids.length)).toEqual([100, 2]);
+  expect(calls.filter((call) => call.method === 'getChats').flatMap((call) => call.mids)).not.toContain('u-direct');
+  expect(calls.findIndex((call) => call.method === 'getContactsV2')).toBeGreaterThan(1);
+  // Ids that LINE does not return give no item; the others match the catalog mapping.
+  expect(details).toHaveLength(101);
+  expect(details.find((item) => item.chatId === 'c-new-5')).toBeUndefined();
+  expect(details.find((item) => item.chatId === 'r-room')).toMatchObject({ chatType: 'room', title: 'Name r-room' });
+  const first = details.find((item) => item.chatId === 'c-new-0');
+  const catalog = await fetchLinejsConversationCatalog({
+    ownMid: 'u-self',
+    getAllChatMids: async () => ({ memberChatMids: ['c-new-0'] }),
+    getMessageBoxes: async () => ({ messageBoxes: [] }),
+    getChats: talk.getChats,
+    getContactsV2: talk.getContactsV2,
+  }, async (call) => await call());
+  expect(first).toEqual(catalog[0]);
+  expect(first).toEqual({ chatType: 'group', chatId: 'c-new-0', title: 'Name c-new-0', picturePath: 'https://profile.line-scdn.net/0hGroup', members: [
+    { memberId: 'u-c-new-0', displayName: 'D u-c-new-0' }, { memberId: 'u-self', displayName: 'D u-self', nickname: 'Me' },
+  ] });
+});
+
+it('sends listConversationDetails through the DESKTOPWIN talk service with the catalog request arguments', async () => {
+  const { TalkService } = await import(new URL('./service/talk/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
+    TalkService: new (...args: never[]) => { getProfile(...args: unknown[]): Promise<unknown>; getChats(...args: unknown[]): Promise<unknown>;
+      getContactsV2(...args: unknown[]): Promise<unknown> };
+  };
+  vi.spyOn(TalkService.prototype, 'getProfile').mockResolvedValue({ mid: 'u-self', displayName: 'Agent' });
+  const getChats = vi.spyOn(TalkService.prototype, 'getChats').mockResolvedValue({ chats: [{ chatMid: 'c-new', chatName: 'Fresh',
+    extra: { groupExtra: { memberMids: { 'u-peer': 0 } } } }] });
+  const getContacts = vi.spyOn(TalkService.prototype, 'getContactsV2').mockResolvedValue({ contacts: { 'u-peer': { contact: { displayName: 'Alice' } } } });
+  try {
+    const adapter = await createLinejsAdapter({ ...lease, mode: 'MONITOR_ONLY', validateLease: () => true,
+      physicalTransport: async () => { throw new Error('offline fixture stop'); } });
+    await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+    await adapter.loginToken(jwt);
+    const result = await adapter.listConversationDetails!(['c-new']);
+    expect(getChats.mock.calls).toEqual([[{ chatMids: ['c-new'] }]]);
+    expect(getContacts.mock.calls).toEqual([[{ mids: ['u-peer'] }]]);
+    expect(result).toEqual([{ chatType: 'group', chatId: 'c-new', title: 'Fresh', members: [{ memberId: 'u-peer', displayName: 'Alice' }] }]);
+  } finally { vi.restoreAllMocks(); }
 });

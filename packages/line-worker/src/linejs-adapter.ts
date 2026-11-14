@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { BaseClient, InternalError } from '@evex/linejs/base';
 import { MemoryStorage } from '@evex/linejs/storage';
 import { Protocols } from '@evex/linejs/thrift';
-import { buildMentionContentMetadata, normalizeNativePicturePath, type OutgoingMention, relationAddServerError, TALK_SERVER_ERRORS, type AccountMode, type ChatResourceReadCommand, type ConversationCatalogItem, type DownloadAuthProbe, type JsonValue, type NativeAttachmentDownloadInput, type RelationAddServerErrorCode, type TalkCursorV1Dto } from '@line-agent/contracts';
+import { buildMentionContentMetadata, normalizeNativePicturePath, type OutgoingMention, relationAddServerError, TALK_SERVER_ERRORS, type AccountMode, type ChatResourceReadCommand, type ConversationCatalogItem, type JsonValue, type RelationAddServerErrorCode, type TalkCursorV1Dto } from '@line-agent/contracts';
 import {
   createMutationGate, EffectDeniedError, isReadOnlyRpc,
   type ControlLease, type ControlLeasePhase, type DirectFetchEffect, type MediaUploadScope, type RpcCallContext, type RpcTransportState, type ServerLogoutPermit,
@@ -19,7 +19,7 @@ import { safeRaw } from './normalizer.js';
 import { verifyLinejsPackage } from './version.js';
 import { trafficLabel } from './traffic-log.js';
 import { SafeAttachmentError } from './attachment-error.js';
-import { parseEncryptedAccessToken, validateAttachmentMessage, validateNativeAttachment, type AttachmentDownloadIdentity } from './attachment-download.js';
+import { parseEncryptedAccessToken, validateAttachmentMessage, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { boundedChatResourceResponseCode, ChatResourceFailure, safeChatResourceFailureDetails,
   safeChatResourceUpstreamCode, safeChatResourceUpstreamNumber } from './chat-resource-error.js';
 import { decodeLinejsServerRejection, isLineServerRejection, isTalkAuthInvalidation } from './line-server-error.js';
@@ -33,8 +33,6 @@ type SourceCall = Readonly<{
   headers: Record<string, string | undefined>;
 }>;
 type AttachmentDownloadContext = Readonly<{ signal: AbortSignal; maxBytes: number }>;
-/** Bounds only the token RPC and OBS preflight responses during download-auth adoption. */
-const DOWNLOAD_AUTH_PREFLIGHT_MAX_BYTES = 64 * 1024;
 type RelationAddContext = { consumed: boolean; signal: RelationCancellation; onPhysicalStart: () => void };
 type ServerLogoutContext = Readonly<{ permit: ServerLogoutPermit; signal: AbortSignal }>;
 
@@ -102,7 +100,6 @@ function isNotAuthorizedDeviceRequestError(error: unknown): boolean {
 
 export type LinejsAdapterOptions = Readonly<ControlLease & {
   mode: AccountMode;
-  application?: string;
   validateLease: (lease: ControlLease) => boolean | Promise<boolean>;
   physicalTransport: (request: Request) => Promise<Response>;
   packageRoot?: string;
@@ -430,23 +427,11 @@ function isV3Jwt(value: string): boolean {
       ['ver', 'scp', 'exp', 'iat', 'sub', 'iss', 'aud'].some((key) => payload[key] !== undefined);
   } catch { return false; }
 }
-function extractJwtUserMids(value: string): string[] {
-  const parts = value.split('.');
-  if (parts.length !== 3) return [];
-  try {
-    const payload = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8')) as unknown;
-    const mids: string[] = [];
-    const visit = (item: unknown) => {
-      if (typeof item === 'string') {
-        if (/^u[0-9a-fA-F]{32}$/.test(item)) mids.push(item.toLowerCase());
-        return;
-      }
-      if (Array.isArray(item)) { for (const entry of item) visit(entry); return; }
-      if (item && typeof item === 'object') { for (const entry of Object.values(item as Record<string, unknown>)) visit(entry); }
-    };
-    visit(payload);
-    return mids;
-  } catch { return []; }
+/** OpType 64 (DESTROY_MESSAGE) is the own account on another device; 65 (NOTIFIED_DESTROY_MESSAGE) is another member. */
+function unsendOperationKind(type: unknown): 'self' | 'notified' | null {
+  if (type === 'DESTROY_MESSAGE' || type === 64) return 'self';
+  if (type === 'NOTIFIED_DESTROY_MESSAGE' || type === 65) return 'notified';
+  return null;
 }
 function decimal(value: unknown, fallback: string): string {
   if (value === undefined || value === null) return fallback;
@@ -509,6 +494,15 @@ export async function fetchLinejsConversationCatalog(
   const messageBoxIds = (boxes.messageBoxes ?? []).flatMap((box) =>
     typeof box.id === 'string' && chatType(box.id) !== null ? [box.id] : []);
   const chatMids = [...new Set([...messageBoxIds, ...stringIds(joined.memberChatMids)])];
+  return buildConversationCatalogItems(talk, invokeRead, chatMids);
+}
+
+/** getChats chunks + getContactsV2 chunks + item mapping, shared by the full catalog and the detail read. */
+async function buildConversationCatalogItems(
+  talk: Pick<CatalogTalk, 'getChats' | 'getContactsV2'>,
+  invokeRead: <T>(call: () => Promise<T>) => Promise<T>,
+  chatMids: readonly string[],
+): Promise<ConversationCatalogItem[]> {
   const joinedChatMids = chatMids.filter((chatId) => chatType(chatId) !== 'direct');
   const chats: CatalogChat[] = [];
   for (const batch of chunks(joinedChatMids, CATALOG_BATCH_SIZE)) {
@@ -568,6 +562,19 @@ export async function fetchLinejsConversationCatalog(
     return { chatType: type, chatId, title, members,
       ...(picturePath === undefined ? {} : { picturePath }) };
   });
+}
+
+/**
+ * Group/room detail read for chats the catalog has not seen: getChats (chunks of 100), then getContactsV2 for the member MIDs.
+ * Official ext 3.7.2 thunks talkChat/fetchTalkChats and contact/fetchContacts: same chunking, same request shape.
+ */
+export async function fetchLinejsConversationDetails(
+  talk: Pick<CatalogTalk, 'getChats' | 'getContactsV2'>,
+  invokeRead: <T>(call: () => Promise<T>) => Promise<T>,
+  chatIds: readonly string[],
+): Promise<ConversationCatalogItem[]> {
+  const ids = [...new Set(chatIds)].filter((chatId) => chatType(chatId) === 'group' || chatType(chatId) === 'room');
+  return buildConversationCatalogItems(talk, invokeRead, ids);
 }
 
 export async function decryptLinejsHistoryMessages(
@@ -657,8 +664,6 @@ export class LinejsAdapter implements LineTransport {
   #refreshTimerGeneration = 0;
   #tokenScheduleActive = true;
   #serverLogoutStarted = false;
-  #downloadAuthAdopted = false;
-  #adoptedObsToken: string | null = null;
   #activeRelationAdd: RelationAddContext | undefined;
   readonly #seenConversationIds = new Set<string>();
   #pendingCatchupMessages: unknown[] = [];
@@ -672,11 +677,7 @@ export class LinejsAdapter implements LineTransport {
     const requestClient: TrustedRequestClient<OpaqueCall, unknown, Response> = {
       invoke: (call, dispatch) => dispatchContext.run(dispatch, call),
     };
-    const appVersion = options.application?.split('\t')[1];
-    if (options.application && (!options.application.startsWith('DESKTOPWIN\t') || !appVersion || !/^\d+(?:\.\d+){1,4}$/.test(appVersion))) {
-      throw new Error('official desktop application version is invalid');
-    }
-    base = new BaseClient({ device: 'DESKTOPWIN', ...(appVersion ? { version: appVersion } : {}), storage: this.#storage, legy: { encrypted: 'auto' },
+    base = new BaseClient({ device: 'DESKTOPWIN', storage: this.#storage, legy: { encrypted: 'auto' },
       fetch: async (request: Request) => {
         const source = sourceContext.getStore();
         const dispatch = dispatchContext.getStore();
@@ -721,9 +722,7 @@ export class LinejsAdapter implements LineTransport {
         const transport: RpcTransportState = !token
           ? { mode: 'direct', tokenState: 'none' }
           : !isV3Jwt(token)
-            ? this.#downloadAuthAdopted
-              ? { mode: 'direct', tokenState: 'legacy-opaque' }
-              : { mode: 'unsupported', tokenState: 'legacy-opaque' }
+            ? { mode: 'unsupported', tokenState: 'legacy-opaque' }
             : talk ? { mode: 'legy-encrypted', tokenState: 'v3-jwt' }
               : { mode: 'direct', tokenState: 'v3-jwt' };
         // For direct requests this is the actual Request object constructed by
@@ -778,7 +777,6 @@ export class LinejsAdapter implements LineTransport {
       try { await inFlight; }
       finally { if (this.#refreshInFlight === inFlight) this.#refreshInFlight = undefined; }
     };
-    if (options.application) base.request.systemType = options.application;
     const original = base.request.request.bind(base.request);
     base.request.request = (async (...args: Parameters<typeof original>) => {
       const [value, methodName, protocolType = 3, _parse = true, path = '/S3', headers = {}] = args;
@@ -865,8 +863,6 @@ export class LinejsAdapter implements LineTransport {
     this.#listeners[event] = listener;
   }
   async installSecrets(secrets: { token: string | null; qrCert: string | null; e2eeStorage: JsonValue | null }): Promise<void> {
-    this.#downloadAuthAdopted = false;
-    this.#adoptedObsToken = null;
     this.#pendingCatchupMessages = [];
     this.#clearChatResourceTokens();
     await this.#storage.load(secrets.e2eeStorage, secrets.qrCert);
@@ -875,16 +871,12 @@ export class LinejsAdapter implements LineTransport {
     await this.#scheduleTokenRefresh();
   }
   async loginQr(): Promise<TransportIdentity> {
-    this.#downloadAuthAdopted = false;
-    this.#adoptedObsToken = null;
     this.#pendingCatchupMessages = [];
     await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ qr: true, v3: true }));
     await this.#scheduleTokenRefresh();
     return this.#profile();
   }
   async loginToken(token: string): Promise<TransportIdentity> {
-    this.#downloadAuthAdopted = false;
-    this.#adoptedObsToken = null;
     this.#pendingCatchupMessages = [];
     const expire = await this.#storage.get('expire');
     const refreshToken = await this.#storage.get('refreshToken');
@@ -988,92 +980,6 @@ export class LinejsAdapter implements LineTransport {
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
   }
-  async adoptDownloadAuth(token: string, application: string,
-    options?: Readonly<{ expectedMid?: string; probe?: DownloadAuthProbe; signal?: AbortSignal }>): Promise<TransportIdentity> {
-    const version = application.split('\t')[1];
-    if (!application.startsWith('DESKTOPWIN\t') || !version || !/^\d+(?:\.\d+){1,4}$/.test(version)) {
-      throw new Error('official desktop application version does not match worker');
-    }
-    const jwtMids = extractJwtUserMids(token);
-    if (jwtMids.length > 0 && options?.expectedMid && !jwtMids.includes(options.expectedMid.toLowerCase())) {
-      return { ownMid: jwtMids[0]!, displayName: null };
-    }
-    const probe = options?.probe;
-    if (!probe) throw new Error('download auth probe is required');
-    const ownMid = options?.expectedMid ?? jwtMids[0] ?? '';
-    // Size-neutral validation: preflight never reads the body, so the download byte cap must not gate adoption.
-    const validationMaxBytes = Number.MAX_SAFE_INTEGER - 64;
-    const identity: AttachmentDownloadIdentity = {
-      accountId: this.#options.accountId,
-      chatType: probe.chatType,
-      chatId: probe.chatId,
-      ownMid,
-      messageId: probe.messageId,
-      kind: probe.kind,
-      externalAttachmentId: probe.externalAttachmentId,
-    };
-    const parsed = probe.nativeAttachment
-      ? validateNativeAttachment(probe.nativeAttachment, identity, validationMaxBytes)
-      : validateAttachmentMessage(probe.lineMessage, identity, validationMaxBytes);
-    const signal = options?.signal ?? new AbortController().signal;
-    const context = { phase: 'MONITOR_READ' as const };
-    this.#base.authToken = token;
-    this.#base.request.systemType = application;
-    this.#base.request.userAgent = `Line/${version}`;
-    this.#downloadAuthAdopted = true;
-    this.#adoptedObsToken = null;
-    try {
-      return await this.#attachmentDownloadContext.run({ signal, maxBytes: DOWNLOAD_AUTH_PREFLIGHT_MAX_BYTES }, async () =>
-        await this.#directFetchContext.run(context, async () => {
-          const path = `/r/talk/${parsed.sid}/${parsed.oid}`;
-          const talkMeta = parsed.encrypted ? attachmentTalkMeta(identity.messageId) : null;
-          if (!isV3Jwt(token)) {
-            let directObsToken: string | null = null;
-            try {
-              directObsToken = token.includes('\u001e') ? parseEncryptedAccessToken(token) : token;
-            } catch { directObsToken = null; }
-            if (directObsToken && /^[\x21-\x7e]+$/.test(directObsToken)) {
-              try {
-                await preflightAttachment(this.#gate, context, {
-                  path, headers: attachmentHeaders(this.#base, directObsToken, talkMeta), obsPop: parsed.obsPop, signal,
-                });
-                this.#adoptedObsToken = directObsToken;
-                return { ownMid, displayName: null };
-              } catch (error) {
-                if (!(error instanceof SafeAttachmentError)
-                  || (error.code !== 'LINE_OBS_HTTP_401' && error.code !== 'LINE_OBS_HTTP_403')) {
-                  throw error;
-                }
-              }
-            }
-          }
-          let rawToken: unknown;
-          try {
-            rawToken = await this.#gate.invokeRpc({ ...context, allowLegacyOpaqueDirect: true },
-              () => this.#base.talk.acquireEncryptedAccessToken({ featureType: 2 }));
-          } catch (error) {
-            throw classifyAttachmentRpcPhase(error, 'LINE_OBS_TOKEN_RPC_FAILED',
-              this.#requestFailures.has(error as object));
-          }
-          const obsToken = parseEncryptedAccessToken(rawToken);
-          await preflightAttachment(this.#gate, context, {
-            path, headers: attachmentHeaders(this.#base, obsToken, talkMeta), obsPop: parsed.obsPop, signal,
-          });
-          this.#adoptedObsToken = obsToken;
-          return { ownMid, displayName: null };
-        }));
-    } catch (error) {
-      this.#downloadAuthAdopted = false;
-      this.#adoptedObsToken = null;
-      delete this.#base.authToken;
-      throw error;
-    }
-  }
-  clearDownloadAuth(): void {
-    this.#downloadAuthAdopted = false;
-    this.#adoptedObsToken = null;
-    delete this.#base.authToken;
-  }
   async listConversations(): Promise<readonly ConversationCatalogItem[]> {
     const context = this.#readContext();
     return fetchLinejsConversationCatalog({
@@ -1084,8 +990,15 @@ export class LinejsAdapter implements LineTransport {
       getContactsV2: (options) => this.#base.talk.getContactsV2(options),
     }, async (call) => await this.#gate.invokeRpc(context, call) as Awaited<ReturnType<typeof call>>);
   }
+  async listConversationDetails(chatIds: readonly string[]): Promise<readonly ConversationCatalogItem[]> {
+    const context = this.#readContext();
+    return fetchLinejsConversationDetails({
+      getChats: (options) => this.#base.talk.getChats(options),
+      getContactsV2: (options) => this.#base.talk.getContactsV2(options),
+    }, async (call) => await this.#gate.invokeRpc(context, call) as Awaited<ReturnType<typeof call>>, chatIds);
+  }
   async refreshOwnProfile(): Promise<TransportIdentity> {
-    if (this.#downloadAuthAdopted || this.#revoked || !this.#base.authToken) throw new Error('LINE profile read is unavailable');
+    if (this.#revoked || !this.#base.authToken) throw new Error('LINE profile read is unavailable');
     const profile = await this.#gate.invokeRpc(this.#readContext(), () => this.#base.talk.getProfile()) as {
       mid?: unknown; displayName?: unknown; picturePath?: unknown;
     };
@@ -1134,6 +1047,7 @@ export class LinejsAdapter implements LineTransport {
     const catchupChatIds: string[] = [];
     const catchupMessages = [...this.#pendingCatchupMessages];
     const receipts = new Map<string, { chatId: string; readerMid: string; messageId: bigint; createdTime: number }>();
+    const unsendMap = new Map<string, { chatId: string; messageId: string; kind: 'self' | 'notified'; observedAt: string }>();
     const rawOperations = response.operationResponse?.operations ?? [];
     for (const operation of rawOperations) {
       revision = decimal(operation.revision, revision);
@@ -1154,6 +1068,8 @@ export class LinejsAdapter implements LineTransport {
       } else {
         const value = operation as unknown as { type?: unknown; param1?: unknown; param2?: unknown; param3?: unknown; createdTime?: unknown };
         if (value.type === 'NOTIFIED_READ_MESSAGE') this.#collectReadReceipt(value, receipts);
+        const unsendKind = unsendOperationKind(value.type);
+        if (unsendKind) this.#collectUnsend(value, unsendKind, unsendMap);
         if (value.type === 'NOTIFIED_READ_MESSAGE' && typeof value.param1 === 'string'
           && /^[ucr]/.test(value.param1) && !this.#seenConversationIds.has(value.param1)) {
           this.#seenConversationIds.add(value.param1);
@@ -1181,12 +1097,38 @@ export class LinejsAdapter implements LineTransport {
       chatId: receipt.chatId, readerMid: receipt.readerMid, messageId: receipt.messageId.toString(),
       readAt: new Date(receipt.createdTime).toISOString(),
     }));
+    const unsends = [...unsendMap.values()];
     const queued = drainStartupCatchupQueue(catchupMessages, Math.max(0, 100 - operations.length));
     operations.push(...queued.operations);
     this.#pendingCatchupMessages = [...queued.remaining];
     return { cursorAfter: { version: 1, revision, globalRev, individualRev }, operations, rawOperationCount: rawOperations.length,
       hasMoreStartupItems: queued.hasMoreStartupItems,
-      ...(readReceipts.length === 0 ? {} : { readReceipts }) };
+      ...(readReceipts.length === 0 ? {} : { readReceipts }),
+      ...(unsends.length === 0 ? {} : { unsends }) };
+  }
+  /** In-memory drop counters for DESTROY_MESSAGE and NOTIFIED_DESTROY_MESSAGE ops. */
+  readonly #unsendCounters = { unsendShapeDropped: 0, unsendOverflowDropped: 0 };
+  get unsendCounters(): Readonly<{ unsendShapeDropped: number; unsendOverflowDropped: number }> {
+    return { ...this.#unsendCounters };
+  }
+  #collectUnsend(value: { param1?: unknown; param2?: unknown; createdTime?: unknown }, kind: 'self' | 'notified',
+    unsends: Map<string, { chatId: string; messageId: string; kind: 'self' | 'notified'; observedAt: string }>): void {
+    const { param1: chatId, param2: messageId } = value;
+    if (typeof chatId !== 'string' || !/^[ucr][0-9a-f]{32}$/.test(chatId)
+      || typeof messageId !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(messageId) || BigInt(messageId) > 9223372036854775807n) {
+      this.#unsendCounters.unsendShapeDropped += 1;
+      return;
+    }
+    const createdTime = typeof value.createdTime === 'bigint' ? Number(value.createdTime)
+      : typeof value.createdTime === 'string' && /^[0-9]{1,15}$/.test(value.createdTime) ? Number(value.createdTime)
+        : value.createdTime;
+    const observed = typeof createdTime === 'number' && Number.isSafeInteger(createdTime) && createdTime > 0
+      ? new Date(createdTime) : new Date();
+    const observedAt = Number.isNaN(observed.getTime()) ? new Date().toISOString() : observed.toISOString();
+    const key = `${chatId}|${messageId}`;
+    if (unsends.has(key)) return;
+    if (unsends.size >= 500) { this.#unsendCounters.unsendOverflowDropped += 1; return; }
+    unsends.set(key, { chatId, messageId, kind, observedAt });
   }
   /** In-memory drop counters for NOTIFIED_READ_MESSAGE ops (no event type carries them). */
   readonly #readReceiptCounters = { readReceiptShapeDropped: 0, readReceiptOverflowDropped: 0 };
@@ -1353,18 +1295,16 @@ export class LinejsAdapter implements LineTransport {
   async download(_kind: 'image' | 'video' | 'audio' | 'file', _messageId: string,
     _externalAttachmentId: string, lineMessage: JsonValue,
     options: Readonly<{ signal: AbortSignal; maxBytes: number; identity: AttachmentDownloadIdentity;
-      nativeAttachment?: NativeAttachmentDownloadInput }>): Promise<DownloadedAttachment> {
+    }>): Promise<DownloadedAttachment> {
     if (!this.#base.authToken) throw new EffectDeniedError('OBS download requires login');
     const context = this.#readContext();
     try {
       const boundedContext = { signal: options.signal, maxBytes: options.maxBytes + 32 };
       return await this.#attachmentDownloadContext.run(boundedContext, async () => await this.#directFetchContext.run(context, async () => {
-        const native = options.nativeAttachment;
-        const nativeParsed = native ? validateNativeAttachment(native, options.identity, options.maxBytes) : null;
-        const parsed = nativeParsed ?? validateAttachmentMessage(lineMessage, options.identity, options.maxBytes);
-        let keyMaterial: Buffer | null = nativeParsed?.keyMaterial ?? null;
-        let name: string | null = nativeParsed?.fileName ?? null;
-        if (parsed.encrypted && !native) {
+        const parsed = validateAttachmentMessage(lineMessage, options.identity, options.maxBytes);
+        let keyMaterial: Buffer | null = null;
+        let name: string | null = null;
+        if (parsed.encrypted) {
           let payload: Record<string, unknown>;
           try {
             payload = await this.#gate.invokeRpc(context, () => this.#base.e2ee.decryptE2EEDataMessage(
@@ -1380,57 +1320,29 @@ export class LinejsAdapter implements LineTransport {
         const acquireObsToken = async (): Promise<string> => {
           let rawToken: unknown;
           try {
-            rawToken = await this.#gate.invokeRpc({ ...context, ...(this.#downloadAuthAdopted ? { allowLegacyOpaqueDirect: true } : {}) },
+            rawToken = await this.#gate.invokeRpc(context,
               () => this.#base.talk.acquireEncryptedAccessToken({ featureType: 2 }));
           } catch (error) { throw classifyAttachmentRpcPhase(error, 'LINE_OBS_TOKEN_RPC_FAILED',
             this.#requestFailures.has(error as object)); }
-          const nextToken = parseEncryptedAccessToken(rawToken);
-          if (this.#downloadAuthAdopted) this.#adoptedObsToken = nextToken;
-          return nextToken;
+          return parseEncryptedAccessToken(rawToken);
         };
-        let usedCachedObsToken = this.#downloadAuthAdopted && this.#adoptedObsToken !== null;
-        let token = usedCachedObsToken ? this.#adoptedObsToken! : await acquireObsToken();
+        const token = await acquireObsToken();
         const talkMeta = parsed.encrypted ? attachmentTalkMeta(options.identity.messageId) : null;
-        let headers = attachmentHeaders(this.#base, token, talkMeta);
+        const headers = attachmentHeaders(this.#base, token, talkMeta);
         const path = `/r/talk/${parsed.sid}/${parsed.oid}`;
         for (let cycle = 0; cycle < 6; cycle += 1) {
           if (options.signal.aborted) throw options.signal.reason;
-          let preflight: 'ready' | 'incomplete';
-          try {
-            preflight = await preflightAttachment(this.#gate, context,
-              { path, headers, obsPop: parsed.obsPop, signal: options.signal });
-          } catch (error) {
-            if (usedCachedObsToken && error instanceof SafeAttachmentError
-              && (error.code === 'LINE_OBS_HTTP_401' || error.code === 'LINE_OBS_HTTP_403')) {
-              usedCachedObsToken = false;
-              this.#adoptedObsToken = null;
-              token = await acquireObsToken();
-              headers = attachmentHeaders(this.#base, token, talkMeta);
-              preflight = await preflightAttachment(this.#gate, context,
-                { path, headers, obsPop: parsed.obsPop, signal: options.signal });
-            } else {
-              throw error;
-            }
-          }
+          const preflight = await preflightAttachment(this.#gate, context,
+            { path, headers, obsPop: parsed.obsPop, signal: options.signal });
           if (preflight === 'incomplete') {
             if (cycle === 5) throw new SafeAttachmentError('LINE_OBS_ENCODING_INCOMPLETE');
             await abortableAttachmentDelay(options.signal);
             continue;
           }
           const mediaPath = parsed.tid ? `${path}/original` : path;
-          let response = await responseForObs(this.#gate, context, new Request(attachmentUrl(mediaPath, parsed.obsPop), {
+          const response = await responseForObs(this.#gate, context, new Request(attachmentUrl(mediaPath, parsed.obsPop), {
             method: 'GET', headers, signal: options.signal, redirect: 'error',
           }));
-          if (usedCachedObsToken && (response.status === 401 || response.status === 403)) {
-            await cancelResponse(response);
-            usedCachedObsToken = false;
-            this.#adoptedObsToken = null;
-            token = await acquireObsToken();
-            headers = attachmentHeaders(this.#base, token, talkMeta);
-            response = await responseForObs(this.#gate, context, new Request(attachmentUrl(mediaPath, parsed.obsPop), {
-              method: 'GET', headers, signal: options.signal, redirect: 'error',
-            }));
-          }
           if (response.status === 202) {
             await cancelResponse(response);
             if (cycle === 5) throw new SafeAttachmentError('LINE_OBS_ENCODING_INCOMPLETE');
@@ -1620,7 +1532,7 @@ export class LinejsAdapter implements LineTransport {
         : { status: 'unknown', error: 'TRANSPORT_OUTCOME_UNKNOWN' };
     } finally { this.#activeRelationAdd = undefined; }
   }
-  revoke(): void { this.#revoked = true; this.#adoptedObsToken = null; this.#cancelTokenRefresh(true); }
+  revoke(): void { this.#revoked = true; this.#cancelTokenRefresh(true); }
   #clearChatResourceTokens(): void {
     const timeline = this.#base.timeline as unknown as { timelineToken?: string; timelineHeaders: Record<string, string | undefined> };
     delete timeline.timelineToken;

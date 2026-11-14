@@ -7,7 +7,7 @@ import { compareVersions, resolveArtifact, type DownloadArtifact } from './manif
 import { EMBEDDED_PG_ADMIN_USER, EMBEDDED_PG_DATABASE, EMBEDDED_PG_MANIFEST_URL, MANAGED_CONF_MARKER, embeddedPaths } from './pin.js';
 import { resetAdminPasswordViaLocalSocket } from './password.js';
 import { chooseFreePort, type BindPort } from './port.js';
-import type { RunProcess } from './process.js';
+import type { RunProcess, RunProcessSync } from './process.js';
 import { EmbeddedPostgresServer, minimalEnv } from './server.js';
 import { ensurePrivateRoot, resolveEmbeddedRoot } from './root.js';
 import { extractZip } from './zip.js';
@@ -23,6 +23,7 @@ export type ProvisionerDeps = {
   getSid: () => Promise<string>;
   fs: Fs;
   run: RunProcess;
+  runSync: RunProcessSync;
   httpGet: HttpGet;
   bindPort: BindPort;
   now: () => number;
@@ -168,7 +169,7 @@ export class EmbeddedPostgresProvisioner {
   }
 
   private serverDeps() {
-    return { run: this.deps.run, bindPort: this.deps.bindPort, env: this.deps.env, log: this.deps.log,
+    return { run: this.deps.run, runSync: this.deps.runSync, bindPort: this.deps.bindPort, env: this.deps.env, log: this.deps.log,
       readFile: (path: string) => this.deps.fs.readFile(path, 'utf8'), mkdir: (path: string) => this.deps.fs.mkdir(path, { recursive: true }),
       processImage: this.deps.processImage };
   }

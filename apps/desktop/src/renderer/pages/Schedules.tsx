@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AGENT_SCHEDULE_DEFAULT_TIMEZONE, AGENT_SCHEDULE_MAX_ENABLED, type AgentSchedule, type AgentScheduleCreateInput, type AgentScheduleRun, type AgentScheduleRunOutcome, type ProviderStatus } from '@line-agent/contracts';
+import { AGENT_SCHEDULE_DEFAULT_TIMEZONE, AGENT_SCHEDULE_MAX_ENABLED, scheduleForwardActions, type AgentSchedule, type AgentScheduleCreateInput, type AgentScheduleRun, type AgentScheduleRunOutcome, type ProviderStatus } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import { useDesktopLocale } from '../desktop-i18n.js';
 import { scheduleTextFor, type ScheduleCopyKey } from '../../desktop-schedule-copy.js';
@@ -9,13 +9,18 @@ import { ScheduleForm, type ScheduleFormResult } from './ScheduleForm.js';
 
 const OUTCOME_KEYS: Record<AgentScheduleRunOutcome, ScheduleCopyKey> = {
   submitting: 'outcomeSubmitting', submitted: 'outcomeSubmitted', missed: 'outcomeMissed', skipped_overlap: 'outcomeSkippedOverlap', failed: 'outcomeFailed',
-  sent: 'outcomeSent', send_failed: 'outcomeSendFailed', send_unknown: 'outcomeSendUnknown', no_messages: 'outcomeNoMessages',
+  sent: 'outcomeSent', send_failed: 'outcomeSendFailed', send_unknown: 'outcomeSendUnknown', no_messages: 'outcomeNoMessages', notified: 'outcomeNotified',
 };
 const TASK_KEYS = { message_forward:'taskForward',custom: 'taskCustom', summary: 'taskSummary', keyword_digest: 'taskKeywordDigest', message: 'taskMessage', new_messages: 'taskNewMessages' } as const satisfies Record<AgentSchedule['task']['type'], ScheduleCopyKey>;
 const EXECUTION_KEYS = { program: 'kindProgram', agent: 'kindAgent' } as const satisfies Record<AgentSchedule['execution'], ScheduleCopyKey>;
 const DAY_KEYS = ['day0', 'day1', 'day2', 'day3', 'day4', 'day5', 'day6'] as const;
 const ERROR_KEYS: Record<string, ScheduleCopyKey> = {
   SCHEDULE_LIMIT: 'errLimit', SCHEDULE_NO_FUTURE_TIME: 'errNoFutureTime', SCHEDULE_NOT_FOUND: 'errNotFound', SCHEDULE_INVALID: 'errInvalid', SCHEDULE_INVALID_TARGET: 'errInvalidTarget',
+};
+/** Safe error codes of a mention Agent job that did not run (schedule_forward_work.agent_error). */
+const AGENT_ERROR_KEYS: Record<string, ScheduleCopyKey> = {
+  send_target_invalid: 'agentErrTargetInvalid', send_target_check_failed: 'agentErrTargetCheck', agent_unavailable: 'agentErrUnavailable', agent_submit_failed: 'agentErrSubmit',
+  agent_queue_full: 'agentErrQueueFull', stale_after_restart: 'agentErrStale', authority_changed: 'agentErrAuthority', forwarding_cancelled: 'agentErrCancelled',
 };
 const RELOAD_DEBOUNCE_MS = 150;
 const RUNS_LIMIT = 5;
@@ -33,6 +38,18 @@ export function describeRecurrence(schedule: AgentSchedule, text: Text): string 
     case 'interval': return text('recurrenceInterval', { arg0: recurrence.everyMinutes });
     case 'cron': return text('recurrenceCron', { arg0: recurrence.expression });
   }
+}
+
+/** The condition of a mention rule (`@ 提及：管理員、<labels>、全體`; empty for the other modes) and the short tags of its actions. */
+export function describeForwardRule(schedule: AgentSchedule, text: Text): { condition: string; tags: string[] } {
+  const task = schedule.task;
+  if (task.type !== 'message_forward') return { condition: '', tags: [] };
+  const actions = scheduleForwardActions(task);
+  const tags = [...(actions.forward ? [text('tagForward')] : []), ...(actions.notify ? [text('tagNotify')] : []), ...(actions.agent ? [text('tagAgent')] : [])];
+  const match = task.match;
+  if (match.mode !== 'mention') return { condition: '', tags };
+  const parts = [...(match.admin ? [text('mentionAdminShort')] : []), ...match.members.map((member) => member.label || member.mid), ...(match.all ? [text('mentionAllShort')] : [])];
+  return { condition: text('summaryMention', { arg0: parts.join(text('listSeparator')) }), tags };
 }
 
 /** The single datetime of the list: the next fire when there is one, else the last fire (`past`), else a dash. */
@@ -150,7 +167,7 @@ export function Schedules({ api, defaultProvider, providers, headingRef, onNotic
   }
 
   const outcomeText = (outcome: AgentScheduleRunOutcome) => text(OUTCOME_KEYS[outcome]);
-  const outcomeDot = (outcome: AgentScheduleRunOutcome) => outcome === 'submitted' || outcome === 'sent' ? 'ready' : outcome === 'failed' || outcome === 'send_failed' ? 'stopped' : '';
+  const outcomeDot = (outcome: AgentScheduleRunOutcome) => outcome === 'submitted' || outcome === 'sent' || outcome === 'notified' ? 'ready' : outcome === 'failed' || outcome === 'send_failed' ? 'stopped' : '';
 
   /** The full reply of a run's job, read through the same job-events IPC the Jobs page uses. */
   async function openReply(run: AgentScheduleRun, element: HTMLElement) {
@@ -182,7 +199,12 @@ export function Schedules({ api, defaultProvider, providers, headingRef, onNotic
       {runsState?.rows && runsState.rows.length > 0 && <ul className="schedule-run-list">{runsState.rows.map((run) => <li key={run.runId}>
         <time dateTime={run.scheduledFor}>{shortWall(run.scheduledFor, schedule.timezone)}</time><span aria-hidden="true">·</span><span>{outcomeText(run.outcome)}</span>
         {run.forwarding && <div className="schedule-hint">{run.forwarding.sourceTitle || run.forwarding.accountId} · {run.forwarding.senderName || run.forwarding.senderId}
-          {run.forwarding.parts.map((part,index)=><div key={index}>{part.filename || part.kind} · {text(part.errorCode==='unsupported_content'?'forwardUnsupported':part.errorCode==='download_failed'?'forwardDownloadFailed':part.state==='sent'?'forwardPartSent':part.state==='unknown'?'forwardPartUnknown':part.state==='waiting'?'forwardPartWaiting':part.state==='pending'||part.state==='sending'?'outcomeSubmitting':'forwardPartFailed')}</div>)}
+          {run.forwarding.notifyState==='shown' && <div>{text('runNotified')}</div>}
+          {run.forwarding.notifyState==='failed' && <div>{text('runNotifyFailed')}</div>}
+          {run.forwarding.agentState==='pending' && <div>{text('runAgentPending')}</div>}
+          {run.forwarding.agentState==='submitted' && <div>{text('runAgentSubmitted')}</div>}
+          {(run.forwarding.agentState==='failed' || run.forwarding.agentState==='skipped') && <div>{text('runAgentFailed', { arg0: text(AGENT_ERROR_KEYS[run.forwarding.agentError ?? ''] ?? 'agentErrUnknown') })}</div>}
+          {run.forwarding.parts.map((part,index)=><div key={index}>{part.filename || part.kind} · {text(part.errorCode==='unsupported_content'?'forwardUnsupported':part.errorCode==='download_failed'?'forwardDownloadFailed':part.errorCode==='EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE'?'forwardExternalUnavailable':part.state==='sent'?'forwardPartSent':part.state==='unknown'?'forwardPartUnknown':part.state==='waiting'?'forwardPartWaiting':part.state==='pending'||part.state==='sending'?'outcomeSubmitting':'forwardPartFailed')}</div>)}
         </div>}
         {schedule.task.type !== 'message' && run.jobId && <><span aria-hidden="true">·</span><button type="button" className="schedule-link" disabled={busyReplies.has(run.jobId)} onClick={(event) => void openReply(run, event.currentTarget)}>{text('runViewReply')}</button></>}
       </li>)}</ul>}
@@ -210,6 +232,7 @@ export function Schedules({ api, defaultProvider, providers, headingRef, onNotic
           const lastOutcome = schedule.enabled ? schedule.lastOutcome : null;
           const statusTitle = !schedule.enabled ? text('disabledBadge') : lastOutcome ? `${outcomeText(lastOutcome)}${schedule.lastFireAt ? ` · ${wallDisplay(schedule.lastFireAt, schedule.timezone)}` : ''}` : text('statusWaiting');
           const titles = new Map(schedule.targets.map((chat) => [chat.chatId, chat.title]));
+          const forwardRule = describeForwardRule(schedule, text);
           const llmWhen = schedule.execution === 'program' && schedule.mayUseLlm ? describeLlmRules(schedule.task, text, { chatTitle: (id) => titles.get(id) }) : '';
           return <tr key={schedule.scheduleId} className={schedule.enabled ? 'schedule-row-main' : 'schedule-row-main disabled'}
             onClick={(event) => { const button = event.currentTarget.querySelector<HTMLElement>('button.schedule-name-button'); if (button) openEditor(schedule, button); }}>
@@ -220,7 +243,9 @@ export function Schedules({ api, defaultProvider, providers, headingRef, onNotic
               <span className="badge">{text(TASK_KEYS[schedule.task.type])}</span>
               <span className="badge">{text(EXECUTION_KEYS[schedule.execution])}</span>
               {schedule.execution === 'program' && schedule.mayUseLlm && <span className="badge">{text('llmBadge')}</span>}
+              {forwardRule.tags.map((tag) => <span key={tag} className="badge">{tag}</span>)}
             </div>
+            {forwardRule.condition && <div className="schedule-sub-line" title={forwardRule.condition}>{forwardRule.condition}</div>}
             {llmWhen && <div className="schedule-sub-line" title={text('llmWhen', { arg0: llmWhen })}>{text('llmWhen', { arg0: llmWhen })}</div>}</td>
             <td className={runAt.past ? 'schedule-time-past' : undefined} title={timeTitle(schedule)}>{schedule.enabled && schedule.task.type==='message_forward'?text('forwardWaiting'):runAt.text}</td>
             <td title={delivery}>{delivery}</td>

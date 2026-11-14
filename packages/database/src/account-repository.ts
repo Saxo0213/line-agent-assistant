@@ -5,6 +5,7 @@ import { normalizeNativePicturePath } from '@line-agent/contracts';
 import { transitionAgentJobStatus, type AgentJobStatusProjection } from './agent-repository.js';
 import { appendAgentLineage, retireAgentLineage } from './agent-lineage.js';
 import { withBoundedTransaction } from './bounded-transaction.js';
+import { lockAccountForAdministratorChange, replacePrimaryAdministratorRow } from './room-activation-repository.js';
 import { normalizeManagedMcpScopes } from './managed-mcp-scopes.js';
 
 export interface AccountState {
@@ -55,6 +56,13 @@ export interface RevokeResult extends ControlState {
   cancelledJobs: AgentJobStatusProjection[];
 }
 
+export type ChangePrimaryAdministratorResult =
+  | { ok: true; agentAccountId: string; oldAdminAccountId: string | null; newAdminAccountId: string; adminVersion: number; displayName: string }
+  | { ok: false; code: 'ADMIN_CHANGE_STALE' | 'ADMIN_VERSION_CHANGED' | 'ADMIN_IDENTITY_INVALID' };
+
+/** Placeholder name of a Primary Admin account row whose LINE name is not known. */
+export const PRIMARY_ADMIN_PLACEHOLDER_NAME = 'Primary Admin';
+
 async function readControl(client: PoolClient): Promise<ControlState> {
   const state = await client.query<{ control_epoch: string }>('SELECT control_epoch FROM account_control WHERE singleton = true FOR UPDATE');
   const active = await client.query<{ account_id: string }>("SELECT account_id FROM line_accounts WHERE mode = 'ACTIVE_CONTROL' FOR UPDATE");
@@ -91,7 +99,7 @@ export class AccountRepository {
   }
 
   /** Caller holds account_control and the existing Primary Admin row before the Agent row. */
-  private async ensurePrimaryAdminHolder(client: PoolClient, mid: string): Promise<void> {
+  private async ensurePrimaryAdminHolder(client: PoolClient, mid: string, displayName: string = PRIMARY_ADMIN_PLACEHOLDER_NAME): Promise<void> {
     if (!/^u[0-9a-f]{32}$/.test(mid)) throw new Error('PRIMARY_ADMIN_IDENTITY_INVALID');
     const holder = (await client.query<{ account_id: string; own_mid: string | null }>(
       "SELECT account_id,own_mid FROM line_accounts WHERE product_role='PRIMARY_ADMIN' FOR UPDATE")).rows[0];
@@ -103,10 +111,87 @@ export class AccountRepository {
     const accountId = `account-${randomUUID()}`;
     await client.query(
       `INSERT INTO line_accounts(account_id,display_name,product_role,own_mid,connection_mode)
-       VALUES($1,'Primary Admin','PRIMARY_ADMIN',$2,'OFFLINE')`, [accountId, mid]);
+       VALUES($1,$3,'PRIMARY_ADMIN',$2,'OFFLINE')`, [accountId, mid, displayName]);
     await client.query(
       `INSERT INTO conversations(account_id,chat_type,chat_id,title,agent_enabled)
        VALUES($1,'direct',$2,$3,true)`, [accountId, LOCAL_AGENT_ROOM_CHAT_ID, LOCAL_AGENT_ROOM_TITLE]);
+  }
+
+  /**
+   * Replaces the Primary Administrator in one transaction. Lock order: managed tokens, account_control, room-activation
+   * locks of the Agent account, PRIMARY_ADMIN row, its sources, Agent row, administrator binding. The old holder row is
+   * archived with the replaceAgentAccount pattern (role removed, offline, sources retired; messages, conversations and
+   * contacts stay). Room policies, grants and activations of the Agent account are cleaned up by the shared
+   * replacePrimaryAdministratorRow. Any stale input returns a code and writes nothing.
+   */
+  async changePrimaryAdministrator(input: { agentAccountId: string; expectedAdminVersion: number; expectedOldUserId: string;
+    newUserId: string; correlationId: string }): Promise<ChangePrimaryAdministratorResult> {
+    const { agentAccountId, newUserId } = input;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Preserve managed role selection before the old holder loses its role.
+      await normalizeManagedMcpScopes(client);
+      await client.query('SELECT singleton FROM account_control WHERE singleton=true FOR UPDATE');
+      await lockAccountForAdministratorChange(client, agentAccountId);
+      const oldAdmin = (await client.query<{ account_id: string; own_mid: string | null }>(
+        "SELECT account_id,own_mid FROM line_accounts WHERE product_role='PRIMARY_ADMIN' FOR UPDATE")).rows[0];
+      if (oldAdmin) await client.query(
+        'SELECT source_id FROM line_account_sources WHERE account_id=$1 ORDER BY source_id FOR UPDATE', [oldAdmin.account_id]);
+      const agent = (await client.query<{ own_mid: string | null }>(
+        "SELECT own_mid FROM line_accounts WHERE account_id=$1 AND product_role='AGENT' FOR UPDATE", [agentAccountId])).rows[0];
+      const binding = (await client.query<{ chat_id: string; user_id: string }>(
+        "SELECT chat_id,user_id FROM account_administrators WHERE account_id=$1 AND role='PRIMARY_ADMIN' FOR UPDATE", [agentAccountId])).rows[0];
+      if (!agent?.own_mid || !binding || binding.user_id !== input.expectedOldUserId || binding.chat_id !== binding.user_id
+        || (oldAdmin?.own_mid && oldAdmin.own_mid !== binding.user_id)) {
+        await client.query('ROLLBACK'); return { ok: false, code: 'ADMIN_CHANGE_STALE' };
+      }
+      if (!/^u[0-9a-f]{32}$/.test(newUserId) || newUserId === agent.own_mid || newUserId === binding.user_id) {
+        await client.query('ROLLBACK'); return { ok: false, code: 'ADMIN_IDENTITY_INVALID' };
+      }
+      const displayName = await this.resolveMidDisplayName(client, agentAccountId, newUserId);
+      if (oldAdmin) {
+        await client.query(
+          `UPDATE line_accounts SET product_role=NULL,mode='MONITOR_ONLY',role_revision=role_revision+1,status='disconnected',
+             worker_instance_id=NULL,worker_binding_epoch=NULL,auto_login_on_startup=false,connection_mode='OFFLINE',
+             selected_source_id=NULL,selected_source_generation=NULL,updated_at=now() WHERE account_id=$1`, [oldAdmin.account_id]);
+        await client.query(
+          `UPDATE line_account_sources SET state='RETIRED',retired_at=now() WHERE account_id=$1 AND state<>'RETIRED'`, [oldAdmin.account_id]);
+      }
+      const version = await replacePrimaryAdministratorRow(client, agentAccountId, newUserId, newUserId, input.expectedAdminVersion);
+      if (version === null) { await client.query('ROLLBACK'); return { ok: false, code: 'ADMIN_VERSION_CHANGED' }; }
+      // The old holder has no role now, so the single PRIMARY_ADMIN slot is free for the new holder.
+      await this.ensurePrimaryAdminHolder(client, newUserId, displayName);
+      const created = (await client.query<{ account_id: string }>("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN'")).rows[0]!;
+      if (oldAdmin) {
+        // Schedule and job scopes that named the old holder follow the role to the new holder.
+        await client.query(`UPDATE agent_schedules SET external_account_scope = ARRAY(
+            SELECT DISTINCT scoped_id FROM unnest(array_replace(external_account_scope, $1::text, $2::text)) AS scoped_id ORDER BY scoped_id)
+          WHERE external_account_scope @> ARRAY[$1::text]`, [oldAdmin.account_id, created.account_id]);
+        await client.query(`UPDATE agent_jobs SET mcp_account_scope = ARRAY(
+            SELECT DISTINCT scoped_id FROM unnest(array_replace(mcp_account_scope, $1::text, $2::text)) AS scoped_id ORDER BY scoped_id)
+          WHERE mcp_account_scope @> ARRAY[$1::text]`, [oldAdmin.account_id, created.account_id]);
+      }
+      await client.query(
+        `INSERT INTO audit_logs(action, actor, details, created_at) VALUES ('primary_admin_changed','user',$1::jsonb,now())`,
+        [JSON.stringify({ correlation_id: input.correlationId, phase: 'succeeded', account_id: created.account_id,
+          ...(oldAdmin ? { old_account_id: oldAdmin.account_id } : {}), new_account_id: created.account_id,
+          reason_code: 'operator_action' })]);
+      await client.query('COMMIT');
+      return { ok: true, agentAccountId, oldAdminAccountId: oldAdmin?.account_id ?? null, newAdminAccountId: created.account_id,
+        adminVersion: version, displayName };
+    } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; }
+    finally { client.release(); }
+  }
+
+  /** LINE name of a MID as the Agent account knows it: contact nickname, contact name, then a member name; else the placeholder. */
+  private async resolveMidDisplayName(client: PoolClient, agentAccountId: string, mid: string): Promise<string> {
+    const named = (await client.query<{ name: string | null }>(
+      `SELECT COALESCE(
+         (SELECT COALESCE(c.nickname,c.display_name) FROM line_contacts c WHERE c.account_id=$1 AND c.mid=$2),
+         (SELECT m.display_name FROM conversation_members m WHERE m.account_id=$1 AND m.member_id=$2 AND m.display_name IS NOT NULL
+            ORDER BY m.updated_at DESC LIMIT 1)) AS name`, [agentAccountId, mid])).rows[0]?.name?.trim();
+    return named && named.length <= 256 ? named : PRIMARY_ADMIN_PLACEHOLDER_NAME;
   }
 
   async replaceAgentAccount(accountId: string, expectedControlEpoch: number): Promise<
@@ -267,7 +352,7 @@ export class AccountRepository {
    */
   async bindPrimaryAdminFromExternalMonitor(input: { mid: string; correlationId: string; displayName?: string | null; picturePath?: string | null }): Promise<
     { ok: true; accountId: string; created: boolean; bindingWritten: boolean } |
-    { ok: false; code: 'AGENT_ACCOUNT_REQUIRED' | 'PRIMARY_ADMIN_ALREADY_BOUND' | 'ADMIN_SLOT_CONFLICT' }> {
+    { ok: false; code: 'AGENT_ACCOUNT_REQUIRED' | 'PRIMARY_ADMIN_ALREADY_BOUND' | 'ADMIN_SLOT_CONFLICT' | 'ADMIN_IDENTITY_MISMATCH' }> {
     if (!/^u[0-9a-f]{32}$/.test(input.mid)) throw new Error('Invalid official LINE account identity');
     const suppliedName = input.displayName?.trim() ?? '';
     const displayName = suppliedName.length > 0 && suppliedName.length <= 256 && !/[\u0000-\u001f\u007f-\u009f]/.test(suppliedName)
@@ -288,18 +373,26 @@ export class AccountRepository {
       // slot records the official identity; the Agent login binds it later (bindPendingSlotAdmin).
       let bindingWritten = false;
       if (agent?.own_mid) {
-        const existing = await client.query(
-          `SELECT 1 FROM account_administrators WHERE account_id=$1 AND role='PRIMARY_ADMIN' FOR UPDATE`, [agent.account_id]);
-        if (existing.rowCount) { await client.query('ROLLBACK'); return { ok: false, code: 'PRIMARY_ADMIN_ALREADY_BOUND' }; }
-        if (agent.own_mid === input.mid || (admin?.own_mid && admin.own_mid !== input.mid)) {
-          await client.query('ROLLBACK'); return { ok: false, code: 'ADMIN_SLOT_CONFLICT' };
+        const existing = await client.query<{ user_id: string }>(
+          `SELECT user_id FROM account_administrators WHERE account_id=$1 AND role='PRIMARY_ADMIN' FOR UPDATE`, [agent.account_id]);
+        if (existing.rowCount) {
+          // A pairing-made administrator: its own row may start monitoring, only for the same official identity,
+          // and only while that row is not monitoring yet.
+          if (existing.rows[0]!.user_id !== input.mid) { await client.query('ROLLBACK'); return { ok: false, code: 'ADMIN_IDENTITY_MISMATCH' }; }
+          if (!admin || admin.own_mid !== input.mid || admin.connection_mode === 'EXTERNAL_MONITOR' || admin.selected_source_id !== null) {
+            await client.query('ROLLBACK'); return { ok: false, code: 'PRIMARY_ADMIN_ALREADY_BOUND' };
+          }
+        } else {
+          if (agent.own_mid === input.mid || (admin?.own_mid && admin.own_mid !== input.mid)) {
+            await client.query('ROLLBACK'); return { ok: false, code: 'ADMIN_SLOT_CONFLICT' };
+          }
+          const bound = await client.query(
+            `INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
+             VALUES($1,'direct',$2,$2,'PRIMARY_ADMIN') ON CONFLICT (account_id,role) DO NOTHING RETURNING account_id`,
+            [agent.account_id, input.mid]);
+          if (bound.rowCount !== 1) { await client.query('ROLLBACK'); return { ok: false, code: 'PRIMARY_ADMIN_ALREADY_BOUND' }; }
+          bindingWritten = true;
         }
-        const bound = await client.query(
-          `INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
-           VALUES($1,'direct',$2,$2,'PRIMARY_ADMIN') ON CONFLICT (account_id,role) DO NOTHING RETURNING account_id`,
-          [agent.account_id, input.mid]);
-        if (bound.rowCount !== 1) { await client.query('ROLLBACK'); return { ok: false, code: 'PRIMARY_ADMIN_ALREADY_BOUND' }; }
-        bindingWritten = true;
       } else if (admin?.own_mid) {
         // A slot with an official identity already exists: the admin is set.
         await client.query('ROLLBACK'); return { ok: false, code: 'PRIMARY_ADMIN_ALREADY_BOUND' };

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createDesktopLifecycle, parseDesktopCommand, routeSecondInstance, shutdownServices } from './desktop-lifecycle.js';
+import { createDesktopLifecycle, parseDesktopCommand, routeSecondInstance, runSessionEndSteps, shutdownServices } from './desktop-lifecycle.js';
 import { createOperationalAudit } from './services/operational-audit.js';
 import type { DesktopLifecycleFailure } from './desktop-lifecycle.js';
 
@@ -16,6 +16,18 @@ function auditedReporter(events: unknown[]) {
   };
   return report;
 }
+
+describe('session end steps', () => {
+  it('runs every step in order when one step throws and does not throw', () => {
+    const order: string[] = [];
+    expect(() => runSessionEndSteps([
+      () => { order.push('a'); },
+      () => { order.push('b'); throw new Error('boom'); },
+      () => { order.push('c'); },
+    ])).not.toThrow();
+    expect(order).toEqual(['a', 'b', 'c']);
+  });
+});
 
 describe('desktop command parsing', () => {
   it('accepts exactly one quit or restart switch alongside the executable arguments', () => {

@@ -141,6 +141,8 @@ export function App({ api = window.lineAgent }: { api?: DesktopApi }) {
   const [setupStatus, setSetupStatus] = useState<DatabaseSetupStatus | null>(null);
   const heading = useRef<HTMLHeadingElement | null>(null);
   const openConversationRef = useRef<ConversationKey | null>(null);
+  const conversationsRef = useRef<AppSnapshot['conversations']>([]);
+  conversationsRef.current = snapshot.conversations;
   const completedImportAccounts = useRef(new Set<string>());
   const railAccounts = visibleRoleAccounts(snapshot.accounts);
   const active = railAccounts.find((account) => account.mode === 'ACTIVE_CONTROL');
@@ -205,6 +207,13 @@ export function App({ api = window.lineAgent }: { api?: DesktopApi }) {
   useEffect(() => {
     const remove = api.onEvent((event) => {
       if (event.type === 'snapshotChanged') setSnapshot(event.snapshot);
+      // A clicked desktop notification: open that chat like a search result; a chat that is not in the list is ignored.
+      if (event.type === 'openConversation') {
+        const key = keyOf(event);
+        if (conversationsRef.current.some((item) => !item.localOnly && keyOf(item) === key)) {
+          setAllAccountsSearchScope(false); setConversationAccountOverrideId(event.accountId); setSelected(key); setPage('conversations');
+        }
+      }
       if (event.type === 'lineAvatarRefreshed') accountAvatarRefreshed(event.accountId, event.ownMid);
       if (event.type === 'controlChanged') setSnapshot((current) => ({ ...current, control: event.control }));
       if (event.type === 'messageStored') {

@@ -178,8 +178,14 @@ database('monitor Agent real ingress',()=>{
       const r=await receipt('',{kind:'image',occurredAt:new Date(Date.now()+1000).toISOString(),attachments:[
         {id:'original-image',kind:'image',name:'原圖.png',mimeType:'image/png',sizeBytes:8,expiresAt:null},
         {id:'original-file',kind:'file',name:'原檔.pdf',mimeType:'application/pdf',sizeBytes:8,expiresAt:null}]});
+      // An External Monitor attachment never downloads, so the text carries a notice and the media parts fail.
       await forward.drain();expect(sent).toEqual([]);
-      expect(texts).toEqual([`${adminMid}:`]);
+      expect(texts).toEqual([`${adminMid}: [圖片] [檔案]`]);
+      expect((await schedules.listRuns(schedule.scheduleId))[0]).toMatchObject({outcome:'send_failed',forwarding:{parts:[{state:'sent'},{state:'failed',errorCode:'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE'},{state:'failed',errorCode:'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE'}]}});
+      // Rebuild the legacy waiting state so that the rest of this test still covers sending of downloaded media bytes.
+      await pool.query("UPDATE agent_schedule_forward_parts SET state='waiting',error_code=NULL WHERE kind<>'text' AND work_id=(SELECT work_id FROM agent_schedule_forward_work WHERE message_id=$1)",[r.messageId]);
+      await pool.query('DELETE FROM message_source_provenance WHERE message_id=$1',[r.messageId]);
+      await pool.query("UPDATE agent_schedule_runs SET outcome='submitting' WHERE run_id=(SELECT run_id FROM agent_schedule_forward_work WHERE message_id=$1)",[r.messageId]);
       const attachments=await pool.query<{attachment_id:string;external_attachment_id:string}>('SELECT attachment_id,external_attachment_id FROM attachments WHERE account_id=$1 AND message_id=$2',['admin',r.messageId]);
       for(const attachment of attachments.rows) {
         const bytes=attachment.external_attachment_id==='original-image'?'IMAGE123':'FILE1234';
@@ -208,7 +214,7 @@ database('monitor Agent real ingress',()=>{
       const imageHash=createHash('sha256').update('IMAGE123').digest('hex');
       await pool.query("UPDATE attachments SET status='ready',relative_path=$2,sha256=$3,size_bytes=8 WHERE account_id='admin' AND message_id=$1",[blocked.messageId,`att-${imageHash}.blob`,imageHash]);
       await forward.drain();expect(sent).toHaveLength(2);
-      expect((await pool.query('SELECT p.state FROM agent_schedule_forward_parts p JOIN agent_schedule_forward_work w USING(work_id) WHERE w.message_id=$1 ORDER BY p.part_index',[blocked.messageId])).rows).toEqual([{state:'cancelled'},{state:'cancelled'}]);
+      expect((await pool.query('SELECT p.state FROM agent_schedule_forward_parts p JOIN agent_schedule_forward_work w USING(work_id) WHERE w.message_id=$1 ORDER BY p.part_index',[blocked.messageId])).rows).toEqual([{state:'cancelled'},{state:'failed'}]);
     } finally {await forward.stop();await sender.shutdown();await schedules.delete(schedule.scheduleId);await rm(root,{recursive:true,force:true});}
   });
   it('requires current group membership before admission and preserves mentions',async()=>{

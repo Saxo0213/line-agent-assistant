@@ -228,6 +228,38 @@ function senderSegment(sender: { readonly id: string; readonly displayName: stri
   return `${safe}-${suffix}`;
 }
 
+const ENCODED_ID_SEGMENT = /^id-(?:[0-9a-f]{2})+$/;
+const LOCAL_MESSAGE_SEGMENT = /^\d{4,}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_id-(?:[0-9a-f]{2})+$/;
+const SENDER_SUFFIX = /-[0-9a-f]{12}$/;
+const ATTACHMENT_DIGEST_SEGMENT = /^[0-9a-f]{64}$/;
+
+/** True when the segment has the shape that senderSegment() makes. */
+function isSenderSegment(segment: string): boolean {
+  if (!isWellFormedUnicode(segment) || !SENDER_SUFFIX.test(segment)) return false;
+  const display = segment.slice(0, -13);
+  return display.length > 0 && Array.from(display).length <= 48
+    && !/[<>:"/\\|?*\u0000-\u001f]/.test(display);
+}
+
+/**
+ * True when the managed relative path has a layout that buildAttachmentLocation() makes in the primary store.
+ * Direct chats: accounts/<id>/direct/<id>/<YYYY>/<MM>/<id-message>/<sha256>/<file> (9 segments).
+ * Group and room chats: accounts/<id>/<group|room>/<id>/<sender>/<local time and id-message>/<sha256>/<file> (8 segments).
+ * The 9-segment dated layout is also accepted for group and room chats because older versions stored them that way.
+ */
+export function isPrimaryAttachmentRelativePath(relativePath: string): boolean {
+  const segments = relativePath.split("/");
+  const fileName = segments.at(-1);
+  if (fileName === undefined || (segments.length !== 8 && segments.length !== 9)) return false;
+  if (segments[0] !== "accounts" || !ENCODED_ID_SEGMENT.test(segments[1]!)
+    || !["direct", "group", "room"].includes(segments[2]!) || !ENCODED_ID_SEGMENT.test(segments[3]!)) return false;
+  if (segments.length === 9) {
+    if (!/^\d{4}$/.test(segments[4]!) || !/^(?:0[1-9]|1[0-2])$/.test(segments[5]!) || !ENCODED_ID_SEGMENT.test(segments[6]!)) return false;
+  } else if (segments[2] === "direct" || !isSenderSegment(segments[4]!) || !LOCAL_MESSAGE_SEGMENT.test(segments[5]!)) return false;
+  if (!ATTACHMENT_DIGEST_SEGMENT.test(segments[segments.length - 2]!)) return false;
+  try { return sanitizeAttachmentFilename(fileName) === fileName; } catch { return false; }
+}
+
 function assertContained(root: string, candidate: string): void {
   const rel = relative(root, candidate);
   if (rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel))) return;

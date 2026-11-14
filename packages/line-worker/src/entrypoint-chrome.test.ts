@@ -54,8 +54,6 @@ it('builds the DESKTOPWIN adapter exactly as before when lineTransport is absent
   expect(createLinejs.mock.calls[0]![0]).toEqual({ ...binding, mode: 'MONITOR_ONLY', validateLease: expect.any(Function),
     physicalTransport: expect.any(Function) });
   expect(Object.keys(createLinejs.mock.calls[0]![0]).sort()).toEqual(['accountId', 'controlEpoch', 'mode', 'physicalTransport', 'validateLease', 'workerInstanceId']);
-  await factory(init({ purpose: 'DOWNLOAD_ONLY', application: 'DESKTOPWIN\t9.9.9\tWINDOWS\t10.0' }));
-  expect(createLinejs.mock.calls[2]![0]).toMatchObject({ application: 'DESKTOPWIN\t9.9.9\tWINDOWS\t10.0' });
 });
 
 it('builds the Chrome adapter for lineTransport CHROMEOS with the store root and Node fetch', async () => {
@@ -65,7 +63,7 @@ it('builds the Chrome adapter for lineTransport CHROMEOS with the store root and
   const chromeFetch = vi.fn(async () => new Response('{}'));
   const factory = createTransportFactory({ createLinejs, createChrome, chromeFetch });
   await factory(init({ lineTransport: 'CHROMEOS', chromeLtsmDir: '/abs/line-chrome/ltsm' }));
-  await factory(init({ lineTransport: 'CHROMEOS', application: 'CHROMEOS\t3.7.2\tChrome_OS\t' }));
+  await factory(init({ lineTransport: 'CHROMEOS' }));
   expect(createLinejs).not.toHaveBeenCalled();
   expect(createChrome.mock.calls[0]![0]).toMatchObject({ ...binding, mode: 'MONITOR_ONLY', ltsmRoot: '/abs/line-chrome/ltsm', fetch: expect.any(Function) });
   expect(createChrome.mock.calls[1]![0]).not.toHaveProperty('ltsmRoot');

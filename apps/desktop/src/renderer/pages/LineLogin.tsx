@@ -1,7 +1,8 @@
-import { desktopTextFor, generatedMessageText, useDesktopLocale, useDesktopText, useExtraText, useSafeErrorText } from '../desktop-i18n.js';
+import { PRIMARY_ADMIN_LINE_LOGIN_ENABLED } from '../../primary-admin-line-login.js';
+import { desktopTextFor, generatedMessageText, useDesktopLocale, useDesktopText, useDownloadBridgeErrorText, useExtraText, useSafeErrorText } from '../desktop-i18n.js';
 import React, { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
-import type { ChromeLtsmInstallResult, ChromeLtsmUnavailableStatus, IpcResult, LineAccountSummary } from '@line-agent/contracts';
+import type { ChromeLtsmInstallResult, ChromeLtsmUnavailableStatus, DownloadBridgeState, IpcResult, LineAccountSummary } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import { InlineBusy } from '../components/InlineBusy.js';
 import { ProgressOverlay } from '../components/ProgressOverlay.js';
@@ -82,6 +83,17 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     /** Show the login method choice in the confirmation. */ methodChoice?: boolean;
     /** After 確定: follow the Primary Admin account's first-import progress from the snapshot. */ following?: boolean; followWarning?: string | null } | null>(null);
   const confirmationResolve = useRef<((confirmed: boolean) => void) | null>(null);
+  // Administrator change codes live in memory only. They are never logged or stored.
+  const [adminChange, setAdminChange] = useState<{ accountId: string; stage: 'confirm_current' | 'await_new'; token: string; expiresAt: string } | null>(null);
+  const [beginningAdminChange, setBeginningAdminChange] = useState(false);
+  // Download bridge status from events. The QR image and the PIN stay in memory only. They are never logged or stored.
+  const [bridgeLive, setBridgeLive] = useState<{ accountId: string; state: DownloadBridgeState; code?: string; detail?: string; qrImageDataUrl?: string; pin?: string; qrExpiresAt?: number; identity?: 'pending' | 'verified' } | null>(null);
+  const [bridgeBusy, setBridgeBusy] = useState(false);
+  // Key of the QR image or PIN whose dialog the user closed. A new QR image or PIN opens the dialog again.
+  const [bridgeDialogHiddenKey, setBridgeDialogHiddenKey] = useState<string | null>(null);
+  const [bridgeNow, setBridgeNow] = useState(() => Date.now());
+  const bridgeErrorText = useDownloadBridgeErrorText();
+  const [adminChangeNow, setAdminChangeNow] = useState(() => Date.now());
   const [loginMethod, setLoginMethod] = useState<LoginMethod>('DESKTOPWIN');
   // The ref gives async handlers the newest choice. Some handlers run from older renders.
   const loginMethodRef = useRef<LoginMethod>('DESKTOPWIN');
@@ -97,6 +109,36 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   const [windowPrompt, setWindowPrompt] = useState<string | null>(null);
   const previousImport = useRef<Map<string, string>>(new Map(accounts.map((account) => [account.accountId, importKey(account)])));
   const [pairing, setPairing] = useState<{ accountId: string; token: string; expiresAt: string } | null>(null);
+  useEffect(() => {
+    if (typeof api.onEvent !== 'function') return;
+    return api.onEvent((event) => {
+      if (event.type === 'adminDownloadBridgeStatus') {
+        setBridgeLive({ accountId: event.accountId, state: event.state, ...(event.code ? { code: event.code } : {}),
+          ...(event.detail ? { detail: event.detail } : {}), ...(event.qrImageDataUrl ? { qrImageDataUrl: event.qrImageDataUrl } : {}), ...(event.pin ? { pin: event.pin } : {}),
+          ...(event.qrExpiresAt !== undefined ? { qrExpiresAt: event.qrExpiresAt } : {}), ...(event.identity ? { identity: event.identity } : {}) });
+        return;
+      }
+      if (event.type !== 'adminChangeProgress') return;
+      if (event.stage === 'confirm_current' || event.stage === 'await_new') {
+        if (event.token && event.expiresAt) setAdminChange({ accountId: event.accountId, stage: event.stage, token: event.token, expiresAt: event.expiresAt });
+        return;
+      }
+      setAdminChange(null);
+      if (event.stage === 'completed') notify(desktopText('administratorChangedToArg0', { arg0: event.newAdminName ?? '' }));
+      else if (event.stage === 'expired') notify(desktopText('adminChangeCodeExpired'));
+      else setProgress({ get title() { return desktopText('changeAdministrator'); }, step: '', error: safeErrorText({ code: event.code }, desktopText('adminChangeFailed')), errorCode: event.code ?? null });
+    });
+  }, [api, desktopText, safeErrorText]);
+  useEffect(() => {
+    if (!adminChange) return;
+    setAdminChangeNow(Date.now());
+    const interval = window.setInterval(() => {
+      const now = Date.now();
+      setAdminChangeNow(now);
+      if (now >= Date.parse(adminChange.expiresAt)) { setAdminChange(null); notify(desktopText('adminChangeCodeExpired')); }
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [adminChange?.token, adminChange?.expiresAt]);
   useEffect(() => {
     if (!status) return;
     const timeout = window.setTimeout(() => setStatus(''), 4000);
@@ -353,6 +395,48 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       notify(desktopText('primaryAdministratorVerificationMonitoringStartedEnterTheCodeIn'));
     } catch (cause) { notify(safeErrorText(cause, desktopText('unableToCreateAdministratorVerificationCode'))); }
   }
+  async function requestAdminChange(agentAccount: LineAccountSummary, adminName: string) {
+    if (adminChange || beginningAdminChange) return;
+    setProgress({ get title() { return desktopText('changeAdministrator'); }, step: '', confirmationAction: desktopText('startAdminChange'),
+      confirmation: desktopText('changeAdministratorPromptArg0', { arg0: adminName }) });
+    const confirmed = await new Promise<boolean>((resolve) => { confirmationResolve.current = resolve; });
+    confirmationResolve.current = null;
+    setProgress(null);
+    if (!confirmed) return;
+    setBeginningAdminChange(true);
+    try {
+      const result = await api.lineBeginAdminChange(agentAccount.accountId);
+      setAdminChange({ accountId: agentAccount.accountId, stage: result.stage, token: result.token, expiresAt: result.expiresAt });
+    } catch (cause) {
+      setProgress({ get title() { return desktopText('changeAdministrator'); }, step: '', error: safeErrorText(cause, desktopText('adminChangeFailed')),
+        errorCode: typeof (cause as { code?: unknown })?.code === 'string' ? (cause as { code: string }).code : null });
+    } finally { setBeginningAdminChange(false); }
+  }
+  async function cancelAdminChange() {
+    const current = adminChange;
+    setAdminChange(null);
+    if (!current) return;
+    try { await api.lineCancelAdminChange(current.accountId); }
+    catch (cause) { notify(safeErrorText(cause)); }
+  }
+  async function runBridgeRequest(call: () => Promise<IpcResult>) {
+    setBridgeBusy(true);
+    try {
+      const result = await call();
+      if (!result.ok) notify(safeErrorText(result));
+    } catch (cause) { notify(safeErrorText(cause)); }
+    finally { setBridgeBusy(false); }
+  }
+  async function startDownloadBridge(account: LineAccountSummary) {
+    if (bridgeBusy || progress !== null) return;
+    setProgress({ get title() { return desktopText('downloadBridgeTitle'); }, step: '', confirmationAction: desktopText('downloadBridgeStartAction'),
+      confirmation: desktopText('downloadBridgeConfirm') });
+    const confirmed = await new Promise<boolean>((resolve) => { confirmationResolve.current = resolve; });
+    confirmationResolve.current = null;
+    setProgress(null);
+    if (!confirmed) return;
+    await runBridgeRequest(() => api.adminDownloadBridgeStart(account.accountId));
+  }
   async function bindAdminFromOfficialLine() {
     if (bindingAdmin) return;
     setBindingAdmin(true);
@@ -459,6 +543,8 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     const busy = pending !== null && pending.target === account.accountId;
     const stage = account.externalImportProgress?.stage;
     const monitoring = stage === 'monitoring' || stage === 'syncing';
+    // The administrator account has no LINE login controls while PRIMARY_ADMIN_LINE_LOGIN_ENABLED is false.
+    const isAdmin = !PRIMARY_ADMIN_LINE_LOGIN_ENABLED && account.productRole === 'PRIMARY_ADMIN';
     const adminMonitoring = monitoring && account.productRole === 'PRIMARY_ADMIN';
     const loggedOut = account.status === 'disconnected' || account.status === 'reauth_required';
     const stopping = stoppingExternalImport === account.accountId;
@@ -467,6 +553,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       {account.lineTransport === 'CHROMEOS' && <p className="login-method-badge">{extraText('loginMethodChrome')}</p>}
       <p>{desktopText('connectionStatus')}{monitoring && account.productRole === 'PRIMARY_ADMIN' ? desktopText('externalMonitoringActive') : account.status === 'connected' ? desktopText('connected') : account.status === 'reauth_required' ? desktopText('lineLoginRequiredAgain') : account.status === 'disconnected' ? desktopText('loggedOut') : desktopText('connectionError')}</p>
       {(!embedded || account.productRole === 'AGENT') && <p>{desktopText('lastSynced')}{account.lastSyncedAt ? new Date(account.lastSyncedAt).toLocaleString(locale) : desktopText('notSyncedYet')}</p>}
+      {account.adminLineage === 'former' && <p className="former-admin-label">{desktopText('formerAdministratorAccount')}</p>}
       {account.hasPrimaryAdmin === true && <p>{desktopText('primaryAdministratorLinked')}</p>}
       {account.productRole === 'AGENT' && account.hasPrimaryAdmin !== true && account.hasVerifiedLineIdentity !== true && admin
         && <p>{desktopText('primaryAdministratorConfiguredANewAgentAccountWillBe')}</p>}
@@ -494,33 +581,93 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
         })()}
       </section>}
       {pairing?.accountId === account.accountId && <div className="line-auth-code"><h3>{desktopText('primaryAdministratorVerificationCode')}</h3><output aria-label={desktopText('primaryAdministrator6DigitVerificationCode')}>{pairing.token}</output><p>{desktopText('enterThisCodeBefore')}{new Date(pairing.expiresAt).toLocaleTimeString(locale)} {desktopText('inADirectChatGroupMessagesAreNotAccepted')}</p></div>}
-      <label className="auto-login-option"><input type="checkbox" checked={account.autoLoginOnStartup === true} disabled={monitoring}
+      {!isAdmin && <label className="auto-login-option"><input type="checkbox" checked={account.autoLoginOnStartup === true} disabled={monitoring}
         title={monitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={monitoring ? `auto-login-disabled-${account.accountId}` : undefined}
-        onChange={(event) => void setAutoLogin(account, event.target.checked)} /> {desktopText('logInAutomaticallyAtStartup')}</label>
-      {monitoring && <span id={`auto-login-disabled-${account.accountId}`} className="sr-only">{desktopText('unavailableDuringExternalMonitoring')}</span>}
+        onChange={(event) => void setAutoLogin(account, event.target.checked)} /> {desktopText('logInAutomaticallyAtStartup')}</label>}
+      {!isAdmin && monitoring && <span id={`auto-login-disabled-${account.accountId}`} className="sr-only">{desktopText('unavailableDuringExternalMonitoring')}</span>}
       <div className="button-row account-actions">
         {account.status === 'connected' && !monitoring && <button disabled={refreshingAvatar !== null || busy}
           onClick={() => void refreshAvatar(account)}>{refreshingAvatar === account.accountId ? desktopText('refreshingAvatar') : desktopText('refreshAvatar')}</button>}
         {account.productRole === 'AGENT' && account.hasPrimaryAdmin !== true && <button className="primary" onClick={() => void beginAdminPairing(account)}>{desktopText('addAdministrator')}</button>}
-        <button disabled={account.status === 'disconnected' || busy} onClick={() => void restart(account.accountId)}>{desktopText('restart')}</button>
-        {loggedOut && <button aria-label={`${desktopText('logIn')} ${account.displayName}`} disabled={busy || adminMonitoring} title={adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={adminMonitoring ? `auto-login-disabled-${account.accountId}` : undefined} onClick={() => void relogin(account.accountId)}>{desktopText('logIn')}</button>}
+        {!isAdmin && <button disabled={account.status === 'disconnected' || busy} onClick={() => void restart(account.accountId)}>{desktopText('restart')}</button>}
+        {!isAdmin && loggedOut && <button aria-label={`${desktopText('logIn')} ${account.displayName}`} disabled={busy || adminMonitoring} title={adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={adminMonitoring ? `auto-login-disabled-${account.accountId}` : undefined} onClick={() => void relogin(account.accountId)}>{desktopText('logIn')}</button>}
         {account.productRole === 'AGENT' && account.hasVerifiedLineIdentity === true && account.status === 'disconnected' && <button disabled={busy || loginActive}
           onClick={() => void requestAgentReplacement(account.accountId, account.displayName)}>{desktopText('replaceAgentAccount')}</button>}
-        <button aria-label={desktopText('logOutArg0', { arg0: account.displayName })} disabled={account.status === 'disconnected' || busy || loggingOut === account.accountId} onClick={() => void logout(account)}>{loggingOut === account.accountId ? desktopText('loggingOut') : desktopText('logOut')}</button>
-        <select className="login-method-select" aria-label={extraText('loginMethodLabel')} value={accountMethod(account)}
+        {!isAdmin && <button aria-label={desktopText('logOutArg0', { arg0: account.displayName })} disabled={account.status === 'disconnected' || busy || loggingOut === account.accountId} onClick={() => void logout(account)}>{loggingOut === account.accountId ? desktopText('loggingOut') : desktopText('logOut')}</button>}
+        {!isAdmin && <select className="login-method-select" aria-label={extraText('loginMethodLabel')} value={accountMethod(account)}
           disabled={!loggedOut || busy || loginActive || adminMonitoring}
           title={!loggedOut ? extraText('loginMethodLogoutFirst') : adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined}
           onChange={(event) => void chooseAccountMethod(account.accountId, event.target.value as LoginMethod)}>
           <option value="DESKTOPWIN">{extraText('loginMethodWindows')}</option>
           <option value="CHROMEOS">{extraText('loginMethodChrome')}</option>
-        </select>
+        </select>}
         {busy && <InlineBusy>{desktopText('startingLineLogin')}</InlineBusy>}
         {loggingOut === account.accountId && <InlineBusy>{desktopText('loggingOut')}</InlineBusy>}
-        {!embedded && account.productRole === 'PRIMARY_ADMIN' && account.hasVerifiedLineIdentity === true && externalMonitorAction(account)}
+        {!embedded && account.productRole === 'PRIMARY_ADMIN' && (account.hasVerifiedLineIdentity === true || account.connectionMode === 'OFFLINE') && externalMonitorAction(account)}
       </div>
     </article>;
   };
   const addPending = pending !== null && pending.action === 'add';
+  const adminConnectionStatus = !admin ? null : admin.connectionMode === 'EXTERNAL_MONITOR' ? desktopText('adminStatusMonitoring')
+    : admin.connectionMode === 'OFFLINE' ? desktopText('adminStatusVerifiedNotMonitoring') : null;
+  const adminChangeActive = adminChange !== null || beginningAdminChange;
+  const adminCountdown = adminChange ? Math.max(0, Math.ceil((Date.parse(adminChange.expiresAt) - adminChangeNow) / 1000)) : 0;
+  const adminChangeControls = admin && agent && agent.productRole === 'AGENT' && agent.mode === 'ACTIVE_CONTROL' ? <div className="admin-change">
+    {adminChange && <div className="line-auth-code admin-change-panel">
+      <h3>{adminChange.stage === 'confirm_current' ? desktopText('adminChangeCurrentCodeTitle') : desktopText('adminChangeNewCodeTitle')}</h3>
+      <output aria-label={desktopText('adminChangeVerificationCode')}>{adminChange.token}</output>
+      <p role="timer" className="admin-change-countdown">{desktopText('adminChangeCodeExpiresInArg0', { arg0: `${Math.floor(adminCountdown / 60)}:${String(adminCountdown % 60).padStart(2, '0')}` })}</p>
+      <p>{adminChange.stage === 'confirm_current' ? desktopText('adminChangeCurrentInstructionArg0', { arg0: admin.displayName }) : desktopText('adminChangeNewInstruction')}</p>
+      <div className="button-row"><button onClick={() => void cancelAdminChange()}>{desktopText('cancelAdminChange')}</button></div>
+    </div>}
+    <div className="button-row"><button disabled={adminChangeActive || progress !== null} onClick={() => void requestAdminChange(agent, admin.displayName)}>{desktopText('changeAdministrator')}</button></div>
+  </div> : null;
+  // The section shows only when the snapshot has the download bridge of the Primary Admin. A live event is newer than the snapshot.
+  const bridge: { state: DownloadBridgeState; code?: string | undefined; detail?: string | undefined; qrImageDataUrl?: string | undefined; pin?: string | undefined; qrExpiresAt?: number | undefined; identity?: 'pending' | 'verified' | undefined } | null = admin?.downloadBridge
+    ? (bridgeLive && bridgeLive.accountId === admin.accountId ? bridgeLive : admin.downloadBridge) : null;
+  const bridgeStateText = !bridge ? '' : bridge.state === 'not_configured' ? desktopText('downloadBridgeNotConfigured')
+    : bridge.state === 'starting' ? desktopText('downloadBridgeStarting') : bridge.state === 'waiting_qr' ? desktopText('downloadBridgeWaitingQr')
+    : bridge.state === 'waiting_pin' ? desktopText('downloadBridgeWaitingPin') : bridge.state === 'logged_in' ? desktopText('downloadBridgeLoggedIn')
+    : bridgeErrorText(bridge.code);
+  const verification = admin?.downloadBridge?.verification;
+  const oldMessageState = (kind: { match: number; mismatch: number; threshold: number; open: boolean }) => kind.mismatch > 0 ? desktopText('downloadBridgeOldMismatch')
+    : kind.open ? desktopText('downloadBridgeOldOpen') : desktopText('downloadBridgeOldNeedArg0', { arg0: Math.max(0, kind.threshold - kind.match) });
+  const bridgeCanRefresh = bridge?.state === 'error' && (bridge.code === 'QR_EXPIRED' || bridge.code === 'QR_FLOW_ERROR' || bridge.code === 'PIN_CODE_TIMEOUT');
+  const bridgeWaiting = bridge?.state === 'waiting_qr' || bridge?.state === 'waiting_pin';
+  const bridgeQrExpiresAt = bridge?.state === 'waiting_qr' ? bridge.qrExpiresAt : undefined;
+  const bridgeDialogKey = bridge?.qrImageDataUrl ?? bridge?.pin ?? null;
+  const bridgeDialogHidden = bridgeDialogHiddenKey !== null && bridgeDialogHiddenKey === bridgeDialogKey;
+  const bridgeDialogOpen = admin !== undefined && bridgeWaiting && bridgeDialogKey !== null && !bridgeDialogHidden && progress === null;
+  useEffect(() => {
+    if (bridgeQrExpiresAt === undefined) return;
+    setBridgeNow(Date.now());
+    const interval = window.setInterval(() => setBridgeNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [bridgeQrExpiresAt]);
+  const bridgeCountdownText = bridgeQrExpiresAt === undefined ? null : bridgeNow >= bridgeQrExpiresAt ? desktopText('downloadBridgeQrExpiredNow')
+    : desktopText('downloadBridgeQrRemainingArg0', { arg0: `${Math.floor(Math.ceil((bridgeQrExpiresAt - bridgeNow) / 1000) / 60)}:${String(Math.ceil((bridgeQrExpiresAt - bridgeNow) / 1000) % 60).padStart(2, '0')}` });
+  const downloadControls = admin && bridge ? <div className="admin-change download-bridge" role="group" aria-label={desktopText('downloadBridgeTitle')}>
+    <p role="status" className="download-bridge-state">{desktopText('downloadBridgeStatusLabel')}{bridgeStateText}{bridge.state === 'starting' && bridge.code && <small className="muted">（{bridge.code}）</small>}</p>
+    {(bridge.state === 'starting' || bridge.state === 'error' || (bridge.state === 'logged_in' && bridge.identity !== 'verified')) && bridge.detail && <p><small className="muted" style={{ wordBreak: 'break-all' }}>{bridge.detail}</small></p>}
+    {bridgeCountdownText && <p><small className="muted">{bridgeCountdownText}</small></p>}
+    {bridge.state === 'logged_in' && bridge.identity !== 'verified' && <p><small className="muted">{desktopText('downloadBridgeIdentityPending')}</small></p>}
+    <div className="button-row">
+      {bridgeWaiting && bridgeDialogKey !== null && bridgeDialogHidden && <button onClick={() => setBridgeDialogHiddenKey(null)}>{desktopText('downloadBridgeShowQr')}</button>}
+      {(bridge.state === 'not_configured' || (bridge.state === 'error' && !bridgeCanRefresh)) && <button disabled={bridgeBusy || progress !== null} onClick={() => void startDownloadBridge(admin)}>{desktopText('downloadBridgeLogin')}</button>}
+      {bridgeCanRefresh && <button disabled={bridgeBusy} onClick={() => void runBridgeRequest(() => api.adminDownloadBridgeRefreshQr(admin.accountId))}>{desktopText('downloadBridgeRefreshQr')}</button>}
+      {(bridge.state === 'logged_in' || bridge.state === 'error' || bridge.state === 'starting') && <button disabled={bridgeBusy} onClick={() => void runBridgeRequest(() => api.adminDownloadBridgeClear(admin.accountId))}>{desktopText('downloadBridgeClear')}</button>}
+      <label className="auto-login-option"><input type="checkbox" checked={admin.downloadBridge?.downloadEnabled === true} disabled={bridgeBusy}
+        onChange={(event) => void runBridgeRequest(() => api.adminDownloadBridgeSetDownloadEnabled(admin.accountId, event.target.checked))} /> {desktopText('downloadBridgeAllowDownload')}</label>
+      <label className="auto-login-option"><input type="checkbox" checked={admin.downloadBridge?.autoDownload === true} disabled={bridgeBusy || admin.downloadBridge?.downloadEnabled !== true}
+        onChange={(event) => void runBridgeRequest(() => api.adminDownloadBridgeSetAutoDownload(admin.accountId, event.target.checked))} /> {desktopText('downloadBridgeAutoDownload')}</label>
+    </div>
+    {verification && (verification.image.mismatch > 0 || verification.file.mismatch > 0) && <p className="download-bridge-verify">{desktopText('downloadBridgeVerifyCountsArg0Arg1Arg2Arg3Arg4Arg5Arg6Arg7', {
+      arg0: verification.image.match, arg1: verification.image.mismatch, arg2: verification.image.notInStore,
+      arg3: verification.image.nativeIncomplete > 0 ? desktopText('downloadBridgeVerifyIncompleteArg0', { arg0: verification.image.nativeIncomplete }) : '',
+      arg4: verification.file.match, arg5: verification.file.mismatch, arg6: verification.file.notInStore,
+      arg7: verification.file.nativeIncomplete > 0 ? desktopText('downloadBridgeVerifyIncompleteArg0', { arg0: verification.file.nativeIncomplete }) : '' })}</p>}
+    {verification && (verification.image.mismatch > 0 || verification.file.mismatch > 0) && <p className="download-bridge-verify">{desktopText('downloadBridgeOldMessagesArg0Arg1', { arg0: oldMessageState(verification.image), arg1: oldMessageState(verification.file) })}</p>}
+  </div> : null;
   const methodChoice = <div className="button-row login-method-choice" role="group" aria-label={extraText('loginMethodLabel')}>
     {(['DESKTOPWIN', 'CHROMEOS'] as const).map((method) => <button key={method} type="button" aria-pressed={loginMethod === method}
       className={loginMethod === method ? 'primary' : undefined} disabled={loginActive || addPending}
@@ -563,14 +710,40 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       : current === null ? { get title() { return desktopText('logInToLineAccount'); }, accountId: live.accountId, step: live.pin ? desktopText('enterThePinOnYourPhone') : live.imageDataUrl ? desktopText('scanTheQrCodeWithLineOnYourPhone') : desktopText('loggingIn') } : current);
     else if (live?.state === 'degraded' && progress?.title === desktopText('logInToLineAccount')) setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: desktopText('lineLoginFailed') });
   }, [live?.state, live?.imageDataUrl, live?.pin, live?.message]);
+  const guideAgentDone = agent?.status === 'connected';
+  const guideAdminDone = admin !== undefined || agent?.hasPrimaryAdmin === true;
+  const guideBridgeDone = bridge?.state === 'logged_in' && bridge.identity === 'verified';
+  const guideAllDone = guideAgentDone && guideAdminDone;
+  const [guideOpen, setGuideOpen] = useState(!guideAllDone);
+  const guideWasDone = useRef(guideAllDone);
+  useEffect(() => {
+    if (guideWasDone.current && !guideAllDone) setGuideOpen(true);
+    guideWasDone.current = guideAllDone;
+  }, [guideAllDone]);
+  const guideBadge = (done: boolean) => <span className={`badge login-guide-badge ${done ? 'done' : 'todo'}`}>{done ? desktopText('loginGuideDone') : desktopText('loginGuideNotDone')}</span>;
+  const loginGuide = <details className="panel login-guide" open={guideOpen} onToggle={(event) => setGuideOpen(event.currentTarget.open)}>
+    <summary>{desktopText('loginGuideSummary')}</summary>
+    <p className="muted">{desktopText('loginGuideIntro')}</p>
+    <ol>
+      <li><strong>{desktopText('loginGuideStep1Title')}</strong> {guideBadge(guideAgentDone)}
+        <p>{desktopText('loginGuideStep1Purpose')}</p><p>{desktopText('loginGuideStep1Login')}</p><p>{desktopText('loginGuideStep1Warning')}</p></li>
+      <li><strong>{desktopText('loginGuideStep2Title')}</strong> {guideBadge(guideAdminDone)}
+        <p>{desktopText('loginGuideStep2Purpose')}</p><p>{desktopText('loginGuideStep2Setup')}</p><p>{desktopText('loginGuideStep2Alternative')}</p></li>
+      <li><strong>{desktopText('loginGuideStep3Title')}</strong>
+        <p>{desktopText('loginGuideStep3Body')}</p></li>
+      <li><strong>{desktopText('loginGuideStep4Title')}</strong> <span className="badge login-guide-badge optional">{desktopText('loginGuideOptional')}</span>{guideBridgeDone && guideBadge(true)}
+        <p>{desktopText('loginGuideStep4Purpose')}</p><p>{desktopText('loginGuideStep4Setup')}</p></li>
+    </ol>
+  </details>;
   const windowPromptAccount = windowPrompt ? accounts.find((account) => account.accountId === windowPrompt) : undefined;
   return <div className={embedded ? 'account-settings' : 'page'}>
     {!embedded && <header className="page-header compact"><div><span className="eyebrow">{extraText('lineAccounts')}</span><div className="page-title-row"><h1 tabIndex={-1} ref={headingRef}>{desktopText('account')}</h1><p>{desktopText('agentAndAdministratorAccounts')}</p></div></div></header>}
+    {embedded && loginGuide}
     <section className={embedded ? 'panel combined-account-card' : undefined} aria-label={embedded ? desktopText('lineAccountSettings') : undefined}>
     {embedded && <h2 className="combined-account-title">{desktopText('account')}</h2>}
     <div className="account-role-slots">
       <section className="account-role-slot" aria-label={extraText('agentAccountSlot')}><div className="account-role-heading"><h2>Agent</h2><p>{agent?.displayName ?? desktopText('notLoggedIn182')}</p></div>{agent ? accountCard(agent) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}>{admin ? <p>{desktopText('primaryAdministratorConfiguredANewAgentAccountWillBe')}</p> : null}{methodChoice}<div className="action-with-status"><button className="primary" disabled={loginActive || addPending} onClick={() => void addAccount('add:agent')}>{desktopText('logInToAgentLineAccount')}</button>{vacantPending('add:agent') && <InlineBusy>{vacantPending('add:agent')!}</InlineBusy>}</div></article>}</section>
-      <section className="account-role-slot" aria-label={extraText('primaryAdminAccountSlot')}><div className="account-role-heading"><h2>Primary Admin</h2><p>{admin?.displayName ?? desktopText('notLoggedIn182')}</p></div>{admin ? accountCard(admin) : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}>{methodChoice}<div className="action-with-status"><button className="primary" disabled={loginActive || addPending || agent?.hasPrimaryAdmin !== true} onClick={() => void addAccount('add:admin')}>{desktopText('logInToPrimaryAdminLineAccount')}</button>{vacantPending('add:admin') && <InlineBusy>{vacantPending('add:admin')!}</InlineBusy>}</div>
+      <section className="account-role-slot" aria-label={extraText('primaryAdminAccountSlot')}><div className="account-role-heading"><h2>Primary Admin</h2><p>{admin?.displayName ?? desktopText('notLoggedIn182')}{adminConnectionStatus && <small className="admin-connection-status"> · {adminConnectionStatus}</small>}</p></div>{admin ? <div className="account-role-body">{accountCard(admin)}{adminChangeControls}{downloadControls}</div> : <article className={`${embedded ? 'account-record' : 'panel slot-vacant'}`}>{PRIMARY_ADMIN_LINE_LOGIN_ENABLED && <>{methodChoice}<div className="action-with-status"><button className="primary" disabled={loginActive || addPending || agent?.hasPrimaryAdmin !== true} onClick={() => void addAccount('add:admin')}>{desktopText('logInToPrimaryAdminLineAccount')}</button>{vacantPending('add:admin') && <InlineBusy>{vacantPending('add:admin')!}</InlineBusy>}</div></>}
         {embedded && canBindAdminFromSettings && <div className="action-with-status"><button className="primary" disabled={bindingAdmin || addPending} onClick={() => void bindAdminFromOfficialLine()}>{desktopText('setAdministratorFromLineAndStartExternalMonitoring')}</button>{bindingAdmin && <InlineBusy>{desktopText('settingPrimaryAdministrator')}</InlineBusy>}</div>}
         {!embedded && (!agent || agent.hasPrimaryAdmin !== true) && <div className="action-with-status"><button className="primary" disabled={bindingAdmin || addPending} onClick={() => void bindAdminFromOfficialLine()}>{desktopText('setAdministratorFromLineAndStartExternalMonitoring')}</button></div>}</article>}</section>
     </div>
@@ -578,12 +751,12 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     {embedded && <section className="panel external-monitor-card" aria-label={desktopText('externalMonitoring')}><h2>{desktopText('externalMonitoring')}</h2>
       {admin ? <>
         <p>{desktopText('lastSynced')}{admin.lastSyncedAt ? new Date(admin.lastSyncedAt).toLocaleString(locale) : desktopText('notSyncedYet')}</p>
-        {(admin.officialLineBuild || admin.hasVerifiedLineIdentity === true) && <section className="official-line-build" aria-label={desktopText('lineVersionStatus')}>
+        {(admin.officialLineBuild || admin.hasVerifiedLineIdentity === true || admin.connectionMode === 'OFFLINE') && <section className="official-line-build" aria-label={desktopText('lineVersionStatus')}>
           <div className="external-monitor-version-row">
             {admin.officialLineBuild && <p role={admin.officialLineBuild.status === 'accepted' || admin.officialLineBuild.status === 'candidate' ? 'status' : 'alert'}>
               {desktopText('lineVersion')}{admin.officialLineBuild.version ?? desktopText('unknown')}（{officialBuildText[admin.officialLineBuild.status]}）
             </p>}
-            {admin.hasVerifiedLineIdentity === true && externalMonitorAction(admin, true)}
+            {(admin.hasVerifiedLineIdentity === true || admin.connectionMode === 'OFFLINE') && externalMonitorAction(admin, true)}
           </div>
           {admin.officialLineBuild?.status === 'rotation' && <div className="action-with-status"><button disabled={approvingSigner} onClick={() => void approveOfficialSigner()}>{approvingSigner ? desktopText('confirmingNewCertificate') : desktopText('confirmNewCertificate')}</button>{approvingSigner && <InlineBusy>{desktopText('confirmingCertificate')}</InlineBusy>}</div>}
         </section>}
@@ -612,6 +785,18 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       {progress.title === desktopText('logInToLineAccount') && live?.state === 'connecting' && live.imageDataUrl && !live.pin && <img src={live.imageDataUrl} alt={desktopText('lineLoginQrCode')} width="320" height="320" />}
       {progress.title === desktopText('logInToLineAccount') && live?.state === 'connecting' && live.pin && <div className="line-auth-code"><h3>{desktopText('enterVerificationCodeOnYourPhone')}</h3><output aria-label={desktopText('line6DigitVerificationCode')}>{live.pin}</output></div>}
       {progress.title === desktopText('logInToLineAccount') && live?.state === 'connecting' && <div className="progress-actions"><button onClick={() => void cancelLogin()}>{desktopText('cancelLogin')}</button></div>}
+    </ProgressOverlay>}
+    {bridgeDialogOpen && admin && bridge && <ProgressOverlay title={desktopText('downloadBridgeTitle')} step="" spinner={false}>
+      {bridge.state === 'waiting_qr' && bridge.qrImageDataUrl && <div className="line-auth-code">
+        <img src={bridge.qrImageDataUrl} alt={desktopText('downloadBridgeQrAlt')} width="320" height="320" />
+        <p>{desktopText('downloadBridgeScanInstruction')}</p>
+      </div>}
+      {bridge.state === 'waiting_pin' && bridge.pin && <div className="line-auth-code"><h3>{desktopText('downloadBridgePinInstruction')}</h3><output aria-label={desktopText('downloadBridgePinLabel')}>{bridge.pin}</output></div>}
+      {bridgeCountdownText && <p role="timer">{bridgeCountdownText}</p>}
+      <div className="progress-actions">
+        <button onClick={() => setBridgeDialogHiddenKey(bridgeDialogKey)}>{desktopText('close')}</button>
+        <button disabled={bridgeBusy} onClick={() => void runBridgeRequest(() => api.adminDownloadBridgeClear(admin.accountId))}>{desktopText('downloadBridgeClear')}</button>
+      </div>
     </ProgressOverlay>}
     {chromeSetup && <ProgressOverlay title={extraText(chromeSetup.ready ? 'chromeLoginReadyTitle' : 'chromeLoginUnavailableTitle')} step="" spinner={false}>
       {chromeSetup.ready ? <p role="status">{extraText('chromeLoginReady')}</p> : <>

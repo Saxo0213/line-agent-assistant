@@ -2,13 +2,14 @@
 // Existing workflow assertions explicitly exercise the retained Traditional Chinese catalog.
 import React from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render as renderWithoutLocale, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render as renderWithoutLocale, screen, waitFor, within } from '@testing-library/react';
 import type { IpcEvent, IpcResult, LineAccountSummary } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import { LocaleProvider, type LocaleState } from '../locale-context.js';
 import { readFileSync } from 'node:fs';
 import { URL as NodeURL } from 'node:url';
 import { LineLogin } from './LineLogin.js';
+import { PRIMARY_ADMIN_LINE_LOGIN_ENABLED } from '../../primary-admin-line-login.js';
 import { accountAvatarRefreshed, LineMediaImage } from '../LineMediaImage.js';
 import { desktopTextFor, extraTextFor } from '../desktop-i18n.js';
 
@@ -203,6 +204,8 @@ describe('embedded external monitor card', () => {
 });
 
 describe('inline account action status', () => {
+  // The account that shows the automatic-login checkbox: the administrator only when its LINE login is enabled.
+  const autoLoginAccount = () => PRIMARY_ADMIN_LINE_LOGIN_ENABLED ? buildAdmin() : buildAgent;
   const deferred = <T,>() => { let resolve!: (value: T) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; };
 
   it('shows LINE reading while the admin preview is pending and clears it after cancellation', async () => {
@@ -337,7 +340,7 @@ describe('inline account action status', () => {
   });
 
   it('keeps the automatic-login checkbox and label text in one left-aligned row', () => {
-    renderBuildPage([{ ...buildAdmin(), autoLoginOnStartup: true } as LineAccountSummary]);
+    renderBuildPage([{ ...autoLoginAccount(), autoLoginOnStartup: true } as LineAccountSummary]);
     const option = screen.getByLabelText('啟動時自動登入').closest('label');
     expect(option?.querySelector('input[type="checkbox"]')).toBeTruthy();
     expect(option?.textContent).toContain('啟動時自動登入');
@@ -346,17 +349,17 @@ describe('inline account action status', () => {
 
   it('disables automatic login while monitoring and leaves it enabled otherwise', () => {
     const { rerender } = render(<LineLogin api={{ lineSetAutoLogin: vi.fn() } as unknown as DesktopApi}
-      accounts={[{ ...buildAdmin(), externalImportProgress: { stage: 'monitoring', copiedBytes: null, totalBytes: null,
+      accounts={[{ ...autoLoginAccount(), externalImportProgress: { stage: 'monitoring', copiedBytes: null, totalBytes: null,
         committedRows: '0', eligibleRows: null, message: null } } as unknown as LineAccountSummary]}
       headingRef={React.createRef()} onNotice={() => undefined} />);
     expect((screen.getByLabelText('啟動時自動登入') as HTMLInputElement).disabled).toBe(true);
     expect(screen.getByText('外部監控中無法使用', { selector: '.sr-only' })).toBeTruthy();
     rerender(<LineLogin api={{ lineSetAutoLogin: vi.fn() } as unknown as DesktopApi}
-      accounts={[buildAdmin()]} headingRef={React.createRef()} onNotice={() => undefined} />);
+      accounts={[autoLoginAccount()]} headingRef={React.createRef()} onNotice={() => undefined} />);
     expect((screen.getByLabelText('啟動時自動登入') as HTMLInputElement).disabled).toBe(false);
   });
 
-  it('disables the Primary Admin login button while external monitoring runs and leaves the Agent button enabled', () => {
+  it.runIf(PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('disables the Primary Admin login button while external monitoring runs and leaves the Agent button enabled', () => {
     const progress = (stage: 'monitoring' | 'syncing') => ({ stage, copiedBytes: null, totalBytes: null, committedRows: '0', eligibleRows: null, message: null });
     const accounts = (admin: LineAccountSummary) => [buildAgent, admin];
     const page = (list: LineAccountSummary[]) => <LineLogin api={{ lineSetAutoLogin: vi.fn() } as unknown as DesktopApi}
@@ -375,6 +378,44 @@ describe('inline account action status', () => {
     rerender(page(accounts(buildAdmin())));
     expect(adminButton().disabled).toBe(false);
     expect(adminButton().getAttribute('aria-describedby')).toBeNull();
+  });
+
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('shows no LINE login controls on the Primary Admin card and keeps them on the Agent card', () => {
+    const progress = (stage: 'monitoring' | 'syncing') => ({ stage, copiedBytes: null, totalBytes: null, committedRows: '0', eligibleRows: null, message: null });
+    const page = (admin: LineAccountSummary) => <LineLogin api={{ lineSetAutoLogin: vi.fn() } as unknown as DesktopApi}
+      accounts={[buildAgent, admin]} headingRef={React.createRef()} onNotice={() => undefined} />;
+    const { rerender } = render(page(buildAdmin()));
+    const card = (id: string) => document.querySelector(`[data-account-id="${id}"]`) as HTMLElement;
+    for (const variant of [buildAdmin(), { ...buildAdmin(), status: 'connected' }, { ...buildAdmin(), externalImportProgress: progress('monitoring') },
+      { ...buildAdmin(), externalImportProgress: progress('syncing') }] as unknown as LineAccountSummary[]) {
+      rerender(page(variant));
+      const admin = within(card('admin-1'));
+      expect(admin.queryByRole('button', { name: '重新啟動' })).toBeNull();
+      expect(admin.queryByRole('button', { name: /^登入/ })).toBeNull();
+      expect(admin.queryByRole('button', { name: /^登出/ })).toBeNull();
+      expect(admin.queryByRole('checkbox')).toBeNull();
+      expect(admin.queryByRole('combobox')).toBeNull();
+      expect(admin.queryByText('啟動時自動登入')).toBeNull();
+      expect(admin.getByRole('button', { name: /外部監控/ })).toBeTruthy();
+    }
+    const agent = within(card('buildAgent-1'));
+    expect(agent.getByRole('button', { name: '重新啟動' })).toBeTruthy();
+    expect(agent.getByRole('button', { name: '登入 Agent' })).toBeTruthy();
+    expect(agent.getByRole('button', { name: '登出 Agent' })).toBeTruthy();
+    expect(agent.getByRole('checkbox')).toBeTruthy();
+    expect(agent.getByRole('combobox', { name: '登入方式' })).toBeTruthy();
+  });
+
+  it.runIf(!PRIMARY_ADMIN_LINE_LOGIN_ENABLED)('offers only external monitoring on the vacant Primary Admin slot', () => {
+    renderBuildPage([{ ...buildAgent, hasPrimaryAdmin: true }]);
+    const slot = within(document.querySelector('.account-role-slot:nth-of-type(2)') as HTMLElement);
+    expect(slot.queryByRole('button', { name: '登入管理者帳號' })).toBeNull();
+    expect(slot.queryByRole('group', { name: '登入方式' })).toBeNull();
+    cleanup();
+    renderBuildPage([]);
+    const vacant = within(document.querySelectorAll('.account-role-slot')[1] as HTMLElement);
+    expect(vacant.queryByRole('group', { name: '登入方式' })).toBeNull();
+    expect(vacant.getByRole('button', { name: '管理者帳號(LINE監控模式)' })).toBeTruthy();
   });
 
   it('clears automatic login before starting monitoring and reports a failed clear in the overlay', async () => {
@@ -711,12 +752,14 @@ describe('login method menu of an existing account', () => {
     }
   });
 
-  it('is disabled during a login and for the Primary Admin while monitoring', () => {
+  it('is disabled during a login and for the Primary Admin card only as the switch allows', () => {
     show(menuApi(), {}, { accountId: buildAgent.accountId, loginAttemptId: 'attempt-1', state: 'connecting', message: null });
     expect(menu().disabled).toBe(true);
     cleanup();
     render(<LineLogin api={menuApi() as unknown as DesktopApi} headingRef={React.createRef()} onNotice={() => undefined}
       accounts={[{ ...buildAdmin(), externalImportProgress: { stage: 'monitoring' } } as unknown as LineAccountSummary]} />);
-    expect(menu().disabled).toBe(true);
+    // Enabled: the menu exists and is disabled while monitoring. Disabled: the menu is absent.
+    if (PRIMARY_ADMIN_LINE_LOGIN_ENABLED) expect(menu().disabled).toBe(true);
+    else expect(screen.queryByRole('combobox', { name: '登入方式' })).toBeNull();
   });
 });

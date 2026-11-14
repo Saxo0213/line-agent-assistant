@@ -368,7 +368,7 @@ describe('Schedules form', () => {
 });
 
 describe('Schedules form defaults and pickers', () => {
-  const admin: AgentScheduleTargetOption = { accountId: 'agent-1', chatType: 'direct', chatId: 'uadmin-d6da', title: '徐佳誠', role: 'primary_admin' };
+  const admin: AgentScheduleTargetOption = { accountId: 'agent-1', chatType: 'direct', chatId: 'uadmin-d6da', title: '林曉安', role: 'primary_admin' };
 
   it('defaults the delivery to the administrator and requests nothing until something is typed', async () => {
     const { api } = setup({ targets: [target('c1', '客戶群')] });
@@ -420,12 +420,12 @@ describe('Schedules form defaults and pickers', () => {
   });
 
   it('shows a community target and badges the administrator, with no id hints', async () => {
-    setup({ targets: [target('c-other-53dd', '徐佳誠', 'direct'), admin, target('cm1', '開放社群', 'community'), target('c-last-9999', '徐佳誠', 'group')] });
+    setup({ targets: [target('c-other-53dd', '林曉安', 'direct'), admin, target('cm1', '開放社群', 'community'), target('c-last-9999', '林曉安', 'group')] });
     await openNew();
     const picker = screen.getByRole('group', { name: '要讀取的聊天室' });
     fireEvent.change(within(picker).getByRole('combobox'), { target: { value: '徐' } });
     const rows = await within(picker).findAllByRole('option');
-    expect(rows.map((row) => row.getAttribute('aria-label'))).toEqual(['加入 徐佳誠', '加入 徐佳誠', '加入 開放社群', '加入 徐佳誠']);
+    expect(rows.map((row) => row.getAttribute('aria-label'))).toEqual(['加入 林曉安', '加入 林曉安', '加入 開放社群', '加入 林曉安']);
     expect(within(rows[0]!).getByText('管理員')).toBeTruthy();
     expect(picker.textContent).not.toMatch(/…[0-9a-z]{4}/);
     expect(rows[2]!.querySelector('[data-chat-icon="house"]')).toBeTruthy();
@@ -711,5 +711,45 @@ describe('Schedules: system messages, record-only delivery and run replies', () 
     }
     expect(TRADITIONAL_CHINESE_SCHEDULE_COPY.deliveryRecordOnly).toBe('只保存在排程紀錄（不傳送）');
     expect(TRADITIONAL_CHINESE_SCHEDULE_COPY.deliveryOptionRecordOnly).toBe('只保存在排程紀錄');
+  });
+});
+
+describe('Mention rules in the list and the run history', () => {
+  const mention: AgentSchedule = {
+    ...base, scheduleId: '33333333-1111-4111-8111-111111111111', title: '提及我', prompt: '', recurrence: { kind: 'message' }, execution: 'program', mayUseLlm: false,
+    task: { type: 'message_forward', match: { mode: 'mention', admin: true, members: [{ accountId: 'a', mid: 'u1', label: '小明' }], all: true },
+      actions: { forward: false, notify: true, agent: { prompt: '', target: { accountId: 'agent-1', chatType: 'direct', chatId: 'admin', title: '管理員' } } } },
+    delivery: { mode: 'record_only' }, nextFireAt: null, lastFireAt: null, lastOutcome: 'notified',
+  };
+  const run = (patch: Partial<AgentScheduleRun>, forwarding: NonNullable<AgentScheduleRun['forwarding']>): AgentScheduleRun => ({
+    runId: '44444444-1111-4111-8111-111111111111', scheduleId: mention.scheduleId, scheduledFor: '2026-10-28T01:00:00.000Z', outcome: 'notified', jobId: null, replyPreview: null,
+    createdAt: '2026-10-28T01:00:00.000Z', forwarding, ...patch,
+  });
+  const forwarding = { sourceTitle: '群組', accountId: 'a', senderName: '小華', senderId: 'u9', parts: [] };
+
+  it('shows the condition, the action tags and the notified outcome', async () => {
+    setup({ schedules: [mention] });
+    expect(await screen.findByText('@ 提及：管理員、小明、全體')).toBeTruthy();
+    expect(screen.getAllByText('通知').length).toBeGreaterThan(0);
+    expect(screen.getByText('Agent')).toBeTruthy();
+    expect(screen.queryByText('轉發')).toBeNull();
+    expect(screen.getAllByText('已通知').length).toBeGreaterThan(0);
+  });
+
+  it('shows the notification and Agent states of a run, and opens the reply of the Agent job', async () => {
+    const jobId = '55555555-1111-4111-8111-111111111111';
+    const { api } = setup({ schedules: [mention], runs: [run({ jobId }, { ...forwarding, notifyState: 'shown', agentState: 'submitted', agentError: null })] });
+    const dialog = await openEditorOf('提及我');
+    expect(await within(dialog).findByText('已交給 Agent')).toBeTruthy();
+    expect(within(dialog).getAllByText('已通知').length).toBeGreaterThan(1);
+    fireEvent.click(within(dialog).getByRole('button', { name: '查看回覆' }));
+    await waitFor(() => expect(api.getAgentRoomJobEvents).toHaveBeenCalledWith(jobId));
+  });
+
+  it('maps the error code of an Agent job that did not run', async () => {
+    setup({ schedules: [mention], runs: [run({}, { ...forwarding, notifyState: 'failed', agentState: 'skipped', agentError: 'agent_queue_full' })] });
+    const dialog = await openEditorOf('提及我');
+    expect(await within(dialog).findByText('Agent 未執行：待處理的 Agent 工作過多')).toBeTruthy();
+    expect(within(dialog).getByText('通知無法顯示')).toBeTruthy();
   });
 });

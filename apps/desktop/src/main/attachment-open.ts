@@ -3,11 +3,12 @@ import { lstat, open, realpath, type FileHandle } from 'node:fs/promises';
 import { lstatSync } from 'node:fs';
 import path from 'node:path';
 import type { PreviewAuthority, PreviewRequester, PreviewRecord } from './attachment-preview.js';
-import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+import { diagnosticFailure, sniffImageMimeType, type SafeDiagnostic } from '@line-agent/contracts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 64 * 1024;
+const IMAGE_FILE_EXTENSION = /\.(?:jpe?g|png|gif|webp)$/i;
 
 function samePath(left: string, right: string): boolean {
   const normalize = (value: string) => process.platform === 'win32' ? path.normalize(value).toLowerCase() : path.normalize(value);
@@ -48,6 +49,7 @@ export class AttachmentOpenService {
   readonly #rootIno: number;
   readonly #authority: PreviewAuthority;
   readonly #openPath: (file: string) => Promise<string>;
+  readonly #viewImage: ((attachmentId: string, requester: PreviewRequester) => Promise<boolean>) | undefined;
   readonly #afterAcquire: (() => Promise<void>) | undefined;
   readonly #onDiagnostic: ((diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void) | undefined;
   readonly #handles = new Set<FileHandle>();
@@ -55,7 +57,9 @@ export class AttachmentOpenService {
   #closed = false;
   #active = 0;
 
-  constructor(options: { root: string; authority: PreviewAuthority; openPath(file: string): Promise<string>; afterAcquire?: () => Promise<void>;
+  constructor(options: { root: string; authority: PreviewAuthority; openPath(file: string): Promise<string>;
+    /** Opens the in-app viewer. Used for image files whose stored name has no image extension. */
+    viewImage?(attachmentId: string, requester: PreviewRequester): Promise<boolean>; afterAcquire?: () => Promise<void>;
     onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void }) {
     if (!path.isAbsolute(options.root)) throw new Error('Attachment root must be absolute');
     const configuredRoot = path.resolve(options.root), rootInfo = lstatSync(configuredRoot);
@@ -63,6 +67,7 @@ export class AttachmentOpenService {
     this.#root = configuredRoot; this.#rootDev = rootInfo.dev; this.#rootIno = rootInfo.ino;
     this.#authority = options.authority;
     this.#openPath = options.openPath;
+    this.#viewImage = options.viewImage;
     this.#afterAcquire = options.afterAcquire;
     this.#onDiagnostic = options.onDiagnostic;
   }
@@ -110,11 +115,13 @@ export class AttachmentOpenService {
       if (this.#closed || !this.#sameIdentity(source, initial) || initial.size !== first.sizeBytes || initial.size > MAX_FILE_BYTES) return false;
       const hash = createHash('sha256'), chunk = Buffer.alloc(HASH_CHUNK_BYTES);
       let position = 0;
+      let prefix = Buffer.alloc(0);
       while (position < initial.size) {
         if (this.#closed) return false;
         const read = await source.handle.read(chunk, 0, Math.min(chunk.length, initial.size - position), position);
         if (this.#closed || read.bytesRead <= 0) return false;
         hash.update(chunk.subarray(0, read.bytesRead));
+        if (prefix.length < 12) prefix = Buffer.concat([prefix, chunk.subarray(0, Math.min(read.bytesRead, 12 - prefix.length))]);
         position += read.bytesRead;
       }
       if (this.#closed || hash.digest('hex') !== first.sha256.toLowerCase()) return false;
@@ -125,6 +132,12 @@ export class AttachmentOpenService {
       const immediatelyBeforeLaunch = await source.handle.stat();
       if (this.#closed || !this.#sameIdentity(source, immediatelyBeforeLaunch)
         || !await this.#namedSourceIsSame(first.relativePath, source) || this.#closed) return false;
+      // LINE image messages have no file name, so older downloads are stored as attachment.bin. The shell would open
+      // such a file with the wrong program. Show it in the in-app viewer, which checks the content itself.
+      if (this.#viewImage && first.kind === 'image' && !IMAGE_FILE_EXTENSION.test(path.basename(first.relativePath))
+        && sniffImageMimeType(prefix) !== null) {
+        return !this.#closed && await this.#viewImage(id, requester);
+      }
       const error = await this.#openPath(source.launchPath);
       if (!this.#closed && error !== '') {
         try { this.#onDiagnostic?.({ operation: 'attachment', stage: 'execute', category: 'unavailable', recovery: 'check_configuration', outcome: 'failed' }, { ...identity, accountId: first.accountId }); } catch { /* observer only */ }

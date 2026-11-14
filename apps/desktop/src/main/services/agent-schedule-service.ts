@@ -2,6 +2,7 @@ import {
   AGENT_SCHEDULE_REQUEST_PREFIX,
   agentScheduleShapeError,
   resolveScheduleMessagePlaceholders,
+  scheduleForwardActions,
   type AgentProvider,
   type AgentSchedulePreviewNewMessagesOutput,
   type AgentSchedulePreviewNewMessagesRequest,
@@ -12,10 +13,11 @@ import {
   type AgentScheduleSendTarget,
   type AgentScheduleTarget,
   type AgentScheduleTargetOption,
+  type AgentScheduleTask,
   type AgentScheduleUpdatePatch,
 } from '@line-agent/contracts';
-import { AgentScheduleError, resolveCurrentAgentKey, type AgentLineage, type AgentScheduleClaim, type AgentScheduleClaimResult, type AgentScheduleRepository } from '@line-agent/database';
-import { composeScheduleRunContext, composeScheduledPrompt, computeScheduleWindow, type ScheduleTimeWindow } from './agent-schedule-prompt.js';
+import { AgentScheduleError, resolveCurrentAgentKey, type AgentLineage, type AgentScheduleClaim, type AgentScheduleClaimResult, type AgentScheduleRepository, type ScheduleForwardRepository } from '@line-agent/database';
+import { composeForwardRunContext, composeScheduleRunContext, composeScheduledPrompt, computeScheduleWindow, type ScheduleTimeWindow } from './agent-schedule-prompt.js';
 import type { AgentScheduleMessageContext, AgentScheduleMessageReader } from './agent-schedule-reader.js';
 import { NEW_MESSAGES_EMPTY_LINE, evaluateNewMessages, listedText, type NewMessagesEvaluation, type ScheduleOwnDelivery } from './agent-schedule-rules.js';
 
@@ -60,6 +62,8 @@ export interface AgentScheduleServiceOptions {
   /** Reads the messages of a window for new_messages schedules (same scope, redaction and audit as a scheduled Agent run). */
   readMessages?: AgentScheduleMessageReader;
   targets?: AgentScheduleTargetResolver;
+  /** Reads the captured source of a mention Agent job (request id `schedule:<id>:forward:<workId>`). */
+  forwards?: Pick<ScheduleForwardRepository, 'forwardWorkById' | 'forwardMessage'>;
   /** Resolves the Agent account lineage; stored targets of former Agent accounts are mapped to the current account at fire time. */
   agentLineage?: () => Promise<AgentLineage>;
   /** Resolves the Primary Admin direct chat at fire time; null when none. A failure counts as none. */
@@ -74,6 +78,16 @@ export interface AgentScheduleServiceOptions {
 /** The job request id of one schedule slot; AgentRepository.enqueueScheduleJob de-duplicates on it. */
 export const scheduleRequestId = (scheduleId: string, scheduledFor: Date): string =>
   `${AGENT_SCHEDULE_REQUEST_PREFIX}${scheduleId}:${scheduledFor.toISOString()}`;
+
+/** The job request id of one mention Agent job: `schedule:<scheduleId>:forward:<workId>`. It starts with the schedule prefix, so the job cannot manage schedules. */
+export const forwardRequestId = (scheduleId: string, workId: string): string => `${AGENT_SCHEDULE_REQUEST_PREFIX}${scheduleId}:forward:${workId}`;
+
+const FORWARD_REQUEST_ID = /^schedule:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):forward:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+/** The schedule id and work id of a request id made by forwardRequestId; null for any other id. */
+export function parseForwardRequestId(sourceRequestId: string | null | undefined): { scheduleId: string; workId: string } | null {
+  const match = typeof sourceRequestId === 'string' ? FORWARD_REQUEST_ID.exec(sourceRequestId) : null;
+  return match ? { scheduleId: match[1]!, workId: match[2]! } : null;
+}
 
 /** True for a job created by a schedule; such a job must not manage schedules. */
 export const isScheduledRunRequestId = (sourceRequestId: string | null | undefined): boolean =>
@@ -260,6 +274,8 @@ export class AgentScheduleService {
    */
   async runContext(sourceRequestId: string, jobId?: string): Promise<string | null> {
     if (!isScheduledRunRequestId(sourceRequestId)) return null;
+    const forward = parseForwardRequestId(sourceRequestId);
+    if (forward) return this.forwardRunContext(forward.scheduleId, forward.workId);
     const match = /^schedule:([0-9a-f-]{36}):(.+)$/i.exec(sourceRequestId);
     const scheduledFor = match ? new Date(match[2]!) : null;
     if (!match || !scheduledFor || Number.isNaN(scheduledFor.getTime())) return null;
@@ -282,11 +298,27 @@ export class AgentScheduleService {
     });
   }
 
+  /** The hidden context of a mention Agent job. Null when the rule is gone or has no Agent action. A missing work row or message gives a short context. */
+  private async forwardRunContext(scheduleId: string, workId: string): Promise<string | null> {
+    const schedule = await this.options.store.get(scheduleId);
+    if (!schedule || schedule.task.type !== 'message_forward') return null;
+    const agent = scheduleForwardActions(schedule.task).agent;
+    if (!agent) return null;
+    const work = await this.options.forwards?.forwardWorkById(scheduleId, workId) ?? null;
+    const message = work ? await this.options.forwards?.forwardMessage(work) ?? null : null;
+    const match = schedule.task.match;
+    return composeForwardRunContext({
+      prompt: agent.prompt, agentTarget: await this.currentDeliveryTarget(agent.target), work, message,
+      mention: match.mode === 'mention' ? { admin: match.admin, members: match.members, all: match.all } : null,
+    });
+  }
+
   private async lineage(): Promise<AgentLineage | null> {
     try { return await this.options.agentLineage?.() ?? null; } catch (error) { this.options.onError?.(error); return null; }
   }
 
-  private async currentAccountScope(accountScope: readonly string[] | null): Promise<string[] | null> {
+  /** The external account scope of a rule, mapped through the Agent lineage; null for an internal rule. */
+  async currentAccountScope(accountScope: readonly string[] | null): Promise<string[] | null> {
     if (accountScope === null) return null;
     const lineage = await this.lineage();
     return [...new Set(accountScope.map((accountId) => lineage?.currentAccountId && lineage.accountIds.includes(accountId)
@@ -299,6 +331,11 @@ export class AgentScheduleService {
     if (!lineage) return value;
     return { ...value, targets: value.targets.map((target) => resolveCurrentAgentKey(lineage, target)),
       delivery: value.delivery.mode === 'line_target' ? { ...value.delivery, target: resolveCurrentAgentKey(lineage, value.delivery.target) } : value.delivery };
+  }
+
+  /** Maps a stored Agent send target to the current Agent account and checks that it is still a valid Agent send target. Throws SCHEDULE_INVALID_TARGET if not. */
+  async resolveAgentSendTarget(target: AgentScheduleSendTarget): Promise<AgentScheduleSendTarget> {
+    return this.resolveSendTarget(await this.currentDeliveryTarget(target));
   }
 
   private async currentDeliveryTarget(target: AgentScheduleSendTarget): Promise<AgentScheduleSendTarget> {
@@ -350,6 +387,12 @@ export class AgentScheduleService {
     return this.options.targets.resolve(targets, purpose);
   }
 
+  /** A message_forward task with its Agent action target mapped through the lineage and checked; other tasks are returned as they are. */
+  private async resolveForwardTask(task: AgentScheduleTask): Promise<AgentScheduleTask> {
+    if (task.type !== 'message_forward' || !task.actions?.agent) return task;
+    return { ...task, actions: { ...task.actions, agent: { ...task.actions.agent, target: await this.resolveAgentSendTarget(task.actions.agent.target) } } };
+  }
+
   private async resolveSendTarget(target: AgentScheduleSendTarget): Promise<AgentScheduleSendTarget> {
     const resolved = this.options.targets ? (await this.options.targets.resolve([target], 'delivery'))[0]! : target;
     if (resolved.chatType !== 'direct' && resolved.chatType !== 'group' && resolved.chatType !== 'room') {
@@ -364,7 +407,8 @@ export class AgentScheduleService {
 
   async createExternal(input: AgentScheduleCreateInput, accountScope: readonly string[], signal?: AbortSignal): Promise<AgentSchedule> {
     const scope = [...new Set(accountScope)];
-    const required = this.scheduleTargetAccounts(input.targets, input.delivery);
+    const required = this.scheduleTargetAccounts(input.targets, input.delivery, input.task);
+    if (input.task.type === 'message_forward' && input.targets.length === 0) throw this.emptyForwardScopeError();
     if (required.some((accountId) => !scope.includes(accountId))) {
       throw new AgentScheduleError('SCHEDULE_INVALID_TARGET', 'Schedule target is outside its authorized account scope.');
     }
@@ -376,6 +420,7 @@ export class AgentScheduleService {
     if (invalid) throw new AgentScheduleError('SCHEDULE_INVALID', invalid);
     const resolved: AgentScheduleCreateInput = {
       ...input,
+      task: await this.resolveForwardTask(input.task),
       targets: await this.resolveTargets(input.targets),
       delivery: input.delivery.mode === 'line_target' ? { mode: 'line_target', target: await this.resolveSendTarget(await this.currentDeliveryTarget(input.delivery.target)) } : input.delivery,
     };
@@ -394,6 +439,7 @@ export class AgentScheduleService {
       delivery: patch.delivery ?? current.delivery });
     if (invalid) throw new AgentScheduleError('SCHEDULE_INVALID', invalid);
     const resolved: AgentScheduleUpdatePatch = { ...patch };
+    if (patch.task) resolved.task = await this.resolveForwardTask(patch.task);
     if (patch.targets) resolved.targets = await this.resolveTargets(patch.targets);
     if (patch.delivery?.mode === 'line_target') {
       resolved.delivery = { mode: 'line_target', target: await this.resolveSendTarget(await this.currentDeliveryTarget(patch.delivery.target)) };
@@ -405,16 +451,18 @@ export class AgentScheduleService {
   }
 
   async updateExternal(scheduleId: string, patch: AgentScheduleUpdatePatch, allowedAccountIds: readonly string[], signal?: AbortSignal): Promise<AgentSchedule> {
-    const required = this.scheduleTargetAccounts(patch.targets, patch.delivery);
+    const required = this.scheduleTargetAccounts(patch.targets, patch.delivery, patch.task);
     if (required.some((accountId) => !allowedAccountIds.includes(accountId))) {
       throw new AgentScheduleError('SCHEDULE_INVALID_TARGET', 'Schedule target is outside its authorized account scope.');
     }
     const resolved: AgentScheduleUpdatePatch = { ...patch };
+    if (patch.task) resolved.task = await this.resolveForwardTask(patch.task);
     if (patch.targets) resolved.targets = await this.resolveTargets(patch.targets);
     if (patch.delivery?.mode === 'line_target') {
       resolved.delivery = { mode: 'line_target', target: await this.resolveSendTarget(await this.currentDeliveryTarget(patch.delivery.target)) };
     }
     const current=await this.options.store.get(scheduleId);
+    if (current && (resolved.task ?? current.task).type === 'message_forward' && (resolved.targets ?? current.targets).length === 0) throw this.emptyForwardScopeError();
     if(current) await this.options.targets?.validateForward?.({targets:resolved.targets??current.targets,task:resolved.task??current.task,delivery:resolved.delivery??current.delivery});
     if (!this.options.store.updateExternalScoped) throw new AgentScheduleError('SCHEDULE_NOT_FOUND', 'Schedule not found.');
     if (signal?.aborted) throw signal.reason ?? new Error('Schedule request cancelled before database mutation.');
@@ -436,7 +484,14 @@ export class AgentScheduleService {
     return deleted;
   }
 
-  private scheduleTargetAccounts(targets: readonly AgentScheduleTarget[] | undefined, delivery: AgentSchedule['delivery'] | undefined): string[] {
-    return [...new Set([...(targets ?? []).map((target) => target.accountId), ...(delivery?.mode === 'line_target' ? [delivery.target.accountId] : [])])];
+  /** An external rule with no source chats would read every chat, so it needs explicit source chats inside its authorized scope. */
+  private emptyForwardScopeError(): AgentScheduleError {
+    return new AgentScheduleError('SCHEDULE_INVALID_TARGET', 'A forwarding rule of an external caller needs explicit source chats inside its authorized account scope.');
+  }
+
+  private scheduleTargetAccounts(targets: readonly AgentScheduleTarget[] | undefined, delivery: AgentSchedule['delivery'] | undefined, task?: AgentScheduleTask): string[] {
+    const agentTarget = task?.type === 'message_forward' ? task.actions?.agent?.target : undefined;
+    return [...new Set([...(targets ?? []).map((target) => target.accountId), ...(delivery?.mode === 'line_target' ? [delivery.target.accountId] : []),
+      ...(agentTarget ? [agentTarget.accountId] : [])])];
   }
 }

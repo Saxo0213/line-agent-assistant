@@ -1,9 +1,10 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { ScheduleForwardRepository } from '@line-agent/database';
 import { ScheduleForwardService } from './services/schedule-forward-service.js';
+import type { ForwardNotify } from './services/forward-notifier.js';
 import type { Pool } from 'pg';
 import type {
-  AgentEvent, AgentProvider, AgentRunRequest, ConversationKey, DiagnosticIdentity, DownloadAuthProbe, IpcEvent, IpcRequest, IpcResult, LineWorkerCommand,
+  AgentEvent, AgentProvider, AgentRunRequest, ConversationKey, DiagnosticIdentity, IpcEvent, IpcRequest, IpcResult, LineWorkerCommand,
   LineWorkerEvent, WorkerBinding, ComponentHealth, LineServerErrorCode, LineTransportKind, ChromeLtsmUnavailableStatus,
 } from '@line-agent/contracts';
 import { CHROME_EXTENSION_STORE_URL, CHROME_LTSM_UNAVAILABLE_CODE, resolveLineTransport } from '@line-agent/contracts';
@@ -14,14 +15,15 @@ import { mkdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeAttachmentDownloadInputSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
+import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
 import {
   AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, AttachmentStorageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, ProviderQuotaRepository, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
-import type { Attachment, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
+import type { Attachment, BridgeVerificationCounts, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
 import type { DesktopServiceFacade, TimelineMessage, WorkRecord } from './service-facade.js';
 import { FRIEND_LIST_LIMIT, MESSAGE_READER_LIMIT } from '../desktop-protocol.js';
+import { PRIMARY_ADMIN_LINE_LOGIN_ENABLED } from '../primary-admin-line-login.js';
 import type { AgentJobStatusProjection } from '@line-agent/database';
 import type { Locale } from '../locale.js';
 
@@ -30,6 +32,7 @@ import { AccountSupervisor, LineService } from './services/line-service.js';
 import { AgentService, type AgentRunner, type InternalMcpLauncher } from './services/agent-service.js';
 import { AgentScheduleService } from './services/agent-schedule-service.js';
 import { FreeModeService } from './services/free-mode-service.js';
+import { createReplyContextResolver } from './services/agent-reply-context.js';
 import { PERSONA_DESCRIPTION_SETTING, PERSONA_LIVELINESS_SETTING, readGlobalPersona, resolveEffectivePersona } from './services/agent-persona.js';
 import { defaultProjectPathPolicy } from './services/project-folder-path.js';
 import { ProjectFolderService } from './services/project-folder-service.js';
@@ -50,7 +53,7 @@ import { createChatResourceDiagnostics, parseChatResourceDiagnostic } from './se
 import { createMcpChatResourceArchiveReader } from './services/mcp-chat-resource-reader.js';
 import { trackOperation, type TrackedOperationContext } from './tracked-operation.js';
 import { WorkspaceAuthority, InvalidWorkspaceError } from './services/workspace-authority.js';
-import { AttachmentService } from './services/attachment-service.js';
+import { AttachmentService, EXTERNAL_BRIDGE_AUTO_MAX_AGE_MS } from './services/attachment-service.js';
 import { AttachmentStorageService } from './services/attachment-storage-service.js';
 import { createWindowsAttachmentBroker, resolveWindowsAttachmentBrokerPath } from '@line-agent/line-worker/attachment-storage';
 import { DeliveryService } from './services/delivery-service.js';
@@ -58,7 +61,11 @@ import { AgentLineSendService } from './services/agent-line-send-service.js';
 import { PermissionCommandService, type PermissionCommandTransport } from './services/permission-command.js';
 import { ContentReprojectionService } from './services/content-reprojection-service.js';
 import { HealthService, kindPreview } from './services/health-service.js';
-import { AdminPairingService } from './services/admin-pairing-service.js';
+import { AdminChangeError, AdminPairingService, type AdminChangeOutcome } from './services/admin-pairing-service.js';
+import { OfficialDownloadBridgeService } from './services/official-download-bridge/official-download-bridge-service.js';
+import { OfficialDownloadBridgeDownloader } from './services/official-download-bridge/bridge-download.js';
+import { BRIDGE_VERIFY_RESULT_CODES, bridgeGateThreshold, isBridgeGateOpen, type BridgeKind, type BridgeVerifyResult } from './services/official-download-bridge/bridge-verification.js';
+import { createBridgeAttachmentStore } from './services/official-download-bridge/bridge-attachment-store.js';
 import { FriendEnrollmentService } from './services/friend-enrollment-service.js';
 import { RoomAutomationService, type RoomAutomationTransport } from './services/room-automation.js';
 import { McpService } from './services/mcp-service.js';
@@ -83,7 +90,7 @@ import type { AuditEventsReadResult } from './services/operational-audit-runtime
 import { systemActivityResult, systemErrorsResult } from './services/system-records.js';
 import { createSingleFlightRead } from './services/system-read-flight.js';
 import { runCleanupInOrder, StartupCleanup } from './startup-cleanup.js';
-import type { DirectMonitorPage, ImportCatalogPage, ImportCursor, ImportDirectoryPage, ImportProgress, ImportRow, NativeMonitorAccess } from './services/js-external-reader/protocol.js';
+import type { DirectMonitorPage, ImportCatalogPage, ImportCursor, ImportDirectoryPage, ImportProgress, ImportRow } from './services/js-external-reader/protocol.js';
 import { createFirstImportProgressLog } from './services/first-import-progress-log.js';
 import { classifyExternalMonitorFailure, clearExternalMonitorDiagnostic, ExternalMonitorDiagnosticFailure, externalMonitorDatabaseFailure, externalMonitorFailureDetail, recordExternalMonitorDiagnostic as persistExternalMonitorDiagnostic, type ExternalMonitorFailurePhase } from './services/external-monitor-diagnostics.js';
 import { linePrompt } from './services/line-prompts.js';
@@ -99,7 +106,7 @@ const REPLY_SENDER_NAME_SQL = senderNameSql({ m: 'qm', la: 'qla', c: 'qc', cm: '
 const REPLY_SENDER_PICTURE_SQL = senderPictureSql({ m: 'qm', la: 'qla', c: 'qc', cm: 'qcm',
   senderContact: 'quoted_sender_contact', peerContact: 'quoted_peer_contact' });
 
-type Bound = WorkerBinding & { mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED'; purpose?: 'DOWNLOAD_ONLY'; expectedMid?: string; application?: string };
+type Bound = WorkerBinding & { mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' | 'PAUSED' };
 type SendResult = Extract<LineWorkerEvent, { type: 'sendResult' }>;
 const MACHINE_CODE_PATTERN = /^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)*$/;
 function asChatResourceBinding(binding: (Bound | null) | undefined): ChatResourceBinding | null {
@@ -152,8 +159,6 @@ export interface IntegratedWorkerGateway {
   addFriendByMid(command: Extract<LineWorkerCommand, { type: 'addFriendByMid' }>): Promise<Extract<LineWorkerEvent, { type: 'addFriendResult' }>>;
   download(command: Extract<LineWorkerCommand, { type: 'downloadAttachment' }>, signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'attachmentResult' }>>;
   readChatResource?(command: ChatResourceRequest, signal?: AbortSignal): Promise<ChatResourceReadResult>;
-  adoptDownloadAuth?(command: Extract<LineWorkerCommand, { type: 'adoptDownloadAuth' }>, signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'downloadAuthResult' }>>;
-  isDownloadReady?(binding: WorkerBinding): boolean;
   /** Effective per-operation bound of the gateway (child boot/protocol guard and in-flight sends). */
   readonly responseTimeoutMs?: number;
   waitModeAck(accountId: string, mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY', timeoutMs: number): Promise<boolean>;
@@ -184,8 +189,6 @@ export interface ConnectedFacadeOptions {
   workers: IntegratedWorkerGateway;
   agent: IntegratedAgent;
   workspaceAuthority?: WorkspaceAuthority;
-  /** Shelved: borrowing official LINE tokens for external downloads. Production never passes true. */
-  externalDownloadTokenLookup?: boolean;
   attachmentRoot: string;
   attachmentBrokerHelperPath?: string;
   /** App-managed empty directory used as the working directory of the free-mode judge. */
@@ -205,6 +208,8 @@ export interface ConnectedFacadeOptions {
   chromeLogin?: { ltsm: ChromeLtsmControl; chooseFolder(): Promise<string | null>; openStore(url: string): Promise<void> };
   audit?: OperationalAudit & { listEvents?: (limit?: number, onUpdate?: (result: AuditEventsReadResult) => void) => Promise<AuditEventsReadResult>; waitForReadDrain?: () => Promise<void> };
   publish?: (event: IpcEvent) => void;
+  /** Shows one desktop notification of a message rule; resolves false when it cannot be shown. Absent = no notification is shown. */
+  forwardNotify?: ForwardNotify;
   migrationDirectory?: string;
   closePoolOnShutdown?: boolean;
   runMigrations?: boolean;
@@ -229,6 +234,8 @@ export interface ConnectedFacadeOptions {
   externalMonitorDiagnosticPath?: string;
   /** Persisted official LINE build trust; drives the Primary Admin build status and signer approval. */
   officialBuildTrust?: OfficialBuildTrustService;
+  /** App folder of the Primary Admin download bridge (`ext/`, `profile/`, `login.json`). Absent = the bridge is not available. */
+  downloadBridgeRoot?: string;
 }
 
 export function resolveMcpLocalClientBridgePath(appPath: string, packaged: boolean): string {
@@ -268,7 +275,7 @@ export type OfficialSnapshotImporter = {
     signal: AbortSignal;
     onPhase?(phase: ExternalMonitorFailurePhase): void;
     onProgress(progress: ImportProgress): void;
-    onReady?(access: NativeMonitorAccess, signal?: AbortSignal): Promise<void> | void;
+    onReady?(signal?: AbortSignal): Promise<void> | void;
     onDirectoryPage?(page: ImportDirectoryPage, signal?: AbortSignal): Promise<void> | void;
     onPage(page: DirectMonitorPage, signal?: AbortSignal): Promise<ImportCursor | null> | ImportCursor | null;
   }): Promise<void>;
@@ -292,6 +299,7 @@ function chromeLtsmMessage(status: ChromeLtsmUnavailableStatus): string {
 const chromeLtsmUnavailable = (requestId: string, status: ChromeLtsmUnavailableStatus): IpcResult =>
   ({ type: 'error', requestId, ok: false, code: CHROME_LTSM_UNAVAILABLE_CODE, message: chromeLtsmMessage(status), retryable: false,
     chromeLtsmStatus: status });
+const ADMIN_MONITOR_ONLY = 'ADMIN_MONITOR_ONLY';
 const JOB_NOT_RETRYABLE = 'AGENT_JOB_NOT_RETRYABLE';
 const JOB_NOT_RETRYABLE_MESSAGE = '此任務目前無法重試（可能已取消、已產生輸出，或所屬 Agent 會話已變更）。';
 
@@ -492,8 +500,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let externalImportOwner: { accountId: string; abort: AbortController; task?: Promise<unknown> } | null = null;
   /** At most one read-only official identity read at a time (admin binding preview / confirm). */
   let identityReadAbort: AbortController | null = null;
-  const nativeMonitorAccess = new Map<string, { sourceId: string; generation: number; access: NativeMonitorAccess; signal: AbortSignal }>();
-  const downloadAuthFlights = new Map<string, Promise<boolean>>();
   const recoveryTimers = new Set<ReturnType<typeof setTimeout>>();
   const avatarRefreshFlights = new Map<string, Promise<IpcResult>>();
   let ownAvatarRefreshScheduler: ReturnType<typeof createOwnAvatarRefreshScheduler> | undefined;
@@ -528,6 +534,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let publishSnapshot!: ReturnType<typeof createCoalescedSnapshotPublisher>;
   let stopPublishSnapshot: () => Promise<void> = async () => undefined;
   let stopContentReprojection: () => Promise<void> = async () => undefined;
+  let downloadBridge: OfficialDownloadBridgeService | undefined;
+  let stopDownloadBridge: () => Promise<void> = async () => undefined;
   let lineService!: LineService;
   let lineServiceReady = false;
   let monitorDispatchFlight: Promise<void> | null = null;
@@ -567,7 +575,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       () => unsubscribeBinding?.(), () => unsubscribeRestartBinding?.(), () => unsubscribeModeChange?.(),
     ]);
     const earlyOwners = await Promise.allSettled([
-      stopMcpHttpServer, stopMcpService, stopLineSend, stopAgentService, stopDelivery,
+      stopMcpHttpServer, stopMcpService, stopLineSend, stopAgentService, stopDelivery, stopDownloadBridge,
       stopAttachmentService, stopAttachmentStorageService, stopLineMedia, stopPreview, stopAttachmentOpen, stopPublishSnapshot, stopContentReprojection,
     ].map((cleanup) => Promise.resolve().then(cleanup)));
     earlyErrors.push(...earlyOwners.filter((result): result is PromiseRejectedResult => result.status === 'rejected').map((result) => result.reason));
@@ -601,9 +609,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       owner.abort.abort();
       await owner.task;
     }
-    nativeMonitorAccess.delete(accountId);
-    const binding = await options.workers.binding(accountId);
-    if (binding?.purpose === 'DOWNLOAD_ONLY') await options.workers.stopBinding(binding);
   }
   if (options.runMigrations !== false) await migrate(options.pool, options.migrationDirectory);
   if (options.contentReprojection === true) {
@@ -628,6 +633,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const agents = new AgentRepository(options.pool);
   const providerQuota = new ProviderQuotaRepository(options.pool);
   const settings = new SettingsRepository(options.pool);
+  // Toggle of the automatic bridge download for new messages. Default false. Loaded once here and updated on each set.
+  let externalBridgeAutoDownload = await settings.getExternalBridgeAutoDownload().catch(() => false);
+  // Switch that allows every Chrome extension download of the bridge. Default false. Loaded once here and updated on each set.
+  let externalBridgeDownloadEnabled = await settings.getExternalBridgeDownloadEnabled().catch(() => false);
   let conversationSettingsError: string | null = null;
   let conversationSettings = await settings.getConversationSettings().catch((error: unknown) => {
     options.audit?.failure(diagnosticFailure('database', 'read', error));
@@ -643,8 +652,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const admins = new AdminRepository(options.pool);
   const permissionRepository = new AgentPermissionRepository(options.pool);
   const chatFolders = new ChatFolderService(permissionRepository, workspace);
+  const attachmentBroker = createWindowsAttachmentBroker({ helperPath: options.attachmentBrokerHelperPath ?? resolveWindowsAttachmentBrokerPath() });
   const attachmentStorageService = new AttachmentStorageService({ repository: attachmentStorage, messages, attachmentRoot: options.attachmentRoot,
-    windowsSafetyBroker: createWindowsAttachmentBroker({ helperPath: options.attachmentBrokerHelperPath ?? resolveWindowsAttachmentBrokerPath() }),
+    windowsSafetyBroker: attachmentBroker,
     protectedPaths: options.projectFolderProtectedPaths ?? [],
     workspaceRoot: async () => { const inspection = await workspace.inspect(); return inspection.status === 'available' ? inspection.path : inspection.configuredPath; },
     ownChatWorkspaceFolder: async (key) => (await chatFolders.resolveExisting(key.accountId,key.chatType,key.chatId))?.path ?? null,
@@ -834,7 +844,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const scheduleTargets = createAgentScheduleTargetResolver({ messages, pool: options.pool });
   // Scheduled Agent triggers (list/create/update/delete_schedule and the schedules IPC). The Agent room job is submitted through
   // agentService, which is built later; the service only calls it from its tick, which starts after both exist.
-  const agentSchedules = new AgentScheduleService({ store: new AgentScheduleRepository(options.pool), targets: scheduleTargets, agentLineage: () => resolveAgentLineage(options.pool),
+  const forwardStore = new ScheduleForwardRepository(options.pool);
+  const agentSchedules = new AgentScheduleService({ store: new AgentScheduleRepository(options.pool), targets: scheduleTargets, forwards: forwardStore, agentLineage: () => resolveAgentLineage(options.pool),
     primaryAdminChat: async () => {
       const identity = await agents.describeJobIdentity({ sourceType: 'ui', accountId: null, chatType: null, chatId: null });
       return identity.admin ? { accountId: identity.admin.accountId, chatId: identity.admin.chatId, title: identity.admin.name ?? '' } : null;
@@ -845,7 +856,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     readMessages: createScheduleMessageReader((tool, context) => mcpService.callInternalTool(tool, context ?? { sourceType: 'schedule', accountScope: null })),
     publish: () => { options.publish?.({ type: 'agentSchedulesChanged' }); },
     onError: (error) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); } });
-  const scheduleForward=new ScheduleForwardService({store:new ScheduleForwardRepository(options.pool),messages,sender:agentLineSend,
+  const scheduleForward=new ScheduleForwardService({store:forwardStore,messages,sender:agentLineSend,
+    ...(options.forwardNotify ? {notify:options.forwardNotify} : {}),
+    submitAgent:(input)=>agentService.submitScheduled(input),resolveAgentTarget:(target)=>agentSchedules.resolveAgentSendTarget(target),
+    accountScope:(scope)=>agentSchedules.currentAccountScope(scope),
     publish:()=>options.publish?.({type:'agentSchedulesChanged'}),onError:(error)=>options.audit?.failure(diagnosticFailure('agent','execute',error))});
   stopAgentSchedules = onceCleanup(async () => { await scheduleForward.stop(); await agentSchedules.stop(); });
   startupCleanup.add(stopAgentSchedules);
@@ -923,6 +937,51 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const health = new HealthService(options.pool, options.workers.health
     ? { status: () => options.workers.health!() }
     : undefined);
+  // Counts of the latest bridge verification result of each attachment. They come from the audit rows and are cached for the snapshot.
+  const bridgeVerificationCache = new Map<string, BridgeVerificationCounts>();
+  const bridgeVerificationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  startupCleanup.add(() => { for (const timer of bridgeVerificationTimers.values()) clearTimeout(timer); bridgeVerificationTimers.clear(); });
+  // A failed count keeps the safe fallback (gate closed). The error goes to the audit failure path with a safe code.
+  const reportBridgeCountError = (error: unknown): void => {
+    try { options.audit?.failure(diagnosticFailure('attachment', 'read', error), { background: true }); } catch { /* Diagnostics never change the snapshot. */ }
+  };
+  const bridgeVerificationSummary = async (accountId: string) => {
+    let counts = bridgeVerificationCache.get(accountId);
+    if (!counts) {
+      counts = await messages.countBridgeVerification(accountId).catch((error: unknown) => { reportBridgeCountError(error); return undefined; });
+      if (counts) bridgeVerificationCache.set(accountId, counts);
+    }
+    const empty = { match: 0, mismatch: 0, notInStore: 0, nativeIncomplete: 0 };
+    const own: BridgeVerificationCounts = counts ?? { image: empty, file: empty };
+    const kindSummary = (kind: BridgeKind) => ({ ...own[kind], threshold: bridgeGateThreshold(kind), open: isBridgeGateOpen(kind, own) });
+    return { image: kindSummary('image'), file: kindSummary('file') };
+  };
+  const refreshBridgeVerification = async (accountId: string): Promise<void> => {
+    if (closing) return;
+    try { bridgeVerificationCache.set(accountId, await messages.countBridgeVerification(accountId)); } catch (error) { reportBridgeCountError(error); return; }
+    if (!closing) await publishSnapshot().catch(() => undefined);
+  };
+  // The audit row is written by a queue. The count is read at once and again after a short delay, when the row is stored.
+  const scheduleBridgeVerificationRefresh = (accountId: string): void => {
+    if (closing) return;
+    void refreshBridgeVerification(accountId);
+    const previous = bridgeVerificationTimers.get(accountId);
+    if (previous) clearTimeout(previous);
+    const timer = setTimeout(() => { bridgeVerificationTimers.delete(accountId); void refreshBridgeVerification(accountId); }, 2_500);
+    timer.unref?.();
+    bridgeVerificationTimers.set(accountId, timer);
+  };
+  const recordBridgeVerification = (record: { accountId: string; attachmentId: string; correlationId: string;
+    verification: { result: BridgeVerifyResult; detail: string } }): void => {
+    if (closing) return;
+    const { result, detail } = record.verification;
+    // Names only. The detail never holds a key, an id or a metadata value.
+    options.audit?.observed('bridge_message_verify', { initiator: 'system', accountId: record.accountId, requestId: record.attachmentId,
+      correlationId: record.correlationId, resultCode: BRIDGE_VERIFY_RESULT_CODES[result],
+      diagnostic: { operation: 'attachment', stage: 'read', detail, recovery: 'none',
+        category: result === 'match' ? 'unknown' : result === 'mismatch' ? 'invalid_response' : result === 'not_in_store' ? 'unavailable' : 'invalid_input' } });
+    scheduleBridgeVerificationRefresh(record.accountId);
+  };
   publishSnapshot = createCoalescedSnapshotPublisher(async () => {
     const snapshot = await health.snapshot();
     const buildTrustState = options.officialBuildTrust ? await options.officialBuildTrust.state().catch(() => null) : null;
@@ -953,7 +1012,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     }));
     const accountsWithTransport = await Promise.all(accountsWithManualSend.map(async (account) =>
       await transportOf(account.accountId) === 'CHROMEOS' ? { ...account, lineTransport: 'CHROMEOS' as const } : account));
-    return { ...snapshot, accounts: accountsWithTransport };
+    const bridgeStatus = downloadBridge?.status();
+    const accountsWithBridge = await Promise.all(accountsWithTransport.map(async (account) => account.productRole === 'PRIMARY_ADMIN' && downloadBridge
+      ? { ...account, downloadBridge: bridgeStatus?.accountId === account.accountId
+        ? { state: bridgeStatus.state, ...(bridgeStatus.code ? { code: bridgeStatus.code } : {}),
+          ...(bridgeStatus.detail ? { detail: bridgeStatus.detail } : {}),
+          ...(bridgeStatus.qrExpiresAt !== undefined ? { qrExpiresAt: bridgeStatus.qrExpiresAt } : {}),
+          ...(bridgeStatus.identity ? { identity: bridgeStatus.identity } : {}), autoDownload: externalBridgeAutoDownload,
+          downloadEnabled: externalBridgeDownloadEnabled, verification: await bridgeVerificationSummary(account.accountId) }
+        : { state: 'not_configured' as const, autoDownload: externalBridgeAutoDownload,
+          downloadEnabled: externalBridgeDownloadEnabled, verification: await bridgeVerificationSummary(account.accountId) } }
+      : account));
+    return { ...snapshot, accounts: accountsWithBridge };
   }, (event) => options.publish?.(event));
   stopPublishSnapshot = onceCleanup(() => publishSnapshot.shutdown());
   startupCleanup.add(stopPublishSnapshot);
@@ -1034,7 +1104,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     const job=await agents.getJob(jobId);
     if(!job||job.sourceType!=='line') return null;
     const current=await options.workers.binding(job.accountId);
-    if(!current||current.mode!=='ACTIVE_CONTROL'||current.purpose==='DOWNLOAD_ONLY'||current.accountId!==job.accountId
+    if(!current||current.mode!=='ACTIVE_CONTROL'||current.accountId!==job.accountId
       ||current.controlEpoch!==job.creationEpoch||(expected&&(current.workerInstanceId!==expected.workerInstanceId||current.controlEpoch!==expected.controlEpoch))
       ||!lineService.isAuthenticatedReady(current)||!options.workers.isCurrentActiveControlBinding(current)) return null;
     if(!await providerQuota.validateFailureNoticeAuthority({jobId,accountId:job.accountId,workerInstanceId:current.workerInstanceId,controlEpoch:current.controlEpoch})) return null;
@@ -1119,155 +1189,22 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       await providerQuota.saveSnapshot({provider,requestedAt:snapshot.requestedAt,fetchedAt:snapshot.fetchedAt,stale:snapshot.stale,snapshot});
       const updated=await providerQuota.get(provider);
       return updated?.blocked?{blocked:true,recoveryAt:updated.recoveryAt}:null;
-    });
+    },
+    // attachmentService is created below; the resolver reads it only when a LINE reply job runs.
+    createReplyContextResolver({ database: options.pool, attachments: { resolveReadyPath: (attachmentId) => attachmentService.resolveReadyPath(attachmentId),
+      downloadById: (attachmentId, signal) => attachmentService.downloadById(attachmentId, signal) } }));
   providerQuotaService = new ProviderQuotaService((provider) => agentService.queryQuota(provider));
   agentService.setStatusRotationIntervalSeconds(conversationSettings.agentStatusRotationIntervalSeconds);
   stopAgentService = onceCleanup(() => agentService.shutdown());
   startupCleanup.add(stopAgentService);
 
-  async function ensureDownloadOnlyWorker(accountId: string, expectedMid: string): Promise<Bound> {
-    const current = await options.workers.binding(accountId);
-    if (current) {
-      if (current.purpose === 'DOWNLOAD_ONLY' && current.expectedMid === expectedMid) return current;
-      throw new Error('Another LINE worker already owns this account.');
-    }
-    const account = await accounts.getAccount(accountId);
-    const capability = await accounts.resolveCapabilities(accountId);
-    const control = await accounts.getControlState();
-    if (!account || account.productRole !== 'PRIMARY_ADMIN' || account.ownMid !== expectedMid
-      || capability?.connectionMode !== 'EXTERNAL_MONITOR' || control.activeAccountId === accountId || loginAttempts.has(accountId)) {
-      throw new Error('External download worker eligibility changed.');
-    }
-    const binding: Bound = { accountId, workerInstanceId: randomUUID(), controlEpoch: control.controlEpoch,
-      mode: 'MONITOR_ONLY', purpose: 'DOWNLOAD_ONLY', expectedMid };
-    await options.workers.start(accountId, binding);
-    const started = await options.workers.binding(accountId);
-    if (!started || started.workerInstanceId !== binding.workerInstanceId || started.purpose !== 'DOWNLOAD_ONLY') {
-      throw new Error('External download worker did not start under its expected binding.');
-    }
-    return started;
-  }
-
-  // Borrowing the official LINE app token for external downloads is shelved.
-  const downloadTokenLookupEnabled = options.externalDownloadTokenLookup === true;
-
-  function ensureDownloadOnlyAuth(binding: Bound | null, signal?: AbortSignal, requestedAccountId?: string,
-    requestedExpectedMid?: string, canAcquireAuth?: () => boolean): Promise<boolean> {
-    if (!downloadTokenLookupEnabled) return Promise.resolve(false);
-    const accountId = binding?.accountId ?? requestedAccountId;
-    const expectedMid = binding?.expectedMid ?? requestedExpectedMid;
-    if (!accountId || !expectedMid) return Promise.resolve(false);
-    const existing = downloadAuthFlights.get(accountId);
-    if (existing) return existing;
-    const task = (async () => {
-      if (signal?.aborted || closing || !options.workers.adoptDownloadAuth) return false;
-      const access = nativeMonitorAccess.get(accountId);
-      const capability = await accounts.resolveCapabilities(accountId);
-      if (!access || access.signal.aborted || access.sourceId !== capability?.selectedSourceId
-        || access.generation !== capability?.selectedSourceGeneration) return false;
-      let current = binding ?? await ensureDownloadOnlyWorker(accountId, expectedMid);
-      if (current.purpose !== 'DOWNLOAD_ONLY' || current.expectedMid !== expectedMid) return false;
-      if (options.workers.isDownloadReady?.(current)) return true;
-      const actual = await options.workers.binding(accountId);
-      if (!actual || actual.purpose !== 'DOWNLOAD_ONLY' || actual.workerInstanceId !== current.workerInstanceId
-        || actual.controlEpoch !== current.controlEpoch || actual.expectedMid !== expectedMid) return false;
-      current = actual;
-      let acquired: Awaited<ReturnType<NativeMonitorAccess['acquireAuthCandidates']>>;
-      if (canAcquireAuth && !canAcquireAuth()) return false;
-      const probeSignal = signal ?? access.signal;
-      const probe = await resolveDownloadAuthProbe(accountId, probeSignal);
-      if (!probe) {
-        if (!signal?.aborted && !access.signal.aborted) await options.workers.stopBinding(current).catch(() => undefined);
-        return false;
-      }
-      try { acquired = await access.access.acquireAuthCandidates(probeSignal); }
-      catch (error) {
-        if (!probeSignal.aborted) {
-          options.audit?.failure(diagnosticFailure('adoptDownloadAuth', 'prepare', error),
-            { accountId, initiator: 'system', background: true }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED');
-        }
-        await options.workers.stopBinding(current).catch(() => undefined);
-        return false;
-      }
-      if (signal?.aborted || access.signal.aborted) return false;
-      for (const candidate of acquired.candidates) {
-        if (signal?.aborted || access.signal.aborted || closing) return false;
-        try {
-          const { mode: _mode, purpose: _purpose, expectedMid: _expectedMid, application: _application, ...workerBinding } = current;
-          const result = await options.workers.adoptDownloadAuth({ type: 'adoptDownloadAuth', ...workerBinding,
-            requestId: randomUUID(), token: candidate.token, application: candidate.application, expectedMid, probe }, probeSignal);
-          if (result.accepted) return true;
-        } catch { /* A failed candidate is followed by the next bounded native candidate. */ }
-      }
-      if (!signal?.aborted && !access.signal.aborted) {
-        options.audit?.failure(diagnosticFailure('adoptDownloadAuth', 'authenticate'),
-          { accountId, initiator: 'system', background: true }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED');
-        await options.workers.stopBinding(current).catch(() => undefined);
-      }
-      return false;
-    })().finally(() => { if (downloadAuthFlights.get(accountId) === task) downloadAuthFlights.delete(accountId); });
-    downloadAuthFlights.set(accountId, task);
-    return task;
-  }
-
-  async function resolveNativeAttachment(attachment: Attachment, signal: AbortSignal) {
-    if (!attachment.externalSource || !attachment.nativePayload || signal.aborted) return null;
-    const active = nativeMonitorAccess.get(attachment.accountId);
-    if (!active || active.signal.aborted) return null;
-    const result = await active.access.decodeAttachment({ envelope: attachment.nativePayload,
-      expectedMessageId: attachment.messageId, expectedChatId: attachment.chatId }, signal);
-    if (signal.aborted || !result.metadata) return null;
-    return NativeAttachmentDownloadInputSchema.parse(result.metadata);
-  }
-
-  async function resolveDownloadAuthProbe(accountId: string, signal: AbortSignal): Promise<DownloadAuthProbe | null> {
-    if (signal.aborted) return null;
-    const candidates = await messages.getRecentExternalAttachmentsForDownloadProbe(accountId, 5);
-    for (const candidate of candidates) {
-      if (signal.aborted) return null;
-      if (!isWritableChatType(candidate.chatType)) continue;
-      try {
-        const nativeAttachment = await resolveNativeAttachment(candidate, signal);
-        if (!nativeAttachment) continue;
-        return {
-          chatType: candidate.chatType,
-          chatId: candidate.chatId,
-          messageId: candidate.messageId,
-          externalAttachmentId: candidate.externalAttachmentId,
-          kind: candidate.kind,
-          lineMessage: candidate.lineMessage,
-          nativeAttachment,
-        };
-      } catch { /* Try the next recent attachment candidate. */ }
-    }
-    return null;
-  }
-
   attachmentService = new AttachmentService(messages, {
-    binding: async (accountId) => {
-      await downloadAuthFlights.get(accountId)?.catch(() => false);
-      if (!downloadTokenLookupEnabled) return await options.workers.binding(accountId);
-      const current = await options.workers.binding(accountId);
-      if (current) return current;
-      const access = nativeMonitorAccess.get(accountId);
-      if (!access || access.signal.aborted) return null;
-      const account = await accounts.getAccount(accountId);
-      if (!account?.ownMid) return null;
-      try { return await ensureDownloadOnlyWorker(accountId, account.ownMid); }
-      catch (error) {
-        options.audit?.failure(diagnosticFailure('downloadAttachment', 'spawn', error),
-          { accountId, initiator: 'system', background: true }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED');
-        return null;
-      }
-    },
-    isReady: async (binding, canAcquireAuth): Promise<boolean> => {
+    // An External Monitor account has no worker, so it gets no binding here.
+    binding: (accountId) => options.workers.binding(accountId),
+    isReady: async (binding): Promise<boolean> => {
       const current = await options.workers.binding(binding.accountId);
       if (!current || current.mode === 'PAUSED' || current.workerInstanceId !== binding.workerInstanceId
         || current.controlEpoch !== binding.controlEpoch) return false;
-      if (current.purpose === 'DOWNLOAD_ONLY') {
-        if (!await ensureDownloadOnlyAuth(current, undefined, undefined, undefined, canAcquireAuth)) return false;
-        return options.workers.isDownloadReady?.(current) ?? true;
-      }
       if (!lineService.isAttachmentReady(current)) return false;
       return await options.workers.waitModeAck(current.accountId, current.mode, 0);
     },
@@ -1275,15 +1212,27 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   }, options.attachmentRoot, 4, async (attachmentId) => {
     options.publish?.({ type: 'attachmentChanged', attachmentId });
     void publishSnapshot().catch(() => undefined);
-  }, (error, identity) => options.audit?.failure(parseSafeDiagnostic(error) ?? diagnosticFailure('attachment', 'execute', error), identity), resolveNativeAttachment, async (accountId) =>
+  }, (error, identity) => options.audit?.failure(parseSafeDiagnostic(error) ?? diagnosticFailure('attachment', 'execute', error), identity), async (accountId) =>
     (await options.pool.query<{ status: string }>('SELECT status FROM line_accounts WHERE account_id=$1', [accountId])).rows[0]?.status === 'connected',
   Math.random, (result) => recordAttachmentServerResult(options, result),
   // One audit row for each reason change of one account. The detail field holds the bounded reason code.
   (accountId, reason) => options.audit?.failure({ operation: 'attachment', stage: 'queue', outcome: 'not_started', detail: reason,
-    category: reason === 'ATTACHMENT_WORKER_UNAVAILABLE' ? 'authentication_required' : 'unavailable',
-    recovery: reason === 'ATTACHMENT_WORKER_UNAVAILABLE' ? 'relogin' : reason === 'ATTACHMENT_WORKER_NOT_READY' ? 'wait' : 'none' },
+    category: reason === 'ATTACHMENT_WORKER_UNAVAILABLE' || reason === 'BRIDGE_NOT_LOGGED_IN' ? 'authentication_required'
+      : reason === 'BRIDGE_DOWNLOAD_DISABLED' || reason === 'BRIDGE_IDENTITY_PENDING' ? 'denied' : 'unavailable',
+    recovery: reason === 'ATTACHMENT_WORKER_UNAVAILABLE' || reason === 'BRIDGE_NOT_LOGGED_IN' ? 'relogin'
+      : reason === 'ATTACHMENT_WORKER_NOT_READY' || reason === 'BRIDGE_VERIFICATION_PENDING' || reason === 'BRIDGE_IDENTITY_PENDING' ? 'wait'
+        : reason === 'BRIDGE_DOWNLOAD_DISABLED' ? 'check_configuration' : 'none' },
   { accountId, initiator: 'system' }, 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED'),
-  (key, attachmentId) => attachmentStorageService.onPrimaryReady(key,attachmentId));
+  (key, attachmentId) => attachmentStorageService.onPrimaryReady(key,attachmentId),
+  // The bridge is created below. The downloader reads it only when an External Monitor attachment downloads.
+  options.downloadBridgeRoot ? {
+    downloader: new OfficialDownloadBridgeDownloader({ getLive: () => downloadBridge?.getLive() ?? null }),
+    store: createBridgeAttachmentStore({ root: options.attachmentRoot, broker: attachmentBroker }),
+    isAutoDownloadEnabled: () => externalBridgeAutoDownload,
+    isDownloadEnabled: () => externalBridgeDownloadEnabled,
+    isIdentityVerified: () => downloadBridge?.status().identity === 'verified',
+    recordVerification: recordBridgeVerification,
+  } : undefined);
   stopAttachmentService = onceCleanup(() => attachmentService.shutdown());
   startupCleanup.add(stopAttachmentService);
   stopAttachmentStorageService = onceCleanup(() => attachmentStorageService.shutdown());
@@ -1300,7 +1249,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   if (options.openAttachmentPath) {
     attachmentOpenService = new AttachmentOpenService({ root: options.attachmentRoot,
       onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
-      authority: createRepositoryPreviewAuthority(messages), openPath: options.openAttachmentPath });
+      authority: createRepositoryPreviewAuthority(messages), openPath: options.openAttachmentPath,
+      viewImage: (attachmentId, requester) => previewService?.open(attachmentId, requester) ?? Promise.resolve(false) });
     stopAttachmentOpen = onceCleanup(() => attachmentOpenService?.shutdown());
     startupCleanup.add(stopAttachmentOpen);
   }
@@ -1356,7 +1306,107 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const adminPairings = new AdminPairingService({
     hasPrimary: (accountId) => admins.hasPrimary(accountId),
     bindPrimary: (accountId, chatId, userId) => accounts.bindPrimaryAdministrator(accountId, chatId, userId),
+  }, undefined, undefined, {
+    store: {
+      getPrimary: (accountId) => admins.getPrimaryAdministrator(accountId),
+      getVersion: (accountId) => admins.getPrimaryAdministratorVersion(accountId),
+      isPrimaryAdministrator: (accountId, chatId, userId) => admins.isPrimaryAdministrator(accountId, chatId, userId),
+      ownMid: async (accountId) => (await accounts.getAccount(accountId))?.ownMid ?? null,
+      change: (input) => accounts.changePrimaryAdministrator(input),
+    },
+    // Code 2 is shown by the renderer only. The Agent sends no LINE message at this stage.
+    onProgress: (event) => {
+      if (closing) return;
+      if (event.type === 'await_new') options.publish?.({ type: 'adminChangeProgress', accountId: event.accountId, stage: 'await_new',
+        token: event.token, expiresAt: event.expiresAt });
+      else if (event.type === 'expired') options.publish?.({ type: 'adminChangeProgress', accountId: event.accountId, stage: 'expired' });
+      else options.publish?.({ type: 'adminChangeProgress', accountId: event.accountId, stage: 'failed', code: event.code });
+    },
+    // The old administrator account stops reading before its role moves; the caller holds the lifecycle lock.
+    prepare: async () => {
+      const holder = await options.pool.query<{ account_id: string }>("SELECT account_id FROM line_accounts WHERE product_role='PRIMARY_ADMIN'");
+      for (const row of holder.rows) await stopExternalImportForAccount(row.account_id);
+    },
   });
+  startupCleanup.add(() => adminPairings.dispose());
+  if (options.downloadBridgeRoot) {
+    downloadBridge = new OfficialDownloadBridgeService({
+      root: options.downloadBridgeRoot,
+      onStatus: (status) => {
+        if (closing) return;
+        options.publish?.({ type: 'adminDownloadBridgeStatus', accountId: status.accountId, state: status.state,
+          ...(status.code ? { code: status.code } : {}),
+          ...(status.detail ? { detail: status.detail } : {}),
+          ...(status.qrImageDataUrl ? { qrImageDataUrl: status.qrImageDataUrl } : {}),
+          ...(status.pin ? { pin: status.pin } : {}),
+          ...(status.qrExpiresAt !== undefined ? { qrExpiresAt: status.qrExpiresAt } : {}),
+          ...(status.identity ? { identity: status.identity } : {}) });
+        void publishSnapshot().catch(() => undefined);
+      },
+      onError: (error) => options.audit?.failure(diagnosticFailure('ipc', 'execute', error), { background: true }),
+    });
+    stopDownloadBridge = onceCleanup(() => downloadBridge?.close());
+    startupCleanup.add(stopDownloadBridge);
+  }
+  /** One-time administrator welcome in the direct chat of the new administrator. Same no-retry rules as the first pairing. */
+  const scheduleAdminWelcome = (accountId: string, chatId: string): void => {
+    if (closing) return;
+    void track(async () => {
+      if (closing) return;
+      const binding = await options.workers.binding(accountId);
+      if (!binding || binding.mode !== 'ACTIVE_CONTROL'
+        || !options.workers.isCurrentActiveControlBinding(binding)) {
+        console.warn('[admin-pairing] welcome send skipped: binding unavailable');
+        return;
+      }
+      if (closing || !options.workers.isCurrentActiveControlBinding(binding)) return;
+      try {
+        await assertLineWriteAllowed(accountId);
+        if (closing || !options.workers.isCurrentActiveControlBinding(binding)) return;
+        const result = await sendLineCommand({ type: 'sendText', ...binding, accountId,
+          requestId: randomUUID(), chatType: 'direct', chatId,
+          text: linePrompt(options.locale ?? 'en', 'adminWelcome'), replyToMessageId: null });
+        if (result.status !== 'sent') console.warn('[admin-pairing] welcome send did not report sent');
+      } catch (error) {
+        options.audit?.failure(diagnosticFailure('sendText', 'execute', error),
+          { accountId, initiator: 'system', background: true }, 'MESSAGE_SEND_FAILED');
+        console.warn('[admin-pairing] welcome send failed');
+      }
+    }, { operation: 'line_ingest', identity: { accountId, background: true } })
+      .catch(() => console.warn('[admin-pairing] welcome send failed'));
+  };
+  /** Runs the claimed administrator change outside the ingest path, under the lifecycle lock. Real error codes reach the renderer. */
+  const runAdminChange = (agentAccountId: string, apply: () => Promise<AdminChangeOutcome>): void => {
+    if (closing) return;
+    void track(async () => {
+      let outcome: AdminChangeOutcome;
+      try { outcome = await supervisor.runLifecycle(apply); }
+      catch (error) {
+        options.audit?.failure(diagnosticFailure('database', 'persist', error), { accountId: agentAccountId, initiator: 'system', background: true });
+        const code = error instanceof Error && /^[A-Z][A-Z0-9_]{2,63}$/.test(error.message) ? error.message : 'ADMIN_CHANGE_FAILED';
+        options.publish?.({ type: 'adminChangeProgress', accountId: agentAccountId, stage: 'failed', code });
+        return;
+      }
+      if (!outcome.ok) {
+        options.publish?.({ type: 'adminChangeProgress', accountId: agentAccountId, stage: 'failed', code: outcome.code });
+        return;
+      }
+      // The download login belongs to the former administrator. Close Chrome and delete its profile.
+      await downloadBridge?.clear().catch(() => console.warn('[admin-change] download bridge clear failed'));
+      // The automatic download toggle belongs to the former administrator setup. It goes back to off.
+      externalBridgeAutoDownload = false;
+      await settings.setExternalBridgeAutoDownload(false).catch(() => console.warn('[admin-change] auto download reset failed'));
+      // The download switch and the verification counts belong to the former administrator too.
+      externalBridgeDownloadEnabled = false;
+      bridgeVerificationCache.clear();
+      await settings.setExternalBridgeDownloadEnabled(false).catch(() => console.warn('[admin-change] download switch reset failed'));
+      await publishSnapshot().catch(() => console.warn('[admin-change] snapshot publish failed'));
+      options.publish?.({ type: 'adminChangeProgress', accountId: agentAccountId, stage: 'completed',
+        newAdminName: outcome.displayName });
+      scheduleAdminWelcome(agentAccountId, outcome.newUserId);
+    }, { operation: 'line_ingest', identity: { accountId: agentAccountId, background: true } })
+      .catch(() => console.warn('[admin-change] change failed'));
+  };
   const friendEnrollment = new FriendEnrollmentService({ admins, whitelist: friendWhitelist, accounts, workers: {
     binding: (accountId) => options.workers.binding(accountId),
     isCurrentActiveControlBinding: (binding) => options.workers.isCurrentActiveControlBinding(binding),
@@ -1445,32 +1495,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       const paired = await adminPairings.consume(envelope);
       if (paired) {
         void publishSnapshot().catch(() => console.warn('[admin-pairing] snapshot publish failed'));
-        if (!closing) void track(async () => {
-          if (closing) return;
-          const binding = await options.workers.binding(envelope.accountId);
-          if (!binding || binding.mode !== 'ACTIVE_CONTROL'
-            || !options.workers.isCurrentActiveControlBinding(binding)) {
-            console.warn('[admin-pairing] welcome send skipped: binding unavailable');
-            return;
-          }
-          if (closing || !options.workers.isCurrentActiveControlBinding(binding)) return;
-          try {
-            await assertLineWriteAllowed(envelope.accountId);
-            if (closing || !options.workers.isCurrentActiveControlBinding(binding)) return;
-            const result = await sendLineCommand({ type: 'sendText', ...binding, accountId: envelope.accountId,
-              requestId: randomUUID(), chatType: 'direct', chatId: envelope.chatId,
-              text: linePrompt(options.locale ?? 'en', 'adminWelcome'), replyToMessageId: null });
-            if (result.status !== 'sent') console.warn('[admin-pairing] welcome send did not report sent');
-          } catch (error) {
-            options.audit?.failure(diagnosticFailure('sendText', 'execute', error),
-              { accountId: envelope.accountId, initiator: 'system', background: true }, 'MESSAGE_SEND_FAILED');
-            console.warn('[admin-pairing] welcome send failed');
-          }
-        }, { operation: 'line_ingest', identity: { accountId: envelope.accountId, background: true } })
-          .catch(() => console.warn('[admin-pairing] welcome send failed'));
+        scheduleAdminWelcome(envelope.accountId, envelope.chatId);
       }
+      const change = await adminPairings.consumeChange(envelope);
+      if (change.kind === 'apply') runAdminChange(envelope.accountId, change.apply);
       const enrolled = await friendEnrollment.handle(envelope, secretCandidate, ownMid, capturedBinding);
-      return paired || enrolled;
+      return paired || change.kind !== 'ignored' || enrolled;
     }, admins, workspace, roomAutomation, friendWhitelist,
     async (envelope, candidate, ownMid) => adminPairings.classify(envelope)
       || await friendEnrollment.classify(envelope, candidate, ownMid),
@@ -1571,15 +1601,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   }
 
   unsubscribeEvent = options.workers.onEvent((instance, event) => closing ? Promise.resolve() : track(async () => {
-    if (event.type === 'downloadAuthInvalidated') {
-      const binding = await options.workers.binding(event.accountId);
-      if (binding?.purpose === 'DOWNLOAD_ONLY' && binding.workerInstanceId === instance
-        && binding.controlEpoch === event.controlEpoch) {
-        void ensureDownloadOnlyAuth(binding).catch(() => undefined);
-      }
-      return;
-    }
-    if (event.type === 'downloadAuthResult' || event.type === 'downloadReady') return;
     if (!lineService.isCurrentWorkerEvent(instance, event)) return;
     if (event.type === 'authInvalidated') {
       // Settle a pending user logout from this exact binding before teardown unbinds it.
@@ -1794,10 +1815,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     chatResourceAdmission.observeBinding(binding);
     return admitted(async () => {
       if (signal.aborted) throw new Error('Worker binding cancelled');
-      if (binding.purpose === 'DOWNLOAD_ONLY') {
-        await accounts.bindWorker(binding, signal);
-        return;
-      }
       await lineService.bind(binding, signal);
       if (signal.aborted) throw new Error('Worker binding cancelled');
     }, { operation: 'line_ingest', identity: { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, background: true } });
@@ -1817,11 +1834,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const current = await options.workers.binding(binding.accountId);
         if (signal.aborted || !current || current.accountId !== binding.accountId
           || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch) return;
-        if (current.purpose === 'DOWNLOAD_ONLY') {
-          await accounts.bindWorker(current, signal);
-          await ensureDownloadOnlyAuth(current, signal);
-          return;
-        }
         if (binding.mode === 'ACTIVE_CONTROL'
           && !await supervisor.adoptWithinLifecycle(current, supervisedWorker(current), true)) return;
       }, signal);
@@ -1834,7 +1846,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     chatResourceAdmission.close(binding.accountId, 'The account mode changed.', true);
     return admitted(async () => {
       if (signal.aborted) return;
-      if (binding.purpose === 'DOWNLOAD_ONLY') return;
       await lineService.bind(binding, signal);
       if (signal.aborted) return;
       const mode = binding.mode;
@@ -1978,9 +1989,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
 
   async function reloginAccountWithQr(accountId: string, requestId: string, requestedTransport?: LineTransportKind): Promise<IpcResult> {
     return supervisor.runLifecycle(async () => {
-      await stopExternalImportForAccount(accountId);
       const account = await accounts.getAccount(accountId);
-      if (!account) return failure(requestId, 'ACCOUNT_NOT_FOUND', 'LINE account not found.');
+      if (!account) { await stopExternalImportForAccount(accountId); return failure(requestId, 'ACCOUNT_NOT_FOUND', 'LINE account not found.'); }
+      // Reject the administrator before anything stops. External monitoring must keep running.
+      if (!PRIMARY_ADMIN_LINE_LOGIN_ENABLED && account.productRole === 'PRIMARY_ADMIN') return failure(requestId, ADMIN_MONITOR_ONLY, 'The administrator account uses external monitoring only.');
+      await stopExternalImportForAccount(accountId);
       if (!account.productRole) return failure(requestId, 'ACCOUNT_ROLE_UNCLASSIFIED', 'This account has no verified Agent or Primary Admin role.');
       if (account.mode === 'PAUSED') return failure(requestId, 'ACCOUNT_PAUSED', 'This LINE account is paused.');
       // No requested method means the current method of the account. A different method is only stored after the QR login succeeds.
@@ -2110,6 +2123,58 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     });
   }
 
+  /**
+   * New External Monitor attachments of the Primary Admin: after the page commit, verify them against the extension store.
+   * The verification runs with the download switches on or off. It reads local extension memory only.
+   * The attachment service downloads through the bridge only after a `match`, with both switches on, for a queued image or file
+   * that is not older than the new-message limit. It never runs inside the ingest transaction. Errors never reach the monitor.
+   */
+  const queueNewExternalAttachments = async (accountId: string, changed: ReadonlyArray<{ chatType: string; chatId: string; messageId: string }>): Promise<void> => {
+    if (closing || changed.length === 0) return;
+    try {
+      const rows = await options.pool.query<{ attachment_id: string }>(
+        `SELECT a.attachment_id FROM attachments a JOIN messages m ON m.account_id=a.account_id AND m.chat_type=a.chat_type
+           AND m.chat_id=a.chat_id AND m.message_id=a.message_id
+         WHERE a.account_id=$1 AND a.status='queued' AND a.kind IN ('image','file') AND a.chat_type IN ('direct','group','room')
+           AND (a.chat_type,a.chat_id,a.message_id) IN (SELECT * FROM unnest($2::text[],$3::text[],$4::text[]))
+           AND m.occurred_at >= now() - ($5::integer * interval '1 millisecond')
+           AND EXISTS (SELECT 1 FROM line_accounts la WHERE la.account_id=a.account_id AND la.product_role='PRIMARY_ADMIN')
+           AND EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR')`,
+        [accountId, changed.map((row) => row.chatType), changed.map((row) => row.chatId), changed.map((row) => row.messageId), EXTERNAL_BRIDGE_AUTO_MAX_AGE_MS]);
+      for (const row of rows.rows) void attachmentService.verifyNewExternalAttachment(row.attachment_id).catch(() => undefined);
+    } catch { /* A queue error must not change monitoring. The row waits for a user click. */ }
+  };
+
+  /**
+   * Identity proof of the download bridge. After the page commit, take the new messages that the Primary Admin sent.
+   * The extension store must hold the same message with the same sender as the logged-in Chrome account.
+   * It reads local extension memory only. It never waits in the commit path. Errors never reach the monitor.
+   */
+  const queueBridgeIdentityProof = async (accountId: string, ownMid: string, changed: ReadonlyArray<{ chatType: string; chatId: string; messageId: string }>): Promise<void> => {
+    if (closing || changed.length === 0 || !downloadBridge) return;
+    const status = downloadBridge.status();
+    if (status.accountId !== accountId || status.state !== 'logged_in' || status.identity !== 'pending') return;
+    try {
+      const rows = await options.pool.query<{ message_id: string }>(
+        `SELECT m.message_id FROM messages m
+         WHERE m.account_id=$1 AND m.sender_id=$2 AND m.chat_type IN ('direct','group','room')
+           AND m.kind IN ('text','sticker','image','video','audio','file') -- The extension stores an own message from another device: handler kS (SEND_MESSAGE) for non-media, handler MS (SEND_CONTENT) for media.
+           AND (m.chat_type,m.chat_id,m.message_id) IN (SELECT * FROM unnest($3::text[],$4::text[],$5::text[]))
+           AND m.occurred_at >= now() - ($6::integer * interval '1 millisecond')
+         ORDER BY m.occurred_at DESC LIMIT 5`,
+        [accountId, ownMid, changed.map((row) => row.chatType), changed.map((row) => row.chatId), changed.map((row) => row.messageId), EXTERNAL_BRIDGE_AUTO_MAX_AGE_MS]);
+      for (const row of rows.rows) {
+        // The result shows in the bridge status detail (`proof=<result>`). Only an error needs a report here.
+        void downloadBridge.proveIdentity(row.message_id).catch((error: unknown) => {
+          try { options.audit?.failure(diagnosticFailure('attachment', 'execute', error), { background: true }); } catch { /* Diagnostics never change monitoring. */ }
+        });
+      }
+    } catch (error) {
+      // A proof error must not change monitoring. The next message of the Primary Admin tries again.
+      try { options.audit?.failure(diagnosticFailure('attachment', 'read', error), { background: true }); } catch { /* Diagnostics never change monitoring. */ }
+    }
+  };
+
   async function runDirectMonitor(input: {
     accountId: string; ownMid: string; sourceId: string; generation: number; modeRevision: number;
     sourceIdentityDigest: string; checkpoint: Record<string, unknown>; signal: AbortSignal;
@@ -2142,21 +2207,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       || pendingMonitorRefresh.sourceId !== input.sourceId || pendingMonitorRefresh.generation !== input.generation) {
       pendingMonitorRefresh = { accountId: input.accountId, sourceId: input.sourceId, generation: input.generation, pending: false };
     }
-    try {
     try { await importer({
       expectedMid: input.ownMid, sourceIdentityDigest: input.sourceIdentityDigest,
       cursor: importCursor(checkpoint) as ImportCursor | null, signal: input.signal,
       onPhase: (phase) => { diagnosticPhase = phase; },
-      onReady: (access) => {
+      onReady: () => {
         if (input.signal.aborted) return;
         readerReady = true;
         readinessDiagnosticClear = clearExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath);
-        const current = { sourceId: input.sourceId, generation: input.generation, access, signal: input.signal };
-        nativeMonitorAccess.set(input.accountId, current);
-        // The session owns the access object for the full monitor lifetime.
-        // Keep auth acquisition in its coalesced owner instead of making the
-        // reader's ready callback wait on an auxiliary request it must pump.
-        if (downloadTokenLookupEnabled) void ensureDownloadOnlyAuth(null, input.signal, input.accountId, input.ownMid).catch(() => undefined);
       },
       onProgress: () => {
         input.setProgress({ stage: 'monitoring', copiedBytes: null, totalBytes: null,
@@ -2197,6 +2255,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           signal };
         const committed: ExternalDirectPollResult = await repository(() => committer.commitDirectPoll(poll));
         requestMonitorDispatch();
+        // Only after the first full round (not the backlog) and only for rows that this commit changed.
+        if (poll.dispatchEligible === true && !committed.replayed) {
+          void queueNewExternalAttachments(input.accountId, committed.changedMessages);
+          void queueBridgeIdentityProof(input.accountId, input.ownMid, committed.changedMessages);
+        }
         // The repository commits this cursor atomically with the page. Advance
         // the local predecessor only after that transaction resolves.
         checkpoint = poll.cursor;
@@ -2214,15 +2277,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       const stage = readerReady ? 'runtime' : 'startup';
       const phase = error instanceof ExternalMonitorDiagnosticFailure && error.phase ? error.phase : diagnosticPhase;
       throw new ExternalMonitorDiagnosticFailure(classifyExternalMonitorFailure(error, stage), stage, externalMonitorFailureDetail(error), phase);
-    }
-    } finally {
-      await downloadAuthFlights.get(input.accountId)?.catch(() => false);
-      const currentAccess = nativeMonitorAccess.get(input.accountId);
-      if (currentAccess?.sourceId === input.sourceId && currentAccess.generation === input.generation) nativeMonitorAccess.delete(input.accountId);
-      const currentWorker = await options.workers.binding(input.accountId).catch(() => null);
-      if (currentWorker?.purpose === 'DOWNLOAD_ONLY' && currentWorker.expectedMid === input.ownMid) {
-        await options.workers.stopBinding(currentWorker).catch(() => undefined);
-      }
     }
   }
 
@@ -2561,8 +2615,17 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     // The admin is unset when no Agent binding and no Primary Admin slot identity exist; an Agent account is optional.
     const authenticated = await accounts.listAuthenticatedAccounts();
     const agent = authenticated.find((item) => item.productRole === 'AGENT');
-    if ((agent && await admins.hasPrimary(agent.accountId)) || authenticated.some((item) => item.productRole === 'PRIMARY_ADMIN')) {
-      return failure(requestId, 'PRIMARY_ADMIN_ALREADY_BOUND', '已經設定主要管理者。');
+    const adminRow = authenticated.find((item) => item.productRole === 'PRIMARY_ADMIN');
+    // An administrator made by pairing may start monitoring on its own row, when that row is not monitoring and the
+    // official LINE account is the same person. Every other existing administrator state stays "already bound".
+    let expectedAdminMid: string | null = null;
+    if ((agent && await admins.hasPrimary(agent.accountId)) || adminRow) {
+      const capability = adminRow ? await accounts.resolveCapabilities(adminRow.accountId) : null;
+      if (!agent || !await admins.hasPrimary(agent.accountId) || !adminRow?.ownMid || !capability
+        || capability.connectionMode !== 'OFFLINE' || capability.selectedSourceId !== null) {
+        return failure(requestId, 'PRIMARY_ADMIN_ALREADY_BOUND', '已經設定主要管理者。');
+      }
+      expectedAdminMid = adminRow.ownMid;
     }
     if (externalImportOwner || identityReadAbort) return failure(requestId, 'EXTERNAL_IMPORT_BUSY', 'LINE 讀取正在進行中，請稍後再試。', true);
     const readIdentity = options.officialSnapshotImporter?.readOfficialIdentity?.bind(options.officialSnapshotImporter);
@@ -2579,6 +2642,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return failure(requestId, 'OFFICIAL_IDENTITY_UNAVAILABLE', code, true);
       }
       if (!/^u[0-9a-f]{32}$/.test(read.mid)) return failure(requestId, 'OFFICIAL_IDENTITY_UNAVAILABLE', 'identity_invalid');
+      if (expectedAdminMid !== null && read.mid !== expectedAdminMid) {
+        return failure(requestId, 'ADMIN_IDENTITY_MISMATCH', '目前登入的 LINE 帳號與主要管理者不是同一人。');
+      }
       return { identity: { mid: read.mid, displayName: read.displayName, ...(read.picturePath === undefined ? {} : { picturePath: read.picturePath }) }, candidateCount: read.candidateCount };
     } catch (error) {
       // Never log the MID; the reader error is a finite code.
@@ -2612,6 +2678,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (!bound.ok) {
       const message = bound.code === 'AGENT_ACCOUNT_REQUIRED' ? '請先登入 Agent 帳號。'
         : bound.code === 'PRIMARY_ADMIN_ALREADY_BOUND' ? '已經設定主要管理者。'
+          : bound.code === 'ADMIN_IDENTITY_MISMATCH' ? '目前登入的 LINE 帳號與主要管理者不是同一人。'
           : 'LINE 目前的帳號無法成為主要管理者（與 Agent 帳號相同，或管理者帳號位已被其他帳號佔用）。';
       return failure(requestId, bound.code, message);
     }
@@ -2638,7 +2705,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         || account.mode === 'PAUSED' || !binding
         || capability?.connectionMode !== 'SYSTEM_LOGIN' || capability.selectedSourceType === 'EXTERNAL_MONITOR'
         || capability.sourceState === 'FENCED' || capability.sourceState === 'RETIRED'
-        || binding.mode === 'PAUSED' || binding.purpose === 'DOWNLOAD_ONLY' || !options.workers.refreshOwnProfile
+        || binding.mode === 'PAUSED' || !options.workers.refreshOwnProfile
         || !await accounts.canRefreshWorkerAvatar(binding, account.ownMid)) {
         return failure(requestId, 'LINE_PROFILE_REFRESH_UNAVAILABLE', 'A connected signed-in LINE account is required.', true);
       }
@@ -2734,9 +2801,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       if (request.type === 'lineStart') {
         return await supervisor.runLifecycle(async () => {
-          await stopExternalImportForAccount(request.accountId);
           const account = await accounts.getAccount(request.accountId);
-          if (!account) return failure(request.requestId, 'ACCOUNT_NOT_FOUND', 'LINE account not found.');
+          if (!account) { await stopExternalImportForAccount(request.accountId); return failure(request.requestId, 'ACCOUNT_NOT_FOUND', 'LINE account not found.'); }
+          if (!PRIMARY_ADMIN_LINE_LOGIN_ENABLED && account.productRole === 'PRIMARY_ADMIN') return failure(request.requestId, ADMIN_MONITOR_ONLY, 'The administrator account uses external monitoring only.');
+          await stopExternalImportForAccount(request.accountId);
           if (!account.productRole) return failure(request.requestId, 'ACCOUNT_ROLE_UNCLASSIFIED', 'This account has no assigned role slot.');
           const ltsmBlock = await chromeLtsmBlock(await transportOf(account.accountId));
           if (ltsmBlock) return chromeLtsmUnavailable(request.requestId, ltsmBlock);
@@ -2795,6 +2863,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return await supervisor.runLifecycle(async () => {
         const account = await accounts.getAccount(request.accountId);
         if (!account) return failure(request.requestId, 'ACCOUNT_NOT_FOUND', '找不到這個 LINE 帳號。');
+        if (!PRIMARY_ADMIN_LINE_LOGIN_ENABLED && account.productRole === 'PRIMARY_ADMIN') return failure(request.requestId, ADMIN_MONITOR_ONLY, 'The administrator account uses external monitoring only.');
         const loginAttemptId = loginAttempts.get(request.accountId);
         if (!account.ownMid && !loginAttemptId) return failure(request.requestId, 'ACCOUNT_NOT_AUTHENTICATED', '這不是已完成登入的 LINE 帳號。');
         const binding = await options.workers.binding(request.accountId) ?? supervisor.binding(request.accountId);
@@ -2826,6 +2895,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (request.type === 'lineSetAutoLogin') {
         const account = await accounts.getAccount(request.accountId);
         if (!account) return failure(request.requestId, 'ACCOUNT_NOT_FOUND', '找不到這個 LINE 帳號。');
+        if (!PRIMARY_ADMIN_LINE_LOGIN_ENABLED && request.enabled && account.productRole === 'PRIMARY_ADMIN') return failure(request.requestId, ADMIN_MONITOR_ONLY, 'The administrator account uses external monitoring only.');
         await accounts.setAutoLoginOnStartup(request.accountId, request.enabled);
         await publishSnapshot();
         return accepted(request.requestId);
@@ -2840,6 +2910,54 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           options.audit?.failure(diagnosticFailure('ipc', 'execute', error), { requestId });
           return failure(request.requestId, 'ADMIN_ALREADY_EXISTS', '無法建立主要管理者驗證。');
         }
+      }
+      if (request.type === 'lineBeginAdminChange') {
+        const account = await accounts.getAccount(request.accountId);
+        if (account?.productRole !== 'AGENT' || !account.ownMid || account.mode !== 'ACTIVE_CONTROL') return failure(request.requestId, 'ACCOUNT_NOT_ACTIVE', '只有已登入的主操作帳號可以更換主要管理者。');
+        try {
+          const change = await adminPairings.beginChange(request.accountId);
+          return { type: 'lineBeginAdminChange', requestId, ok: true, ...change };
+        } catch (error) {
+          if (error instanceof AdminChangeError) return failure(request.requestId, error.code, '尚未設定主要管理者，無法更換。');
+          options.audit?.failure(diagnosticFailure('ipc', 'execute', error), { requestId });
+          return failure(request.requestId, 'ADMIN_CHANGE_FAILED', '無法開始更換主要管理者。');
+        }
+      }
+      if (request.type === 'lineCancelAdminChange') {
+        adminPairings.cancelChange(request.accountId);
+        return accepted(request.requestId);
+      }
+      if (request.type === 'adminDownloadBridgeSetAutoDownload') {
+        const account = await accounts.getAccount(request.accountId);
+        if (account?.productRole !== 'PRIMARY_ADMIN') return failure(request.requestId, 'ADMIN_NOT_SET', '尚未設定主要管理者。');
+        await settings.setExternalBridgeAutoDownload(request.enabled);
+        externalBridgeAutoDownload = request.enabled;
+        await publishSnapshot().catch(() => undefined);
+        return accepted(request.requestId);
+      }
+      if (request.type === 'adminDownloadBridgeSetDownloadEnabled') {
+        const account = await accounts.getAccount(request.accountId);
+        if (account?.productRole !== 'PRIMARY_ADMIN') return failure(request.requestId, 'ADMIN_NOT_SET', '尚未設定主要管理者。');
+        await settings.setExternalBridgeDownloadEnabled(request.enabled);
+        externalBridgeDownloadEnabled = request.enabled;
+        await publishSnapshot().catch(() => undefined);
+        return accepted(request.requestId);
+      }
+      if (request.type === 'adminDownloadBridgeStart' || request.type === 'adminDownloadBridgeRefreshQr' || request.type === 'adminDownloadBridgeClear') {
+        const account = await accounts.getAccount(request.accountId);
+        if (account?.productRole !== 'PRIMARY_ADMIN') return failure(request.requestId, 'ADMIN_NOT_SET', '尚未設定主要管理者。');
+        if (!downloadBridge) return failure(request.requestId, 'DOWNLOAD_BRIDGE_UNAVAILABLE', '下載登入無法使用。');
+        if (request.type === 'adminDownloadBridgeClear') {
+          await downloadBridge.clear();
+          return accepted(request.requestId);
+        }
+        if (!account.ownMid) return failure(request.requestId, 'ADMIN_NOT_SET', '尚未設定主要管理者。');
+        if (request.type === 'adminDownloadBridgeStart') {
+          await downloadBridge.start({ accountId: account.accountId, adminMid: account.ownMid });
+          return accepted(request.requestId);
+        }
+        if (!await downloadBridge.refreshQr()) return failure(request.requestId, 'QR_REFRESH_UNAVAILABLE', '目前沒有可重新產生的 QR 碼。');
+        return accepted(request.requestId);
       }
       if (request.type === 'switchControl') {
         return failure(request.requestId, 'CONTROL_SWITCH_DISABLED', 'Account control is assigned to the fixed Agent role.');
@@ -3137,7 +3255,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         // Check the chosen login method before Main reserves a slot. A refused CHROMEOS login leaves no slot and no worker.
         const requestedBlock = await chromeLtsmBlock(request.lineTransport);
         if (requestedBlock) return chromeLtsmUnavailable(request.requestId, requestedBlock);
+        // With a logged-in Agent, the only free slot is the Primary Admin slot. That slot uses external monitoring only.
+        if (!PRIMARY_ADMIN_LINE_LOGIN_ENABLED && (await accounts.listAuthenticatedAccounts()).some((item) => item.productRole === 'AGENT')) {
+          return failure(request.requestId, ADMIN_MONITOR_ONLY, 'The administrator account uses external monitoring only.');
+        }
         const reserved = await accounts.reserveAccountSlot();
+        if (!PRIMARY_ADMIN_LINE_LOGIN_ENABLED && reserved.productRole === 'PRIMARY_ADMIN') return failure(request.requestId, ADMIN_MONITOR_ONLY, 'The administrator account uses external monitoring only.');
         if (request.lineTransport && await transportOf(reserved.accountId) !== request.lineTransport) {
           // Stop a worker that remains from the previous login method. Then store the chosen method.
           const leftover = await options.workers.binding(reserved.accountId);
@@ -3356,7 +3479,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
 
   if (options.secretStore) {
     for (const account of await accounts.listAuthenticatedAccounts()) {
-      if (account.autoLoginOnStartup !== true) {
+      // The administrator account never logs in to LINE. A stale auto-login flag does not start it.
+      if (account.autoLoginOnStartup !== true || (!PRIMARY_ADMIN_LINE_LOGIN_ENABLED && account.productRole === 'PRIMARY_ADMIN')) {
         await accounts.setConnectionStatus(account.accountId, 'disconnected');
         continue;
       }
@@ -3530,13 +3654,16 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
                 AND NOT EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
                   AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR') THEN 'queued' ELSE a.status END,
             'blockReason',CASE WHEN a.status='queued' AND a.error = ANY($6::text[]) THEN a.error END,
-            'canRetryManually',la.status='connected' AND (m.occurred_at >= now() - interval '7 days' OR NOT EXISTS (SELECT 1 FROM message_source_provenance p
+            'canRetryManually',(la.status='connected' AND (m.occurred_at >= now() - interval '7 days' OR NOT EXISTS (SELECT 1 FROM message_source_provenance p
                 WHERE p.account_id=a.account_id AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR'))
               AND (a.status='expired' OR (a.status='failed' AND (a.retry_count >= $5 OR a.retry_after='infinity'::timestamptz
                 OR EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
                   AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR')))
                 OR (a.status='queued' AND EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id
-                  AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR')))))
+                  AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR'))))
+              OR (a.status IN ('queued','failed') AND a.kind IN ('image','file') AND a.chat_type IN ('direct','group','room')
+             AND m.occurred_at >= now() - interval '7 days' AND EXISTS (SELECT 1 FROM message_source_provenance p
+               WHERE p.account_id=a.account_id AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR'))))
             FILTER (WHERE a.attachment_id IS NOT NULL),'[]'::jsonb) attachments
         FROM messages m JOIN line_accounts la ON la.account_id=m.account_id
         JOIN conversations c ON c.account_id=m.account_id AND c.chat_type=m.chat_type AND c.chat_id=m.chat_id
@@ -3699,7 +3826,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const owners = Promise.allSettled([
           () => lineService.shutdownIngress(), () => permissionCommands.close(), () => options.agent.shutdown(),
           () => options.workers.shutdown(), stopAgentService,
-          stopDelivery, stopLineSend, stopAttachmentService, stopAttachmentStorageService, stopMcpHttpServer, stopMcpService,
+          stopDelivery, stopLineSend, stopAttachmentService, stopAttachmentStorageService, stopMcpHttpServer, stopMcpService, stopDownloadBridge,
         ].map((cleanup) => Promise.resolve().then(cleanup)));
         while (inFlight.size) await Promise.allSettled([...inFlight]);
 
@@ -3734,6 +3861,16 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     catch (error) { options.audit?.failure(diagnosticFailure('refreshOwnProfile', 'recover', error)); throw error; }
   });
   ownAvatarRefreshScheduler.start(await accounts.listAuthenticatedAccounts());
+  // Download bridge resume. It starts only when `login.json` has the MID of the Primary Admin. The work runs in the background.
+  if (downloadBridge) {
+    void track(async () => {
+      const holder = await options.pool.query<{ account_id: string; own_mid: string | null }>("SELECT account_id, own_mid FROM line_accounts WHERE product_role='PRIMARY_ADMIN'");
+      const admin = holder.rows[0];
+      if (closing || !admin?.own_mid) return;
+      await downloadBridge?.startAtAppStart({ accountId: admin.account_id, adminMid: admin.own_mid });
+    }, { operation: 'external_monitor', identity: { background: true }, reportFailure: false })
+      .catch(() => console.warn('[download-bridge] startup resume failed'));
+  }
   return { ...facade,
     openAttachment: (...args) => admitted(() => facade.openAttachment!(...args), { operation: 'attachment' }),
     listMessages: (...args) => admitted(() => facade.listMessages(...args), { operation: 'ipc', identity: { accountId: args[0].accountId } }),

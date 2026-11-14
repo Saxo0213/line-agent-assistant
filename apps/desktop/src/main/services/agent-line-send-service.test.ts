@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LineSendAuditRow, SendAttachment, SendSourceMessage } from '@line-agent/database';
+import { buildAttachmentLocation } from '@line-agent/line-worker/attachment-storage';
 import {
   AgentLineSendService,
   SEND_PENDING_MAX,
@@ -156,6 +157,27 @@ describe('target and account authorization', () => {
     expect(worker.sent).toMatchObject([{kind:'media',mediaKind:'image',fileName:'原圖.png',sha256:hash}]);
     expect(await service.sendSystemAttachment({...input,validateBeforeSend:async()=>false})).toMatchObject({status:'failed'});
     expect(worker.sent).toHaveLength(1);
+  });
+  it('forwards a system owned attachment stored in the group and room layout', async () => {
+    for (const chatType of ['group', 'room'] as const) {
+      const id = randomUUID(), bytes = Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 0, 1, 0, 1, 3, 1, 17, 0, 2, 17, 0, 3, 17, 0]);
+      const hash = createHash('sha256').update(bytes).digest('hex');
+      const location = buildAttachmentLocation({ root: attachmentRoot, occurredAt: '2026-11-06T14:37:41.000Z', originalFileName: 'attachment.jpg',
+        identity: { accountId: 'admin', chatType, chatId: 'chat', messageId: 'm1', externalAttachmentId: id },
+        sender: { id: 'u1', displayName: 'Ivy\u{13170}' } });
+      expect(location.managedRelativePath.split('/')).toHaveLength(8);
+      await mkdir(location.directoryAbsolutePath, { recursive: true });
+      await writeFile(location.absolutePath, bytes);
+      repo.attachments.set(id, { attachmentId: id, accountId: 'admin', kind: 'image', name: 'photo.jpg', status: 'ready', relativePath: location.managedRelativePath,
+        sha256: hash, sizeBytes: bytes.byteLength, masked: false });
+      repo.messages.set('m1', { kind: 'image', text: null, masked: false, attachments: [repo.attachments.get(id)!] });
+      const input = { runId: randomUUID(), target: { accountId: ACCOUNT, chatType: 'direct' as const, chatId: 'u-friend' },
+        source: { accountId: 'admin', chatType, chatId: 'chat', messageId: 'm1' }, attachmentId: id, validateBeforeSend: async () => true };
+      const before = worker.sent.length;
+      expect(await service.sendSystemAttachment(input)).toEqual({ status: 'sent' });
+      expect(worker.sent.length).toBe(before + 1);
+      expect(worker.sent.at(-1)).toMatchObject({ kind: 'media', mediaKind: 'image', sha256: hash });
+    }
   });
   it('returns no Agent send targets when the current external account scope excludes a paused Agent', async () => {
     repo.account = ACCOUNT;
