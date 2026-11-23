@@ -38,6 +38,8 @@ const errorExplanationText: Partial<Record<SystemErrorCode, (text: ReturnType<ty
   FRIEND_RELATION_CHECK_FAILED: (text) => text('friendRelationCheckFailed'), FRIEND_ADD_FAILED: (text) => text('friendAddFailed'), PRIMARY_ADMIN_NOT_FRIEND: (text) => text('primaryAdminNotFriend'),
   ATTACHMENT_DOWNLOAD_OPERATION_FAILED: (text) => text('attachmentDownloadOperationFailed'),
   CREDENTIAL_RESTORE_FAILED: (text) => text('credentialRestoreFailed'), LINE_SYNC_FAILED: (text) => text('lineSyncFailed'),
+  LINE_CONNECTION_SUSPENDED: (text) => text('lineConnectionSuspended'),
+  AGENT_JOB_FAILED: (text) => text('agentJobFailed'),
 };
 
 export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOpen: (key: ConversationKey) => void; headingRef: React.RefObject<HTMLHeadingElement | null> }) {
@@ -123,6 +125,7 @@ export function WorkRecords({ api, onOpen, headingRef }: { api: DesktopApi; onOp
             {row.diagnostic.failureKind && <><dt>{diagnosticLabels[locale].failureKind}</dt><dd><code>{row.diagnostic.failureKind}</code></dd></>}
             {row.diagnostic.upstreamStatus !== undefined && <><dt>{diagnosticLabels[locale].upstreamStatus}</dt><dd><code>{row.diagnostic.upstreamStatus}</code></dd></>}
             {row.diagnostic.upstreamCode !== undefined && <><dt>{diagnosticLabels[locale].upstreamCode}</dt><dd><code>{row.diagnostic.upstreamCode}</code></dd></>}
+            {row.diagnostic.detail && <><dt>{diagnosticLabels[locale].detail}</dt><dd><code>{row.diagnostic.detail}</code></dd></>}
             <dt>{diagnosticLabels[locale].recovery}</dt><dd>{diagnosticRecovery(locale, row.diagnostic)}</dd>
           </dl> : <p>{diagnosticLabels[locale].legacy}</p>}</div><span className="badge">{desktopText('error')}</span>
       </article>)}</div>

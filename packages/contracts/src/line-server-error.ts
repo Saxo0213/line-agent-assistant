@@ -173,7 +173,7 @@ export function isLineServerErrorCode(code: unknown): code is LineServerErrorCod
   return lineServerErrorMessage(code) !== null;
 }
 
-const LOCAL_RESULT_FAILURES = ['SIDE_EFFECT_DENIED', 'LOCAL_ROUTE_DENIED', 'FILE_CHANGED', 'FILE_UNREADABLE', 'UPLOAD_FAILED'] as const;
+const LOCAL_RESULT_FAILURES = ['SIDE_EFFECT_DENIED', 'LOCAL_ROUTE_DENIED', 'FILE_CHANGED', 'FILE_UNREADABLE', 'UPLOAD_FAILED', 'LINE_CONNECTION_SUSPENDED'] as const;
 
 /** Keep only stable machine codes when projecting a worker failure into UI text. */
 export function lineResultErrorMessage(code: unknown, fallback: string, detail?: unknown): string {

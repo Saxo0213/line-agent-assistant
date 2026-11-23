@@ -312,4 +312,73 @@ describe('internal request_permission prompt tool', () => {
     expect(h.requestSpy).not.toHaveBeenCalled();
     await h.cleanup();
   });
+
+  describe('resident token between jobs and tool activity', () => {
+    type AuditEntry = { principalId: string; disposition: string | null; toolName: string | null };
+    const residentHarness = (permissions: EffectivePermissions = allPermissions('ALLOW')) => {
+      const verify = vi.fn(async () => ({ permissions, roomHistory: false }));
+      const audits: AuditEntry[] = [];
+      const tokens = {
+        verifyInternalAgent: async () => permissions,
+        verifyInternalAgentAccess: verify,
+        executeForInternalAgent: async () => ({ toolName: 'list_targets', targets: [] }),
+        recordAudit: async (entry: AuditEntry) => { audits.push(entry); },
+      } as unknown as McpTokenRepository;
+      const activity: Array<[string, number]> = [];
+      let onActivity: (jobId: string, delta: 1 | -1) => void = (jobId, delta) => { activity.push([jobId, delta]); };
+      const service = new McpService({ pool: {} as Pool, tokens, messages: {} as MessageRepository,
+        onInternalToolActivity: (jobId, delta) => onActivity(jobId, delta) });
+      const bound = service.internalCapabilities.bindResident({ residentKey: 'r', fresh: true, jobId: 'job-1', accountId: 'a', generation: 1, endpointInstance: 'instance' }) as { token: string };
+      const rpc = (method: string, params?: unknown, instance = 'instance') => service.handleInternalJsonRpc(bound.token, instance,
+        { jsonrpc: '2.0', id: 1, method, ...(params === undefined ? {} : { params }) });
+      return { service, rpc, verify, audits, activity, setActivity: (fn: typeof onActivity) => { onActivity = fn; } };
+    };
+
+    it('answers the handshake without a database read, lists the cached tools and denies tools/call between jobs', async () => {
+      const h = residentHarness();
+      try {
+        const listed = await h.rpc('tools/list');
+        const tools = (listed.body as { result: { tools: unknown[] } }).result.tools;
+        expect(tools.length).toBeGreaterThan(0);
+        h.service.internalCapabilities.release('job-1');
+        h.verify.mockClear();
+        expect((await h.rpc('initialize', { protocolVersion: '2025-03-26' })).httpStatus).toBe(200);
+        expect((await h.rpc('notifications/initialized')).httpStatus).toBe(202);
+        expect((await h.rpc('ping')).httpStatus).toBe(200);
+        const idleList = await h.rpc('tools/list');
+        expect((idleList.body as { result: { tools: unknown[] } }).result.tools).toEqual(tools);
+        const call = await h.rpc('tools/call', { name: 'list_targets', arguments: {} });
+        expect(call.httpStatus).toBe(403);
+        expect(call.body).toMatchObject({ error: { data: { code: 'SCOPE_DENIED' } } });
+        expect(h.audits.some((entry) => entry.principalId === 'internal:job:idle' && entry.disposition === 'SCOPE_DENIED')).toBe(true);
+        expect((await h.rpc('resources/list')).httpStatus).toBe(404);
+        expect(h.verify).not.toHaveBeenCalled();
+        // Another listener instance never sees the idle answers.
+        expect((await h.rpc('ping', undefined, 'other')).httpStatus).not.toBe(200);
+      } finally { await h.service.shutdown(); }
+    });
+
+    it('returns an empty tool list between jobs when none was recorded', async () => {
+      const h = residentHarness();
+      try {
+        h.service.internalCapabilities.release('job-1');
+        const idleList = await h.rpc('tools/list');
+        expect((idleList.body as { result: { tools: unknown[] } }).result.tools).toEqual([]);
+      } finally { await h.service.shutdown(); }
+    });
+
+    it('reports +1 before and -1 after every tools/call, and ignores a callback throw', async () => {
+      const h = residentHarness();
+      try {
+        expect((await h.rpc('tools/call', { name: 'list_targets', arguments: {} })).httpStatus).toBe(200);
+        expect(h.activity).toEqual([['job-1', 1], ['job-1', -1]]);
+        await h.rpc('tools/call', { name: 'not_a_tool', arguments: {} });
+        expect(h.activity.slice(2)).toEqual([['job-1', 1], ['job-1', -1]]);
+        await h.rpc('ping');
+        expect(h.activity).toHaveLength(4);
+        h.setActivity(() => { throw new Error('callback failure'); });
+        expect((await h.rpc('tools/call', { name: 'list_targets', arguments: {} })).httpStatus).toBe(200);
+      } finally { await h.service.shutdown(); }
+    });
+  });
 });

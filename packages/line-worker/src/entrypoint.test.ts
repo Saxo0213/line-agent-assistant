@@ -3,6 +3,7 @@ import { FakeLineTransport } from './fake-transport.js';
 import { fetchLineRequest, fetchWithTimeout, runWorkerLoopOnPort } from './entrypoint.js';
 import { LineServerRejection } from './line-server-error.js';
 import { ChromeApiError, ChromeLoginProtocolError, tagLoginStage } from '@line-agent/line-chrome';
+import { classifyLinejsFailure, tagLinejsFailure } from './login-failure-detail.js';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const cursor = { version: 1 as const, revision: '0', globalRev: '0', individualRev: '0' };
@@ -825,4 +826,15 @@ it('adds no detail to a timeout failure', async () => {
   const failure = await loginFailureOf(async () => { throw Object.assign(new Error(secretText), { name: 'TimeoutError' }); });
   expect(failure.code).toBe('LOGIN_TIMEOUT');
   expect(Object.hasOwn(failure, 'detail')).toBe(false);
+});
+
+it('adds the LINEJS method, the HTTP status and a fixed kind and reports the status, never the message', async () => {
+  const error = new Error(`Request internal failed: status=404 ${secretText}`);
+  tagLinejsFailure(error, { method: 'getProfile', httpStatus: 404, kind: classifyLinejsFailure(error) });
+  tagLinejsFailure(error, { method: 'other', httpStatus: 500, kind: 'local_error' });
+  const failure = await loginFailureOf(async () => { throw error; });
+  expect(failure).toMatchObject({ code: 'LOGIN_FAILED', detail: 'credential_swap:Error:getProfile:http404:unparsable_response', upstreamStatus: 404 });
+  expect(classifyLinejsFailure(new Error('bad key size'))).toBe('e2ee_key_size');
+  expect(classifyLinejsFailure(new Error('fid 3 wrong'))).toBe('thrift_parse');
+  expect(classifyLinejsFailure(new Error(secretText))).toBe('local_error');
 });

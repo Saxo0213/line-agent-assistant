@@ -152,26 +152,29 @@ describe('terminal state publication ordering', () => {
     expect(providerRuns).toBe(0);
   });
 
-  it('publishes started after the provider session is bound', async () => {
+  it.each(['completed', 'failed'] as const)('binds the provider session only when the job completes (%s)', async (outcome) => {
     const order: string[] = [];
     let claimed = false;
     const job = { jobId: 'job-started', accountId: 'a', chatType: 'direct' as const, chatId: 'c', provider: 'codex' as const,
-      prompt: 'work', workspacePath: 'C:\\trusted', generation: 0, status: 'running' as const,
+      prompt: 'work', workspacePath: 'C:\trusted', generation: 0, status: 'running' as const,
       sourceType: 'ui' as const, sourceMessageId: null, sourceRequestId: 'r', creationEpoch: null };
     const repository = {
       async claimNext() { if (claimed) return null; claimed = true; return job; },
-      async getJob() { return job; }, async lookupSession() { return null; }, async appendEvent() { order.push('persist-event'); },
-      async bindSession() { order.push('bind-session'); return true; }, async completeJob() { return true; },
-      async failJob() { return true; }, async cancelJob() { return true; },
+      async getJob() { return job; }, async lookupSession() { return null; }, async appendEvent(_jobId: string, event: AgentEvent) { order.push(`persist-${event.type}`); },
+      async bindSession() { order.push('bind-session'); return true; }, async completeJob() { order.push('complete-commit'); return true; },
+      async failJob() { order.push('fail-commit'); return true; }, async cancelJob() { return true; },
     };
-    const service = newAgentService(repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' },
-      { async *run() { yield { type: 'started' as const, externalSessionId: 'session-1', workspacePath: 'C:\\trusted' }; }, async cancel() {} },
+    const terminal: AgentEvent = outcome === 'completed' ? { type: 'completed', finalText: 'answer' } : { type: 'failed', code: 'PROVIDER_FAILED', message: 'no', retryable: false };
+    const service = newAgentService(repository as unknown as AgentRepository, { current: async () => 'C:\trusted' },
+      { async *run() { yield { type: 'started' as const, externalSessionId: 'session-1', workspacePath: 'C:\trusted' }; yield terminal; }, async cancel() {} },
       (_jobId, event) => { if (event.type === 'started') order.push('publish-started'); });
 
     service.kick(key('c'));
     await service.idle();
 
-    expect(order).toEqual(['persist-event', 'bind-session', 'publish-started']);
+    expect(order).toEqual(outcome === 'completed'
+      ? ['persist-started', 'publish-started', 'persist-completed', 'bind-session', 'complete-commit']
+      : ['persist-started', 'publish-started', 'persist-failed', 'fail-commit']);
   });
 
   it('publishes completed only after completeJob commits', async () => {
@@ -205,7 +208,7 @@ describe('LINE execution reactions', () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const started = new Promise<void>((resolve) => { announceStart = resolve; });
     let claimed = false;
-    const job = { jobId: 'reaction-timeout', accountId: 'a', chatType: 'direct' as const, chatId: 'chat-timeout', provider: 'codex' as const,
+    const job = { jobId: 'reaction-timeout', accountId: 'a', chatType: 'direct' as const, chatId: 'chat-timeout', provider: 'claude' as const,
       prompt: 'work', workspacePath: 'C:\\trusted', generation: 0, status: 'running' as 'running' | 'failed',
       sourceType: 'line' as const, sourceMessageId: 'source-timeout', sourceRequestId: null, creationEpoch: 1 };
     let cancelCalls = 0;
@@ -275,7 +278,7 @@ describe('LINE execution reactions', () => {
     let releaseHeartbeat!: () => void;
     const heartbeat = new Promise<void>((resolve) => { releaseHeartbeat = resolve; });
     let claimed = false;
-    const job = { jobId: 'reaction-terminal', accountId: 'a', chatType: 'direct' as const, chatId: 'chat-terminal', provider: 'codex' as const,
+    const job = { jobId: 'reaction-terminal', accountId: 'a', chatType: 'direct' as const, chatId: 'chat-terminal', provider: 'claude' as const,
       prompt: 'work', workspacePath: 'C:\\trusted', generation: 0, status: 'running' as const,
       sourceType: 'line' as const, sourceMessageId: 'source-terminal', sourceRequestId: null, creationEpoch: 1 };
     const reactions: string[] = [];
@@ -653,7 +656,7 @@ describe('global Agent execution capacity', () => {
 
   it('does not leave a timed-out job running when the first timeout event write fails', async () => {
     const job = { jobId: 'timeout-write-job', accountId: 'a', chatType: 'direct' as const, chatId: 'timeout-write',
-      provider: 'codex' as const, prompt: 'work', workspacePath: 'C:\\trusted', generation: 0,
+      provider: 'claude' as const, prompt: 'work', workspacePath: 'C:\\trusted', generation: 0,
       status: 'running' as 'running' | 'failed', sourceType: 'ui' as const, sourceMessageId: null, sourceRequestId: 'r', creationEpoch: null };
     let claimed = false; let release!: () => void; let status: 'running' | 'failed' = 'running'; let timeoutWrites = 0;
     const repository = {
@@ -762,7 +765,7 @@ describe('global Agent execution capacity', () => {
 
   it('cancels TIMEOUT persistence backoff on shutdown after the provider has exited', async () => {
     const job = { jobId: 'timeout-shutdown', accountId: 'a', chatType: 'direct' as const, chatId: 'timeout-shutdown',
-      provider: 'codex' as const, prompt: 'work', workspacePath: 'C:\\trusted', generation: 0,
+      provider: 'claude' as const, prompt: 'work', workspacePath: 'C:\\trusted', generation: 0,
       status: 'running' as const, sourceType: 'ui' as const, sourceMessageId: null, sourceRequestId: 'r', creationEpoch: null };
     let claimed = false; let release!: () => void; let cancelCalls = 0; let failCalls = 0;
     const repository = {
@@ -925,7 +928,7 @@ describe('global Agent execution capacity', () => {
 
   it('cancels an over-deadline provider tree and persists one timeout terminal event', async () => {
     const job = { jobId: 'deadline-job', accountId: 'a', chatType: 'direct' as const, chatId: 'deadline',
-      provider: 'codex' as const, prompt: 'work', workspacePath: 'C:\\trusted', generation: 0,
+      provider: 'claude' as const, prompt: 'work', workspacePath: 'C:\\trusted', generation: 0,
       status: 'running' as const, sourceType: 'ui' as const, sourceMessageId: null, sourceRequestId: 'r', creationEpoch: null };
     let claimed = false; let release!: () => void; let cancelCalled = false; let failed = 0;
     const events: AgentEvent[] = [];

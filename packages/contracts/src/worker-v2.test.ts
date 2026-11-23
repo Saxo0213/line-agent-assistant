@@ -356,6 +356,9 @@ describe('lineTransport on init', () => {
     expect(LineWorkerCommandSchema.safeParse({ ...init, chromeLtsmDir: '/abs/ltsm' }).success).toBe(false);
     expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'DESKTOPWIN', chromeLtsmDir: '/abs/ltsm' }).success).toBe(false);
     expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', unknownField: 1 }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, legyEncrypted: true }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'DESKTOPWIN', legyEncrypted: false }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', legyEncrypted: true }).success).toBe(false);
   });
   it('carries the transport on the shared binding and types the unavailable-store error', () => {
     expect(LineWorkerCommandSchema.safeParse({ type: 'poll', ...binding, lineTransport: 'CHROMEOS' }).success).toBe(true);

@@ -17,7 +17,7 @@ export const BRIDGE_GATE_IMAGE_MATCH_THRESHOLD = 50;
 export const BRIDGE_GATE_FILE_MATCH_THRESHOLD = 20;
 
 export type BridgeKind = 'image' | 'file';
-export type BridgeVerifyResult = 'match' | 'mismatch' | 'not_in_store' | 'native_incomplete';
+export type BridgeVerifyResult = 'match' | 'mismatch' | 'not_in_store' | 'native_incomplete' | 'store_incomplete';
 
 export interface BridgeVerification {
   readonly result: BridgeVerifyResult;
@@ -25,12 +25,13 @@ export interface BridgeVerification {
   readonly detail: string;
 }
 
-/** Audit result codes of the four results. */
+/** Audit result codes of the five results. */
 export const BRIDGE_VERIFY_RESULT_CODES = {
   match: 'BRIDGE_VERIFY_MATCH',
   mismatch: 'BRIDGE_VERIFY_MISMATCH',
   not_in_store: 'BRIDGE_VERIFY_NOT_IN_STORE',
   native_incomplete: 'BRIDGE_VERIFY_NATIVE_INCOMPLETE',
+  store_incomplete: 'BRIDGE_VERIFY_STORE_INCOMPLETE',
 } as const satisfies Record<BridgeVerifyResult, string>;
 
 export function bridgeGateThreshold(kind: BridgeKind): number {
@@ -87,10 +88,17 @@ export function classifyBridgeComparison(raw: unknown): BridgeVerification | nul
     if (names.length > 0) segments.push(`${state}:${names.join(':')}`);
   }
   const blocking = segments.length > 0;
+  // The store message can be a placeholder until the upload ends: same id, STRICT items missing only on the store side.
+  // The flags contentType, path and headPath can be false in this case.
+  const strictConflict = STRICT_NAMES.some((name) => input[name] === 'diff' || input[name] === 'missing_official');
+  const placeholder = input.id === true && !strictConflict && input[OID_NAME] !== 'diff'
+    && STRICT_NAMES.some((name) => input[name] === 'missing_chrome');
   const info = INFO_NAMES.filter((name) => input[name] !== 'same');
   if (info.length > 0) segments.push(`info:${info.join(':')}`);
-  if (!blocking) segments.unshift('match');
-  return { result: blocking ? 'mismatch' : 'match', detail: segments.join('.').slice(0, 160) };
+  if (placeholder) segments.unshift('store_incomplete');
+  else if (!blocking) segments.unshift('match');
+  const result: BridgeVerifyResult = placeholder ? 'store_incomplete' : blocking ? 'mismatch' : 'match';
+  return { result, detail: segments.join('.').slice(0, 160) };
 }
 
 /** First bytes of a photo: JPEG, PNG, GIF, WEBP or HEIF/HEIC. */

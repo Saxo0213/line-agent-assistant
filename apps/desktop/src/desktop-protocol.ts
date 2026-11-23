@@ -73,7 +73,7 @@ const LocalSystemErrorCode = z.enum(['DATABASE_WRITE_FAILED', 'FALLBACK_WRITE_FA
   'HISTORY_READ_FAILED', 'CHAT_RESOURCE_READ_FAILED', 'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED',
   'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED', 'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED', 'PRIMARY_ADMIN_NOT_FRIEND',
   'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED',
-  'UNKNOWN_ERROR']);
+  'LINE_CONNECTION_SUSPENDED', 'AGENT_JOB_FAILED', 'UNKNOWN_ERROR']);
 const SystemErrorCode = z.union([LocalSystemErrorCode,
   z.custom<LineServerErrorCode>((value) => typeof value === 'string' && value.length <= 80 && isLineServerErrorCode(value))]);
 const SystemActivityAuditSchema = z.strictObject({ kind: z.literal('audit'), createdAt: z.iso.datetime({ offset: true }),

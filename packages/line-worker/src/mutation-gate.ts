@@ -31,7 +31,11 @@ export type TrustedInvocationDispatch<RpcResult, TransportResult> =
 export type TrustedRequestClient<Call, RpcResult, TransportResult> = Readonly<{
   invoke(call: Call, dispatch: TrustedInvocationDispatch<RpcResult, TransportResult>): Promise<RpcResult>;
 }>;
+/** How V3 Talk RPCs (/S4, /SYNC4) reach LINE. The gate accepts exactly one of the two. */
+export type TalkTransportKind = "legy-encrypted" | "plain";
 export type MutationGateOptions<Call, RpcResult, TransportResult> = Readonly<{
+  /** Absent means "legy-encrypted". "plain" accepts a V3 Talk RPC only as the direct logical request to the RPC host. */
+  talkTransport?: TalkTransportKind;
   accountId: string;
   workerInstanceId: string;
   controlEpoch?: number;
@@ -136,6 +140,7 @@ export class MutationGate<Call, RpcResult, TransportResult> {
   readonly #accountId: string;
   readonly #workerInstanceId: string;
   readonly #controlEpoch: number | undefined;
+  readonly #talkTransport: TalkTransportKind;
   readonly #validateControlLease: MutationGateOptions<Call, RpcResult, TransportResult>["validateControlLease"];
   readonly #requestClient: TrustedRequestClient<Call, RpcResult, TransportResult>;
   readonly #physicalTransport: MutationGateOptions<Call, RpcResult, TransportResult>["physicalTransport"];
@@ -151,6 +156,7 @@ export class MutationGate<Call, RpcResult, TransportResult> {
     this.#accountId = options.accountId;
     this.#workerInstanceId = options.workerInstanceId;
     this.#controlEpoch = options.controlEpoch;
+    this.#talkTransport = options.talkTransport === "plain" ? "plain" : "legy-encrypted";
     this.#validateControlLease = options.validateControlLease;
     this.#requestClient = options.requestClient;
     this.#physicalTransport = options.physicalTransport;
@@ -353,6 +359,7 @@ export class MutationGate<Call, RpcResult, TransportResult> {
     if (transport.mode === "unsupported") return deny("legacy opaque token transport is unsupported");
     const talk = logicalPath === "/S4" || logicalPath === "/SYNC4";
     if (transport.mode === "legy-encrypted") {
+      if (this.#talkTransport !== "legy-encrypted") return deny("LEGY encrypted transport is not enabled");
       if (transport.tokenState !== "v3-jwt" || !talk) return deny("LEGY encrypted mode/token/path mismatch");
       return { url: LEGY_OUTER_URL, sameAsLogical: false };
     }
@@ -363,7 +370,8 @@ export class MutationGate<Call, RpcResult, TransportResult> {
       }
       return { url: logicalUrl, sameAsLogical: true };
     }
-    if (talk) return deny("V3 Talk RPC must use the verified LEGY outer transport");
+    // The plain transport sends the logical request itself. The physical URL and request identity must equal the logical ones.
+    if (talk && this.#talkTransport !== "plain") return deny("V3 Talk RPC must use the verified LEGY outer transport");
     return { url: logicalUrl, sameAsLogical: true };
   }
 

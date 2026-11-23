@@ -63,7 +63,7 @@ database('reply context of a LINE job (real database)', () => {
     const epoch = (await accounts.getControlState()).controlEpoch;
     await accounts.activateControl(accountId, epoch);
     await accounts.bindWorker({ accountId, workerInstanceId: 'w1', controlEpoch: epoch });
-    await accounts.applyWorkerLogin({ accountId, workerInstanceId: 'w1', controlEpoch: epoch }, OWN_MID, 'Agentsaxo');
+    await accounts.applyWorkerLogin({ accountId, workerInstanceId: 'w1', controlEpoch: epoch }, OWN_MID, 'AgentDemo');
     for (const chatId of ['g1', 'g2']) await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES ($1,'group',$2,'群組')", [accountId, chatId]);
     await pool.query("INSERT INTO conversation_members(account_id,chat_type,chat_id,member_id,display_name) VALUES ($1,'group','g1',$2,'小明')", [accountId, MEMBER_MID]);
   });
@@ -88,7 +88,7 @@ database('reply context of a LINE job (real database)', () => {
 
   it('names the quoted sender, the Taipei time and the text', async () => {
     await message('q1', { text: '今天幾點出發' });
-    await message('r1', { text: '@Agentsaxo 好嗎', reply: 'q1' });
+    await message('r1', { text: '@AgentDemo 好嗎', reply: 'q1' });
     const result = await resolver()(input('r1'));
     expect(result).toEqual({ section: '\n\n---\n這則訊息是在回覆以下訊息：\n[小明] 11/5 09:03：今天幾點出發', files: [] });
   });
@@ -97,7 +97,7 @@ database('reply context of a LINE job (real database)', () => {
     await message('q2', { sender: OWN_MID, text: 'x'.repeat(2500) });
     await message('r2', { reply: 'q2' });
     const section = (await resolver()(input('r2')))!.section;
-    expect(section).toContain(`[Agentsaxo] 11/5 09:03：${'x'.repeat(2000)}…`);
+    expect(section).toContain(`[AgentDemo] 11/5 09:03：${'x'.repeat(2000)}…`);
     expect(section).not.toContain('x'.repeat(2001));
   });
 

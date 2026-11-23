@@ -134,7 +134,8 @@ describe('Codex extension arguments',()=>{
     const base=codexArguments(codex(),'C:\\ws');
     const withOverrides=codexArguments(codex({extensions:extensions()}),'C:\\ws');
     expect(value(withOverrides,'--sandbox')).toBe(value(base,'--sandbox'));
-    expect(withOverrides.slice(-4)).toEqual(base.slice(-4));
+    expect(withOverrides.slice(0,6)).toEqual(base.slice(0,6));
+    expect(withOverrides.at(-1)).toBe('-');
   });
 });
 

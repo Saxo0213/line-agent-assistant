@@ -1,9 +1,7 @@
-import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, realpath, rename, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, realpath } from 'node:fs/promises';
 import { AGENT_ATTACHMENT_LIMITS, type AgentProvider } from '@line-agent/contracts';
 import { PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, parseLineStickerDescriptor } from '@line-agent/database';
-import { ATTACHMENT_DIRECTORY, assertWithin, humanSize, jobDirectory, removeJobAttachments, sanitizeAttachmentName, sniffAttachment, uniqueName, type ResolvedAttachment } from './agent-attachments.js';
+import { COPY_VERIFY_FAILED, assertWithin, copyReadyFile, humanSize, jobDirectory, removeJobAttachments, type ResolvedAttachment } from './agent-attachments.js';
 
 /**
  * Reply context of a LINE job. When the trigger message replies to an earlier message, the run request names the
@@ -44,7 +42,6 @@ export const REPLY_DOWNLOAD_WAIT_MS = 30_000;
 const MISSING_LINE = '（被回覆的訊息不在系統紀錄中）';
 const HEADER = '\n\n---\n這則訊息是在回覆以下訊息：\n';
 const KIND_LABELS: Record<string, string> = { image: '圖片', video: '影片', audio: '語音', file: '檔案', sticker: '貼圖' };
-const IMAGE_EXTENSIONS: Record<string, string> = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp' };
 
 interface QuotedRow {
   sender_name: string | null; kind: string; text_content: string | null; occurred_at: Date | string; withdrawn: boolean | null;
@@ -113,34 +110,7 @@ const fileLabel = (row: AttachmentRow, name: string | null, size: number | null)
 const notReadyReason = (row: AttachmentRow): string =>
   row.status === 'queued' && row.error === 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' ? '外部監控來源無法下載' : '尚未下載';
 
-const VERIFY_FAILED = '檔案驗證失敗';
-
-/** Copies one ready file into the job directory and checks the copy against the stored size and SHA-256. */
-async function copyReadyFile(input: { row: AttachmentRow; source: string; directory: string; jobId: string; index: number; used: Set<string> }):
-  Promise<{ file: ResolvedAttachment } | { reason: string }> {
-  const { row, source, directory, jobId, index, used } = input;
-  const expectedSize = Number(row.size_bytes);
-  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || !row.sha256) return { reason: VERIFY_FAILED };
-  const expectedHash = row.sha256.toLowerCase();
-  let name = uniqueName(sanitizeAttachmentName(row.name ?? `${row.kind}-${index + 1}`, index), used);
-  const target = join(directory, name);
-  // A copy that fails a check is deleted, so no unverified bytes stay in the job directory.
-  const fail = async () => { await rm(join(directory, name), { force: true }).catch(() => undefined); return { reason: VERIFY_FAILED }; };
-  try {
-    assertWithin(directory, target);
-    await copyFile(source, target);
-    const copied = await readFile(target);
-    if (copied.byteLength !== expectedSize || createHash('sha256').update(copied).digest('hex') !== expectedHash) return await fail();
-    const sniffed = sniffAttachment(copied, name);
-    if (sniffed.kind === 'image' && !/\.[A-Za-z0-9]{1,8}$/.test(name)) {
-      // An image without an extension gets one from its magic bytes, so the Agent tools open it as an image.
-      const renamed = uniqueName(`${name}${IMAGE_EXTENSIONS[sniffed.mime] ?? ''}`, used);
-      if (renamed !== name) { await rename(target, join(directory, renamed)); name = renamed; }
-    }
-    return { file: { name, size: expectedSize, kind: sniffed.kind, mime: sniffed.mime, sha256: expectedHash,
-      relativePath: `${ATTACHMENT_DIRECTORY}/${jobId}/${name}`, absolutePath: join(directory, name) } };
-  } catch { return await fail(); }
-}
+const VERIFY_FAILED = COPY_VERIFY_FAILED;
 
 const QUOTED_SQL = `SELECT ${SENDER_NAME_SQL} AS sender_name, m.kind, m.text_content, m.occurred_at, m.reply_to_message_id, m.content, m.raw,
      (COALESCE(m.content->>'type', '') = 'unsent' OR m.raw ? 'sourceDeleted') AS withdrawn

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { mkdir, realpath, rm, stat, lstat, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { copyFile, mkdir, readFile, realpath, rename, rm, stat, lstat, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { AGENT_ATTACHMENT_LIMITS, sniffImageMimeType, type AgentAttachmentUpload, type AgentProvider, type AgentStoredAttachment } from '@line-agent/contracts';
 
@@ -127,6 +128,46 @@ export async function storeAttachments(input: { workspace: string; jobId: string
 }
 
 export type ResolvedAttachment = AgentStoredAttachment & { absolutePath: string };
+
+export const COPY_VERIFY_FAILED = '檔案驗證失敗';
+const IMAGE_EXTENSIONS: Record<string, string> = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp' };
+
+/**
+ * Copies one stored file into the job directory and checks the copy against the stored size and SHA-256.
+ * With exclusive, an existing file is never overwritten or deleted.
+ */
+export async function copyReadyFile(input: {
+  row: { name: string | null; kind: string; size_bytes: string | number | null; sha256: string | null };
+  source: string; directory: string; jobId: string; index: number; used: Set<string>; exclusive?: boolean;
+}): Promise<{ file: ResolvedAttachment } | { reason: string }> {
+  const { row, source, directory, jobId, index, used, exclusive } = input;
+  const expectedSize = Number(row.size_bytes);
+  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || !row.sha256) return { reason: COPY_VERIFY_FAILED };
+  const expectedHash = row.sha256.toLowerCase();
+  let name = uniqueName(sanitizeAttachmentName(row.name ?? `${row.kind}-${index + 1}`, index), used);
+  const target = join(directory, name);
+  let created = false;
+  // A copy that fails a check is deleted, so no unverified bytes stay in the job directory.
+  const fail = async () => {
+    if (!exclusive || created) await rm(join(directory, name), { force: true }).catch(() => undefined);
+    return { reason: COPY_VERIFY_FAILED };
+  };
+  try {
+    assertWithin(directory, target);
+    await copyFile(source, target, exclusive ? fsConstants.COPYFILE_EXCL : 0);
+    created = true;
+    const copied = await readFile(target);
+    if (copied.byteLength !== expectedSize || createHash('sha256').update(copied).digest('hex') !== expectedHash) return await fail();
+    const sniffed = sniffAttachment(copied, name);
+    if (sniffed.kind === 'image' && !/.[A-Za-z0-9]{1,8}$/.test(name)) {
+      // An image without an extension gets one from its magic bytes, so the Agent tools open it as an image.
+      const renamed = uniqueName(`${name}${IMAGE_EXTENSIONS[sniffed.mime] ?? ''}`, used);
+      if (renamed !== name) { await rename(target, join(directory, renamed)); name = renamed; }
+    }
+    return { file: { name, size: expectedSize, kind: sniffed.kind, mime: sniffed.mime, sha256: expectedHash,
+      relativePath: `${ATTACHMENT_DIRECTORY}/${jobId}/${name}`, absolutePath: join(directory, name) } };
+  } catch { return await fail(); }
+}
 
 /** Run-time lookup: every stored file must still be an existing regular file inside the job directory. */
 export async function resolveStoredAttachments(workspace: string, jobId: string, attachments: readonly AgentStoredAttachment[]): Promise<ResolvedAttachment[]> {

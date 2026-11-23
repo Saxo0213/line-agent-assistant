@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { codexQuotaWindows, formatProviderQuota, ProviderQuotaService, quotaFailureSuggestion } from './provider-quota-service.js';
+import { codexQuotaWindows, formatProviderQuota, ProviderQuotaService } from './provider-quota-service.js';
 
 describe('provider quota formatting', () => {
   it('uses the provider supplied duration and reset time for each Codex window', () => {
@@ -22,6 +22,16 @@ describe('provider quota formatting', () => {
     expect(calls).toBe(1);
     expect(left.fetchedAt).toBeNull();
     expect(right.error).toBe('offline');
+  });
+
+  it('keeps one cache and one query per account source and passes the account to the query', async () => {
+    const asked: Array<string | undefined> = [];
+    const service = new ProviderQuotaService(async (_provider, account) => { asked.push(account?.id); return { rateLimits: { primary: { usedPercent: 10, windowDurationMins: 60 } } }; });
+    const [system, managed] = await Promise.all([service.get('codex'), service.get('codex', { id: 'acct-0123456789', kind: 'managed' })]);
+    await service.get('codex', { id: 'acct-0123456789', kind: 'managed' });
+    expect(asked).toEqual([undefined, 'acct-0123456789']);
+    expect([system.sourceId, managed.sourceId]).toEqual(['codex', 'acct-0123456789']);
+    expect(formatProviderQuota(managed, 'Work')).toMatch(/^帳號「Work」\nCodex 額度/);
   });
 
   it('prefers authoritative Claude limits and labels scoped quota from the returned model name', async () => {
@@ -54,9 +64,6 @@ describe('provider quota formatting', () => {
     expect(snapshot.windows).toEqual([expect.objectContaining({ label: 'Fable 專用每週額度', usedPercent: 57, blocksProvider: false })]);
     expect(snapshot.availabilityKnown).toBe(false);
     expect(formatProviderQuota(snapshot)).toContain('整體可用性：未知');
-    expect(quotaFailureSuggestion({ currentName:'Codex',currentRecoveryAt:null,targetName:'Claude',currentBlocked:true,
-      alternateBlocked:false,alternateRecoveryAt:null,alternateAvailable:snapshot.availabilityKnown,alternateQueryError:null,
-      alternateStale:false,consentAvailable:false,originalSenderAdmin:true })).toContain('目前無法確認 Claude Agent 是否可用');
   });
 
   it('falls back only to recognized general Claude legacy fields when limits are absent or unusable', async () => {
@@ -71,15 +78,5 @@ describe('provider quota formatting', () => {
       expect.objectContaining({ label: 'five_hour', usedPercent: 37, blocksProvider: true }),
       expect.objectContaining({ label: 'seven_day', usedPercent: 61, blocksProvider: true }),
     ]);
-  });
-
-  it('reports both persisted providers blocked with both reset times even when the alternate query errors', () => {
-    const suggestion=quotaFailureSuggestion({currentName:'Codex',currentRecoveryAt:'2026-11-01T00:00:00Z',targetName:'Claude',currentBlocked:true,alternateBlocked:true,
-      alternateRecoveryAt:'2026-11-02T16:00:00Z',alternateAvailable:false,alternateQueryError:'OAuth unavailable',
-      alternateStale:true,consentAvailable:false,originalSenderAdmin:true});
-    expect(suggestion).toMatch(/Codex Agent 預計重設：.+；Claude Agent 預計重設：.+。/);
-    expect(suggestion).toContain('Claude Agent 預計重設');
-    expect(suggestion).toContain('目前沒有可用的 Agent');
-    expect(suggestion).toContain('最新查詢失敗：OAuth unavailable');
   });
 });

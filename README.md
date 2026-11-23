@@ -24,7 +24,7 @@
 </tr>
 </table>
 
-v1.0.342 adds a download login for the primary administrator (photos and files), a login guide in Settings, quoted messages and their files in Agent replies, message rules triggered by @mentions, and a record of recalled messages. Install through the app's **Check for updates**. See the [v1.0.323 → v1.0.342 release notes](docs/releases/v1.0.342.md) for the complete changes.
+v1.0.359 runs Claude on a resident process, adds several CLI account sources per provider with automatic failover, a `/model` command per chat, attachment reading for the Agent, adjustable download intervals, and automatic retry of the external monitor. Install through the app's **Check for updates**. See the [v1.0.342 → v1.0.359 release notes](docs/releases/v1.0.359.md) for the complete changes.
 
 ## Installation
 

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, AgentProviderSchema, isAgentScheduleQueueKey, type AgentEvent, type AgentStoredAttachment, type AgentProvider, type AgentRoomKey, type AgentScheduleQueueKey, type AgentRunRequest, type WritableConversationKey, type ResumeSessionValidationResult } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
 import { ensureLineageSessionRow } from './agent-lineage.js';
+import { routeKeyFor } from './pending-turn-repository.js';
 
 /**
  * A queue key: one LINE chat, the shared Agent room, or the scheduled-run queue. The room is operator-owned and has no LINE
@@ -16,6 +17,9 @@ export type SessionKey = (WritableConversationKey | AgentRoomKey) & {
   sourceType?: 'line' | 'ui';
 };
 
+/** One turn of a transcript: the user's prompt or the Agent's final text. */
+export interface TranscriptEvent { role: 'user' | 'assistant'; text: string }
+const TRANSCRIPT_JOB_LIMIT = 24;
 export type AgentJobSourceType = 'line' | 'ui' | 'schedule';
 
 /** The job source a queue key addresses; every key-scoped job query filters on it so the room and the schedule queue never mix. */
@@ -215,8 +219,53 @@ async function readSessionGeneration(client: Queryable, key: SessionKey, lock: b
   return generation;
 }
 
+/** The route of one session key: where new turns go now, and where the previous generation ran (migration 102). */
+export interface SessionRoute {
+  provider: AgentProvider;
+  sourceId: string | null;
+  generation: number;
+  previousProvider: AgentProvider | null;
+  previousGeneration: number | null;
+}
+
+/** The result of applyRoute. A scheduled run has no session: sessionKey is null and generation is 0. */
+export interface AppliedRoute {
+  switched: boolean;
+  sessionKey: SessionKey | null;
+  generation: number;
+  /** Only on a switch: the provider and generation that ran before. */
+  previous?: { provider: AgentProvider; generation: number };
+}
+
+/** The WHERE of one agent_sessions row; the placeholders start at $first. */
+function sessionRowWhere(key: SessionKey, first: number): { sql: string; params: unknown[] } {
+  if (key.accountId === null) return { sql: `provider = $${first} AND source_type = 'ui'`, params: [key.provider] };
+  return { sql: `account_id = $${first} AND chat_type = $${first + 1} AND chat_id = $${first + 2} AND provider = $${first + 3} AND source_type = $${first + 4}`,
+    params: [key.accountId, key.chatType, key.chatId, key.provider, key.sourceType ?? 'line'] };
+}
+
+/** Writes the route row. Only a switch changes the previous provider and generation. */
+async function upsertRoute(client: Queryable, routeKey: string, provider: AgentProvider, sourceId: string, generation: number,
+  previous: { provider: AgentProvider; generation: number } | null): Promise<void> {
+  await client.query(
+    `INSERT INTO agent_session_routes (route_key, provider, source_id, generation, previous_provider, previous_generation)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (route_key) DO UPDATE SET provider = EXCLUDED.provider, source_id = EXCLUDED.source_id, generation = EXCLUDED.generation,
+       previous_provider = CASE WHEN $7::boolean THEN EXCLUDED.previous_provider ELSE agent_session_routes.previous_provider END,
+       previous_generation = CASE WHEN $7::boolean THEN EXCLUDED.previous_generation ELSE agent_session_routes.previous_generation END,
+       updated_at = now()`,
+    [routeKey, provider, sourceId, generation, previous?.provider ?? null, previous?.generation ?? null, previous !== null]);
+}
+
 /** A claimed job. Room jobs also carry the session they must use, fixed inside the claim transaction. */
-export type ClaimedAgentJob = AgentJob & { revision: string; sessionKey?: SessionKey; sessionGeneration?: number };
+/** A queued LINE job folded into a claimed lead job (migration 099). It keeps the queued status until the lead ends. */
+export interface FoldedAgentJob { jobId: string; prompt: string; sourceMessageId: string | null; queuePosition: string }
+
+export type ClaimedAgentJob = AgentJob & { revision: string; sessionKey?: SessionKey; sessionGeneration?: number;
+  /** Followers folded into this job, in creation order. Absent when none. */
+  foldedJobs?: FoldedAgentJob[] };
+
+const FOLD_TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'interrupted'] as const;
 
 export interface DeliverySegment {
   deliveryId: string;
@@ -258,7 +307,7 @@ export const queuedConversationDiscoverySql = `SELECT head.account_id, head.chat
       SELECT j.account_id, j.chat_type, j.chat_id, j.queue_position
       FROM agent_jobs j
       CROSS JOIN account_control c
-      WHERE j.account_id = a.account_id AND j.status = 'queued' AND j.source_type = 'line'
+      WHERE j.account_id = a.account_id AND j.status = 'queued' AND j.source_type = 'line' AND j.folded_into IS NULL
         AND a.mode = 'ACTIVE_CONTROL' AND c.singleton = true AND c.control_epoch = j.creation_epoch
         AND NOT EXISTS (
           SELECT 1 FROM agent_jobs running
@@ -493,6 +542,269 @@ export class AgentRepository {
     return result.rowCount === 1;
   }
 
+  /**
+   * The account source that one chat session uses (D13). The session row is locked. A NULL binding gets the effective default
+   * source of the session provider, written once; a bound session keeps its source when the default changes later.
+   * The row is created by the claim, not here: a missing row or a different generation (the chat was reset) writes nothing
+   * and returns the effective default source for that run.
+   */
+  async bindSessionAccountSource(key: SessionKey, generation: number): Promise<string> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const locked = key.accountId === null
+        ? await client.query<{ account_source_id: string | null }>(
+          "SELECT account_source_id FROM agent_sessions WHERE provider = $1 AND source_type = 'ui' AND generation = $2 FOR UPDATE",
+          [key.provider, generation])
+        : await client.query<{ account_source_id: string | null }>(
+          `SELECT account_source_id FROM agent_sessions WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 AND provider = $4
+             AND source_type = $5 AND generation = $6 FOR UPDATE`,
+          [key.accountId, key.chatType, key.chatId, key.provider, key.sourceType ?? 'line', generation]);
+      const stored = locked.rows[0]?.account_source_id ?? null;
+      if (stored !== null) { await client.query('COMMIT'); return stored; }
+      const effective = (await client.query<{ source_id: string }>(
+        'SELECT COALESCE((SELECT source_id FROM agent_account_sources WHERE provider = $1 AND is_default), $1::text) AS source_id', [key.provider])).rows[0]!.source_id;
+      if (locked.rows[0]) {
+        await (key.accountId === null
+          ? client.query("UPDATE agent_sessions SET account_source_id = $2, updated_at = now() WHERE provider = $1 AND source_type = 'ui' AND generation = $3",
+            [key.provider, effective, generation])
+          : client.query(
+            `UPDATE agent_sessions SET account_source_id = $5, updated_at = now() WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3
+               AND provider = $4 AND source_type = $6 AND generation = $7`,
+            [key.accountId, key.chatType, key.chatId, key.provider, effective, key.sourceType ?? 'line', generation]));
+      }
+      await client.query('COMMIT');
+      return effective;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** The account source recorded for a job. Null when none was recorded (the job failed before the claim bound one) or the source was removed. */
+  async jobAccountSource(jobId: string): Promise<string | null> {
+    return (await this.pool.query<{ account_source_id: string | null }>('SELECT account_source_id FROM agent_jobs WHERE job_id = $1', [jobId])).rows[0]?.account_source_id ?? null;
+  }
+
+  /** Records the account source that a claimed job runs with. A removed source leaves NULL (ON DELETE SET NULL). */
+  async setJobAccountSource(jobId: string, sourceId: string): Promise<void> {
+    await this.pool.query('UPDATE agent_jobs SET account_source_id = $2 WHERE job_id = $1', [jobId, sourceId]);
+  }
+
+  /** The route of one session key (migration 102): the provider, source and generation that new turns use, and the previous ones. */
+  async getRoute(routeKey: string): Promise<SessionRoute | null> {
+    const row = (await this.pool.query<{ provider: AgentProvider; source_id: string | null; generation: number;
+      previous_provider: AgentProvider | null; previous_generation: number | null }>(
+      'SELECT provider, source_id, generation, previous_provider, previous_generation FROM agent_session_routes WHERE route_key = $1', [routeKey])).rows[0];
+    return row ? { provider: row.provider, sourceId: row.source_id, generation: row.generation,
+      previousProvider: row.previous_provider, previousGeneration: row.previous_generation } : null;
+  }
+
+  /**
+   * Applies the chosen provider and account source to a claimed job (CTA registry.rs 1847-1882, plan D21). One transaction.
+   * Lock order is session rows (in provider order, like the resets), then the job row.
+   * "Current" is the route row of the session key when it exists, else the claimed session (a LINE job is enqueued with the chat
+   * preference, so its claimed provider can differ from the route). A run that keeps the current provider and source is not a
+   * switch: the job moves to the current session generation and the route row is refreshed. Any other run is a switch:
+   * the target session starts a new generation with no provider session id, the job and its folded followers move to it, and the
+   * route row remembers the previous provider and generation. A scheduled run has no session: it only takes the provider and
+   * source, and it never writes a route row (D25).
+   */
+  async applyRoute(input: { jobId: string; sessionKey?: SessionKey; sessionGeneration: number; provider: AgentProvider; sourceId: string }): Promise<AppliedRoute> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const peek = (await client.query<{ source_type: AgentJobSourceType }>('SELECT source_type FROM agent_jobs WHERE job_id = $1', [input.jobId])).rows[0];
+      if (!peek) throw new Error('Agent job missing');
+      if (peek.source_type === 'schedule') {
+        const job = (await client.query<{ provider: AgentProvider; status: AgentJob['status']; account_source_id: string | null }>(
+          'SELECT provider, status, account_source_id FROM agent_jobs WHERE job_id = $1 FOR UPDATE', [input.jobId])).rows[0];
+        if (!job || (job.status !== 'running' && job.status !== 'queued')) throw new Error('Agent job is not running or queued');
+        await client.query('UPDATE agent_jobs SET provider = $2, account_source_id = $3 WHERE job_id = $1', [input.jobId, input.provider, input.sourceId]);
+        await client.query('COMMIT');
+        return { switched: job.provider !== input.provider || (job.account_source_id !== null && job.account_source_id !== input.sourceId),
+          sessionKey: null, generation: 0 };
+      }
+      const origin = input.sessionKey;
+      if (!origin) throw new Error('A session key is required for a LINE or room job');
+      const routeKey = routeKeyFor(origin);
+      // The route row is locked first. Only applyRoute locks it, and a chat has one running job, so no session-first order can cross it.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`agent-route:${routeKey}`]);
+      const route = (await client.query<{ provider: AgentProvider; source_id: string | null; generation: number }>(
+        'SELECT provider, source_id, generation FROM agent_session_routes WHERE route_key = $1 FOR UPDATE', [routeKey])).rows[0];
+      const currentProvider = route?.provider ?? origin.provider;
+      const target: SessionKey = { ...origin, provider: input.provider };
+      const wanted = new Map<AgentProvider, SessionKey>();
+      for (const provider of new Set<AgentProvider>([origin.provider, currentProvider, input.provider])) {
+        const key: SessionKey = { ...origin, provider };
+        await ensureSessionRow(client, key);
+        wanted.set(provider, key);
+      }
+      const locked = new Map<AgentProvider, { generation: number; accountSourceId: string | null }>();
+      for (const key of [...wanted.values()].sort((a, b) => AgentProviderSchema.options.indexOf(a.provider) - AgentProviderSchema.options.indexOf(b.provider))) {
+        const where = sessionRowWhere(key, 1);
+        const row = (await client.query<{ generation: number; account_source_id: string | null }>(
+          `SELECT generation, account_source_id FROM agent_sessions WHERE ${where.sql} FOR UPDATE`, where.params)).rows[0];
+        if (!row) throw new Error('Agent session row missing');
+        locked.set(key.provider, { generation: row.generation, accountSourceId: row.account_source_id });
+      }
+      const job = (await client.query<{ status: AgentJob['status'] }>('SELECT status FROM agent_jobs WHERE job_id = $1 FOR UPDATE', [input.jobId])).rows[0];
+      if (!job || (job.status !== 'running' && job.status !== 'queued')) throw new Error('Agent job is not running or queued');
+      // The claimed generation is only meaningful for the claimed provider's session.
+      if (currentProvider === origin.provider && locked.get(origin.provider)!.generation !== input.sessionGeneration) {
+        throw new Error('Agent session generation changed');
+      }
+      // "Current" is the route row when it exists. Without a row it is the claimed session.
+      const currentSession = locked.get(currentProvider)!;
+      const currentSource = route ? route.source_id : currentSession.accountSourceId;
+      const current = { provider: currentProvider, generation: route ? route.generation : currentSession.generation };
+      const moveJob = (generation: number) => client.query(
+        `UPDATE agent_jobs SET provider = $2, account_source_id = $3, generation = $4
+         WHERE job_id = $1 OR (folded_into = $1 AND status = 'queued')`, [input.jobId, input.provider, input.sourceId, generation]);
+      if (input.provider === currentProvider && (currentSource === null || currentSource === input.sourceId)) {
+        const sessionKey = wanted.get(currentProvider)!;
+        if (currentSession.accountSourceId === null) {
+          const where = sessionRowWhere(sessionKey, 2);
+          await client.query(`UPDATE agent_sessions SET account_source_id = $1, updated_at = now() WHERE ${where.sql}`, [input.sourceId, ...where.params]);
+        }
+        // A reset may have raised the session generation: the session row wins over the route row.
+        await moveJob(currentSession.generation);
+        await upsertRoute(client, routeKey, input.provider, input.sourceId, currentSession.generation, null);
+        await client.query('COMMIT');
+        return { switched: false, sessionKey, generation: currentSession.generation };
+      }
+      const where = sessionRowWhere(target, 2);
+      const bumped = await client.query<{ generation: number }>(
+        `UPDATE agent_sessions SET generation = generation + 1, external_session_id = NULL, account_source_id = $1, updated_at = now()
+         WHERE ${where.sql} RETURNING generation`, [input.sourceId, ...where.params]);
+      const generation = bumped.rows[0]?.generation;
+      if (generation === undefined) throw new Error('Agent session switch failed');
+      await moveJob(generation);
+      const previous = current;
+      await upsertRoute(client, routeKey, input.provider, input.sourceId, generation, previous);
+      await client.query('COMMIT');
+      return { switched: true, sessionKey: target, generation, previous };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Queues one continuation of a failed job (CTA replay of a pending turn, plan D22). The new job copies the origin job and
+   * points to it with retry_of_job_id (one continuation per origin). A LINE job re-checks its authority in the same transaction
+   * (the checks of the removed acceptQuotaRetry): the control epoch, ACTIVE_CONTROL, SYSTEM_LOGIN, the worker binding when given,
+   * and the stored friend and room grants. It returns null when a check fails, the origin is not failed or interrupted, it has an
+   * output, or it already has a continuation.
+   */
+  async enqueueContinuation(input: { originJobId: string; prompt: string; workerInstanceId?: string; controlEpoch?: number }): Promise<AgentJobStatusProjection | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const peek = (await client.query<{ source_type: AgentJobSourceType; account_id: string | null; chat_type: WritableConversationKey['chatType'] | null; chat_id: string | null }>(
+        'SELECT source_type, account_id, chat_type, chat_id FROM agent_jobs WHERE job_id = $1', [input.originJobId])).rows[0];
+      if (!peek) { await client.query('ROLLBACK'); return null; }
+      const owner = jobOwner(peek);
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [queueLockKey(owner)]);
+      let authority: { control_epoch: string; mode: string; connection_mode: string; worker_instance_id: string | null; worker_binding_epoch: string | null } | undefined;
+      if (peek.source_type === 'line') {
+        authority = (await client.query<NonNullable<typeof authority>>(
+          `SELECT c.control_epoch, a.mode, a.connection_mode, a.worker_instance_id, a.worker_binding_epoch
+           FROM account_control c CROSS JOIN line_accounts a WHERE a.account_id = $1 AND c.singleton = true FOR SHARE OF c, a`, [peek.account_id])).rows[0];
+        if (!authority) { await client.query('ROLLBACK'); return null; }
+      }
+      const origin = (await client.query<{ job_id: string; provider: AgentProvider; status: AgentJob['status']; source_message_id: string | null;
+        source_request_id: string | null; source_sender_id: string | null; creation_epoch: string | null; workspace_path: string; attachments: AgentStoredAttachment[] | null;
+        free_mode: boolean; mcp_account_scope: string[] | null; account_source_id: string | null; direct_friend_grant_id: string | null;
+        direct_friend_grant_version: string | null; room_agent_grant_id: string | null; room_agent_grant_version: string | null }>(
+        `SELECT job_id, provider, status, source_message_id, source_request_id, source_sender_id, creation_epoch, workspace_path, attachments,
+           free_mode, mcp_account_scope, account_source_id, direct_friend_grant_id, direct_friend_grant_version, room_agent_grant_id, room_agent_grant_version
+         FROM agent_jobs WHERE job_id = $1 FOR UPDATE`, [input.originJobId])).rows[0];
+      if (!origin || (origin.status !== 'failed' && origin.status !== 'interrupted')) { await client.query('ROLLBACK'); return null; }
+      if (authority && peek.account_id !== null) {
+        const controlEpoch = Number(authority.control_epoch);
+        if (origin.creation_epoch === null || Number(origin.creation_epoch) !== controlEpoch
+          || (input.controlEpoch !== undefined && input.controlEpoch !== controlEpoch)
+          || authority.mode !== 'ACTIVE_CONTROL' || authority.connection_mode !== 'SYSTEM_LOGIN'
+          || (input.workerInstanceId !== undefined && (authority.worker_instance_id !== input.workerInstanceId
+            || authority.worker_binding_epoch === null || Number(authority.worker_binding_epoch) !== controlEpoch))) {
+          await client.query('ROLLBACK'); return null;
+        }
+        if (origin.direct_friend_grant_id) {
+          const grant = await client.query(
+            `SELECT 1 FROM line_friend_whitelist_grants WHERE grant_id = $1 AND account_id = $2 AND target_mid = $3
+               AND version = $4 AND state = 'ACTIVE' AND (scope_kind = 'ACCOUNT' OR (scope_kind = 'CHAT' AND chat_type = $5 AND chat_id = $6)) FOR SHARE`,
+            [origin.direct_friend_grant_id, peek.account_id, origin.source_sender_id, origin.direct_friend_grant_version, peek.chat_type, peek.chat_id]);
+          if (!grant.rowCount) { await client.query('ROLLBACK'); return null; }
+        }
+        if (origin.room_agent_grant_id) {
+          const grant = await client.query(
+            `SELECT 1 FROM room_agent_grants WHERE grant_id = $1 AND account_id = $2 AND chat_type = $3 AND chat_id = $4
+               AND version = $5 AND state = 'ACTIVE' FOR SHARE`,
+            [origin.room_agent_grant_id, peek.account_id, peek.chat_type, peek.chat_id, origin.room_agent_grant_version]);
+          if (!grant.rowCount) { await client.query('ROLLBACK'); return null; }
+        }
+      }
+      const taken = await client.query(
+        'SELECT 1 FROM agent_jobs WHERE retry_of_job_id = $1 UNION ALL SELECT 1 FROM agent_outputs WHERE job_id = $1', [input.originJobId]);
+      if (taken.rowCount) { await client.query('ROLLBACK'); return null; }
+      let generation = 0;
+      if (peek.source_type === 'line') {
+        const sessionKey: SessionKey = { ...(owner as WritableConversationKey), provider: origin.provider, sourceType: 'line' };
+        await ensureSessionRow(client, sessionKey);
+        generation = await readSessionGeneration(client, sessionKey, true);
+      } else if (peek.source_type === 'ui') {
+        const sessionKey = (await resolveRoomSessionTarget(client, origin.provider)).key;
+        await ensureSessionRow(client, sessionKey);
+        generation = await readSessionGeneration(client, sessionKey, true);
+      }
+      const newJobId = randomUUID();
+      // A UI or schedule job names its request id, and the index of that id is unique. The new id keeps the schedule prefix.
+      const requestId = origin.source_request_id === null ? null : `${origin.source_request_id}:continue:${newJobId}`;
+      const inserted = await client.query<StatusProjectionRow>(
+        `INSERT INTO agent_jobs (job_id, account_id, chat_type, chat_id, provider, source_type, source_message_id, source_request_id, prompt,
+           workspace_path, generation, status, creation_epoch, attachments, source_sender_id, direct_friend_grant_id, direct_friend_grant_version,
+           room_agent_grant_id, room_agent_grant_version, free_mode, retry_of_job_id, mcp_account_scope, account_source_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued', $12, $13::jsonb, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+         RETURNING ${statusProjectionColumns}`,
+        [newJobId, peek.account_id, peek.chat_type, peek.chat_id, origin.provider, peek.source_type, origin.source_message_id, requestId, input.prompt,
+          origin.workspace_path, generation, origin.creation_epoch, JSON.stringify(origin.attachments ?? []), origin.source_sender_id,
+          origin.direct_friend_grant_id, origin.direct_friend_grant_version, origin.room_agent_grant_id, origin.room_agent_grant_version,
+          origin.free_mode, input.originJobId, origin.mcp_account_scope, origin.account_source_id]);
+      await client.query('COMMIT');
+      return inserted.rows[0] ? toStatusProjection(inserted.rows[0]) : null;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Clears the stored provider session id of one session row. One UPDATE; it matches only when the key, the generation and the
+   * expected id are all current, so a newer bound session is never cleared. Returns true when a row changed.
+   */
+  async clearExternalSession(key: SessionKey, generation: number, expectedExternalSessionId: string): Promise<boolean> {
+    const result = key.accountId === null
+      ? await this.pool.query(
+        `UPDATE agent_sessions SET external_session_id = NULL, updated_at = now()
+         WHERE provider = $1 AND generation = $2 AND source_type = 'ui' AND external_session_id = $3`,
+        [key.provider, generation, expectedExternalSessionId],
+      )
+      : await this.pool.query(
+        `UPDATE agent_sessions SET external_session_id = NULL, updated_at = now()
+         WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 AND provider = $4 AND generation = $5 AND source_type = $6
+           AND external_session_id = $7`,
+        [key.accountId, key.chatType, key.chatId, key.provider, generation, key.sourceType ?? 'line', expectedExternalSessionId],
+      );
+    return (result.rowCount ?? 0) > 0;
+  }
+
   async resetGeneration(key: SessionKey): Promise<{ generation: number; cancelledJobIds: string[]; cancelledJobs: AgentJobStatusProjection[] }> {
     const client = await this.pool.connect();
     try {
@@ -637,7 +949,7 @@ export class AgentRepository {
         // Scheduled runs: their own queue, one running at a time, independent of the room, every LINE chat and every session.
         candidate = await client.query<JobRow>(
           `SELECT ${jobColumns}
-           FROM agent_jobs j WHERE j.source_type = 'schedule' AND j.status = 'queued'
+           FROM agent_jobs j WHERE j.source_type = 'schedule' AND j.status = 'queued' AND j.folded_into IS NULL
              AND NOT EXISTS (SELECT 1 FROM agent_jobs running WHERE running.source_type = 'schedule' AND running.status = 'running')
            ORDER BY j.queue_position FOR UPDATE SKIP LOCKED LIMIT 1`);
       } else if (key.accountId === null) {
@@ -647,7 +959,7 @@ export class AgentRepository {
         // and none while the admin-direct chat it shares a session with has a running LINE job.
         candidate = await client.query<JobRow>(
           `SELECT ${jobColumns}
-           FROM agent_jobs j WHERE j.source_type = 'ui' AND j.status = 'queued'
+           FROM agent_jobs j WHERE j.source_type = 'ui' AND j.status = 'queued' AND j.folded_into IS NULL
              AND NOT EXISTS (SELECT 1 FROM agent_jobs running WHERE running.source_type = 'ui' AND running.status = 'running')
              AND ($1::text IS NULL OR NOT EXISTS (SELECT 1 FROM agent_jobs line_running WHERE line_running.source_type = 'line'
                AND line_running.status = 'running' AND line_running.account_id = $1 AND line_running.chat_type = 'direct' AND line_running.chat_id = $2))
@@ -660,7 +972,7 @@ export class AgentRepository {
         candidate = await client.query<JobRow>(
           `SELECT ${jobColumns}
            FROM agent_jobs j WHERE j.account_id = $1 AND j.chat_type = $2 AND j.chat_id = $3 AND j.status = 'queued'
-             AND j.source_type = 'line' AND EXISTS (
+             AND j.folded_into IS NULL AND j.source_type = 'line' AND EXISTS (
                SELECT 1 FROM line_accounts a, account_control c
                WHERE a.account_id = j.account_id AND a.mode = 'ACTIVE_CONTROL'
                  AND c.singleton = true AND c.control_epoch = j.creation_epoch
@@ -684,16 +996,83 @@ export class AgentRepository {
         await ensureSessionRow(client, sessionKey);
         session = { sessionKey, sessionGeneration: await readSessionGeneration(client, sessionKey, false) };
       }
+      const foldedJobs = row.source_type === 'line' ? await this.foldDeferredFollowers(client, row.job_id) : [];
       await client.query('COMMIT');
       const committed = claimed[0];
       if (!committed) throw new Error('Claimed job projection missing');
-      return { ...toAgentJob({ ...row, status: committed.status }), status: committed.status, revision: committed.revision, ...session };
+      return { ...toAgentJob({ ...row, status: committed.status }), status: committed.status, revision: committed.revision, ...session,
+        ...(foldedJobs.length > 0 ? { foldedJobs } : {}) };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * CliTalkAgent R2 drain: messages that arrive while a turn runs are joined into ONE follow-up turn. A claimed LINE job is
+   * "deferred" when it was created before the latest end of another job of its chat (it waited while a turn ran); the owner,
+   * a job that did not wait, folds nothing. A deferred lead folds the later queued jobs of the same chat, sender, provider,
+   * generation and creation epoch (not free mode). Runs in the claim transaction, under the chat queue lock.
+   */
+  private async foldDeferredFollowers(client: PoolClient, leadJobId: string): Promise<FoldedAgentJob[]> {
+    const folded = await client.query<{ job_id: string; prompt: string; source_message_id: string | null; queue_position: string }>(
+      `UPDATE agent_jobs f SET folded_into = lead.job_id
+       FROM agent_jobs lead
+       WHERE lead.job_id = $1 AND lead.source_type = 'line' AND lead.free_mode = false AND lead.source_sender_id IS NOT NULL
+         AND lead.created_at < (SELECT max(d.completed_at) FROM agent_jobs d
+           WHERE d.account_id = lead.account_id AND d.chat_type = lead.chat_type AND d.chat_id = lead.chat_id
+             AND d.source_type = 'line' AND d.job_id <> lead.job_id AND d.completed_at IS NOT NULL)
+         AND f.status = 'queued' AND f.folded_into IS NULL AND f.job_id <> lead.job_id
+         AND f.source_type = 'line' AND f.free_mode = false
+         AND f.account_id = lead.account_id AND f.chat_type = lead.chat_type AND f.chat_id = lead.chat_id
+         AND f.provider = lead.provider AND f.generation = lead.generation
+         AND f.creation_epoch IS NOT DISTINCT FROM lead.creation_epoch
+         AND f.source_sender_id = lead.source_sender_id
+         AND f.created_at > lead.created_at AND f.queue_position > lead.queue_position
+       RETURNING f.job_id, f.prompt, f.source_message_id, f.queue_position::text AS queue_position`, [leadJobId]);
+    return folded.rows.sort((a, b) => (BigInt(a.queue_position) < BigInt(b.queue_position) ? -1 : 1))
+      .map((item) => ({ jobId: item.job_id, prompt: item.prompt, sourceMessageId: item.source_message_id, queuePosition: item.queue_position }));
+  }
+
+  /**
+   * The lead of folded jobs reached a terminal status: each still-queued follower takes the same status in one transaction.
+   * A completed lead gives each follower an output with the lead's final text and NO delivery (the lead delivers the one reply).
+   * Returns the follower projections; empty while the lead is not terminal.
+   */
+  async settleFolded(leadJobId: string): Promise<AgentJobStatusProjection[]> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const settled = await this.settleFoldedIn(client, leadJobId);
+      await client.query('COMMIT');
+      return settled;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
+  }
+
+  private async settleFoldedIn(client: PoolClient, leadJobId: string): Promise<AgentJobStatusProjection[]> {
+    const lead = await client.query<{ status: AgentJob['status'] }>('SELECT status FROM agent_jobs WHERE job_id = $1 FOR UPDATE', [leadJobId]);
+    const status = lead.rows[0]?.status;
+    if (!status || !(FOLD_TERMINAL_STATUSES as readonly string[]).includes(status)) return [];
+    const followers = await client.query<{ job_id: string }>(
+      "SELECT job_id FROM agent_jobs WHERE folded_into = $1 AND status = 'queued' ORDER BY queue_position FOR UPDATE", [leadJobId]);
+    if (followers.rows.length === 0) return [];
+    if (status === 'completed') {
+      await client.query(
+        `INSERT INTO agent_outputs (job_id, final_text)
+         SELECT f.job_id, o.final_text FROM agent_jobs f JOIN agent_outputs o ON o.job_id = $1
+         WHERE f.folded_into = $1 AND f.status = 'queued' ON CONFLICT (job_id) DO NOTHING`, [leadJobId]);
+    }
+    return transitionAgentJobStatus(client, status, "folded_into = $1 AND status = 'queued'", [leadJobId]);
+  }
+
+  /** A job leaves its fold: it is its own lead again (retry) and its own queued followers run as normal jobs. */
+  private async releaseFold(jobId: string): Promise<void> {
+    await this.pool.query("UPDATE agent_jobs SET folded_into = NULL WHERE job_id = $1 OR (folded_into = $1 AND status = 'queued')", [jobId]);
   }
 
   async listQueuedConversations(limit = 256): Promise<AgentQueueKey[]> {
@@ -715,6 +1094,39 @@ export class AgentRepository {
   async getJob(jobId: string): Promise<AgentJob | null> {
     const result = await this.pool.query<JobRow>(`SELECT ${jobColumns} FROM agent_jobs WHERE job_id = $1`, [jobId]);
     return result.rows[0] ? toAgentJob(result.rows[0]) : null;
+  }
+
+  /**
+   * Earlier turns of the queue key of a job, for the transcript preamble of a new resident process. One SELECT: jobs with the same
+   * queue key (account/chat or the room), provider and session generation, created before the job and not the job itself, newest
+   * 24 jobs, returned oldest first. Each job gives its prompt as a user event and, when it completed, its final text as an assistant event.
+   * With `from`, the earlier jobs of that provider and generation are used instead of the job's own provider and `generation`:
+   * this is the previous-generation context of a provider or source switch (see applyRoute).
+   */
+  async listTranscriptEvents(input: { jobId: string; generation: number; from?: { provider: AgentProvider; generation: number } }): Promise<TranscriptEvent[]> {
+    const result = await this.pool.query<{ job_id: string; folded_into: string | null; prompt: string; final_text: string | null }>(
+      `SELECT j.job_id, j.folded_into, j.prompt, o.final_text
+       FROM agent_jobs c
+       JOIN agent_jobs j ON j.source_type = c.source_type AND j.account_id IS NOT DISTINCT FROM c.account_id
+         AND j.chat_type IS NOT DISTINCT FROM c.chat_type AND j.chat_id IS NOT DISTINCT FROM c.chat_id
+         AND j.provider = COALESCE($3::text, c.provider) AND j.generation = $2 AND j.job_id <> c.job_id
+         AND (j.created_at, j.queue_position) < (c.created_at, c.queue_position)
+       LEFT JOIN agent_jobs lead ON lead.job_id = j.folded_into
+       LEFT JOIN agent_outputs o ON o.job_id = j.job_id AND j.status = 'completed' AND j.folded_into IS NULL
+       WHERE c.job_id = $1
+       ORDER BY COALESCE(lead.created_at, j.created_at) DESC, COALESCE(lead.queue_position, j.queue_position) DESC, j.queue_position DESC
+       LIMIT ${TRANSCRIPT_JOB_LIMIT}`,
+      [input.jobId, input.from ? input.from.generation : input.generation, input.from?.provider ?? null]);
+    const events: TranscriptEvent[] = [];
+    // A folded follower has a user event only. The reply of a lead follows the user events of its followers (one turn).
+    let pending: { leadId: string; text: string } | null = null;
+    for (const row of result.rows.reverse()) {
+      if (pending && row.folded_into !== pending.leadId) { events.push({ role: 'assistant', text: pending.text }); pending = null; }
+      events.push({ role: 'user', text: row.prompt });
+      if (row.final_text !== null) pending = { leadId: row.job_id, text: row.final_text };
+    }
+    if (pending) events.push({ role: 'assistant', text: pending.text });
+    return events;
   }
 
   async getJobForKey(key: AgentQueueKey, jobId: string): Promise<AgentJob | null> {
@@ -791,6 +1203,8 @@ export class AgentRepository {
     const result = await transitionAgentJobStatus(this.pool, 'cancelled',
       "job_id = $1 AND account_id IS NOT DISTINCT FROM $2::text AND chat_type IS NOT DISTINCT FROM $3::text AND chat_id IS NOT DISTINCT FROM $4::text AND source_type = $5 AND status IN ('queued', 'running')",
       [jobId, key.accountId, keyChatType(key), key.chatId, queueKeySourceType(key)]);
+    // A cancelled follower leaves its fold and does not stop the lead. A cancelled lead is settled with its followers by the service.
+    if (result[0]) await this.pool.query('UPDATE agent_jobs SET folded_into = NULL WHERE job_id = $1', [jobId]);
     return result[0] ?? null;
   }
 
@@ -805,89 +1219,8 @@ export class AgentRepository {
        AND (source_type IN ('ui', 'schedule') OR EXISTS (SELECT 1 FROM line_accounts a CROSS JOIN account_control c
          WHERE a.account_id=agent_jobs.account_id AND a.mode='ACTIVE_CONTROL' AND c.singleton=true AND c.control_epoch=agent_jobs.creation_epoch))`,
       [jobId, key.accountId, keyChatType(key), key.chatId, queueKeySourceType(key)], workspacePath);
+    if (result[0]) await this.releaseFold(jobId);
     return result[0] ?? null;
-  }
-
-  async acceptQuotaRetry(input: { jobId: string; senderId: string; messageId: string; targetProvider: AgentProvider;
-    workerInstanceId: string; controlEpoch: number }): Promise<AgentJobStatusProjection | null> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      const proposal = await client.query<any>(`SELECT p.*,j.account_id AS job_account,j.chat_type AS job_chat_type,j.chat_id AS job_chat_id,
-        j.status AS job_status,j.provider AS job_provider,j.source_type,j.source_message_id AS job_source_message_id,j.source_sender_id AS job_sender_id,j.creation_epoch,
-        j.prompt,j.workspace_path,j.source_request_id,j.attachments,j.free_mode,j.direct_friend_grant_id AS job_direct_grant,
-        j.direct_friend_grant_version AS job_direct_version,j.room_agent_grant_id AS job_room_grant,j.room_agent_grant_version AS job_room_version,
-        c.control_epoch,a.mode,a.connection_mode,a.worker_instance_id AS current_worker,a.worker_binding_epoch
-        FROM provider_quota_proposals p JOIN agent_jobs j ON j.job_id=p.job_id JOIN line_accounts a ON a.account_id=j.account_id
-        CROSS JOIN account_control c WHERE p.job_id=$1 AND c.singleton=true FOR UPDATE OF p,j,a,c`, [input.jobId]);
-      const p=proposal.rows[0];
-      if(!p || p.state!=='pending' || new Date(p.expires_at).getTime()<=Date.now() || p.target_provider!==input.targetProvider
-        || p.source_sender_id!==input.senderId || p.job_status!=='failed' || p.source_type!=='line'
-        || p.job_account!==p.account_id || p.job_chat_type!==p.chat_type || p.job_chat_id!==p.chat_id
-        || p.source_message_id!==p.job_source_message_id || p.job_provider!==p.failed_provider || p.source_sender_id!==p.job_sender_id
-        || String(p.control_epoch)!==String(input.controlEpoch) || String(p.creation_epoch)!==String(input.controlEpoch)
-        || p.mode!=='ACTIVE_CONTROL' || p.connection_mode!=='SYSTEM_LOGIN' || p.current_worker!==input.workerInstanceId
-        || String(p.worker_binding_epoch)!==String(input.controlEpoch)) { await client.query('ROLLBACK'); return null; }
-      const command=await client.query<{text_content:string|null;sender_id:string;mention_ranges:unknown;own_mid:string|null}>(`SELECT m.text_content,m.sender_id,m.mention_ranges,a.own_mid
-        FROM messages m JOIN conversations c ON c.account_id=m.account_id AND c.chat_type=$4 AND c.chat_id=m.chat_id
-        JOIN line_accounts a ON a.account_id=m.account_id
-        WHERE m.account_id=$1 AND m.message_id=$2 AND m.chat_id=$3 AND m.ingestion_source='live' FOR SHARE OF m,c,a`,
-        [p.account_id,input.messageId,p.chat_id,p.chat_type]);
-      let commandBody=command.rows[0]?.text_content??'';
-      const ranges=Array.isArray(command.rows[0]?.mention_ranges)?command.rows[0]!.mention_ranges as Array<{start:number;end:number;userId:string}>:[];
-      const ownMention=ranges.find((range)=>range.userId===command.rows[0]?.own_mid && range.start>=0 && range.end>range.start && range.end<=commandBody.length);
-      if(ownMention) commandBody=commandBody.slice(0,ownMention.start)+commandBody.slice(ownMention.end);
-      const commandText=commandBody.trim().replace(/\s+/g,' ').toLowerCase();
-      if(command.rows[0]?.sender_id!==input.senderId || commandText!==`/agent ${input.targetProvider}`) {
-        await client.query('ROLLBACK'); return null;
-      }
-      const admin=await client.query(`SELECT 1 FROM account_administrators WHERE account_id=$1 AND user_id=$2 AND role='PRIMARY_ADMIN' FOR SHARE`,[p.account_id,input.senderId]);
-      if(!admin.rowCount) { await client.query('ROLLBACK'); return null; }
-      const existingRetry=await client.query('SELECT 1 FROM agent_jobs WHERE retry_of_job_id=$1',[input.jobId]);
-      if(existingRetry.rowCount) { await client.query('ROLLBACK'); return null; }
-      const output=await client.query('SELECT 1 FROM agent_outputs WHERE job_id=$1',[input.jobId]);
-      if(output.rowCount) { await client.query('ROLLBACK'); return null; }
-      const quotas=await client.query<{blocked:boolean;snapshot_stale:boolean;snapshot_fetched_at:Date|null;snapshot:unknown}>(`SELECT blocked,snapshot_stale,snapshot_fetched_at,snapshot FROM provider_quota_state WHERE provider=$1 FOR SHARE`,[input.targetProvider]);
-      const quotaSnapshot=quotas.rows[0]?.snapshot&&typeof quotas.rows[0].snapshot==='object'
-        ? quotas.rows[0].snapshot as {availabilityKnown?:unknown;windows?:unknown}:{};
-      const hasGeneralWindow=Array.isArray(quotaSnapshot.windows)&&quotaSnapshot.windows.some((window)=>!!window&&typeof window==='object'
-        &&(window as {blocksProvider?:unknown}).blocksProvider===true);
-      const availabilityKnown=quotaSnapshot.availabilityKnown===true||(quotaSnapshot.availabilityKnown!==false&&hasGeneralWindow);
-      if(!quotas.rows[0] || quotas.rows[0].blocked || quotas.rows[0].snapshot_stale || !quotas.rows[0].snapshot_fetched_at
-        || quotas.rows[0].snapshot_fetched_at.getTime()<Date.now()-5*60_000 || !availabilityKnown) { await client.query('ROLLBACK'); return null; }
-      if(p.direct_grant_id) {
-        const grant=await client.query(`SELECT 1 FROM line_friend_whitelist_grants WHERE grant_id=$1 AND account_id=$2 AND target_mid=$3
-          AND version=$4 AND state='ACTIVE' AND (scope_kind='ACCOUNT' OR (scope_kind='CHAT' AND chat_type=$5 AND chat_id=$6)) FOR SHARE`,
-          [p.direct_grant_id,p.account_id,input.senderId,p.direct_grant_version,p.chat_type,p.chat_id]);
-        if(!grant.rowCount) { await client.query('ROLLBACK'); return null; }
-      }
-      if(p.room_grant_id) {
-        const grant=await client.query(`SELECT 1 FROM room_agent_grants WHERE grant_id=$1 AND account_id=$2 AND chat_type=$3 AND chat_id=$4
-          AND version=$5 AND state='ACTIVE' FOR SHARE`,[p.room_grant_id,p.account_id,p.chat_type,p.chat_id,p.room_grant_version]);
-        if(!grant.rowCount) { await client.query('ROLLBACK'); return null; }
-      }
-      const key: WritableConversationKey={accountId:p.account_id,chatType:p.chat_type,chatId:p.chat_id};
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[queueLockKey(key)]);
-      const sessionKey: SessionKey={...key,provider:input.targetProvider,sourceType:'line'};
-      await ensureSessionRow(client,sessionKey);
-      const generation=await readSessionGeneration(client,sessionKey,true);
-      const newJobId=randomUUID();
-      const inserted=await client.query<StatusProjectionRow>(`INSERT INTO agent_jobs(job_id,account_id,chat_type,chat_id,provider,source_type,
-        source_message_id,source_request_id,prompt,workspace_path,generation,status,creation_epoch,attachments,source_sender_id,
-        direct_friend_grant_id,direct_friend_grant_version,room_agent_grant_id,room_agent_grant_version,free_mode,retry_of_job_id)
-        VALUES($1,$2,$3,$4,$5,'line',$6,$7,$8,$9,$10,'queued',$11,$12,$13,$14,$15,$16,$17,$18,$19)
-        RETURNING ${statusProjectionColumns}`,[newJobId,p.account_id,p.chat_type,p.chat_id,input.targetProvider,p.source_message_id,p.source_request_id,
-        p.prompt,p.workspace_path,generation,input.controlEpoch,JSON.stringify(Array.isArray(p.attachments)?p.attachments:[]),p.source_sender_id,p.job_direct_grant,p.job_direct_version,
-        p.job_room_grant,p.job_room_version,p.free_mode,input.jobId]);
-      const changed=await client.query('UPDATE conversations SET default_provider=$4,updated_at=now() WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3',
-        [p.account_id,p.chat_type,p.chat_id,input.targetProvider]);
-      if(changed.rowCount!==1) { await client.query('ROLLBACK'); return null; }
-      const consumed=await client.query(`UPDATE provider_quota_proposals SET state='accepted',consumed_at=now(),retry_job_id=$2,
-        confirmation_message_id=$3 WHERE job_id=$1 AND state='pending'`,[input.jobId,newJobId,input.messageId]);
-      if(consumed.rowCount!==1) { await client.query('ROLLBACK'); return null; }
-      await client.query('COMMIT');
-      return inserted.rows[0]?toStatusProjection(inserted.rows[0]):null;
-    } catch(error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
   }
 
   async cancelJob(jobId: string): Promise<AgentJobStatusProjection | null> {
@@ -1024,6 +1357,52 @@ export class AgentRepository {
     }
   }
 
+  /**
+   * Add delivery rows to a completed LINE job for an autonomous reply (a result that no job started).
+   * One transaction. The job row is locked, so part indexes continue without a gap. The job must be completed, source 'line',
+   * in the current control epoch, with an ACTIVE_CONTROL account (the checks of completeJob). A free-mode job skips a lone [[NO_REPLY]] text.
+   * Returns true when rows were added.
+   */
+  async appendRelayDelivery(anchorJobId: string, parts: readonly string[], relayId: string): Promise<boolean> {
+    const texts = parts.filter((text) => text.trim() !== '');
+    if (texts.length === 0) return false;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const job = await client.query<{ account_id: string; chat_type: WritableConversationKey['chatType']; chat_id: string; creation_epoch: string; free_mode: boolean; source_type: string; status: string }>(
+        `SELECT account_id, chat_type, chat_id, creation_epoch, free_mode, source_type, status FROM agent_jobs WHERE job_id = $1 FOR UPDATE`,
+        [anchorJobId],
+      );
+      const row = job.rows[0];
+      if (!row || row.source_type !== 'line' || row.status !== 'completed') { await client.query('COMMIT'); return false; }
+      const control = await client.query<{ mode: string; control_epoch: string }>(
+        `SELECT a.mode, c.control_epoch FROM line_accounts a CROSS JOIN account_control c
+         WHERE a.account_id = $1 AND c.singleton = true FOR SHARE OF c, a`, [row.account_id],
+      );
+      if (row.creation_epoch !== control.rows[0]?.control_epoch || control.rows[0]?.mode !== 'ACTIVE_CONTROL') { await client.query('COMMIT'); return false; }
+      if (row.free_mode && texts.length === 1 && texts[0]!.trim() === FREE_MODE_NO_REPLY) {
+        await client.query('COMMIT');
+        return false;
+      }
+      const last = await client.query<{ next: number }>('SELECT COALESCE(MAX(part_index), -1) + 1 AS next FROM agent_deliveries WHERE job_id = $1', [anchorJobId]);
+      const first = Number(last.rows[0]?.next ?? 0);
+      for (const [index, text] of texts.entries()) {
+        await client.query(
+          `INSERT INTO agent_deliveries (delivery_id, job_id, part_index, text_content, idempotency_key, account_id, chat_type, chat_id, creation_epoch)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [randomUUID(), anchorJobId, first + index, text, `${anchorJobId}:relay:${relayId}:${index}`, row.account_id, row.chat_type, row.chat_id, row.creation_epoch],
+        );
+      }
+      await client.query('COMMIT');
+      return true;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async listDeliveries(jobId: string): Promise<DeliverySegment[]> {
     const result = await this.pool.query<DeliveryRow>('SELECT delivery_id, job_id, part_index, text_content, idempotency_key, status, line_message_id FROM agent_deliveries WHERE job_id = $1 ORDER BY part_index', [jobId]);
     return result.rows.map(toDeliverySegment);
@@ -1112,6 +1491,13 @@ export class AgentRepository {
       await client.query('BEGIN');
       const jobs = await transitionAgentJobStatus(client, 'interrupted', "status = 'running'", []);
       const deliveries = await client.query("UPDATE agent_deliveries SET status = 'unknown', updated_at = now() WHERE status = 'sending'");
+      // A follower whose lead did not finish runs again as a normal job. A follower whose lead already ended is settled with it.
+      await client.query(
+        `UPDATE agent_jobs f SET folded_into = NULL FROM agent_jobs lead
+         WHERE f.folded_into = lead.job_id AND f.status = 'queued' AND lead.status NOT IN ('completed', 'failed', 'cancelled')`);
+      const endedLeads = await client.query<{ folded_into: string }>(
+        "SELECT DISTINCT folded_into FROM agent_jobs WHERE folded_into IS NOT NULL AND status = 'queued'");
+      for (const item of endedLeads.rows) await this.settleFoldedIn(client, item.folded_into);
       await client.query('COMMIT');
       return { interruptedJobs: jobs.length, unknownDeliveries: deliveries.rowCount ?? 0 };
     } catch (error) {

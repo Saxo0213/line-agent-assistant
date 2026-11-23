@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { InboundEnvelope } from '@line-agent/contracts';
+import { modelReply, normalizeModelArgument, normalizeModelForProvider, parseModelCommand } from './model-command.js';
 import { hasOwnMention, isFolderCommandText, parseAgentSwitch, parseFolderCommand, routeTrigger } from './trigger-router.js';
 
 const envelope = (overrides: Partial<InboundEnvelope> = {}): InboundEnvelope => ({
@@ -222,5 +223,50 @@ describe('provider quota system command', () => {
     expect(routeTrigger(envelope({text:'@Agent /quota',...mention}),{...context,agentEnabled:false})).toEqual({type:'ignore'});
     expect(routeTrigger(envelope({text:'@Agent /quota',...mention}),{...context,agentEnabled:true})).toEqual({type:'agent_quota'});
     expect(routeTrigger(envelope({text:'@Agent /quota now',...mention}),context).type).not.toBe('agent_quota');
+  });
+});
+
+describe('/model command', () => {
+  const mention = { mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] };
+  const admin = { ...context, senderIsPrimaryAdmin: true, primaryAdmin: true };
+  it('normalizes like CliTalkAgent: empty shows, default/reset/預設 clear, anything else is the trimmed argument', () => {
+    expect(normalizeModelArgument('')).toEqual({ action: 'show' });
+    for (const word of ['default', 'RESET', ' 預設 ']) expect(normalizeModelArgument(word)).toEqual({ action: 'clear' });
+    expect(normalizeModelArgument(' OPUS ')).toEqual({ action: 'argument', value: 'OPUS' });
+    expect(normalizeModelArgument('gpt-5.2-codex')).toEqual({ action: 'argument', value: 'gpt-5.2-codex' });
+  });
+  it('validates the argument per provider', () => {
+    for (const model of ['haiku', 'sonnet', 'opus']) expect(normalizeModelForProvider('claude', model.toUpperCase())).toEqual({ ok: true, model });
+    expect(normalizeModelForProvider('claude', 'gpt-5')).toEqual({ ok: false, error: 'unknown Claude model (use haiku / sonnet / opus / default)' });
+    expect(normalizeModelForProvider('codex', ' gpt-5.2-codex ')).toEqual({ ok: true, model: 'gpt-5.2-codex' });
+    for (const bad of ['opus', 'Sonnet', 'a b', 'x'.repeat(129)]) expect(normalizeModelForProvider('codex', bad)).toEqual({ ok: false, error: 'invalid Codex model ID (use letters, numbers, . _ : / -; max 128 characters)' });
+  });
+  it('parses only /model and /model <argument>', () => {
+    expect(parseModelCommand('/model')).toEqual({ action: 'show' });
+    expect(parseModelCommand(' /MODEL opus ')).toEqual({ action: 'argument', value: 'opus' });
+    expect(parseModelCommand('/models')).toBeNull();
+    expect(parseModelCommand('please /model')).toBeNull();
+  });
+  it('replies with the fixed texts', () => {
+    expect(modelReply('claude', { action: 'show' }, null)).toBe('🧠 你目前的 Claude 模型：預設\n切換：/model <haiku / sonnet / opus>；回預設：/model default');
+    expect(modelReply('codex', { action: 'show' }, 'gpt-5')).toBe('🧠 你目前的 Codex 模型：gpt-5\n切換：/model <Codex model ID（例如 gpt-5.2-codex）>；回預設：/model default');
+    expect(modelReply('claude', { action: 'clear' }, 'opus')).toBe('🧠 已回到 Claude 預設模型。下一則訊息起生效。');
+    expect(modelReply('codex', { action: 'argument', value: 'gpt-5' }, null)).toBe('🧠 已切換到 gpt-5。下一則訊息起生效。');
+    expect(modelReply('claude', { action: 'argument', value: 'HAIKU' }, null)).toBe('🧠 已切換到 haiku。下一則訊息起生效。');
+    expect(modelReply('claude', { action: 'argument', value: 'x' }, null)).toBe('⚠️ Claude 模型無效：unknown Claude model (use haiku / sonnet / opus / default)');
+  });
+  it('routes the Primary Administrator to agent_model in a group and a direct chat, with no Agent job', () => {
+    expect(routeTrigger(envelope({ text: '@Agent /model', ...mention }), admin)).toEqual({ type: 'agent_model', command: { action: 'show' } });
+    expect(routeTrigger(envelope({ text: '@Agent /model sonnet', ...mention }), admin)).toEqual({ type: 'agent_model', command: { action: 'argument', value: 'sonnet' } });
+    expect(routeTrigger(envelope({ text: '@Agent /model default', ...mention }), admin)).toEqual({ type: 'agent_model', command: { action: 'clear' } });
+    expect(routeTrigger(envelope({ text: '@Agent /model xyz', ...mention }), admin)).toEqual({ type: 'agent_model', command: { action: 'argument', value: 'xyz' } });
+    const direct = envelope({ chatType: 'direct', text: '/model opus', mentionIds: [], mentionRanges: [] });
+    expect(routeTrigger(direct, admin)).toEqual({ type: 'agent_model', command: { action: 'argument', value: 'opus' } });
+  });
+  it('a served non-administrator never changes the model: the text is ordinary, like /agent default', () => {
+    expect(routeTrigger(envelope({ text: '@Agent /model opus', ...mention }), context)).toEqual({ type: 'prompt', provider: 'codex', prompt: '/model opus' });
+    const direct = envelope({ chatType: 'direct', text: '/model opus', mentionIds: [], mentionRanges: [] });
+    expect(routeTrigger(direct, { ...context, senderIsPrimaryAdmin: true, primaryAdmin: false })).toEqual({ type: 'prompt', provider: 'codex', prompt: '/model opus' });
+    expect(routeTrigger(direct, { ...context, senderIsPrimaryAdmin: false })).toEqual({ type: 'ignore' });
   });
 });

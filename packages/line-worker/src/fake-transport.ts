@@ -27,6 +27,8 @@ export class FakeLineTransport implements LineTransport {
   friendAddResult: FriendAddResult = { status: 'added', error: null };
   friendAddError?: Error;
   syncError?: Error;
+  /** HTTP status that `lastSyncHttpStatus` reports; null means no status. */
+  syncHttpStatus: number | null = null;
   sendStarted: Promise<void> = Promise.resolve();
   #signalSendStarted?: () => void;
   #sendWait?: Promise<void>;
@@ -85,6 +87,7 @@ export class FakeLineTransport implements LineTransport {
     return this.#detailQueue.shift() ?? [];
   }
   enqueueSync(result: SyncResult): void { this.#syncQueue.push(result); }
+  lastSyncHttpStatus(): number | null { return this.syncHttpStatus; }
   async sync(cursor: unknown): Promise<SyncResult> {
     this.syncCalls.push(cursor);
     if (this.syncError) throw this.syncError;

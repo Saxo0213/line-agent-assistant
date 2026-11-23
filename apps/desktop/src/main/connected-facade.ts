@@ -15,9 +15,9 @@ import { mkdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, NativeAttachmentDescriptorSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
+import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, DEFAULT_DOWNLOAD_BRIDGE_INTERVALS, NativeAttachmentDescriptorSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
 import {
-  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, AttachmentStorageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, ProviderQuotaRepository, migrate, parseLineStickerDescriptor,
+  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AGENT_RUNTIME_DEFAULTS, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, AttachmentStorageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, ProviderQuotaRepository, AccountSourceRepository, PendingTurnRepository, effectiveDefaultId, normalizedFallbackOrder, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
 import type { Attachment, BridgeVerificationCounts, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
@@ -28,8 +28,9 @@ import type { AgentJobStatusProjection } from '@line-agent/database';
 import type { Locale } from '../locale.js';
 
 import { boundedSticonRawSql, projectSticons } from './sticon-projection.js';
-import { AccountSupervisor, LineService } from './services/line-service.js';
-import { AgentService, type AgentRunner, type InternalMcpLauncher } from './services/agent-service.js';
+import { AccountSupervisor, isTokenLoginRejection, LineService } from './services/line-service.js';
+import { ProviderFailoverProbe } from './services/provider-failover-probe.js';
+import { AgentService, type AgentFailover, type AgentRunner, type InternalMcpLauncher } from './services/agent-service.js';
 import { AgentScheduleService } from './services/agent-schedule-service.js';
 import { FreeModeService } from './services/free-mode-service.js';
 import { createReplyContextResolver } from './services/agent-reply-context.js';
@@ -53,7 +54,7 @@ import { createChatResourceDiagnostics, parseChatResourceDiagnostic } from './se
 import { createMcpChatResourceArchiveReader } from './services/mcp-chat-resource-reader.js';
 import { trackOperation, type TrackedOperationContext } from './tracked-operation.js';
 import { WorkspaceAuthority, InvalidWorkspaceError } from './services/workspace-authority.js';
-import { AttachmentService, EXTERNAL_BRIDGE_AUTO_MAX_AGE_MS } from './services/attachment-service.js';
+import { AttachmentService, EXTERNAL_BRIDGE_AUTO_MAX_AGE_MS, EXTERNAL_BRIDGE_RECOVERED_MAX_AGE_MS } from './services/attachment-service.js';
 import { AttachmentStorageService } from './services/attachment-storage-service.js';
 import { createWindowsAttachmentBroker, resolveWindowsAttachmentBrokerPath } from '@line-agent/line-worker/attachment-storage';
 import { DeliveryService } from './services/delivery-service.js';
@@ -63,7 +64,7 @@ import { ContentReprojectionService } from './services/content-reprojection-serv
 import { HealthService, kindPreview } from './services/health-service.js';
 import { AdminChangeError, AdminPairingService, type AdminChangeOutcome } from './services/admin-pairing-service.js';
 import { OfficialDownloadBridgeService } from './services/official-download-bridge/official-download-bridge-service.js';
-import { OfficialDownloadBridgeDownloader } from './services/official-download-bridge/bridge-download.js';
+import { OfficialDownloadBridgeDownloader, randomIntervalMs } from './services/official-download-bridge/bridge-download.js';
 import { BRIDGE_VERIFY_RESULT_CODES, bridgeGateThreshold, isBridgeGateOpen, type BridgeKind, type BridgeVerifyResult } from './services/official-download-bridge/bridge-verification.js';
 import { createBridgeAttachmentStore } from './services/official-download-bridge/bridge-attachment-store.js';
 import { FriendEnrollmentService } from './services/friend-enrollment-service.js';
@@ -81,18 +82,21 @@ import { toDataURL } from 'qrcode';
 import { createCoalescedSnapshotPublisher } from './domain-event-publisher.js';
 import type { OfficialBuildTrustService } from './services/official-build-trust.js';
 import {probeInitialProviderAuth} from './provider-auth.js';
-import { AUDIT_ERROR_CODES, type AuditErrorCode, type OperationalAudit } from './services/operational-audit.js';
-import { resolveChatProvider } from './services/default-provider.js';
-import { ProviderQuotaService, quotaFailureSuggestion } from './services/provider-quota-service.js';
-import { providerFailureResetAt } from '@line-agent/agent-bridge';
-import { diagnosticFailure, parseSafeDiagnostic, type SafeDiagnostic } from '@line-agent/contracts';
+import { AUDIT_ERROR_CODES, type AuditAction, type AuditErrorCode, type OperationalAudit } from './services/operational-audit.js';
+import { resolveChatProvider, resolveDefaultProvider } from './services/default-provider.js';
+import { AccountSourceService, AccountSourceServiceError } from './services/account-source-service.js';
+import { ProviderFailoverService } from './services/provider-failover-service.js';
+import { ProviderQuotaService } from './services/provider-quota-service.js';
+import { homeDirectoryFrom, providerFailureResetAt, slimReason, transcriptBytes } from '@line-agent/agent-bridge';
+import { parseResidentKey, residentSessionKey } from './services/agent-resident.js';
+import { DIAGNOSTIC_DETAIL_PATTERN, diagnosticFailure, parseSafeDiagnostic, safeErrorCode, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AuditEventsReadResult } from './services/operational-audit-runtime.js';
 import { systemActivityResult, systemErrorsResult } from './services/system-records.js';
 import { createSingleFlightRead } from './services/system-read-flight.js';
 import { runCleanupInOrder, StartupCleanup } from './startup-cleanup.js';
 import type { DirectMonitorPage, ImportCatalogPage, ImportCursor, ImportDirectoryPage, ImportProgress, ImportRow } from './services/js-external-reader/protocol.js';
 import { createFirstImportProgressLog } from './services/first-import-progress-log.js';
-import { classifyExternalMonitorFailure, clearExternalMonitorDiagnostic, ExternalMonitorDiagnosticFailure, externalMonitorDatabaseFailure, externalMonitorFailureDetail, recordExternalMonitorDiagnostic as persistExternalMonitorDiagnostic, type ExternalMonitorFailurePhase } from './services/external-monitor-diagnostics.js';
+import { classifyExternalMonitorFailure, clearExternalMonitorDiagnostic, ExternalMonitorDiagnosticFailure, externalMonitorDatabaseFailure, externalMonitorFailureDetail, recordExternalMonitorDiagnostic as persistExternalMonitorDiagnostic, type ExternalMonitorDiagnosticProducer, type ExternalMonitorFailurePhase } from './services/external-monitor-diagnostics.js';
 import { linePrompt } from './services/line-prompts.js';
 import { createOwnAvatarRefreshScheduler, runOwnAvatarRefreshes } from './services/own-avatar-refresh-scheduler.js';
 import { cleanupStaleManualMedia, ManualMediaError, stageManualMedia } from './services/manual-media-staging.js';
@@ -170,12 +174,15 @@ export interface IntegratedWorkerGateway {
 }
 
 export interface IntegratedAgent extends AgentRunner {
-  getAuthStatus(provider: AgentProvider): Promise<{ status: 'authenticated' | 'logged_out' | 'not_installed' | 'error'; detail?: string }>;
-  agentRefreshStatus(provider: AgentProvider): Promise<{ status: 'authenticated' | 'logged_out' | 'not_installed' | 'error'; detail?: string }>;
+  getAuthStatus(provider: AgentProvider, account?: { id: string; kind: 'system' | 'managed' }): Promise<{ status: 'authenticated' | 'logged_out' | 'not_installed' | 'error'; detail?: string }>;
+  agentRefreshStatus(provider: AgentProvider, account?: { id: string; kind: 'system' | 'managed' }): Promise<{ status: 'authenticated' | 'logged_out' | 'not_installed' | 'error'; detail?: string }>;
+  /** `sourceId` names the account source that the status belongs to. It is absent for a status without an account. */
   onAuthStatus?(listener: (status: { provider: AgentProvider; status: 'not_installed' | 'logged_out' | 'authenticated' | 'error';
-    detail?: string }) => void): (() => void) | void;
-  openLogin(provider: AgentProvider): Promise<{ ok: boolean; detail?: string }>;
-  logout(provider: AgentProvider): Promise<{ ok: boolean; detail?: string }>;
+    sourceId?: string; detail?: string }) => void): (() => void) | void;
+  /** Changes the resident settings after the bridge exists (the idle time of the reaper). */
+  configureResidents?(options: { idleMs?: number }): void;
+  openLogin(provider: AgentProvider, account?: { id: string; kind: 'system' | 'managed' }): Promise<{ ok: boolean; detail?: string }>;
+  logout(provider: AgentProvider, account?: { id: string; kind: 'system' | 'managed' }): Promise<{ ok: boolean; detail?: string }>;
   /** One tool-less, read-only fast-model turn (group free-mode judge). */
   judge?(request: { provider: AgentProvider; prompt: string; systemPrompt: string; workspacePath: string; resumeSessionId?: string;
     timeoutMs?: number }): Promise<{ text: string; sessionId: string }>;
@@ -190,6 +197,8 @@ export interface ConnectedFacadeOptions {
   agent: IntegratedAgent;
   workspaceAuthority?: WorkspaceAuthority;
   attachmentRoot: string;
+  /** `userData/llm-accounts`: the directories of the managed CLI accounts. Without it the account source actions are unavailable. */
+  accountsDirectory?: string;
   attachmentBrokerHelperPath?: string;
   /** App-managed empty directory used as the working directory of the free-mode judge. */
   freeModeJudgeDirectory?: string;
@@ -479,13 +488,27 @@ class StartupStageError extends Error {
 const DEFAULT_WORKER_RESPONSE_TIMEOUT_MS = 30_000;
 /** Single delayed retry for a failed startup auto-login. */
 const STARTUP_AUTOLOGIN_RETRY_DELAY_MS = 5_000;
+/** External monitor retry: first delay 30 s, doubled after each failure, at most 10 minutes. */
+const MONITOR_RETRY_INITIAL_MS = 30_000;
+const MONITOR_RETRY_MAX_MS = 600_000;
+/** Transient failure codes only. The codes that need user action (stale authority, changed checkpoint or source) never retry. */
+const MONITOR_RETRY_CODES: ReadonlySet<string> = new Set([
+  'external_monitor_database_failed', 'external_monitor_reader_failed',
+  'external_monitor_reader_startup_failed', 'external_monitor_unknown',
+]);
 
 async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, startupCleanup: StartupCleanup): Promise<DesktopServiceFacade> {
-  async function recordExternalMonitorDiagnostic(...args: Parameters<typeof persistExternalMonitorDiagnostic>): Promise<void> {
+  /**
+   * The first argument is the safe error code (for example a SQLSTATE) or undefined. It goes into the audit row only.
+   * The local diagnostic file keeps its whitelist and never receives it.
+   */
+  async function recordExternalMonitorDiagnostic(errorCode: string | undefined,
+    ...args: Parameters<typeof persistExternalMonitorDiagnostic>): Promise<void> {
     const correlationId = options.audit?.failure({ operation: 'external_monitor', stage: args[4] ?? (args[1] === 'startup' ? 'bootstrap' : 'execute'),
       reason: args[2], category: args[2] === 'external_monitor_database_failed' ? 'persistence_failed'
         : args[2] === 'external_monitor_authority_stale' || args[2] === 'external_monitor_source_changed' ? 'stale_binding' : 'unknown',
-      recovery: 'check_configuration' });
+      recovery: 'check_configuration',
+      ...(errorCode && DIAGNOSTIC_DETAIL_PATTERN.test(`code:${errorCode}`) ? { detail: `code:${errorCode}` } : {}) });
     await persistExternalMonitorDiagnostic(args[0], args[1], args[2], args[3], args[4], args[5],
       () => { options.audit?.failure(diagnosticFailure('external_monitor', 'write')); }, correlationId);
   }
@@ -498,6 +521,41 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const externalImportProgress = new Map<string, ExternalImportProgress>();
   let pendingMonitorRefresh: { accountId: string; sourceId: string; generation: number; pending: boolean } | null = null;
   let externalImportOwner: { accountId: string; abort: AbortController; task?: Promise<unknown> } | null = null;
+  /**
+   * One retry timer for the external monitor. It starts again after a transient failure only.
+   * The retry reads local official LINE data through the existing reader and sends nothing to LINE servers.
+   */
+  let monitorRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  let monitorRetryDelayMs = MONITOR_RETRY_INITIAL_MS;
+  function clearMonitorRetry(): void {
+    if (monitorRetryTimer) clearTimeout(monitorRetryTimer);
+    monitorRetryTimer = null;
+  }
+  function scheduleMonitorRetry(code: string | null | undefined): void {
+    if (closing || !code || !MONITOR_RETRY_CODES.has(code)) return;
+    clearMonitorRetry();
+    const delay = monitorRetryDelayMs;
+    monitorRetryDelayMs = Math.min(delay * 2, MONITOR_RETRY_MAX_MS);
+    monitorRetryTimer = setTimeout(() => {
+      monitorRetryTimer = null;
+      if (closing || externalImportOwner) return;
+      void resumeExternalMonitor('auto_retry');
+    }, delay);
+    monitorRetryTimer.unref();
+  }
+  /** Shared by the startup resume and the retry timer. A failure schedules the next retry. */
+  function resumeExternalMonitor(producer: ExternalMonitorDiagnosticProducer): Promise<void> {
+    return track(() => resumeExternalMonitorOnStartup(producer), { operation: 'external_monitor', identity: { background: true }, reportFailure: false })
+      .catch((error: unknown) => {
+        const stage = error instanceof ExternalMonitorDiagnosticFailure ? error.stage : 'startup';
+        const code = classifyExternalMonitorFailure(error, stage);
+        void recordExternalMonitorDiagnostic(error instanceof ExternalMonitorDiagnosticFailure ? error.errorCode : safeErrorCode(error),
+          options.externalMonitorDiagnosticPath, stage, code, externalMonitorFailureDetail(error),
+          error instanceof ExternalMonitorDiagnosticFailure ? error.phase : 'facade_startup_selection', producer);
+        console.warn(`[external-monitor] ${producer === 'auto_retry' ? 'retry' : 'startup resume'} failed:`, code);
+        scheduleMonitorRetry(code);
+      });
+  }
   /** At most one read-only official identity read at a time (admin binding preview / confirm). */
   let identityReadAbort: AbortController | null = null;
   const recoveryTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -521,6 +579,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let projectFolders: ProjectFolderService | undefined;
   let delivery!: DeliveryService;
   let stopDelivery: () => Promise<void> = async () => undefined;
+  let failoverProbe: ProviderFailoverProbe | null = null;
   let stopLineSend: () => Promise<void> = async () => undefined;
   let attachmentService!: AttachmentService;
   let stopAttachmentService: () => Promise<void> = async () => undefined;
@@ -532,6 +591,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let lineMedia!: LineMediaService;
   let stopLineMedia: () => Promise<void> = async () => undefined;
   let publishSnapshot!: ReturnType<typeof createCoalescedSnapshotPublisher>;
+  let accountSourceService: AccountSourceService | null = null;
   let stopPublishSnapshot: () => Promise<void> = async () => undefined;
   let stopContentReprojection: () => Promise<void> = async () => undefined;
   let downloadBridge: OfficialDownloadBridgeService | undefined;
@@ -563,8 +623,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const monitorDispatchTimer = setInterval(requestMonitorDispatch,1000);
   monitorDispatchTimer.unref();
   startupCleanup.add(() => clearInterval(monitorDispatchTimer));
+  startupCleanup.add(clearMonitorRetry);
   startupCleanup.beforeUnwind(async () => {
     closing = true;
+    clearMonitorRetry();
     manualMediaAdmission.shutdown();
     externalImportOwner?.abort.abort();
     identityReadAbort?.abort();
@@ -604,6 +666,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     });
   }
   async function stopExternalImportForAccount(accountId: string): Promise<void> {
+    clearMonitorRetry();
     const owner = externalImportOwner;
     if (owner?.accountId === accountId) {
       owner.abort.abort();
@@ -632,9 +695,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const attachmentStorage = new AttachmentStorageRepository(options.pool);
   const agents = new AgentRepository(options.pool);
   const providerQuota = new ProviderQuotaRepository(options.pool);
+  const accountSources = new AccountSourceRepository(options.pool);
+  /** The source of a job (its recorded source when it has one), else the effective default source of the provider. */
+  const quotaAccount = async (provider: AgentProvider, sourceId?: string | null): Promise<{ id: string; kind: 'system' | 'managed' }> => {
+    const row = (sourceId ? await accountSources.get(sourceId) : null) ?? await accountSources.effectiveDefault(provider);
+    return { id: row.sourceId, kind: row.kind };
+  };
   const settings = new SettingsRepository(options.pool);
   // Toggle of the automatic bridge download for new messages. Default false. Loaded once here and updated on each set.
   let externalBridgeAutoDownload = await settings.getExternalBridgeAutoDownload().catch(() => false);
+  // Intervals between two non-live bridge downloads, for each kind. Loaded once here and updated on each set (no restart).
+  let externalBridgeDownloadIntervals = await settings.getExternalBridgeDownloadIntervals().catch(() => DEFAULT_DOWNLOAD_BRIDGE_INTERVALS);
+  const bridgeDownloadGapMs = (kind: 'image' | 'file'): number => randomIntervalMs(externalBridgeDownloadIntervals[kind]);
   // Switch that allows every Chrome extension download of the bridge. Default false. Loaded once here and updated on each set.
   let externalBridgeDownloadEnabled = await settings.getExternalBridgeDownloadEnabled().catch(() => false);
   let conversationSettingsError: string | null = null;
@@ -644,6 +716,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     return { attachmentAutoAttemptLimit: 3, showAgentStatusMarkers: true, agentStatusIcons: DEFAULT_AGENT_STATUS_ICONS,
       agentStatusRotationIntervalSeconds: 10 };
   });
+  // Resident Claude settings: read once here (no UI). A failed read keeps the defaults.
+  const agentRuntime = await settings.getAgentRuntimeSettings().catch((error: unknown) => {
+    options.audit?.failure(diagnosticFailure('database', 'read', error));
+    return AGENT_RUNTIME_DEFAULTS;
+  });
+  options.agent.configureResidents?.({ idleMs: agentRuntime.idleTimeoutSeconds * 1000 });
   let settingsTail: Promise<void> = Promise.resolve();
   const friendWhitelist = new FriendWhitelistRepository(options.pool);
   const autoresponders = new AutoResponderRepository(options.pool);
@@ -864,12 +942,17 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   stopAgentSchedules = onceCleanup(async () => { await scheduleForward.stop(); await agentSchedules.stop(); });
   startupCleanup.add(stopAgentSchedules);
   mcpService = new McpService({ pool: options.pool, tokens: mcpTokens, messages, approvalBroker, lineSend: agentLineSend, schedules: agentSchedules,
+    // attachmentService is created below; read_message_attachment reads it only when an Agent job calls the tool.
+    jobFileAccess: (jobId) => agentService.runFileAccess(jobId),
+    attachments: { recoverFromLocalDownloads: (attachmentId) => attachmentService.recoverFromLocalDownloads(attachmentId), resolveReadyPath: (attachmentId) => attachmentService.resolveReadyPath(attachmentId) },
     onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
     ...(chatResourceStore ? { chatResources: createMcpChatResourceArchiveReader(chatResources, diagnostics ? (record) => diagnostics.record(record) : undefined) } : {}),
     getLiveLoginBinding: getMcpLiveLoginBinding,
-    onInternalObservation: (jobId, observation) => agentService?.noteMcpObservation(jobId, observation) });
+    onInternalObservation: (jobId, observation) => agentService?.noteMcpObservation(jobId, observation),
+    onInternalToolActivity: (jobId, delta) => agentService?.noteToolActivity(jobId, delta) });
   /** Tells subscribers to re-read the execution policy after a successful write. */
-  const publishExecutionPolicyChanged = (): void => { options.publish?.({ type: 'agentExecutionPolicyChanged' }); };
+  // Every call site is an execution-policy or extension change: resident Claude processes are replaced at their next turn.
+  const publishExecutionPolicyChanged = (): void => { options.publish?.({ type: 'agentExecutionPolicyChanged' }); agentService?.noteAgentPolicyChanged(); };
   // Pending approvals settle (cancelled → deny) before MCP admission closes.
   stopMcpService = onceCleanup(async () => { await approvalBroker.close(); await mcpService.shutdown(); });
   startupCleanup.add(stopMcpService);
@@ -951,7 +1034,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       counts = await messages.countBridgeVerification(accountId).catch((error: unknown) => { reportBridgeCountError(error); return undefined; });
       if (counts) bridgeVerificationCache.set(accountId, counts);
     }
-    const empty = { match: 0, mismatch: 0, notInStore: 0, nativeIncomplete: 0 };
+    const empty = { match: 0, mismatch: 0, notInStore: 0, nativeIncomplete: 0, storeIncomplete: 0 };
     const own: BridgeVerificationCounts = counts ?? { image: empty, file: empty };
     const kindSummary = (kind: BridgeKind) => ({ ...own[kind], threshold: bridgeGateThreshold(kind), open: isBridgeGateOpen(kind, own) });
     return { image: kindSummary('image'), file: kindSummary('file') };
@@ -979,7 +1062,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     options.audit?.observed('bridge_message_verify', { initiator: 'system', accountId: record.accountId, requestId: record.attachmentId,
       correlationId: record.correlationId, resultCode: BRIDGE_VERIFY_RESULT_CODES[result],
       diagnostic: { operation: 'attachment', stage: 'read', detail, recovery: 'none',
-        category: result === 'match' ? 'unknown' : result === 'mismatch' ? 'invalid_response' : result === 'not_in_store' ? 'unavailable' : 'invalid_input' } });
+        category: result === 'match' ? 'unknown' : result === 'mismatch' ? 'invalid_response' : result === 'not_in_store' || result === 'store_incomplete' ? 'unavailable' : 'invalid_input' } });
     scheduleBridgeVerificationRefresh(record.accountId);
   };
   publishSnapshot = createCoalescedSnapshotPublisher(async () => {
@@ -1019,11 +1102,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           ...(bridgeStatus.detail ? { detail: bridgeStatus.detail } : {}),
           ...(bridgeStatus.qrExpiresAt !== undefined ? { qrExpiresAt: bridgeStatus.qrExpiresAt } : {}),
           ...(bridgeStatus.identity ? { identity: bridgeStatus.identity } : {}), autoDownload: externalBridgeAutoDownload,
-          downloadEnabled: externalBridgeDownloadEnabled, verification: await bridgeVerificationSummary(account.accountId) }
+          downloadEnabled: externalBridgeDownloadEnabled, intervals: externalBridgeDownloadIntervals, verification: await bridgeVerificationSummary(account.accountId) }
         : { state: 'not_configured' as const, autoDownload: externalBridgeAutoDownload,
-          downloadEnabled: externalBridgeDownloadEnabled, verification: await bridgeVerificationSummary(account.accountId) } }
+          downloadEnabled: externalBridgeDownloadEnabled, intervals: externalBridgeDownloadIntervals, verification: await bridgeVerificationSummary(account.accountId) } }
       : account));
-    return { ...snapshot, accounts: accountsWithBridge };
+    const agentAccountSources = accountSourceService ? await accountSourceService.list().catch(() => null) : null;
+    const agentAutoFailoverEnabled = agentAccountSources ? await settings.getAgentAutoFailoverEnabled().catch(() => null) : null;
+    return { ...snapshot, accounts: accountsWithBridge, ...(agentAccountSources ? { agentAccountSources } : {}), ...(agentAutoFailoverEnabled !== null ? { agentAutoFailoverEnabled } : {}) };
   }, (event) => options.publish?.(event));
   stopPublishSnapshot = onceCleanup(() => publishSnapshot.shutdown());
   startupCleanup.add(stopPublishSnapshot);
@@ -1067,9 +1152,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   }
   unsubscribeAuth = options.agent.onAuthStatus?.((auth) => {
     if (closing) return;
-    if (auth.status === 'error') options.audit?.failure({ ...diagnosticFailure('provider_auth', 'authenticate'), provider: auth.provider });
-    applyProviderAuthStatus(health, auth);
-    void publishSnapshot().catch(() => undefined);
+    if (auth.sourceId !== undefined) accountSourceService?.record(auth.sourceId, auth);
+    void (async () => {
+      // A status of a source that is not the default of its provider must not replace the provider status.
+      if (auth.sourceId !== undefined && auth.sourceId !== (await quotaAccount(auth.provider)).id) return;
+      if (auth.status === 'error') options.audit?.failure({ ...diagnosticFailure('provider_auth', 'authenticate'), provider: auth.provider });
+      applyProviderAuthStatus(health, auth);
+    })().catch(() => undefined).then(() => publishSnapshot()).catch(() => undefined);
   });
   if (unsubscribeAuth) startupCleanup.add(unsubscribeAuth);
   unsubscribeWorkerExit = options.workers.onWorkerExit?.((binding) => {
@@ -1090,6 +1179,15 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return { endpoint: transport.endpoint, token };
     },
     release: (jobId) => mcpService.internalCapabilities.release(jobId),
+    bindResident: (input) => {
+      const transport = mcpHttpServer.status();
+      if (!transport.running || !transport.endpoint) return null;
+      const bound = mcpService.internalCapabilities.bindResident({ ...input, endpointInstance: mcpHttpServer.endpointInstance });
+      if (bound === null) return null;
+      return bound === 'rebound' ? { endpoint: transport.endpoint, rebound: true } : { endpoint: transport.endpoint, token: bound.token };
+    },
+    releaseResident: (residentKey) => mcpService.internalCapabilities.releaseResident(residentKey),
+    endpoint: () => { const transport = mcpHttpServer.status(); return transport.running && transport.endpoint ? transport.endpoint : null; },
     scheduleContext: (sourceRequestId, jobId) => agentSchedules.runContext(sourceRequestId, jobId),
     skill: async () => {
       if (!options.skillsDirectory) return null;
@@ -1100,68 +1198,76 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     },
   };
   let providerQuotaService!: ProviderQuotaService;
-  const validateQuotaFailureNotice = async (jobId:string, expected?:WorkerBinding):Promise<Bound|null> => {
-    const job=await agents.getJob(jobId);
-    if(!job||job.sourceType!=='line') return null;
-    const current=await options.workers.binding(job.accountId);
-    if(!current||current.mode!=='ACTIVE_CONTROL'||current.accountId!==job.accountId
-      ||current.controlEpoch!==job.creationEpoch||(expected&&(current.workerInstanceId!==expected.workerInstanceId||current.controlEpoch!==expected.controlEpoch))
-      ||!lineService.isAuthenticatedReady(current)||!options.workers.isCurrentActiveControlBinding(current)) return null;
-    if(!await providerQuota.validateFailureNoticeAuthority({jobId,accountId:job.accountId,workerInstanceId:current.workerInstanceId,controlEpoch:current.controlEpoch})) return null;
-    return current;
-  };
   const handleProviderQuotaFailure = async (jobId: string, event: Extract<AgentEvent,{type:'failed'}>, observedAt = new Date().toISOString()): Promise<void> => {
     const failedJob=await agents.getJob(jobId);
     if(!failedJob) return;
     const resetAt=event.quotaRecoveryAt??providerFailureResetAt(event.message,Date.parse(observedAt));
-    await providerQuota.recordFailure({provider:failedJob.provider,observedAt,recoveryAt:resetAt??null,
-      source:'Agent PROVIDER_LIMIT failure',evidence:event.message});
-    if(failedJob.sourceType!=='line') return;
-    if(!await validateQuotaFailureNotice(jobId)) { await providerQuota.skipNotice(jobId); return; }
-    const targetProvider=failedJob.provider==='codex'?'claude':'codex';
-    const alternate=await providerQuotaService.get(targetProvider);
-    await providerQuota.saveSnapshot({provider:targetProvider,requestedAt:alternate.requestedAt,fetchedAt:alternate.fetchedAt,
-      stale:alternate.stale,snapshot:alternate});
-    const stored=await providerQuota.get(targetProvider);
-    const alternateBlocked=!!stored?.blocked||alternate.windows.some(window=>window.blocksProvider&&window.usedPercent>=100);
-    const currentState=await providerQuota.get(failedJob.provider);
-    const alternateAvailable=!alternate.error&&!alternate.stale&&!!alternate.fetchedAt&&alternate.availabilityKnown&&alternate.windows.length>0
-      &&!alternate.windows.some(window=>window.blocksProvider&&window.usedPercent>=100)&&!!stored&&!stored.blocked;
-    const consentAvailable=alternateAvailable&&await providerQuota.createProposal(jobId,targetProvider,new Date(Date.now()+10*60_000).toISOString());
-    if(!await validateQuotaFailureNotice(jobId)) { await providerQuota.skipNotice(jobId); return; }
-    await providerQuota.createNotice(jobId);
-    const noticeBinding=await validateQuotaFailureNotice(jobId);
-    if(!noticeBinding) { await providerQuota.skipNotice(jobId); return; }
-    if(!await providerQuota.claimNotice(jobId)) return;
-    const failedName=failedJob.provider==='codex'?'Codex':'Claude';
-    const targetName=targetProvider==='codex'?'Codex':'Claude';
-    const recovery=currentState?.recoveryAt??resetAt??null;
-    const suggestion=quotaFailureSuggestion({currentName:failedName,currentRecoveryAt:recovery,targetName,
-      currentBlocked:currentState?.blocked===true,alternateBlocked,alternateRecoveryAt:stored?.recoveryAt??null,
-      alternateAvailable,alternateQueryError:alternate.error,alternateStale:alternate.stale,consentAvailable,
-      originalSenderAdmin:consentAvailable});
-    const currentReset=recovery?new Intl.DateTimeFormat('zh-TW',{timeZone:'Asia/Taipei',dateStyle:'medium',timeStyle:'short'}).format(new Date(recovery)):'重設時間未知';
-    const failureStatus=currentState?.blocked&&alternateBlocked?`${failedName} 額度已用完。`:`${failedName} 額度已用完；預計重設：${currentReset}。`;
-    try {
-      const sent=await agentLineSend.sendSystemText({runId:randomUUID(),target:failedJob,principalId:'system:provider_quota',
-        text:`${failureStatus}這次工作已失敗。${suggestion}`,
-        validateBeforeSend:async(binding)=>{
-          const sameBinding=binding.accountId===noticeBinding.accountId&&binding.workerInstanceId===noticeBinding.workerInstanceId
-            &&binding.controlEpoch===noticeBinding.controlEpoch;
-          const valid=sameBinding&&!!await validateQuotaFailureNotice(jobId,noticeBinding);
-          if(!valid) await providerQuota.skipNotice(jobId);
-          return !!valid;
-        }});
-      await providerQuota.finishNotice(jobId,sent.status==='sent'?'sent':'unknown');
-    } catch { await providerQuota.finishNotice(jobId,'unknown').catch(()=>undefined); }
+    // The failure belongs to the account source the job ran on (agent_jobs.account_source_id).
+    const failedAccount=await quotaAccount(failedJob.provider,await agents.jobAccountSource(jobId));
+    await providerQuota.recordQuotaFailure({sourceId:failedAccount.id,kind:'quota_exhausted',observedAt,recoveryAt:resetAt??null,
+      evidence:event.message});
+  };
+  // P5 failover (plan D21 to D26): the router picks the provider and source at the start of each turn.
+  const failoverRouting = new ProviderFailoverService({
+    settings,
+    sources: { list: async () => {
+      if (accountSourceService) return accountSourceService.list();
+      // No account service (no accounts directory): the stored rows, with no cached login status.
+      const rows = await accountSources.list();
+      const order = normalizedFallbackOrder(rows);
+      return rows.map((row) => ({ id: row.sourceId, provider: row.provider, fallbackEnabled: row.fallbackEnabled,
+        isDefault: effectiveDefaultId(rows, row.provider) === row.sourceId, order: order.includes(row.sourceId) ? order.indexOf(row.sourceId) : null,
+        status: 'unknown' as const }));
+    } },
+    quota: providerQuota,
+    agents });
+  // The notice goes only to the chat of the job, and only while the original LINE authority and the worker binding still hold.
+  const validateJobNotice = async (jobId: string, expected?: WorkerBinding): Promise<Bound | null> => {
+    const job = await agents.getJob(jobId);
+    if (!job || job.sourceType !== 'line') return null;
+    const current = await options.workers.binding(job.accountId);
+    if (!current || current.mode !== 'ACTIVE_CONTROL' || current.accountId !== job.accountId
+      || current.controlEpoch !== job.creationEpoch || (expected && (current.workerInstanceId !== expected.workerInstanceId || current.controlEpoch !== expected.controlEpoch))
+      || !lineService.isAuthenticatedReady(current) || !options.workers.isCurrentActiveControlBinding(current)) return null;
+    if (!await providerQuota.validateJobNoticeAuthority({ jobId, accountId: job.accountId, workerInstanceId: current.workerInstanceId, controlEpoch: current.controlEpoch })) return null;
+    return current;
+  };
+  const pendingTurnRepository = new PendingTurnRepository(options.pool);
+  const failover: AgentFailover = {
+    routing: failoverRouting,
+    pendingTurns: pendingTurnRepository,
+    // P5 B3b: a continuation of a LINE job must match the worker binding that holds the chat now.
+    turns: { store: pendingTurnRepository, currentBinding: async (job) => {
+      if (job.sourceType !== 'line') return null;
+      const current = await options.workers.binding(job.accountId);
+      return current ? { workerInstanceId: current.workerInstanceId, controlEpoch: current.controlEpoch } : null;
+    } },
+    sendNotice: async (job, text) => {
+      if (job.sourceType !== 'line') return;
+      const noticeBinding = await validateJobNotice(job.jobId);
+      if (!noticeBinding) return;
+      await agentLineSend.sendSystemText({ runId: randomUUID(), target: { accountId: job.accountId, chatType: job.chatType, chatId: job.chatId }, text,
+        principalId: 'system:provider_quota',
+        validateBeforeSend: async (binding) => binding.accountId === noticeBinding.accountId && binding.workerInstanceId === noticeBinding.workerInstanceId
+          && binding.controlEpoch === noticeBinding.controlEpoch && !!await validateJobNotice(job.jobId, noticeBinding) });
+    },
   };
   agentService = new AgentService(agents, workspace, options.agent,
     async (jobId, event) => {
       if (event.type === 'failed' && event.code === 'PROVIDER_LIMIT') await handleProviderQuotaFailure(jobId,event).catch(()=>undefined);
-      if (event.type === 'failed') options.audit?.failure({ operation: 'agent',
-        stage: event.code === 'BRIDGE_ERROR' ? 'spawn' : event.code === 'INVALID_JSONL' ? 'parse' : 'execute',
-        category: event.code === 'AUTH_REQUIRED' ? 'authentication_required' : event.code === 'TIMEOUT' ? 'timeout' : 'unknown',
-        recovery: event.code === 'AUTH_REQUIRED' ? 'check_configuration' : 'retry' }, { jobId });
+      if (event.type === 'failed') {
+        const code = /^[A-Z][A-Z0-9_]{0,59}$/.test(event.code) ? event.code : 'UNKNOWN';
+        const category = event.code === 'MISSING_TERMINAL' || event.code === 'NO_ASSISTANT_TEXT' || event.code === 'EMPTY_REPLY' ? 'invalid_response'
+          : event.code === 'INVALID_MODEL' ? 'invalid_input'
+          : event.code === 'RESUME_NOT_FOUND' || event.code === 'ALL_SOURCES_EXHAUSTED' || event.code === 'NO_AVAILABLE_SOURCE' ? 'unavailable'
+          : event.code === 'CLI_EXIT' ? 'process_exit'
+          : event.code === 'AUTH_REQUIRED' || event.code === 'ACCOUNT_NOT_LOGGED_IN' ? 'authentication_required'
+          : event.code === 'TIMEOUT' || event.code === 'TURN_STALLED' ? 'timeout' : 'unknown';
+        options.audit?.failure({ operation: 'agent',
+          stage: event.code === 'BRIDGE_ERROR' ? 'spawn' : 'execute',
+          category, recovery: event.code === 'AUTH_REQUIRED' || event.code === 'ACCOUNT_NOT_LOGGED_IN' ? 'check_configuration' : 'retry',
+          detail: event.detail ? `${code}:${event.detail}` : code }, { jobId }, 'AGENT_JOB_FAILED');
+      }
       if (event.type === 'failed') freeMode?.noteJobFailed(jobId, event.message);
       options.publish?.({ type: 'agentEvent', jobId, event });
       if (event.type === 'started' || event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
@@ -1180,23 +1286,65 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     internalMcpLauncher, agentJobEnvironment,
     (diagnostic, jobId) => options.audit?.failure(diagnostic, { ...(jobId ? { jobId } : {}) }),
     (chat) => resolveEffectivePersona(settings, chat).then((persona) => persona.description),
-    async (provider) => {
-      const current=await providerQuota.get(provider);
-      if(!current?.blocked) return null;
-      const reset=current.recoveryAt?Date.parse(current.recoveryAt):NaN;
-      if(!Number.isFinite(reset)||reset>Date.now()) return {blocked:true,recoveryAt:current.recoveryAt};
-      const snapshot=await providerQuotaService.refreshNow(provider);
-      await providerQuota.saveSnapshot({provider,requestedAt:snapshot.requestedAt,fetchedAt:snapshot.fetchedAt,stale:snapshot.stale,snapshot});
-      const updated=await providerQuota.get(provider);
-      return updated?.blocked?{blocked:true,recoveryAt:updated.recoveryAt}:null;
-    },
     // attachmentService is created below; the resolver reads it only when a LINE reply job runs.
     createReplyContextResolver({ database: options.pool, attachments: { resolveReadyPath: (attachmentId) => attachmentService.resolveReadyPath(attachmentId),
-      downloadById: (attachmentId, signal) => attachmentService.downloadById(attachmentId, signal) } }));
-  providerQuotaService = new ProviderQuotaService((provider) => agentService.queryQuota(provider));
+      downloadById: (attachmentId, signal) => attachmentService.downloadById(attachmentId, signal) } }),
+    { accountSources, failover, residentTurnTimeoutMs: agentRuntime.turnTimeoutSeconds * 1000, residentStallMs: agentRuntime.turnStallSeconds * 1000,
+      // Decision D1: a job with a committed LINE send is never replayed by the self-heal.
+      committedLineSends: (jobId) => messages.countJobLineSends(jobId),
+      // /model: a LINE job uses its chat's model. A room job uses the model of the admin-direct chat while the claim fixed that
+      // session for it (the room shares the chat); a room job on its own session has no model and follows the bridge default.
+      resolveClaudeModel: async (job) => {
+        const chat = job.sourceType === 'line' ? { accountId: job.accountId, chatType: job.chatType, chatId: job.chatId }
+          : job.sourceType === 'ui' && job.sessionKey && job.sessionKey.accountId !== null
+            ? { accountId: job.sessionKey.accountId, chatType: job.sessionKey.chatType, chatId: job.sessionKey.chatId } : null;
+        return chat ? await settings.getConversationClaudeModel(chat) : null;
+      },
+      // The same chat rule for a Codex job; the Codex model is a free ID.
+      resolveCodexModel: async (job) => {
+        const chat = job.sourceType === 'line' ? { accountId: job.accountId, chatType: job.chatType, chatId: job.chatId }
+          : job.sourceType === 'ui' && job.sessionKey && job.sessionKey.accountId !== null
+            ? { accountId: job.sessionKey.accountId, chatType: job.sessionKey.chatType, chatId: job.sessionKey.chatId } : null;
+        return chat ? await settings.getConversationCodexModel(chat) : null;
+      } });
+  providerQuotaService = new ProviderQuotaService((provider, account) => agentService.queryQuota(provider, account));
+  if (options.accountsDirectory) {
+    accountSourceService = new AccountSourceService({ repository: accountSources, bridge: options.agent, accountsDirectory: options.accountsDirectory,
+      quota: providerQuotaService, quotaState: (sourceId) => providerQuota.get(sourceId),
+      busySourceIds: async () => new Set((await options.pool.query<{ account_source_id: string }>(
+        "SELECT DISTINCT account_source_id FROM agent_jobs WHERE account_source_id IS NOT NULL AND status IN ('queued','running')")).rows.map((row) => row.account_source_id)),
+      onChange: () => { if (!closing) void publishSnapshot().catch(() => undefined); },
+      onDiagnostic: (code, sourceId) => options.audit?.failure({ ...diagnosticFailure('agent', 'execute'), detail: `${code}:${sourceId}` }) });
+  }
   agentService.setStatusRotationIntervalSeconds(conversationSettings.agentStatusRotationIntervalSeconds);
   stopAgentService = onceCleanup(() => agentService.shutdown());
   startupCleanup.add(stopAgentService);
+  // A closed resident process (reap, reset, exit) gives its MCP token back.
+  const unsubscribeResidentClosed = options.agent.onResidentClosed?.(({ key }) => { internalMcpLauncher.releaseResident?.(key); agentService.forgetRelayTarget(key); });
+  if (typeof unsubscribeResidentClosed === 'function') startupCleanup.add(unsubscribeResidentClosed);
+  // A result that no LINE job started (a background sub-agent finished) goes to the chat of the last completed LINE job of that resident.
+  options.agent.setRelayTarget?.((key) => agentService.hasRelayTarget(key));
+  const unsubscribeAutonomousReply = options.agent.onAutonomousReply?.((event) => { void agentService.relayAutonomousReply(event); });
+  if (typeof unsubscribeAutonomousReply === 'function') startupCleanup.add(unsubscribeAutonomousReply);
+  // Auto-Slim (CliTalkAgent stream_json_host.rs reap_idle_sessions): when an idle resident is reaped and its transcript or turn count is
+  // over the limit, forget the stored provider session id, so the next turn starts a new, small session instead of a resume.
+  const unsubscribeResidentReaped = options.agent.onResidentReaped?.((reaped) => {
+    void (async () => {
+      const reason = slimReason(reaped.turnsCompleted, transcriptBytes(reaped.capturedSessionId, reaped.cwd, homeDirectoryFrom(process.env), undefined, reaped.claudeConfigDir),
+        { enabled: agentRuntime.autoSlimEnabled, maxTurns: agentRuntime.autoSlimMaxTurns, maxBytes: agentRuntime.autoSlimMaxTranscriptBytes });
+      if (reason === undefined || reaped.capturedSessionId === undefined) return;
+      const parsed = parseResidentKey(reaped.key);
+      if (parsed === null) return;
+      const cleared = await agents.clearExternalSession(residentSessionKey(parsed.identity), parsed.generation, reaped.capturedSessionId);
+      options.audit?.failure({ ...diagnosticFailure('agent', 'persist', undefined, 'recovered'), detail: `auto_slim:${reason}:${cleared ? 'cleared' : 'kept'}` });
+    })().catch((error: unknown) => options.audit?.failure(diagnosticFailure('agent', 'persist', error)));
+  });
+  if (typeof unsubscribeResidentReaped === 'function') startupCleanup.add(unsubscribeResidentReaped);
+  // A resident spawn at the limit with no reapable resident still runs; the audit gets a diagnostic.
+  const unsubscribeResidentCapacity = options.agent.onResidentCapacityExceeded?.(() => {
+    try { options.audit?.failure({ ...diagnosticFailure('agent', 'spawn', undefined, 'recovered'), detail: 'resident_capacity_exceeded' }); } catch { /* Diagnostics never change a job. */ }
+  });
+  if (typeof unsubscribeResidentCapacity === 'function') startupCleanup.add(unsubscribeResidentCapacity);
 
   attachmentService = new AttachmentService(messages, {
     // An External Monitor account has no worker, so it gets no binding here.
@@ -1226,13 +1374,16 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   (key, attachmentId) => attachmentStorageService.onPrimaryReady(key,attachmentId),
   // The bridge is created below. The downloader reads it only when an External Monitor attachment downloads.
   options.downloadBridgeRoot ? {
-    downloader: new OfficialDownloadBridgeDownloader({ getLive: () => downloadBridge?.getLive() ?? null }),
+    downloader: new OfficialDownloadBridgeDownloader({ getLive: () => downloadBridge?.getLive() ?? null, downloadGapMs: bridgeDownloadGapMs }),
+    downloadGapMs: bridgeDownloadGapMs,
     store: createBridgeAttachmentStore({ root: options.attachmentRoot, broker: attachmentBroker }),
     isAutoDownloadEnabled: () => externalBridgeAutoDownload,
     isDownloadEnabled: () => externalBridgeDownloadEnabled,
     isIdentityVerified: () => downloadBridge?.status().identity === 'verified',
     recordVerification: recordBridgeVerification,
-  } : undefined);
+  } : undefined,
+  // An expired attachment is recovered from the local Downloads folder first. No network is used.
+  { downloadsDir: path.join(homedir(), 'Downloads'), store: createBridgeAttachmentStore({ root: options.attachmentRoot, broker: attachmentBroker }) });
   stopAttachmentService = onceCleanup(() => attachmentService.shutdown());
   startupCleanup.add(stopAttachmentService);
   stopAttachmentStorageService = onceCleanup(() => attachmentStorageService.shutdown());
@@ -1523,10 +1674,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }, { operation: 'line_ingest', identity: { ...(changes[0] ? { accountId: changes[0].key.accountId } : {}), background: true } }).catch(() => undefined);
     }, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic), freeMode, projectFolders,
     (input) => agentLineSend.sendSystemText(input),
-    async (snapshot) => providerQuota.saveSnapshot({ provider: snapshot.provider, requestedAt: snapshot.requestedAt,
+    async (snapshot) => providerQuota.saveSnapshot({ sourceId: snapshot.sourceId ?? snapshot.provider, requestedAt: snapshot.requestedAt,
       fetchedAt: snapshot.fetchedAt, stale: snapshot.stale, snapshot }), providerQuotaService,
-    (key, senderId, targetProvider) => providerQuota.pendingProposal({ ...key, senderId, targetProvider }),
-    (provider) => providerQuota.get(provider));
+    (sourceId) => providerQuota.get(sourceId), () => accountSources.list(),
+    async (routeKey) => await settings.getAgentAutoFailoverEnabled() ? agents.getRoute(routeKey) : null);
   lineServiceReady = true;
   delivery = new DeliveryService(agents, {
     binding: (accountId) => options.workers.binding(accountId),
@@ -1663,8 +1814,22 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       // A failed QR login ends logged out. A token login (startup or resume) and a replaced or busy attempt keep the old state.
       const endsLoggedOut = (event.code === 'LOGIN_FAILED' || event.code === 'LOGIN_TIMEOUT')
         && lineService.loginAttemptKind(event.accountId, instance, event.loginAttemptId) === 'qr';
+      const sessionRejected = event.code === 'LOGIN_FAILED'
+        && lineService.loginAttemptKind(event.accountId, instance, event.loginAttemptId) === 'token' && isTokenLoginRejection(event);
       await lineService.handleWorkerEvent(instance, event);
       if (!lineService.isCurrentWorkerEvent(instance, event)) return;
+      if (sessionRejected) {
+        // LINE rejected the stored session with HTTP 4xx. A restart would reuse it, so the account needs a new login. Secrets stay.
+        await supervisor.runLifecycle(async () => {
+          const running = await options.workers.binding(event.accountId) ?? supervisor.binding(event.accountId);
+          if (running && running.workerInstanceId !== instance) return;
+          await accounts.setConnectionStatus(event.accountId, 'reauth_required');
+          options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId: event.loginAttemptId,
+            state: 'reauth_required', message: event.message });
+        });
+        await publishSnapshot();
+        return;
+      }
       if (endsLoggedOut) {
         await supervisor.runLifecycle(async () => {
           const running = await options.workers.binding(event.accountId) ?? supervisor.binding(event.accountId);
@@ -1878,11 +2043,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       || current.workerInstanceId !== binding.workerInstanceId || current.controlEpoch !== binding.controlEpoch
       || !lineService.isAuthenticatedReady(current) || !options.workers.isCurrentActiveControlBinding(current)) return;
     await delivery.recoverPending(binding.accountId);
-    for(const failure of await providerQuota.recoverableFailures(binding.accountId)) {
-      if(failure.event.type==='failed'&&failure.event.code==='PROVIDER_LIMIT') {
-        await handleProviderQuotaFailure(failure.jobId,failure.event as unknown as Extract<AgentEvent,{type:'failed'}>,failure.observedAt).catch(()=>undefined);
-      }
-    }
     if ((await accounts.getAccount(binding.accountId))?.productRole !== 'AGENT') return;
     if (signal?.aborted || closing || !lineService.isAuthenticatedReady(current)
       || !options.workers.isCurrentActiveControlBinding(current)) return;
@@ -2146,6 +2306,31 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   };
 
   /**
+   * Recovered (backlog) External Monitor attachments of the Primary Admin. The first complete polling round is archive-only,
+   * so those rows get no new-message verification. After that round, verify the queued rows of the last 7 days one after another.
+   * The attachment service downloads only after a `match`, with both switches on. It reads local extension memory only.
+   * Errors never reach the monitor.
+   */
+  const sweepRecoveredExternalAttachments = async (accountId: string, signal: AbortSignal): Promise<void> => {
+    if (closing || signal.aborted) return;
+    try {
+      const rows = await options.pool.query<{ attachment_id: string }>(
+        `SELECT a.attachment_id FROM attachments a JOIN messages m ON m.account_id=a.account_id AND m.chat_type=a.chat_type
+           AND m.chat_id=a.chat_id AND m.message_id=a.message_id
+         WHERE a.account_id=$1 AND a.status='queued' AND a.kind IN ('image','file') AND a.chat_type IN ('direct','group','room')
+           AND m.occurred_at >= now() - ($2::integer * interval '1 millisecond')
+           AND EXISTS (SELECT 1 FROM line_accounts la WHERE la.account_id=a.account_id AND la.product_role='PRIMARY_ADMIN')
+           AND EXISTS (SELECT 1 FROM message_source_provenance p WHERE p.account_id=a.account_id AND p.message_id=a.message_id AND p.origin='EXTERNAL_MONITOR')
+         ORDER BY m.occurred_at DESC LIMIT 200`,
+        [accountId, EXTERNAL_BRIDGE_RECOVERED_MAX_AGE_MS]);
+      for (const row of rows.rows) {
+        if (closing || signal.aborted) return;
+        await attachmentService.verifyRecoveredExternalAttachment(row.attachment_id).catch(() => undefined);
+      }
+    } catch { /* A sweep error must not change monitoring. The row waits for a user click. */ }
+  };
+
+  /**
    * Identity proof of the download bridge. After the page commit, take the new messages that the Primary Admin sent.
    * The extension store must hold the same message with the same sender as the logged-in Chrome account.
    * It reads local extension memory only. It never waits in the commit path. Errors never reach the monitor.
@@ -2187,7 +2372,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     const repository = async <T>(operation: () => Promise<T>): Promise<T> => {
       try { return await operation(); } catch (error) {
         const failure = externalMonitorDatabaseFailure(error, readerReady ? 'runtime' : 'startup');
-        throw new ExternalMonitorDiagnosticFailure(failure.code, failure.stage, failure.detail, diagnosticPhase);
+        throw new ExternalMonitorDiagnosticFailure(failure.code, failure.stage, failure.detail, diagnosticPhase, failure.errorCode);
       }
     };
     if (!importer) throw new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup');
@@ -2254,6 +2439,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           dispatchEligible: firstMonitorRoundComplete,
           signal };
         const committed: ExternalDirectPollResult = await repository(() => committer.commitDirectPoll(poll));
+        monitorRetryDelayMs = MONITOR_RETRY_INITIAL_MS;
         requestMonitorDispatch();
         // Only after the first full round (not the backlog) and only for rows that this commit changed.
         if (poll.dispatchEligible === true && !committed.replayed) {
@@ -2263,7 +2449,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         // The repository commits this cursor atomically with the page. Advance
         // the local predecessor only after that transaction resolves.
         checkpoint = poll.cursor;
-        if (!page.hasMore) firstMonitorRoundComplete = true;
+        if (!page.hasMore) {
+          // One time for each monitor run: the backlog of the first round gets its verification now.
+          if (!firstMonitorRoundComplete) void sweepRecoveredExternalAttachments(input.accountId, input.signal).catch(() => undefined);
+          firstMonitorRoundComplete = true;
+        }
         if (!committed.replayed && committed.changedMessages.length > 0) pendingMonitorRefresh!.pending = true;
         if (!committed.replayed && committed.unreadChanged > 0) pendingMonitorRefresh!.pending = true;
         if (!page.hasMore && pendingMonitorRefresh!.pending) {
@@ -2276,7 +2466,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       await readinessDiagnosticClear;
       const stage = readerReady ? 'runtime' : 'startup';
       const phase = error instanceof ExternalMonitorDiagnosticFailure && error.phase ? error.phase : diagnosticPhase;
-      throw new ExternalMonitorDiagnosticFailure(classifyExternalMonitorFailure(error, stage), stage, externalMonitorFailureDetail(error), phase);
+      throw new ExternalMonitorDiagnosticFailure(classifyExternalMonitorFailure(error, stage), stage, externalMonitorFailureDetail(error), phase,
+        error instanceof ExternalMonitorDiagnosticFailure ? error.errorCode : safeErrorCode(error));
     }
   }
 
@@ -2306,6 +2497,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (closing) return failure(requestId, 'SERVICE_CLOSING', 'Service is closing.');
       const abort = new AbortController();
       externalImportOwner = { accountId, abort };
+      clearMonitorRetry();
       const progressLog = !previousState?.initialImportComplete && options.externalImportProgressPath
         ? createFirstImportProgressLog(options.externalImportProgressPath, {
           onError: (error) => options.audit?.failure(diagnosticFailure('external_monitor', 'write', error)),
@@ -2498,8 +2690,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           } else {
             const monitorFailure = error instanceof ExternalMonitorDiagnosticFailure ? error : null;
             const safeCode = monitorFailure?.code ?? null;
-            if (monitorFailure) await recordExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath, monitorFailure.stage, monitorFailure.code,
+            if (monitorFailure) await recordExternalMonitorDiagnostic(monitorFailure.errorCode, options.externalMonitorDiagnosticPath, monitorFailure.stage, monitorFailure.code,
               monitorFailure.detail, monitorFailure.phase, 'manual_start');
+            // Every ExternalMonitorDiagnosticFailure comes from the monitor phase or from a database call. Only transient codes retry.
+            scheduleMonitorRetry(safeCode);
             setProgress({ stage: 'failed', copiedBytes: externalImportProgress.get(accountId)?.copiedBytes ?? null,
               totalBytes: externalImportProgress.get(accountId)?.totalBytes ?? null,
               committedRows: externalImportProgress.get(accountId)?.committedRows ?? previousState?.committedCount ?? '0',
@@ -2518,7 +2712,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     });
   }
 
-  async function resumeExternalMonitorOnStartup(): Promise<void> {
+  async function resumeExternalMonitorOnStartup(producer: ExternalMonitorDiagnosticProducer = 'startup_resume'): Promise<void> {
     if (!options.officialSnapshotImporter?.readOfficialMonitor) return;
     await supervisor.runLifecycle(async () => {
     if (closing || externalImportOwner) return;
@@ -2547,11 +2741,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         sourceId: candidate.source_id, generation });
     } catch (error) {
       const diagnostic = externalMonitorDatabaseFailure(error, 'startup');
-      await recordExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath, diagnostic.stage, diagnostic.code,
-        undefined, 'facade_checkpoint_fence', 'startup_resume');
+      await recordExternalMonitorDiagnostic(diagnostic.errorCode, options.externalMonitorDiagnosticPath, diagnostic.stage, diagnostic.code,
+        undefined, 'facade_checkpoint_fence', producer);
       externalImportProgress.set(candidate.account_id, { stage: 'failed', copiedBytes: null, totalBytes: null,
         committedRows: '0', eligibleRows: null, message: diagnostic.code });
       await publishSnapshot().catch(() => undefined);
+      scheduleMonitorRetry(diagnostic.code);
       return;
     }
     if (closing || externalImportOwner || !state?.initialImportComplete || state.sourceIdentityDigest !== candidate.identity_digest) return;
@@ -2571,7 +2766,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
             generation, signal: abort.signal });
         } catch (error) {
           const failure = externalMonitorDatabaseFailure(error, 'startup');
-          throw new ExternalMonitorDiagnosticFailure(failure.code, failure.stage, failure.detail, 'facade_checkpoint_fence');
+          throw new ExternalMonitorDiagnosticFailure(failure.code, failure.stage, failure.detail, 'facade_checkpoint_fence', failure.errorCode);
         }
         await runDirectMonitor({ accountId: candidate.account_id, ownMid: candidate.own_mid, sourceId: candidate.source_id,
           generation, modeRevision: fence.expectedModeRevision,
@@ -2579,8 +2774,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       } catch (error) {
         const failureStage = error instanceof ExternalMonitorDiagnosticFailure ? error.stage : 'startup';
         const failureCode = abort.signal.aborted ? null : classifyExternalMonitorFailure(error, failureStage);
-        if (failureCode) await recordExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath, failureStage, failureCode,
-          externalMonitorFailureDetail(error), error instanceof ExternalMonitorDiagnosticFailure ? error.phase : undefined, 'startup_resume');
+        if (failureCode) await recordExternalMonitorDiagnostic(error instanceof ExternalMonitorDiagnosticFailure ? error.errorCode : safeErrorCode(error),
+          options.externalMonitorDiagnosticPath, failureStage, failureCode,
+          externalMonitorFailureDetail(error), error instanceof ExternalMonitorDiagnosticFailure ? error.phase : undefined, producer);
+        scheduleMonitorRetry(failureCode);
         setProgress({ stage: abort.signal.aborted ? 'complete' : 'failed', copiedBytes: null, totalBytes: null,
           committedRows: state.committedCount, eligibleRows: state.eligibleCount,
           message: abort.signal.aborted ? 'External monitoring paused.'
@@ -2776,6 +2973,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         await settings.setAppSetting('manual_unsend_window', request.window);
         return { type: request.type, requestId, ok: true, window: request.window };
       }
+      if (request.type === 'getLineLegyEncrypted') {
+        return { type: request.type, requestId, ok: true, enabled: await settings.getLineLegyEncrypted().catch(() => false) };
+      }
+      if (request.type === 'setLineLegyEncrypted') {
+        await settings.setLineLegyEncrypted(request.enabled);
+        return { type: request.type, requestId, ok: true, enabled: request.enabled };
+      }
       if (request.type === 'getAgentPersona') return { type: request.type, requestId, ok: true, persona: await readGlobalPersona(settings) };
       if (request.type === 'setAgentPersona') {
         const description = request.persona.description.trim();
@@ -2932,6 +3136,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         if (account?.productRole !== 'PRIMARY_ADMIN') return failure(request.requestId, 'ADMIN_NOT_SET', '尚未設定主要管理者。');
         await settings.setExternalBridgeAutoDownload(request.enabled);
         externalBridgeAutoDownload = request.enabled;
+        await publishSnapshot().catch(() => undefined);
+        return accepted(request.requestId);
+      }
+      if (request.type === 'adminDownloadBridgeSetIntervals') {
+        const account = await accounts.getAccount(request.accountId);
+        if (account?.productRole !== 'PRIMARY_ADMIN') return failure(request.requestId, 'ADMIN_NOT_SET', '尚未設定主要管理者。');
+        await settings.setExternalBridgeDownloadIntervals(request.intervals);
+        externalBridgeDownloadIntervals = request.intervals;
         await publishSnapshot().catch(() => undefined);
         return accepted(request.requestId);
       }
@@ -3184,11 +3396,69 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (request.type === 'setDefaultAgent') { await settings.setAppSetting('default_provider', request.provider); await publishSnapshot(); return accepted(request.requestId); }
       if (request.type === 'setWorkspace') { await workspace.configure(request.workspacePath); return accepted(request.requestId); }
       if (request.type === 'agentRefreshStatus') {
-        const auth = await options.agent.agentRefreshStatus(request.provider);
+        const auth = await options.agent.agentRefreshStatus(request.provider, await quotaAccount(request.provider));
         if (auth.status === 'error') options.audit?.failure({ ...diagnosticFailure('provider_auth', 'authenticate'), provider: request.provider });
         applyProviderAuthStatus(health, {provider:request.provider,...auth});
         await publishSnapshot();
         return accepted(request.requestId);
+      }
+      if (request.type === 'agentSourceSetAutoFailover') {
+        await settings.setAgentAutoFailoverEnabled(request.enabled);
+        await publishSnapshot();
+        return { type: request.type, requestId, ok: true, enabled: request.enabled };
+      }
+      if (request.type === 'agentSourceAdd' || request.type === 'agentSourceRename' || request.type === 'agentSourceRemove'
+        || request.type === 'agentSourceSetDefault' || request.type === 'agentSourceMove' || request.type === 'agentSourceSetFallback'
+        || request.type === 'agentSourceLogin' || request.type === 'agentSourceLogout' || request.type === 'agentSourceRefresh'
+        || request.type === 'agentSourceUsage') {
+        const sourceService = accountSourceService;
+        if (!sourceService) return failure(requestId, 'SERVICE_UNAVAILABLE', 'CLI 帳號功能目前無法使用。', true);
+        // Audit: login and logout reuse the provider login and logout actions. The other changes use the provider status action.
+        // The audit has no field for the account id or the label, so it holds the request id only.
+        const providerOf = async (id: string) => (await sourceService.list()).find((row) => row.id === id)?.provider;
+        const action: AuditAction | null = request.type === 'agentSourceLogin'
+          ? (await providerOf(request.id)) === 'codex' ? 'agent_codex_login' : 'agent_claude_login'
+          : request.type === 'agentSourceLogout'
+            ? (await providerOf(request.id)) === 'codex' ? 'agent_codex_logout' : 'agent_claude_logout'
+            : request.type === 'agentSourceRefresh' || request.type === 'agentSourceUsage' ? null : 'agent_provider_status';
+        const correlationId = action ? options.audit?.request(action, { initiator: 'user', requestId: request.requestId, reasonCode: 'operator_action' }) : undefined;
+        try {
+          let result: IpcResult;
+          let ok = true;
+          if (request.type === 'agentSourceAdd') result = { type: request.type, requestId, ok: true, sources: await sourceService.add({ provider: request.provider, label: request.label }) };
+          else if (request.type === 'agentSourceRename') result = { type: request.type, requestId, ok: true, sources: await sourceService.rename(request.id, request.label) };
+          else if (request.type === 'agentSourceRemove') result = { type: request.type, requestId, ok: true, sources: await sourceService.remove(request.id) };
+          else if (request.type === 'agentSourceSetDefault') result = { type: request.type, requestId, ok: true, sources: await sourceService.setDefault(request.provider, request.id) };
+          else if (request.type === 'agentSourceMove') result = { type: request.type, requestId, ok: true, sources: await sourceService.move(request.id, request.direction) };
+          else if (request.type === 'agentSourceSetFallback') result = { type: request.type, requestId, ok: true, sources: await sourceService.setFallbackEnabled(request.id, request.enabled) };
+          else if (request.type === 'agentSourceLogin' || request.type === 'agentSourceLogout') {
+            const done = request.type === 'agentSourceLogin' ? await sourceService.login(request.id) : await sourceService.logout(request.id);
+            ok = done.result.ok;
+            result = ok ? { type: request.type, requestId, ok: true, sources: done.sources }
+              : failure(requestId, 'AGENT_AUTH_FAILED', done.result.detail ?? 'Agent 登入操作失敗。');
+          } else if (request.type === 'agentSourceRefresh') {
+            await sourceService.refresh(request.id);
+            result = { type: request.type, requestId, ok: true, sources: await sourceService.list() };
+          } else {
+            const usage = await sourceService.usage(request.id, request.force);
+            result = { type: 'agentSourceUsage', requestId, ok: true, sources: await sourceService.list(), usage };
+          }
+          if (correlationId) options.audit?.complete(correlationId, ok ? 'succeeded' : 'failed', ok
+            ? { resultCode: 'agent_auth_action_completed' } : { errorCode: 'AGENT_AUTH_FAILED' });
+          // The provider status follows the effective default source, which an action may have changed.
+          if (request.type !== 'agentSourceUsage') {
+            for (const provider of ['claude', 'codex'] as const) {
+              const status = sourceService.cachedStatus((await quotaAccount(provider)).id);
+              if (status) applyProviderAuthStatus(health, { provider, ...status });
+            }
+            await publishSnapshot();
+          }
+          return result;
+        } catch (error) {
+          if (correlationId) options.audit?.complete(correlationId, 'failed', { errorCode: error instanceof AccountSourceServiceError ? 'UNKNOWN' : 'AGENT_AUTH_FAILED' });
+          if (error instanceof AccountSourceServiceError) return failure(requestId, error.code, error.message);
+          throw error;
+        }
       }
       if (request.type === 'agentLogin' || request.type === 'agentLogout') {
         const action = request.type === 'agentLogin'
@@ -3198,7 +3468,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           reasonCode: 'operator_action' });
         let result: { ok: boolean; detail?: string };
         try {
-          result = request.type === 'agentLogin' ? await options.agent.openLogin(request.provider) : await options.agent.logout(request.provider);
+          const account = await quotaAccount(request.provider);
+          result = request.type === 'agentLogin' ? await options.agent.openLogin(request.provider, account) : await options.agent.logout(request.provider, account);
           if (correlationId) options.audit?.complete(correlationId, result.ok ? 'succeeded' : 'failed', result.ok
             ? { resultCode: 'agent_auth_action_completed' } : { errorCode: 'AGENT_AUTH_FAILED',
               diagnostic: { ...diagnosticFailure('provider_auth', 'authenticate'), provider: request.provider } });
@@ -3207,7 +3478,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
             diagnostic: { ...diagnosticFailure('provider_auth', 'authenticate', error), provider: request.provider } });
           throw error;
         }
-        const auth = await options.agent.getAuthStatus(request.provider);
+        const auth = await options.agent.getAuthStatus(request.provider, await quotaAccount(request.provider));
         applyProviderAuthStatus(health, { provider: request.provider, ...auth });
         await publishSnapshot();
         return result.ok ? accepted(request.requestId) : failure(request.requestId, 'AGENT_AUTH_FAILED', result.detail ?? 'Agent 登入操作失敗。');
@@ -3419,12 +3690,14 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (request.type === 'saveAgentMcpServer' || request.type === 'deleteAgentMcpServer' || request.type === 'setAgentMcpServerEnabled'
         || request.type === 'setAgentExtensionTools' || request.type === 'listAgentMcpImportCandidates' || request.type === 'importAgentMcpServers') {
         try {
-          if (request.type === 'saveAgentMcpServer') return { type: request.type, requestId, ok: true, server: await agentExtensions.save(request.server) };
-          if (request.type === 'deleteAgentMcpServer') { await agentExtensions.delete(request.serverId); return { type: request.type, requestId, ok: true }; }
-          if (request.type === 'setAgentMcpServerEnabled') return { type: request.type, requestId, ok: true, server: await agentExtensions.setEnabled(request.serverId, request.enabled) };
-          if (request.type === 'setAgentExtensionTools') return { type: request.type, requestId, ok: true, tools: await agentExtensions.setTools(request.tools) };
+          if (request.type === 'saveAgentMcpServer') { const server = await agentExtensions.save(request.server); agentService.noteAgentPolicyChanged(); return { type: request.type, requestId, ok: true, server }; }
+          if (request.type === 'deleteAgentMcpServer') { await agentExtensions.delete(request.serverId); agentService.noteAgentPolicyChanged(); return { type: request.type, requestId, ok: true }; }
+          if (request.type === 'setAgentMcpServerEnabled') { const server = await agentExtensions.setEnabled(request.serverId, request.enabled); agentService.noteAgentPolicyChanged(); return { type: request.type, requestId, ok: true, server }; }
+          if (request.type === 'setAgentExtensionTools') { const tools = await agentExtensions.setTools(request.tools); agentService.noteAgentPolicyChanged(); return { type: request.type, requestId, ok: true, tools }; }
           if (request.type === 'listAgentMcpImportCandidates') return { type: request.type, requestId, ok: true, listing: await agentExtensions.listImportCandidates() };
-          return { type: request.type, requestId, ok: true, result: await agentExtensions.importSelected(request.items) };
+          const result = await agentExtensions.importSelected(request.items);
+          agentService.noteAgentPolicyChanged();
+          return { type: request.type, requestId, ok: true, result };
         } catch (error) {
           if (error instanceof AgentExtensionsServiceError) return failure(requestId, `AGENT_EXTENSION_${error.code}`, error.message);
           throw error;
@@ -3802,6 +4075,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     shutdown() {
       closing = true;
       clearInterval(monitorDispatchTimer);
+      clearMonitorRetry();
       manualMediaAdmission.shutdown();
       return shutdownPromise ??= (async () => {
         const errors: unknown[] = [];
@@ -3815,6 +4089,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           () => chatResources.shutdown(),
           () => ownAvatarRefreshScheduler?.shutdown(),
           () => { for (const timer of recoveryTimers) clearTimeout(timer); recoveryTimers.clear(); },
+          () => failoverProbe?.stop(),
           // Before AgentService shuts down: no schedule may submit a job into a closing Agent service.
           stopAgentSchedules,
           () => unsubscribeAuth?.(), () => unsubscribeWorkerExit?.(), () => unsubscribeEvent?.(),
@@ -3840,22 +4115,43 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       })();
     },
   };
-  await probeInitialProviderAuth({getAuthStatus: provider => options.agent.getAuthStatus(provider),
+  await probeInitialProviderAuth({getAuthStatus: async provider => options.agent.getAuthStatus(provider, await quotaAccount(provider)),
     report: status => health.setProviderAuthStatus(status.provider,{status:status.status,detail:status.detail})});
+  // The other account sources are checked in the background, one at a time. The start is late, so the check does not compete with the startup
+  // work, and its snapshot publish does not use the first publish slot of the coalescing publisher.
+  if (accountSourceService) {
+    const sourceService = accountSourceService;
+    const refreshTimer = setTimeout(() => { if (!closing) void sourceService.refreshAll().catch(() => undefined); }, 5_000);
+    refreshTimer.unref?.();
+    startupCleanup.add(() => clearTimeout(refreshTimer));
+  }
   await options.beforeMcpListen?.();
   await mcpHttpServer.start();
+  // CliTalkAgent PendingFailoverStore load path (TODO 5.8): a turn that was replaying at the restart needs a confirmation. This runs before the queued jobs are reclaimed.
+  await pendingTurnRepository.recoverAfterRestart().catch((error: unknown) => { options.audit?.failure(diagnosticFailure('agent', 'recover', error)); });
   await agentService.recoverQueued();
+  // P5 D27: every 30 s the blocked sources are probed and the exhausted pending turns replay; every 300 s all sources are refreshed.
+  // The loop starts after the recovery above, so its first tick comes 30 s later.
+  failoverProbe = new ProviderFailoverProbe({
+    enabled: () => failoverRouting.enabled(),
+    isClosing: () => closing,
+    quota: providerQuota,
+    sources: { list: async () => {
+      if (accountSourceService) return (await accountSourceService.list()).map((row) => ({ id: row.id, provider: row.provider, kind: row.kind, status: row.status }));
+      return (await accountSources.list()).map((row) => ({ id: row.sourceId, provider: row.provider, kind: row.kind, status: 'unknown' as const }));
+    } },
+    ...(accountSourceService ? { refreshLoginStatus: () => accountSourceService!.refreshAll() } : {}),
+    usage: { refreshNow: (provider, account) => providerQuotaService.refreshNow(provider, account) },
+    pendingTurns: pendingTurnRepository,
+    failoverTurns: { recoverExhausted: (limit) => agentService.recoverFailoverTurns(limit) },
+    report: (error) => options.audit?.failure(diagnosticFailure('agent', 'execute', error)),
+  });
+  failoverProbe.start();
+  startupCleanup.add(() => failoverProbe?.stop());
   await freeMode.start().catch((error: unknown) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); });
   await agentSchedules.start().catch((error: unknown) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); });
   await scheduleForward.start().catch((error:unknown)=>options.audit?.failure(diagnosticFailure('agent','execute',error)));
-  void track(() => resumeExternalMonitorOnStartup(), { operation: 'external_monitor', identity: { background: true }, reportFailure: false })
-    .catch((error: unknown) => {
-    const stage = error instanceof ExternalMonitorDiagnosticFailure ? error.stage : 'startup';
-    const code = classifyExternalMonitorFailure(error, stage);
-    void recordExternalMonitorDiagnostic(options.externalMonitorDiagnosticPath, stage, code, externalMonitorFailureDetail(error),
-      error instanceof ExternalMonitorDiagnosticFailure ? error.phase : 'facade_startup_selection', 'startup_resume');
-    console.warn('[external-monitor] startup resume failed:', code);
-  });
+  void resumeExternalMonitor('startup_resume');
   ownAvatarRefreshScheduler = createOwnAvatarRefreshScheduler(async (accounts) => {
     try { await runPeriodicOwnAvatarRefreshes(accounts); }
     catch (error) { options.audit?.failure(diagnosticFailure('refreshOwnProfile', 'recover', error)); throw error; }

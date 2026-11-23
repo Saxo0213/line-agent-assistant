@@ -2,7 +2,8 @@ import { PRIMARY_ADMIN_LINE_LOGIN_ENABLED } from '../../primary-admin-line-login
 import { desktopTextFor, generatedMessageText, useDesktopLocale, useDesktopText, useDownloadBridgeErrorText, useExtraText, useSafeErrorText } from '../desktop-i18n.js';
 import React, { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
-import type { ChromeLtsmInstallResult, ChromeLtsmUnavailableStatus, DownloadBridgeState, IpcResult, LineAccountSummary } from '@line-agent/contracts';
+import { DEFAULT_DOWNLOAD_BRIDGE_INTERVALS, DOWNLOAD_BRIDGE_INTERVAL_SECONDS_MAX } from '@line-agent/contracts';
+import type { ChromeLtsmInstallResult, ChromeLtsmUnavailableStatus, DownloadBridgeIntervalRange, DownloadBridgeIntervals, DownloadBridgeState, IpcResult, LineAccountSummary } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import { InlineBusy } from '../components/InlineBusy.js';
 import { ProgressOverlay } from '../components/ProgressOverlay.js';
@@ -60,6 +61,37 @@ export function describeExternalImportMessage(message: string, locale: Parameter
 export function externalImportMessageText(message: string, locale: Parameters<typeof desktopTextFor>[0] = 'en'): string { return describeExternalImportMessage(message, locale).text; }
 const importKey = (account: LineAccountSummary) => `${account.externalImportProgress?.stage ?? ''}|${account.externalImportProgress?.message ?? ''}`;
 const maskMid = (mid: string) => `${mid.slice(0, 5)}…${mid.slice(-4)}`;
+/** Parses the two draft texts of an interval row. Null when a text is not a whole number from 0 to the limit, or when min is above max. */
+function parseIntervalDraft(draft: { min: string; max: string }): DownloadBridgeIntervalRange | null {
+  if (!/^\d{1,3}$/.test(draft.min) || !/^\d{1,3}$/.test(draft.max)) return null;
+  const minSeconds = Number(draft.min);
+  const maxSeconds = Number(draft.max);
+  return minSeconds <= maxSeconds && maxSeconds <= DOWNLOAD_BRIDGE_INTERVAL_SECONDS_MAX ? { minSeconds, maxSeconds } : null;
+}
+/** One interval row of the download bridge. It saves on each valid change. An invalid draft shows the stored value again when the field loses focus. */
+function BridgeIntervalRow({ label, minLabel, maxLabel, unit, value, disabled, onSave }: {
+  label: string; minLabel: string; maxLabel: string; unit: string; value: DownloadBridgeIntervalRange; disabled: boolean;
+  onSave: (range: DownloadBridgeIntervalRange) => void;
+}) {
+  const stored = { min: String(value.minSeconds), max: String(value.maxSeconds) };
+  const [draft, setDraft] = useState(stored);
+  useEffect(() => { setDraft({ min: String(value.minSeconds), max: String(value.maxSeconds) }); }, [value.minSeconds, value.maxSeconds]);
+  const change = (next: { min: string; max: string }) => {
+    setDraft(next);
+    const range = parseIntervalDraft(next);
+    if (range && (range.minSeconds !== value.minSeconds || range.maxSeconds !== value.maxSeconds)) onSave(range);
+  };
+  const restore = () => { if (parseIntervalDraft(draft) === null) setDraft(stored); };
+  return <div className="download-bridge-interval">
+    <span>{label}</span>
+    <input type="number" min={0} max={DOWNLOAD_BRIDGE_INTERVAL_SECONDS_MAX} step={1} aria-label={`${label} ${minLabel}`} value={draft.min} disabled={disabled}
+      onChange={(event) => change({ ...draft, min: event.target.value })} onBlur={restore} />
+    <span aria-hidden="true">～</span>
+    <input type="number" min={0} max={DOWNLOAD_BRIDGE_INTERVAL_SECONDS_MAX} step={1} aria-label={`${label} ${maxLabel}`} value={draft.max} disabled={disabled}
+      onChange={(event) => change({ ...draft, max: event.target.value })} onBlur={restore} />
+    <span>{unit}</span>
+  </div>;
+}
 type Props = { api: DesktopApi; accounts: LineAccountSummary[]; headingRef?: React.RefObject<HTMLHeadingElement | null>; embedded?: boolean; live?: LineLoginView | null; onNotice?: (message: string) => void };
 
 export function LineLogin({ api, accounts, headingRef, embedded = false, live = null, onNotice }: Props) {
@@ -105,6 +137,20 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   // Only CHROMEOS goes to main. A request without lineTransport keeps the DESKTOPWIN flow as before.
   const chosenTransport = (): 'CHROMEOS' | undefined => loginMethodRef.current === 'CHROMEOS' ? 'CHROMEOS' : undefined;
   const notify = (message: string) => { if (onNotice) onNotice(message); else setStatus(message); };
+  // LEGY encrypted transport setting of the Agent worker. Null until the main process answers. It applies at the next login.
+  const [legyEncrypted, setLegyEncrypted] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (typeof api.getLineLegyEncrypted !== 'function') return;
+    let live = true;
+    void api.getLineLegyEncrypted().then((value) => { if (live) setLegyEncrypted(value); }).catch(() => undefined);
+    return () => { live = false; };
+  }, [api]);
+  async function changeLegyEncrypted(enabled: boolean): Promise<void> {
+    try {
+      setLegyEncrypted(await api.setLineLegyEncrypted(enabled));
+      notify(desktopText('legyEncryptedTransportHint'));
+    } catch (cause) { notify(safeErrorText(cause, desktopText('unableToSave'))); }
+  }
   const previousLive = useRef(live);
   const [windowPrompt, setWindowPrompt] = useState<string | null>(null);
   const previousImport = useRef<Map<string, string>>(new Map(accounts.map((account) => [account.accountId, importKey(account)])));
@@ -584,13 +630,15 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       {!isAdmin && <label className="auto-login-option"><input type="checkbox" checked={account.autoLoginOnStartup === true} disabled={monitoring}
         title={monitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={monitoring ? `auto-login-disabled-${account.accountId}` : undefined}
         onChange={(event) => void setAutoLogin(account, event.target.checked)} /> {desktopText('logInAutomaticallyAtStartup')}</label>}
+      {!isAdmin && accountMethod(account) === 'DESKTOPWIN' && legyEncrypted !== null && <label className="auto-login-option"><input type="checkbox" checked={legyEncrypted}
+        onChange={(event) => void changeLegyEncrypted(event.target.checked)} /> {desktopText('legyEncryptedTransport')}<small> {desktopText('legyEncryptedTransportHint')}</small></label>}
       {!isAdmin && monitoring && <span id={`auto-login-disabled-${account.accountId}`} className="sr-only">{desktopText('unavailableDuringExternalMonitoring')}</span>}
       <div className="button-row account-actions">
         {account.status === 'connected' && !monitoring && <button disabled={refreshingAvatar !== null || busy}
           onClick={() => void refreshAvatar(account)}>{refreshingAvatar === account.accountId ? desktopText('refreshingAvatar') : desktopText('refreshAvatar')}</button>}
         {account.productRole === 'AGENT' && account.hasPrimaryAdmin !== true && <button className="primary" onClick={() => void beginAdminPairing(account)}>{desktopText('addAdministrator')}</button>}
-        {!isAdmin && <button disabled={account.status === 'disconnected' || busy} onClick={() => void restart(account.accountId)}>{desktopText('restart')}</button>}
-        {!isAdmin && loggedOut && <button aria-label={`${desktopText('logIn')} ${account.displayName}`} disabled={busy || adminMonitoring} title={adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={adminMonitoring ? `auto-login-disabled-${account.accountId}` : undefined} onClick={() => void relogin(account.accountId)}>{desktopText('logIn')}</button>}
+        {!isAdmin && account.status !== 'reauth_required' && <button disabled={account.status === 'disconnected' || busy} onClick={() => void restart(account.accountId)}>{desktopText('restart')}</button>}
+        {!isAdmin && (loggedOut || account.status === 'degraded') && <button aria-label={`${desktopText('logIn')} ${account.displayName}`} disabled={busy || adminMonitoring} title={adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={adminMonitoring ? `auto-login-disabled-${account.accountId}` : undefined} onClick={() => void relogin(account.accountId)}>{desktopText('logIn')}</button>}
         {account.productRole === 'AGENT' && account.hasVerifiedLineIdentity === true && account.status === 'disconnected' && <button disabled={busy || loginActive}
           onClick={() => void requestAgentReplacement(account.accountId, account.displayName)}>{desktopText('replaceAgentAccount')}</button>}
         {!isAdmin && <button aria-label={desktopText('logOutArg0', { arg0: account.displayName })} disabled={account.status === 'disconnected' || busy || loggingOut === account.accountId} onClick={() => void logout(account)}>{loggingOut === account.accountId ? desktopText('loggingOut') : desktopText('logOut')}</button>}
@@ -629,9 +677,6 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     : bridge.state === 'starting' ? desktopText('downloadBridgeStarting') : bridge.state === 'waiting_qr' ? desktopText('downloadBridgeWaitingQr')
     : bridge.state === 'waiting_pin' ? desktopText('downloadBridgeWaitingPin') : bridge.state === 'logged_in' ? desktopText('downloadBridgeLoggedIn')
     : bridgeErrorText(bridge.code);
-  const verification = admin?.downloadBridge?.verification;
-  const oldMessageState = (kind: { match: number; mismatch: number; threshold: number; open: boolean }) => kind.mismatch > 0 ? desktopText('downloadBridgeOldMismatch')
-    : kind.open ? desktopText('downloadBridgeOldOpen') : desktopText('downloadBridgeOldNeedArg0', { arg0: Math.max(0, kind.threshold - kind.match) });
   const bridgeCanRefresh = bridge?.state === 'error' && (bridge.code === 'QR_EXPIRED' || bridge.code === 'QR_FLOW_ERROR' || bridge.code === 'PIN_CODE_TIMEOUT');
   const bridgeWaiting = bridge?.state === 'waiting_qr' || bridge?.state === 'waiting_pin';
   const bridgeQrExpiresAt = bridge?.state === 'waiting_qr' ? bridge.qrExpiresAt : undefined;
@@ -661,12 +706,15 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       <label className="auto-login-option"><input type="checkbox" checked={admin.downloadBridge?.autoDownload === true} disabled={bridgeBusy || admin.downloadBridge?.downloadEnabled !== true}
         onChange={(event) => void runBridgeRequest(() => api.adminDownloadBridgeSetAutoDownload(admin.accountId, event.target.checked))} /> {desktopText('downloadBridgeAutoDownload')}</label>
     </div>
-    {verification && (verification.image.mismatch > 0 || verification.file.mismatch > 0) && <p className="download-bridge-verify">{desktopText('downloadBridgeVerifyCountsArg0Arg1Arg2Arg3Arg4Arg5Arg6Arg7', {
-      arg0: verification.image.match, arg1: verification.image.mismatch, arg2: verification.image.notInStore,
-      arg3: verification.image.nativeIncomplete > 0 ? desktopText('downloadBridgeVerifyIncompleteArg0', { arg0: verification.image.nativeIncomplete }) : '',
-      arg4: verification.file.match, arg5: verification.file.mismatch, arg6: verification.file.notInStore,
-      arg7: verification.file.nativeIncomplete > 0 ? desktopText('downloadBridgeVerifyIncompleteArg0', { arg0: verification.file.nativeIncomplete }) : '' })}</p>}
-    {verification && (verification.image.mismatch > 0 || verification.file.mismatch > 0) && <p className="download-bridge-verify">{desktopText('downloadBridgeOldMessagesArg0Arg1', { arg0: oldMessageState(verification.image), arg1: oldMessageState(verification.file) })}</p>}
+    {(['image', 'file'] as const).map((kind) => <BridgeIntervalRow key={kind}
+      label={desktopText(kind === 'image' ? 'downloadBridgeImageInterval' : 'downloadBridgeFileInterval')}
+      minLabel={desktopText('downloadBridgeIntervalMin')} maxLabel={desktopText('downloadBridgeIntervalMax')} unit={desktopText('downloadBridgeIntervalUnit')}
+      value={(admin.downloadBridge?.intervals ?? DEFAULT_DOWNLOAD_BRIDGE_INTERVALS)[kind]}
+      disabled={admin.downloadBridge?.downloadEnabled !== true}
+      onSave={(range) => {
+        const current: DownloadBridgeIntervals = admin.downloadBridge?.intervals ?? DEFAULT_DOWNLOAD_BRIDGE_INTERVALS;
+        void runBridgeRequest(() => api.adminDownloadBridgeSetIntervals(admin.accountId, { ...current, [kind]: range }));
+      }} />)}
   </div> : null;
   const methodChoice = <div className="button-row login-method-choice" role="group" aria-label={extraText('loginMethodLabel')}>
     {(['DESKTOPWIN', 'CHROMEOS'] as const).map((method) => <button key={method} type="button" aria-pressed={loginMethod === method}
@@ -708,7 +756,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     else if (live?.state === 'connecting') setProgress((current) => current?.title === desktopText('logInToLineAccount')
       ? { ...current, accountId: live.accountId, step: live.pin ? desktopText('enterThePinOnYourPhone') : live.imageDataUrl ? desktopText('scanTheQrCodeWithLineOnYourPhone') : desktopText('loggingIn') }
       : current === null ? { get title() { return desktopText('logInToLineAccount'); }, accountId: live.accountId, step: live.pin ? desktopText('enterThePinOnYourPhone') : live.imageDataUrl ? desktopText('scanTheQrCodeWithLineOnYourPhone') : desktopText('loggingIn') } : current);
-    else if (live?.state === 'degraded' && progress?.title === desktopText('logInToLineAccount')) setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: desktopText('lineLoginFailed') });
+    else if ((live?.state === 'degraded' || live?.state === 'disconnected' || live?.state === 'reauth_required') && progress?.title === desktopText('logInToLineAccount')) setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: desktopText('lineLoginFailed') });
   }, [live?.state, live?.imageDataUrl, live?.pin, live?.message]);
   const guideAgentDone = agent?.status === 'connected';
   const guideAdminDone = admin !== undefined || agent?.hasPrimaryAdmin === true;

@@ -249,10 +249,9 @@ describe('administrative archive admission', () => {
 
 describe('LineService group mention authorization fast path', () => {
   function setup(options: { primary?: boolean; primaryError?: boolean; friend?: boolean; room?: boolean; responder?: boolean; handledMessageId?: string;
-    freeMode?: never; freeActive?: boolean; quotaProposal?: boolean } = {}) {
+    freeMode?: never; freeActive?: boolean; chatProvider?: 'claude' | 'codex'; quotaRoute?: { provider: 'claude' | 'codex'; sourceId: string | null } | null } = {}) {
     const providerChanges: Array<string | null> = [];
-    let proposalLookups = 0;
-    let quotaRetryAccepts = 0;
+    const modelWrites: Array<{ provider: string; model: string | null }> = [];
     const personaChanges: unknown[] = [];
     const calls: string[] = [];
     const friendScopes: unknown[] = [];
@@ -277,12 +276,15 @@ describe('LineService group mention authorization fast path', () => {
             && (decision.eligible || decision.action === 'stop' || decision.action === 'new' || decision.action === 'status'
               || decision.workspaceFailure) ? [input.envelopes[index]!.messageId] : []) };
       } } as never,
-      { async getAppSetting() { return undefined; }, async getConversationAgent() { return { enabled: true, provider: 'codex' }; },
+      { async getAppSetting() { return undefined; }, async getConversationAgent() { return { enabled: true, provider: options.chatProvider ?? 'codex' }; },
+        async getConversationCodexModel() { return 'gpt-5.2-codex'; }, async getConversationClaudeModel() { return 'sonnet'; },
+        async setConversationCodexModel(_key: unknown, model: string | null) { modelWrites.push({ provider: 'codex', model }); return true; },
+        async setConversationClaudeModel(_key: unknown, model: string | null) { modelWrites.push({ provider: 'claude', model }); return true; },
         async setConversationProvider(_key: unknown, provider: string | null) { providerChanges.push(provider); return true; },
         async getConversationPersona() { return { description: null, liveliness: null }; },
         async setConversationPersona(_key: unknown, patch: unknown) { personaChanges.push(patch); return true; } } as never,
       { async send(command: LineWorkerCommand) { commands.push(command); } },
-      { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {}, async acceptQuotaRetry() { quotaRetryAccepts++; return true; } },
+      { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {}, async queryQuota() { throw new Error('quota unused'); } },
       undefined, undefined, async (envelope, candidate, ownMid) => {
         enrollmentInputs.push({ candidate, ownMid });
         if (envelope.messageId !== options.handledMessageId) return false;
@@ -300,12 +302,15 @@ describe('LineService group mention authorization fast path', () => {
       } } as never,
       async (envelope) => envelope.messageId === options.handledMessageId,
       undefined, undefined, undefined, 'en', undefined, freeMode, projectFolders,
-      undefined, undefined, undefined,
-      options.quotaProposal ? async () => { proposalLookups++; return 'stale-proposal'; } : undefined,
+      undefined, undefined, options.quotaRoute === undefined ? undefined : { async get(provider: string, account: { id: string }) {
+        return { provider, sourceId: account.id, source: "test", requestedAt: "2026-11-19T00:00:00.000Z", fetchedAt: null, stale: false, error: null, windows: [], availabilityKnown: false };
+      }, async getAll() { return []; } } as never,
       undefined,
+      async () => [{ sourceId: "claude", provider: "claude", kind: "system", label: "Claude", isDefault: true, fallbackEnabled: true, fallbackPosition: 0, createdAt: "", updatedAt: "" },
+        { sourceId: "acct-0000000002", provider: "claude", kind: "managed", label: "Work", isDefault: false, fallbackEnabled: true, fallbackPosition: 1, createdAt: "", updatedAt: "" }] as never,
+      async () => options.quotaRoute ?? null,
     );
-    return { service, freeCommands, folderCommands, calls, archived, kicked, replies, enrollmentInputs, friendScopes, commands, providerChanges, personaChanges,
-      get proposalLookups() { return proposalLookups; }, get quotaRetryAccepts() { return quotaRetryAccepts; } };
+    return { service, freeCommands, folderCommands, calls, archived, kicked, replies, enrollmentInputs, friendScopes, commands, providerChanges, modelWrites, personaChanges };
   }
 
   const groupMessage = (overrides: Partial<InboundEnvelope> = {}): InboundEnvelope => ({
@@ -358,6 +363,59 @@ describe('LineService group mention authorization fast path', () => {
     });
   });
 
+  describe('/quota current source line', () => {
+    const sentTexts = (commands: LineWorkerCommand[]) => commands.flatMap((command) => command.type === 'sendText' ? [command.text] : []);
+    async function run(quotaRoute: { provider: 'claude' | 'codex'; sourceId: string | null } | null) {
+      const harness = setup({ primary: true, chatProvider: 'claude', quotaRoute });
+      await harness.service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+      await harness.service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'quota-1', text: '@Agent /quota', mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
+      await harness.service.idleRoomEffects();
+      return sentTexts(harness.commands)[0] ?? '';
+    }
+    it('shows the source in use after the chat Agent line', async () => {
+      const text = await run({ provider: 'claude', sourceId: 'acct-0000000002' });
+      expect(text.split('\n').slice(0, 2)).toEqual(['目前聊天室 Agent：Claude', '目前使用來源：Work（Claude）']);
+    });
+    it('omits the line when no route row exists', async () => {
+      const text = await run(null);
+      expect(text.split('\n')[0]).toBe('目前聊天室 Agent：Claude');
+      expect(text).not.toContain('目前使用來源');
+    });
+  });
+
+  describe('/model per provider', () => {
+    const sentTexts = (commands: LineWorkerCommand[]) => commands.flatMap((command) => command.type === 'sendText' ? [command.text] : []);
+    async function run(options: Parameters<typeof setup>[0], text: string) {
+      const harness = setup(options);
+      await harness.service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+      await harness.service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'model-1', text: `@Agent ${text}`, mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
+      await harness.service.idleRoomEffects();
+      return harness;
+    }
+    it('sets the Codex model of a Codex chat and confirms it', async () => {
+      const h = await run({ primary: true, chatProvider: 'codex' }, '/model gpt-5.2-codex');
+      expect(h.modelWrites).toEqual([{ provider: 'codex', model: 'gpt-5.2-codex' }]);
+      expect(sentTexts(h.commands)).toEqual(['🧠 已切換到 gpt-5.2-codex。下一則訊息起生效。']);
+    });
+    it('rejects a Claude alias for a Codex chat and writes nothing', async () => {
+      const h = await run({ primary: true, chatProvider: 'codex' }, '/model opus');
+      expect(h.modelWrites).toEqual([]);
+      expect(sentTexts(h.commands)).toEqual(['⚠️ Codex 模型無效：invalid Codex model ID (use letters, numbers, . _ : / -; max 128 characters)']);
+    });
+    it('shows the Codex model, and clears it', async () => {
+      const shown = await run({ primary: true, chatProvider: 'codex' }, '/model');
+      expect(sentTexts(shown.commands)).toEqual(['🧠 你目前的 Codex 模型：gpt-5.2-codex\n切換：/model <Codex model ID（例如 gpt-5.2-codex）>；回預設：/model default']);
+      const cleared = await run({ primary: true, chatProvider: 'codex' }, '/model default');
+      expect(cleared.modelWrites).toEqual([{ provider: 'codex', model: null }]);
+      expect(sentTexts(cleared.commands)).toEqual(['🧠 已回到 Codex 預設模型。下一則訊息起生效。']);
+    });
+    it('keeps the Claude alias rule for a Claude chat', async () => {
+      const h = await run({ primary: true, chatProvider: 'claude' }, '/model OPUS');
+      expect(h.modelWrites).toEqual([{ provider: 'claude', model: 'opus' }]);
+      expect(sentTexts(h.commands)).toEqual(['🧠 已切換到 opus。下一則訊息起生效。']);
+    });
+  });
+
   describe('/agent chat override', () => {
     const mentioned = (text: string, messageId = 'agent-command') => groupMessage({ messageId, text,
       mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] });
@@ -395,18 +453,6 @@ describe('LineService group mention authorization fast path', () => {
       const h = await run({ primary: false }, mentioned('@Agent /agent claude'));
       expect(h.providerChanges).toEqual([]);
       expect(sentTexts(h.commands)).toContain('Add what you want done after /agent claude');
-    });
-
-    it('does not consume a retry proposal from an agent_usage dispatch even when a friend grant remains', async () => {
-      const h = setup({ primary: false, friend: true, quotaProposal: true });
-      const command = groupMessage({ chatType: 'direct', chatId: 'friend-chat', messageId: 'revoked-admin', text: '/agent codex' });
-      await h.service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
-      await h.service.handleWorkerEvent('w1', { ...batch(), envelopes: [command] });
-      await h.service.idleRoomEffects();
-      expect(h.proposalLookups).toBe(0);
-      expect(h.quotaRetryAccepts).toBe(0);
-      expect(h.providerChanges).toEqual([]);
-      expect(h.commands.some((entry) => entry.type === 'sendText' && entry.text.includes('Add what you want done'))).toBe(true);
     });
 
     it('treats /agent default from a non-administrator in an unserved room as ordinary text for the responder', async () => {
@@ -800,6 +846,25 @@ it('exposes accepted native login readiness for manual send admission and clears
   expect(service.isAuthenticatedReady(binding)).toBe(true);
   await service.handleWorkerEvent(binding.workerInstanceId, { type: 'status', ...binding, state: 'connecting', message: null });
   expect(service.isAuthenticatedReady(binding)).toBe(false);
+});
+
+it('maps a suspended LINE connection to reauth_required and recovers on ready', async () => {
+  const statuses: string[] = [];
+  const service = new LineService({ async bindWorker() {}, async getAccount() { return { ownMid: 'u-self' }; },
+    async applyWorkerLogin() { return true; }, async applyWorkerConnectionStatus(_binding: unknown, status: string) {
+      statuses.push(status); return true;
+    } } as never,
+    { async listPendingRouteActions() { return []; }, async applyPendingRouteAction() {} } as never,
+    {} as never, { async send() {} }, { kick() {}, async stopChat() {}, async resetChat() {} });
+  const binding = { accountId: 'a-suspended', workerInstanceId: 'w-suspended', controlEpoch: 1, mode: 'ACTIVE_CONTROL' as const };
+  service.bind(binding);
+  await service.handleWorkerEvent(binding.workerInstanceId, { type: 'login', ...binding,
+    loginAttemptId: 'suspended-login', ownMid: 'u-self', displayName: 'Agent' });
+  await service.handleWorkerEvent(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
+  await service.handleWorkerEvent(binding.workerInstanceId, { type: 'status', ...binding, state: 'degraded', message: 'LINE_CONNECTION_SUSPENDED' });
+  await vi.waitFor(() => expect(statuses.at(-1)).toBe('reauth_required'));
+  await service.handleWorkerEvent(binding.workerInstanceId, { type: 'status', ...binding, state: 'ready', message: null });
+  await vi.waitFor(() => expect(statuses.at(-1)).toBe('connected'));
 });
 
 it('does not let catalog recovery clear a degraded transport, and clears either health only after its own recovery', async () => {

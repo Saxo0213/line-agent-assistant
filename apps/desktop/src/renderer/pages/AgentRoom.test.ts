@@ -236,7 +236,7 @@ describe('AgentRoom errors and provider selection', () => {
     const job = { jobId: 'job-f', accountId: null, chatType: null, chatId: null, provider: 'codex' as const,
       prompt: '壞掉的工作', status: 'failed' as const, createdAt: '2026-10-20T00:00:00.000Z' };
     const api = {
-      getAgentRoomJobEvents: vi.fn(async () => [{ type: 'failed', code: 'INVALID_JSONL', message: 'The CLI returned invalid or incomplete output.', retryable: false }]),
+      getAgentRoomJobEvents: vi.fn(async () => [{ type: 'failed', code: 'CLI_IO', message: 'The CLI returned invalid or incomplete output.', retryable: false }]),
       listPendingAgentApprovals: vi.fn(async () => []), decideAgentApproval: vi.fn(async () => ({ type: 'decideAgentApproval' })),
       onEvent: vi.fn(() => () => undefined),
     } as unknown as DesktopApi;

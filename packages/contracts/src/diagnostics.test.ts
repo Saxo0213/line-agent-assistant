@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { diagnosticFailure, parseSafeDiagnostic } from './diagnostics.js';
+import { diagnosticFailure, parseSafeDiagnostic, safeErrorCode } from './diagnostics.js';
 import { IPC_ACTION_CODES } from './ipc-actions.js';
 import { IpcRequestSchema } from './ipc.js';
 
@@ -37,6 +37,21 @@ describe('safe operational diagnostics', () => {
     expect(parseSafeDiagnostic({ ...result, upstreamCode: 1_000_000_001 })).toBeUndefined();
     expect(parseSafeDiagnostic({ ...result, upstreamStatus: 799 })).toBeUndefined();
     expect(parseSafeDiagnostic({ ...result, upstreamCode: 'non_numeric' })).toMatchObject({ upstreamCode: 'non_numeric' });
+  });
+
+  it('keeps only a safe error code as detail and never the message', () => {
+    expect(safeErrorCode({ code: '53200', message: 'private' })).toBe('53200');
+    expect(safeErrorCode({ code: 'ECONNRESET' })).toBe('ECONNRESET');
+    expect(safeErrorCode({ code: -4077 })).toBe('-4077');
+    for (const code of ['econnreset', 'C:\\private', 'A', 'X'.repeat(65), 1.5, Number.MAX_SAFE_INTEGER + 2, null]) {
+      expect(safeErrorCode({ code })).toBeUndefined();
+    }
+    expect(safeErrorCode('53200')).toBeUndefined();
+    const result = diagnosticFailure('external_monitor', 'execute', Object.assign(new Error('private-sentinel'), { code: '53200' }));
+    expect(result.detail).toBe('code:53200');
+    expect(parseSafeDiagnostic(result)).toEqual(result);
+    expect(JSON.stringify(result)).not.toContain('private-sentinel');
+    expect(() => safeErrorCode(Object.defineProperty({}, 'code', { get() { throw new Error('private'); } }))).not.toThrow();
   });
 
   it('contains hostile diagnostic and exception getters', () => {

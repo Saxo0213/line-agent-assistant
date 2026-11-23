@@ -166,7 +166,7 @@ export const OFFICIAL_BRIDGE_OWNER_ID = '5f0e9a52-8c1d-4b6e-9a47-0d1b7c3a2f10';
 /** Fixed value of `download_worker_instance_id` for a row that the download bridge holds. */
 export const OFFICIAL_BRIDGE_WORKER_ID = 'official-download-bridge';
 /** Count of attachments of one kind by the latest bridge verification result. */
-export interface BridgeVerificationKindCounts { match: number; mismatch: number; notInStore: number; nativeIncomplete: number }
+export interface BridgeVerificationKindCounts { match: number; mismatch: number; notInStore: number; nativeIncomplete: number; storeIncomplete: number }
 export interface BridgeVerificationCounts { image: BridgeVerificationKindCounts; file: BridgeVerificationKindCounts }
 /** Lease of a bridge claim. A large file read over the debugging pipe can last several minutes. */
 const OFFICIAL_BRIDGE_LEASE_INTERVAL = '15 minutes';
@@ -194,8 +194,18 @@ export type ConversationCatalogEntry = Readonly<{
 
 /** Recalled and source-deleted messages: MCP reads return their stored content with recalled: true; send and forward sources are masked with these predicates. */
 const AGENT_MASKED_SQL = "(m.content->>'type' = 'unsent' OR m.raw ? 'sourceDeleted')";
-/** Send and forward sources only. MCP reads use the stored m.text_content. */
-const AGENT_VISIBLE_TEXT_SQL = `CASE WHEN ${AGENT_MASKED_SQL} THEN NULL ELSE m.text_content END`;
+/** The text an Agent read shows: text_content, or for an event row with no text_content the system line in content->>'text'. */
+const AGENT_TEXT_SQL = `CASE WHEN m.kind = 'event' AND coalesce(m.text_content, '') = '' THEN coalesce(m.content->>'text', m.text_content) ELSE m.text_content END`;
+/** Send and forward sources only. MCP reads use AGENT_TEXT_SQL without the mask. */
+const AGENT_VISIBLE_TEXT_SQL = `CASE WHEN ${AGENT_MASKED_SQL} THEN NULL ELSE ${AGENT_TEXT_SQL} END`;
+/** Member system events only: type 0 (community join and removal lines) and type 18 (group chat events). Notes and other event rows are excluded. */
+const MEMBER_EVENT_SQL = `(m.kind = 'event' AND m.content->>'nativeContentType' IN ('0', '18'))`;
+/** A member system event names a member in its event data (raw). Only an input with the shape of a LINE id matches. The text cast runs for member events only. */
+const eventRawHasIdSql = (placeholder: string): string =>
+  `CASE WHEN ${MEMBER_EVENT_SQL} AND ${placeholder} ~ '^[a-z][0-9a-f]{32}$' THEN position(${placeholder} in m.raw::text) > 0 ELSE false END`;
+/** A member system event names a member in its event line. */
+const eventLineHasNameSql = (placeholder: string): string =>
+  `(${MEMBER_EVENT_SQL} AND position(lower(${placeholder}) in lower(coalesce(m.content->>'text', ''))) > 0)`;
 
 /** The direction of a stored message as an MCP record reports it; the direction filter compares against this same expression. */
 const MESSAGE_DIRECTION_SQL = `CASE WHEN ${ownMessageSql('m', 'la')} THEN 'outbound' ELSE 'inbound' END`;
@@ -1231,7 +1241,7 @@ export class MessageRepository {
       `SELECT m.account_id, m.chat_type, m.chat_id, m.message_id, m.sender_id,
          ${SENDER_NAME_SQL} AS sender_name,
          ${ownMessageSql('m', 'la')} AS is_own,
-         ${CONVERSATION_TITLE_SQL} AS conversation_title, m.text_content, m.occurred_at
+         ${CONVERSATION_TITLE_SQL} AS conversation_title, ${AGENT_TEXT_SQL} AS text_content, m.occurred_at
        FROM messages m
        JOIN line_accounts la ON la.account_id = m.account_id
        LEFT JOIN conversations c ON c.account_id = m.account_id AND c.chat_type = m.chat_type AND c.chat_id = m.chat_id
@@ -1244,7 +1254,7 @@ export class MessageRepository {
          AND ($2::text IS NULL OR m.chat_type = $2)
          AND ($3::text IS NULL OR m.chat_id = $3)
          AND ($4::text IS NULL OR m.sender_id = $4)
-         AND ($5::text IS NULL OR position(lower($5) in lower(coalesce(m.text_content, ''))) > 0
+         AND ($5::text IS NULL OR position(lower($5) in lower(coalesce(${AGENT_TEXT_SQL}, ''))) > 0
            OR position(lower($5) in lower(coalesce(${SENDER_NAME_SQL}, ''))) > 0
            OR position(lower($5) in lower(coalesce(${CONVERSATION_TITLE_SQL}, ''))) > 0
            OR (m.chat_type NOT IN ('community', 'thread')
@@ -1661,26 +1671,51 @@ export class MessageRepository {
   }
 
   /**
-   * Counts the latest download bridge verification result of each attachment of one account, per kind (image, file).
+   * Counts the download bridge verification state of each attachment of one account, per kind (image, file).
    * The audit row `request_id` is the attachment id. Rows of other attachment kinds are not counted.
+   * An attachment with a real mismatch row (at any time) counts as `mismatch`. Any other attachment counts by its newest row.
    */
   async countBridgeVerification(accountId: string): Promise<BridgeVerificationCounts> {
-    const result = await this.pool.query<{ kind: string; result_code: string; total: number }>(
-      `SELECT a.kind, l.result_code, count(*)::int AS total
-         FROM (SELECT DISTINCT ON (details->>'request_id') details->>'request_id' AS request_id, details->>'result_code' AS result_code
-                 FROM audit_logs
-                WHERE action = 'bridge_message_verify' AND details->>'account_id' = $1 AND details ? 'request_id'
-                ORDER BY details->>'request_id', created_at DESC, audit_id DESC) l
-         JOIN attachments a ON a.attachment_id::text = l.request_id AND a.account_id = $1 AND a.kind IN ('image', 'file')
-        GROUP BY a.kind, l.result_code`, [accountId]);
+    // Legacy rule: before the result `store_incomplete` existed, a placeholder store message was recorded as MISMATCH.
+    // Such a row has a `missing_chrome:` segment, no `diff:` segment, no `missing_official:` segment, and it does not start with `false:id`.
+    // It is not a real mismatch. It counts as `store_incomplete` when it is the newest row.
+    const result = await this.pool.query<{ kind: string; state: string; total: number }>(
+      `WITH rows AS (
+         SELECT details->>'request_id' AS request_id, details->>'result_code' AS result_code, created_at, audit_id,
+                (details->>'result_code' = 'BRIDGE_VERIFY_MISMATCH' AND NOT (
+                   COALESCE(details->'diagnostic'->>'detail', '') LIKE '%missing\\_chrome:%'
+                   AND COALESCE(details->'diagnostic'->>'detail', '') NOT LIKE '%diff:%'
+                   AND COALESCE(details->'diagnostic'->>'detail', '') NOT LIKE '%missing\\_official:%'
+                   AND COALESCE(details->'diagnostic'->>'detail', '') NOT LIKE 'false:id%')) AS real_mismatch,
+                (details->>'result_code' = 'BRIDGE_VERIFY_MISMATCH' AND
+                   COALESCE(details->'diagnostic'->>'detail', '') LIKE '%missing\\_chrome:%'
+                   AND COALESCE(details->'diagnostic'->>'detail', '') NOT LIKE '%diff:%'
+                   AND COALESCE(details->'diagnostic'->>'detail', '') NOT LIKE '%missing\\_official:%'
+                   AND COALESCE(details->'diagnostic'->>'detail', '') NOT LIKE 'false:id%') AS legacy_placeholder
+           FROM audit_logs
+          WHERE action = 'bridge_message_verify' AND details->>'account_id' = $1 AND details ? 'request_id'),
+       newest AS (
+         SELECT DISTINCT ON (request_id) request_id, result_code, legacy_placeholder FROM rows
+          ORDER BY request_id, created_at DESC, audit_id DESC),
+       sticky AS (SELECT DISTINCT request_id FROM rows WHERE real_mismatch)
+       SELECT a.kind,
+              CASE WHEN s.request_id IS NOT NULL THEN 'BRIDGE_VERIFY_MISMATCH'
+                   WHEN n.legacy_placeholder THEN 'BRIDGE_VERIFY_STORE_INCOMPLETE'
+                   ELSE n.result_code END AS state,
+              count(*)::int AS total
+         FROM newest n
+         LEFT JOIN sticky s ON s.request_id = n.request_id
+         JOIN attachments a ON a.attachment_id::text = n.request_id AND a.account_id = $1 AND a.kind IN ('image', 'file')
+        GROUP BY 1, 2`, [accountId]);
     const counts: BridgeVerificationCounts = {
-      image: { match: 0, mismatch: 0, notInStore: 0, nativeIncomplete: 0 },
-      file: { match: 0, mismatch: 0, notInStore: 0, nativeIncomplete: 0 },
+      image: { match: 0, mismatch: 0, notInStore: 0, nativeIncomplete: 0, storeIncomplete: 0 },
+      file: { match: 0, mismatch: 0, notInStore: 0, nativeIncomplete: 0, storeIncomplete: 0 },
     };
     for (const row of result.rows) {
       const kind = row.kind === 'image' || row.kind === 'file' ? row.kind : undefined;
-      const field = row.result_code === 'BRIDGE_VERIFY_MATCH' ? 'match' : row.result_code === 'BRIDGE_VERIFY_MISMATCH' ? 'mismatch'
-        : row.result_code === 'BRIDGE_VERIFY_NOT_IN_STORE' ? 'notInStore' : row.result_code === 'BRIDGE_VERIFY_NATIVE_INCOMPLETE' ? 'nativeIncomplete' : undefined;
+      const field = row.state === 'BRIDGE_VERIFY_MATCH' ? 'match' : row.state === 'BRIDGE_VERIFY_MISMATCH' ? 'mismatch'
+        : row.state === 'BRIDGE_VERIFY_NOT_IN_STORE' ? 'notInStore' : row.state === 'BRIDGE_VERIFY_NATIVE_INCOMPLETE' ? 'nativeIncomplete'
+        : row.state === 'BRIDGE_VERIFY_STORE_INCOMPLETE' ? 'storeIncomplete' : undefined;
       if (kind && field) counts[kind][field] += row.total;
     }
     return counts;
@@ -1766,6 +1801,22 @@ export class MessageRepository {
       [mutation.attachmentId, mutation.accountId, mutation.chatType, mutation.chatId, mutation.workerInstanceId, data.relativePath,
         data.sha256, data.sizeBytes, data.name ?? null, mutation.attemptToken, mutation.ownerId, data.mimeType ?? null],
     );
+  }
+
+  /**
+   * Marks a row ready after a file was copied from the local Downloads folder. No claim is needed: the file is already stored.
+   * The read model shows an old External Monitor row as `expired` while the table still holds `queued`, so all three states pass.
+   * A row that holds a download lease (`downloading`) or that is already `ready` does not change.
+   */
+  async markAttachmentRecoveredFromLocal(input: { attachmentId: string; accountId: string; relativePath: string; sha256: string; sizeBytes: number }): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE attachments SET status = 'ready', relative_path = $3, sha256 = $4, size_bytes = $5, error = NULL, retry_after = NULL,
+         download_lease_expires_at = NULL, download_attempt_token = NULL, download_owner_id = NULL,
+         download_worker_instance_id = NULL, download_worker_binding_epoch = NULL, updated_at = now()
+       WHERE attachment_id = $1 AND account_id = $2 AND status IN ('queued', 'failed', 'expired')
+       RETURNING attachment_id`,
+      [input.attachmentId, input.accountId, input.relativePath, input.sha256, input.sizeBytes]);
+    return result.rowCount === 1;
   }
 
   async markAttachmentFailed(mutation: AttachmentAttemptMutation, error: string, automaticAttemptLimit = 3): Promise<boolean> {
@@ -2142,6 +2193,27 @@ export class MessageRepository {
     return row ? { ...toSendAttachment(row), masked: row.masked } : null;
   }
 
+  /**
+   * One attachment that an MCP principal may read: the owning message must pass the same account, conversation scope, local-room and
+   * Agent lineage rules as every MCP message read (messageScopeWhereSql). Null when unknown or not visible, so a caller cannot tell which.
+   */
+  async getReadableMessageAttachment(
+    input: { attachmentId: string; accountIds: readonly string[]; conversationScope?: ConversationKey; extraConversationScopes?: readonly Pick<ConversationKey, 'chatType' | 'chatId'>[] },
+    queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'> = this.pool,
+  ): Promise<{ attachmentId: string; accountId: string; name: string } | null> {
+    if (input.accountIds.length === 0 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.attachmentId)) return null;
+    const lineage = await expandAgentLineage(queryable, input.accountIds, input.conversationScope?.accountId);
+    const result = await queryable.query<{ attachment_id: string; account_id: string; name: string }>(
+      `SELECT a.attachment_id, a.account_id, ${ATTACHMENT_DISPLAY_NAME_SQL} AS name
+       FROM attachments a
+       JOIN messages m ON m.account_id = a.account_id AND m.chat_type = a.chat_type AND m.chat_id = a.chat_id AND m.message_id = a.message_id
+       WHERE a.attachment_id = $1
+         AND ${messageScopeWhereSql({ accountIds: '$2', scopeAccountIds: '$3', scopeChatType: '$4', scopeChatId: '$5', extraScopes: '$6', lineageOrder: '$7' })}`,
+      [input.attachmentId, lineage.accountIds, ...messageScopeValues(lineage, input)]);
+    const row = result.rows[0];
+    return row ? { attachmentId: row.attachment_id, accountId: row.account_id, name: row.name } : null;
+  }
+
   /** Appends one audit row. It never stores message text or a file name. */
   async recordLineSend(row: LineSendAuditRow, queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'> = this.pool): Promise<void> {
     await queryable.query(
@@ -2335,7 +2407,7 @@ export class MessageRepository {
               CASE WHEN m.content->>'type' = 'unsent' THEN m.recalled_at
                    WHEN m.raw ? 'sourceDeleted' THEN (m.raw->'sourceDeleted'->>'detectedAt')::timestamptz
                    ELSE NULL END AS recalled_at,
-              m.text_content,
+              ${AGENT_TEXT_SQL} AS text_content,
               m.occurred_at,
               to_char(m.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS occurred_key,
               COALESCE(
@@ -2373,16 +2445,19 @@ export class MessageRepository {
          AND ${messageFilterWhereSql({ chatType: '$2', from: '$9', to: '$10', excludeChatIds: '$19', direction: '$20', kinds: '$21', excludeKinds: '$22' })}
          AND ($3::text IS NULL OR m.chat_id = $3)
          AND ($4::text IS NULL OR position(lower($4) in lower(coalesce(${names.title}, ''))) > 0)
-         AND ($5::text IS NULL OR m.sender_id = $5)
+         AND ($5::text IS NULL OR m.sender_id = $5 OR ${eventRawHasIdSql('$5')})
          AND (
            $6::text IS NULL
            OR position(lower($6) in lower(coalesce(${names.sender}, ''))) > 0
+           OR ${eventLineHasNameSql('$6')}
          )
          AND (
            $7::text IS NULL
            OR position(lower($7) in lower(coalesce(${names.title}, ''))) > 0
            OR lower(m.chat_id) = lower($7)
            OR lower(m.sender_id) = lower($7)
+           OR ${eventRawHasIdSql('$7')}
+           OR ${eventLineHasNameSql('$7')}
            OR position(lower($7) in lower(coalesce(cm.display_name, ''))) > 0
            OR (m.chat_type NOT IN ('community', 'thread')
              AND (position(lower($7) in lower(${names.nickname('sender_contact')})) > 0
@@ -2406,7 +2481,7 @@ export class MessageRepository {
                )
            )
          )
-         AND ($8::text IS NULL OR position(lower($8) in lower(coalesce(m.text_content, ''))) > 0)
+         AND ($8::text IS NULL OR position(lower($8) in lower(coalesce(${AGENT_TEXT_SQL}, ''))) > 0)
          AND ($17::timestamptz IS NULL OR (m.occurred_at, m.message_id) ${ascending ? '>' : '<'} ($17::timestamptz, $18::text))
        GROUP BY m.account_id, m.chat_type, m.chat_id, m.message_id, m.sender_id, m.kind, m.content, m.text_content, m.occurred_at, m.raw, m.recalled_at, la.own_mid,
                 ${NAME_RESOLUTION_GROUP_COLUMNS}

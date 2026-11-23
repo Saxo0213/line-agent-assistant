@@ -30,9 +30,9 @@ describe('desktop error copy', () => {
     expect(desktopErrorText('ko', undefined)).toBeUndefined();
   });
 
-  it('keeps Japanese and Korean translations in exact parity with all 45 error codes', () => {
+  it('keeps Japanese and Korean translations in exact parity with all 58 error codes', () => {
     const codes = Object.keys(DESKTOP_ERROR_COPY).sort();
-    expect(codes).toHaveLength(45);
+    expect(codes).toHaveLength(58);
     expect(Object.keys(JAPANESE_DESKTOP_ERROR_COPY).sort()).toEqual(codes);
     expect(Object.keys(KOREAN_DESKTOP_ERROR_COPY).sort()).toEqual(codes);
   });

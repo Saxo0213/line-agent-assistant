@@ -339,12 +339,39 @@ describe('inline account action status', () => {
     rerender(<LineLogin api={api} accounts={[{ ...buildAgent, accountId: 'agent-1' }]} headingRef={React.createRef()} />);
   });
 
+  it('ends the login dialog with an error when the login ends disconnected, and hides restart for reauth_required', async () => {
+    const api = { lineLoginQr: vi.fn(async () => ({ type: 'accepted', requestId: 'x', ok: true } as const)) } as unknown as DesktopApi;
+    const account = { ...buildAgent, accountId: 'agent-1' };
+    const { rerender } = render(<LineLogin api={api} accounts={[account]} headingRef={React.createRef()}
+      live={{ accountId: 'agent-1', loginAttemptId: 'attempt-1', state: 'connecting', message: null, pin: '1234' }} />);
+    fireEvent.click(screen.getByRole('button', { name: '登入 Agent' }));
+    await screen.findByRole('dialog');
+    rerender(<LineLogin api={api} accounts={[account]} headingRef={React.createRef()}
+      live={{ accountId: 'agent-1', loginAttemptId: 'attempt-1', state: 'disconnected', message: null }} />);
+    expect((await screen.findByRole('alert')).textContent).toContain(desktopTextFor('zh-TW', 'lineLoginFailed'));
+    cleanup();
+    render(<LineLogin api={api} accounts={[{ ...account, status: 'reauth_required' }]} headingRef={React.createRef()} />);
+    expect(screen.queryByRole('button', { name: '重新啟動' })).toBeNull();
+  });
+
   it('keeps the automatic-login checkbox and label text in one left-aligned row', () => {
     renderBuildPage([{ ...autoLoginAccount(), autoLoginOnStartup: true } as LineAccountSummary]);
     const option = screen.getByLabelText('啟動時自動登入').closest('label');
     expect(option?.querySelector('input[type="checkbox"]')).toBeTruthy();
     expect(option?.textContent).toContain('啟動時自動登入');
     expect(option?.classList.contains('auto-login-option')).toBe(true);
+  });
+
+  it('reads and writes the LEGY encrypted transport setting for the Agent account', async () => {
+    const api = { getLineLegyEncrypted: vi.fn(async () => false), setLineLegyEncrypted: vi.fn(async (enabled: boolean) => enabled) } as unknown as DesktopApi;
+    const notices: string[] = [];
+    render(<LineLogin api={api} accounts={[buildAgent]} headingRef={React.createRef()} onNotice={(message) => notices.push(message)} />);
+    const checkbox = await screen.findByLabelText(/加密傳輸（LEGY）/) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    fireEvent.click(checkbox);
+    await waitFor(() => expect(api.setLineLegyEncrypted).toHaveBeenCalledWith(true));
+    await waitFor(() => expect((screen.getByLabelText(/加密傳輸（LEGY）/) as HTMLInputElement).checked).toBe(true));
+    expect(notices.at(-1)).toBe(desktopTextFor('zh-TW', 'legyEncryptedTransportHint'));
   });
 
   it('disables automatic login while monitoring and leaves it enabled otherwise', () => {
@@ -735,15 +762,17 @@ describe('login method menu of an existing account', () => {
     }
   });
 
-  it('shows the login button only for a logged-out account', () => {
-    for (const status of ['connected', 'degraded'] as const) {
-      show(menuApi(), { status });
-      expect(screen.queryByRole('button', { name: /^(重新)?登入 Agent$/ })).toBeNull();
-      expect(screen.queryAllByRole('button', { name: /^(重新)?登入/ }).filter((button) => button.getAttribute('aria-label')?.endsWith('Agent') || button.textContent === '登入')).toHaveLength(0);
-      expect(screen.getByRole('button', { name: '重新啟動' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: '登出 Agent' })).toBeTruthy();
-      cleanup();
-    }
+  it('shows the login button only for a logged-out or degraded account', () => {
+    show(menuApi(), { status: 'connected' });
+    expect(screen.queryByRole('button', { name: /^(重新)?登入 Agent$/ })).toBeNull();
+    expect(screen.queryAllByRole('button', { name: /^(重新)?登入/ }).filter((button) => button.getAttribute('aria-label')?.endsWith('Agent') || button.textContent === '登入')).toHaveLength(0);
+    expect(screen.getByRole('button', { name: '重新啟動' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '登出 Agent' })).toBeTruthy();
+    cleanup();
+    show(menuApi(), { status: 'degraded' });
+    expect(screen.getByRole('button', { name: '登入 Agent' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '重新啟動' })).toBeTruthy();
+    cleanup();
     for (const status of ['disconnected', 'reauth_required'] as const) {
       show(menuApi(), { status });
       expect(screen.getByRole('button', { name: '登入 Agent' })).toBeTruthy();
@@ -761,5 +790,44 @@ describe('login method menu of an existing account', () => {
     // Enabled: the menu exists and is disabled while monitoring. Disabled: the menu is absent.
     if (PRIMARY_ADMIN_LINE_LOGIN_ENABLED) expect(menu().disabled).toBe(true);
     else expect(screen.queryByRole('combobox', { name: '登入方式' })).toBeNull();
+  });
+});
+
+describe('download bridge intervals', () => {
+  const intervals = { image: { minSeconds: 3, maxSeconds: 10 }, file: { minSeconds: 3, maxSeconds: 10 } };
+  const bridgeAdmin = (downloadEnabled: boolean): LineAccountSummary => ({ ...buildAdmin(),
+    downloadBridge: { state: 'logged_in', identity: 'verified', autoDownload: true, downloadEnabled, intervals } });
+  const view = (downloadEnabled = true) => {
+    const adminDownloadBridgeSetIntervals = vi.fn(async () => accepted);
+    const api = { adminDownloadBridgeSetIntervals } as unknown as DesktopApi;
+    render(<LineLogin api={api} accounts={[bridgeAdmin(downloadEnabled)]} headingRef={React.createRef()} />);
+    return adminDownloadBridgeSetIntervals;
+  };
+
+  it('shows both rows and saves a valid change for one kind only', async () => {
+    const save = view();
+    const imageMax = screen.getByRole('spinbutton', { name: '照片下載間隔 最長秒數' }) as HTMLInputElement;
+    expect((screen.getByRole('spinbutton', { name: '檔案下載間隔 最短秒數' }) as HTMLInputElement).value).toBe('3');
+    expect(imageMax.value).toBe('10');
+    fireEvent.change(imageMax, { target: { value: '20' } });
+    await waitFor(() => expect(save).toHaveBeenCalledWith('admin-1', { image: { minSeconds: 3, maxSeconds: 20 }, file: intervals.file }));
+  });
+
+  it('does not save an invalid range and shows the stored value again', () => {
+    const save = view();
+    const imageMin = screen.getByRole('spinbutton', { name: '照片下載間隔 最短秒數' }) as HTMLInputElement;
+    fireEvent.change(imageMin, { target: { value: '20' } });
+    expect(save).not.toHaveBeenCalled();
+    fireEvent.blur(imageMin);
+    expect(imageMin.value).toBe('3');
+    fireEvent.change(imageMin, { target: { value: '' } });
+    fireEvent.blur(imageMin);
+    expect(save).not.toHaveBeenCalled();
+    expect(imageMin.value).toBe('3');
+  });
+
+  it('disables the inputs while the download switch is off', () => {
+    view(false);
+    expect((screen.getByRole('spinbutton', { name: '檔案下載間隔 最長秒數' }) as HTMLInputElement).disabled).toBe(true);
   });
 });

@@ -1,93 +1,174 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
+import {
+  NORMAL_USAGE_REFRESH_MS, applyResetTimeRecovery, applyUsageObservation, blockSource, redactSensitiveDetail,
+  type FailureClass, type FailureKind, type SourceFailoverState, type UsageObservationInput,
+} from './provider-failover.js';
 
 export type StoredQuotaState = {
-  provider: 'codex' | 'claude'; blocked: boolean; observedAt: string | null; recoveryAt: string | null;
+  sourceId: string; provider: 'codex' | 'claude'; blocked: boolean; observedAt: string | null; recoveryAt: string | null;
   evidenceSource: string | null; evidence: string | null; snapshot: unknown; snapshotFetchedAt: string | null; snapshotStale: boolean;
+  blockedAt: string | null; failureKind: FailureKind; failureCount: number; lastUsageFetchedAt: string | null; lastProbeAt: string | null;
 };
+
+type QuotaRow = {
+  source_id: string; provider: 'codex' | 'claude'; blocked: boolean; observed_at: Date | null; recovery_at: Date | null;
+  evidence_source: string | null; evidence: string | null; snapshot: unknown; snapshot_fetched_at: Date | null; snapshot_stale: boolean;
+  blocked_at: Date | null; failure_kind: FailureKind; failure_count: number; last_usage_fetched_at: Date | null; last_probe_at: Date | null;
+};
+
+/** The usage snapshot that `observe` reads. ProviderQuotaSnapshot fits. The whole object is stored as the snapshot column. */
+export type ObservedQuotaSnapshot = {
+  fetchedAt: string | null; stale: boolean; error?: string | null; availabilityKnown?: boolean;
+  windows?: Array<{ usedPercent?: number; resetsAt?: string | null; blocksProvider?: boolean }>;
+};
+
+const iso = (value: Date | null): string | null => value?.toISOString() ?? null;
+const ms = (value: Date | null): number | null => value ? value.getTime() : null;
+const date = (value: number | null): Date | null => value === null ? null : new Date(value);
+
+function toStored(row: QuotaRow): StoredQuotaState {
+  return { sourceId: row.source_id, provider: row.provider, blocked: row.blocked, observedAt: iso(row.observed_at), recoveryAt: iso(row.recovery_at),
+    evidenceSource: row.evidence_source, evidence: row.evidence, snapshot: row.snapshot, snapshotFetchedAt: iso(row.snapshot_fetched_at),
+    snapshotStale: row.snapshot_stale, blockedAt: iso(row.blocked_at), failureKind: row.failure_kind, failureCount: row.failure_count,
+    lastUsageFetchedAt: iso(row.last_usage_fetched_at), lastProbeAt: iso(row.last_probe_at) };
+}
+
+/**
+ * A row that never held a failure (not blocked, no count, no block time) is the same as "no failover record" in CTA.
+ * That distinction matters: fresh exhausted usage creates a block only for a source with no record.
+ */
+function toFailoverState(row: QuotaRow): SourceFailoverState | null {
+  if (!row.blocked && row.failure_count === 0 && row.blocked_at === null) return null;
+  return { sourceId: row.source_id, blocked: row.blocked, blockedAt: ms(row.blocked_at) ?? ms(row.observed_at), recoveryAt: ms(row.recovery_at),
+    failureKind: row.failure_kind, failureCount: row.failure_count, lastUsageFetchedAt: ms(row.last_usage_fetched_at),
+    lastProbeAt: ms(row.last_probe_at), evidence: row.evidence };
+}
+
+/** Normalizes an untrusted snapshot object to the structural usage input. Only windows that block the source stay. */
+function toUsageInput(snapshot: ObservedQuotaSnapshot): UsageObservationInput {
+  const windows = (Array.isArray(snapshot.windows) ? snapshot.windows : []).filter((window) => window && typeof window.usedPercent === 'number')
+    .map((window) => ({ usedPercent: window.usedPercent as number, resetsAt: typeof window.resetsAt === 'string' ? window.resetsAt : null,
+      blocksProvider: window.blocksProvider !== false }));
+  return { fetchedAt: snapshot.fetchedAt, stale: snapshot.stale === true, error: snapshot.error ?? null,
+    availabilityKnown: snapshot.availabilityKnown ?? windows.some((window) => window.blocksProvider), windows };
+}
 
 export class ProviderQuotaRepository {
   constructor(private readonly pool: Pool) {}
 
-  async get(provider: 'codex' | 'claude'): Promise<StoredQuotaState | null> {
-    const row = (await this.pool.query<{
-      provider: 'codex' | 'claude'; blocked: boolean; observed_at: Date | null; recovery_at: Date | null;
-      evidence_source: string | null; evidence: string | null; snapshot: unknown; snapshot_fetched_at: Date | null; snapshot_stale: boolean;
-    }>(`SELECT * FROM provider_quota_state WHERE provider=$1`, [provider])).rows[0];
-    return row ? { provider: row.provider, blocked: row.blocked, observedAt: row.observed_at?.toISOString() ?? null,
-      recoveryAt: row.recovery_at?.toISOString() ?? null, evidenceSource: row.evidence_source, evidence: row.evidence,
-      snapshot: row.snapshot, snapshotFetchedAt: row.snapshot_fetched_at?.toISOString() ?? null, snapshotStale: row.snapshot_stale } : null;
+  async get(sourceId: string): Promise<StoredQuotaState | null> {
+    const row = (await this.pool.query<QuotaRow>(`SELECT * FROM provider_quota_state WHERE source_id=$1`, [sourceId])).rows[0];
+    return row ? toStored(row) : null;
   }
 
-  async recordFailure(input: { provider: 'codex' | 'claude'; observedAt: string; recoveryAt: string | null; source: string; evidence: string }): Promise<void> {
-    await this.pool.query(`INSERT INTO provider_quota_state(provider,blocked,observed_at,recovery_at,evidence_source,evidence)
-      VALUES($1,true,$2::timestamptz,$3::timestamptz,$4,$5)
-      ON CONFLICT(provider) DO UPDATE SET blocked=true,observed_at=EXCLUDED.observed_at,recovery_at=EXCLUDED.recovery_at,
-        evidence_source=EXCLUDED.evidence_source,evidence=EXCLUDED.evidence,updated_at=now()
-      WHERE provider_quota_state.observed_at IS NULL OR EXCLUDED.observed_at >= provider_quota_state.observed_at`,
-    [input.provider, input.observedAt, input.recoveryAt, input.source, input.evidence.slice(0, 500)]);
+  async list(): Promise<StoredQuotaState[]> {
+    return (await this.pool.query<QuotaRow>(`SELECT * FROM provider_quota_state ORDER BY source_id`)).rows.map(toStored);
   }
 
-  async saveSnapshot(input: { provider: 'codex' | 'claude'; requestedAt: string; fetchedAt: string | null; stale: boolean; snapshot: unknown }): Promise<void> {
-    const data = input.snapshot && typeof input.snapshot === 'object' ? input.snapshot as { availabilityKnown?: boolean; windows?: Array<{ usedPercent?: number; resetsAt?: string | null; blocksProvider?: boolean }> } : {};
-    const windows = data.windows ?? [];
-    const availabilityKnown = data.availabilityKnown ?? windows.some((window) => window.blocksProvider !== false);
-    const blocking = input.fetchedAt !== null && !input.stale
-      ? windows.filter((window) => window.usedPercent === 100 && window.blocksProvider !== false) : [];
-    const exhausted = blocking.length > 0;
-    const recoveryAt = exhausted && blocking.every((window) => typeof window.resetsAt === 'string')
-      ? blocking.map((window) => window.resetsAt!).sort().at(-1) ?? null : null;
-    const valid = input.fetchedAt !== null && !input.stale;
-    const reconcileAvailability = valid && availabilityKnown;
-    await this.pool.query(`INSERT INTO provider_quota_state(provider,blocked,observed_at,recovery_at,evidence_source,evidence,snapshot,snapshot_fetched_at,snapshot_stale)
-      VALUES($1,CASE WHEN $10::boolean THEN $5::boolean ELSE false END,
-        CASE WHEN $10::boolean THEN $2::timestamptz ELSE NULL END,CASE WHEN $10::boolean THEN $6::timestamptz ELSE NULL END,
-        'provider quota snapshot',CASE WHEN $10::boolean THEN $7 ELSE 'Provider-wide availability is unknown' END,$8::jsonb,$3::timestamptz,$4)
-      ON CONFLICT(provider) DO UPDATE SET
-        snapshot=CASE WHEN $9::boolean AND (provider_quota_state.snapshot_fetched_at IS NULL OR EXCLUDED.snapshot_fetched_at >= provider_quota_state.snapshot_fetched_at) THEN EXCLUDED.snapshot ELSE provider_quota_state.snapshot END,
-        snapshot_fetched_at=CASE WHEN $9::boolean THEN GREATEST(COALESCE(provider_quota_state.snapshot_fetched_at,EXCLUDED.snapshot_fetched_at),EXCLUDED.snapshot_fetched_at) ELSE provider_quota_state.snapshot_fetched_at END,
-        snapshot_stale=CASE WHEN $9::boolean THEN EXCLUDED.snapshot_stale ELSE provider_quota_state.snapshot_stale END,
-        blocked=CASE WHEN $10::boolean AND $2::timestamptz >= COALESCE(provider_quota_state.observed_at,'-infinity'::timestamptz)
-          THEN $5::boolean ELSE provider_quota_state.blocked END,
-        observed_at=CASE WHEN $10::boolean AND $2::timestamptz >= COALESCE(provider_quota_state.observed_at,'-infinity'::timestamptz) THEN $2::timestamptz ELSE provider_quota_state.observed_at END,
-        recovery_at=CASE WHEN $10::boolean AND $2::timestamptz >= COALESCE(provider_quota_state.observed_at,'-infinity'::timestamptz) THEN $6::timestamptz ELSE provider_quota_state.recovery_at END,
-        evidence_source=CASE WHEN $10::boolean AND $2::timestamptz >= COALESCE(provider_quota_state.observed_at,'-infinity'::timestamptz) THEN 'provider quota snapshot' ELSE provider_quota_state.evidence_source END,
-        evidence=CASE WHEN $10::boolean AND $2::timestamptz >= COALESCE(provider_quota_state.observed_at,'-infinity'::timestamptz) THEN $7 ELSE provider_quota_state.evidence END,
-        updated_at=now()`, [input.provider,input.requestedAt,input.fetchedAt,input.stale,exhausted,recoveryAt,
-        exhausted?'Provider reports one or more exhausted usage windows':'Provider reports available usage',JSON.stringify(input.snapshot),valid,reconcileAvailability]);
+  /** Inserts the row when the source exists, then locks it. Returns null when the source does not exist. */
+  private async lockRow(client: PoolClient, sourceId: string): Promise<QuotaRow | null> {
+    await client.query(`INSERT INTO provider_quota_state(source_id,provider,snapshot_stale)
+      SELECT s.source_id,s.provider,true FROM agent_account_sources s WHERE s.source_id=$1 ON CONFLICT(source_id) DO NOTHING`, [sourceId]);
+    return (await client.query<QuotaRow>(`SELECT * FROM provider_quota_state WHERE source_id=$1 FOR UPDATE`, [sourceId])).rows[0] ?? null;
   }
 
-  async createProposal(jobId: string, targetProvider: 'codex' | 'claude', expiresAt: string): Promise<boolean> {
-    const result = await this.pool.query(`INSERT INTO provider_quota_proposals
-      (job_id,account_id,chat_type,chat_id,source_message_id,source_sender_id,control_epoch,failed_provider,target_provider,
-       direct_grant_id,direct_grant_version,room_grant_id,room_grant_version,expires_at)
-      SELECT j.job_id,j.account_id,j.chat_type,j.chat_id,j.source_message_id,j.source_sender_id,j.creation_epoch,j.provider,$2,
-        j.direct_friend_grant_id,j.direct_friend_grant_version,j.room_agent_grant_id,j.room_agent_grant_version,$3::timestamptz
-      FROM agent_jobs j
-      WHERE j.job_id=$1 AND j.source_type='line' AND j.status='failed' AND j.source_message_id IS NOT NULL
-        AND j.source_sender_id IS NOT NULL AND j.creation_epoch IS NOT NULL AND j.provider<>$2
-        AND EXISTS(SELECT 1 FROM account_administrators aa WHERE aa.account_id=j.account_id AND aa.user_id=j.source_sender_id AND aa.role='PRIMARY_ADMIN')
-        AND EXISTS(SELECT 1 FROM agent_events e WHERE e.job_id=j.job_id AND e.event->>'type'='failed' AND e.event->>'code'='PROVIDER_LIMIT')
-        AND NOT EXISTS(SELECT 1 FROM agent_outputs o WHERE o.job_id=j.job_id)
-      ON CONFLICT(job_id) DO UPDATE SET expires_at=EXCLUDED.expires_at
-        WHERE provider_quota_proposals.state='pending' AND provider_quota_proposals.target_provider=EXCLUDED.target_provider`, [jobId, targetProvider, expiresAt]);
+  private async inTransaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await work(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async writeState(client: PoolClient, state: SourceFailoverState, observedAt: Date | null, evidenceSource: string | null): Promise<void> {
+    await client.query(`UPDATE provider_quota_state SET blocked=$2,blocked_at=$3::timestamptz,recovery_at=$4::timestamptz,failure_kind=$5,
+      failure_count=$6,last_usage_fetched_at=$7::timestamptz,last_probe_at=$8::timestamptz,evidence=$9,
+      observed_at=COALESCE($10::timestamptz,observed_at),evidence_source=COALESCE($11::text,evidence_source),updated_at=now() WHERE source_id=$1`,
+    [state.sourceId, state.blocked, date(state.blockedAt), date(state.recoveryAt), state.failureKind, state.failureCount,
+      date(state.lastUsageFetchedAt), date(state.lastProbeAt), state.evidence, observedAt, evidenceSource]);
+  }
+
+  /**
+   * Records a failed turn of one source. Only a quota failure blocks the source (CTA block_source).
+   * A transient rate limit and a non-quota failure change nothing (D23): CTA never blocks for them.
+   */
+  async recordQuotaFailure(input: { sourceId: string; kind: FailureClass; observedAt: string; recoveryAt: string | null; evidence: string }): Promise<{ blocked: boolean }> {
+    return this.inTransaction(async (client) => {
+      const row = await this.lockRow(client, input.sourceId);
+      if (!row) return { blocked: false };
+      if (input.kind !== 'quota_exhausted') return { blocked: row.blocked };
+      const observed = new Date(input.observedAt);
+      const recovery = input.recoveryAt === null ? null : Date.parse(input.recoveryAt);
+      const next = blockSource(toFailoverState(row), { sourceId: input.sourceId, now: observed.getTime(),
+        recoveryAt: recovery !== null && Number.isFinite(recovery) ? recovery : null, evidence: input.evidence });
+      await this.writeState(client, next, observed, 'provider failure');
+      return { blocked: true };
+    });
+  }
+
+  /**
+   * Stores a usage snapshot and applies the CTA recovery rules to the failover state, in one transaction.
+   * `unblocked` is true when the row went from blocked to not blocked.
+   */
+  async observe(input: { sourceId: string; snapshot: ObservedQuotaSnapshot; requestedAt: string; now: Date }): Promise<{ blocked: boolean; unblocked: boolean }> {
+    return this.inTransaction(async (client) => {
+      const row = await this.lockRow(client, input.sourceId);
+      if (!row) return { blocked: false, unblocked: false };
+      const { snapshot } = input;
+      const valid = snapshot.fetchedAt !== null && !snapshot.stale;
+      if (valid || row.snapshot === null) {
+        const incoming = snapshot.fetchedAt === null ? null : new Date(snapshot.fetchedAt);
+        const replace = !valid || row.snapshot_fetched_at === null || (incoming !== null && incoming >= row.snapshot_fetched_at);
+        const fetched = valid ? new Date(Math.max(row.snapshot_fetched_at?.getTime() ?? 0, incoming!.getTime())) : incoming;
+        await client.query(`UPDATE provider_quota_state SET snapshot=$2::jsonb,snapshot_fetched_at=$3::timestamptz,snapshot_stale=$4::boolean,updated_at=now() WHERE source_id=$1`,
+          [input.sourceId, replace ? JSON.stringify(snapshot) : JSON.stringify(row.snapshot), fetched, snapshot.stale === true]);
+      }
+      const before = toFailoverState(row);
+      const usage = toUsageInput(snapshot);
+      const observed = applyUsageObservation(before, input.sourceId, usage);
+      const recovered = applyResetTimeRecovery(observed.state, usage, input.now.getTime());
+      const after = recovered.state;
+      if (after) {
+        const created = before === null && after.blocked;
+        await this.writeState(client, after, created ? date(after.blockedAt) : null, created ? 'provider quota snapshot' : null);
+      }
+      return { blocked: after?.blocked ?? false, unblocked: before?.blocked === true && after?.blocked === false };
+    });
+  }
+
+  /** Thin wrapper of `observe` for the callers that pass the snapshot fields beside the snapshot. */
+  async saveSnapshot(input: { sourceId: string; requestedAt: string; fetchedAt: string | null; stale: boolean; snapshot: unknown }): Promise<void> {
+    const base = input.snapshot && typeof input.snapshot === 'object' ? input.snapshot as Record<string, unknown> : {};
+    await this.observe({ sourceId: input.sourceId, requestedAt: input.requestedAt, now: new Date(),
+      snapshot: { ...base, fetchedAt: input.fetchedAt, stale: input.stale } as ObservedQuotaSnapshot });
+  }
+
+  /**
+   * Atomic markUsageProbe. It sets last_probe_at only when the source is blocked and due
+   * (the sourcesDueForUsageRefresh rule for one source). Returns true when this caller won.
+   */
+  async claimProbe(sourceId: string, now: Date): Promise<boolean> {
+    const result = await this.pool.query(`UPDATE provider_quota_state SET last_probe_at=$2::timestamptz,updated_at=now()
+      WHERE source_id=$1 AND blocked AND CASE
+        WHEN last_probe_at IS NOT NULL THEN $2::timestamptz - last_probe_at >= make_interval(secs => $3::double precision)
+        WHEN recovery_at IS NOT NULL THEN $2::timestamptz >= recovery_at
+        ELSE blocked_at IS NOT NULL AND $2::timestamptz - blocked_at >= make_interval(secs => $3::double precision) END`,
+    [sourceId, now, NORMAL_USAGE_REFRESH_MS / 1000]);
     return result.rowCount === 1;
   }
 
-  async createNotice(jobId: string): Promise<void> {
-    await this.pool.query(`INSERT INTO provider_quota_notices(job_id) VALUES($1) ON CONFLICT(job_id) DO NOTHING`,[jobId]);
-  }
-
-  async skipNotice(jobId:string): Promise<void> {
-    await this.pool.query(`INSERT INTO provider_quota_notices(job_id,notification_state) VALUES($1,'skipped')
-      ON CONFLICT(job_id) DO UPDATE SET notification_state='skipped',updated_at=now()
-      WHERE provider_quota_notices.notification_state IN ('pending','claimed')`,[jobId]);
-  }
-
   /** Revalidates the original LINE authority and active SYSTEM_LOGIN binding, not just the current chat address. */
-  async validateFailureNoticeAuthority(input:{jobId:string;accountId:string;workerInstanceId:string;controlEpoch:number}):Promise<boolean> {
+  async validateJobNoticeAuthority(input:{jobId:string;accountId:string;workerInstanceId:string;controlEpoch:number}):Promise<boolean> {
     const result=await this.pool.query(`SELECT 1 FROM agent_jobs j
       JOIN line_accounts a ON a.account_id=j.account_id CROSS JOIN account_control c
-      WHERE j.job_id=$1 AND j.account_id=$2 AND j.source_type='line' AND j.status='failed'
+      WHERE j.job_id=$1 AND j.account_id=$2 AND j.source_type='line'
         AND j.creation_epoch=$4 AND c.singleton=true AND c.control_epoch=$4
         AND a.mode='ACTIVE_CONTROL' AND a.connection_mode='SYSTEM_LOGIN' AND a.worker_instance_id=$3 AND a.worker_binding_epoch=$4
         AND (j.direct_friend_grant_id IS NULL OR EXISTS(SELECT 1 FROM line_friend_whitelist_grants f
@@ -100,35 +181,5 @@ export class ProviderQuotaRepository {
           OR EXISTS(SELECT 1 FROM account_administrators aa WHERE aa.account_id=j.account_id AND aa.user_id=j.source_sender_id AND aa.role='PRIMARY_ADMIN'))`,
       [input.jobId,input.accountId,input.workerInstanceId,input.controlEpoch]);
     return result.rowCount===1;
-  }
-
-  async recoverableFailures(accountId:string): Promise<Array<{jobId:string;provider:'codex'|'claude';event:Record<string,unknown>;observedAt:string}>> {
-    const rows=await this.pool.query<{job_id:string;provider:'codex'|'claude';event:Record<string,unknown>;observed_at:Date}>(`SELECT j.job_id,j.provider,e.event,e.created_at AS observed_at
-      FROM agent_jobs j JOIN LATERAL (SELECT event,created_at FROM agent_events WHERE job_id=j.job_id AND event->>'type'='failed'
-        AND event->>'code'='PROVIDER_LIMIT' ORDER BY created_at DESC LIMIT 1) e ON true
-        WHERE j.status='failed' AND j.source_type IN ('line','ui','schedule') AND (j.source_type<>'line' OR j.account_id=$1)
-        AND NOT EXISTS(SELECT 1 FROM agent_outputs o WHERE o.job_id=j.job_id)
-        AND ((j.source_type='line' AND NOT EXISTS(SELECT 1 FROM provider_quota_notices n WHERE n.job_id=j.job_id AND n.notification_state<>'pending'))
-          OR (j.source_type<>'line' AND NOT EXISTS(SELECT 1 FROM provider_quota_state q WHERE q.provider=j.provider AND q.observed_at>=e.created_at)))`,[accountId]);
-    return rows.rows.map(row=>({jobId:row.job_id,provider:row.provider,event:row.event,observedAt:row.observed_at.toISOString()}));
-  }
-
-  async pendingProposal(input: { accountId: string; chatType: 'direct'|'group'|'room'; chatId: string; senderId: string;
-    targetProvider: 'codex'|'claude' }): Promise<string | null> {
-    const row=await this.pool.query<{job_id:string}>(`SELECT p.job_id FROM provider_quota_proposals p JOIN agent_jobs j ON j.job_id=p.job_id
-      WHERE p.account_id=$1 AND p.chat_type=$2 AND p.chat_id=$3 AND p.source_sender_id=$4 AND p.target_provider=$5
-        AND p.state='pending' AND p.expires_at>now() AND j.status='failed' ORDER BY p.created_at DESC LIMIT 1`,
-      [input.accountId,input.chatType,input.chatId,input.senderId,input.targetProvider]);
-    return row.rows[0]?.job_id??null;
-  }
-
-  /** Durable send claim: a claimed or unknown notice is never automatically retransmitted. */
-  async claimNotice(jobId: string): Promise<boolean> {
-    const result = await this.pool.query(`UPDATE provider_quota_notices SET notification_state='claimed',updated_at=now()
-      WHERE job_id=$1 AND notification_state='pending'`, [jobId]);
-    return result.rowCount === 1;
-  }
-  async finishNotice(jobId: string, state: 'sent' | 'unknown' | 'failed' | 'skipped'): Promise<void> {
-    await this.pool.query(`UPDATE provider_quota_notices SET notification_state=$2,updated_at=now() WHERE job_id=$1 AND notification_state='claimed'`, [jobId, state]);
   }
 }

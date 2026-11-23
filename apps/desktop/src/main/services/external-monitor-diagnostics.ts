@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { safeErrorCode } from '@line-agent/contracts';
 
 export const EXTERNAL_MONITOR_FAILURE_CODES = [
   'external_monitor_authority_stale',
@@ -19,7 +20,7 @@ export const EXTERNAL_MONITOR_FAILURE_PHASES = [
   'protocol_source_ready', 'directory_callback_ack', 'first_poll_callback_ack', 'cleanup',
 ] as const;
 export type ExternalMonitorFailurePhase = typeof EXTERNAL_MONITOR_FAILURE_PHASES[number];
-export const EXTERNAL_MONITOR_DIAGNOSTIC_PRODUCERS = ['manual_start', 'startup_resume'] as const;
+export const EXTERNAL_MONITOR_DIAGNOSTIC_PRODUCERS = ['manual_start', 'startup_resume', 'auto_retry'] as const;
 export type ExternalMonitorDiagnosticProducer = typeof EXTERNAL_MONITOR_DIAGNOSTIC_PRODUCERS[number];
 export type ExternalMonitorFailureDetail =
   | 'reader_source_io_error' | 'reader_source_identity_changed' | 'reader_source_changed'
@@ -69,7 +70,8 @@ const errorCodePattern = /^[a-z][a-z0-9_]*$/;
 
 export class ExternalMonitorDiagnosticFailure extends Error {
   constructor(readonly code: ExternalMonitorFailureCode, readonly stage: ExternalMonitorFailureStage,
-    readonly detail?: ExternalMonitorFailureDetail, readonly phase?: ExternalMonitorFailurePhase) {
+    readonly detail?: ExternalMonitorFailureDetail, readonly phase?: ExternalMonitorFailurePhase,
+    readonly errorCode?: string) {
     super(code);
     this.name = 'ExternalMonitorDiagnosticFailure';
   }
@@ -121,7 +123,7 @@ export function externalMonitorFailureDetail(error: unknown): ExternalMonitorFai
 export function externalMonitorDatabaseFailure(error: unknown, stage: ExternalMonitorFailureStage): ExternalMonitorDiagnosticFailure {
   const known = classifyExternalMonitorFailure(error, stage);
   return new ExternalMonitorDiagnosticFailure(known === 'external_monitor_unknown'
-    ? 'external_monitor_database_failed' : known, stage);
+    ? 'external_monitor_database_failed' : known, stage, undefined, undefined, safeErrorCode(error));
 }
 
 export async function recordExternalMonitorDiagnostic(

@@ -3,9 +3,10 @@ import type { AccountMode, ConversationKey, InboundEnvelope, WritableConversatio
 import { isWritableChatType, diagnosticFailure, InboundEnvelopeSchema, normalizeMentionRanges, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AccountRepository, AdminRepository, AgentJobStatusProjection, FriendWhitelistRepository, MessageRepository, RoutingDecision, SettingsRepository } from '@line-agent/database';
 import type { ExternalMonitorAgentReceipt } from '@line-agent/database';
-import { bridgeNativeEnvelope } from '@line-agent/database';
+import { bridgeNativeEnvelope, normalizedFallbackOrder, routeKeyFor, type AccountSource } from '@line-agent/database';
 import { hasOwnMention, isAgentSwitchText, isFolderCommandText, isFreeCommandText, isPersonaCommandText, routeTrigger, type FolderCommand, type FreeCommand, type PersonaCommand, type TriggerDecision } from './trigger-router.js';
 import { executePersonaCommand } from './agent-persona.js';
+import { modelReply, normalizeModelForProvider, type ModelCommand } from './model-command.js';
 import { classifyRoomControl, ownMentionBody, sanitizeRoomControlEnvelope, type RoomActivationCommand } from './room-control.js';
 import { sanitizeInbound } from './sensitive-message-sanitizer.js';
 import type { SecretStore } from './secret-store.js';
@@ -21,6 +22,12 @@ import type { SystemTextResult } from './agent-line-send-service.js';
 import { pickWorkerBinding } from '../worker-binding-fields.js';
 export type BoundWorker = WorkerBinding & { mode: AccountMode };
 
+/** True when a failed login carries a permanent HTTP 4xx status from LINE (not 408 or 429, which are temporary). The caller checks that the attempt used a stored token. */
+export function isTokenLoginRejection(event: { upstreamStatus?: number | undefined }): boolean {
+  return event.upstreamStatus !== undefined && event.upstreamStatus >= 400 && event.upstreamStatus <= 499
+    && event.upstreamStatus !== 408 && event.upstreamStatus !== 429;
+}
+
 type ConnectionHealthLane = { binding: BoundWorker; generation: number; pending: boolean; running: boolean };
 
 export interface WorkerCommandSink {
@@ -33,9 +40,7 @@ export interface AgentControl {
   stopChat(key: WritableConversationKey): Promise<boolean | void>;
   resetChat(key: WritableConversationKey, commandMessageId?: string): Promise<void>;
   getChatStatus?(key: WritableConversationKey): Promise<{ runningJobId: string | null }>;
-  queryQuota?(provider: import('@line-agent/contracts').AgentProvider): Promise<unknown>;
-  acceptQuotaRetry?(input: { jobId: string; senderId: string; messageId: string; targetProvider: import('@line-agent/contracts').AgentProvider;
-    workerInstanceId: string; controlEpoch: number }): Promise<boolean>;
+  queryQuota?(provider: import('@line-agent/contracts').AgentProvider, account?: import('./provider-quota-service.js').QuotaAccount): Promise<unknown>;
 }
 
 interface AttachmentControl { downloadById(attachmentId: string): Promise<boolean>; }
@@ -60,7 +65,7 @@ export interface ProjectFolderControl {
 }
 
 type FreeDispatch = { command: FreeCommand } | { message: true };
-type AgentDispatch = Extract<TriggerDecision, { type: 'agent_provider' | 'agent_usage' }>;
+type AgentDispatch = Extract<TriggerDecision, { type: 'agent_provider' | 'agent_usage' | 'agent_model' }>;
 
 export class LineService {
   private readonly bindings = new Map<string, BoundWorker>();
@@ -69,7 +74,7 @@ export class LineService {
   private readonly pendingLogouts = new Map<string, { binding: WorkerBinding; resolve(value: { ok: boolean; error: string | null }): void;
     reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
   private readonly attachmentReadiness = new Map<string, { accountId: string; controlEpoch: number; authenticated: boolean; ready: boolean; protocolVerified: boolean }>();
-  private readonly transportHealth = new Map<string, 'connected' | 'degraded' | 'disconnected' | 'unverified'>();
+  private readonly transportHealth = new Map<string, 'connected' | 'degraded' | 'disconnected' | 'unverified' | 'suspended'>();
   private readonly catalogHealth = new Map<string, 'ready' | 'degraded'>();
   private readonly connectionHealthWrites = new Map<string, ConnectionHealthLane>();
   private connectionHealthGeneration = 0;
@@ -112,9 +117,13 @@ export class LineService {
       principalId: 'system:provider_quota' }) => Promise<SystemTextResult>,
     private readonly persistQuotaSnapshot?: (snapshot: import('./provider-quota-service.js').ProviderQuotaSnapshot) => Promise<void>,
     quotaService?: ProviderQuotaService,
-    private readonly findQuotaProposal?: (key: WritableConversationKey, senderId: string, targetProvider: import('@line-agent/contracts').AgentProvider) => Promise<string | null>,
-    private readonly loadQuotaState?: (provider: import('@line-agent/contracts').AgentProvider) => Promise<import('@line-agent/database').StoredQuotaState | null>,
-  ) { this.quotaService = quotaService ?? new ProviderQuotaService((provider) => this.agents.queryQuota!(provider)); }
+    /** The stored quota state of one account source (the system source id equals the provider name). */
+    private readonly loadQuotaState?: (sourceId: string) => Promise<import('@line-agent/database').StoredQuotaState | null>,
+    /** The CLI account sources for /quota. Without it /quota shows one block per provider. */
+    private readonly listQuotaSources?: () => Promise<AccountSource[]>,
+    /** The route row of one session key for /quota. It gives null when the automatic failover switch is off. */
+    private readonly loadQuotaRoute?: (routeKey: string) => Promise<{ provider: 'claude' | 'codex'; sourceId: string | null } | null>,
+  ) { this.quotaService = quotaService ?? new ProviderQuotaService((provider, account) => this.agents.queryQuota!(provider, account)); }
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown): void {
     try { this.onDiagnostic?.(diagnosticFailure('line_ingest', stage, error)); } catch { /* Preserve ingestion and replay ownership. */ }
@@ -330,19 +339,11 @@ export class LineService {
 
   /** Primary Administrator's `/agent claude|codex|default`, or the usage hint for a served non-administrator. */
   private async applyAgentCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string, senderId: string, dispatch: AgentDispatch): Promise<void> {
-    const name = (provider: 'claude' | 'codex') => provider === 'codex' ? 'Codex' : 'Claude';
-    const consentProvider = dispatch.provider === 'default' ? null : dispatch.provider;
-    if (dispatch.type === 'agent_provider' && consentProvider && this.findQuotaProposal && this.agents.acceptQuotaRetry) {
-      const jobId = await this.findQuotaProposal(key, senderId, consentProvider);
-      if (jobId) {
-        const accepted = await this.agents.acceptQuotaRetry({ jobId, senderId, messageId, targetProvider: consentProvider,
-          workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch });
-        await this.sendChatText(binding, key, accepted
-          ? `已將此聊天室切換為 ${name(consentProvider)}，原工作已排入一次重試。`
-          : '無法確認這次切換：聊天室授權、額度或工作狀態已變更，沒有切換或重試。', messageId);
-        return;
-      }
+    if (dispatch.type === 'agent_model') {
+      await this.applyModelCommand(binding, key, messageId, dispatch.command);
+      return;
     }
+    const name = (provider: 'claude' | 'codex') => provider === 'codex' ? 'Codex' : 'Claude';
     if (dispatch.type === 'agent_usage') {
       await this.sendChatText(binding, key, linePrompt(this.locale, 'agentSwitchUsage', { name: dispatch.provider }), messageId);
       return;
@@ -354,24 +355,56 @@ export class LineService {
     await this.sendChatText(binding, key, text, messageId);
   }
 
+  /**
+   * Primary Administrator's /model: shows, sets or clears the model of the provider that the next Agent job of this chat uses
+   * (the chat's /agent choice, else the default provider; the same rule as the routing in handleIncoming). It never creates an Agent job.
+   */
+  private async applyModelCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string, command: ModelCommand): Promise<void> {
+    try {
+      const provider = await resolveChatProvider(this.settings, (await this.settings.getConversationAgent(key))?.provider);
+      const read = () => provider === 'codex' ? this.settings.getConversationCodexModel(key) : this.settings.getConversationClaudeModel(key);
+      const write = (model: string | null) => provider === 'codex' ? this.settings.setConversationCodexModel(key, model)
+        : this.settings.setConversationClaudeModel(key, model as 'haiku' | 'sonnet' | 'opus' | null);
+      const current = command.action === 'show' ? await read() : null;
+      let result: ReturnType<typeof normalizeModelForProvider> | undefined;
+      if (command.action === 'argument') {
+        result = normalizeModelForProvider(provider, command.value);
+        if (result.ok && !await write(result.model)) return;
+      }
+      if (command.action === 'clear' && !await write(null)) return;
+      await this.sendChatText(binding, key, modelReply(provider, command, current, result), messageId);
+    } catch (error) { this.reportFailure('execute', error); }
+  }
+
   private async applyQuotaCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string): Promise<void> {
     try {
       if (!this.agents.queryQuota) throw new Error('Provider quota query is unavailable');
-      const [conversation, queried] = await Promise.all([this.settings.getConversationAgent(key), this.quotaService.getAll()]);
-      const quotas = await Promise.all(queried.map(async (snapshot) => {
+      // One block per account source in the normalized fallback order; a source outside the rotation follows. A failed source listing
+      // falls back to one block per provider.
+      const rows = await this.listQuotaSources?.().catch((error) => { this.reportFailure('execute', error); return null; }) ?? null;
+      const sources = rows ? [...normalizedFallbackOrder(rows).flatMap((id) => rows.filter((row) => row.sourceId === id)),
+        ...rows.filter((row) => !normalizedFallbackOrder(rows).includes(row.sourceId))] : null;
+      const [conversation, queried] = await Promise.all([this.settings.getConversationAgent(key),
+        sources ? Promise.all(sources.map(async (row) => ({ row, snapshot: await this.quotaService.get(row.provider, { id: row.sourceId, kind: row.kind }) })))
+          : this.quotaService.getAll().then((all) => all.map((snapshot) => ({ row: null, snapshot })))]);
+      const quotas = await Promise.all(queried.map(async ({ row, snapshot }) => {
         await this.persistQuotaSnapshot?.(snapshot).catch((error)=>this.reportFailure('persist',error));
-        const state=await this.loadQuotaState?.(snapshot.provider).catch(()=>null);
+        const state=await this.loadQuotaState?.(row?.sourceId ?? snapshot.provider).catch(()=>null);
         let result=snapshot;
         if(snapshot.error && state?.snapshot && typeof state.snapshot==='object') {
           const saved=state.snapshot as ProviderQuotaSnapshot;
           if(saved.provider===snapshot.provider && Array.isArray(saved.windows)) result={...saved,requestedAt:snapshot.requestedAt,
             fetchedAt:state.snapshotFetchedAt,stale:true,error:snapshot.error};
         }
-        return {...result,blocked:state?.blocked??false,recoveryAt:state?.recoveryAt??null,evidence:state?.evidence??null};
+        const label = row && rows && rows.filter((other) => other.provider === row.provider).length > 1 ? row.label : undefined;
+        return {quota:{...result,blocked:state?.blocked??false,recoveryAt:state?.recoveryAt??null,evidence:state?.evidence??null},label};
       }));
       const current = await resolveChatProvider(this.settings, conversation?.provider);
-      const text = [`目前聊天室 Agent：${current === 'codex' ? 'Codex' : 'Claude'}`,
-        ...quotas.map(formatProviderQuota)].join('\n\n');
+      const route = await this.loadQuotaRoute?.(routeKeyFor(key)).catch(() => null) ?? null;
+      const routeRow = route?.sourceId ? rows?.find((row) => row.sourceId === route.sourceId) : undefined;
+      const text = [[`目前聊天室 Agent：${current === 'codex' ? 'Codex' : 'Claude'}`,
+        ...(route && routeRow ? [`目前使用來源：${routeRow.label}（${route.provider === 'codex' ? 'Codex' : 'Claude'}）`] : [])].join('\n'),
+        ...quotas.map(({ quota, label }) => formatProviderQuota(quota, label))].join('\n\n');
       if (this.sendSystemText) {
         const result = await this.sendSystemText({ runId: randomUUID(), target: key, text, principalId: 'system:provider_quota' });
         if (result.status !== 'sent') this.reportFailure('execute', new Error(`Quota status LINE send ${result.status}`));
@@ -493,7 +526,8 @@ export class LineService {
         if (this.bindings.get(binding.workerInstanceId) !== binding) continue;
         const transport = this.transportHealth.get(binding.workerInstanceId) ?? 'disconnected';
         const catalog = this.catalogHealth.get(binding.workerInstanceId) ?? 'ready';
-        const status = transport === 'degraded' || transport === 'unverified' || catalog === 'degraded' ? 'degraded'
+        const status = transport === 'suspended' ? 'reauth_required'
+          : transport === 'degraded' || transport === 'unverified' || catalog === 'degraded' ? 'degraded'
           : transport === 'disconnected' ? 'disconnected' : 'connected';
         let applied: boolean | undefined;
         try { applied = await this.accounts.applyWorkerConnectionStatus(binding, status); }
@@ -668,7 +702,9 @@ export class LineService {
       this.qrAttempts.delete(event.accountId);
       this.qrPendingSecrets.delete(event.accountId);
       await this.secrets?.closeLogin(event.accountId, processInstanceId, event.loginAttemptId);
-      this.transportHealth.set(processInstanceId, 'degraded');
+      // LINE rejected the stored session of a token login (HTTP 4xx). The composed status must be reauth_required, not degraded.
+      const sessionRejected = attempt.kind === 'token' && event.code === 'LOGIN_FAILED' && isTokenLoginRejection(event);
+      this.transportHealth.set(processInstanceId, sessionRejected ? 'suspended' : 'degraded');
       const readiness = this.attachmentReadiness.get(processInstanceId);
       if (readiness?.accountId === binding.accountId && readiness.controlEpoch === binding.controlEpoch) readiness.ready = false;
       this.enqueueComposedConnectionStatus(binding);
@@ -676,7 +712,7 @@ export class LineService {
     }
     if (event.type === 'status') {
       const status = event.state === 'ready' ? 'connected' : event.state === 'PROTOCOL_UNVERIFIED' ? 'unverified'
-        : event.state === 'degraded' ? 'degraded' : 'disconnected';
+        : event.state === 'degraded' ? (event.message === 'LINE_CONNECTION_SUSPENDED' ? 'suspended' : 'degraded') : 'disconnected';
       this.transportHealth.set(processInstanceId, status);
       this.enqueueComposedConnectionStatus(binding);
       const readiness = this.attachmentReadiness.get(processInstanceId);
@@ -872,10 +908,10 @@ export class LineService {
       const freeDispatch: FreeDispatch | null = !this.freeMode ? null : routed.type === 'free' || routed.type === 'free_range' ? { command: routed }
         : routed.type === 'free_message' ? { message: true } : null;
       if (primaryAdmin === true) primaryAdminMessageIds.add(envelope.messageId);
-      const agentDispatch = routed.type === 'agent_provider' || routed.type === 'agent_usage' ? routed : null;
+      const agentDispatch = routed.type === 'agent_provider' || routed.type === 'agent_usage' || routed.type === 'agent_model' ? routed : null;
       if (routed.type === 'agent_quota') quotaDispatches.add(envelope.messageId);
       const decision: Exclude<TriggerDecision, FreeCommand | FolderCommand | PersonaCommand | { type: 'free_message' } | AgentDispatch> = routed.type === 'free' || routed.type === 'free_range' || routed.type === 'folder'
-        || routed.type === 'persona' || routed.type === 'free_message' || routed.type === 'agent_provider' || routed.type === 'agent_usage'
+        || routed.type === 'persona' || routed.type === 'free_message' || routed.type === 'agent_provider' || routed.type === 'agent_usage' || routed.type === 'agent_model'
         || routed.type === 'agent_quota' ? { type: 'ignore' } : routed;
       const authorization = !primaryAdmin && friendAuthorization ? {
         directGrantId: friendAuthorization.grantId,

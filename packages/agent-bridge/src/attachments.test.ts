@@ -33,10 +33,10 @@ async function workspaceWithImage(name='shot.png') {
 
 describe('codexArguments image flags',()=>{
   const base=request('codex','C:\\ws');
-  it('passes one --image=<path> per image before -C, keeping the trailing - last',()=>{
+  it('passes one --image=<path> per image before --sandbox, keeping the trailing - last',()=>{
     const args=codexArguments({...base,imagePaths:['C:\\ws\\a.png','C:\\ws\\b b.png']},'C:\\ws');
     expect(args.filter(arg=>arg.startsWith('--image='))).toEqual(['--image=C:\\ws\\a.png','--image=C:\\ws\\b b.png']);
-    expect(args.indexOf('--image=C:\\ws\\a.png')).toBeLessThan(args.indexOf('-C'));
+    expect(args.indexOf('--image=C:\\ws\\a.png')).toBeLessThan(args.indexOf('--sandbox'));
     expect(args.at(-1)).toBe('-');
     expect(args).not.toContain('--image');
     expect(args).not.toContain('-i');

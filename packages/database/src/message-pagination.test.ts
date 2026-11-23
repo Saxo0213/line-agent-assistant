@@ -43,6 +43,35 @@ database('message and attachment pagination', () => {
     expect(JSON.stringify(row)).not.toContain(actor);
     expect(JSON.stringify(row)).not.toContain(own);
   });
+  it('shows the event line as text and finds an event row by line text, member id and member name', async () => {
+    const eventKey = { accountId: 'event-text', chatType: 'community' as const, chatId: 'event-chat' };
+    const admin = `u${'3'.repeat(32)}`; const member = `u${'4'.repeat(32)}`;
+    await pool.query("INSERT INTO line_accounts(account_id,display_name,own_mid) VALUES ($1,$1,'event-own')", [eventKey.accountId]);
+    await pool.query("INSERT INTO conversations (account_id, chat_type, chat_id, title, updated_at) VALUES ($1,$2,$3,'Community',now())",
+      [eventKey.accountId, eventKey.chatType, eventKey.chatId]);
+    await pool.query(
+      `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, ingestion_source, occurred_at, raw, content)
+       VALUES ($1,'event-row','event-row-ev',$2,$3,$4,'event','','live',now(),$5::jsonb,$6::jsonb)`,
+      [eventKey.accountId, eventKey.chatId, eventKey.chatType, admin, JSON.stringify({ midList: [member] }),
+        JSON.stringify({ format: 1, type: 'event', nativeContentType: 0, text: 'Admin已將Member強制退出社群。' })]);
+    const find = (extra: object) => repo.queryTargetMessages({ accountIds: [eventKey.accountId], chatType: eventKey.chatType, chatId: eventKey.chatId, limit: 20, ...extra });
+    expect((await find({}))[0]).toMatchObject({ messageId: 'event-row', kind: 'event', text: 'Admin已將Member強制退出社群。' });
+    expect((await find({ text: '強制退出' })).map((row) => row.messageId)).toEqual(['event-row']);
+    expect((await find({ senderId: member })).map((row) => row.messageId)).toEqual(['event-row']);
+    expect((await find({ senderName: 'Member' })).map((row) => row.messageId)).toEqual(['event-row']);
+    await pool.query(
+      `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, ingestion_source, occurred_at, raw, content)
+       VALUES ($1,'note-row','note-row-ev',$2,$3,$4,'event','','live',now(),$5::jsonb,$6::jsonb)`,
+      [eventKey.accountId, eventKey.chatId, eventKey.chatType, admin, JSON.stringify({ midList: [member] }),
+        JSON.stringify({ format: 1, type: 'event', nativeContentType: 16, text: 'Member posted a note.' })]);
+    // A note is free user text: member filters do not match it, but it still shows its line.
+    expect((await find({ senderName: 'Member' })).map((row) => row.messageId)).toEqual(['event-row']);
+    expect((await find({ target: 'Member' })).map((row) => row.messageId)).toEqual(['event-row']);
+    expect((await find({ text: 'posted a note' })).map((row) => row.messageId)).toEqual(['note-row']);
+    // A 2-character target that occurs only in the raw JSON (inside the member id) does not match through the raw id rule.
+    expect(await find({ target: '44' })).toEqual([]);
+    expect((await find({ target: member })).map((row) => row.messageId)).toEqual(['event-row']);
+  });
   it('filters search by account, date and attachment presence', async () => {
     expect((await repo.searchMessages({ accountId: 'a', from: '2026-10-15T00:00:02Z', hasAttachment: true, limit: 10 })).map((row) => row.messageId)).toEqual(['m3', 'm2']);
     expect(await repo.searchMessages({ accountId: 'other', limit: 10 })).toHaveLength(0);

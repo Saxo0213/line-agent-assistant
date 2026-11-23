@@ -74,9 +74,13 @@ export const AgentRunRequestSchema = z.strictObject({
   /** Main-resolved provider tool decision; the runner applies it and never infers one. */
   tools: AgentToolPolicySchema,
   resumeSessionId: IdSchema.optional(),
+  /** Provider model ID. Codex validates it (CliTalkAgent rule); a Claude one-shot run ignores it. */
+  model: z.string().min(1).max(128).optional(),
   mcp: AgentMcpLaunchSchema.optional(),
   /** Main-resolved extra MCP servers and built-in tool additions; present only for jobs whose durable principal is eligible. */
   extensions: AgentRunExtensionsSchema.optional(),
+  /** Account source of the run. Absent = the system source (the CLI default home). */
+  account: z.strictObject({ id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), kind: z.enum(['system', 'managed']) }).optional(),
 });
 export type AgentRunRequest = z.infer<typeof AgentRunRequestSchema>;
 
@@ -97,9 +101,11 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('tool_started'), toolName: z.string().min(1), toolUseId: IdSchema }),
   z.strictObject({ type: z.literal('tool_completed'), toolUseId: IdSchema, summary: z.string() }),
   z.strictObject({ type: z.literal('approval_required'), approvalId: IdSchema, summary: z.string().min(1) }),
-  z.strictObject({ type: z.literal('completed'), finalText: z.string(), usage: UsageSchema.optional() }),
+  z.strictObject({ type: z.literal('completed'), finalText: z.string(), usage: UsageSchema.optional(), partial: z.literal(true).optional() }),
   z.strictObject({ type: z.literal('failed'), code: z.string().min(1), message: z.string().min(1), retryable: z.boolean(),
-    quotaRecoveryAt: TimestampSchema.optional() }),
+    quotaRecoveryAt: TimestampSchema.optional(), detail: z.string().regex(/^[a-z_]{1,60}$/).optional(),
+    // Flags of the CLI run (CliTalkAgent ProviderTurnFailure). Set only for a failure after the CLI started.
+    hadToolActivity: z.boolean().optional(), hadEffectiveOutput: z.boolean().optional() }),
   z.strictObject({ type: z.literal('cancelled') }),
   z.strictObject({ type: z.literal('mcp_status'), status: z.enum(['configured', 'available', 'not_loaded']), message: z.string().min(1) }),
 ]);

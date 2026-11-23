@@ -4,6 +4,7 @@
 // Every call is `Runtime.callFunctionOn` on a RemoteObject id. This module never defines or patches extension code.
 // The real error code of each stage is kept. It is never mapped to a generic code.
 
+import { DEFAULT_DOWNLOAD_BRIDGE_INTERVALS } from '@line-agent/contracts';
 import { BridgeError } from './errors.js';
 import type { CdpPipe } from './cdp-pipe.js';
 import type { ExtensionHandles } from './extension-handles.js';
@@ -13,9 +14,13 @@ import {
   type BridgeKind, type BridgeVerification,
 } from './bridge-verification.js';
 
-/** Random gap between two bridge downloads: 2 to 5 s. */
-export const BRIDGE_DOWNLOAD_GAP_MIN_MS = 2000;
-export const BRIDGE_DOWNLOAD_GAP_MAX_MS = 5000;
+/** Random time in ms from a range in seconds. `random` gives a value from 0 up to (not including) 1. */
+export function randomIntervalMs(range: { readonly minSeconds: number; readonly maxSeconds: number }, random: () => number = Math.random): number {
+  const min = range.minSeconds * 1000;
+  const max = Math.max(min, range.maxSeconds * 1000);
+  const unit = Math.min(Math.max(random(), 0), 0.999999999);
+  return min + Math.floor(unit * (max - min + 1));
+}
 export const BRIDGE_READ_SLICE_BYTES = 1024 * 1024;
 const CALL_TIMEOUT_MS = 60_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
@@ -81,6 +86,8 @@ export interface BridgeDownloadRequest {
   /** LINE server message id. It is the key of `message.entities.messages`. */
   readonly messageId: string;
   readonly kind: BridgeKind;
+  /** True for the download of a new message that the user must get at once. It never waits for the gap of an earlier download. */
+  readonly live?: boolean;
   /** The message that `eB` gets: the store message (by object id) or the message built from `nativeRow` (by value). */
   readonly source: BridgeAttemptStage;
   /** Plain `_message` row of the external-monitor message (`raw.native.row`). The `native` source builds the message from it. */
@@ -114,8 +121,10 @@ export interface BridgeDownloaderOptions {
   readonly getLive: () => LiveBridge | null;
   /** Test seam. */
   readonly sleep?: (ms: number) => Promise<void>;
-  /** Test seam. Returns the gap after a download in ms. The default is random from 2 to 5 s. */
-  readonly downloadGapMs?: () => number;
+  /** Returns the gap after a download of this kind in ms. Only a download that is not live waits for it. The default is random from 3 to 10 s. */
+  readonly downloadGapMs?: (kind: BridgeKind) => number;
+  /** Test seam. Clock in ms. */
+  readonly now?: () => number;
 }
 
 interface RemoteObject {
@@ -141,17 +150,20 @@ function parseFileSize(value: string | undefined): number | null {
 export class OfficialDownloadBridgeDownloader {
   readonly #getLive: () => LiveBridge | null;
   readonly #sleep: (ms: number) => Promise<void>;
-  readonly #downloadGapMs: () => number;
+  readonly #downloadGapMs: (kind: BridgeKind) => number;
+  readonly #now: () => number;
   /** One download at a time for the whole bridge. */
   #tail: Promise<void> = Promise.resolve();
+  /** A download that is not live may start at this time or later. It is set when a download ends. */
+  #gapUntil = 0;
   /** One waiting verification at a time. This queue is separate: a verification never waits for the download lock. */
   #verifyTail: Promise<void> = Promise.resolve();
 
   constructor(options: BridgeDownloaderOptions) {
     this.#getLive = options.getLive;
     this.#sleep = options.sleep ?? defaultSleep;
-    this.#downloadGapMs = options.downloadGapMs
-      ?? (() => BRIDGE_DOWNLOAD_GAP_MIN_MS + Math.floor(Math.random() * (BRIDGE_DOWNLOAD_GAP_MAX_MS - BRIDGE_DOWNLOAD_GAP_MIN_MS + 1)));
+    this.#now = options.now ?? Date.now;
+    this.#downloadGapMs = options.downloadGapMs ?? (() => randomIntervalMs(DEFAULT_DOWNLOAD_BRIDGE_INTERVALS.image));
   }
 
   /** True when the bridge is logged in and Chrome is alive. */
@@ -161,21 +173,46 @@ export class OfficialDownloadBridgeDownloader {
 
   /**
    * Downloads the File with one `eB` call and calls `consume` while the File is readable.
-   * The bridge lock stays until `consume` ends. The next download starts after a gap.
+   * Downloads run one at a time. A download that ends sets a gap for the kind of that download.
+   * A download that is not live starts only after the gap, and it waits outside the lock. A live download starts when the lock is free.
    */
   async run<T>(request: BridgeDownloadRequest, consume: (file: BridgeDownloadedFile) => Promise<T>): Promise<T> {
     this.#assertRequest(request);
+    let waitedUntil = 0;
+    for (;;) {
+      if (request.live !== true && this.#gapUntil > waitedUntil) {
+        waitedUntil = this.#gapUntil;
+        await this.#waitUntil(waitedUntil, request);
+      }
+      const release = await this.#lock();
+      // A download that ended while this request waited can set a later gap.
+      if (request.live !== true && this.#gapUntil > waitedUntil) { release(); continue; }
+      try {
+        return await this.#runLocked(request, consume);
+      } finally {
+        this.#gapUntil = this.#now() + Math.max(0, this.#downloadGapMs(request.kind));
+        release();
+      }
+    }
+  }
+
+  async #lock(): Promise<() => void> {
     const previous = this.#tail;
     let unlock!: () => void;
     this.#tail = new Promise<void>((resolve) => { unlock = resolve; });
-    try {
-      await previous;
-      return await this.#runLocked(request, consume);
-    } finally {
-      // The gap starts when the download ends. The caller does not wait for it.
-      const gap = this.#downloadGapMs();
-      void this.#sleep(gap).then(unlock, unlock);
-    }
+    await previous;
+    return unlock;
+  }
+
+  /** Waits outside the lock until `until` (ms of the clock). An abort ends the wait at once. */
+  async #waitUntil(until: number, request: BridgeDownloadRequest): Promise<void> {
+    const wait = until - this.#now();
+    if (wait <= 0) return;
+    if (request.signal?.aborted) throw new BridgeDownloadError('DOWNLOAD_ABORTED', 'locate', 'download was cancelled');
+    let onAbort!: () => void;
+    const aborted = new Promise<void>((resolve) => { onAbort = resolve; request.signal?.addEventListener('abort', onAbort, { once: true }); });
+    try { await Promise.race([this.#sleep(wait), aborted]); }
+    finally { request.signal?.removeEventListener('abort', onAbort); }
   }
 
   /**
@@ -200,6 +237,8 @@ export class OfficialDownloadBridgeDownloader {
 
   async #verifyStore(request: BridgeVerifyRequest, built: BridgeMessage, waitMs: number): Promise<BridgeVerification> {
     const reads = Math.floor(waitMs / BRIDGE_VERIFY_POLL_MS) + 1;
+    // The store message can be a placeholder until the upload ends. With waitMs above 0 the read repeats while it is one.
+    let incomplete: BridgeVerification | null = null;
     for (let read = 0; read < reads; read += 1) {
       if (request.signal?.aborted) throw new BridgeDownloadError('DOWNLOAD_ABORTED', 'locate', 'verification was cancelled');
       const live = this.#getLive();
@@ -207,14 +246,18 @@ export class OfficialDownloadBridgeDownloader {
       const objectId = await this.#findStoreMessage(live, request.messageId);
       if (objectId) {
         try {
-          return await this.#compareStoreMessage(live, objectId, built);
+          const verification = await this.#compareStoreMessage(live, objectId, built);
+          if (verification.result !== 'store_incomplete' || waitMs <= 0) return verification;
+          incomplete = verification;
         } finally {
           await this.#release(live, objectId);
         }
+      } else {
+        incomplete = null;
       }
       if (read < reads - 1) await this.#sleep(BRIDGE_VERIFY_POLL_MS);
     }
-    return { result: 'not_in_store', detail: 'not_in_store' };
+    return incomplete ?? { result: 'not_in_store', detail: 'not_in_store' };
   }
 
   /** One page call. The page gives back booleans and the words same, diff, missing_chrome and missing_official only. */

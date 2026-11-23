@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { FakeLineTransport } from './fake-transport.js';
 import { LineWorkerLoop, LOGOUT_DEADLINE_MS, SYNC_CONFIRMED_INTERVAL_MS, type TransportIdentity } from './worker-loop.js';
@@ -44,6 +44,13 @@ async function pollAndAckStartup(worker: LineWorkerLoop, events: any[]): Promise
   if (batch) await worker.handle({ type: 'ackBatch', ...binding, batchId: batch.batchId,
     cursorAfter: batch.cursorAfter, ...(batch.startupFinal ? { startupComplete: true } : {}) });
 }
+
+// A failed poll starts a backoff. Tests with a fake Date step past it so that the next poll reaches the transport.
+const pollAfterBackoff = async (worker: LineWorkerLoop) => {
+  vi.setSystemTime(Date.now() + 300_001);
+  await worker.handle({ type: 'poll', ...binding });
+};
+afterEach(() => { vi.useRealTimers(); });
 
 async function authenticate(worker: LineWorkerLoop): Promise<void> {
   await worker.handle({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
@@ -1625,37 +1632,39 @@ describe('one-account worker loop', () => {
   });
 
   it('reports repeated sync failures as degraded and recovers on a later poll without a worker restart', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
     const { worker, transport, events, init } = setup();
     await init;
     await authenticate(worker);
     transport.syncError = new Error('token=private MID=u12345678901234567890123456789012');
     for (let attempt = 0; attempt < 5; attempt++) {
-      await expect(worker.handle({ type: 'poll', ...binding })).resolves.toBeUndefined();
+      await expect(pollAfterBackoff(worker)).resolves.toBeUndefined();
     }
     expect(events.at(-1)).toMatchObject({ type: 'status', ...binding, state: 'degraded', message: null });
     expect(events.filter((event) => event.type === 'error' && event.diagnostic?.operation === 'poll')).toEqual([]);
     expect(JSON.stringify(events)).not.toContain('token=private');
     transport.syncError = undefined;
-    await expect(worker.handle({ type: 'poll', ...binding })).resolves.toBeUndefined();
+    await expect(pollAfterBackoff(worker)).resolves.toBeUndefined();
     expect(transport.syncCalls).toHaveLength(6);
     expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ type: 'status', ...binding, state: 'ready', message: null });
   });
 
-  it('emits fixed poll rejection diagnostics on each failure and keeps degraded recovery behavior', async () => {
+  it('emits fixed poll rejection diagnostics on each failure and suspends the connection at the fifth', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
     const { worker, transport, events, init } = setup();
     await init;
     await authenticate(worker);
     transport.syncError = new LineServerRejection('LINE_TALK_EXCESSIVE_ACCESS', 4);
-    for (let attempt = 0; attempt < 5; attempt++) await worker.handle({ type: 'poll', ...binding });
+    for (let attempt = 0; attempt < 5; attempt++) await pollAfterBackoff(worker);
     expect(events.filter((event) => event.type === 'error' && event.code === 'LINE_TALK_EXCESSIVE_ACCESS')).toHaveLength(5);
     expect(events.find((event) => event.type === 'error' && event.code === 'LINE_TALK_EXCESSIVE_ACCESS')).toMatchObject({
       message: 'LINE_TALK_EXCESSIVE_ACCESS', retryable: false,
       diagnostic: { operation: 'poll', stage: 'response', category: 'denied', recovery: 'none', upstreamCode: 4 } });
-    expect(events.at(-1)).toMatchObject({ type: 'status', state: 'degraded', message: 'LINE_TALK_EXCESSIVE_ACCESS' });
+    expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ type: 'status', state: 'degraded', message: 'LINE_CONNECTION_SUSPENDED' });
+    expect(events.at(-1)).toMatchObject({ type: 'error', code: 'LINE_CONNECTION_SUSPENDED' });
     transport.syncError = undefined;
-    await worker.handle({ type: 'poll', ...binding });
-    expect(transport.syncCalls).toHaveLength(6);
-    expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ type: 'status', state: 'ready', message: null });
+    await pollAfterBackoff(worker);
+    expect(transport.syncCalls).toHaveLength(5);
     expect(JSON.stringify(events)).not.toContain('token=private');
   });
 
@@ -1669,15 +1678,16 @@ describe('one-account worker loop', () => {
   });
 
   it('emits degraded once after 5 poll failures and ready on the next success', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
     const { worker, transport, events, init } = setup();
     await init;
     await authenticate(worker);
     transport.syncError = new Error('sync failed');
-    for (let attempt = 0; attempt < 8; attempt++) await worker.handle({ type: 'poll', ...binding });
+    for (let attempt = 0; attempt < 8; attempt++) await pollAfterBackoff(worker);
     expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toHaveLength(1);
     const readyBefore = events.filter((event) => event.type === 'status' && event.state === 'ready').length;
     transport.syncError = undefined;
-    await worker.handle({ type: 'poll', ...binding });
+    await pollAfterBackoff(worker);
     expect(events.filter((event) => event.type === 'status' && event.state === 'ready')).toHaveLength(readyBefore + 1);
     expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ type: 'status', state: 'ready' });
   });
@@ -1706,6 +1716,7 @@ describe('one-account worker loop', () => {
       await worker.handle({ type: 'poll', ...binding });
       expect(confirmed()).toEqual([]);
       transport.syncError = undefined;
+      vi.setSystemTime(Date.now() + 300_001);
       await pollAndAckStartup(worker, events);
       expect(confirmed()).toHaveLength(1);
       expect(confirmed()[0]).toMatchObject({ type: 'syncConfirmed', ...binding });
@@ -1727,6 +1738,7 @@ describe('one-account worker loop', () => {
       .map((part) => Buffer.from(part).toString('base64url')).join('.'), qrCert: null, e2eeStorage: null });
     const { worker, transport, events, init } = setup();
     transport.sync = (syncCursor) => adapter.sync(syncCursor as Parameters<typeof adapter.sync>[0]);
+    transport.lastSyncHttpStatus = () => adapter.lastSyncHttpStatus();
     try {
       await init;
       await authenticate(worker);
@@ -1736,13 +1748,15 @@ describe('one-account worker loop', () => {
       expect(events.filter((event) => event.type === 'error')).toEqual([]);
       expect(events.filter((event) => event.type === 'batch').every((event) => event.startupSync === true)).toBe(true);
 
+      // HTTP 500 is a server rejection: five of them suspend the connection and no later poll reaches LINE.
+      vi.useFakeTimers({ toFake: ['Date'] });
       httpStatus = 500;
-      for (let attempt = 0; attempt < 5; attempt++) await worker.handle({ type: 'poll', ...binding });
+      for (let attempt = 0; attempt < 5; attempt++) await pollAfterBackoff(worker);
       expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toHaveLength(1);
-
+      expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ message: 'LINE_CONNECTION_SUSPENDED' });
       httpStatus = 410;
-      await pollAndAckStartup(worker, events);
-      expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ state: 'ready' });
+      await pollAfterBackoff(worker);
+      expect(physicalTransport).toHaveBeenCalledTimes(17);
     } finally { adapter.revoke(); }
   });
 

@@ -114,17 +114,3 @@ function npmShim(packageName:string,entry:string) {
   const target=`node_modules\\${packageName.replaceAll('/','\\')}\\${entry.replaceAll('/','\\')}`;
   return `@ECHO off\nGOTO start\n:find_dp0\nSET dp0=%~dp0\nEXIT /b\n:start\nSETLOCAL\nCALL :find_dp0\n\nIF EXIST "%dp0%\\node.exe" (\n  SET "_prog=%dp0%\\node.exe"\n) ELSE (\n  SET "_prog=node"\n  SET PATHEXT=%PATHEXT:;.JS;=;%\n)\n\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${target}" %*`;
 }
-
-export type Compatibility='supported'|'unverified'|'incompatible';
-export function protocolCompatibility(provider:AgentProvider,version:string):Compatibility {
-  const fixture=provider==='codex'?'0.144.5':'2.1.295';
-  if(version===fixture) return 'supported';
-  if(!/^\d+\.\d+\.\d+$/.test(version)) return 'incompatible';
-  const numbers=version.split('.').map(Number), minimum=fixture.split('.').map(Number);
-  if(numbers[0]!==minimum[0]) return 'incompatible';
-  for(let i=1;i<3;i++) {
-    if(numbers[i]!<minimum[i]!) return 'incompatible';
-    if(numbers[i]!>minimum[i]!) return 'unverified';
-  }
-  return 'incompatible';
-}

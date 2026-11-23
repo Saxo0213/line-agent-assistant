@@ -19,6 +19,7 @@ import { LocaleProvider, type LocaleState } from './locale-context.js';
 import { updateTextFor } from '../desktop-update-copy.js';
 import { useUpdateCheck } from './useUpdateCheck.js';
 import { UpdatePrompt } from './UpdatePrompt.js';
+import { ConnectionAlert } from './ConnectionAlert.js';
 import { LocalePreferenceSchema, type LocalePreference, type LocaleSnapshot } from '../locale.js';
 
 export type Page = 'conversations' | 'assistant' | 'schedules' | 'search' | 'jobs' | 'settings';
@@ -303,10 +304,10 @@ export function App({ api = window.lineAgent }: { api?: DesktopApi }) {
         {page === 'search' && <Search api={api} accounts={snapshot.accounts} conversations={snapshot.conversations} accountScopeId={searchScopeAccountId} onAccountScopeChange={(accountId) => { setAllAccountsSearchScope(accountId === null); setSearchAccountId(accountId); if (accountId !== null && railAccounts.some((account) => account.accountId === accountId)) setViewAccountId(accountId); }} onOpen={(key) => { setAllAccountsSearchScope(false); setConversationAccountOverrideId(key.accountId); setSelected(keyOf(key)); setPage('conversations'); }} headingRef={heading} />}
         {page === 'schedules' && <Schedules api={api} defaultProvider={snapshot.defaultProvider} providers={snapshot.providers} headingRef={heading} onNotice={setToast} />}
         {page === 'jobs' && <Jobs api={api} jobs={snapshot.jobs} headingRef={heading} onNotice={setToast} />}
-        {page === 'settings' && <Settings api={api} defaultProvider={snapshot.defaultProvider} providers={snapshot.providers} accounts={snapshot.accounts} components={snapshot.components} initialTab={settingsInitialTab} live={lineLogin} headingRef={heading} onNotice={setToast} onOpenWorkConversation={(key) => { setAllAccountsSearchScope(false); setConversationAccountOverrideId(null); setViewAccountId(key.accountId); setSelected(keyOf(key)); setPage('conversations'); }} />}
+        {page === 'settings' && <Settings api={api} defaultProvider={snapshot.defaultProvider} providers={snapshot.providers} agentAccountSources={snapshot.agentAccountSources} agentAutoFailoverEnabled={snapshot.agentAutoFailoverEnabled} accounts={snapshot.accounts} components={snapshot.components} initialTab={settingsInitialTab} live={lineLogin} headingRef={heading} onNotice={setToast} onOpenWorkConversation={(key) => { setAllAccountsSearchScope(false); setConversationAccountOverrideId(null); setViewAccountId(key.accountId); setSelected(keyOf(key)); setPage('conversations'); }} />}
       </main>
     </div>
     {toast && <div role="status" className="system-toast">{generatedMessageText(toast)}</div>}
-    <UpdatePrompt api={api} />
+    <div className="floating-cards"><ConnectionAlert accounts={snapshot.accounts} onView={() => { setSettingsInitialTab(openedTab('system')); setPage('settings'); }} /><UpdatePrompt api={api} /></div>
   </div></LocaleProvider>;
 }

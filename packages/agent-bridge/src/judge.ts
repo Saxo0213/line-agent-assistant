@@ -1,4 +1,5 @@
 import type {AgentProvider} from '@line-agent/contracts';
+import type {AccountRef} from './child-environment.js';
 
 /** The fast model the Claude judge uses (`claude --model` alias for the latest Haiku). */
 export const CLAUDE_JUDGE_MODEL='haiku';
@@ -16,6 +17,8 @@ export interface JudgeRequest {
   workspacePath:string;
   resumeSessionId?:string;
   timeoutMs?:number;
+  /** Account source. Absent = the system source. A managed source without its login file makes the judge fail. */
+  account?:AccountRef;
 }
 export interface JudgeResult {text:string; sessionId:string}
 

@@ -3,6 +3,7 @@ import {
   AgentApprovalDecisionSchema,
   AgentSchedulePreviewNewMessagesInputSchema,
   PendingAgentApprovalSchema,
+  type DownloadBridgeIntervals,
   type AgentApprovalDecision,
   type AgentExtensionTools,
   type AgentExtensionsState,
@@ -116,6 +117,8 @@ export type DesktopApi = {
   unsendMessage(key: ConversationKey, messageId: string): Promise<IpcResult>;
   getManualUnsendWindow(): Promise<'1h' | '7d'>;
   setManualUnsendWindow(window: '1h' | '7d'): Promise<'1h' | '7d'>;
+  getLineLegyEncrypted(): Promise<boolean>;
+  setLineLegyEncrypted(enabled: boolean): Promise<boolean>;
   /** The global Agent persona (Settings > Assistant). */
   getAgentPersona(): Promise<AgentPersona>;
   setAgentPersona(persona: AgentPersona): Promise<AgentPersona>;
@@ -147,6 +150,7 @@ export type DesktopApi = {
   adminDownloadBridgeRefreshQr(accountId: string): Promise<IpcResult>;
   adminDownloadBridgeClear(accountId: string): Promise<IpcResult>;
   adminDownloadBridgeSetAutoDownload(accountId: string, enabled: boolean): Promise<IpcResult>;
+  adminDownloadBridgeSetIntervals(accountId: string, intervals: DownloadBridgeIntervals): Promise<IpcResult>;
   adminDownloadBridgeSetDownloadEnabled(accountId: string, enabled: boolean): Promise<IpcResult>;
   lineStart(accountId: string): Promise<IpcResult>;
   externalImportStart(accountId: string): Promise<IpcResult>;
@@ -160,6 +164,17 @@ export type DesktopApi = {
   agentLogin(provider: AgentProvider): Promise<IpcResult>;
   agentLogout(provider: AgentProvider): Promise<IpcResult>;
   agentRefreshStatus(provider: AgentProvider): Promise<IpcResult>;
+  agentSourceAdd(provider: AgentProvider, label: string): Promise<IpcResult>;
+  agentSourceRename(id: string, label: string): Promise<IpcResult>;
+  agentSourceRemove(id: string): Promise<IpcResult>;
+  agentSourceSetDefault(provider: AgentProvider, id: string): Promise<IpcResult>;
+  agentSourceMove(id: string, direction: 'up' | 'down'): Promise<IpcResult>;
+  agentSourceSetFallback(id: string, enabled: boolean): Promise<IpcResult>;
+  agentSourceSetAutoFailover(enabled: boolean): Promise<IpcResult>;
+  agentSourceLogin(id: string): Promise<IpcResult>;
+  agentSourceLogout(id: string): Promise<IpcResult>;
+  agentSourceRefresh(id: string): Promise<IpcResult>;
+  agentSourceUsage(id: string, force: boolean): Promise<IpcResult>;
   stopJob(key: WritableConversationKey, jobId: string): Promise<IpcResult>;
   retryJob(key: WritableConversationKey, jobId: string): Promise<IpcResult>;
   setWorkspace(workspacePath: string): Promise<IpcResult>;
@@ -314,6 +329,8 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     sendManualMedia: (key, files) => request({ type: 'sendManualMedia', ...key, files }),
     unsendMessage: (key, messageId) => request({ type: 'unsendMessage', ...key, messageId }),
     async getManualUnsendWindow() { const result = await request({ type: 'getManualUnsendWindow' }); if (result.type !== 'getManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },
+    async getLineLegyEncrypted() { const result = await request({ type: 'getLineLegyEncrypted' }); if (result.type !== 'getLineLegyEncrypted') throwIpcErrorOrUnexpected(result, 'Unexpected transport setting response'); return result.enabled; },
+    async setLineLegyEncrypted(enabled) { const result = await request({ type: 'setLineLegyEncrypted', enabled }); if (result.type !== 'setLineLegyEncrypted') throwIpcErrorOrUnexpected(result, 'Unexpected transport setting response'); return result.enabled; },
     async setManualUnsendWindow(window) { const result = await request({ type: 'setManualUnsendWindow', window }); if (result.type !== 'setManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },
     async getAgentPersona() { const result = await request({ type: 'getAgentPersona' }); if (result.type !== 'getAgentPersona') throwIpcErrorOrUnexpected(result, 'Unexpected persona response'); return result.persona; },
     async setAgentPersona(persona) { const result = await request({ type: 'setAgentPersona', persona }); if (result.type !== 'setAgentPersona') throwIpcErrorOrUnexpected(result, 'Unexpected persona response'); return result.persona; },
@@ -343,6 +360,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     adminDownloadBridgeRefreshQr: (accountId) => request({ type: 'adminDownloadBridgeRefreshQr', accountId }),
     adminDownloadBridgeClear: (accountId) => request({ type: 'adminDownloadBridgeClear', accountId }),
     adminDownloadBridgeSetAutoDownload: (accountId, enabled) => request({ type: 'adminDownloadBridgeSetAutoDownload', accountId, enabled }),
+    adminDownloadBridgeSetIntervals: (accountId, intervals) => request({ type: 'adminDownloadBridgeSetIntervals', accountId, intervals }),
     adminDownloadBridgeSetDownloadEnabled: (accountId, enabled) => request({ type: 'adminDownloadBridgeSetDownloadEnabled', accountId, enabled }),
     lineStart: (accountId) => request({ type: 'lineStart', accountId }),
     externalImportStart: (accountId) => request({ type: 'externalImportStart', accountId }),
@@ -354,6 +372,17 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     agentLogin: (provider) => request({ type: 'agentLogin', provider }),
     agentLogout: (provider) => request({ type: 'agentLogout', provider }),
     agentRefreshStatus: (provider) => request({ type: 'agentRefreshStatus', provider }),
+    agentSourceAdd: (provider, label) => request({ type: 'agentSourceAdd', provider, label }),
+    agentSourceRename: (id, label) => request({ type: 'agentSourceRename', id, label }),
+    agentSourceRemove: (id) => request({ type: 'agentSourceRemove', id }),
+    agentSourceSetDefault: (provider, id) => request({ type: 'agentSourceSetDefault', provider, id }),
+    agentSourceMove: (id, direction) => request({ type: 'agentSourceMove', id, direction }),
+    agentSourceSetFallback: (id, enabled) => request({ type: 'agentSourceSetFallback', id, enabled }),
+    agentSourceSetAutoFailover: (enabled) => request({ type: 'agentSourceSetAutoFailover', enabled }),
+    agentSourceLogin: (id) => request({ type: 'agentSourceLogin', id }),
+    agentSourceLogout: (id) => request({ type: 'agentSourceLogout', id }),
+    agentSourceRefresh: (id) => request({ type: 'agentSourceRefresh', id }),
+    agentSourceUsage: (id, force) => request({ type: 'agentSourceUsage', id, force }),
     stopJob: (key, jobId) => request({ type: 'stopJob', ...key, jobId }),
     retryJob: (key, jobId) => request({ type: 'retryJob', ...key, jobId }),
     setWorkspace: (workspacePath) => request({ type: 'setWorkspace', workspacePath }),

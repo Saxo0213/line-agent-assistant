@@ -36,7 +36,7 @@ export const WORKER_PROTOCOL_VERSION = 4 as const;
 export const WORKER_ERROR_CODES = ['INVALID_COMMAND', 'QUEUE_FULL', 'CATALOG_REFRESH_FAILED', 'WORKER_OPERATION_FAILED',
   'HISTORY_READ_FAILED', 'CHAT_RESOURCE_READ_FAILED', 'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED',
   'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED', 'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED',
-  'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED', 'CHROME_LTSM_UNAVAILABLE'] as const;
+  'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED', 'CHROME_LTSM_UNAVAILABLE', 'LINE_CONNECTION_SUSPENDED'] as const;
 export type WorkerErrorCode = typeof WORKER_ERROR_CODES[number] | LineServerErrorCode;
 const WorkerErrorCodeSchema = z.union([z.enum(WORKER_ERROR_CODES),
   z.custom<LineServerErrorCode>((value) => lineServerErrorMessage(value) !== null)]);
@@ -55,7 +55,7 @@ const LoginFailure = z.union([
   LoginAttempt.extend({ type: z.literal('loginFailure'), code: z.literal('LOGIN_IN_PROGRESS'), message: z.literal(LOGIN_FAILURES.LOGIN_IN_PROGRESS) }),
   LoginAttempt.extend({ type: z.literal('loginFailure'), code: z.literal('LOGIN_ATTEMPT_REPLACED'), message: z.literal(LOGIN_FAILURES.LOGIN_ATTEMPT_REPLACED) }),
   LoginAttempt.extend({ type: z.literal('loginFailure'), code: z.literal('LOGIN_FAILED'), message: z.literal(LOGIN_FAILURES.LOGIN_FAILED),
-    detail: z.string().regex(DIAGNOSTIC_DETAIL_PATTERN).optional() }),
+    detail: z.string().regex(DIAGNOSTIC_DETAIL_PATTERN).optional(), upstreamStatus: z.number().int().min(100).max(599).optional() }),
 ]);
 const Secrets = z.strictObject({ token: Id.nullable(), qrCert: Id.nullable(), e2eeStorage: JsonValueSchema.nullable() });
 export const ConversationCatalogMemberSchema = z.strictObject({
@@ -144,11 +144,14 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
     /** Absolute path of the ltsm store root under app userData. Only meaningful (and only allowed) for CHROMEOS. */
     chromeLtsmDir: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/).optional(),
     /** Absolute path of the LINE traffic log directory under app userData. A worker without it does not log. */
-    trafficLogDir: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/).optional() }).superRefine((command, context) => {
+    trafficLogDir: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/).optional(),
+    /** True turns on the LEGY encrypted transport. Absent or false means the plain transport. Only allowed for DESKTOPWIN. */
+    legyEncrypted: z.boolean().optional() }).superRefine((command, context) => {
     if (resolveLineTransport(command.lineTransport) === 'DESKTOPWIN') {
       if (command.chromeLtsmDir !== undefined) context.addIssue({ code: 'custom', path: ['chromeLtsmDir'], message: 'chromeLtsmDir requires lineTransport CHROMEOS' });
       return;
     }
+    if (command.legyEncrypted !== undefined) context.addIssue({ code: 'custom', path: ['legyEncrypted'], message: 'legyEncrypted requires lineTransport DESKTOPWIN' });
   }),
   LoginAttempt.extend({ type: z.literal('loginQr') }),
   LoginAttempt.extend({ type: z.literal('loginToken') }),

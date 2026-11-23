@@ -6,6 +6,8 @@ import {
   AGENT_SCHEDULE_NUMBER_OPS,
   LIST_SEND_TARGETS_TOOL_NAME,
   SEND_TO_TARGET_TOOL_NAME,
+  READ_MESSAGE_ATTACHMENT_TOOL_NAME,
+  McpReadMessageAttachmentInputSchema,
   LIST_SCHEDULES_TOOL_NAME,
   CREATE_SCHEDULE_TOOL_NAME,
   UPDATE_SCHEDULE_TOOL_NAME,
@@ -41,6 +43,7 @@ import {
   type McpInternalToolName,
   McpInternalToolNameSchema,
   type McpAgentRoomHistoryOutput,
+  type McpReadMessageAttachmentOutput,
 } from '@line-agent/contracts';
 import {
   AgentScheduleError,
@@ -64,6 +67,7 @@ import type { AgentLineSendHandler, AuthorizeOutcome } from './agent-line-send-s
 import { isScheduledRunRequestId, type AgentScheduleService } from './agent-schedule-service.js';
 import { formatTaipei } from './agent-schedule-prompt.js';
 import type { McpChatResourceReader } from './mcp-chat-resource-reader.js';
+import { readMessageAttachmentForJob, type MessageAttachmentAccess } from './mcp-attachment-read.js';
 import type { SafeDiagnostic } from '@line-agent/contracts';
 
 export const MAX_CONCURRENT_MCP_REQUESTS = 8;
@@ -161,6 +165,9 @@ export interface McpToolDefinition {
   inputSchema: Record<string, unknown>;
 }
 
+/** Added to the descriptions of the two message query tools. */
+const EVENT_ROW_GUIDANCE = ' An event row (kind: event) has the system line in text, for example a join or a removal by an admin. The sender of a removal event is the admin who did it; the sender and target filters also return events that name the member as joiner, actor or target. recalled: true also covers a message that the official LINE client removed (for example after an admin removed the member); check event rows near that time before you say the sender recalled it.';
+
 const MESSAGE_FILTER_JSON_PROPERTIES = {
   excludeChatIds: { type: 'array', maxItems: 100, items: { type: 'string', minLength: 1, maxLength: 256 }, description: 'Skip messages of these chats (chatId values, exact match).' },
   direction: { type: 'string', enum: ['inbound', 'outbound'], description: 'inbound = received messages only; outbound = messages sent by the account only.' },
@@ -187,7 +194,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: 'query_target_messages',
     description:
-      'Query archived LINE messages for a specified target (conversation title, chatId, sender displayName, or senderId) within authorized account scopes. A number refers to the no in the most recent list_targets result. Messages are returned newest first. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.',
+      'Query archived LINE messages for a specified target (conversation title, chatId, sender displayName, or senderId) within authorized account scopes. A number refers to the no in the most recent list_targets result. Messages are returned newest first. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.' + EVENT_ROW_GUIDANCE,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -208,7 +215,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: 'query_target_messages_by_time',
     description:
-      'Query archived LINE messages within an explicit [from, to] time window (ISO-8601 datetime with offset or YYYY-MM-DD). A YYYY-MM-DD value is a full day in Taiwan time (Asia/Taipei, UTC+08:00): from starts at 00:00:00.000 and to ends at 23:59:59.999 of that day. To read new messages from all chats, omit every target field and give from. One call returns the messages of all readable chats, and each message has its accountId, chatType, chatId and conversationTitle. Do not call this tool once per chat. Do not call list_targets first for this purpose. To see which chats have new messages and how many, call list_active_chats first, then read only the chats you need with chatId. To skip chats you do not want, pass excludeChatIds. To keep or drop message kinds, pass kinds or excludeKinds (not both); direction keeps only inbound (received) or only outbound (sent by the account) messages. These four filters apply to every page, so pass the same values together with cursor. To read one chat, give a target field (a number refers to the no in the most recent list_targets result). from is required when no target field is given. Messages are returned oldest first (chronological) within the window. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.',
+      'Query archived LINE messages within an explicit [from, to] time window (ISO-8601 datetime with offset or YYYY-MM-DD). A YYYY-MM-DD value is a full day in Taiwan time (Asia/Taipei, UTC+08:00): from starts at 00:00:00.000 and to ends at 23:59:59.999 of that day. To read new messages from all chats, omit every target field and give from. One call returns the messages of all readable chats, and each message has its accountId, chatType, chatId and conversationTitle. Do not call this tool once per chat. Do not call list_targets first for this purpose. To see which chats have new messages and how many, call list_active_chats first, then read only the chats you need with chatId. To skip chats you do not want, pass excludeChatIds. To keep or drop message kinds, pass kinds or excludeKinds (not both); direction keeps only inbound (received) or only outbound (sent by the account) messages. These four filters apply to every page, so pass the same values together with cursor. To read one chat, give a target field (a number refers to the no in the most recent list_targets result). from is required when no target field is given. Messages are returned oldest first (chronological) within the window. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.' + EVENT_ROW_GUIDANCE,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -330,6 +337,21 @@ export const SEND_TO_TARGET_TOOL_DEFINITION = {
       },
     },
     required: ['chatType', 'chatId', 'items'],
+  },
+} as const;
+/**
+ * Internal-only (never in MCP_TOOL_DEFINITIONS, so never on the external endpoint or in a token scope). It is offered to every
+ * Agent job that may call query_target_messages, and tools/call re-checks the same permission and message visibility.
+ */
+export const READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION = {
+  name: READ_MESSAGE_ATTACHMENT_TOOL_NAME,
+  description:
+    'Gives the Agent a local copy of one message attachment (image, video, audio or file). Use an attachmentId from the query_target_messages or query_target_messages_by_time results. The result has available, absolutePath, relativePath and reason. When available is true, open absolutePath with your file reading tools. When available is false, reason says why the file is not on this computer. This tool never downloads from LINE. It copies a file that is already stored on this computer, or the same file from the local Downloads folder.',
+  inputSchema: {
+    type: 'object',
+    additionalProperties: false,
+    properties: { attachmentId: { type: 'string', minLength: 1, maxLength: 128, description: 'attachmentId of an attachment in a message record.' } },
+    required: ['attachmentId'],
   },
 } as const;
 const SEND_TOOLS = [LIST_SEND_TARGETS_TOOL_DEFINITION, SEND_TO_TARGET_TOOL_DEFINITION] as const;
@@ -509,6 +531,8 @@ export interface McpServiceOptions {
   maxInternalCapabilities?: number;
   /** Authenticated, authorized handshake observations on an internal capability. */
   onInternalObservation?: (jobId: string, observation: InternalMcpObservation) => void;
+  /** Called with +1 before and -1 after every tools/call of a job capability. A throw is ignored. */
+  onInternalToolActivity?: (jobId: string, delta: 1 | -1) => void;
   /** Main approval broker behind the internal `request_permission` prompt tool; absent means it is never offered. */
   approvalBroker?: Pick<AgentApprovalBroker, 'request'>;
   /** Agent LINE send behind list_send_targets / send_to_target; absent means the tools are never offered. */
@@ -518,6 +542,10 @@ export interface McpServiceOptions {
   /** Clock for schedule conveniences such as once.inMinutes (tests). */
   now?: () => Date;
   chatResources?: McpChatResourceReader;
+  /** Local file access behind read_message_attachment; absent means the tool is never offered. */
+  /** The prepared run directory and file-read grant of a running Agent job (late wiring to the Agent service). */
+  jobFileAccess?: (jobId: string) => { workspacePath: string; fileRead: boolean } | null;
+  attachments?: Pick<MessageAttachmentAccess, 'recoverFromLocalDownloads' | 'resolveReadyPath'>;
   /** Returns the current authenticated LOGIN binding; archive queries fail closed when absent. */
   getLiveLoginBinding?: (accountId: string) => Promise<WorkerBinding | null>;
 }
@@ -870,6 +898,39 @@ export class McpService {
         },
       });
     }, parentSignal);
+  }
+
+  /**
+   * read_message_attachment: the job may read the attachment only when the owning message is visible to it through the same
+   * rules as query_target_messages (permission, accounts, conversation scope). An unknown id and a hidden id give the same error.
+   * The file copy runs after the authorization transaction commits.
+   */
+  private async callReadMessageAttachment(
+    rawArguments: Record<string, unknown>,
+    context: Extract<InternalAgentExecutionContext, { sourceType: 'job' }>,
+    signal: AbortSignal,
+  ): Promise<McpReadMessageAttachmentOutput> {
+    const access = this.options.attachments;
+    if (!access) throw new McpDomainError('SCOPE_DENIED', 'Attachment reading is unavailable.');
+    const messages = this.options.messages;
+    const authorized = await this.track(() => this.options.tokens.executeForInternalAgent({
+      context, toolName: READ_MESSAGE_ATTACHMENT_TOOL_NAME, signal,
+      execute: async ({ client, authorizedAccountIds, conversationScope, extraConversationScopes }) => {
+        const parsed = McpReadMessageAttachmentInputSchema.safeParse(rawArguments);
+        if (!parsed.success) throw new McpDomainError('INVALID_INPUT', formatValidationIssues(parsed.error));
+        const found = await messages.getReadableMessageAttachment({
+          attachmentId: parsed.data.attachmentId, accountIds: authorizedAccountIds,
+          ...(conversationScope ? { conversationScope } : {}),
+          ...(extraConversationScopes && extraConversationScopes.length > 0 ? { extraConversationScopes } : {}),
+        }, client);
+        if (!found) throw new McpDomainError('SCOPE_DENIED', 'The requested attachment is unavailable.');
+        return { data: { attachmentId: found.attachmentId, displayName: found.name }, resultCount: 1 };
+      },
+    }), signal);
+    return readMessageAttachmentForJob(
+      { getAttachment: (attachmentId) => messages.getAttachment(attachmentId), recoverFromLocalDownloads: (attachmentId) => access.recoverFromLocalDownloads(attachmentId),
+        resolveReadyPath: (attachmentId) => access.resolveReadyPath(attachmentId) },
+      { attachmentId: authorized.attachmentId, displayName: authorized.displayName, jobId: context.jobId, fileAccess: this.options.jobFileAccess?.(context.jobId) ?? null }, signal);
   }
 
   /** Agent room history: authorization (re-resolved per call, audited) runs before the input is parsed or any row is read. */
@@ -1469,7 +1530,11 @@ export class McpService {
     rawPayload: unknown,
     parentSignal?: AbortSignal,
   ): Promise<{ httpStatus: number; body: Record<string, unknown> | null }> {
-    const capability = isInternalMcpToken(bearerToken) ? this.internalCapabilities.validate(bearerToken) : null;
+    const resolved = isInternalMcpToken(bearerToken) ? this.internalCapabilities.resolveToken(bearerToken) : null;
+    if (resolved?.kind === 'idle' && resolved.endpointInstance === endpointInstance) {
+      return this.handleIdleResidentRequest(resolved.slotKey, rawPayload);
+    }
+    const capability = resolved?.kind === 'job' ? resolved.capability : null;
     if (!capability || capability.endpointInstance !== endpointInstance) {
       // Audit the rejection without any token bytes, like the external path.
       await this.options.tokens.recordAudit({
@@ -1501,6 +1566,8 @@ export class McpService {
       }).catch(() => undefined);
       throw new McpDomainError('SCOPE_DENIED', 'The Agent job is no longer authorized to use LINEJS MCP tools.');
     };
+    const trackActivity = rpc.method === 'tools/call';
+    if (trackActivity) this.notifyToolActivity(capability.jobId, 1);
     try {
       if (rpc.method === 'initialize') {
         await verify();
@@ -1530,11 +1597,13 @@ export class McpService {
         this.internalCapabilities.observe(capability, 'tools_listed');
         // Listing is only a hint of the current permissions; tools/call re-resolves them and is the authority.
         const tools: Array<McpToolDefinition | typeof AGENT_ROOM_HISTORY_TOOL_DEFINITION | typeof REQUEST_PERMISSION_TOOL_DEFINITION
-          | (typeof SEND_TOOLS)[number] | (typeof SCHEDULE_TOOLS)[number]> = allowedTools(permissions);
+          | (typeof SEND_TOOLS)[number] | (typeof SCHEDULE_TOOLS)[number] | typeof READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION> = allowedTools(permissions);
         if (roomHistory) tools.push(AGENT_ROOM_HISTORY_TOOL_DEFINITION);
         if (lineSend && this.options.lineSend) tools.push(...SEND_TOOLS);
         if (lineSend && this.options.schedules) tools.push(...SCHEDULE_TOOLS);
+        if (this.options.attachments && MCP_TOOL_PERMISSIONS.query_target_messages.some((permission) => permissions[permission] === 'ALLOW')) tools.push(READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION);
         if (capability.approval && this.options.approvalBroker) tools.push(REQUEST_PERMISSION_TOOL_DEFINITION);
+        this.internalCapabilities.recordToolList(capability, tools);
         return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: { tools } } };
       }
       if (rpc.method === 'tools/call') {
@@ -1586,6 +1655,15 @@ export class McpService {
           return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
             content: [{ type: 'text', text: JSON.stringify(sent.data) }], structuredContent: sent.data, isError: false } } };
         }
+        if (params.name === READ_MESSAGE_ATTACHMENT_TOOL_NAME) {
+          const attachment = await this.callReadMessageAttachment(rawCallArgs, context, signal);
+          await finalCheck(READ_MESSAGE_ATTACHMENT_TOOL_NAME);
+          return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
+            content: [{ type: 'text', text: JSON.stringify(attachment) }],
+            structuredContent: attachment,
+            isError: false,
+          } } };
+        }
         if (isScheduleToolName(params.name)) {
           const scheduled = await this.callScheduleTool(params.name, rawCallArgs, context, signal);
           // Like send_to_target, a mutation that already committed is reported, not turned into an error by a late release.
@@ -1619,7 +1697,49 @@ export class McpService {
       return { httpStatus: 404, body: { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${rpc.method}` } } };
     } catch (error) {
       return this.mapErrorToJsonRpc(id, error, { correlationId: crypto.randomUUID(), ...(capability.accountId ? { accountId: capability.accountId } : {}), jobId: capability.jobId });
+    } finally {
+      if (trackActivity) this.notifyToolActivity(capability.jobId, -1);
     }
+  }
+
+  private notifyToolActivity(jobId: string, delta: 1 | -1): void {
+    try { this.options.onInternalToolActivity?.(jobId, delta); } catch { /* A callback failure must not change the tool result. */ }
+  }
+
+  /** Answers a valid resident token that has no live job. It reads no database and authorizes no tool. */
+  private async handleIdleResidentRequest(slotKey: string, rawPayload: unknown): Promise<{ httpStatus: number; body: Record<string, unknown> | null }> {
+    if (!rawPayload || typeof rawPayload !== 'object' || Array.isArray(rawPayload)) {
+      return { httpStatus: 400, body: { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid JSON-RPC 2.0 request.' } } };
+    }
+    const rpc = rawPayload as { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown };
+    const id = typeof rpc.id === 'string' || typeof rpc.id === 'number' || rpc.id === null ? rpc.id : null;
+    if (rpc.jsonrpc !== '2.0' || typeof rpc.method !== 'string') {
+      return { httpStatus: 400, body: { jsonrpc: '2.0', id, error: { code: -32600, message: 'Invalid JSON-RPC 2.0 envelope.' } } };
+    }
+    if (rpc.method === 'initialize') {
+      const requested = rpc.params && typeof rpc.params === 'object' ? (rpc.params as { protocolVersion?: unknown }).protocolVersion : undefined;
+      return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
+        protocolVersion: negotiateMcpProtocol(requested),
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: 'line-agent-mcp', version: '1.0.0' },
+      } } };
+    }
+    if (rpc.method === 'notifications/initialized') return { httpStatus: 202, body: null };
+    if (rpc.method === 'ping') return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {} } };
+    if (rpc.method === 'tools/list') {
+      return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: { tools: this.internalCapabilities.idleToolList(slotKey) ?? [] } } };
+    }
+    if (rpc.method === 'tools/call') {
+      const params = rpc.params && typeof rpc.params === 'object' && !Array.isArray(rpc.params) ? (rpc.params as { name?: unknown }) : {};
+      const toolName = McpToolNameSchema.safeParse(params.name);
+      await this.options.tokens.recordAudit({
+        tokenId: null, principalId: 'internal:job:idle', initiator: 'internal_agent', action: 'AUTH_REJECTED',
+        toolName: toolName.success ? toolName.data : null,
+        accountScopes: [], grantVersion: null, disposition: 'SCOPE_DENIED', resultCount: null,
+      }).catch(() => undefined);
+      return this.mapErrorToJsonRpc(id, new McpDomainError('SCOPE_DENIED', 'The Agent job is no longer authorized to use LINEJS MCP tools.'));
+    }
+    return { httpStatus: 404, body: { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${rpc.method}` } } };
   }
 
   async shutdown(): Promise<void> {

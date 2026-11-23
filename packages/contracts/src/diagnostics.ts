@@ -61,6 +61,22 @@ export function parseSafeDiagnostic(value: unknown): SafeDiagnostic | undefined 
   catch { return undefined; }
 }
 
+const SAFE_ERROR_CODE_PATTERN = /^[A-Z0-9][A-Z0-9_]{1,63}$/;
+
+/**
+ * Read only the `code` field of an error. A string code must look like a SQLSTATE or a Node code.
+ * A numeric code must be a safe integer. Message, stack and cause are never read.
+ */
+export function safeErrorCode(error: unknown): string | undefined {
+  try {
+    if (!error || typeof error !== 'object') return undefined;
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string') return SAFE_ERROR_CODE_PATTERN.test(code) ? code : undefined;
+    if (typeof code === 'number' && Number.isSafeInteger(code)) return String(code);
+  } catch { /* Hostile getters are not diagnostic evidence. */ }
+  return undefined;
+}
+
 /** Inspect only platform-controlled discriminants; exception text/cause never leaves the caller. */
 export function diagnosticFailure(operation: SafeDiagnostic['operation'], stage: SafeDiagnostic['stage'], error?: unknown,
   outcome: SafeDiagnostic['outcome'] = 'failed'): SafeDiagnostic {
@@ -78,9 +94,11 @@ export function diagnosticFailure(operation: SafeDiagnostic['operation'], stage:
         : stage === 'persist' || stage === 'write' ? 'persistence_failed'
           : stage === 'spawn' ? 'process_start_failed' : stage === 'parse' || stage === 'response' ? 'invalid_response'
             : stage === 'publish' ? 'event_publish_failed' : 'unknown';
+  const errorCode = safeErrorCode(error);
   return { operation, stage, category, outcome,
     recovery: outcome === 'unknown' ? 'inspect_outcome' : category === 'cancelled' ? 'none'
-      : category === 'denied' || category === 'unavailable' ? 'check_configuration' : 'retry' };
+      : category === 'denied' || category === 'unavailable' ? 'check_configuration' : 'retry',
+    ...(errorCode ? { detail: `code:${errorCode}` } : {}) };
 }
 
 /** Numeric timing of one slow live ingest batch. Counters and millisecond spans only; never message text or ids. */

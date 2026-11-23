@@ -66,4 +66,13 @@ describe('Task 5 IPC authority contract', () => {
     expect(IpcEventSchema.safeParse({ ...base, imageDataUrl: 'https://example.test/qr.png' }).success).toBe(false);
     expect(IpcEventSchema.safeParse({ ...base, imageDataUrl: `data:image/png;base64,${'A'.repeat(300_000)}` }).success).toBe(false);
   });
+  it('validates the download bridge interval request', () => {
+    const intervals = { image: { minSeconds: 3, maxSeconds: 10 }, file: { minSeconds: 0, maxSeconds: 600 } };
+    const request = { type: 'adminDownloadBridgeSetIntervals', requestId: 'r', accountId: 'a', intervals };
+    expect(IpcRequestSchema.safeParse(request).success).toBe(true);
+    for (const bad of [{ ...intervals, image: { minSeconds: 11, maxSeconds: 10 } }, { ...intervals, file: { minSeconds: 0, maxSeconds: 601 } },
+      { ...intervals, file: { minSeconds: -1, maxSeconds: 5 } }, { ...intervals, image: { minSeconds: 1.5, maxSeconds: 5 } }, { image: intervals.image }]) {
+      expect(IpcRequestSchema.safeParse({ ...request, intervals: bad }).success).toBe(false);
+    }
+  });
 });

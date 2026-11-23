@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { IMAGE_EXTENSION_BY_MIME, diagnosticFailure, type AttachmentBlockReason, type SafeDiagnostic } from '@line-agent/contracts';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
-import { realpath } from 'node:fs/promises';
+import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
+import { createReadStream } from 'node:fs';
+import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { isWritableChatType, type AttachmentResult, type LineWorkerCommand, type WorkerBinding } from '@line-agent/contracts';
 import { OFFICIAL_BRIDGE_WORKER_ID, type Attachment, type AttachmentAttemptMutation, type AttachmentPriorState, type MessageRepository } from '@line-agent/database';
 import { pickWorkerBinding } from '../worker-binding-fields.js';
@@ -10,6 +11,32 @@ import {
   type BridgeAttempt, type BridgeAttemptStage, type BridgeDownloadRequest, type BridgeDownloadedFile, type BridgeKind, type BridgeVerification, type BridgeVerifyRequest,
 } from './official-download-bridge/index.js';
 import type { BridgeAttachmentStore, BridgeStoredAttachment } from './official-download-bridge/bridge-attachment-store.js';
+
+/** Local recovery of an expired attachment from a Downloads folder. No network is used. */
+export interface LocalDownloadsRecovery {
+  /** The folder to search. Only its top level is read. */
+  readonly downloadsDir: string;
+  /** The managed store that a normal download uses. */
+  readonly store: BridgeAttachmentStore;
+}
+
+export type LocalRecoveryResult = 'recovered' | 'not_found' | 'not_eligible';
+
+const LOCAL_RECOVERY_MAX_DUPLICATE = 20;
+
+/** A safe plain file name: no path part, no stream marker, no control character. */
+function isSafeLocalFileName(name: string | null): name is string {
+  return name !== null && name.length > 0 && name.length <= 255 && name === name.trim() && name !== '.' && name !== '..'
+    && !/[\\/:\u0000-\u001f]/.test(name) && !name.includes('..');
+}
+
+/** The exact name first, then the duplicate names that Windows and LINE make: <base> (N)<ext>. */
+function localCandidateNames(name: string): string[] {
+  const { name: base, ext } = parse(name);
+  const names = [name];
+  for (let n = 1; n <= LOCAL_RECOVERY_MAX_DUPLICATE; n += 1) names.push(`${base} (${n})${ext}`);
+  return names;
+}
 
 /** The Primary Admin download bridge, as the attachment service uses it. */
 export interface ExternalBridgeDownloads {
@@ -21,6 +48,8 @@ export interface ExternalBridgeDownloads {
   readonly store: BridgeAttachmentStore;
   /** The user toggle for the automatic download of new messages. Read from memory. */
   readonly isAutoDownloadEnabled: () => boolean;
+  /** Random gap in ms after a bridge download of this kind (from the user intervals). Absent: the fixed attachment gap is used. */
+  readonly downloadGapMs?: (kind: BridgeKind) => number;
   /** The user switch that allows every bridge download. Read from memory. */
   readonly isDownloadEnabled: () => boolean;
   /** True after the proof of the logged-in Chrome account. No bridge download starts before it. Read from memory. */
@@ -55,6 +84,8 @@ interface RecoveryScan {
 
 /** A bridge download starts by itself only for a message that is not older than this. An older row waits for a user click. */
 export const EXTERNAL_BRIDGE_AUTO_MAX_AGE_MS = 10 * 60 * 1_000;
+/** A recovered (backlog) External Monitor row can be verified and downloaded by itself when it is not older than this. */
+export const EXTERNAL_BRIDGE_RECOVERED_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 export const ATTACHMENT_GAP_MIN_MS = 3_000;
 export const ATTACHMENT_GAP_MAX_MS = 10_000;
 
@@ -64,12 +95,17 @@ export class AttachmentService {
   private readonly ownerId = randomUUID();
   private readonly queued = new Set<string>();
   private readonly manualQueued = new Set<string>();
+  /** Queued attachments of a new message that the bridge must download at once. They skip `nextAutomaticAt` and the durable due time. */
+  private readonly liveQueued = new Set<string>();
   /** Attachments that the passive verification already started in this app run. */
   private readonly verifyStarted = new Set<string>();
   /** Attachments whose passive verification gave `match` in this app run. Only these may download by the automatic path. */
   private readonly verifiedMatch = new Set<string>();
+  /** Attachments of a recovered (backlog) message whose verification gave `match`. They may download although they are older than the new-message limit. */
+  private readonly recoveredMatch = new Set<string>();
   private readonly waiters = new Map<string, { promise: Promise<boolean>; resolve(value: boolean): void }>();
   private readonly inFlight = new Map<string, Promise<boolean>>();
+  private readonly localRecoveries = new Map<string, Promise<LocalRecoveryResult>>();
   private readonly controllers = new Map<string, AbortController>();
   private dispatcher: Promise<void> | null = null;
   private readonly recoveryScans: RecoveryScan[] = [];
@@ -93,7 +129,8 @@ export class AttachmentService {
     private readonly onServerRejection?: (result: Extract<AttachmentResult, { status: 'failed' | 'expired' }>) => void,
     private readonly onBlockReasonChanged?: (accountId: string, reason: AttachmentBlockReason) => void,
     private readonly onPrimaryReady?: (key: import('@line-agent/contracts').WritableConversationKey, attachmentId: string) => void | Promise<void>,
-    private readonly bridge?: ExternalBridgeDownloads) {
+    private readonly bridge?: ExternalBridgeDownloads,
+    private readonly localRecovery?: LocalDownloadsRecovery) {
     void maxConcurrent;
   }
 
@@ -154,6 +191,86 @@ export class AttachmentService {
     return this.enqueue(attachmentId, false, signal);
   }
 
+  /** For an expired or failed row, try the local Downloads folder first. It never throws. */
+  private async recoveredLocally(attachmentId: string, signal?: AbortSignal): Promise<boolean> {
+    if (!this.localRecovery || this.closed || signal?.aborted) return false;
+    try {
+      const row = await this.messages.getAttachment(attachmentId);
+      if (!row || (row.status !== 'expired' && row.status !== 'failed')) return false;
+      return await this.recoverFromLocalDownloads(attachmentId) === 'recovered';
+    } catch { return false; }
+  }
+
+  /**
+   * Copies the same file from the local Downloads folder into the managed store. No network is used.
+   * The file must have the same name (or a duplicate name) and exactly the same size. The source file is only read.
+   */
+  recoverFromLocalDownloads(attachmentId: string): Promise<LocalRecoveryResult> {
+    const existing = this.localRecoveries.get(attachmentId);
+    if (existing) return existing;
+    const run = this.runLocalRecovery(attachmentId).finally(() => this.localRecoveries.delete(attachmentId));
+    this.localRecoveries.set(attachmentId, run);
+    return run;
+  }
+
+  private async runLocalRecovery(attachmentId: string): Promise<LocalRecoveryResult> {
+    const recovery = this.localRecovery;
+    if (!recovery || this.closed) return 'not_eligible';
+    const attachment = await this.messages.getAttachment(attachmentId);
+    if (!attachment || (attachment.status !== 'expired' && attachment.status !== 'failed')
+      || !(attachment.kind === 'file' || attachment.kind === 'image' || attachment.kind === 'video' || attachment.kind === 'audio')
+      || !isSafeLocalFileName(attachment.name)
+      || attachment.sizeBytes === null || !Number.isSafeInteger(attachment.sizeBytes) || attachment.sizeBytes <= 0) return 'not_eligible';
+    const expectedSize = attachment.sizeBytes;
+    let entries: string[];
+    try { entries = await readdir(recovery.downloadsDir); } catch { return 'not_found'; }
+    const fold = (value: string): string => process.platform === 'win32' ? value.toLowerCase() : value;
+    const byName = new Map<string, string>();
+    for (const entry of entries) if (!byName.has(fold(entry))) byName.set(fold(entry), entry);
+    for (const candidate of localCandidateNames(attachment.name)) {
+      const actual = byName.get(fold(candidate));
+      if (actual === undefined) continue;
+      const source = join(recovery.downloadsDir, actual);
+      try {
+        const info = await lstat(source);
+        if (info.isSymbolicLink() || !info.isFile() || info.size !== expectedSize) continue;
+      } catch { continue; }
+      const stored = await this.copyLocalFile(attachment, source, expectedSize, recovery.store);
+      if (!stored) continue;
+      let marked = false;
+      try {
+        marked = await this.messages.markAttachmentRecoveredFromLocal({ attachmentId, accountId: attachment.accountId,
+          relativePath: stored.relativePath, sha256: stored.sha256, sizeBytes: stored.sizeBytes });
+      } catch { marked = false; }
+      if (!marked) { await this.removeStoredCopy(stored.relativePath); return 'not_found'; }
+      const identity = { requestId: attachmentId, accountId: attachment.accountId, workerInstanceId: OFFICIAL_BRIDGE_WORKER_ID, correlationId: randomUUID() };
+      void Promise.resolve(this.onPrimaryReady?.({ accountId: attachment.accountId, chatType: attachment.chatType as import('@line-agent/contracts').WritableConversationKey['chatType'], chatId: attachment.chatId }, attachmentId))
+        .catch((error: unknown) => this.reportFailure('persist', error, identity));
+      this.notifyChanged(attachmentId);
+      return 'recovered';
+    }
+    return 'not_found';
+  }
+
+  /** Copies one file into the managed store. The store computes SHA-256. Any failure removes the partial copy. */
+  private async copyLocalFile(attachment: Attachment, source: string, expectedSize: number, store: BridgeAttachmentStore): Promise<BridgeStoredAttachment | null> {
+    let stored: BridgeStoredAttachment | null = null;
+    try {
+      stored = await store({ attachment, name: attachment.name ?? 'attachment.blob',
+        source: createReadStream(source, { flags: 'r' }), maxBytes: expectedSize, signal: new AbortController().signal });
+      if (stored.sizeBytes !== expectedSize || !/^[0-9a-f]{64}$/i.test(stored.sha256)) throw new Error('size or hash mismatch');
+      return stored;
+    } catch {
+      if (stored) await this.removeStoredCopy(stored.relativePath);
+      return null;
+    }
+  }
+
+  private async removeStoredCopy(relativePath: string): Promise<void> {
+    if (!this.root || relativePath.startsWith('/') || relativePath.split('/').some((part) => !part || part === '..' || part === '.')) return;
+    try { await rm(resolve(this.root, ...relativePath.split('/')), { force: true }); } catch { /* A partial copy that stays is only unused bytes. */ }
+  }
+
   async downloadManually(key: { accountId: string; chatType: Attachment['chatType']; chatId: string }, attachmentId: string): Promise<boolean> {
     if (this.closed) return false;
     const attachment = await this.messages.getAttachment(attachmentId);
@@ -162,6 +279,7 @@ export class AttachmentService {
     if (!attachment.externalSource && this.isAccountConnected && !await this.isAccountConnected(key.accountId)) return false;
     const existing = this.inFlight.get(attachmentId) ?? this.waiters.get(attachmentId)?.promise;
     if (existing) return existing;
+    if (await this.recoveredLocally(attachmentId)) return true;
     // An External Monitor row has no worker. Only the download bridge can get its file.
     if (attachment.externalSource) {
       if (!this.bridge) return false;
@@ -190,7 +308,7 @@ export class AttachmentService {
   }
 
   /** Download of an External Monitor row through the bridge. Only a row that is not older than 7 days. */
-  private async downloadExternalClaimed(attachment: Attachment, signal: AbortSignal, manual: boolean): Promise<boolean> {
+  private async downloadExternalClaimed(attachment: Attachment, signal: AbortSignal, manual: boolean, live: boolean): Promise<boolean> {
     if (signal.aborted || !this.bridge || (attachment.status !== 'queued' && attachment.status !== 'failed')) return false;
     if (this.externalSourceExpired(attachment)) return false;
     if (attachment.chatType === 'community' || attachment.chatType === 'thread') {
@@ -202,14 +320,17 @@ export class AttachmentService {
     // Any other automatic case writes the reason only. A failed row waits for a user click.
     if (!manual) {
       if (attachment.status !== 'queued') return false;
-      const live = this.bridge.downloader.isLive();
+      const bridgeLive = this.bridge.downloader.isLive();
       const downloadEnabled = this.bridge.isDownloadEnabled();
       const identityVerified = this.bridge.isIdentityVerified();
-      if (live && downloadEnabled && identityVerified && this.isRecentExternal(attachment) && this.isBridgeChatType(attachment)
+      // A recovered row (backlog) has its own age limit (7 days). Its mark is used one time.
+      const recovered = this.recoveredMatch.delete(attachment.attachmentId);
+      if (bridgeLive && downloadEnabled && identityVerified && (recovered || this.isRecentExternal(attachment)) && this.isBridgeChatType(attachment)
         && this.bridge.isAutoDownloadEnabled() && this.verifiedMatch.delete(attachment.attachmentId)) {
-        return this.runBridgeDownload(attachment, signal, this.bridge, { source: 'store' });
+        // Only a live (new message) download skips the gap of the downloader. A recovered download keeps it.
+        return this.runBridgeDownload(attachment, signal, this.bridge, { source: 'store' }, live);
       }
-      await this.recordBlock(attachment, !live ? 'BRIDGE_NOT_LOGGED_IN' : !downloadEnabled ? 'BRIDGE_DOWNLOAD_DISABLED' : !identityVerified ? 'BRIDGE_IDENTITY_PENDING' : 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE');
+      await this.recordBlock(attachment, !bridgeLive ? 'BRIDGE_NOT_LOGGED_IN' : !downloadEnabled ? 'BRIDGE_DOWNLOAD_DISABLED' : !identityVerified ? 'BRIDGE_IDENTITY_PENDING' : 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE');
       return false;
     }
     if (!this.isBridgeChatType(attachment) || !this.bridge.downloader.isLive()) {
@@ -228,12 +349,17 @@ export class AttachmentService {
     }
     const plan = await this.planManualBridgeDownload(attachment, this.bridge);
     if (!plan) return false;
-    return this.runBridgeDownload(attachment, signal, this.bridge, plan);
+    return this.runBridgeDownload(attachment, signal, this.bridge, plan, false);
   }
 
   private isRecentExternal(attachment: Attachment): boolean {
     const occurredAt = Date.parse(attachment.occurredAt);
     return Number.isFinite(occurredAt) && Date.now() - occurredAt <= EXTERNAL_BRIDGE_AUTO_MAX_AGE_MS;
+  }
+
+  private isRecoveredExternal(attachment: Attachment): boolean {
+    const occurredAt = Date.parse(attachment.occurredAt);
+    return Number.isFinite(occurredAt) && Date.now() - occurredAt <= EXTERNAL_BRIDGE_RECOVERED_MAX_AGE_MS;
   }
 
   private bridgeKind(attachment: Attachment): BridgeKind | null {
@@ -259,25 +385,42 @@ export class AttachmentService {
    * It runs when the bridge is live, with the download switches on or off, one time for each attachment in an app run.
    * It reads local extension memory only. When the result is `match` and both switches are on, the automatic download starts.
    */
-  async verifyNewExternalAttachment(attachmentId: string): Promise<void> {
+  verifyNewExternalAttachment(attachmentId: string): Promise<void> {
+    return this.verifyExternalAttachment(attachmentId, false);
+  }
+
+  /**
+   * Passive verification of a recovered (backlog) External Monitor attachment, not older than 7 days.
+   * It reads local extension memory one time (no wait). Only the result `match`, with both switches on, starts a download.
+   * That download is not live, so the user download interval applies. Any other result starts no download.
+   * The counts of the snapshot use the latest result of each attachment, so a repeated verification does not count twice.
+   */
+  verifyRecoveredExternalAttachment(attachmentId: string): Promise<void> {
+    return this.verifyExternalAttachment(attachmentId, true);
+  }
+
+  private async verifyExternalAttachment(attachmentId: string, recovered: boolean): Promise<void> {
     const bridge = this.bridge;
     if (!bridge || this.closed || this.verifyStarted.has(attachmentId)) return;
     let attachment: Attachment | null;
     try { attachment = await this.messages.getAttachment(attachmentId); } catch { return; }
     if (!attachment || this.closed || !attachment.externalSource || attachment.status !== 'queued') return;
-    if (!this.isBridgeChatType(attachment) || this.externalSourceExpired(attachment) || !this.isRecentExternal(attachment)) return;
+    if (!this.isBridgeChatType(attachment) || this.externalSourceExpired(attachment)) return;
+    if (recovered ? !this.isRecoveredExternal(attachment) : !this.isRecentExternal(attachment)) return;
     if (!bridge.downloader.isLive() || this.verifyStarted.has(attachmentId)) return;
     this.remember(this.verifyStarted, attachmentId);
     const identity = { requestId: attachmentId, accountId: attachment.accountId, workerInstanceId: OFFICIAL_BRIDGE_WORKER_ID, correlationId: randomUUID() };
     try {
       const verification = await bridge.downloader.verify({
-        messageId: attachment.messageId, nativeRow: nativeRowFromEnvelope(attachment.nativeEnvelope), waitMs: BRIDGE_VERIFY_WAIT_MS,
+        messageId: attachment.messageId, nativeRow: nativeRowFromEnvelope(attachment.nativeEnvelope), waitMs: recovered ? 0 : BRIDGE_VERIFY_WAIT_MS,
       });
       if (this.closed) return;
-      this.recordVerification(attachment, verification);
+      // A recovered message that is not in the store is a normal case. It gets no record and no download.
+      if (!(recovered && verification.result === 'not_in_store')) this.recordVerification(attachment, verification);
       if (verification.result !== 'match') return;
       this.remember(this.verifiedMatch, attachmentId);
-      if (bridge.isDownloadEnabled() && bridge.isAutoDownloadEnabled()) void this.enqueue(attachmentId, false);
+      if (recovered) this.remember(this.recoveredMatch, attachmentId);
+      if (bridge.isDownloadEnabled() && bridge.isAutoDownloadEnabled()) void this.enqueue(attachmentId, false, undefined, !recovered);
     } catch (error) {
       const code = (error as { code?: unknown } | null)?.code;
       const text = typeof code === 'string' && code.length > 0 ? code : 'BRIDGE_VERIFY_FAILED';
@@ -309,7 +452,7 @@ export class AttachmentService {
     if (verification.result === 'match') return { source: 'store' };
     if (verification.result === 'mismatch') return { fail: 'BRIDGE_MESSAGE_MISMATCH', stage: 'store' };
     if (verification.result === 'native_incomplete') return { fail: 'NATIVE_MESSAGE_INCOMPLETE', stage: 'native' };
-    // Not in the extension store (an old message). The built message is allowed only when the gate is open for this kind.
+    // Not in the extension store (an old message), or only a placeholder there (`store_incomplete`). The built message is allowed only when the gate is open for this kind.
     let open = false;
     try { open = isBridgeGateOpen(kind, await this.messages.countBridgeVerification(attachment.accountId)); } catch (error) {
       // Safe fallback: the gate stays closed. The error goes to the diagnostic path.
@@ -334,7 +477,7 @@ export class AttachmentService {
       ...(status !== undefined && status >= 100 && status <= 599 ? { upstreamStatus: status } : {}) };
   }
 
-  private async runBridgeDownload(attachment: Attachment, signal: AbortSignal, bridge: ExternalBridgeDownloads, plan: BridgeDownloadPlan): Promise<boolean> {
+  private async runBridgeDownload(attachment: Attachment, signal: AbortSignal, bridge: ExternalBridgeDownloads, plan: BridgeDownloadPlan, live: boolean): Promise<boolean> {
     const attachmentId = attachment.attachmentId;
     const attempt = { attachmentId, accountId: attachment.accountId, attemptToken: randomUUID() };
     if (!await this.messages.claimExternalAttachmentForBridge(attempt)) return false;
@@ -350,7 +493,7 @@ export class AttachmentService {
       const kind = this.bridgeKind(attachment);
       if (!kind) throw new BridgeDownloadError('BRIDGE_CONTENT_TYPE_UNSUPPORTED', 'precheck', 'attachment is not an image or a file');
       const stored: BridgeStoredAttachment = await bridge.downloader.run({
-        chatType: attachment.chatType, messageId: attachment.messageId, kind, source: plan.source,
+        chatType: attachment.chatType, messageId: attachment.messageId, kind, source: plan.source, live,
         nativeRow: nativeRowFromEnvelope(attachment.nativeEnvelope), expectedSizeBytes: attachment.sizeBytes,
         maxBytes: BRIDGE_MAX_BYTES, signal,
       }, async (file) => {
@@ -388,23 +531,31 @@ export class AttachmentService {
       this.notifyChanged(attachmentId);
       return false;
     } finally {
-      this.nextAutomaticAt = Date.now() + this.randomGapMs();
+      // The gap is for the next download that is not live. A live download never reads it.
+      const kind = this.bridgeKind(attachment);
+      this.nextAutomaticAt = Date.now() + (kind && bridge.downloadGapMs ? bridge.downloadGapMs(kind) : this.randomGapMs());
     }
   }
 
-  private enqueue(attachmentId: string, manual: boolean, signal?: AbortSignal): Promise<boolean> {
+  /** `live`: a new message that passed the verification. It goes to the bridge at once, with no gap. */
+  private enqueue(attachmentId: string, manual: boolean, signal?: AbortSignal, live = false): Promise<boolean> {
     if (this.closed || signal?.aborted) return Promise.resolve(false);
     const existing = this.inFlight.get(attachmentId) ?? this.waiters.get(attachmentId)?.promise;
-    if (existing) return existing;
+    if (existing) {
+      if (live && this.queued.has(attachmentId)) { this.liveQueued.add(attachmentId); this.kick(); }
+      return existing;
+    }
     if (this.waiters.size >= AttachmentService.MAX_ADMITTED) return Promise.resolve(false);
     let resolve!: (value: boolean) => void;
     const promise = new Promise<boolean>((done) => { resolve = done; });
     this.waiters.set(attachmentId, { promise, resolve });
     this.queued.add(attachmentId);
     if (manual) this.manualQueued.add(attachmentId);
+    else if (live) this.liveQueued.add(attachmentId);
     if (signal) {
       const cancel = () => {
         if (this.queued.delete(attachmentId)) {
+          this.liveQueued.delete(attachmentId);
           this.waiters.get(attachmentId)?.resolve(false);
           this.waiters.delete(attachmentId);
         } else this.controllers.get(attachmentId)?.abort(signal.reason);
@@ -416,9 +567,9 @@ export class AttachmentService {
     return promise;
   }
 
-  private async downloadClaimed(attachmentId: string, signal: AbortSignal, manual: boolean): Promise<boolean> {
+  private async downloadClaimed(attachmentId: string, signal: AbortSignal, manual: boolean, live = false): Promise<boolean> {
     const attachment = await this.messages.getAttachment(attachmentId);
-    if (attachment?.externalSource && this.bridge) return this.downloadExternalClaimed(attachment, signal, manual);
+    if (attachment?.externalSource && this.bridge) return this.downloadExternalClaimed(attachment, signal, manual, live);
     if (!signal.aborted && attachment && !manual && attachment.externalSource && isWritableChatType(attachment.chatType)
       && (attachment.status === 'queued' || attachment.status === 'failed') && !this.externalSourceExpired(attachment)) {
       await this.recordBlock(attachment, 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE');
@@ -591,7 +742,8 @@ export class AttachmentService {
   private kick(): void {
     if (this.dispatcher || this.closed) return;
     this.dispatcher = (async () => {
-      while (!this.closed && this.inFlight.size < this.maxConcurrent) {
+      // A live download may start while another download waits in the bridge: the bridge lock keeps the downloads one at a time.
+      while (!this.closed && (this.inFlight.size < this.maxConcurrent || this.liveQueued.size > 0)) {
         if (!this.queued.size && this.recoveryScans.length) {
           const scan = this.recoveryScans.shift()!;
           this.activeScan = scan;
@@ -657,10 +809,12 @@ export class AttachmentService {
           if (!this.queued.size && !this.recoveryScans.length) break;
         }
         const id = (this.manualQueued.size ? [...this.manualQueued].find((candidate) => this.queued.has(candidate)) : undefined)
+          ?? (this.liveQueued.size ? [...this.liveQueued].find((candidate) => this.queued.has(candidate)) : undefined)
           ?? this.queued.values().next().value as string | undefined;
         if (!id) break;
         const manual = this.manualQueued.has(id);
-        if (!manual) {
+        const live = !manual && this.liveQueued.has(id);
+        if (!manual && !live) {
           let wakeAt = this.nextAutomaticAt;
           let row: Attachment | null;
           try { row = await this.messages.getAttachment(id); }
@@ -676,11 +830,12 @@ export class AttachmentService {
         }
         this.queued.delete(id);
         this.manualQueued.delete(id);
+        this.liveQueued.delete(id);
         const controller = new AbortController();
         this.controllers.set(id, controller);
         const task = (async () => {
           let result = false;
-          try { result = await this.downloadClaimed(id, controller.signal, manual); } catch { result = false; }
+          try { result = await this.downloadClaimed(id, controller.signal, manual, live); } catch { result = false; }
           this.waiters.get(id)?.resolve(result);
           this.controllers.delete(id);
           this.inFlight.delete(id);
@@ -722,6 +877,7 @@ export class AttachmentService {
     }
     this.queued.clear();
     this.manualQueued.clear();
+    this.liveQueued.clear();
     this.recoveryScans.length = 0;
     this.scanGenerations.clear();
     const drain = Promise.allSettled([...this.inFlight.values()]).then(() => undefined);

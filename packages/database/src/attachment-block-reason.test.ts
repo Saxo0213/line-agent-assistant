@@ -72,6 +72,23 @@ database('attachment block reasons', () => {
     expect((await repository.getAttachment(attachmentId))?.error).toBe('ATTACHMENT_WORKER_NOT_READY');
   });
 
+  it('counts a real bridge mismatch for good and counts a legacy placeholder mismatch as store_incomplete', async () => {
+    const accountId = 'block-bridge-count';
+    const sticky = await ingest(accountId);
+    const legacy = await ingest(accountId);
+    const record = (attachmentId: string, resultCode: string, detail: string) => pool.query(
+      `INSERT INTO audit_logs(action, actor, details) VALUES ('bridge_message_verify', 'system', $1::jsonb)`,
+      [JSON.stringify({ account_id: accountId, request_id: attachmentId, correlation_id: randomUUID(), phase: 'observed', result_code: resultCode,
+        diagnostic: { operation: 'attachment', stage: 'read', category: 'invalid_response', recovery: 'none', detail } })]);
+    await record(sticky.attachmentId, 'BRIDGE_VERIFY_MISMATCH', 'false:id:path.diff:SID');
+    await record(sticky.attachmentId, 'BRIDGE_VERIFY_NATIVE_INCOMPLETE', 'native_incomplete');
+    await record(legacy.attachmentId, 'BRIDGE_VERIFY_MISMATCH', 'false:contentType:path:headPath.missing_chrome:ENC_KM:e2eeVersion:SID.info:FILE_SIZE');
+    const counts = await repository.countBridgeVerification(accountId);
+    expect(counts.file).toMatchObject({ match: 0, mismatch: 1, nativeIncomplete: 0, storeIncomplete: 1 });
+    await record(legacy.attachmentId, 'BRIDGE_VERIFY_STORE_INCOMPLETE', 'store_incomplete.false:contentType');
+    expect((await repository.countBridgeVerification(accountId)).file).toMatchObject({ mismatch: 1, storeIncomplete: 1 });
+  });
+
   it('keeps a real error and writes nothing on a row that is not queued', async () => {
     const { attachmentId } = await ingest('block-real');
     await pool.query("UPDATE attachments SET error='LINE_NATIVE_DOWNLOAD_FAILED' WHERE attachment_id=$1", [attachmentId]);

@@ -35,7 +35,7 @@ export const AUDIT_ERROR_CODES = [
   'CATALOG_REFRESH_FAILED', 'WORKER_OPERATION_FAILED', 'HISTORY_READ_FAILED', 'CHAT_RESOURCE_READ_FAILED',
   'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED', 'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED',
   'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED', 'PRIMARY_ADMIN_NOT_FRIEND', 'ATTACHMENT_DOWNLOAD_OPERATION_FAILED',
-  'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED',
+  'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED', 'LINE_CONNECTION_SUSPENDED', 'AGENT_JOB_FAILED',
   ...LINE_SERVER_ERROR_CODES,
 ] as const;
 export type AuditErrorCode = typeof AUDIT_ERROR_CODES[number];
@@ -45,7 +45,8 @@ export const AUDIT_RESULT_CODES = ['worker_stopped', 'secret_removed', 'agent_au
   'authorization_active_reply_failed', 'authorization_active_reply_unknown', 'authorization_denied',
   'catalog_refresh_recovered', 'free_mode_judge_reply', 'free_mode_judge_no_reply', 'free_mode_interrupted',
   'free_mode_interrupt_refused_urgency', 'free_mode_interrupt_refused_limit', 'free_mode_interrupt_refused_not_running',
-  'BRIDGE_VERIFY_MATCH', 'BRIDGE_VERIFY_MISMATCH', 'BRIDGE_VERIFY_NOT_IN_STORE', 'BRIDGE_VERIFY_NATIVE_INCOMPLETE'] as const;
+  'BRIDGE_VERIFY_MATCH', 'BRIDGE_VERIFY_MISMATCH', 'BRIDGE_VERIFY_NOT_IN_STORE', 'BRIDGE_VERIFY_NATIVE_INCOMPLETE',
+  'BRIDGE_VERIFY_STORE_INCOMPLETE'] as const;
 export type AuditResultCode = typeof AUDIT_RESULT_CODES[number];
 
 export interface AuditEvent {

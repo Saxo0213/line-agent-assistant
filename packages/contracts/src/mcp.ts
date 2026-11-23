@@ -387,8 +387,10 @@ export type McpToolOutputUnion = z.infer<typeof McpToolOutputUnionSchema>;
 export const AGENT_ROOM_HISTORY_TOOL_NAME = 'query_agent_room_history' as const;
 export const LIST_SEND_TARGETS_TOOL_NAME = 'list_send_targets' as const;
 export const SEND_TO_TARGET_TOOL_NAME = 'send_to_target' as const;
+/** Internal-only tool: gives an Agent job a local copy of one message attachment. Never part of McpToolNameSchema. */
+export const READ_MESSAGE_ATTACHMENT_TOOL_NAME = 'read_message_attachment' as const;
 export const McpInternalToolNameSchema = z.enum([
-  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, ...SCHEDULE_TOOL_NAMES,
+  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, ...SCHEDULE_TOOL_NAMES,
 ]);
 export type McpInternalToolName = z.infer<typeof McpInternalToolNameSchema>;
 /** The principal of an Agent room job or the local console UI; an admin-direct LINE job is also allowed while the room shares that chat. */
@@ -558,3 +560,23 @@ export const McpSendToTargetOutputSchema = z.strictObject({
   results: z.array(McpSendResultSchema).min(1).max(SEND_ITEMS_MAX),
 });
 export type McpSendToTargetOutput = z.infer<typeof McpSendToTargetOutputSchema>;
+
+export const McpReadMessageAttachmentInputSchema = z.strictObject({ attachmentId: z.string().min(1).max(128) });
+export type McpReadMessageAttachmentInput = z.infer<typeof McpReadMessageAttachmentInputSchema>;
+
+export const McpReadMessageAttachmentOutputSchema = z.strictObject({
+  attachmentId: z.string().min(1),
+  name: z.string().nullable(),
+  kind: McpMessageAttachmentSchema.shape.kind,
+  mimeType: z.string().nullable(),
+  sizeBytes: z.number().int().nonnegative().nullable(),
+  status: McpMessageAttachmentSchema.shape.status,
+  /** True when a verified local copy exists at absolutePath. */
+  available: z.boolean(),
+  /** Path of the copy relative to the job workspace, with forward slashes. */
+  relativePath: z.string().min(1).nullable(),
+  absolutePath: z.string().min(1).nullable(),
+  /** Short English reason when available is false. */
+  reason: z.string().min(1).max(500).nullable(),
+});
+export type McpReadMessageAttachmentOutput = z.infer<typeof McpReadMessageAttachmentOutputSchema>;

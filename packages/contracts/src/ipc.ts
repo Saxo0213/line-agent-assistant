@@ -4,9 +4,11 @@ import { ATTACHMENT_BLOCK_REASONS } from './attachment-block.js';
 import { AgentAttachmentSummarySchema, AgentAttachmentUploadsSchema, AgentEventSchema, AgentProviderSchema } from './agent.js';
 import { AgentStatusIconsSchema } from './agent-status-icons.js';
 import { AgentPersonaSchema } from './agent-persona.js';
+import { AccountSourceIdSchema, AccountSourceLabelSchema, AgentAccountSourceSchema, AgentAccountSourceUsageSchema } from './agent-account-sources.js';
 import { AgentExtensionToolsSchema, AgentExtensionsStateSchema, AgentMcpImportListingSchema, AgentMcpImportResultSchema, AgentMcpImportSelectionSchema, AgentMcpServerInputSchema, AgentMcpServerSummarySchema } from './agent-extensions.js';
 import { AgentScheduleCreateInputSchema, AgentScheduleListRunsInputSchema, AgentScheduleListTargetsInputSchema, AgentSchedulePreviewNewMessagesInputSchema, AgentSchedulePreviewNewMessagesOutputSchema, AgentScheduleRunSchema, AgentScheduleSchema, AgentScheduleTargetOptionSchema, AgentScheduleUpdatePatchSchema } from './agent-schedule.js';
 import { AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN } from './agent-status-rotation.js';
+import { DownloadBridgeIntervalsSchema } from './download-bridge-intervals.js';
 import { AutoResponderRuleSchema, AutoResponderSettingsSchema, validateAutoresponderConfig } from './autoresponder.js';
 import { AccountModeSchema, ChatTypeSchema, ConversationKeySchema, LineTransportKindSchema, WritableConversationKeySchema } from './account.js';
 import { ChromeLtsmInstallResultSchema, ChromeLtsmStatusSchema, ChromeLtsmUnavailableStatusSchema } from './chrome-login.js';
@@ -136,6 +138,8 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeClear'), accountId: IdSchema }),
   /** Turns the automatic download of new External Monitor attachments on or off. */
   RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeSetAutoDownload'), accountId: IdSchema, enabled: z.boolean() }),
+  /** Sets the intervals between two non-live bridge downloads, for each kind. A live new-message download never waits. */
+  RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeSetIntervals'), accountId: IdSchema, intervals: DownloadBridgeIntervalsSchema }),
   /** Allows or blocks every Chrome extension download of the bridge. Off by default. */
   RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeSetDownloadEnabled'), accountId: IdSchema, enabled: z.boolean() }),
   RequestIdSchema.extend({ type: z.literal('lineStart'), accountId: IdSchema }),
@@ -177,6 +181,8 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('unsendMessage'), messageId: z.string().regex(/^(?:0|[1-9][0-9]*)$/) }),
   RequestIdSchema.extend({ type: z.literal('getManualUnsendWindow') }),
   RequestIdSchema.extend({ type: z.literal('setManualUnsendWindow'), window: z.enum(['1h', '7d']) }),
+  RequestIdSchema.extend({ type: z.literal('getLineLegyEncrypted') }),
+  RequestIdSchema.extend({ type: z.literal('setLineLegyEncrypted'), enabled: z.boolean() }),
   RequestIdSchema.extend({ type: z.literal('getAgentPersona') }),
   RequestIdSchema.extend({ type: z.literal('setAgentPersona'), persona: AgentPersonaSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('stopJob'), jobId: IdSchema }),
@@ -209,6 +215,17 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('agentLogin'), provider: AgentProviderSchema }),
   RequestIdSchema.extend({ type: z.literal('agentLogout'), provider: AgentProviderSchema }),
   RequestIdSchema.extend({ type: z.literal('agentRefreshStatus'), provider: AgentProviderSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceAdd'), provider: AgentProviderSchema, label: AccountSourceLabelSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceRename'), id: AccountSourceIdSchema, label: AccountSourceLabelSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceRemove'), id: AccountSourceIdSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceSetDefault'), provider: AgentProviderSchema, id: AccountSourceIdSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceMove'), id: AccountSourceIdSchema, direction: z.enum(['up', 'down']) }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceSetFallback'), id: AccountSourceIdSchema, enabled: z.boolean() }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceSetAutoFailover'), enabled: z.boolean() }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceLogin'), id: AccountSourceIdSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceLogout'), id: AccountSourceIdSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceRefresh'), id: AccountSourceIdSchema }),
+  RequestIdSchema.extend({ type: z.literal('agentSourceUsage'), id: AccountSourceIdSchema, force: z.boolean() }),
   RequestIdSchema.extend({ type: z.literal('mcpGetStatus') }),
   RequestIdSchema.extend({ type: z.literal('mcpLocalClientStatus') }),
   RequestIdSchema.extend({ type: z.literal('mcpLocalClientConnect'), client: McpLocalClientKindSchema }),
@@ -261,6 +278,7 @@ export type ComponentHealth = z.infer<typeof ComponentHealthSchema>;
 export const DownloadBridgeVerificationKindSchema = z.strictObject({
   match: z.number().int().nonnegative(), mismatch: z.number().int().nonnegative(),
   notInStore: z.number().int().nonnegative(), nativeIncomplete: z.number().int().nonnegative(),
+  storeIncomplete: z.number().int().nonnegative(),
   threshold: z.number().int().positive(), open: z.boolean(),
 });
 export const DownloadBridgeStateSchema = z.enum(['not_configured', 'starting', 'waiting_qr', 'waiting_pin', 'logged_in', 'error']);
@@ -295,7 +313,7 @@ export const LineAccountSummarySchema = z.strictObject({
   /** Primary Admin only: state of the download bridge. `code` is the real error code when the state is error. */
   downloadBridge: z.strictObject({ state: DownloadBridgeStateSchema, code: z.string().max(64).optional(),
     detail: z.string().max(200).regex(/^[A-Za-z0-9_.:/|=,-]*$/).optional(), autoDownload: z.boolean().optional(),
-    downloadEnabled: z.boolean().optional(), qrExpiresAt: z.number().int().positive().optional(),
+    downloadEnabled: z.boolean().optional(), intervals: DownloadBridgeIntervalsSchema.optional(), qrExpiresAt: z.number().int().positive().optional(),
     identity: z.enum(['pending', 'verified']).optional(),
     verification: z.strictObject({ image: DownloadBridgeVerificationKindSchema, file: DownloadBridgeVerificationKindSchema }).optional() }).optional(),
   externalImportProgress: z.strictObject({
@@ -388,6 +406,10 @@ export const AppSnapshotSchema = z.strictObject({
   conversations: z.array(ConversationSummarySchema),
   jobs: z.array(AgentJobSummarySchema),
   providers: z.array(ProviderStatusSchema),
+  /** The CLI account sources of each provider, in rotation order. Absent when the source service is not available. */
+  agentAccountSources: z.array(AgentAccountSourceSchema).optional(),
+  /** Automatic source failover switch (default on). Absent when the source service is not available. */
+  agentAutoFailoverEnabled: z.boolean().optional(),
 });
 export type AppSnapshot = z.infer<typeof AppSnapshotSchema>;
 
@@ -492,9 +514,16 @@ export const IpcResultSchema = z.union([
     }) }),
     z.strictObject({ type: z.literal('getManualUnsendWindow'), requestId: IdSchema, ok: z.literal(true), window: z.enum(['1h', '7d']) }),
     z.strictObject({ type: z.literal('setManualUnsendWindow'), requestId: IdSchema, ok: z.literal(true), window: z.enum(['1h', '7d']) }),
+    z.strictObject({ type: z.literal('getLineLegyEncrypted'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
+    z.strictObject({ type: z.literal('setLineLegyEncrypted'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
     z.strictObject({ type: z.literal('getAgentPersona'), requestId: IdSchema, ok: z.literal(true), persona: AgentPersonaSchema }),
     z.strictObject({ type: z.literal('setAgentPersona'), requestId: IdSchema, ok: z.literal(true), persona: AgentPersonaSchema }),
     z.strictObject({ type: z.literal('setAutoResponderSettings'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().positive() }),
+    ...(['agentSourceAdd', 'agentSourceRename', 'agentSourceRemove', 'agentSourceSetDefault', 'agentSourceMove', 'agentSourceSetFallback',
+      'agentSourceLogin', 'agentSourceLogout', 'agentSourceRefresh'] as const).map((type) =>
+      z.strictObject({ type: z.literal(type), requestId: IdSchema, ok: z.literal(true), sources: z.array(AgentAccountSourceSchema) })),
+    z.strictObject({ type: z.literal('agentSourceUsage'), requestId: IdSchema, ok: z.literal(true), sources: z.array(AgentAccountSourceSchema), usage: AgentAccountSourceUsageSchema }),
+    z.strictObject({ type: z.literal('agentSourceSetAutoFailover'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
     z.strictObject({ type: z.literal('accepted'), requestId: IdSchema, ok: z.literal(true), ownMid: z.string().regex(/^u[0-9a-fA-F]{32}$/).optional() }),
     z.strictObject({ type: z.literal('lineAdminPairing'), requestId: IdSchema, ok: z.literal(true), token: z.string().regex(/^\d{6}$/), expiresAt: TimestampSchema }),
     z.strictObject({ type: z.literal('lineBeginAdminChange'), requestId: IdSchema, ok: z.literal(true), token: z.string().regex(/^\d{6}$/), expiresAt: TimestampSchema,

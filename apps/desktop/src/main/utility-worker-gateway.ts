@@ -88,6 +88,8 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
   durableCursor?(accountId: string, signal: AbortSignal): Promise<TalkCursorV1Dto | null>;
   /** Absolute path of the ltsm store root (in app userData). The gateway sends it as `chromeLtsmDir` in the init of CHROMEOS workers only. */
   chromeLtsmDir?: string;
+  /** Reads the LEGY encrypted transport setting at each worker start. The gateway sends it in the init of DESKTOPWIN workers only. A failed read means false. */
+  legyEncrypted?: () => Promise<boolean>;
   /** Absolute path of the LINE traffic log directory. The gateway sends it as `trafficLogDir` in the init of every worker. */
   trafficLogDir?: string;
   pollIntervalMs?: number; responseTimeoutMs?: number; restartDelayMs?: number; maxRestarts?: number; stopTimeoutMs?: number;
@@ -837,7 +839,10 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
           }
           scheduleRestart(lifecycle, state!);
         });
+        const legyEncrypted = resolveLineTransport(effective.lineTransport) === 'DESKTOPWIN' && options.legyEncrypted
+          ? await options.legyEncrypted().catch(() => false) : false;
         child.postMessage({ type: 'init', ...effective, protocolVersion: WORKER_PROTOCOL_VERSION, durableCursor: cursor,
+          ...(resolveLineTransport(effective.lineTransport) === 'DESKTOPWIN' && options.legyEncrypted ? { legyEncrypted } : {}),
           ...(resolveLineTransport(effective.lineTransport) === 'CHROMEOS' && options.chromeLtsmDir ? { chromeLtsmDir: options.chromeLtsmDir } : {}),
           ...(options.trafficLogDir ? { trafficLogDir: options.trafficLogDir } : {}) });
         await runBounded(lifecycle, owner, 'binding', controller, (signal) => bindingListener?.(effective, signal));

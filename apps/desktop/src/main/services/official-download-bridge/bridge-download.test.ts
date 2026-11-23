@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { BridgeDownloadError, OfficialDownloadBridgeDownloader } from './bridge-download.js';
 import { attachmentRawFields } from '../../../../../../packages/database/src/message-repository.js';
+import { classifyBridgeComparison } from './bridge-verification.js';
 import { buildMessageFromNativeRow, nativeRowFromEnvelope, type NativeRowInput } from './native-message.js';
 
 // Synthetic values only.
@@ -116,6 +117,20 @@ async function runWith(outcomes: EbOutcome[], source: 'native' | 'store', native
   return { result, calls, attemptsSeen };
 }
 
+describe('classifyBridgeComparison', () => {
+  const same = { SID: 'same', OID: 'same', OBS_POP: 'same', DOWNLOAD_URL: 'same', e2eeVersion: 'same', ENC_KM: 'same',
+    FILE_NAME: 'same', FILE_SIZE: 'same', MEDIA_CONTENT_INFO: 'same', id: true, contentType: true, path: true, headPath: true };
+  it('gives store_incomplete for a placeholder store message and mismatch when a strict item differs', () => {
+    const placeholder = classifyBridgeComparison({ ...same, contentType: false, path: false, headPath: false,
+      ENC_KM: 'missing_chrome', e2eeVersion: 'missing_chrome', SID: 'missing_chrome' });
+    expect(placeholder?.result).toBe('store_incomplete');
+    expect(placeholder?.detail.startsWith('store_incomplete.false:contentType:path:headPath.missing_chrome:')).toBe(true);
+    expect(classifyBridgeComparison({ ...same, ENC_KM: 'diff', SID: 'missing_chrome' })?.result).toBe('mismatch');
+    expect(classifyBridgeComparison({ ...same, id: false, SID: 'missing_chrome' })?.result).toBe('mismatch');
+    expect(classifyBridgeComparison(same)?.result).toBe('match');
+  });
+});
+
 describe('bridge download', () => {
   it('calls eB one time with the built message and does not touch the store', async () => {
     const { result, calls, attemptsSeen } = await runWith([{ ok: true }], 'native', row());
@@ -168,5 +183,61 @@ describe('bridge download', () => {
     const error = await downloader.run({ ...request, chatType: 'community', source: 'native', nativeRow: row() }, async () => 'unused').catch((e: unknown) => e);
     expect((error as BridgeDownloadError).code).toBe('BRIDGE_CHAT_TYPE_UNSUPPORTED');
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('bridge download gap', () => {
+  function gapped(options: { gap?: (kind: string) => number } = {}) {
+    const { live } = fakeLive([{ ok: true }, { ok: true }, { ok: true }, { ok: true }]);
+    const sleeps: number[] = [];
+    const gapKinds: string[] = [];
+    let clock = 1_000_000;
+    const downloader = new OfficialDownloadBridgeDownloader({
+      getLive: () => live as never, now: () => clock,
+      sleep: async (ms) => { sleeps.push(ms); clock += ms; },
+      downloadGapMs: (kind) => { gapKinds.push(kind); return options.gap?.(kind) ?? 5_000; },
+    });
+    const run = (extra: { live?: boolean; kind?: 'image' | 'file' } = {}) =>
+      downloader.run({ ...request, source: 'native', nativeRow: row(), ...extra }, async () => 'done').catch((error: unknown) => error);
+    return { run, sleeps, gapKinds };
+  }
+
+  it('waits for the gap of the kind of the earlier download before a download that is not live', async () => {
+    const { run, sleeps, gapKinds } = gapped({ gap: (kind) => (kind === 'image' ? 1_000 : 4_000) });
+    // A photo of 3 bytes fails the format check after the download. The gap still starts for the kind photo.
+    await run({ kind: 'image' });
+    await run({ kind: 'file' });
+    await run({ kind: 'file' });
+    expect(gapKinds).toEqual(['image', 'file', 'file']);
+    expect(sleeps).toEqual([1_000, 4_000]);
+  });
+
+  it('starts a live download without waiting, and the live download sets the gap for the next download that is not live', async () => {
+    const { run, sleeps } = gapped();
+    expect(await run()).toBe('done');
+    expect(await run({ live: true })).toBe('done');
+    expect(sleeps).toEqual([]);
+    expect(await run()).toBe('done');
+    expect(sleeps).toEqual([5_000]);
+  });
+
+  it('does not hold the lock for a gap: a live request starts while a request that is not live waits', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const order: string[] = [];
+    const { live } = fakeLive([{ ok: true }, { ok: true }, { ok: true }]);
+    let clock = 0;
+    const downloader = new OfficialDownloadBridgeDownloader({
+      getLive: () => live as never, now: () => clock,
+      sleep: async (ms) => { order.push(`sleep:${ms}`); await held; clock += ms; },
+      downloadGapMs: () => 5_000,
+    });
+    await downloader.run({ ...request, source: 'native', nativeRow: row() }, async () => 'first');
+    const slow = downloader.run({ ...request, source: 'native', nativeRow: row() }, async () => { order.push('slow'); return 'slow'; });
+    const fast = downloader.run({ ...request, source: 'native', nativeRow: row(), live: true }, async () => { order.push('live'); return 'live'; });
+    expect(await fast).toBe('live');
+    expect(order).toEqual(['sleep:5000', 'live']);
+    release();
+    expect(await slow).toBe('slow');
   });
 });

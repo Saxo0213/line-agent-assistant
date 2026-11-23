@@ -1,4 +1,4 @@
-import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
+import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
 import { lockAndCheckAgentAuthorization, lockAndCheckRoomAgentGrant } from './agent-authorization.js';
 import { findSharedAdminChat, type SharedAdminChat } from './agent-repository.js';
@@ -525,7 +525,9 @@ export class McpTokenRepository {
       }
 
       // The tool's permission is re-resolved on every call and is the authority; tools/list is only a hint.
-      if (!MCP_TOOL_PERMISSIONS[input.toolName as McpToolName].some((permission) => permissions[permission] === 'ALLOW')) {
+      // read_message_attachment reads a message attachment, so it needs the same permission as query_target_messages.
+      const permissionTool = (input.toolName === READ_MESSAGE_ATTACHMENT_TOOL_NAME ? 'query_target_messages' : input.toolName) as McpToolName;
+      if (!MCP_TOOL_PERMISSIONS[permissionTool].some((permission) => permissions[permission] === 'ALLOW')) {
         await this.insertAudit(client, {
           tokenId: null,
           principalId,

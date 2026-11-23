@@ -3,14 +3,21 @@ import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, isAgentScheduleQueueKey, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, AgentProviderSchema, type AgentAttachmentUpload, type AgentEvent, type AgentProvider, type AgentRunRequest, type WritableConversationKey } from '@line-agent/contracts';
 import { AgentAttachmentError, DEFAULT_ATTACHMENT_PROMPT, attachmentPromptSection, removeJobAttachments, resolveStoredAttachments, storeAttachments, validateUploads, type ResolvedAttachment } from './agent-attachments.js';
 import { projectFolderPromptSection } from './project-folder-prompt.js';
-import type { AgentRepository, AgentJobStatusProjection, AgentQueueKey, SessionKey } from '@line-agent/database';
+import { routeKeyFor, type AgentRepository, type AgentJob, type AgentJobStatusProjection, type ClaimedAgentJob, type AgentQueueKey, type PendingFailureInput, type PendingTurn, type RouteDecision, type SessionKey } from '@line-agent/database';
 import type { WorkspaceAuthority } from './workspace-authority.js';
 import { splitDeliveryText } from './delivery-service.js';
 import { personaPromptSection } from './agent-persona.js';
 import type { ReplyContextResolver } from './agent-reply-context.js';
-import { formatIdentityBlock, withAgentRoomHistoryHint, withIdentityBlock, withMcpSkill, withOutputChannel } from './mcp-skill.js';
+import type { ResidentReaped, ResidentTurnOptions } from '@line-agent/agent-bridge';
+import { decideSelfHeal, emptyReplyFailure, isBlankCompletion, markAfterSelfHeal, needsLineSendCheck, type FailedAgentEvent, type SelfHealContext } from './agent-self-heal.js';
+import { formatIdentityBlock, withAgentRoomHistoryHint, withIdentityBlock, withMcpSkill, withOutputChannel, type JobIdentityView } from './mcp-skill.js';
+import { buildTranscript, withTranscriptPreamble } from './agent-transcript.js';
+import { buildResidentPrompt, parseResidentKey, residentIdentity, residentKey, type ResidentIdentity } from './agent-resident.js';
 import { isScheduledRunRequestId } from './agent-schedule-service.js';
 import type { AgentJobEnvironment, AgentJobPlan } from './agent-job-environment.js';
+import { AgentFailoverTurns, ALL_SOURCES_EXHAUSTED_TEXT, NO_AVAILABLE_SOURCE_TEXT, type FailoverTurnContext, type FailoverTurnStore } from './agent-failover-turns.js';
+/** Plan texts T6 and T7 (CliTalkAgent ChatAvailabilityCode user messages); defined in agent-failover-turns.ts. */
+export { ALL_SOURCES_EXHAUSTED_TEXT, NO_AVAILABLE_SOURCE_TEXT };
 const SCHEDULE_CONTEXT_UNAVAILABLE = '（排程資料讀取失敗：請依上列卡片盡力完成，並在回覆說明缺少什麼。）';
 
 /** Main-owned source of per-job LINEJS MCP capabilities for built-in Agents. */
@@ -21,8 +28,20 @@ export interface InternalMcpLauncher {
     /** Set only for interactive-approval (operator) jobs; enables the internal permission prompt tool. */
     approval: { sessionKey: string; workspaceRoot: string } | null;
   }): { endpoint: string; token: string } | null;
-  /** Synchronously closes admission and aborts in-flight requests for the job. */
+  /** Synchronously closes admission and aborts in-flight requests for the job. A resident token stays. */
   release(jobId: string): void;
+  /**
+   * Binds a job to the token of a resident process. fresh: new token. Not fresh: the old token stays ("rebound").
+   * Null when the listener is unavailable, or a not-fresh bind has no slot for the current listener instance.
+   */
+  bindResident?(input: {
+    residentKey: string; fresh: boolean; jobId: string; accountId: string | null; generation: number;
+    approval: { sessionKey: string; workspaceRoot: string } | null;
+  }): { endpoint: string; token: string } | { endpoint: string; rebound: true } | null;
+  /** Deletes the token of a resident process and aborts its current capability. */
+  releaseResident?(residentKey: string): void;
+  /** The URL of the running internal MCP listener, or null when it is not running. */
+  endpoint?(): string | null;
   /** App-owned Skill guidance text, or null when unavailable. */
   skill(): Promise<string | null>;
   /** Hidden run-time instructions of a schedule-sourced job (request id `schedule:...`), or null when unavailable. */
@@ -42,12 +61,90 @@ export const MCP_STATUS_MESSAGES = {
 } as const;
 export const MCP_OBSERVATION_TIMEOUT_MS = 10_000;
 
+/** The CLI account source that a run uses (the `account` field of the run request). */
+export type AgentAccountRef = NonNullable<AgentRunRequest['account']>;
+
+/** Reads of the CLI account sources (AccountSourceRepository satisfies it). */
+export interface AgentAccountSources {
+  get(sourceId: string): Promise<{ sourceId: string; kind: 'system' | 'managed' } | null>;
+  effectiveDefault(provider: AgentProvider): Promise<{ sourceId: string; kind: 'system' | 'managed' }>;
+}
+
+/** The router and the pending-turn store of the automatic failover (P5, plan D21 to D26). */
+export interface AgentFailover {
+  routing: {
+    enabled(): Promise<boolean>;
+    routeFor(input: { job: AgentJob; sessionKey?: SessionKey; sessionGeneration: number; excluded: readonly string[] }): Promise<RouteDecision>;
+  };
+  pendingTurns: {
+    findByJob(jobId: string): Promise<PendingTurn | null>;
+    recordFailure(input: PendingFailureInput): Promise<PendingTurn | null>;
+    markExhausted(pendingId: string): Promise<boolean>;
+  };
+  /** Sends a notice text to the LINE chat of the job (provider switch, no source). A failure never fails the job. */
+  sendNotice?: (job: ClaimedAgentJob, text: string) => Promise<void>;
+  /**
+   * What happens after a turn fails on quota, logout or a transient rate limit (P5 B3b). Without it the turns end as before.
+   * `store` is the PendingTurnRepository; `currentBinding` gives the worker binding that a continuation of a LINE job must match.
+   */
+  turns?: { store: FailoverTurnStore; currentBinding?: (job: AgentJob) => Promise<{ workerInstanceId: string; controlEpoch: number } | null> };
+}
+
 export interface AgentRunner {
-  run(request: AgentRunRequest): AsyncIterable<AgentEvent>;
-  queryQuota?(provider: AgentProvider): Promise<unknown>;
+  /** `options.timeoutMs` is a per-run time limit that only a Codex one-shot run uses (a partial reply is kept at the limit). */
+  run(request: AgentRunRequest, options?: { timeoutMs?: number }): AsyncIterable<AgentEvent>;
+  queryQuota?(provider: AgentProvider, account?: AgentAccountRef): Promise<unknown>;
   /** Resolves only after the owned process tree has exited. */
   cancel(jobId: string): Promise<void>;
+  /** Called with +1 before and -1 after every MCP tool call of the job. */
+  noteToolActivity?(jobId: string, delta: 1 | -1): void;
+  /** One turn on a resident Claude process (one process per session key). */
+  runResident?(request: AgentRunRequest, turn: ResidentTurnOptions): AsyncIterable<AgentEvent>;
+  hasResident?(key: string): boolean;
+  /** Kills and removes each resident that the predicate accepts. */
+  resetResidents?(predicate: (key: string) => boolean): number;
+  /** Marks each accepted resident stale: an idle one closes now, a busy one at the end of its turn. */
+  markResidentsStale?(predicate: (key: string) => boolean): number;
+  /** Subscribes to the close of a resident process (reap, reset, exit). Returns the unsubscribe function. */
+  onResidentClosed?(listener: (event: { key: string }) => void): (() => void) | void;
+  /** Subscribes to a resident spawn at the limit when no resident can be reaped. Returns the unsubscribe function. */
+  onResidentCapacityExceeded?(listener: (event: { key: string; live: number; max: number }) => void): (() => void) | void;
+  /** Subscribes to the idle reap of a resident process (Auto-Slim input). Returns the unsubscribe function. */
+  onResidentReaped?(listener: (event: ResidentReaped) => void): (() => void) | void;
+  /** Subscribes to the result of a resident turn that no job started. The texts are ready to deliver. */
+  onAutonomousReply?(listener: (event: { key: string; texts: string[] }) => void): (() => void) | void;
+  /** Sets the check that tells if a resident key has a chat to deliver an autonomous reply to. */
+  setRelayTarget?(hasTarget: (key: string) => boolean): void;
 }
+
+/** Options of the resident Claude path. */
+export interface AgentServiceResidentOptions {
+  /** Timeout of one resident turn. Default 900 000 ms. */
+  residentTurnTimeoutMs?: number;
+  /** Stall time of one resident turn (no CLI output). 0 = off. Default 120 000 ms. */
+  residentStallMs?: number;
+  /**
+   * The number of committed LINE sends of a job (decision D1: no self-heal after a LINE side effect).
+   * Without it, or when it throws, a failed first attempt is final.
+   */
+  committedLineSends?: (jobId: string) => Promise<number>;
+  /**
+   * The Claude model alias that the chat of a job chose with /model; null follows the bridge default (opus).
+   * A change of the model changes the arguments hash, so the bridge replaces the process with --resume.
+   */
+  resolveClaudeModel?: (job: ClaimedAgentJob) => Promise<'haiku' | 'sonnet' | 'opus' | null>;
+  /** The Codex model ID that the chat of a job chose with /model; null follows the Codex default. A resolver error means no model. */
+  resolveCodexModel?: (job: ClaimedAgentJob) => Promise<string | null>;
+  /**
+   * The CLI account sources (P4). A chat session binds the default source on its first run and keeps it (CliTalkAgent chat.rs 3128-3166);
+   * a schedule run uses the effective default. Without it every job runs on the system source of its provider.
+   */
+  accountSources?: AgentAccountSources;
+  /** The automatic failover. Without it, or with the switch off, a job keeps the P4 source binding and no route is chosen. */
+  failover?: AgentFailover;
+}
+export const RESIDENT_TURN_TIMEOUT_MS = 900_000;
+export const RESIDENT_STALL_MS = 120_000;
 
 /** A prompt from the shared Agent room; it has no LINE account or chat. */
 export interface UiSubmission {
@@ -88,6 +185,8 @@ interface ActiveExecution {
   terminal: boolean;
   mcpPhase?: 'configured' | 'available' | 'not_loaded';
   mcpObserveAt?: number;
+  /** The prepared run directory and file-read grant. Set after the workspace plan is ready. */
+  fileAccess?: { workspacePath: string; fileRead: boolean };
 }
 
 /** Interval between running-reaction rotations. The single scheduler timer also serves deadlines and MCP observation. */
@@ -120,8 +219,12 @@ export class AgentService {
   private readonly stoppingJobs = new Map<string, number>();
   private readonly shutdownAbortController = new AbortController();
   private shuttingDown = false;
+  /** Per resident key: the last completed LINE job that ran on it. An autonomous reply goes to the chat of this job. A room job never sets it. */
+  private readonly relayAnchors = new Map<string, string>();
   private readonly retrying = new Set<string>();
   /** Per-account lane for reactions of jobs that have no active execution; entries exist only while non-empty. */
+  /** The turn lifecycle after a quota, logout or rate-limit failure; set only when the failover has a turn store. */
+  private readonly failoverTurns: AgentFailoverTurns | undefined;
   private readonly detachedReactions = new Map<string, { active: boolean;
     queue: Array<{ jobId: string; key: WritableConversationKey; messageId: string; reaction: AgentReaction; phase: AgentReactionPhase }> }>();
   constructor(
@@ -147,13 +250,86 @@ export class AgentService {
     private readonly onDiagnostic?: (diagnostic: SafeDiagnostic, jobId?: string) => void,
     /** The persona description in force for a LINE chat (docs/architecture/agent-persona.md); blank adds nothing to the prompt. */
     private readonly resolvePersonaDescription?: (chat: { accountId: string; chatType: string; chatId: string }) => Promise<string>,
-    private readonly quotaGate?: (provider: AgentProvider) => Promise<{ blocked: boolean; recoveryAt: string | null } | null>,
     /** The quoted message of a LINE reply and its ready files (run request only); null when the trigger message is no reply. */
     private readonly resolveReplyContext?: ReplyContextResolver,
-  ) {}
+    private readonly residentOptions: AgentServiceResidentOptions = {},
+  ) {
+    const failover = residentOptions.failover;
+    if (failover?.turns) {
+      this.failoverTurns = new AgentFailoverTurns({
+        enabled: () => failover.routing.enabled(),
+        routeFor: (input) => failover.routing.routeFor(input),
+        store: failover.turns.store,
+        enqueueContinuation: (input) => this.agents.enqueueContinuation(input),
+        getJob: (jobId) => this.agents.getJob(jobId),
+        ...(failover.turns.currentBinding ? { currentBinding: failover.turns.currentBinding } : {}),
+        notify: (job, text) => this.sendFailoverNotice(job, text),
+        publish: (projection) => this.publishLifecycle(projection),
+        kick: (queueKey) => this.kick(queueKey),
+        isShuttingDown: () => this.shuttingDown,
+        ...(residentOptions.committedLineSends ? { committedLineSends: residentOptions.committedLineSends } : {}),
+        report: (error, jobId) => this.reportFailure('execute', error, jobId),
+      });
+    }
+  }
+
+  /** CTA resume_recoverable_pending_turns: replays the exhausted pending turns (limit 8). Returns the number of continuations that started. */
+  async recoverFailoverTurns(limit = 8): Promise<number> { return this.failoverTurns ? this.failoverTurns.recoverExhausted(limit) : 0; }
+
+  /** Sends a failover notice to the LINE chat of a job in the background. A failure is a diagnostic; it never changes the job. */
+  private sendFailoverNotice(job: ClaimedAgentJob, text: string): void {
+    const send = this.residentOptions.failover?.sendNotice;
+    if (!send) return;
+    void Promise.resolve().then(() => send(job, text)).catch((error: unknown) => this.reportFailure('publish', error, job.jobId));
+  }
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown, jobId?: string): void {
     try { this.onDiagnostic?.(diagnosticFailure('agent', stage, error), jobId); } catch { /* Observation cannot change durable job state. */ }
+  }
+
+  /** True when a resident key has a completed LINE job to deliver an autonomous reply to. */
+  hasRelayTarget(key: string): boolean { return this.relayAnchors.has(key); }
+
+  /** Forget the relay target of a resident key (the process is gone). */
+  forgetRelayTarget(key: string): void { this.relayAnchors.delete(key); }
+
+  /**
+   * Deliver the autonomous reply texts of a resident key to the chat of its last completed LINE job.
+   * Each text is split like a job output and added to that job as new delivery rows, then the job delivery path runs.
+   * A failure is a diagnostic. It never throws.
+   */
+  async relayAutonomousReply(event: { key: string; texts: readonly string[] }): Promise<void> {
+    const anchor = this.relayAnchors.get(event.key);
+    if (!anchor || this.shuttingDown) return;
+    for (const text of event.texts) {
+      if (this.shuttingDown) return;
+      try {
+        const added = await this.agents.appendRelayDelivery(anchor, splitDeliveryText(text), randomUUID());
+        if (added) await this.onCompleted?.(anchor);
+      } catch (error) { this.reportFailure('persist', error, anchor); }
+    }
+  }
+
+  /** One diagnostic for a self-heal. The detail is a bounded slug: the failure code of the first attempt. */
+  private reportSelfHeal(code: string, jobId: string): void {
+    try { this.onDiagnostic?.({ ...diagnosticFailure('agent', 'execute'), detail: `self_heal:${code.replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 80)}` }, jobId); } catch { /* Observation cannot change durable job state. */ }
+  }
+
+  /** One diagnostic for a recovery of a Codex one-shot job (audit outcome 'recovered'). The detail is a fixed slug. */
+  private reportRecovered(detail: string, jobId: string): void {
+    try { this.onDiagnostic?.({ ...diagnosticFailure('agent', 'execute', undefined, 'recovered'), detail }, jobId); } catch { /* Observation cannot change durable job state. */ }
+  }
+
+  /** Decision D1 plus the code rules for the failure of attempt 1. The send check runs only when every code rule allows a heal. */
+  private async shouldSelfHeal(jobId: string, failure: FailedAgentEvent, deadlineExceeded: boolean): Promise<boolean> {
+    let committedLineSends: SelfHealContext['committedLineSends'];
+    if (deadlineExceeded || !needsLineSendCheck(failure)) committedLineSends = undefined;
+    else if (!this.residentOptions.committedLineSends) committedLineSends = undefined;
+    else {
+      try { committedLineSends = await this.residentOptions.committedLineSends(jobId); }
+      catch (error) { committedLineSends = 'error'; this.reportFailure('execute', error, jobId); }
+    }
+    return decideSelfHeal(failure, { deadlineExceeded, committedLineSends }).heal;
   }
 
   private releaseMcp(jobId: string): void {
@@ -173,6 +349,43 @@ export class AgentService {
     const execution = this.executions.get(jobId);
     if (observation !== 'available' || !execution || execution.terminal || execution.terminalPending) return;
     if (execution.mcpPhase === 'configured' || execution.mcpPhase === 'not_loaded') this.emitMcpStatus(execution, 'available');
+  }
+
+  /** Called by Main around every MCP tool call of the job; the bridge may use it to hold its idle timer. */
+  noteToolActivity(jobId: string, delta: 1 | -1): void {
+    this.bridge.noteToolActivity?.(jobId, delta);
+  }
+
+  /** Called when the execution policy or the extension (external MCP server) settings changed: every resident process is replaced at its next turn. */
+  noteAgentPolicyChanged(): void {
+    try { this.bridge.markResidentsStale?.(() => true); } catch { /* A resident that stays is replaced by the arguments hash check. */ }
+  }
+
+  /** Resets the resident processes of a chat; the Agent room and the admin-direct chat are one pair while the room shares that chat. */
+  private async resetResidentsOfChat(key: AgentQueueKey): Promise<void> {
+    if (!this.bridge.resetResidents || isAgentScheduleQueueKey(key)) return;
+    try {
+      const identities: ResidentIdentity[] = [residentIdentity(key)];
+      const isRoom = key.accountId === null;
+      if (isRoom) {
+        const admin = (await this.agents.describeJobIdentity({ sourceType: 'ui', accountId: null, chatType: null, chatId: null }).catch(() => null))?.admin;
+        if (admin) identities.push(residentIdentity({ accountId: admin.accountId, chatType: 'direct', chatId: admin.chatId }));
+      } else if (await this.agents.sharesAgentRoomHistory({ sourceType: 'line', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }).catch(() => false)) {
+        identities.push(['ui']);
+      }
+      const wanted = new Set(identities.map((identity) => JSON.stringify(identity)));
+      this.bridge.resetResidents((residentKeyText) => {
+        const parsed = parseResidentKey(residentKeyText);
+        return parsed !== null && wanted.has(JSON.stringify(parsed.identity));
+      });
+    } catch (error) { this.reportFailure('execute', error); }
+  }
+
+  /** The run directory and file-read grant of a job that is running now. Null when the job has no active execution or it is ending. */
+  runFileAccess(jobId: string): { workspacePath: string; fileRead: boolean } | null {
+    const execution = this.executions.get(jobId);
+    if (!execution || execution.terminal || execution.terminalPending || !execution.fileAccess) return null;
+    return { ...execution.fileAccess };
   }
 
   private publishLifecycle(projection: AgentJobStatusProjection): void {
@@ -290,6 +503,7 @@ export class AgentService {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    this.failoverTurns?.dispose();
     this.stopScheduler();
     this.shutdownAbortController.abort();
     const active = [...this.activeJobs.values()];
@@ -367,6 +581,7 @@ export class AgentService {
       const physicalCancellation = active ? this.bridge.cancel(active) : undefined;
       for (const projection of cancelled) { this.publishLifecycle(projection); this.reactCancelledQueued(projection); }
       if (physicalCancellation) await physicalCancellation;
+      await this.resetResidentsOfChat(key);
       await this.pumps.get(id);
       return cancelled.length > 0 || active !== undefined;
     } finally { this.releaseStarts(id, key); }
@@ -414,19 +629,9 @@ export class AgentService {
     return this.agents.listJobEvents(key, jobId);
   }
 
-  queryQuota(provider: AgentProvider): Promise<unknown> {
+  queryQuota(provider: AgentProvider, account?: AgentAccountRef): Promise<unknown> {
     if (!this.bridge.queryQuota) return Promise.reject(new Error('Provider quota query is unavailable'));
-    return this.bridge.queryQuota(provider);
-  }
-
-  async acceptQuotaRetry(input: { jobId: string; senderId: string; messageId: string; targetProvider: AgentProvider;
-    workerInstanceId: string; controlEpoch: number }): Promise<boolean> {
-    if (this.shuttingDown) return false;
-    const projection = await this.agents.acceptQuotaRetry(input);
-    if (!projection) return false;
-    this.publishLifecycle(projection);
-    if (!this.shuttingDown) this.kick(projection);
-    return true;
+    return this.bridge.queryQuota(provider, account);
   }
 
   /** Events of a scheduled run (never room events: the room's own lookup excludes schedule jobs). */
@@ -477,6 +682,7 @@ export class AgentService {
       for (const projection of committed) { this.publishLifecycle(projection); this.reactCancelledQueued(projection); }
       if (physicalCancellation) await physicalCancellation;
       await Promise.all(otherCancellations);
+      await this.resetResidentsOfChat(key);
       await this.pumps.get(id);
       for (const ownerId of otherIds) await this.pumps.get(ownerId);
     } finally { this.releaseStarts(id, key); }
@@ -563,6 +769,11 @@ export class AgentService {
         deadlineAt: 0, nextHeartbeatAt: 0, deadlineExceeded: false,
         heartbeatPhase: 0, reactionInFlight: false, terminalPending: false, terminal: false };
       let timeoutPersisted = false;
+      // Set after the routing; the turn lifecycle of a failed, completed or cancelled turn reads it (P5 B3b).
+      let turnContext: FailoverTurnContext | undefined;
+      // Jobs folded into this job at the claim (CliTalkAgent R2 drain). They share this run and settle with it.
+      const foldedJobs = job.foldedJobs ?? [];
+      let foldWorkspace: string | null = null;
       // Set when quoted files were copied into the job directory; the directory is removed when the job ends.
       let replyFilesWorkspace: string | null = null;
       const source: AgentRunRequest['source'] = job.sourceType === 'line'
@@ -597,6 +808,8 @@ export class AgentService {
             continue;
           }
         }
+        // CliTalkAgent discord.rs parts.join("\n"): the lead prompt and each folded prompt form ONE message of ONE turn.
+        if (foldedJobs.length > 0) effectivePrompt = [effectivePrompt, ...foldedJobs.map((folded) => folded.prompt)].join('\n');
         // Workspace and provider tools are decided here from the job row and handed to the runner as data.
         let prepared: AgentJobPlan;
         try { prepared = await this.environment.prepare(job.jobId, job.workspacePath); }
@@ -614,26 +827,98 @@ export class AgentService {
           continue;
         }
         const plan = prepared;
-        if(this.quotaGate) {
-          let gate:{blocked:boolean;recoveryAt:string|null}|null;
-          try { gate=await this.quotaGate(job.provider); }
-          catch(error) {
-            this.reportFailure('persist',error,job.jobId);
-            const event:AgentEvent={type:'failed',code:'QUOTA_STATE_UNAVAILABLE',message:'Provider quota state could not be checked; retry later.',retryable:true};
-            await this.agents.appendEvent(job.jobId,event).catch((persistError:unknown)=>this.reportFailure('persist',persistError,job.jobId));
-            const projection=await this.agents.failJob(job.jobId);
-            if(projection){execution.terminal=true;this.publishLifecycle(projection);this.sendReaction(execution,'SAD','failed');await this.onEvent?.(job.jobId,event);}
-            continue;
-          }
-          if(gate?.blocked) {
-            const event:AgentEvent={type:'failed',code:'PROVIDER_LIMIT',message:'Provider usage is still exhausted.',retryable:true,
-              ...(gate.recoveryAt?{quotaRecoveryAt:gate.recoveryAt}:{})};
-            await this.agents.appendEvent(job.jobId,event).catch((error:unknown)=>this.reportFailure('persist',error,job.jobId));
-            const projection=await this.agents.failJob(job.jobId);
-            if(projection){execution.terminal=true;this.publishLifecycle(projection);this.sendReaction(execution,'SAD','failed');await this.onEvent?.(job.jobId,event);}
+        foldWorkspace = plan.workspacePath;
+        // A room job reads and writes the session the claim fixed for it (the admin-direct session while shared, else its own);
+        // every other job uses its chat's session. A scheduled run has NO session (see below).
+        const scheduledRun = job.sourceType === 'schedule';
+        const initialSessionKey = scheduledRun ? undefined : job.sessionKey ?? { ...key, provider: job.provider, sourceType: job.sourceType } as SessionKey;
+        const initialGeneration = job.sessionGeneration ?? job.generation;
+        // The CLI account source of the run (P4, decision D13; P5 routing, plan D21). A failed lookup or binding fails the job: it never runs on another account.
+        // With the failover switch on, the router picks the provider and source at the start of the turn and applyRoute applies the pick.
+        let account: AgentAccountRef = { id: job.provider, kind: 'system' };
+        let routedSessionKey = initialSessionKey;
+        let routedGeneration = initialGeneration;
+        /** Set when applyRoute started a new generation: the provider and generation that ran before. */
+        let switchedFrom: { provider: AgentProvider; generation: number } | undefined;
+        let routingFailure: { code: 'ALL_SOURCES_EXHAUSTED' | 'NO_AVAILABLE_SOURCE'; text: string } | undefined;
+        let routingPending: PendingTurn | null = null;
+        const accountSources = this.residentOptions.accountSources;
+        const failover = this.residentOptions.failover;
+        if (accountSources) {
+          try {
+            if (failover && await failover.routing.enabled()) {
+              const pending = scheduledRun ? null : await failover.pendingTurns.findByJob(job.jobId);
+              routingPending = pending && pending.activeJobId === job.jobId ? pending : null;
+              const decision = await failover.routing.routeFor({ job, ...(initialSessionKey ? { sessionKey: initialSessionKey } : {}),
+                sessionGeneration: initialGeneration, excluded: routingPending?.attemptedSourceIds ?? [] });
+              if (decision.kind === 'all_sources_exhausted') routingFailure = { code: 'ALL_SOURCES_EXHAUSTED', text: ALL_SOURCES_EXHAUSTED_TEXT };
+              else if (decision.kind === 'no_available_source') routingFailure = { code: 'NO_AVAILABLE_SOURCE', text: NO_AVAILABLE_SOURCE_TEXT };
+              else {
+                const row = await accountSources.get(decision.sourceId);
+                if (!row) throw new Error('The account source of the job does not exist.');
+                const applied = await this.agents.applyRoute({ jobId: job.jobId, ...(initialSessionKey ? { sessionKey: initialSessionKey } : {}),
+                  sessionGeneration: initialGeneration, provider: decision.provider, sourceId: decision.sourceId });
+                account = { id: row.sourceId, kind: row.kind };
+                // The run goes on with the applied provider, session and generation.
+                job.provider = decision.provider;
+                if (applied.sessionKey) {
+                  routedSessionKey = applied.sessionKey;
+                  routedGeneration = applied.generation;
+                  job.sessionKey = applied.sessionKey;
+                  job.sessionGeneration = applied.generation;
+                  job.generation = applied.generation;
+                }
+                if (applied.switched && applied.previous) {
+                  switchedFrom = applied.previous;
+                  // CliTalkAgent chat.rs 950-970: the notice goes out only when the provider changes.
+                  if (applied.previous.provider !== decision.provider && job.sourceType === 'line') {
+                    this.sendFailoverNotice(job, `已切換至 ${decision.provider === 'codex' ? 'Codex' : 'Claude'}`);
+                  }
+                }
+              }
+            } else {
+              const row = initialSessionKey
+                ? await accountSources.get(await this.agents.bindSessionAccountSource(initialSessionKey, initialGeneration))
+                : await accountSources.effectiveDefault(job.provider);
+              if (!row) throw new Error('The account source of the job does not exist.');
+              account = { id: row.sourceId, kind: row.kind };
+              await this.agents.setJobAccountSource(job.jobId, account.id);
+            }
+          } catch (error) {
+            this.reportFailure('persist', error, job.jobId);
+            const event: AgentEvent = { type: 'failed', code: 'ACCOUNT_SOURCE_UNAVAILABLE', message: 'The CLI account source could not be resolved; retry later.', retryable: true };
+            await this.agents.appendEvent(job.jobId, event).catch((persistError: unknown) => this.reportFailure('persist', persistError, job.jobId));
+            const projection = await this.agents.failJob(job.jobId);
+            if (projection) { execution.terminal = true; this.publishLifecycle(projection); this.sendReaction(execution, 'SAD', 'failed'); await this.onEvent?.(job.jobId, event); }
             continue;
           }
         }
+        turnContext = { job, queueKey: key, sessionKey: routedSessionKey, sessionGeneration: routedGeneration, sourceId: account.id,
+          userText: [job.prompt, ...foldedJobs.map((folded) => folded.prompt)].join('\n') };
+        // CliTalkAgent supersede_matching: a resent text replaces the open pending rows of the chat. A continuation job does not.
+        if (this.failoverTurns && !routingPending) await this.failoverTurns.supersede(turnContext);
+        if (routingFailure && failover) {
+          // CliTalkAgent chat.rs 1370-1390: a turn that finds no route is kept as an exhausted pending turn, so a recovery can run it again.
+          // A scheduled run keeps none (plan D25). A turn that is already pending keeps its row.
+          if (!scheduledRun && initialSessionKey && !routingPending) {
+            try {
+              const userText = [job.prompt, ...foldedJobs.map((folded) => folded.prompt)].join('\n');
+              const recorded = await failover.pendingTurns.recordFailure({ originJobId: job.jobId, lineageKey: routeKeyFor(initialSessionKey), userText,
+                provider: job.provider, sourceId: null, hadToolActivity: false, hadEffectiveOutput: false, error: routingFailure.text });
+              if (recorded) await failover.pendingTurns.markExhausted(recorded.pendingId);
+            } catch (error) { this.reportFailure('persist', error, job.jobId); }
+          }
+          const event: AgentEvent = { type: 'failed', code: routingFailure.code, message: routingFailure.text, retryable: true };
+          await this.agents.appendEvent(job.jobId, event).catch((persistError: unknown) => this.reportFailure('persist', persistError, job.jobId));
+          const projection = await this.agents.failJob(job.jobId);
+          if (projection) { execution.terminal = true; this.publishLifecycle(projection); this.sendReaction(execution, 'SAD', 'failed'); await this.onEvent?.(job.jobId, event); }
+          if (job.sourceType === 'line') this.sendFailoverNotice(job, routingFailure.text);
+          // A continuation that finds no route again goes back to exhausted.
+          if (this.failoverTurns) await this.failoverTurns.afterFailure(turnContext, event);
+          continue;
+        }
+        const sessionKey = routedSessionKey;
+        const sessionGeneration = routedGeneration;
         // Attachments must still exist on every run, including a retry; a missing file fails the job instead of being dropped.
         let attachmentFiles: ResolvedAttachment[] = [];
         if (job.sourceType === 'ui' && job.attachments?.length) {
@@ -658,12 +943,9 @@ export class AgentService {
         // it was queued) starts fresh and binds to the target's current generation.
         // A scheduled run has NO session: no lookup, no resume, no bind. Every run starts a brand-new provider session, and the
         // approval key below is unique to the job so nothing carries over to or from the room or another run.
-        const scheduledRun = job.sourceType === 'schedule';
-        const sessionKey = scheduledRun ? undefined : job.sessionKey ?? { ...key, provider: job.provider, sourceType: job.sourceType } as SessionKey;
-        const sessionGeneration = job.sessionGeneration ?? job.generation;
         const resume = sessionKey ? await this.agents.lookupSession({ ...sessionKey, workspacePath: plan.workspacePath }) : null;
         const request: AgentRunRequest = { jobId: job.jobId, provider: job.provider, source, prompt: effectivePrompt,
-          workspacePath: plan.workspacePath, tools: plan.tools, ...(plan.extensions ? { extensions: plan.extensions } : {}),
+          workspacePath: plan.workspacePath, tools: plan.tools, account, ...(plan.extensions ? { extensions: plan.extensions } : {}),
           ...(sessionGeneration === job.generation && resume?.generation === job.generation ? { resumeSessionId: resume.externalSessionId } : {}) };
 
         const current = await this.agents.getJob(job.jobId);
@@ -671,8 +953,61 @@ export class AgentService {
           if (current?.status === 'running') { const projection = await this.agents.cancelJobForKey(key, job.jobId); if (projection) this.publishLifecycle(projection); }
           continue;
         }
+        // Claude LINE and room jobs run on a resident process; schedule runs and Codex keep the one-shot path.
+        const resident = job.provider === 'claude' && job.sourceType !== 'schedule' && sessionKey !== undefined
+          && typeof this.bridge.runResident === 'function';
         let runRequest = request;
-        if (this.mcpLauncher) {
+        // A Codex one-shot job of a chat or the room (not a schedule): the resident turn timeout, the chat's model, and a retry without resume.
+        const codexOneShot = job.provider === 'codex' && job.sourceType !== 'schedule';
+        const codexTimeoutMs = codexOneShot ? this.residentOptions.residentTurnTimeoutMs ?? RESIDENT_TURN_TIMEOUT_MS : undefined;
+        let residentTurn: ResidentTurnOptions | undefined;
+        const residentParts: { skill: string | null; mcp: boolean; historyEligible: boolean; identity: JobIdentityView | null; visiblePrompt: string } =
+          { skill: null, mcp: false, historyEligible: false, identity: null, visiblePrompt: request.prompt };
+        if (resident && sessionKey) {
+          const mcpEndpoint = this.mcpLauncher?.endpoint?.() ?? null;
+          const launcher = this.mcpLauncher;
+          if (launcher && mcpEndpoint) {
+            try {
+              residentParts.skill = await launcher.skill();
+              residentParts.mcp = true;
+              residentParts.historyEligible = job.sourceType === 'ui'
+                || await (async () => this.agents.sharesAgentRoomHistory({ sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId }))().catch(() => false);
+              residentParts.identity = await (async () => await this.agents.describeJobIdentity({
+                sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, jobId: job.jobId }))().catch(() => null);
+            } catch (error) { this.reportFailure('prepare', error, job.jobId); residentParts.skill = null; }
+          }
+          const scheduleContext = isScheduledRunRequestId(job.sourceRequestId)
+            ? await (async () => await launcher?.scheduleContext?.(job.sourceRequestId!, job.jobId))().catch(() => null) ?? SCHEDULE_CONTEXT_UNAVAILABLE : null;
+          residentParts.visiblePrompt = scheduleContext ? `${request.prompt}
+
+${scheduleContext}` : request.prompt;
+          const turnKey = residentKey(residentIdentity(sessionKey), sessionGeneration, account.id);
+          const bindMcp = (fresh: boolean): { token: string } | 'rebound' | null => {
+            if (!launcher || !mcpEndpoint) return fresh ? null : 'rebound';
+            try {
+              const approval = plan.tools.interactiveApproval
+                ? { sessionKey: approvalSessionKey(sessionKey, sessionGeneration), workspaceRoot: plan.workspacePath } : null;
+              const bound = launcher.bindResident?.({ residentKey: turnKey, fresh, jobId: job.jobId,
+                accountId: job.accountId, generation: job.generation, approval }) ?? null;
+              if (bound === null) return null;
+              return 'rebound' in bound ? 'rebound' : { token: bound.token };
+            } catch (error) { this.reportFailure('prepare', error, job.jobId); return null; }
+          };
+          residentTurn = { key: turnKey, mcpEndpoint, bindMcp,
+            timeoutMs: this.residentOptions.residentTurnTimeoutMs ?? RESIDENT_TURN_TIMEOUT_MS,
+            stallMs: this.residentOptions.residentStallMs ?? RESIDENT_STALL_MS };
+          if (launcher) {
+            const initial: AgentEvent = mcpEndpoint
+              ? { type: 'mcp_status', status: 'configured', message: MCP_STATUS_MESSAGES.configured }
+              : { type: 'mcp_status', status: 'not_loaded', message: MCP_STATUS_MESSAGES.not_loaded };
+            if (mcpEndpoint) {
+              execution.mcpPhase = 'configured';
+              execution.mcpObserveAt = Date.now() + MCP_OBSERVATION_TIMEOUT_MS;
+            }
+            await this.agents.appendEvent(job.jobId, initial).catch((error: unknown) => this.reportFailure('persist', error, job.jobId));
+            await this.onEvent?.(job.jobId, initial);
+          }
+        } else if (this.mcpLauncher) {
           let launch: { endpoint: string; token: string } | null = null;
           try {
             const skill = await this.mcpLauncher.skill();
@@ -711,12 +1046,15 @@ ${scheduleContext}` : request.prompt;
         }
         // The project folders are named in the run request only, after the MCP skill block (a resumed session is told again).
         const projectFolderSection = projectFolderPromptSection(plan.tools.projectDirs, job.provider === 'codex' && plan.tools.ownFolderReadOnly === true);
-        if (projectFolderSection) runRequest = { ...runRequest, prompt: `${runRequest.prompt}${projectFolderSection}` };
+        if (projectFolderSection && !residentTurn) runRequest = { ...runRequest, prompt: `${runRequest.prompt}${projectFolderSection}` };
         // The persona (語氣與風格設定) of a LINE reply: run request only. The Agent room and schedules never get it.
+        let residentPersonaSection = '';
+        let residentReplySection = '';
+        let residentAttachmentSection = '';
         if (job.sourceType === 'line' && job.accountId && job.chatType && job.chatId && this.resolvePersonaDescription) {
           const personaSection = await this.resolvePersonaDescription({ accountId: job.accountId, chatType: job.chatType, chatId: job.chatId })
             .then(personaPromptSection).catch(() => '');
-          if (personaSection) runRequest = { ...runRequest, prompt: `${runRequest.prompt}${personaSection}` };
+          if (personaSection) { residentPersonaSection = personaSection; if (!residentTurn) runRequest = { ...runRequest, prompt: `${runRequest.prompt}${personaSection}` }; }
         }
         // The quoted message of a LINE reply: run request only, before the attachment section. A failure never fails the job.
         if (job.sourceType === 'line' && job.accountId && job.chatType && job.chatId && job.sourceMessageId && this.resolveReplyContext) {
@@ -724,7 +1062,8 @@ ${scheduleContext}` : request.prompt;
             const reply = await this.resolveReplyContext({ jobId: job.jobId, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId,
               messageId: job.sourceMessageId, workspacePath: plan.workspacePath, provider: job.provider });
             if (reply) {
-              runRequest = { ...runRequest, prompt: `${runRequest.prompt}${reply.section}` };
+              residentReplySection = reply.section;
+              if (!residentTurn) runRequest = { ...runRequest, prompt: `${runRequest.prompt}${reply.section}` };
               if (reply.files.length > 0) { attachmentFiles = [...attachmentFiles, ...reply.files]; replyFilesWorkspace = plan.workspacePath; }
             }
           } catch (replyError) { this.reportFailure('prepare', replyError, job.jobId); }
@@ -732,31 +1071,103 @@ ${scheduleContext}` : request.prompt;
         if (attachmentFiles.length > 0) {
           // Added last and to the run request only: the stored job prompt never carries the section or any path.
           const imagePaths = job.provider === 'codex' ? attachmentFiles.filter((item) => item.kind === 'image').map((item) => item.absolutePath) : [];
-          runRequest = { ...runRequest, prompt: `${runRequest.prompt}${attachmentPromptSection(job.provider, attachmentFiles)}`,
+          if (residentTurn) residentAttachmentSection = attachmentPromptSection(job.provider, attachmentFiles);
+          else runRequest = { ...runRequest, prompt: `${runRequest.prompt}${attachmentPromptSection(job.provider, attachmentFiles)}`,
             ...(imagePaths.length > 0 ? { imagePaths } : {}) };
         }
-        execution.deadlineAt = Date.now() + this.maxExecutionMs;
+        if (residentTurn) {
+          const built = buildResidentPrompt({ sourceType: job.sourceType === 'ui' ? 'ui' : 'line', ...residentParts,
+            projectFolderSection, personaSection: residentPersonaSection, replySection: residentReplySection, attachmentSection: residentAttachmentSection });
+          // CliTalkAgent prompt_user_with_session_context: a new process without a session to resume gets the recent turns in front of the message.
+          // It is computed once here, so the second attempt of a self-heal sends the same message.
+          let message = built.message;
+          try {
+            if (switchedFrom) {
+              // A provider or source switch starts a new generation with nothing to resume: the turns of the previous generation come first.
+              message = withTranscriptPreamble(message, buildTranscript(await this.agents.listTranscriptEvents({ jobId: job.jobId, generation: sessionGeneration, from: switchedFrom })));
+            } else if (!request.resumeSessionId && !this.bridge.hasResident?.(residentTurn.key)) {
+              message = withTranscriptPreamble(message, buildTranscript(await this.agents.listTranscriptEvents({ jobId: job.jobId, generation: sessionGeneration })));
+            }
+          } catch (error) { this.reportFailure('prepare', error, job.jobId); message = built.message; }
+          let model: 'haiku' | 'sonnet' | 'opus' | undefined;
+          if (this.residentOptions.resolveClaudeModel) {
+            try { model = await this.residentOptions.resolveClaudeModel(job) ?? undefined; }
+            catch (error) { this.reportFailure('prepare', error, job.jobId); }
+          }
+          residentTurn = { ...residentTurn, ...(built.systemPrompt ? { systemPrompt: built.systemPrompt } : {}), ...(model ? { model } : {}) };
+          runRequest = { ...request, prompt: message };
+        }
+        if (codexOneShot && switchedFrom && !runRequest.resumeSessionId) {
+          try {
+            runRequest = { ...runRequest, prompt: withTranscriptPreamble(runRequest.prompt,
+              buildTranscript(await this.agents.listTranscriptEvents({ jobId: job.jobId, generation: sessionGeneration, from: switchedFrom }))) };
+          } catch (error) { this.reportFailure('prepare', error, job.jobId); }
+        }
+        if (codexOneShot && this.residentOptions.resolveCodexModel) {
+          try { const codexModel = await this.residentOptions.resolveCodexModel(job); if (codexModel) runRequest = { ...runRequest, model: codexModel }; }
+          catch (error) { this.reportFailure('prepare', error, job.jobId); }
+        }
+        execution.fileAccess = { workspacePath: plan.workspacePath, fileRead: plan.tools.fileRead };
+        // A resident job has its own turn timeout; this deadline is only a backstop above it.
+        execution.deadlineAt = Date.now() + (residentTurn ? 2 * residentTurn.timeoutMs + 60_000 : codexTimeoutMs !== undefined ? codexTimeoutMs + 60_000 : this.maxExecutionMs);
         execution.nextHeartbeatAt = Date.now() + this.statusRotationIntervalMs;
         this.executions.set(job.jobId, execution);
         this.startScheduler();
         this.sendReaction(execution, 'NICE', 'running');
-        for await (const event of this.bridge.run(runRequest)) {
+        for (const folded of foldedJobs) {
+          if (job.sourceType === 'line' && folded.sourceMessageId && LINE_MESSAGE_ID.test(folded.sourceMessageId)) {
+            this.enqueueDetachedReaction(folded.jobId, key as WritableConversationKey, folded.sourceMessageId, 'NICE', 'running');
+          }
+        }
+        // The external session id is stored only when the job completes with success (CliTalkAgent chat.rs). A failed job keeps the old session.
+        let pendingSession: { externalSessionId: string; workspacePath: string } | undefined;
+        // Self-heal (CliTalkAgent self_heal_once): a resident turn that fails gets ONE more attempt on a new process, unless a rule in
+        // agent-self-heal.ts forbids it. The failure of attempt 1 is held back: nothing is stored, no reaction is sent for it.
+        let attempt = 1;
+        let healed = false;
+        let attemptRequest = runRequest;
+        let heldFailure: FailedAgentEvent | undefined;
+        do {
+        heldFailure = undefined;
+        pendingSession = undefined;
+        const events = residentTurn && this.bridge.runResident ? this.bridge.runResident(attemptRequest, residentTurn)
+          : this.bridge.run(attemptRequest, ...(codexTimeoutMs !== undefined ? [{ timeoutMs: codexTimeoutMs }] : []));
+        for await (let event of events) {
           if (execution.deadlineExceeded) break;
+          if (residentTurn && isBlankCompletion(event)) event = emptyReplyFailure();
+          if (event.type === 'failed' && residentTurn && attempt === 1
+            && (await this.agents.getJob(job.jobId))?.status === 'running'
+            && await this.shouldSelfHeal(job.jobId, event, execution.deadlineExceeded)) { heldFailure = event; break; }
+          // CliTalkAgent should_retry_without_resume (decision D7): a Codex thread that is gone gets ONE more attempt without resume, under the D1 send rule.
+          if (event.type === 'failed' && codexOneShot && attempt === 1 && event.code === 'RESUME_NOT_FOUND' && attemptRequest.resumeSessionId !== undefined
+            && (await this.agents.getJob(job.jobId))?.status === 'running'
+            && await this.shouldSelfHeal(job.jobId, event, execution.deadlineExceeded)) { heldFailure = event; break; }
+          if (event.type === 'failed' && healed) event = markAfterSelfHeal(event);
+          // CliTalkAgent always clears the stored provider session for this failure; without it the next job resumes the dead thread again.
+          // The retry path cleared it before attempt 2, and attempt 2 has no resume id, so this is the final failure of attempt 1 only.
+          if (event.type === 'failed' && codexOneShot && event.code === 'RESUME_NOT_FOUND' && sessionKey && resume && resume.generation === sessionGeneration) {
+            await this.agents.clearExternalSession(sessionKey, sessionGeneration, resume.externalSessionId)
+              .catch((error: unknown) => this.reportFailure('persist', error, job.jobId));
+          }
           if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') { execution.terminalPending = true; this.releaseMcp(job.jobId); }
           if ((await this.agents.getJob(job.jobId))?.status !== 'running') continue;
           await this.agents.appendEvent(job.jobId, event);
           if (event.type === 'started') {
-            if (event.workspacePath && sessionKey) await this.agents.bindSession({ ...sessionKey,
-              externalSessionId: event.externalSessionId, generation: sessionGeneration, workspacePath: event.workspacePath });
+            if (event.workspacePath) pendingSession = { externalSessionId: event.externalSessionId, workspacePath: event.workspacePath };
             await this.onEvent?.(job.jobId, event);
           } else if (event.type === 'completed') {
+            if (event.partial) this.reportRecovered('timeout_partial', job.jobId);
+            if (pendingSession && sessionKey) await this.agents.bindSession({ ...sessionKey,
+              externalSessionId: pendingSession.externalSessionId, generation: sessionGeneration, workspacePath: pendingSession.workspacePath });
             const projection = await this.agents.completeJob(job.jobId, event.finalText, splitDeliveryText(event.finalText), job.creationEpoch ?? 0);
             if (projection) {
               execution.terminal = true;
+              if (residentTurn && job.sourceType === 'line') this.relayAnchors.set(residentTurn.key, job.jobId);
               this.publishLifecycle(projection);
               this.sendReaction(execution, 'LOVE', 'completed');
               await this.onEvent?.(job.jobId, event);
               await this.onCompleted?.(job.jobId);
+              if (this.failoverTurns && turnContext) await this.failoverTurns.afterCompleted(turnContext);
             }
           } else if (event.type === 'failed') {
             const projection = await this.agents.failJob(job.jobId);
@@ -764,7 +1175,9 @@ ${scheduleContext}` : request.prompt;
               execution.terminal = true;
               this.publishLifecycle(projection);
               this.sendReaction(execution, 'SAD', 'failed');
+              // The failed-event handler (quota block) has finished before the turn lifecycle routes again.
               await this.onEvent?.(job.jobId, event);
+              if (this.failoverTurns && turnContext) await this.failoverTurns.afterFailure(turnContext, event);
             }
           } else if (event.type === 'cancelled') {
             const projection = await this.agents.cancelJob(job.jobId);
@@ -773,9 +1186,27 @@ ${scheduleContext}` : request.prompt;
               this.publishLifecycle(projection);
               this.sendReaction(execution, 'FUN', 'cancelled');
               await this.onEvent?.(job.jobId, event);
+              if (this.failoverTurns && turnContext) await this.failoverTurns.afterCancelled(turnContext);
             }
           } else await this.onEvent?.(job.jobId, event);
         }
+        if (heldFailure && (residentTurn || codexOneShot) && !execution.deadlineExceeded && (await this.agents.getJob(job.jobId))?.status === 'running') {
+          // Attempt 2: reset this key only, forget the stored provider session id, and run without a resume id.
+          if (residentTurn) {
+            this.reportSelfHeal(heldFailure.code, job.jobId);
+            try { this.bridge.resetResidents?.((candidate) => candidate === residentTurn!.key); } catch (error) { this.reportFailure('execute', error, job.jobId); }
+          } else this.reportRecovered('resume_not_found_retry', job.jobId);
+          if (sessionKey && resume && resume.generation === sessionGeneration) {
+            await this.agents.clearExternalSession(sessionKey, sessionGeneration, resume.externalSessionId)
+              .catch((error: unknown) => this.reportFailure('persist', error, job.jobId));
+          }
+          const { resumeSessionId: _dropped, ...withoutResume } = attemptRequest;
+          void _dropped;
+          attemptRequest = withoutResume;
+          attempt = 2;
+          healed = true;
+        } else heldFailure = undefined;
+        } while (heldFailure);
         if (execution.deadlineExceeded) {
           await execution.deadlineCancellation;
           const timeoutEvent: AgentEvent = { type: 'failed', code: 'TIMEOUT', message: 'Agent execution timed out.', retryable: false };
@@ -785,6 +1216,7 @@ ${scheduleContext}` : request.prompt;
             if (timeoutPersisted) {
               this.sendReaction(execution, 'SAD', 'failed');
               await this.onEvent?.(job.jobId, timeoutEvent);
+              if (this.failoverTurns && turnContext) await this.failoverTurns.afterFailure(turnContext, timeoutEvent);
             }
           }
         } else if (!execution.terminal) {
@@ -805,6 +1237,7 @@ ${scheduleContext}` : request.prompt;
             if (timeoutPersisted) {
               this.sendReaction(execution, 'SAD', 'failed');
               await this.onEvent?.(job.jobId, timeoutEvent);
+              if (this.failoverTurns && turnContext) await this.failoverTurns.afterFailure(turnContext, timeoutEvent);
             }
           }
         } else if (!execution.deadlineExceeded) {
@@ -823,6 +1256,7 @@ ${scheduleContext}` : request.prompt;
           if (current.status === 'cancelled') {
             execution.terminal = true;
             this.sendReaction(execution, 'FUN', 'cancelled');
+            if (this.failoverTurns && turnContext) await this.failoverTurns.afterCancelled(turnContext);
           } else if (current.status === 'interrupted') {
             // Runtime interrupt of an active execution only. Jobs marked interrupted by startup recovery have no
             // execution and intentionally send nothing, so startup never bursts reactions to LINE.
@@ -836,6 +1270,11 @@ ${scheduleContext}` : request.prompt;
             this.sendReaction(execution, 'LOVE', 'completed');
           }
         }
+        // A continuation job that ended on a path without the turn lifecycle (early failure, fallback failJob, interrupt) settles its row here.
+        if (this.failoverTurns && current && (current.status === 'completed' || current.status === 'failed' || current.status === 'cancelled' || current.status === 'interrupted')) {
+          await this.failoverTurns.settleLeftover(job.jobId, current.status);
+        }
+        if (foldedJobs.length > 0) await this.settleFoldedJobs(job.jobId, foldedJobs, foldWorkspace);
         this.releaseMcp(job.jobId);
         if (execution.deadlineCancellation) await execution.deadlineCancellation.catch(() => undefined);
         this.executions.delete(job.jobId);
@@ -905,6 +1344,30 @@ ${scheduleContext}` : request.prompt;
         }
       }
     }
+  }
+
+  /**
+   * The lead of folded jobs ended: each still-queued follower takes the lead's status (one reply, delivered by the lead only),
+   * gets the same terminal reaction through the detached lane, and its stored files are deleted. A lead that is not terminal
+   * settles nothing; startup recovery frees its followers. Best effort: a failure never changes the lead.
+   */
+  private async settleFoldedJobs(leadJobId: string, folded: readonly { jobId: string }[], workspacePath: string | null): Promise<void> {
+    let settled: AgentJobStatusProjection[] = [];
+    try { settled = await this.agents.settleFolded(leadJobId); }
+    catch (error) { this.reportFailure('persist', error, leadJobId); }
+    for (const projection of settled) {
+      this.publishLifecycle(projection);
+      if (projection.sourceType !== 'line' || !projection.sourceMessageId || !LINE_MESSAGE_ID.test(projection.sourceMessageId)) continue;
+      const reaction: { reaction: AgentReaction; phase: Exclude<AgentReactionPhase, 'queued' | 'running'> } | null =
+        projection.status === 'completed' ? { reaction: 'LOVE', phase: 'completed' }
+        : projection.status === 'failed' ? { reaction: 'SAD', phase: 'failed' }
+        : projection.status === 'cancelled' ? { reaction: 'FUN', phase: 'cancelled' }
+        : projection.status === 'interrupted' ? { reaction: 'OMG', phase: 'interrupted' } : null;
+      if (!reaction) continue;
+      this.enqueueDetachedReaction(projection.jobId, { accountId: projection.accountId, chatType: projection.chatType, chatId: projection.chatId },
+        projection.sourceMessageId, reaction.reaction, reaction.phase);
+    }
+    if (workspacePath) for (const item of folded) await removeJobAttachments(workspacePath, item.jobId).catch(() => undefined);
   }
 
   private sendReaction(execution: ActiveExecution, reaction: AgentReaction,

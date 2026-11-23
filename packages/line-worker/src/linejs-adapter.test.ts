@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createLinejsAdapter, downloadLinejsE2eeAttachment } from './linejs-adapter.js';
+import { createLinejsAdapter as createLinejsAdapterRaw, downloadLinejsE2eeAttachment } from './linejs-adapter.js';
 import { fetchLinejsConversationCatalog, fetchLinejsConversationDetails } from './linejs-adapter.js';
 import { BaseClient, InternalError } from '@evex/linejs/base';
 import { Protocols, Thrift as LineThrift } from '@evex/linejs/thrift';
@@ -17,6 +17,9 @@ import { normalizeOperation } from './normalizer.js';
 import { validateAttachmentMessage } from './attachment-download.js';
 import { boundedChatResourceResponseCode, ChatResourceFailure } from './chat-resource-error.js';
 import { LineServerRejection } from './line-server-error.js';
+
+/** The tests in this file cover the LEGY encrypted transport, so they turn it on unless a test says otherwise. */
+const createLinejsAdapter: typeof createLinejsAdapterRaw = (options) => createLinejsAdapterRaw({ legyEncrypted: true, ...options });
 
 it('decodes a physical encrypted sendMessage Talk rejection after one network dispatch', async () => {
   const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
@@ -2791,4 +2794,20 @@ it('sends listConversationDetails through the DESKTOPWIN talk service with the c
     expect(getContacts.mock.calls).toEqual([[{ mids: ['u-peer'] }]]);
     expect(result).toEqual([{ chatType: 'group', chatId: 'c-new', title: 'Fresh', members: [{ memberId: 'u-peer', displayName: 'Alice' }] }]);
   } finally { vi.restoreAllMocks(); }
+});
+
+it('sends a V3 Talk RPC to the RPC host without the LEGY layer when encryption is off', async () => {
+  const { LegyEncryptedTransport } = await legyModule();
+  const legy = vi.spyOn(LegyEncryptedTransport.prototype, 'fetch');
+  const requests: Request[] = [];
+  const physicalTransport = vi.fn(async (request: Request) => { requests.push(request); return new Response(null, { status: 410 }); });
+  const adapter = await createLinejsAdapterRaw({ ...lease, mode: 'ACTIVE_CONTROL', validateLease: () => true, physicalTransport });
+  await adapter.installSecrets({ token: jwt, qrCert: null, e2eeStorage: null });
+  try {
+    await adapter.send({ chatType: 'direct', chatId: 'u-peer' }, 'hello', null, lease).catch(() => undefined);
+    expect(legy).not.toHaveBeenCalled();
+    expect(requests.length).toBeGreaterThan(0);
+    for (const request of requests) expect(new URL(request.url).hostname).toBe('legy.line-apps.com');
+    expect(requests.some((request) => request.url.includes('gf.line.naver.jp'))).toBe(false);
+  } finally { adapter.revoke(); legy.mockRestore(); }
 });

@@ -7,7 +7,7 @@ import { LineWorkerLoop, type LineTransport, type LineWorkerOptions } from './wo
 import { createWindowsAttachmentBroker } from './windows-attachment-broker.js';
 import { DIAGNOSTIC_OPERATIONS, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { isLineServerRejection } from './line-server-error.js';
-import { buildLoginFailureDetail } from './login-failure-detail.js';
+import { buildLoginFailureDetail, loginHttpStatus } from './login-failure-detail.js';
 import { startTrafficLog } from './traffic-log.js';
 
 const COMMAND_TYPES: ReadonlySet<string> = new Set(LineWorkerCommandSchema.options.map((option) => option.shape.type.value));
@@ -200,8 +200,10 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
             : localMessage === 'login attempt mismatch' || localMessage === 'LINE credential operation is stale'
               ? 'LOGIN_ATTEMPT_REPLACED' : 'LOGIN_FAILED';
         const detail = code === 'LOGIN_FAILED' ? buildLoginFailureDetail(error) : undefined;
+        const upstreamStatus = code === 'LOGIN_FAILED' ? loginHttpStatus(error) : undefined;
         await emit({ type: 'loginFailure', ...identity, loginAttemptId: command.loginAttemptId, code,
-          message: LOGIN_FAILURES[code], ...(detail === undefined ? {} : { detail }) } as Extract<LineWorkerEvent, { type: 'loginFailure' }>);
+          message: LOGIN_FAILURES[code], ...(detail === undefined ? {} : { detail }),
+          ...(upstreamStatus === undefined ? {} : { upstreamStatus }) } as Extract<LineWorkerEvent, { type: 'loginFailure' }>);
       } else if (error instanceof Error && 'code' in error && error.code === 'PROTOCOL_UNVERIFIED') {
         await emit({ type: 'status', ...identity, state: 'PROTOCOL_UNVERIFIED', message: null });
       } else if (isChromeLtsmUnavailable(error)) {
@@ -376,6 +378,7 @@ export function createTransportFactory(deps: TransportFactoryDeps = {}): (init: 
       controlEpoch: init.controlEpoch, mode: init.mode,
       validateLease: () => true,
       physicalTransport: fetchLineRequest,
+      ...(init.legyEncrypted === true ? { legyEncrypted: true } : {}),
     });
   };
 }

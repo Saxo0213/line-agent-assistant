@@ -1,7 +1,24 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { SettingsRepository } from './settings-repository.js';
+import { AGENT_RUNTIME_DEFAULTS, resolveAgentRuntimeSettings, SettingsRepository } from './settings-repository.js';
 import { createTestDatabase } from './test-database.js';
-import { DEFAULT_AGENT_STATUS_ICONS } from '@line-agent/contracts';
+import { DEFAULT_AGENT_STATUS_ICONS, DEFAULT_DOWNLOAD_BRIDGE_INTERVALS } from '@line-agent/contracts';
+
+describe('agent runtime settings', () => {
+  it('gives the defaults when no value is set', () => {
+    expect(resolveAgentRuntimeSettings({})).toEqual(AGENT_RUNTIME_DEFAULTS);
+    expect(AGENT_RUNTIME_DEFAULTS).toEqual({ turnTimeoutSeconds: 900, turnStallSeconds: 120, idleTimeoutSeconds: 600,
+      autoSlimEnabled: true, autoSlimMaxTurns: 120, autoSlimMaxTranscriptBytes: 8_000_000 });
+  });
+  it('clamps the values and ignores malformed values', () => {
+    expect(resolveAgentRuntimeSettings({ agent_turn_timeout_seconds: 5 }).turnTimeoutSeconds).toBe(30);
+    expect(resolveAgentRuntimeSettings({ agent_turn_timeout_seconds: 99999 }).turnTimeoutSeconds).toBe(7200);
+    expect(resolveAgentRuntimeSettings({ agent_turn_stall_seconds: 0 }).turnStallSeconds).toBe(0);
+    expect(resolveAgentRuntimeSettings({ agent_turn_stall_seconds: 10 }).turnStallSeconds).toBe(30);
+    expect(resolveAgentRuntimeSettings({ agent_idle_timeout_seconds: 10 }).idleTimeoutSeconds).toBe(60);
+    expect(resolveAgentRuntimeSettings({ agent_auto_slim_enabled: false }).autoSlimEnabled).toBe(false);
+    expect(resolveAgentRuntimeSettings({ agent_auto_slim_enabled: 'no', agent_idle_timeout_seconds: 'x' })).toEqual(AGENT_RUNTIME_DEFAULTS);
+  });
+});
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -63,5 +80,19 @@ database('conversation settings repository', () => {
     expect(await repository.getOfficialBuildTrust()).toEqual({ ...trust, pinnedThumbprints: [] });
     expect((await pool.query("SELECT count(*)::int AS count FROM app_settings WHERE key = 'official_line_build_trust'")).rows).toEqual([{ count: 1 }]);
     await expect(repository.getAppSetting('official_line_build_trust')).rejects.toThrow('App setting not allowed');
+  });
+
+  it('gives the default download bridge intervals, saves valid ones and falls back to the defaults for an invalid row', async () => {
+    expect(await repository.getExternalBridgeDownloadIntervals()).toEqual(DEFAULT_DOWNLOAD_BRIDGE_INTERVALS);
+    const custom = { image: { minSeconds: 0, maxSeconds: 0 }, file: { minSeconds: 5, maxSeconds: 600 } };
+    await repository.setExternalBridgeDownloadIntervals(custom);
+    expect(await repository.getExternalBridgeDownloadIntervals()).toEqual(custom);
+    await expect(repository.setExternalBridgeDownloadIntervals({ ...custom, image: { minSeconds: 9, maxSeconds: 3 } })).rejects.toThrow();
+    await expect(repository.setExternalBridgeDownloadIntervals({ ...custom, file: { minSeconds: 0, maxSeconds: 601 } })).rejects.toThrow();
+    expect(await repository.getExternalBridgeDownloadIntervals()).toEqual(custom);
+    for (const bad of [{ image: { minSeconds: 9, maxSeconds: 3 }, file: custom.file }, 'text', { image: custom.image }]) {
+      await pool.query("UPDATE app_settings SET value = $1::jsonb WHERE key = 'external_bridge_download_intervals'", [JSON.stringify(bad)]);
+      expect(await repository.getExternalBridgeDownloadIntervals()).toEqual(DEFAULT_DOWNLOAD_BRIDGE_INTERVALS);
+    }
   });
 });

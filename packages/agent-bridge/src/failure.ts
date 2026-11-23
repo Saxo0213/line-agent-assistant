@@ -1,9 +1,17 @@
 import type {AgentEvent} from '@line-agent/contracts';
 import {redactSensitive} from './redact.js';
 
-export const isAuthenticationDiagnostic=(diagnostic:string)=>/\bnot logged in\b|\bauthentication (?:is )?(?:required|failed)\b|\bplease (?:run|use) (?:`?[\w.-]+`? )?(?:auth )?(?:login|\/login)\b/i.test(diagnostic);
-/** The single list of provider wording that means "usage/rate limit". */
-export const isUsageLimitMessage=(message:string)=>/usage limit|rate[\s_-]?limit|quota|\b429\b|(?:usage|rate) limit reached|hit your (?:usage |weekly |rate )?limit|too many requests/i.test(message);
+// Wording lists ported from CliTalkAgent src/provider_failover.rs (classify_failure and is_logged_out_failure). Same words, same order.
+const TRANSIENT_RATE_LIMIT_WORDS=['http 429','status 429','error 429','http 529','status 529','error 529','too many requests','rate limited','rate_limit_error','rate limit exceeded','overloaded','temporarily limiting','temporarily unavailable'];
+const QUOTA_EXHAUSTED_WORDS=['session limit','subscription limit','weekly limit','monthly limit','usage limit','quota exhausted','quota exceeded','insufficient_quota'];
+const LOGGED_OUT_WORDS=['oauth session expired','could not be refreshed','not logged in','please run /login'];
+const includesAny=(text:string,words:readonly string[])=>{const lower=text.toLowerCase();return words.some(word=>lower.includes(word));};
+/** A short provider-side limit. A later retry can work. The transient check runs before the quota check. */
+export const isTransientRateLimitMessage=(message:string)=>includesAny(message,TRANSIENT_RATE_LIMIT_WORDS);
+/** The usage quota of the account is used up. */
+export const isQuotaExhaustedMessage=(message:string)=>includesAny(message,QUOTA_EXHAUSTED_WORDS);
+/** Only the definite wording of the CLI. A general "authentication failed" is not a logout. */
+export const isAuthenticationDiagnostic=(diagnostic:string)=>includesAny(diagnostic,LOGGED_OUT_WORDS);
 
 /** Parses a provider's explicit reset wording without guessing when the date, clock time or zone is incomplete. */
 export function providerFailureResetAt(message:string,observedAt=Date.now()):string|undefined {
@@ -52,11 +60,12 @@ export function classifyProviderFailure(name:'Codex'|'Claude',raw:string|undefin
   // Classify on the full redacted text; only the displayed text is truncated.
   const full=raw===undefined?'':redactSensitive(raw).replace(/\s+/g,' ').trim();
   const message=full.slice(0,MAX_PROVIDER_MESSAGE);
-  if(full && isAuthenticationDiagnostic(full)) return {type:'failed',code:'AUTH_REQUIRED',message:'Sign in through Settings → Agent and retry the job.',retryable:false};
-  if(full && isUsageLimitMessage(full)) {
+  if(full && isTransientRateLimitMessage(full)) return {type:'failed',code:'PROVIDER_RATE_LIMITED',message:`${name} 暫時被限流：${message}`,retryable:true};
+  if(full && isQuotaExhaustedMessage(full)) {
     const quotaRecoveryAt=providerFailureResetAt(full,observedAt);
     return {type:'failed',code:'PROVIDER_LIMIT',message:`${name} 已達用量上限：${message}`,retryable:true,...(quotaRecoveryAt?{quotaRecoveryAt}:{})};
   }
+  if(full && isAuthenticationDiagnostic(full)) return {type:'failed',code:'AUTH_REQUIRED',message:'Sign in through Settings → Agent and retry the job.',retryable:false};
   if(message) return {type:'failed',code:'PROVIDER_FAILED',message:`${name} 無法完成這次工作：${message}`,retryable:false};
   return {type:'failed',code:'PROVIDER_FAILED',message:`${name} 無法完成這次工作。`,retryable:false};
 }

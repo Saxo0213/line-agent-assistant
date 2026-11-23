@@ -22,6 +22,7 @@ import { SafeAttachmentError } from './attachment-error.js';
 import { parseEncryptedAccessToken, validateAttachmentMessage, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { boundedChatResourceResponseCode, ChatResourceFailure, safeChatResourceFailureDetails,
   safeChatResourceUpstreamCode, safeChatResourceUpstreamNumber } from './chat-resource-error.js';
+import { classifyLinejsFailure, hasLinejsMethodTag, tagLinejsFailure } from './login-failure-detail.js';
 import { decodeLinejsServerRejection, isLineServerRejection, isTalkAuthInvalidation } from './line-server-error.js';
 
 type OpaqueCall = () => Promise<unknown>;
@@ -103,6 +104,8 @@ export type LinejsAdapterOptions = Readonly<ControlLease & {
   validateLease: (lease: ControlLease) => boolean | Promise<boolean>;
   physicalTransport: (request: Request) => Promise<Response>;
   packageRoot?: string;
+  /** True turns on the LEGY encrypted transport. Absent or false means the plain transport. */
+  legyEncrypted?: boolean;
 }>;
 
 /** Drain a bounded slice of supplemental history while keeping any overflow queued for the next real sync. */
@@ -656,6 +659,10 @@ export class LinejsAdapter implements LineTransport {
   readonly #serverLogoutContext = new AsyncLocalStorage<ServerLogoutContext>();
   // Records the physical HTTP status of the current sync RPC so an empty long-poll 410 can be told apart from a real failure.
   readonly #syncPhysicalStatus = new AsyncLocalStorage<{ status?: number }>();
+  // Per-call record of the physical HTTP status. It lets a failure tag use the status of its own call.
+  readonly #callPhysicalStatus = new AsyncLocalStorage<{ status?: number }>();
+  // Method and HTTP status of the latest physical response. Login failures use it when no per-call tag exists.
+  #lastPhysical: { method: string | null; status: number } | null = null;
   readonly #requestFailures = new WeakSet<object>();
   #revoked = false;
   #refreshingCredentials = false;
@@ -677,7 +684,7 @@ export class LinejsAdapter implements LineTransport {
     const requestClient: TrustedRequestClient<OpaqueCall, unknown, Response> = {
       invoke: (call, dispatch) => dispatchContext.run(dispatch, call),
     };
-    base = new BaseClient({ device: 'DESKTOPWIN', storage: this.#storage, legy: { encrypted: 'auto' },
+    base = new BaseClient({ device: 'DESKTOPWIN', storage: this.#storage, legy: { encrypted: options.legyEncrypted === true ? 'auto' : false },
       fetch: async (request: Request) => {
         const source = sourceContext.getStore();
         const dispatch = dispatchContext.getStore();
@@ -723,7 +730,7 @@ export class LinejsAdapter implements LineTransport {
           ? { mode: 'direct', tokenState: 'none' }
           : !isV3Jwt(token)
             ? { mode: 'unsupported', tokenState: 'legacy-opaque' }
-            : talk ? { mode: 'legy-encrypted', tokenState: 'v3-jwt' }
+            : talk && options.legyEncrypted === true ? { mode: 'legy-encrypted', tokenState: 'v3-jwt' }
               : { mode: 'direct', tokenState: 'v3-jwt' };
         // For direct requests this is the actual Request object constructed by
         // LINEJS. For LEGY requests the pinned RequestClient serializer creates
@@ -782,9 +789,14 @@ export class LinejsAdapter implements LineTransport {
       const [value, methodName, protocolType = 3, _parse = true, path = '/S3', headers = {}] = args;
       if (!dispatchContext.getStore()) throw new EffectDeniedError('RequestClient call is outside effect phase');
       // The traffic log reads this label when undici creates the request. It only observes.
+      const callPhysical: { status?: number } = {};
       return trafficLabel.run(methodName, () => sourceContext.run({ value, methodName, path, protocolType, headers }, async () => {
-        try { return await original(...args); }
+        try { return await this.#callPhysicalStatus.run(callPhysical, () => original(...args)); }
         catch (error) {
+          if (!(error instanceof InternalError) && !isLineServerRejection(error) && !(error instanceof EffectDeniedError)) {
+            tagLinejsFailure(error, { method: methodName, ...(callPhysical.status === undefined ? {} : { httpStatus: callPhysical.status }),
+              kind: classifyLinejsFailure(error) });
+          }
           if (error !== null && (typeof error === 'object' || typeof error === 'function')) {
             this.#requestFailures.add(error as object);
           }
@@ -802,7 +814,7 @@ export class LinejsAdapter implements LineTransport {
         }
       }));
     }) as typeof base.request.request;
-    this.#gate = createMutationGate({ accountId: options.accountId, workerInstanceId: options.workerInstanceId, controlEpoch: options.controlEpoch,
+    this.#gate = createMutationGate({ talkTransport: options.legyEncrypted === true ? 'legy-encrypted' : 'plain', accountId: options.accountId, workerInstanceId: options.workerInstanceId, controlEpoch: options.controlEpoch,
       requestClient, physicalTransport: async (request) => {
         const source = sourceContext.getStore();
         if (source?.path === '/RE4' && source.methodName === 'addFriendByMid' && this.#activeRelationAdd) {
@@ -816,6 +828,9 @@ export class LinejsAdapter implements LineTransport {
           active.onPhysicalStart();
         }
         const response = await options.physicalTransport(request);
+        this.#lastPhysical = { method: source?.methodName ?? null, status: response.status };
+        const callObserved = this.#callPhysicalStatus.getStore();
+        if (callObserved) callObserved.status = response.status;
         if (source?.path === '/SYNC4' && source.methodName === 'sync') {
           const observed = this.#syncPhysicalStatus.getStore();
           if (observed) observed.status = response.status;
@@ -872,25 +887,38 @@ export class LinejsAdapter implements LineTransport {
   }
   async loginQr(): Promise<TransportIdentity> {
     this.#pendingCatchupMessages = [];
-    await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ qr: true, v3: true }));
-    await this.#scheduleTokenRefresh();
-    return this.#profile();
+    this.#lastPhysical = null;
+    try {
+      await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ qr: true, v3: true }));
+      await this.#scheduleTokenRefresh();
+      return this.#profile();
+    } catch (error) { throw this.#tagLoginError(error); }
+  }
+  #tagLoginError(error: unknown): unknown {
+    if (hasLinejsMethodTag(error) || error instanceof InternalError || isLineServerRejection(error) || error instanceof EffectDeniedError) return error;
+    const last = this.#lastPhysical;
+    tagLinejsFailure(error, { ...(last?.method ? { method: last.method } : {}), ...(last ? { httpStatus: last.status } : {}),
+      kind: classifyLinejsFailure(error) });
+    return error;
   }
   async loginToken(token: string): Promise<TransportIdentity> {
     this.#pendingCatchupMessages = [];
-    const expire = await this.#storage.get('expire');
-    const refreshToken = await this.#storage.get('refreshToken');
-    let tokenToUse = token;
-    if (typeof expire === 'number' && Number.isFinite(expire) && expire <= Math.floor(Date.now() / 1000)
-      && typeof refreshToken === 'string') {
-      await this.#base.auth.tryRefreshToken();
-      const refreshedToken = this.#base.authToken;
-      if (!refreshedToken) throw new Error('LINEJS refresh returned no access token');
-      tokenToUse = refreshedToken;
-    }
-    await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ authToken: tokenToUse }));
-    await this.#scheduleTokenRefresh();
-    return this.#profile();
+    this.#lastPhysical = null;
+    try {
+      const expire = await this.#storage.get('expire');
+      const refreshToken = await this.#storage.get('refreshToken');
+      let tokenToUse = token;
+      if (typeof expire === 'number' && Number.isFinite(expire) && expire <= Math.floor(Date.now() / 1000)
+        && typeof refreshToken === 'string') {
+        await this.#base.auth.tryRefreshToken();
+        const refreshedToken = this.#base.authToken;
+        if (!refreshedToken) throw new Error('LINEJS refresh returned no access token');
+        tokenToUse = refreshedToken;
+      }
+      await this.#gate.invokeRpc({ phase: 'AUTH_BOOTSTRAP' }, () => this.#base.loginProcess.login({ authToken: tokenToUse }));
+      await this.#scheduleTokenRefresh();
+      return this.#profile();
+    } catch (error) { throw this.#tagLoginError(error); }
   }
   async #validateServerLogoutResponse(response: Response, signal: AbortSignal): Promise<void> {
     let parsed: ReturnType<BaseClient['thrift']['readThrift']>;
@@ -1016,16 +1044,22 @@ export class LinejsAdapter implements LineTransport {
     return { ownMid: profile.mid, displayName: profile.displayName ?? null,
       ...(picturePath === undefined ? {} : { picturePath }) };
   }
+  #lastSyncStatus: number | null = null;
+  /** Physical HTTP status of the last sync attempt, or null when no status was seen. */
+  lastSyncHttpStatus(): number | null { return this.#lastSyncStatus; }
   async sync(cursor: TalkCursorV1Dto): Promise<SyncResult> {
     const context = this.#readContext();
     const observed: { status?: number } = {};
+    this.#lastSyncStatus = null;
     let response: Awaited<ReturnType<BaseClient['talk']['sync']>>;
     try {
       response = await this.#syncPhysicalStatus.run(observed, () => this.#gate.invokeRpc(context, () => this.#base.talk.sync({
         revision: BigInt(cursor.revision), globalRev: BigInt(cursor.globalRev),
         individualRev: BigInt(cursor.individualRev), limit: 100,
       }))) as Awaited<ReturnType<BaseClient['talk']['sync']>>;
+      this.#lastSyncStatus = typeof observed.status === 'number' ? observed.status : null;
     } catch (error) {
+      this.#lastSyncStatus = typeof observed.status === 'number' ? observed.status : null;
       // LINE ends an idle sync long poll with HTTP 410 and an empty body. That is a normal "no events" result.
       // The library fails to decode the empty body, so use the physical status, not the message text.
       if (observed.status === 410 && !isLineServerRejection(error) && !(error instanceof InternalError)

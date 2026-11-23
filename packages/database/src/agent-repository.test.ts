@@ -150,6 +150,18 @@ database('AgentRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () =>
     expect(await agents.lookupSession(key)).toBeNull();
   });
 
+  it('clears the stored session id only when the key, generation and id match', async () => {
+    const input = envelope('clear-session'); await messages.ingestAndRoute(input, { eligible: false });
+    const key = { accountId: input.accountId, chatType: input.chatType, chatId: input.chatId, provider: 'claude' as const, sourceType: 'line' as const };
+    await agents.bindSession({ workspacePath: 'C:\\work', ...key, externalSessionId: 'claude-1', generation: 0 });
+    expect(await agents.clearExternalSession(key, 0, 'other')).toBe(false);
+    expect(await agents.clearExternalSession(key, 1, 'claude-1')).toBe(false);
+    expect(await agents.lookupSession({ workspacePath: 'C:\\work', ...key })).toMatchObject({ externalSessionId: 'claude-1' });
+    expect(await agents.clearExternalSession(key, 0, 'claude-1')).toBe(true);
+    expect(await agents.lookupSession({ workspacePath: 'C:\\work', ...key })).toBeNull();
+    expect(await agents.clearExternalSession(key, 0, 'claude-1')).toBe(false);
+  });
+
   it('binds sessions by provider and prevents stale generation rebinding after reset', async () => {
     const input = envelope('session-chat');
     await messages.ingestAndRoute(input, { eligible: false });
@@ -310,6 +322,27 @@ database('AgentRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () =>
     expect(await agents.claimLineDelivery(jobId, 1, controlEpoch)).toBeNull();
   });
 
+  it('appends relay deliveries to a completed LINE job and rejects a job that is not completed', async () => {
+    const input = envelope('relay-chat');
+    const { jobId } = await messages.ingestAndRoute(input, route);
+    if (!jobId) throw new Error('expected job');
+    const key = { accountId: input.accountId, chatType: input.chatType, chatId: input.chatId };
+    await agents.claimNext(key);
+    expect(await agents.appendRelayDelivery(jobId, ['too early'], 'relay-0')).toBe(false);
+    await agents.saveFinal(jobId, 'first');
+    expect(await agents.createLineDelivery(jobId, controlEpoch, ['first'])).toBe(true);
+    expect(await agents.appendRelayDelivery(jobId, ['second', 'third'], 'relay-1')).toBe(true);
+    expect(await agents.appendRelayDelivery(jobId, ['fourth'], 'relay-2')).toBe(true);
+    const rows = await pool.query('SELECT part_index, text_content, idempotency_key FROM agent_deliveries WHERE job_id = $1 ORDER BY part_index', [jobId]);
+    expect(rows.rows.map((row) => [row.part_index, row.text_content, row.idempotency_key])).toEqual([
+      [0, 'first', `${jobId}:0`],
+      [1, 'second', `${jobId}:relay:relay-1:0`],
+      [2, 'third', `${jobId}:relay:relay-1:1`],
+      [3, 'fourth', `${jobId}:relay:relay-2:0`],
+    ]);
+    await expect(agents.appendRelayDelivery(jobId, ['again'], 'relay-1')).rejects.toThrow();
+  });
+
   it('refuses to claim a LINE delivery whose stored route disagrees with its job', async () => {
     const input = envelope('corrupt-delivery-route');
     const { jobId } = await messages.ingestAndRoute(input, route);
@@ -377,6 +410,23 @@ database('AgentRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () =>
     expect(await settings.setConversationProvider(key, 'codex')).toBe(true);
     expect(await settings.getConversationAgent(key)).toEqual({ enabled: true, provider: 'codex' });
     expect(await settings.setConversationProvider({ ...key, chatId: 'missing-chat' }, 'codex')).toBe(false);
+    // /model: null follows the bridge default; only haiku, sonnet and opus are stored.
+    expect(await settings.getConversationClaudeModel(key)).toBeNull();
+    expect(await settings.setConversationClaudeModel(key, 'sonnet')).toBe(true);
+    expect(await settings.getConversationClaudeModel(key)).toBe('sonnet');
+    expect(await settings.setConversationClaudeModel(key, null)).toBe(true);
+    expect(await settings.getConversationClaudeModel(key)).toBeNull();
+    expect(await settings.setConversationClaudeModel({ ...key, chatId: 'missing-chat' }, 'opus')).toBe(false);
+    await expect(pool.query("UPDATE conversations SET claude_model = 'gpt' WHERE chat_id = $1", [key.chatId])).rejects.toThrow();
+    // Codex /model: a free model ID; the CliTalkAgent rule is also a CHECK constraint.
+    expect(await settings.getConversationCodexModel(key)).toBeNull();
+    expect(await settings.setConversationCodexModel(key, 'gpt-5.2-codex')).toBe(true);
+    expect(await settings.getConversationCodexModel(key)).toBe('gpt-5.2-codex');
+    expect(await settings.setConversationCodexModel(key, null)).toBe(true);
+    expect(await settings.getConversationCodexModel(key)).toBeNull();
+    expect(await settings.setConversationCodexModel({ ...key, chatId: 'missing-chat' }, 'gpt-5')).toBe(false);
+    await expect(pool.query("UPDATE conversations SET codex_model = 'Opus' WHERE chat_id = $1", [key.chatId])).rejects.toThrow();
+    await expect(pool.query("UPDATE conversations SET codex_model = 'bad model' WHERE chat_id = $1", [key.chatId])).rejects.toThrow();
     // Persona overrides: null follows the global value; each field is set and cleared on its own.
     expect(await settings.getConversationPersona(key)).toEqual({ description: null, liveliness: null });
     expect(await settings.setConversationPersona(key, { description: '溫柔簡短' })).toBe(true);
@@ -393,18 +443,11 @@ database('AgentRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () =>
     await expect(settings.setAppSetting('line_token', 'secret')).rejects.toThrow('not allowed');
   });
 
-  it('atomically accepts a consented cross-provider retry and preserves source uniqueness for later LINE admissions', async () => {
+  it('validates job notice authority and reconciles quota snapshots with refusals', async () => {
     const key={accountId:'account-A',chatType:'direct' as const,chatId:'quota-consent-chat'};
     const senderId='quota-admin-mid';
     const original={...envelope(key.chatId),senderId,messageId:`quota-original-${++sequence}`,text:'original work'};
-    const confirm={...envelope(key.chatId),senderId,messageId:`quota-confirm-${++sequence}`,text:'/agent codex'};
     await messages.ingestAndRoute(original,{eligible:false});
-    await messages.ingestAndRoute(confirm,{eligible:false});
-    expect(await settings.setConversationProvider(key,'claude')).toBe(true);
-    await pool.query(`INSERT INTO conversations(account_id,chat_type,chat_id,title,agent_enabled,default_provider)
-      VALUES('account-A','direct','quota-admin-chat','admin',true,'codex') ON CONFLICT(account_id,chat_type,chat_id) DO NOTHING`);
-    await pool.query(`INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
-      VALUES('account-A','direct','quota-admin-chat',$1,'PRIMARY_ADMIN') ON CONFLICT DO NOTHING`,[senderId]);
     const senderGrantId=randomUUID();
     await pool.query(`INSERT INTO line_friend_whitelist_grants(grant_id,account_id,target_mid,capability,version,state)
       VALUES($1,'account-A',$2,'AGENT_USE',1,'ACTIVE')`,[senderGrantId,senderId]);
@@ -420,78 +463,48 @@ database('AgentRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () =>
       [originalJobId,JSON.stringify({type:'failed',code:'PROVIDER_LIMIT',message:'Claude retry limit',retryable:true})]);
     const quota=new ProviderQuotaRepository(pool);
     const noticeAuthority={jobId:originalJobId,accountId:key.accountId,workerInstanceId:'quota-worker',controlEpoch};
-    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(true);
+    expect(await quota.validateJobNoticeAuthority(noticeAuthority)).toBe(true);
     await pool.query(`UPDATE line_friend_whitelist_grants SET state='REVOKED',revoked_at=now() WHERE grant_id=$1`,[senderGrantId]);
-    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(false);
-    await quota.skipNotice(originalJobId);
-    expect((await pool.query<{notification_state:string}>('SELECT notification_state FROM provider_quota_notices WHERE job_id=$1',[originalJobId])).rows[0]?.notification_state).toBe('skipped');
+    expect(await quota.validateJobNoticeAuthority(noticeAuthority)).toBe(false);
     await pool.query(`UPDATE line_friend_whitelist_grants SET state='ACTIVE',revoked_at=NULL WHERE grant_id=$1`,[senderGrantId]);
-    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(true);
+    expect(await quota.validateJobNoticeAuthority(noticeAuthority)).toBe(true);
     await pool.query('UPDATE account_control SET control_epoch=control_epoch+1 WHERE singleton=true');
-    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(false);
+    expect(await quota.validateJobNoticeAuthority(noticeAuthority)).toBe(false);
     await pool.query('UPDATE account_control SET control_epoch=$1 WHERE singleton=true',[controlEpoch]);
-    expect(await quota.validateFailureNoticeAuthority(noticeAuthority)).toBe(true);
+    expect(await quota.validateJobNoticeAuthority(noticeAuthority)).toBe(true);
     const queryAt=new Date().toISOString();
-    await quota.saveSnapshot({provider:'claude',requestedAt:queryAt,fetchedAt:queryAt,stale:false,snapshot:{windows:[
+    await quota.saveSnapshot({sourceId:'claude',requestedAt:queryAt,fetchedAt:queryAt,stale:false,snapshot:{windows:[
       {label:'一般工作階段額度',usedPercent:0,blocksProvider:true,resetsAt:null},
       {label:'一般每週額度',usedPercent:60,blocksProvider:true,resetsAt:null},
       {label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-02T00:00:00Z'},
     ]}});
     expect((await quota.get('claude'))?.blocked).toBe(false);
-    await quota.saveSnapshot({provider:'claude',requestedAt:new Date(Date.now()+5).toISOString(),fetchedAt:new Date(Date.now()+5).toISOString(),stale:false,
+    await quota.saveSnapshot({sourceId:'claude',requestedAt:new Date(Date.now()+5).toISOString(),fetchedAt:new Date(Date.now()+5).toISOString(),stale:false,
       snapshot:{windows:[{label:'一般工作階段額度',usedPercent:100,blocksProvider:true,resetsAt:'2026-11-01T00:00:00Z'},
         {label:'一般每週額度',usedPercent:100,blocksProvider:true,resetsAt:'2026-11-05T00:00:00Z'},
         {label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-03T00:00:00Z'}]}});
-    expect(await quota.get('claude')).toMatchObject({blocked:true,recoveryAt:'2026-11-05T00:00:00.000Z'});
-    await quota.saveSnapshot({provider:'claude',requestedAt:new Date(Date.now()+10).toISOString(),fetchedAt:new Date(Date.now()+10).toISOString(),stale:false,
-      snapshot:{availabilityKnown:false,windows:[{label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-02T00:00:00Z'}]}});
-    expect(await quota.get('claude')).toMatchObject({blocked:true,recoveryAt:'2026-11-05T00:00:00.000Z'});
-    await quota.saveSnapshot({provider:'claude',requestedAt:new Date(Date.now()+15).toISOString(),fetchedAt:new Date(Date.now()+15).toISOString(),stale:false,
+    // CTA rule: the recovery time is the earliest reset time of the exhausted windows (the old rule took the latest one).
+    expect(await quota.get('claude')).toMatchObject({blocked:true,recoveryAt:'2026-11-01T00:00:00.000Z'});
+    // Usage without a deciding window gives no evidence. The reset time is still in the future for this clock, so the block stays.
+    await quota.observe({sourceId:'claude',requestedAt:new Date(Date.now()+10).toISOString(),now:new Date('2026-10-31T00:00:00Z'),
+      snapshot:{fetchedAt:new Date(Date.now()+10).toISOString(),stale:false,availabilityKnown:false,windows:[{label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-02T00:00:00Z'}]}});
+    expect(await quota.get('claude')).toMatchObject({blocked:true,recoveryAt:'2026-11-01T00:00:00.000Z'});
+    await quota.saveSnapshot({sourceId:'claude',requestedAt:new Date(Date.now()+15).toISOString(),fetchedAt:new Date(Date.now()+15).toISOString(),stale:false,
       snapshot:{availabilityKnown:true,windows:[{label:'一般工作階段額度',usedPercent:20,blocksProvider:true,resetsAt:null},
         {label:'一般每週額度',usedPercent:57,blocksProvider:true,resetsAt:null},
         {label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-02T00:00:00Z'}]}});
     expect(await quota.get('claude')).toMatchObject({blocked:false});
     const refusalAt=new Date(Date.now()-2_000).toISOString();
-    await quota.recordFailure({provider:'codex',observedAt:refusalAt,recoveryAt:null,source:'test refusal',evidence:'limit'});
-    await quota.saveSnapshot({provider:'codex',requestedAt:new Date(Date.now()-3_000).toISOString(),fetchedAt:new Date().toISOString(),stale:false,
+    await quota.recordQuotaFailure({sourceId:'codex',kind:'quota_exhausted',observedAt:refusalAt,recoveryAt:null,evidence:'limit'});
+    // CTA rule: only usage fetched after the failure can unblock. Usage fetched before the failure is ignored.
+    await quota.saveSnapshot({sourceId:'codex',requestedAt:new Date(Date.now()-3_000).toISOString(),fetchedAt:new Date(Date.now()-3_000).toISOString(),stale:false,
       snapshot:{provider:'codex',windows:[{usedPercent:12,resetsAt:null}]}});
     expect((await quota.get('codex'))?.blocked).toBe(true);
-    await quota.saveSnapshot({provider:'codex',requestedAt:new Date().toISOString(),fetchedAt:new Date().toISOString(),stale:true,
+    await quota.saveSnapshot({sourceId:'codex',requestedAt:new Date().toISOString(),fetchedAt:new Date().toISOString(),stale:true,
       snapshot:{provider:'codex',windows:[]}});
     expect((await quota.get('codex'))?.blocked).toBe(true);
-    await quota.saveSnapshot({provider:'codex',requestedAt:new Date(Date.now()+5).toISOString(),fetchedAt:new Date(Date.now()+5).toISOString(),stale:false,
+    await quota.saveSnapshot({sourceId:'codex',requestedAt:new Date(Date.now()+5).toISOString(),fetchedAt:new Date(Date.now()+5).toISOString(),stale:false,
       snapshot:{provider:'codex',windows:[{usedPercent:12,resetsAt:null}]}});
     expect((await quota.get('codex'))?.blocked).toBe(false);
-    await pool.query(`INSERT INTO provider_quota_state(provider,blocked,snapshot,snapshot_fetched_at,snapshot_stale)
-      VALUES('codex',false,'{"availabilityKnown":true,"windows":[{"blocksProvider":true,"usedPercent":40}]}'::jsonb,now(),false)
-      ON CONFLICT(provider) DO UPDATE SET blocked=false,snapshot='{"availabilityKnown":true,"windows":[{"blocksProvider":true,"usedPercent":40}]}'::jsonb,snapshot_fetched_at=now(),snapshot_stale=false`);
-    expect(await quota.createProposal(originalJobId,'codex',new Date(Date.now()+60_000).toISOString())).toBe(true);
-    expect(await quota.createProposal(originalJobId,'codex',new Date(Date.now()+60_000).toISOString())).toBe(true);
-    await pool.query(`DELETE FROM account_administrators WHERE account_id='account-A' AND user_id=$1`,[senderId]);
-    expect(await agents.acceptQuotaRetry({jobId:originalJobId,senderId,messageId:confirm.messageId,targetProvider:'codex',
-      workerInstanceId:'quota-worker',controlEpoch})).toBeNull();
-    await pool.query(`INSERT INTO account_administrators(account_id,chat_type,chat_id,user_id,role)
-      VALUES('account-A','direct','quota-admin-chat',$1,'PRIMARY_ADMIN')`,[senderId]);
-    await quota.saveSnapshot({provider:'codex',requestedAt:new Date(Date.now()+10).toISOString(),fetchedAt:new Date(Date.now()+10).toISOString(),stale:false,
-      snapshot:{availabilityKnown:false,windows:[{label:'Fable 專用每週額度',usedPercent:57,blocksProvider:false,resetsAt:'2026-11-02T00:00:00Z'}]}});
-    expect(await agents.acceptQuotaRetry({jobId:originalJobId,senderId,messageId:confirm.messageId,targetProvider:'codex',
-      workerInstanceId:'quota-worker',controlEpoch})).toBeNull();
-    await quota.saveSnapshot({provider:'codex',requestedAt:new Date(Date.now()+15).toISOString(),fetchedAt:new Date(Date.now()+15).toISOString(),stale:false,
-      snapshot:{availabilityKnown:true,windows:[{label:'一般工作階段額度',usedPercent:40,blocksProvider:true,resetsAt:null}]}});
-    const accepted=await agents.acceptQuotaRetry({jobId:originalJobId,senderId,messageId:confirm.messageId,targetProvider:'codex',
-      workerInstanceId:'quota-worker',controlEpoch});
-    expect(accepted).toMatchObject({sourceType:'line',status:'queued',accountId:key.accountId,chatId:key.chatId});
-    await quota.createNotice(accepted!.jobId);
-    expect(await quota.claimNotice(accepted!.jobId)).toBe(true);
-    expect(await quota.claimNotice(accepted!.jobId)).toBe(false);
-    const retry=await pool.query<{provider:string;retry_of_job_id:string;source_message_id:string}>(
-      'SELECT provider,retry_of_job_id,source_message_id FROM agent_jobs WHERE job_id=$1',[accepted!.jobId]);
-    expect(retry.rows[0]).toMatchObject({provider:'codex',retry_of_job_id:originalJobId,source_message_id:original.messageId});
-    expect((await pool.query<{status:string}>('SELECT status FROM agent_jobs WHERE job_id=$1',[originalJobId])).rows[0]?.status).toBe('failed');
-    expect(await settings.getConversationAgent(key)).toEqual({enabled:false,provider:'codex'});
-    expect(await agents.acceptQuotaRetry({jobId:originalJobId,senderId,messageId:confirm.messageId,targetProvider:'codex',
-      workerInstanceId:'quota-worker',controlEpoch})).toBeNull();
-    const admitted=await messages.ingestAndRoute({...envelope(key.chatId),messageId:`quota-following-${++sequence}`},route);
-    expect(admitted.jobId).toBeTruthy();
   });
 });

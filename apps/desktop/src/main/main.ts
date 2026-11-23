@@ -9,6 +9,7 @@ import { createIpcAdapter, createReadAdapter } from './ipc.js';
 import { createDisconnectedFacade } from './service-facade.js';
 import type { DesktopServiceFacade } from './service-facade.js';
 import { createForwardNotifier } from './services/forward-notifier.js';
+import { MAX_INTERNAL_MCP_CAPABILITIES } from './services/internal-mcp-capabilities.js';
 import { createConnectedFacade, type OfficialSnapshotImporter } from './connected-facade.js';
 import { createUtilityWorkerGateway, MAX_UTILITY_WORKERS } from './utility-worker-gateway.js';
 import { createDesktopLifecycle, parseDesktopCommand, routeSecondInstance, runSessionEndSteps, shutdownServices, type DesktopLifecycleFailure } from './desktop-lifecycle.js';
@@ -240,7 +241,10 @@ async function initializeServices(): Promise<void> {
     reportRuntimeFailure(diagnosticFailure('native_reader', 'bootstrap', error));
   }
   const bridge = new AgentCliBridge({ enabled: agentBridgeEnabled(process.env), resolveWorkspaceRoots: async () => [await workspaceAuthority.current()], runner: new NodeProcessRunner({ hostFile: jobHostFile }),
-    validateResumeSession: (request) => agents.validateResumeSession(request) });
+    validateResumeSession: (request) => agents.validateResumeSession(request),
+    spillDirectory: path.join(app.getPath('userData'), 'agent', 'spawn-args'),
+    accountsDirectory: path.join(app.getPath('userData'), 'llm-accounts'),
+    maxResidents: MAX_INTERNAL_MCP_CAPABILITIES - 3 });
   startupCleanup.add(() => bridge.shutdown());
   // Local log of the HTTP requests to LINE hosts. It only observes; a failure inside it never reaches a request.
   const trafficLogDir = path.join(app.getPath('userData'), 'logs', 'line-traffic');
@@ -264,6 +268,7 @@ async function initializeServices(): Promise<void> {
     },
     durableCursor: (accountId, signal) => messages.getLiveCursor(accountId, signal),
     chromeLtsmDir: chromeLtsm.rootDir,
+    legyEncrypted: () => settings.getLineLegyEncrypted(),
   });
   startupCleanup.add(() => workers.shutdown());
   const previewPresenter = createElectronPreviewPresenter({
@@ -273,6 +278,7 @@ async function initializeServices(): Promise<void> {
   });
   const publish = createDomainEventPublisher((channel, event) => window?.webContents.send(channel, event));
   const connected = await createConnectedFacade({ pool, workers, agent: bridge, workspaceAuthority, attachmentRoot: bootstrap.attachmentRoot,
+    accountsDirectory: path.join(app.getPath('userData'), 'llm-accounts'),
     // A click on a message-rule notification shows and focuses the main window, then asks the renderer to open the chat.
     forwardNotify: createForwardNotifier({ Notification, onError: (error) => audit.failure(diagnosticFailure('agent', 'execute', error)),
       focusWindow: (notice) => {

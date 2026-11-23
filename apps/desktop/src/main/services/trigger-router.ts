@@ -1,5 +1,6 @@
 import type { AgentLiveliness, AgentProvider, InboundEnvelope } from '@line-agent/contracts';
 import { parseLivelinessWord } from './agent-persona.js';
+import { parseModelCommand, type ModelCommand } from './model-command.js';
 
 export function findOwnMentionRange(
   envelope: InboundEnvelope,
@@ -161,6 +162,8 @@ export type TriggerDecision =
   /** A served non-administrator sent a bare `/agent claude|codex`: reply with the usage hint, change nothing. */
   | { type: 'agent_usage'; provider: AgentProvider }
   | { type: 'agent_quota' }
+  /** Primary Administrator's `/model` or `/model <argument>`: show, set or clear this chat's Claude model. No Agent job. */
+  | { type: 'agent_model'; command: ModelCommand }
   | FreeCommand
   | FolderCommand
   | PersonaCommand
@@ -240,6 +243,9 @@ function routeNormalTrigger(envelope: InboundEnvelope, context: TriggerContext):
     // `default` from anyone else is ordinary text; bare codex/claude gets the usage hint.
     if (switchCommand.provider !== 'default') return { type: 'agent_usage', provider: switchCommand.provider };
   }
+  // `/model` follows the `/agent default` rule: anyone but the Primary Administrator sends ordinary text.
+  const modelCommand = parseModelCommand(text);
+  if (modelCommand && (context.primaryAdmin ?? context.senderIsPrimaryAdmin)) return { type: 'agent_model', command: modelCommand };
   const command = /^\/agent\s+(codex|claude)(?:\s+([\s\S]*))?$/i.exec(text);
   const provider = command ? command[1]!.toLowerCase() as AgentProvider : context.defaultProvider;
   const prompt = (command ? command[2] ?? '' : text).trim();

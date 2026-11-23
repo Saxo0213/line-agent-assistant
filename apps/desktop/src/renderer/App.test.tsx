@@ -215,6 +215,8 @@ function fakeApi(): DesktopApi {
     unsendMessage: vi.fn(async () => accepted),
     getManualUnsendWindow: vi.fn(async () => '1h' as const),
     setManualUnsendWindow: vi.fn(async (window) => window),
+    getLineLegyEncrypted: vi.fn(async () => false),
+    setLineLegyEncrypted: vi.fn(async (enabled) => enabled),
     getAgentPersona: vi.fn(async () => ({ description: '', liveliness: 'normal' as const })),
     setAgentPersona: vi.fn(async (persona) => persona),
     submitAgentRoomPrompt: vi.fn(async () => ({ type: 'submitAgentRoomPrompt', requestId: 'x', ok: true, jobId: 'job-1' } as const)),
@@ -238,6 +240,7 @@ function fakeApi(): DesktopApi {
     adminDownloadBridgeStart: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-1', ok: true as const })),
     adminDownloadBridgeRefreshQr: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-1', ok: true as const })),
     adminDownloadBridgeSetAutoDownload: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-2', ok: true as const })),
+    adminDownloadBridgeSetIntervals: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-4', ok: true as const })),
     adminDownloadBridgeSetDownloadEnabled: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-3', ok: true as const })),
     adminDownloadBridgeClear: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'bridge-1', ok: true as const })),
     lineStart: vi.fn(async () => accepted),
@@ -251,6 +254,17 @@ function fakeApi(): DesktopApi {
     agentLogin: vi.fn(async () => accepted),
     agentLogout: vi.fn(async () => accepted),
     agentRefreshStatus: vi.fn(async () => accepted),
+    agentSourceAdd: vi.fn(async () => accepted),
+    agentSourceRename: vi.fn(async () => accepted),
+    agentSourceRemove: vi.fn(async () => accepted),
+    agentSourceSetDefault: vi.fn(async () => accepted),
+    agentSourceMove: vi.fn(async () => accepted),
+    agentSourceSetFallback: vi.fn(async () => accepted),
+    agentSourceSetAutoFailover: vi.fn(async () => accepted),
+    agentSourceLogin: vi.fn(async () => accepted),
+    agentSourceLogout: vi.fn(async () => accepted),
+    agentSourceRefresh: vi.fn(async () => accepted),
+    agentSourceUsage: vi.fn(async () => accepted),
     stopJob: vi.fn(async () => accepted),
     retryJob: vi.fn(async () => accepted),
     setWorkspace: vi.fn(async () => accepted),
@@ -527,6 +541,16 @@ describe('last visited page', () => {
     await waitFor(() => expect(screen.getByRole('tab', { name: '系統' }).getAttribute('aria-selected')).toBe('true'));
     expect(localStorage.getItem('line-agent:settings-tab')).toBe('system');
     expect(screen.getByText('連線異常')).toBeTruthy();
+  });
+
+  it('shows the connection alert for a degraded account and 查看 opens Settings on 系統', async () => {
+    localStorage.setItem('line-agent:settings-tab', 'work');
+    const api = fakeApi();
+    api.getSnapshot = vi.fn(async () => ({ ...snapshot, accounts: snapshot.accounts.map((entry) => entry.accountId === 'account-A' ? { ...entry, status: 'degraded' as const } : entry) }));
+    render(<App api={api} />);
+    expect(await screen.findByText('工作帳號連線異常')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '查看' }));
+    await waitFor(() => expect(screen.getByRole('tab', { name: '系統' }).getAttribute('aria-selected')).toBe('true'));
   });
 
   it('redirects a failed snapshot read to 系統 and remembers the surviving tab', async () => {

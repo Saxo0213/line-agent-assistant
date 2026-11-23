@@ -3,7 +3,7 @@ name: linejs-mcp
 description: 使用 LINEJS 內建 MCP 工具查詢已封存的 LINE 對話
 ---
 
-- 請將 `list_targets` 結果依 `no` 顯示為編號清單；使用者回覆編號時，使用最近一次結果中該 `no` 對應的 `accountId`、`chatType`、`chatId` 呼叫查詢工具。
+- 需要請使用者選擇對象時，將 `list_targets` 結果依 `no` 顯示為編號清單；使用者回覆編號時，使用最近一次結果中該 `no` 對應的 `accountId`、`chatType`、`chatId` 呼叫查詢工具。
 
 # LINEJS MCP 使用指引
 
@@ -18,10 +18,11 @@ description: 使用 LINEJS 內建 MCP 工具查詢已封存的 LINE 對話
 - 兩個訊息查詢工具都是分頁：每頁最多 200 則（`limit` 超過 200 會被截為 200），輸出含 `hasMore`、`nextCursor` 與 `page`。`hasMore` 為 true 時，用相同條件加上 `cursor=nextCursor` 再呼叫，直到 `hasMore` 為 false；逐頁整理後再合併。`cursor` 只能搭配同一組查詢條件。除非最後一頁（`hasMore=false`）仍沒有訊息，否則不要說某個時段沒有訊息。
 
 - `query_agent_room_history`：讀取 Agent 室的對話紀錄（管理者的提問與 Agent 的最終回覆，最新在前）。只有在 Agent 室，或與管理者的 1:1 LINE 私訊（Agent 室共用該私訊紀錄時）才有這個工具；沒有就是不可用。參數：`query`（關鍵字）、`provider`、`from` / `to`（ISO-8601）、`cursor`、`limit`。每筆有 `origin`（`agent_room` 或 `line_admin_direct`），文字被截斷時 `promptTruncated` / `replyTruncated` 為 true；用回傳的 `nextCursor` 取下一頁。
+- `read_message_attachment`：用訊息紀錄中的 `attachmentId` 取得該附件（圖片、影片、語音、檔案）的本機副本。結果的 `available` 為 true 時，用檔案讀取工具開啟 `absolutePath`；為 false 時，`reason` 說明檔案不在這台電腦上。它不會從 LINE 下載；檔案已過期或下載失敗時，會先找本機下載資料夾中同名且大小相同的檔案。
 
 ## 原則
 
-1. 先 `list_targets` 確認對象，再查訊息；多個候選時請使用者確認，不要猜。
+1. 先依對話情境判斷使用者要的結果，再決定做法。用 `list_targets` 找對象；有多個候選時自行判斷：查詢、找資料、摘要這類唯讀工作，能一起查就全部查，並標明每筆結果的來源（例如同一人的個人與群組對話都查）。只有在選錯會造成難以挽回的動作（傳送、轉發、刪除、變更設定）、不同解讀的結果差很多且無法一起處理，或範圍大到不合理時，才請使用者確認；確認時先附上已查到的內容。不要猜測不存在的對象。
 2. 有時間條件就用 `query_target_messages_by_time`，並盡量縮小範圍；訊息多時依分頁規則逐頁讀完，不要只看第一頁就下結論。只想處理有新訊息的聊天室時，先用 `list_active_chats` 看哪些聊天室有訊息與數量，再只讀需要的聊天室。
 3. 可用的工具與查詢範圍由管理者的「權限」設定決定：預設只能查詢觸發你的這個聊天室（管理者另有授權的連結群組除外）。看到 `PERMISSION_DENIED` 或工具清單中沒有某個工具，就是未被允許，請如實告知，不要嘗試繞過。你的工作目錄是這個聊天室專屬的資料夾，筆記與整理過的內容請放在那裡。
 4. 工具回傳「無權限」、「帳號已暫停」或「工具未載入」時，如實告知使用者，不要編造內容，也不要改用其他方式繞過。
@@ -30,6 +31,7 @@ description: 使用 LINEJS 內建 MCP 工具查詢已封存的 LINE 對話
 7. 提到聊天類型時，一律使用本應用程式的用語：個人（direct）、群組（group）、聊天室（room）、社群（community）、討論串（thread）。不要自創其他說法，例如「一對一」。
 8. 對話紀錄（`query_agent_room_history`）：只在需要先前對話內容時才查；先用關鍵字縮小範圍，必要時再加 `provider` 或時間；不要一頁一頁把紀錄全部讀完，找到需要的內容就停止。
 9. 本機 Agent 室不屬於任何 LINE 帳號，與選取哪個帳號無關；從 Agent 室查詢時，查詢範圍涵蓋操作者看得到的所有帳號（已暫停的帳號除外）。沒有任何帳號或查無紀錄時，如實說沒有紀錄。
+10. 使用者詢問某個檔案或附件時，先用訊息查詢找到那則訊息，再呼叫 `read_message_attachment`，最後開啟回傳的檔案；在呼叫這個工具之前，不要告訴使用者需要重新下載檔案。
 
 ## 總結
 

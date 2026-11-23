@@ -478,7 +478,7 @@ database('connected facade account login semantics', () => {
       async shutdown() {},
     };
     await pool.query("INSERT INTO app_settings(key,value) VALUES ('workspace_path',$1::jsonb)", [JSON.stringify('Z:\\missing-workspace-recovery')]);
-    facade = await createConnectedFacade({ pool, workers, agent, attachmentRoot: 'C:\\attachments', mediaCacheRoot: join(secretRoot, 'line-media-cache'),
+    facade = await createConnectedFacade({ pool, workers, agent, attachmentRoot: 'C:\\attachments', mediaCacheRoot: join(secretRoot, 'line-media-cache'), accountsDirectory: join(secretRoot, 'llm-accounts'),
       previewPresenter: { async present() { return false; }, closeAll() {} }, secretStore, audit, runMigrations: false,
       chatResourceStore: archiveStore,
       publish(event) { published.push(event); } });
@@ -1217,6 +1217,24 @@ database('connected facade account login semantics', () => {
         { type: 'lineLoginState', accountId: 'auto-failure-event-agent', loginAttemptId: attempt, state: 'degraded', message: 'LINE login failed. Try again.' }]);
       expect(auditEvents.find((event) => event.diagnostic?.reason === 'LOGIN_FAILED')?.diagnostic).toMatchObject({ detail: 'fetch_identity:TypeError' });
       expect((await secretStore.load('auto-failure-event-agent'))?.token).toBe('token-auto-failure-event-agent');
+    });
+
+    it('moves the account to reauth_required and keeps the secrets when LINE rejects a token login with HTTP 4xx', async () => {
+      await addStoredAccounts('auto-rejected-agent');
+      await storeToken('auto-rejected-agent');
+      await new AccountRepository(pool).setAutoLoginOnStartup('auto-rejected-agent', true);
+      await restartFacade();
+      const attempt = (commands.filter((command) => command.type === 'loginToken' && command.accountId === 'auto-rejected-agent')
+        .at(-1)! as { loginAttemptId: string }).loginAttemptId;
+      const binding = bindings.get('auto-rejected-agent')!;
+      published = [];
+      await workerEventHandler?.(binding.workerInstanceId, { type: 'loginFailure', ...binding, loginAttemptId: attempt,
+        code: 'LOGIN_FAILED', message: 'LINE login failed. Try again.', detail: 'credential_swap:Error:getProfile:http404:unparsable_response',
+        upstreamStatus: 404 });
+      await vi.waitFor(async () => expect((await pool.query("SELECT status FROM line_accounts WHERE account_id='auto-rejected-agent'")).rows[0]).toEqual({ status: 'reauth_required' }));
+      expect(published.filter((event) => event.type === 'lineLoginState')).toEqual([
+        { type: 'lineLoginState', accountId: 'auto-rejected-agent', loginAttemptId: attempt, state: 'reauth_required', message: 'LINE login failed. Try again.' }]);
+      expect((await secretStore.load('auto-rejected-agent'))?.token).toBe('token-auto-rejected-agent');
     });
 
     it('makes one opted-in startup restore attempt and preserves the secret after failure', async () => {
@@ -3109,6 +3127,46 @@ database('connected facade account login semantics', () => {
     expect(await facade.dispatch({type:'getSnapshot',requestId:'after-close'})).toMatchObject({ok:false,code:'SERVICE_CLOSING'});
   });
 
+  it('adds, defaults and removes a CLI account source, and sends the effective default account to the login', async () => {
+    const added = await facade.dispatch({ type: 'agentSourceAdd', requestId: 'source-add', provider: 'claude', label: 'Work' });
+    if (!added.ok || added.type !== 'agentSourceAdd') throw new Error('add failed');
+    const id = added.sources.find((source) => source.kind === 'managed')!.id;
+    expect(id).toMatch(/^acct-[0-9a-f]{10}$/);
+    await access(join(secretRoot, 'llm-accounts', id, '.linejs-managed-account'));
+    expect(published).toContainEqual(expect.objectContaining({ type: 'snapshotChanged', snapshot: expect.objectContaining({
+      agentAccountSources: expect.arrayContaining([expect.objectContaining({ id, label: 'Work', isDefault: false })]) }) }));
+
+    const set = await facade.dispatch({ type: 'agentSourceSetDefault', requestId: 'source-default', provider: 'claude', id });
+    expect(set).toMatchObject({ ok: true, sources: expect.arrayContaining([expect.objectContaining({ id, isDefault: true })]) });
+    const openLogin = vi.fn(async () => ({ ok: true }));
+    agent.openLogin = openLogin;
+    await facade.dispatch({ type: 'agentLogin', requestId: 'default-login', provider: 'claude' });
+    expect(openLogin).toHaveBeenCalledWith('claude', { id, kind: 'managed' });
+
+    expect(await facade.dispatch({ type: 'agentSourceSetDefault', requestId: 'wrong-provider', provider: 'codex', id }))
+      .toMatchObject({ ok: false, code: 'ACCOUNT_SOURCE_PROVIDER_MISMATCH' });
+    expect(await facade.dispatch({ type: 'agentSourceRemove', requestId: 'remove-system', id: 'claude' }))
+      .toMatchObject({ ok: false, code: 'ACCOUNT_SOURCE_SYSTEM' });
+    expect(await facade.dispatch({ type: 'agentSourceRemove', requestId: 'remove-missing', id: 'acct-ffffffffff' }))
+      .toMatchObject({ ok: false, code: 'ACCOUNT_SOURCE_NOT_FOUND' });
+
+    const removed = await facade.dispatch({ type: 'agentSourceRemove', requestId: 'source-remove', id });
+    expect(removed).toMatchObject({ ok: true });
+    await expect(access(join(secretRoot, 'llm-accounts', id))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await pool.query('SELECT 1 FROM agent_account_sources WHERE source_id = $1', [id])).rowCount).toBe(0);
+  });
+
+  it('sets the automatic source failover switch, publishes it in the snapshot, and defaults to on', async () => {
+    expect(await facade.dispatch({ type: 'agentSourceSetAutoFailover', requestId: 'failover-off', enabled: false }))
+      .toMatchObject({ ok: true, type: 'agentSourceSetAutoFailover', enabled: false });
+    expect((await pool.query("SELECT value FROM app_settings WHERE key='agent_auto_failover_enabled'")).rows[0].value).toBe(false);
+    expect(published).toContainEqual(expect.objectContaining({ type: 'snapshotChanged', snapshot: expect.objectContaining({ agentAutoFailoverEnabled: false }) }));
+    published.length = 0;
+    await facade.dispatch({ type: 'agentSourceSetAutoFailover', requestId: 'failover-on', enabled: true });
+    // The snapshot publisher coalesces to one run per second, so the on value reaches the snapshot a little later.
+    await vi.waitFor(() => expect(published).toContainEqual(expect.objectContaining({ type: 'snapshotChanged', snapshot: expect.objectContaining({ agentAutoFailoverEnabled: true }) })), { timeout: 4000 });
+  });
+
   it('refreshes provider status without invoking login or logout and publishes the result', async () => {
     const agentRefreshStatus = vi.fn(async () => ({ status: 'authenticated' as const }));
     const getAuthStatus = vi.fn(async () => ({ status: 'logged_out' as const }));
@@ -3122,7 +3180,7 @@ database('connected facade account login semantics', () => {
     const result = await facade.dispatch({type:'agentRefreshStatus',requestId:'refresh-auth',provider:'codex'});
 
     expect(result).toMatchObject({type:'accepted',ok:true});
-    expect(agentRefreshStatus).toHaveBeenCalledExactlyOnceWith('codex');
+    expect(agentRefreshStatus).toHaveBeenCalledExactlyOnceWith('codex', { id: 'codex', kind: 'system' });
     expect(getAuthStatus).not.toHaveBeenCalled();
     expect(openLogin).not.toHaveBeenCalled();
     expect(logout).not.toHaveBeenCalled();

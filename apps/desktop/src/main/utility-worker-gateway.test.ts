@@ -697,6 +697,22 @@ describe('utility worker gateway', () => {
     await gateway.shutdown();
   });
 
+  it('sends the LEGY encrypted setting in the init of DESKTOPWIN workers only, and a failed read means false', async () => {
+    const children: FakeChild[] = [];
+    const spawn = () => { const child = new FakeChild(); children.push(child); return child; };
+    const on = createUtilityWorkerGateway({ durableCursor: async () => null, legyEncrypted: async () => true, spawn });
+    await on.start('a1', { accountId: 'a1', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await on.start('a2', { accountId: 'a2', workerInstanceId: 'w2', controlEpoch: 1, mode: 'ACTIVE_CONTROL', lineTransport: 'CHROMEOS' });
+    const failing = createUtilityWorkerGateway({ durableCursor: async () => null, legyEncrypted: async () => { throw new Error('read failed'); }, spawn });
+    await failing.start('a3', { accountId: 'a3', workerInstanceId: 'w3', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    const [desktopOn, chrome, desktopFailed] = children.map((child) => child.posted[0] as Record<string, unknown>);
+    expect(desktopOn).toMatchObject({ type: 'init', legyEncrypted: true });
+    expect(LineWorkerCommandSchema.safeParse(desktopOn).success).toBe(true);
+    expect(Object.hasOwn(chrome!, 'legyEncrypted')).toBe(false);
+    expect(desktopFailed).toMatchObject({ type: 'init', legyEncrypted: false });
+    await on.shutdown(); await failing.shutdown();
+  });
+
   it('passes lineTransport and the ltsm store root to a CHROMEOS worker only', async () => {
     const children: FakeChild[] = [];
     const gateway = createUtilityWorkerGateway({ durableCursor: async () => null, chromeLtsmDir: 'C:/ltsm',

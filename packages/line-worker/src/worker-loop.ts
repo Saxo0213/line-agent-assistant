@@ -36,6 +36,10 @@ const FRIEND_ADD_LOCAL_FAILURES = new Set(['SIDE_EFFECT_DENIED', 'NOT_STARTED', 
 const CHAT_DETAIL_BATCH_LIMIT = 100;
 export const LOGOUT_DEADLINE_MS = 10_000;
 export const SYNC_CONFIRMED_INTERVAL_MS = 60_000;
+/** Wait after the 1st, 2nd, 3rd, 4th and 5th (or later) consecutive failed poll. */
+const POLL_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000, 300_000] as const;
+const POLL_SUSPEND_AFTER_REJECTIONS = 5;
+const SUSPENDED = 'LINE_CONNECTION_SUSPENDED';
 function safeFriendAddResult(result: FriendAddResult): FriendAddResult {
   if (result.status === 'added') return { status: 'added', error: null };
   if (result.status === 'failed' && typeof result.error === 'string' &&
@@ -55,6 +59,8 @@ export interface LineTransport {
   listConversationDetails?(chatIds: readonly string[]): Promise<readonly ConversationCatalogItem[]>;
   refreshOwnProfile?(): Promise<TransportIdentity>;
   sync(cursor: TalkCursorV1Dto): Promise<SyncResult>;
+  /** Optional: physical HTTP status of the last `sync` attempt, or null when none was seen. */
+  lastSyncHttpStatus?(): number | null;
   history(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string },
     cursor: HistoryCursorV1 | null, limit: number): Promise<readonly unknown[]>;
   readChatResource?(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>): Promise<Readonly<{
@@ -196,6 +202,10 @@ export class LineWorkerLoop {
   #receiveGeneration = 0;
   readonly #usedEffectPermits = new Set<string>();
   #syncFailures = 0;
+  // Poll backoff and suspension. Only a new worker clears `#connectionSuspended`.
+  #pollBackoffUntil = 0;
+  #rejectedPolls = 0;
+  #connectionSuspended = false;
   #lastSyncConfirmedAt = 0;
   #sending = false;
   #currentSend: Promise<void> | undefined;
@@ -385,6 +395,8 @@ export class LineWorkerLoop {
       }
       case 'poll':
         if (!this.#ownMid || this.#loginInFlight || this.#secretRestoreInFlight) return;
+        // Suspension and backoff skip the catalog and detail ticks too, so they send no request.
+        if (this.#connectionSuspended || Date.now() < this.#pollBackoffUntil) return;
         this.#catalogRefreshPollTick();
         this.#detailRefreshPollTick();
         await this.#withTransportCall(() => this.#poll());
@@ -412,9 +424,15 @@ export class LineWorkerLoop {
         } else if (startupFinal) this.#startupFinalBatchId = undefined;
         return;
       case 'history':
+        if (this.#connectionSuspended) throw new Error(SUSPENDED);
         await this.#withTransportCall(() => this.#history(command));
         return;
       case 'chatResourceRead':
+        if (this.#connectionSuspended) {
+          await this.#emit({ type: 'chatResourceResult', ...this.#identity(), chatType: command.chatType, chatId: command.chatId,
+            requestId: command.requestId, action: command.action, ok: false, error: SUSPENDED });
+          return;
+        }
         await this.#withTransportCall(() => this.#chatResourceRead(command));
         return;
       case 'refreshOwnProfile': {
@@ -425,6 +443,7 @@ export class LineWorkerLoop {
         }
         this.#profileReadInFlight = true;
         try {
+          if (this.#connectionSuspended) throw new Error(SUSPENDED);
           if (!this.#ownMid || !this.#transport.refreshOwnProfile) throw new Error('PROFILE_READ_UNAVAILABLE');
           const profile = await this.#withTransportCall(() => this.#transport.refreshOwnProfile!());
           if (this.#stopped || this.#revoked || profile.ownMid !== this.#ownMid) throw new Error('PROFILE_MISMATCH');
@@ -433,7 +452,7 @@ export class LineWorkerLoop {
         } catch (error) {
           await this.#emit({ type: 'ownProfileResult', ...this.#identity(), requestId: command.requestId, ok: false,
             error: isLineServerRejection(error) ? error.code
-              : error instanceof Error && ['PROFILE_READ_UNAVAILABLE', 'PROFILE_MISMATCH'].includes(error.message) ? error.message : 'PROFILE_READ_FAILED' });
+              : error instanceof Error && ['PROFILE_READ_UNAVAILABLE', 'PROFILE_MISMATCH', SUSPENDED].includes(error.message) ? error.message : 'PROFILE_READ_FAILED' });
         } finally { this.#profileReadInFlight = false; }
         return;
       }
@@ -476,6 +495,12 @@ export class LineWorkerLoop {
         return;
       case 'sendText':
       case 'manualSendText':
+        if (this.#connectionSuspended) {
+          await this.#emit({ type: 'sendResult', ...this.#identity(), requestId: command.requestId,
+            operationId: command.operationId, attemptId: command.attemptId,
+            status: 'failed', messageId: null, error: SUSPENDED });
+          return;
+        }
         if (this.#currentSend) {
           await this.#emit({ type: 'sendResult', ...this.#identity(), requestId: command.requestId,
             status: 'failed', messageId: null, error: 'SIDE_EFFECT_DENIED' });
@@ -485,6 +510,12 @@ export class LineWorkerLoop {
         try { await this.#currentSend; } finally { this.#currentSend = undefined; }
         return;
       case 'sendMedia':
+        if (this.#connectionSuspended) {
+          await this.#emit({ type: 'sendResult', ...this.#identity(), requestId: command.requestId,
+            operationId: command.operationId, attemptId: command.attemptId,
+            status: 'failed', messageId: null, error: SUSPENDED });
+          return;
+        }
         if (this.#currentSend) {
           await this.#emit({ type: 'sendResult', ...this.#identity(), requestId: command.requestId,
             operationId: command.operationId, attemptId: command.attemptId,
@@ -495,15 +526,32 @@ export class LineWorkerLoop {
         try { await this.#currentSend; } finally { this.#currentSend = undefined; }
         return;
       case 'reactMessage':
+        // A reaction has no result event; it ends without a LINE request.
+        if (this.#connectionSuspended) throw new Error(SUSPENDED);
         await this.#reactMessage(command);
         return;
       case 'unsendMessage':
+        if (this.#connectionSuspended) {
+          await this.#emit({ type: 'unsendResult', ...this.#identity(), chatType: command.chatType, chatId: command.chatId,
+            requestId: command.requestId, messageId: command.messageId, status: 'failed', error: SUSPENDED });
+          return;
+        }
         await this.#unsendMessage(command);
         return;
       case 'checkFriendRelation':
+        if (this.#connectionSuspended) {
+          await this.#emit({ type: 'friendRelationResult', ...this.#identity(), requestId: command.requestId,
+            targetMid: command.targetMid, status: 'unknown', error: SUSPENDED });
+          return;
+        }
         await this.#checkFriendRelation(command);
         return;
       case 'addFriendByMid':
+        if (this.#connectionSuspended) {
+          await this.#emit({ type: 'addFriendResult', ...this.#identity(), requestId: command.requestId,
+            targetMid: command.targetMid, status: 'failed', error: SUSPENDED });
+          return;
+        }
         await this.#addFriend(command);
         return;
       case 'revokeControl':
@@ -613,7 +661,7 @@ export class LineWorkerLoop {
 
   #detailRefreshPollTick(): void {
     if (!this.#catalogRefreshComplete || this.#catalogRefreshFlight || this.#detailFlight || !this.#ownMid
-      || this.#revoked || this.#authInvalidated || !this.#transport.listConversationDetails) return;
+      || this.#revoked || this.#authInvalidated || this.#connectionSuspended || !this.#transport.listConversationDetails) return;
     if (this.#catalogPollTicks < this.#detailRetryAtTick) return;
     for (const chatId of this.#pendingDetailIds) if (this.#knownChatIds.has(chatId)) this.#pendingDetailIds.delete(chatId);
     const chatIds = [...this.#pendingDetailIds].slice(0, CHAT_DETAIL_BATCH_LIMIT);
@@ -648,7 +696,7 @@ export class LineWorkerLoop {
 
   #catalogRefreshPollTick(): void {
     this.#catalogPollTicks += 1;
-    if (this.#catalogRefreshComplete || !this.#ownMid || this.#revoked || this.#authInvalidated) return;
+    if (this.#catalogRefreshComplete || !this.#ownMid || this.#revoked || this.#authInvalidated || this.#connectionSuspended) return;
     if (this.#catalogRefreshFlight) {
       this.#catalogRequested = true;
       return;
@@ -657,7 +705,7 @@ export class LineWorkerLoop {
   }
 
   #startCatalogRefresh(): void {
-    if (this.#catalogRefreshComplete || !this.#ownMid || this.#revoked || this.#authInvalidated) return;
+    if (this.#catalogRefreshComplete || !this.#ownMid || this.#revoked || this.#authInvalidated || this.#connectionSuspended) return;
     if (this.#catalogRefreshFlight) {
       this.#catalogRequested = true;
       return;
@@ -761,14 +809,30 @@ export class LineWorkerLoop {
         if (receiveGeneration !== this.#receiveGeneration) return;
         const recovered = this.#syncFailures >= 5;
         this.#syncFailures = 0;
+        this.#pollBackoffUntil = 0;
+        this.#rejectedPolls = 0;
+        this.#connectionSuspended = false;
         if (recovered) await this.#emit({ type: 'status', ...this.#identity(), state: 'ready', message: null });
       } catch (error) {
         this.#syncFailures += 1;
+        this.#pollBackoffUntil = Date.now() + POLL_BACKOFF_MS[Math.min(this.#syncFailures, POLL_BACKOFF_MS.length) - 1]!;
+        // A server rejection is a LINE error code or an HTTP status that is neither 410 nor 2xx.
+        const httpStatus = this.#transport.lastSyncHttpStatus?.() ?? null;
+        const serverRejection = isLineServerRejection(error)
+          || (typeof httpStatus === 'number' && httpStatus !== 410 && (httpStatus < 200 || httpStatus > 299));
+        if (serverRejection) this.#rejectedPolls += 1;
         if (isLineServerRejection(error)) await this.#emit({ type: 'error', ...this.#identity(),
           code: error.code, message: error.code, retryable: false,
           diagnostic: { operation: 'poll', stage: 'response', category: 'denied', recovery: 'none',
             upstreamCode: error.upstreamCode } });
-        if (this.#syncFailures === 5) {
+        if (serverRejection && this.#rejectedPolls >= POLL_SUSPEND_AFTER_REJECTIONS && !this.#connectionSuspended) {
+          this.#connectionSuspended = true;
+          await this.#emit({ type: 'status', ...this.#identity(), state: 'degraded', message: 'LINE_CONNECTION_SUSPENDED' });
+          await this.#emit({ type: 'error', ...this.#identity(), code: 'LINE_CONNECTION_SUSPENDED',
+            message: 'LINE_CONNECTION_SUSPENDED', retryable: false,
+            diagnostic: { operation: 'poll', stage: 'response', category: 'denied', recovery: 'reopen_app', outcome: 'failed',
+              ...(typeof httpStatus === 'number' && httpStatus >= 100 && httpStatus <= 599 ? { upstreamStatus: httpStatus } : {}) } });
+        } else if (this.#syncFailures === 5 && !this.#connectionSuspended) {
           await this.#emit({ type: 'status', ...this.#identity(), state: 'degraded',
             message: isLineServerRejection(error) ? error.message : null });
         }
@@ -893,6 +957,7 @@ export class LineWorkerLoop {
     let acquired = false;
     let stage: 'PREPARE' | 'LINE_DOWNLOAD' | 'STORE' = 'PREPARE';
     try {
+      if (this.#connectionSuspended) throw new SafeAttachmentError(SUSPENDED);
       await this.#acquireDownload(controller.signal);
       acquired = true;
       if (controller.signal.aborted) throw controller.signal.reason;
@@ -901,6 +966,7 @@ export class LineWorkerLoop {
       const volume = await statfs(this.#attachmentRoot);
       if (Number(volume.bavail) * Number(volume.bsize) < this.#minFreeBytes) throw new Error('disk watermark reached');
       stage = 'LINE_DOWNLOAD';
+      if (this.#connectionSuspended) throw new SafeAttachmentError(SUSPENDED);
       if (!this.#ownMid) throw new SafeAttachmentError('ATTACHMENT_METADATA_INVALID');
       const identity: AttachmentDownloadIdentity = { accountId: command.accountId, chatType: command.chatType,
         chatId: command.chatId, ownMid: this.#ownMid, messageId: command.messageId,

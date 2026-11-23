@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {randomUUID} from 'node:crypto';
-import {buildChildEnvironment} from './child-environment.js';
+import {buildChildEnvironment,type AccountEnv} from './child-environment.js';
 import {CLAUDE_MCP_TOOL_TIMEOUT_ENV,INTERNAL_MCP_TOKEN_ENV,LINEJS_MCP_TOOL_TIMEOUT_SEC} from './mcp.js';
 
 export interface ProcessSpec {
@@ -17,6 +17,8 @@ export interface ProcessSpec {
   mcpToken?: string;
   /** Extension-server secrets (generated variable names, or the stdio key names Codex forwards); merged into the child environment only. */
   extraEnv?: Record<string,string>;
+  /** Account source home (CODEX_HOME or CLAUDE_CONFIG_DIR, absolute path). Applied after the whitelist; it replaces an inherited value. */
+  accountEnv?: AccountEnv;
 }
 export interface ExitResult { code: number | null; signal: NodeJS.Signals | null }
 export interface RunningProcess {
@@ -42,6 +44,13 @@ export class NodeProcessRunner implements ProcessRunner {
     // app-issued, well-formed per-run value reaches the provider child.
     const env=buildChildEnvironment(spec.env).env;
     const childEnv:NodeJS.ProcessEnv=spec.mcpToken&&/^li_job_[A-Za-z0-9_-]{43}$/.test(spec.mcpToken)?{...env,[INTERNAL_MCP_TOKEN_ENV]:spec.mcpToken,[CLAUDE_MCP_TOOL_TIMEOUT_ENV]:String(LINEJS_MCP_TOOL_TIMEOUT_SEC*1000)}:env;
+    for(const name of ['CODEX_HOME','CLAUDE_CONFIG_DIR'] as const) {
+      const value=spec.accountEnv?.[name];
+      if(value!==undefined) {
+        if(!isAbsolute(value)) throw new Error('An absolute account directory is required');
+        childEnv[name]=value;
+      }
+    }
     // Extension secrets: only well-formed names, never the capability variable, and never over a variable the runner already set.
     for(const [name,value] of Object.entries(spec.extraEnv ?? {})) {
       if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)&&name!==INTERNAL_MCP_TOKEN_ENV&&childEnv[name]===undefined) childEnv[name]=value;

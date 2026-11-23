@@ -64,7 +64,7 @@ async function run(options: { sourceType?: 'line' | 'ui' | 'schedule'; provider?
     },
     async cancel() {},
   }, undefined, undefined, 1, 30_000, 5_000, 1, undefined, undefined, undefined, undefined, environment,
-  (diagnostic) => { diagnostics.push(diagnostic); }, undefined, undefined, resolveReplyContext);
+  (diagnostic) => { diagnostics.push(diagnostic); }, undefined, resolveReplyContext);
   service.kick(key);
   await service.idle();
   storedPrompt = job.prompt;
