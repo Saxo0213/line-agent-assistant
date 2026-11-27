@@ -1,7 +1,7 @@
 import { CONVERSATION_PICTURE_SQL, CONVERSATION_TITLE_SQL, PEER_CONTACT_JOIN, ownMessageSql, resolveAgentLineage, sharedAdminChatSql } from '@line-agent/database';
 import type { Pool } from 'pg';
 import { boundedSticonRawSql, previewWithSticons, projectSticons } from '../sticon-projection.js';
-import { normalizeDefaultProvider } from './default-provider.js';
+import { effectiveDefaultProvider, noteProviderInstallStatus } from './default-provider.js';
 import { isAttachmentBlockReason, isLocalOnlyConversation, type AgentJobSearchQuery, type AgentJobSummary, type AgentProvider, type AppSnapshot, type ComponentHealth, type ControlSnapshot,
   type ConversationKey, type ConversationSummary, type GeneratedPreview, type MessageContent, type ProviderStatus } from '@line-agent/contracts';
 
@@ -211,6 +211,7 @@ export class HealthService {
 
   setProviderAuthStatus(provider: AgentProvider, status: Omit<ProviderStatus, 'provider'>): void {
     this.providerStatuses.set(provider, { provider, ...status });
+    noteProviderInstallStatus(provider, status.status);
   }
 
   setSwitchPhase(phase: ControlSnapshot['phase'], targetAccountId: string | null): void {
@@ -295,7 +296,7 @@ export class HealthService {
     return {
       control: { epoch: Number(control.rows[0]?.control_epoch ?? 0), activeAccountId: control.rows[0]?.active_account_id ?? null,
         phase: this.phase, targetAccountId: this.targetAccountId },
-      defaultProvider: normalizeDefaultProvider(defaultAgentSetting.rows[0]?.provider),
+      defaultProvider: effectiveDefaultProvider(defaultAgentSetting.rows[0]?.provider),
       queueDepth: Number(count.rows[0]?.count ?? 0),
       accounts: accounts.rows.map((row) => ({ accountId: row.account_id, displayName: row.display_name ?? row.account_id,
         status: row.status, lastSyncedAt: row.last_synced_at?.toISOString() ?? null, mode: row.mode, hasPrimaryAdmin: row.has_primary_admin, autoLoginOnStartup: row.auto_login_on_startup,

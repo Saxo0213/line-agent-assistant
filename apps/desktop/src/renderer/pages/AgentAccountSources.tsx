@@ -94,9 +94,9 @@ export function AgentAccountSources({ api, provider, sources, onStatus }: {
             </span>
             : <strong className="account-source-label">{item.label}</strong>}
           {item.kind === 'system' && <span className="badge">{desktopText('acctSrcSystem')}</span>}
-          {item.isDefault && <span className="badge">{desktopText('acctSrcDefault')}</span>}
+          {item.isDefault && item.status !== 'not_installed' && <span className="badge">{desktopText('acctSrcDefault')}</span>}
           <span className="badge">{statusLabel[item.status]}</span>
-          {item.inUse && <span className="badge">{desktopText('acctSrcInUse')}</span>}
+          {item.inUse && item.status !== 'not_installed' && <span className="badge">{desktopText('acctSrcInUse')}</span>}
         </div>
         <div className="button-row account-source-actions">
           <label className="account-source-fallback"><input type="checkbox" checked={item.fallbackEnabled} disabled={busy} onChange={(event) => void run(item.id, () => api.agentSourceSetFallback(item.id, event.target.checked))} /> {desktopText('acctSrcFallback')}</label>
