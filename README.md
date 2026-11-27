@@ -26,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.392 removes group activation: a group checks only the whitelist (an account-wide member can use the Agent in every group, a member added for one group only in that group). Codex now chats in read-only mode for members without the local workspace permission. The download login prefers the LINE extension installed from the Chrome Web Store and checks it by code features. The saved files dialog can open the chat folder. Install through the app's **Check for updates**. See the [v1.0.390 → v1.0.392 release notes](docs/releases/v1.0.392.md) for the complete changes.
+v1.0.393 makes the **Read project folder** permission default to allow; **Write project folder** still defaults to deny. Install through the app's **Check for updates**. See the [v1.0.392 → v1.0.393 release notes](docs/releases/v1.0.393.md) for the changes, and the [v1.0.392 release notes](docs/releases/v1.0.392.md) for the previous version.
 
 ## Installation
 

@@ -25,7 +25,7 @@ describe('Agent permission registry', () => {
       ['chat_folder.read', 'ALLOW', 'CURRENT_CHAT_FOLDER'],
       ['chat_folder.write', 'ALLOW', 'CURRENT_CHAT_FOLDER'],
       ['agent.local_tools', 'DENY', 'PROVIDER_WORKSPACE'],
-      ['project_folder.read', 'DENY', 'CURRENT_CHAT'],
+      ['project_folder.read', 'ALLOW', 'CURRENT_CHAT'],
       ['project_folder.write', 'DENY', 'CURRENT_CHAT'],
     ]);
     expect(AGENT_PERMISSIONS.find((entry) => entry.id === 'chat_folder.read')?.label).toBe('讀取本聊天室資料夾');

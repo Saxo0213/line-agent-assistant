@@ -36,7 +36,7 @@ export const AGENT_PERMISSIONS = [
   { id: 'agent.local_tools', label: '使用本機工作區（讀檔／執行指令）', description: '允許 Agent 使用 CLI 內建的檔案與指令工具（不受聊天室資料夾限制）。',
     defaultEffect: 'DENY', contextRule: 'PROVIDER_WORKSPACE' },
   { id: 'project_folder.read', label: '讀取專案資料夾', description: '允許 Agent 讀取管理者以 /folder 綁定到本聊天室的公司專案資料夾。',
-    defaultEffect: 'DENY', contextRule: 'CURRENT_CHAT' },
+    defaultEffect: 'ALLOW', contextRule: 'CURRENT_CHAT' },
   { id: 'project_folder.write', label: '寫入專案資料夾', description: '允許 Agent 在管理者以 /folder rw 綁定為可讀寫的專案資料夾內建立與修改檔案。',
     defaultEffect: 'DENY', contextRule: 'CURRENT_CHAT' },
 ] as const satisfies readonly AgentPermissionDefinition[];

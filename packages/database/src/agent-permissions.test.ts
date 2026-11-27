@@ -119,7 +119,7 @@ database('Agent permissions, chat folders and folder links', () => {
     await clearRules();
     const defaults = await resolveUserPermissions(pool, ACCOUNT, 'user-a');
     expect(defaults).toEqual({ 'records.query_current_chat': 'ALLOW', 'records.query_all_chats': 'DENY', 'chat_folder.read': 'ALLOW',
-      'chat_folder.write': 'ALLOW', 'agent.local_tools': 'DENY', 'project_folder.read': 'DENY', 'project_folder.write': 'DENY' });
+      'chat_folder.write': 'ALLOW', 'agent.local_tools': 'DENY', 'project_folder.read': 'ALLOW', 'project_folder.write': 'DENY' });
     await seedLegacy('EVERYONE', null, 'records.query_current_chat', 'DENY');
     expect((await resolveUserPermissions(pool, ACCOUNT, 'user-a', { chatType: 'group', chatId: 'g1' }))['records.query_current_chat']).toBe('DENY');
     await seedLegacy('USER', 'user-a', 'records.query_current_chat', 'ALLOW');
