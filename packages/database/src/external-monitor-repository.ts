@@ -4,7 +4,7 @@ import { ContactDescriptorSchema, InboundEnvelopeSchema, JsonValueSchema, normal
 import { Buffer } from 'node:buffer';
 import type { Pool, PoolClient } from 'pg';
 import { upsertLineContacts } from './name-resolution.js';
-import { bridgeLiveMessage, bridgeNativeEnvelope, isRecalledNativeEnvelope, nativeChatEventMids } from './content-bridge/index.js';
+import { bridgeLiveMessage, bridgeNativeEnvelope, isRecalledNativeEnvelope, messageEditMarkerFromNative, messageEditMarkerFromRaw, nativeChatEventMids, type MessageEditMarker } from './content-bridge/index.js';
 import { loadChatEventNames } from './content-bridge/chat-event-names.js';
 import { ChatTypeSchema, NativeCatalogRecordSchema, NativeSourceEnvelopeSchema, NativeStickerMetadataSchema,
   NativeAttachmentDescriptorSchema, NativeConversationMetadataSchema, NativeDirectoryRowSchema, normalizeMentionRanges, redactSensitiveString, redactSensitiveText, storedTextForKind, type ChatType, type MentionRange, type NativeAttachmentDescriptor, type NativeCatalogRecord,
@@ -484,11 +484,21 @@ function canonicalDigest(observation: ExternalObservation): string {
     text: observation.text, occurredAt: observation.occurredAt }));
 }
 
+function isLineInt64(id: string): boolean {
+  return /^(?:0|[1-9][0-9]{0,18})$/.test(id) && BigInt(id) <= 9223372036854775807n;
+}
+
 function hasNativeLineMessageIdentity(observation: ExternalObservation): boolean {
   return observation.nativeMessageId !== undefined && observation.nativeMessageId !== null
     && observation.canonicalMessageId === observation.nativeMessageId
-    && /^(?:0|[1-9][0-9]{0,18})$/.test(observation.nativeMessageId)
-    && BigInt(observation.nativeMessageId) <= 9223372036854775807n;
+    && isLineInt64(observation.nativeMessageId);
+}
+
+// PC LINE local row of a message that is still sending; the real row comes with the LINE id.
+function isLocalSendingRow(observation: ExternalObservation): boolean {
+  return observation.nativePayload !== undefined
+    && (observation.chatType === 'direct' || observation.chatType === 'group' || observation.chatType === 'room')
+    && typeof observation.nativeMessageId === 'string' && !isLineInt64(observation.nativeMessageId);
 }
 
 function isLoginRecallObservation(observation: ExternalObservation): boolean {
@@ -1388,6 +1398,7 @@ export class ExternalMonitorRepository {
       if (forward.length) {
         await ensureBatchReceipt();
         for (const incomingObservation of forward) {
+          if (isLocalSendingRow(incomingObservation)) continue;
           let observation = incomingObservation;
           let normalizedJson = stableJson(observation);
           let normalizedDigest = canonicalDigest(observation);
@@ -1487,6 +1498,7 @@ export class ExternalMonitorRepository {
       }
 
       for (const incomingObservation of tail) {
+        if (isLocalSendingRow(incomingObservation)) continue;
         const existing = await client.query<{ batch_id: string; canonical_message_id: string | null;
           normalized_digest: string; status: string; normalized_payload: ExternalObservation; raw_native_payload: unknown }>(
           `SELECT o.batch_id,o.canonical_message_id,o.normalized_digest,o.status,o.normalized_payload,m.raw->'native' AS raw_native_payload
@@ -1735,6 +1747,37 @@ function buildExternalMessageRaw(existing: Record<string, unknown>, observation:
   return { ...existing, message, ...(native === undefined ? {} : { native }), ...(recall === undefined ? {} : { recall }) };
 }
 
+type MessageRevisionRow = { message_id: string; text_content: string; raw: Record<string, unknown> | null; updated_ms: number | null };
+
+/** Edit marker of the new observation: the live raw message and the native `_message` row. */
+function observationEditMarker(observation: ExternalObservation): MessageEditMarker {
+  const live = messageEditMarkerFromRaw(observation.livePayload?.raw);
+  const native = messageEditMarkerFromNative(observation.nativePayload);
+  const times = [live.updatedTime, native.updatedTime].filter((value): value is number => value !== null);
+  return { edited: live.edited || native.edited, updatedTime: times.length > 0 ? Math.max(...times) : null };
+}
+
+/**
+ * The prior version to keep before an edit overwrites it: only when the new version carries an edit marker,
+ * both texts exist and differ, and the new content is not a recall.
+ */
+function messageRevisionRow(prior: { text_content: string | null; raw: Record<string, unknown> | null } | null | undefined,
+  observation: ExternalObservation, projection: BridgeProjection): MessageRevisionRow | null {
+  if (!prior || !observation.canonicalMessageId || prior.text_content === null || observation.text === null
+    || prior.text_content === observation.text || projection.content?.type === 'unsent') return null;
+  const marker = observationEditMarker(observation);
+  if (!marker.edited) return null;
+  return { message_id: observation.canonicalMessageId, text_content: prior.text_content, raw: prior.raw ?? null, updated_ms: marker.updatedTime };
+}
+
+async function insertMessageRevisions(client: PoolClient, accountId: string, rows: readonly MessageRevisionRow[]): Promise<void> {
+  if (rows.length === 0) return;
+  await client.query(`INSERT INTO message_revisions(revision_id,account_id,message_id,text_content,raw,revised_at)
+    SELECT gen_random_uuid(),$1,row.message_id,row.text_content,row.raw,COALESCE(to_timestamp(row.updated_ms / 1000.0),now())
+      FROM jsonb_to_recordset($2::jsonb) AS row(message_id text,text_content text,raw jsonb,updated_ms double precision)`,
+  [accountId, JSON.stringify(rows)]);
+}
+
 function isNativePlainMessage(envelope: unknown): boolean {
   return isPlainRecord(envelope) && envelope.format === 2 && envelope.encoding === 'plain' && envelope.table === '_message';
 }
@@ -1938,6 +1981,7 @@ async function upsertExternalMessagePage(client: PoolClient, accountId: string, 
   const priorById = new Map(existing.rows.map((row) => [row.message_id, row]));
   const eventNames = new Map<string, ReadonlyMap<string, string> | undefined>();
   for (const observation of eligible) eventNames.set(observation.canonicalMessageId!, await chatEventNames(client, accountId, observation));
+  const revisions: MessageRevisionRow[] = [];
   const writes = eligible.flatMap((observation) => {
     const prior = priorById.get(observation.canonicalMessageId!);
     const raw = buildExternalMessageRaw(prior?.raw ?? {}, observation);
@@ -1947,12 +1991,15 @@ async function upsertExternalMessagePage(client: PoolClient, accountId: string, 
       || !projectionMatches(prior, projection)
       || new Date(prior.occurred_at).getTime() !== new Date(observation.occurredAt).getTime()
       || stableJson(prior.raw ?? {}) !== stableJson(raw);
+    const revision = changed ? messageRevisionRow(prior, observation, projection) : null;
+    if (revision) revisions.push(revision);
     return changed ? [{ message_id: observation.canonicalMessageId, observation_id: observation.observationId,
       chat_type: observation.chatType, chat_id: observation.chatId, sender_id: observation.senderId,
       kind: projection.kind, text_content: observation.text, content: projection.content,
       content_rule_version: projection.version, reply_to_message_id: projection.replyToMessageId,
       occurred_at: observation.occurredAt, raw }] : [];
   });
+  await insertMessageRevisions(client, accountId, revisions);
   if (writes.length > 0) await client.query(`INSERT INTO messages(account_id,message_id,event_id,chat_type,chat_id,sender_id,kind,text_content,content,
       content_rule_version,reply_to_message_id,mention_ids,mention_ranges,ingestion_source,occurred_at,raw)
     SELECT $1,row.message_id,'external:' || $2 || ':' || row.observation_id,row.chat_type,row.chat_id,row.sender_id,row.kind,row.text_content,row.content,
@@ -1982,10 +2029,10 @@ async function upsertExternalAttachments(client: PoolClient, accountId: string, 
         kind text,name text,mime_type text,size_bytes bigint)
     ON CONFLICT(account_id,chat_type,chat_id,message_id,external_attachment_id) DO UPDATE SET
       kind=EXCLUDED.kind,name=COALESCE(EXCLUDED.name,attachments.name),mime_type=COALESCE(EXCLUDED.mime_type,attachments.mime_type),
-      size_bytes=COALESCE(EXCLUDED.size_bytes,attachments.size_bytes),updated_at=now()
+      size_bytes=CASE WHEN attachments.status='ready' THEN attachments.size_bytes ELSE COALESCE(EXCLUDED.size_bytes,attachments.size_bytes) END,updated_at=now()
     WHERE attachments.kind IS DISTINCT FROM EXCLUDED.kind OR (EXCLUDED.name IS NOT NULL AND attachments.name IS DISTINCT FROM EXCLUDED.name)
       OR (EXCLUDED.mime_type IS NOT NULL AND attachments.mime_type IS DISTINCT FROM EXCLUDED.mime_type)
-      OR (EXCLUDED.size_bytes IS NOT NULL AND attachments.size_bytes IS DISTINCT FROM EXCLUDED.size_bytes)`,
+      OR (attachments.status<>'ready' AND EXCLUDED.size_bytes IS NOT NULL AND attachments.size_bytes IS DISTINCT FROM EXCLUDED.size_bytes)`,
   [accountId, JSON.stringify(rows), externalSource]);
 }
 
@@ -1996,7 +2043,7 @@ function communityMemberKey(observation: ExternalObservation): string | null {
   return stableJson([observation.chatType, observation.chatId, observation.senderId]);
 }
 
-async function upsertCommunityMemberNames(client: PoolClient, accountId: string,
+export async function upsertCommunityMemberNames(client: PoolClient, accountId: string,
   observations: ExternalObservation[]): Promise<Set<string>> {
   const names = new Map<string, { chat_type: string; chat_id: string; member_id: string; display_name: string | null; picture_path: string | null }>();
   for (const observation of observations) {
@@ -2087,11 +2134,13 @@ async function upsertCanonicalLineMessage(client: PoolClient, accountId: string,
     return conversationChanged || mentionChanged.length > 0;
   }
   const existingRaw = await client.query<{ raw: Record<string, unknown> | null; content: MessageContent | null;
-    content_rule_version: number; reply_to_message_id: string | null }>(
-    'SELECT raw,content,content_rule_version,reply_to_message_id FROM messages WHERE account_id=$1 AND message_id=$2 FOR UPDATE',
+    content_rule_version: number; reply_to_message_id: string | null; text_content: string | null }>(
+    'SELECT raw,content,content_rule_version,reply_to_message_id,text_content FROM messages WHERE account_id=$1 AND message_id=$2 FOR UPDATE',
     [accountId, observation.canonicalMessageId]);
   const raw = buildExternalMessageRaw(existingRaw.rows[0]?.raw ?? {}, observation);
   const projection = bridgeProjection(observation, existingRaw.rows[0], await chatEventNames(client, accountId, observation));
+  const revision = messageRevisionRow(existingRaw.rows[0], observation, projection);
+  if (revision) await insertMessageRevisions(client, accountId, [revision]);
   await client.query(`INSERT INTO messages(account_id,message_id,event_id,chat_type,chat_id,sender_id,kind,text_content,content,content_rule_version,
     reply_to_message_id,mention_ids,mention_ranges,ingestion_source,occurred_at,raw)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,'[]'::jsonb,'[]'::jsonb,$14,$12::timestamptz,$13::jsonb)

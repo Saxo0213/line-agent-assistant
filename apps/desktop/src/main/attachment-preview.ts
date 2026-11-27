@@ -4,6 +4,13 @@ import { lstat, open, realpath, type FileHandle, mkdir, readdir, rename, unlink,
 import path from 'node:path';
 import { isPrimaryAttachmentRelativePath } from '@line-agent/line-worker/attachment-storage';
 import { sniffImageMimeType, type ChatType } from '@line-agent/contracts';
+import { classifyReadyFile, type AttachmentIntegrity, type IntegrityObservation, type IntegrityRecord } from './attachment-integrity.js';
+
+/** True when the managed file does not exist (the row is ready but the file is gone). */
+export function isMissingFileError(error: unknown): boolean {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OPAQUE_BLOB = /^att-([0-9a-f]{64})\.blob$/i;
@@ -308,9 +315,13 @@ export class AttachmentPreviewService {
   #cacheCanonicalRoot: string | null = null;
   #pendingCacheWrites = 0;
   readonly #activeImageReads = new Set<AbortController>();
+  readonly #integrity: AttachmentIntegrity | undefined;
 
   constructor(options: { root: string; cacheRoot?: string; authority: PreviewAuthority; presenter: PreviewPresenter; now?: () => number; limits?: Partial<PreviewLimits>;
+    /** Repairs a ready row whose file failed the integrity check. */
+    integrity?: AttachmentIntegrity;
     onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void }) {
+    this.#integrity = options.integrity;
     if (options.cacheRoot && pathsOverlap(options.root, options.cacheRoot)) throw new Error('Preview cache must be separate from attachment storage');
     this.#root = options.root;
     this.#cacheRoot = options.cacheRoot ?? null;
@@ -344,20 +355,41 @@ export class AttachmentPreviewService {
         const cachedFormat = imageFormat(cached);
         if (cachedFormat && imageDimensionsAreSafe(cached, cachedFormat)) return { bytes: cached, mimeType: cachedFormat.mimeType };
       }
-      const source = await openManagedBlob(this.#root, record.relativePath, readSignal);
-      if (!source) return null;
-      if (readSignal.aborted || this.#shutDown) { await source.close(); return null; }
+      const ready: IntegrityRecord = { attachmentId, accountId: record.accountId, relativePath: record.relativePath, sizeBytes: record.sizeBytes, sha256: record.sha256 };
+      let source: Awaited<ReturnType<typeof openManagedBlob>>;
+      try { source = await openManagedBlob(this.#root, record.relativePath, readSignal); }
+      catch (error) {
+        if (!isMissingFileError(error)) throw error;
+        source = null;
+      }
+      // Abort and shutdown stay silent. A file that is absent or cannot be opened is an integrity failure of a ready row.
+      if (readSignal.aborted || this.#shutDown) { await source?.close(); return null; }
+      if (!source) { await this.#integrity?.settle(ready, { kind: 'missing' }); return null; }
       let bytes: Buffer | null;
       try { bytes = await readHeldBytes(source, maxBytes, readSignal); }
       finally { await source.close(); }
-      const format = bytes ? imageFormat(bytes) : null;
-      if (readSignal.aborted || this.#shutDown || !bytes || bytes.byteLength !== record.sizeBytes || rejectsActivePrefix(bytes) || !format
-        || !imageDimensionsAreSafe(bytes, format)
-        || createHash('sha256').update(bytes).digest('hex') !== record.sha256.toLowerCase()) return null;
+      if (readSignal.aborted || this.#shutDown) return null;
+      if (!bytes) { await this.#integrity?.settle(ready, { kind: 'missing' }); return null; }
+      const format = imageFormat(bytes);
+      const observation: IntegrityObservation = { kind: 'read', byteLength: bytes.byteLength,
+        sha256: createHash('sha256').update(bytes).digest('hex') };
+      const verdict = classifyReadyFile(ready, observation);
+      if (verdict.kind !== 'ok') {
+        // A correct file with a wrong row size is served. Any other failure moves the row out of ready and starts a new download.
+        await this.#integrity?.settle(ready, observation);
+        if (verdict.kind !== 'size_record_wrong') return null;
+      }
+      // A content check failure is not an integrity failure: the file is the downloaded file. No repair, no move of the row.
+      if (!format || rejectsActivePrefix(bytes) || !imageDimensionsAreSafe(bytes, format)) return null;
       await this.#writeImageCache(cacheKey, bytes, readSignal);
       if (readSignal.aborted || this.#shutDown) return null;
       return { bytes, mimeType: format.mimeType };
-    } catch { return null; }
+    } catch (error) {
+      if (!readSignal.aborted && !this.#shutDown) {
+        try { this.#onDiagnostic?.(diagnosticFailure('attachment', 'read', error), { requestId: attachmentId }); } catch { /* observer only */ }
+      }
+      return null;
+    }
     finally { signal?.removeEventListener('abort', abort); this.#activeImageReads.delete(controller); }
   }
 
@@ -458,17 +490,29 @@ export class AttachmentPreviewService {
       if (!record || record.attachmentId !== attachmentId || record.status !== 'ready' || !record.relativePath || !record.sha256
         || !/^[0-9a-f]{64}$/i.test(record.sha256) || (!declared && sniffedName === null) || record.sizeBytes === null || record.sizeBytes <= 0
         || !Number.isSafeInteger(record.sizeBytes) || record.sizeBytes > this.#limits.maxFileBytes) return false;
-      const source = await openManagedBlob(this.#root, record.relativePath);
-      if (!source) return false;
-      if (!this.#isCurrent(generation)) { await closeQuietly(source.handle); return false; }
+      const ready: IntegrityRecord = { attachmentId, accountId: record.accountId, relativePath: record.relativePath, sizeBytes: record.sizeBytes, sha256: record.sha256 };
+      let source: Awaited<ReturnType<typeof openManagedBlob>>;
+      try { source = await openManagedBlob(this.#root, record.relativePath); }
+      catch (error) {
+        if (!isMissingFileError(error)) throw error;
+        source = null;
+      }
+      if (!this.#isCurrent(generation)) { if (source) await closeQuietly(source.handle); return false; }
+      if (!source) { await this.#integrity?.settle(ready, { kind: 'missing' }); return false; }
       let bytes: Buffer | null;
       try { bytes = await readHeldBytes(source, this.#limits.maxFileBytes); }
       finally { await closeQuietly(source.handle); }
       if (!this.#isCurrent(generation)) return false;
-      const format = declared ?? (bytes ? imageFormat(bytes) : null);
-      if (!bytes || !format || bytes.byteLength !== record.sizeBytes || rejectsActivePrefix(bytes) || !format.signature(bytes)
-        || (!declared && !imageDimensionsAreSafe(bytes, format))
-        || createHash('sha256').update(bytes).digest('hex') !== record.sha256.toLowerCase()) return false;
+      if (!bytes) { await this.#integrity?.settle(ready, { kind: 'missing' }); return false; }
+      const format = declared ?? imageFormat(bytes);
+      const observation: IntegrityObservation = { kind: 'read', byteLength: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex') };
+      const verdict = classifyReadyFile(ready, observation);
+      if (verdict.kind !== 'ok') {
+        await this.#integrity?.settle(ready, observation);
+        if (verdict.kind !== 'size_record_wrong') return false;
+      }
+      // A content check failure is not an integrity failure: no repair, no move of the row.
+      if (!format || rejectsActivePrefix(bytes) || !format.signature(bytes) || (!declared && !imageDimensionsAreSafe(bytes, format))) return false;
       const displayName = declared ? record.name! : (sniffedName || `圖片.${format.extensions[0]}`);
 
       let issued = false;

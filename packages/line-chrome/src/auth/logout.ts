@@ -17,7 +17,7 @@ export interface LogoutOptions {
 /**
  * `Talk.AuthService.logoutV2 []`. A write: never retried. If the server answers that the session is already dead
  * (inner 1/7/8), that is the outcome the caller wanted: `authInvalidated` is emitted and the call resolves, like the
- * linejs adapter's logoutServer. Any other error is rethrown and the refresh timer is re-armed.
+ * logoutServer of the linejs Client engine. Any other error is rethrown and the refresh timer is re-armed.
  */
 export async function logoutV2(options: LogoutOptions): Promise<void> {
   const { gateway, state, refresher, signal } = options;

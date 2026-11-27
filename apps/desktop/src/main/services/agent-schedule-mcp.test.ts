@@ -78,7 +78,7 @@ describe('schedule tools (mocked repository)', () => {
     const task = create.inputSchema.properties as { task: { oneOf: Array<{ properties?: { match?: { oneOf: Array<{ required: string[] }> }; sender?: { required: string[] } } }> } };
     const forward = task.task.oneOf[0]!;
     expect(forward.properties?.match?.oneOf.map((variant) => variant.required)).toEqual([
-      ['mode', 'keywords'], ['mode', 'text'], ['mode'], ['mode'],
+      ['mode', 'keywords'], ['mode', 'text'], ['mode', 'keywords'], ['mode'], ['mode'],
     ]);
     expect(forward.properties?.sender?.required).toEqual(['accountId', 'mid']);
 
@@ -116,7 +116,7 @@ describe('schedule tools (mocked repository)', () => {
     expect(update.description).toContain('task.actions');
     const properties = create.inputSchema.properties as { task: { oneOf: Array<{ properties?: { match?: { oneOf: Array<{ properties: { mode: { const: string } } }> }; actions?: { properties: Record<string, unknown> } } }> } };
     const forward = properties.task.oneOf[0]!;
-    expect(forward.properties?.match?.oneOf.map((variant) => variant.properties.mode.const)).toEqual(['contains', 'exact', 'sender', 'mention']);
+    expect(forward.properties?.match?.oneOf.map((variant) => variant.properties.mode.const)).toEqual(['contains', 'exact', 'image_text', 'sender', 'mention']);
     expect(Object.keys(forward.properties?.actions?.properties ?? {})).toEqual(['forward', 'notify', 'agent']);
     await h.service.shutdown();
   });

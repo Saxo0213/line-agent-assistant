@@ -10,6 +10,8 @@ export const MessageReactionSchema = z.strictObject({
   emojiId: z.string().regex(/^[0-9]{1,6}$/).optional(),
   count: z.number().int().min(1).max(10000),
   reactorNames: z.array(z.string().max(100)).max(50),
+  /** The account's own reaction is in this group. */
+  own: z.boolean().optional(),
 });
 const TimelineMessageBaseSchema =ConversationKeySchema.extend({
   messageId: z.string().min(1), senderId: z.string().min(1), senderName: z.string(), senderAvatarAvailable: z.boolean().optional(), text: z.string().nullable(), occurredAt: z.iso.datetime({ offset: true }),
@@ -30,6 +32,8 @@ const TimelineMessageBaseSchema =ConversationKeySchema.extend({
   recalledContent: MessageContentSchema.nullable().optional(),
   recalledKind: z.enum(['text', 'image', 'video', 'audio', 'file', 'sticker', 'contact', 'event', 'location', 'rich']).nullable().optional(),
   recalledText: z.string().nullable().optional(),
+  edited: z.strictObject({ editedAt: z.iso.datetime({ offset: true }).nullable(),
+    versions: z.array(z.strictObject({ text: z.string().max(4000), until: z.iso.datetime({ offset: true }) })).max(20) }).nullable().optional(),
 });
 export const TimelineMessageSchema = z.preprocess((value) => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
@@ -50,6 +54,8 @@ export const FriendRowSchema = z.strictObject({ mid: z.string().min(1), name: z.
 export const FriendListSchema = z.array(FriendRowSchema).max(FRIEND_LIST_LIMIT);
 export const MESSAGE_READER_LIMIT = 500;
 export const MessageReaderSchema = z.strictObject({ mid: z.string().min(1), name: z.string(), readAt: z.iso.datetime({ offset: true }) });
+export const ConversationMembersSchema = z.strictObject({
+  members: z.array(z.strictObject({ mid: z.string().regex(/^u[0-9a-f]{32}$/), name: z.string().max(200) })).max(1000) });
 export const MessageReadersSchema = z.strictObject({ readers: z.array(MessageReaderSchema).max(MESSAGE_READER_LIMIT) });
 export const ControlStateSchema = z.strictObject({ activeAccountId: z.string().nullable(), epoch: z.number().int().nonnegative(), pendingOutbound: z.number().int().nonnegative() });
 const SystemActionLabel = z.enum(['系統操作失敗', '系統啟動', '系統關閉', '服務啟動', '服務停止', '工作程序啟動', '工作程序停止', '工作程序重新啟動',
@@ -99,6 +105,7 @@ export const DesktopReadRequestSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('listWorkRecords') }),
   z.strictObject({ type: z.literal('listFriends'), accountId: z.string().min(1) }),
   z.strictObject({ type: z.literal('listMessageReaders'), key: ConversationKeySchema, messageId: z.string().min(1) }),
+  z.strictObject({ type: z.literal('listConversationMembers'), key: ConversationKeySchema }),
   z.strictObject({ type: z.literal('listSystemActivity') }),
   z.strictObject({ type: z.literal('listSystemErrors') }),
   z.strictObject({ type: z.literal('getControlState') }),
@@ -112,6 +119,7 @@ export const DesktopReadResultSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('listWorkRecords'), records: z.array(WorkRecordSchema) }),
   z.strictObject({ type: z.literal('listFriends'), friends: FriendListSchema }),
   z.strictObject({ type: z.literal('listMessageReaders'), ...MessageReadersSchema.shape }),
+  z.strictObject({ type: z.literal('listConversationMembers'), ...ConversationMembersSchema.shape }),
   z.strictObject({ type: z.literal('listSystemActivity'), ...SystemActivityResultSchema.shape }),
   z.strictObject({ type: z.literal('listSystemErrors'), ...SystemErrorsResultSchema.shape }),
   z.strictObject({ type: z.literal('getControlState'), state: ControlStateSchema }),

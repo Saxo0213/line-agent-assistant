@@ -4,6 +4,8 @@
 
 [![Latest release](https://img.shields.io/github/v/release/Saxo0213/line-agent-assistant)](https://github.com/Saxo0213/line-agent-assistant/releases/latest) [![Downloads](https://img.shields.io/github/downloads/Saxo0213/line-agent-assistant/total)](https://github.com/Saxo0213/line-agent-assistant/releases) ![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6) [![License: MIT](https://img.shields.io/github/license/Saxo0213/line-agent-assistant)](LICENSE)
 
+### [⬇️ 下載最新版（Windows 安裝檔）](https://github.com/Saxo0213/line-agent-assistant/releases/latest)
+
 **讓 Claude 或 Codex 幫你處理 LINE 對話。** 這是一套 Windows 桌面程式：AI Agent 可以透過 LINE 接收指令、搜尋並摘要你的聊天紀錄，還能經由本機 MCP bridge 讓 Claude Desktop 與 Codex 直接使用 LINE。
 
 ## 功能
@@ -24,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.359 讓 Claude 改在常駐程序上執行，Claude 與 Codex 可各設多個 CLI 帳號來源並自動切換，新增每個聊天室的 `/model` 指令、Agent 讀取附件、可調整的下載間隔，以及外部監控自動重試。可透過 App「檢查更新」安裝。完整變更請見 [v1.0.342 → v1.0.359 版本說明](docs/releases/v1.0.359.md)。
+v1.0.385 改用 linejs 3.6.9 的新 LINE 連線引擎，新增社群訊息收錄、訊息表情與 @ 提及、一對一記事本與相簿、附件自動修復、「設定 → 資料夾」專案資料夾管理，以及照片文字排程規則。可透過 App「檢查更新」安裝。完整變更請見 [v1.0.359 → v1.0.385 版本說明](docs/releases/v1.0.385.md)。
 
 ## 安裝
 

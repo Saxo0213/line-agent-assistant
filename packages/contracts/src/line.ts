@@ -162,7 +162,7 @@ export function parseSticonRanges(text: string | null, contentMetadata: unknown)
   } catch { return []; }
 }
 
-export const InboundEnvelopeSchema = z.strictObject({
+const InboundEnvelopeShape = {
   eventId: IdSchema,
   accountId: IdSchema,
   chatId: IdSchema,
@@ -179,7 +179,10 @@ export const InboundEnvelopeSchema = z.strictObject({
   occurredAt: TimestampSchema,
   attachments: z.array(AttachmentDescriptorSchema),
   raw: JsonValueSchema,
-}).superRefine((envelope, context) => {
+};
+
+function refineInboundEnvelope(envelope: { kind: string; contact?: unknown; text: string | null; mentionIds: string[];
+  mentionRanges: { end: number; userId: string }[] }, context: z.RefinementCtx): void {
   if ((envelope.kind === 'contact') !== (envelope.contact !== undefined)) {
     context.addIssue({ code: 'custom', path: ['contact'], message: 'Contact descriptor must appear only on contact envelopes' });
   }
@@ -191,8 +194,24 @@ export const InboundEnvelopeSchema = z.strictObject({
       context.addIssue({ code: 'custom', path: ['mentionRanges', index, 'userId'], message: 'Mention user is absent from mentionIds' });
     }
   }
-});
+}
+
+export const InboundEnvelopeSchema = z.strictObject(InboundEnvelopeShape).superRefine(refineInboundEnvelope);
 export type InboundEnvelope = z.infer<typeof InboundEnvelopeSchema>;
+
+/**
+ * A community (Square) message seen by the login source. It is stored for archive only: it is not writable, so it is
+ * not part of InboundEnvelopeSchema. chatId is a Square chat MID and senderId is a Square member MID.
+ */
+export const ArchiveInboundEnvelopeSchema = z.strictObject({
+  ...InboundEnvelopeShape,
+  chatType: z.literal('community'),
+  chatId: z.string().regex(/^m[0-9a-f]{32}$/),
+  senderId: z.string().regex(/^p[0-9a-f]{32}$/),
+  /** Display name of the sender in this community, when LINE gave one. */
+  senderName: z.string().min(1).max(256).optional(),
+}).superRefine(refineInboundEnvelope);
+export type ArchiveInboundEnvelope = z.infer<typeof ArchiveInboundEnvelopeSchema>;
 
 export const WorkerCommandSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('loginQr') }),

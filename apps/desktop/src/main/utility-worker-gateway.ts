@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { diagnosticFailure, resolveLineTransport, type IngestLatency, type SafeDiagnostic } from '@line-agent/contracts';
+import { diagnosticFailure, isLinejsTransport, resolveLineTransport, type IngestLatency, type SafeDiagnostic } from '@line-agent/contracts';
 import { isLocalAgentRoom, LineWorkerCommandSchema, LineWorkerEventSchema, WORKER_PROTOCOL_VERSION, type ComponentHealth, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto, type WorkerBinding } from '@line-agent/contracts';
 import type { IntegratedWorkerGateway, SendMediaRequest } from './connected-facade.js';
 import { ManualSendNotStartedError } from './services/manual-send-errors.js';
@@ -47,6 +47,7 @@ type State = { binding: Bound; child: Child; poll: ReturnType<typeof setInterval
   relations: Map<string, Pending<Extract<LineWorkerEvent, { type: 'friendRelationResult' | 'addFriendResult' }>>>;
   chatResources: Map<string, Pending<Extract<LineWorkerEvent, { type: 'chatResourceResult' }>>>;
   ownProfiles: Map<string, Pending<Extract<LineWorkerEvent, { type: 'ownProfileResult' }>>>;
+  contactLookups: Map<string, Pending<Extract<LineWorkerEvent, { type: 'contactLookupResult' }>>>;
   usedRelationRequests: Map<string, { type: 'check' | 'add'; targetMid: string }>;
   modeWaiters: Map<string, Set<(value: boolean) => void>>;
   rawModeWaiters: Map<string, Set<(value: boolean) => void>>; exited: Promise<void>; resolveExited(): void };
@@ -90,6 +91,10 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
   chromeLtsmDir?: string;
   /** Reads the LEGY encrypted transport setting at each worker start. The gateway sends it in the init of DESKTOPWIN workers only. A failed read means false. */
   legyEncrypted?: () => Promise<boolean>;
+  /** Reads the community receive setting at each worker start. It gives true only for an Agent account with a SYSTEM_LOGIN source. The gateway sends it in the init of DESKTOPWIN workers only. A failed read means false. */
+  squareReceive?: (accountId: string) => Promise<boolean>;
+  /** Reads the stored community sync token of one account. Used only when squareReceive gave true. A failed read means no token. */
+  squareCursor?: (accountId: string) => Promise<string | null>;
   /** Absolute path of the LINE traffic log directory. The gateway sends it as `trafficLogDir` in the init of every worker. */
   trafficLogDir?: string;
   pollIntervalMs?: number; responseTimeoutMs?: number; restartDelayMs?: number; maxRestarts?: number; stopTimeoutMs?: number;
@@ -172,6 +177,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     for (const pending of state.chatResources.values()) { pending.cleanup?.(); if (pending.timer) clearTimeout(pending.timer);
       pending.reject(chatResourceGatewayError(reason, 'pending_request', 'pending_stopped')); }
     for (const pending of state.ownProfiles.values()) { if (pending.timer) clearTimeout(pending.timer); pending.reject(new Error(reason)); }
+    for (const pending of state.contactLookups.values()) { if (pending.timer) clearTimeout(pending.timer); pending.reject(new Error(reason)); }
     for (const pending of state.relations.values()) {
       if (pending.timer) clearTimeout(pending.timer);
       const command = pending.command as Extract<LineWorkerCommand, { type: 'addFriendByMid' }> | undefined;
@@ -185,7 +191,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     }
     state.sends.clear(); state.sendQueue.length = 0; state.activeSendId = undefined;
     cancelPacing(state.binding.accountId);
-    state.uncertainSends.clear(); state.downloads.clear(); state.chatResources.clear(); state.ownProfiles.clear(); state.relations.clear();
+    state.uncertainSends.clear(); state.downloads.clear(); state.chatResources.clear(); state.ownProfiles.clear(); state.contactLookups.clear(); state.relations.clear();
     for (const waiters of state.modeWaiters.values()) for (const resolve of waiters) resolve(false);
     state.modeWaiters.clear();
     for (const waiters of state.rawModeWaiters.values()) for (const resolve of waiters) resolve(false);
@@ -522,6 +528,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       // Sends, unsends and Relation mutations keep their own outcome-unknown handling.
       const failure = new Error(`Worker rejected request: ${event.code}`);
       state.ownProfiles.get(event.requestId)?.reject(failure);
+      state.contactLookups.get(event.requestId)?.reject(failure);
       state.chatResources.get(event.requestId)?.reject(chatResourceGatewayError(failure.message, 'pending_request', 'unknown'));
       const relation = state.relations.get(event.requestId);
       if (relation && (relation.command as { type?: string } | undefined)?.type === 'checkFriendRelation') {
@@ -530,7 +537,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     }
     if (event.type !== 'sendResult' && event.type !== 'unsendResult' && event.type !== 'attachmentResult' && event.type !== 'attachmentCancelAck'
       && event.type !== 'friendRelationResult' && event.type !== 'addFriendResult'
-      && event.type !== 'chatResourceResult' && event.type !== 'ownProfileResult'
+      && event.type !== 'chatResourceResult' && event.type !== 'ownProfileResult' && event.type !== 'contactLookupResult'
       && event.type !== 'modeAck' && event.type !== 'workerProtocolAck') {
       if (event.type === 'batch' && trackBatch(state, event)) return;
       if (state.domainEvents.length + Number(state.processingDomainEvents) >= maxQueuedDomainEvents) {
@@ -582,6 +589,12 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     else if (event.type === 'ownProfileResult') {
       const pending = state.ownProfiles.get(event.requestId);
       const command = pending?.command as Extract<LineWorkerCommand, { type: 'refreshOwnProfile' }> | undefined;
+      if (!pending || !command || !sameWorkerBinding(state.binding, command) || !sameWorkerBinding(state.binding, event)) return;
+      pending.resolve(event);
+    }
+    else if (event.type === 'contactLookupResult') {
+      const pending = state.contactLookups.get(event.requestId);
+      const command = pending?.command as Extract<LineWorkerCommand, { type: 'lookupContact' }> | undefined;
       if (!pending || !command || !sameWorkerBinding(state.binding, command) || !sameWorkerBinding(state.binding, event)) return;
       pending.resolve(event);
     }
@@ -814,7 +827,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
             if (state!.protocolVerified || state!.stopping || stateFor(effective.accountId) !== state) return;
             state!.stopping = true; lifecycle.phase = 'retiring'; child.kill();
           }, responseTimeoutMs),
-          sends: new Map(), unsends: new Map(), sendQueue: [], activeSendId: undefined, uncertainSends: new Map(), downloads: new Map(), relations: new Map(), chatResources: new Map(), ownProfiles: new Map(), usedRelationRequests: new Map(), modeWaiters: new Map(), rawModeWaiters: new Map(), exited, resolveExited,
+          sends: new Map(), unsends: new Map(), sendQueue: [], activeSendId: undefined, uncertainSends: new Map(), downloads: new Map(), relations: new Map(), chatResources: new Map(), ownProfiles: new Map(), contactLookups: new Map(), usedRelationRequests: new Map(), modeWaiters: new Map(), rawModeWaiters: new Map(), exited, resolveExited,
           poll: setInterval(() => { if (stateFor(effective.accountId) === state) child.postMessage({ type: 'poll', ...ownerFields(effective), accountId: effective.accountId,
             workerInstanceId: state!.binding.workerInstanceId, controlEpoch: state!.binding.controlEpoch }); }, options.pollIntervalMs ?? 1500) };
         lifecycle.child = state;
@@ -839,10 +852,16 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
           }
           scheduleRestart(lifecycle, state!);
         });
-        const legyEncrypted = resolveLineTransport(effective.lineTransport) === 'DESKTOPWIN' && options.legyEncrypted
+        // LEGY encrypted transport is not available for IOSIPAD (its legacy token goes direct).
+        const legyAllowed = isLinejsTransport(effective.lineTransport) && effective.lineTransport !== 'IOSIPAD';
+        const legyEncrypted = legyAllowed && options.legyEncrypted
           ? await options.legyEncrypted().catch(() => false) : false;
+        const squareReceive = isLinejsTransport(effective.lineTransport) && options.squareReceive
+          ? await options.squareReceive(effective.accountId).catch(() => false) : false;
+        const squareCursor = squareReceive && options.squareCursor ? await options.squareCursor(effective.accountId).catch(() => null) : null;
         child.postMessage({ type: 'init', ...effective, protocolVersion: WORKER_PROTOCOL_VERSION, durableCursor: cursor,
-          ...(resolveLineTransport(effective.lineTransport) === 'DESKTOPWIN' && options.legyEncrypted ? { legyEncrypted } : {}),
+          ...(legyAllowed && options.legyEncrypted ? { legyEncrypted } : {}),
+          ...(squareReceive ? { squareReceive: true, squareCursor } : {}),
           ...(resolveLineTransport(effective.lineTransport) === 'CHROMEOS' && options.chromeLtsmDir ? { chromeLtsmDir: options.chromeLtsmDir } : {}),
           ...(options.trafficLogDir ? { trafficLogDir: options.trafficLogDir } : {}) });
         await runBounded(lifecycle, owner, 'binding', controller, (signal) => bindingListener?.(effective, signal));
@@ -922,7 +941,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch,
       chatType: command.chatType, chatId: command.chatId, requestId: command.requestId,
       text: command.text, replyToMessageId: command.replyToMessageId,
-      ...(!manual && command.mentions?.length ? { mentions: command.mentions } : {}),
+      ...(command.mentions?.length ? { mentions: command.mentions } : {}),
       ...ownerFields(state.binding), operationId: command.requestId, attemptId: randomUUID(), effectPermit: randomUUID(),
     }) as ManualSendCommand;
     return queueWire(state, command.requestId, wireCommand, signal);
@@ -1266,6 +1285,29 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
             timeoutMs: command.timeoutMs, ...ownerFields(state.binding) });
         }
         catch (error) { pending.reject(error instanceof Error ? error : new Error('LINE profile read failed')); }
+      });
+    },
+    async lookupContact(command) {
+      const state = currentFor(command);
+      if (!state.protocolVerified || !state.bindingReady || state.stopping || state.acknowledgedMode === 'PAUSED') throw new Error('Worker protocol/mode not acknowledged for contact lookup');
+      if (!sameWorkerBinding(state.binding, command)) throw new Error('Incomplete or stale worker binding for contact lookup');
+      if (state.contactLookups.size >= 1) throw new Error('Worker contact lookup is already in progress (QUEUE_FULL)');
+      if (state.contactLookups.has(command.requestId)) throw new Error('Duplicate worker contact lookup request ID');
+      return await new Promise((resolve, reject) => {
+        const finish = (settle: () => void) => {
+          if (state.contactLookups.get(command.requestId) !== pending) return;
+          state.contactLookups.delete(command.requestId); if (pending.timer) clearTimeout(pending.timer); settle();
+        };
+        const pending: Pending<Extract<LineWorkerEvent, { type: 'contactLookupResult' }>> = {
+          command, resolve: (value) => finish(() => resolve(value)), reject: (error) => finish(() => reject(error)),
+        };
+        pending.timer = setTimeout(() => pending.reject(new Error('LINE contact lookup timed out')), 30_000);
+        state.contactLookups.set(command.requestId, pending);
+        try {
+          state.child.postMessage({ ...workerBindingFields(command), type: 'lookupContact', requestId: command.requestId,
+            targetMid: command.targetMid, ...ownerFields(state.binding) });
+        }
+        catch (error) { pending.reject(error instanceof Error ? error : new Error('LINE contact lookup failed')); }
       });
     },
     async waitModeAck(accountId, mode, waitMs) {

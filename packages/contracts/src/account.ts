@@ -47,14 +47,22 @@ export type AccountMode = z.infer<typeof AccountModeSchema>;
 export const ControlEpochSchema = z.number().int().nonnegative();
 
 /**
- * Which LINE protocol an account's worker speaks. DESKTOPWIN is the linejs transport and the default; CHROMEOS is the
- * LINE Chrome extension (3.7.2) protocol port. An absent value means DESKTOPWIN (see resolveLineTransport).
+ * Which LINE protocol an account's worker speaks. DESKTOPWIN, DESKTOPMAC, ANDROIDSECONDARY and IOSIPAD are the linejs
+ * devices (DESKTOPWIN is the default); CHROMEOS is the LINE Chrome extension (3.7.2) protocol port.
+ * An absent value means DESKTOPWIN (see resolveLineTransport).
  */
-export const LineTransportKindSchema = z.enum(['DESKTOPWIN', 'CHROMEOS']);
+export const LineTransportKindSchema = z.enum(['DESKTOPWIN', 'DESKTOPMAC', 'ANDROIDSECONDARY', 'IOSIPAD', 'CHROMEOS']);
 export type LineTransportKind = z.infer<typeof LineTransportKindSchema>;
 export const DEFAULT_LINE_TRANSPORT: LineTransportKind = 'DESKTOPWIN';
 export function resolveLineTransport(value: LineTransportKind | undefined): LineTransportKind {
   return value ?? DEFAULT_LINE_TRANSPORT;
+}
+/** The linejs device kinds. Each one uses the linejs default requests of its own device. */
+export const LINEJS_TRANSPORT_KINDS = ['DESKTOPWIN', 'DESKTOPMAC', 'ANDROIDSECONDARY', 'IOSIPAD'] as const;
+export type LinejsTransportKind = (typeof LINEJS_TRANSPORT_KINDS)[number];
+/** True when the kind is one of the four linejs devices. An absent value means DESKTOPWIN, so it is true. */
+export function isLinejsTransport(value: LineTransportKind | undefined): value is LinejsTransportKind | undefined {
+  return value !== 'CHROMEOS';
 }
 /** The only `application` string a CHROMEOS init may carry (the trailing tab is part of the value). */
 export const CHROMEOS_APPLICATION = 'CHROMEOS\t3.7.2\tChrome_OS\t';

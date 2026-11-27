@@ -15,7 +15,7 @@ export const SendDetailSchema = z.string().min(1).max(SEND_DETAIL_MAX_CHARS).reg
 /** Operational evidence only. Never add caller-controlled text or error objects here. */
 // The operation 'adoptDownloadAuth' is kept for stored rows. No code emits it.
 export const DIAGNOSTIC_OPERATIONS = [
-  'init', 'adoptDownloadAuth', 'loginQr', 'loginToken', 'setSecretState', 'poll', 'ackBatch', 'history',
+  'init', 'adoptDownloadAuth', 'loginQr', 'loginToken', 'setSecretState', 'poll', 'ackBatch', 'ackSquareBatch', 'history',
   'chatResourceRead', 'refreshOwnProfile', 'cancelChatResourceRead', 'sendText', 'manualSendText', 'sendMedia',
   'unsendMessage', 'reactMessage', 'checkFriendRelation', 'addFriendByMid', 'downloadAttachment',
   'cancelAttachmentDownload', 'logout', 'revokeControl', 'stop', 'ipc', 'database', 'attachment', 'agent', 'mcp',

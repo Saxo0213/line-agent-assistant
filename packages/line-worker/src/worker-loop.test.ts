@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { FakeLineTransport } from './fake-transport.js';
 import { LineWorkerLoop, LOGOUT_DEADLINE_MS, SYNC_CONFIRMED_INTERVAL_MS, type TransportIdentity } from './worker-loop.js';
-import { createLinejsAdapter } from './linejs-adapter.js';
 import { decodeHistoryCursor, encodeHistoryCursor } from './cursor.js';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -15,7 +14,7 @@ import { LineWorkerEventSchema } from '@line-agent/contracts';
 import { LineServerRejection } from './line-server-error.js';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
-const protocolVersion = 4 as const;
+const protocolVersion = 5 as const;
 const cursor = { version: 1 as const, revision: '0', globalRev: '0', individualRev: '0' };
 const next = { version: 1 as const, revision: '9', globalRev: '2', individualRev: '3' };
 const selfMid = `u${'a'.repeat(32)}`;
@@ -475,6 +474,22 @@ describe('one-account worker loop', () => {
         requestId: `reaction-${reaction}`, messageId: '9', reaction });
     }
     expect(active.transport.reactCalls.map((call) => call.reaction)).toEqual(['AMAZING', 'NICE', 'FUN', 'LOVE', 'SAD', 'OMG']);
+  });
+
+  it('carries the LINE error code of the transport on the authInvalidated event', async () => {
+    const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+    let invalidate!: (detail?: unknown) => void;
+    const register = transport.on.bind(transport);
+    transport.on = ((event: string, listener: (value: unknown) => void) => {
+      if (event === 'authInvalidated') invalidate = listener;
+      else register(event as never, listener as never);
+    }) as typeof transport.on;
+    const events: any[] = [];
+    const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => false });
+    await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'MONITOR_ONLY', durableCursor: cursor });
+    invalidate({ code: 'LINE_TALK_NOT_AUTHORIZED_DEVICE', upstreamCode: 8 });
+    await worker.flushEvents();
+    expect(events).toContainEqual(expect.objectContaining({ type: 'authInvalidated', code: 'LINE_TALK_NOT_AUTHORIZED_DEVICE', upstreamCode: 8 }));
   });
 
   it('stops polling after the trusted LINEJS authentication invalidation signal', async () => {
@@ -1246,6 +1261,14 @@ describe('one-account worker loop', () => {
     expect(events.at(-1)).toMatchObject({ requestId: 'check-2', targetMid: `u${'b'.repeat(32)}`, status: 'not_friend' });
   });
 
+  it('answers lookupContact with LOOKUP_UNSUPPORTED when the transport has no lookup method', async () => {
+    const { worker, events, init } = setup('MONITOR_ONLY');
+    await init;
+    await authenticate(worker);
+    await worker.handle({ type: 'lookupContact', ...binding, requestId: 'lookup-1', targetMid: `u${'a'.repeat(32)}` });
+    expect(events.at(-1)).toMatchObject({ type: 'contactLookupResult', ...binding, requestId: 'lookup-1', status: 'failed', error: 'LOOKUP_UNSUPPORTED' });
+  });
+
   it('forwards safe friend-detail failure fields while keeping the relation unknown', async () => {
     const { worker, transport, events, init } = setup('ACTIVE_CONTROL');
     await init;
@@ -1464,47 +1487,6 @@ describe('one-account worker loop', () => {
     release();
     await Promise.all([sending, revoking]);
     expect(events.at(-1)).toMatchObject({ type: 'modeAck', ...binding, mode: 'MONITOR_ONLY', drained: true });
-  });
-
-  it('revokes real adapter writes during held E2EE preparation while preserving read capabilities', async () => {
-    const { E2EE } = await import(new URL('../../../node_modules/@evex/linejs/base/e2ee/mod.js', import.meta.url).href) as {
-      E2EE: { prototype: object };
-    };
-    let releaseEncryption!: () => void;
-    let signalEncryptionStarted!: () => void;
-    const encryptionStarted = new Promise<void>((resolve) => { signalEncryptionStarted = resolve; });
-    const encryptionHold = new Promise<void>((resolve) => { releaseEncryption = resolve; });
-    const encrypt = vi.spyOn(E2EE.prototype as any, 'encryptE2EEMessage').mockImplementation(async () => {
-      signalEncryptionStarted();
-      await encryptionHold;
-      return [Buffer.from([1, 2, 3])];
-    });
-    const physicalTransport = vi.fn(async () => { throw new Error('read fixture reached physical transport'); });
-    const adapter = await createLinejsAdapter({ ...binding, mode: 'ACTIVE_CONTROL', validateLease: () => true, physicalTransport });
-    await adapter.installSecrets({ token: ['{"alg":"HS256"}', '{"sub":"u-self"}', 'signature']
-      .map((part) => Buffer.from(part).toString('base64url')).join('.'), qrCert: null, e2eeStorage: null });
-    const events: any[] = [];
-    const worker = new LineWorkerLoop({ transport: adapter, validateLease: () => true,
-      emit: (event) => { events.push(event); } });
-    await worker.handle({ type: 'init', ...binding, protocolVersion, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
-    const sending = worker.handle({ type: 'sendText', ...binding, chatType: 'direct', chatId: 'u-peer',
-      requestId: 'revoke-during-encryption', text: 'hello', replyToMessageId: null });
-    try {
-      await encryptionStarted;
-      const revoking = worker.handle({ type: 'revokeControl', ...binding });
-      releaseEncryption();
-      await Promise.all([sending, revoking]);
-      expect(events.at(-1)).toMatchObject({ type: 'modeAck', mode: 'MONITOR_ONLY', drained: true });
-      expect(events.find((event) => event.type === 'sendResult')).toMatchObject({ status: 'failed' });
-      expect(physicalTransport).not.toHaveBeenCalled();
-      await expect(adapter.sync(cursor)).rejects.toThrow('read fixture reached physical transport');
-      await expect(adapter.history({ chatType: 'group', chatId: 'c-group' }, null, 10))
-        .rejects.toThrow('read fixture reached physical transport');
-      expect(physicalTransport).toHaveBeenCalledTimes(2);
-    } finally {
-      releaseEncryption();
-      encrypt.mockRestore();
-    }
   });
 
   it('rejects a concurrent send without losing the in-flight revoke drain', async () => {
@@ -1728,36 +1710,6 @@ describe('one-account worker loop', () => {
       await pollAndAckStartup(worker, events);
       expect(confirmed()).toHaveLength(2);
     } finally { vi.useRealTimers(); }
-  });
-
-  it('an idle account stays ready through repeated HTTP 410 long polls', async () => {
-    let httpStatus = 410;
-    const physicalTransport = vi.fn(async () => new Response(null, { status: httpStatus }));
-    const adapter = await createLinejsAdapter({ ...binding, mode: 'MONITOR_ONLY', validateLease: () => false, physicalTransport });
-    await adapter.installSecrets({ token: ['{"alg":"HS256"}', '{"sub":"u-self"}', 'signature']
-      .map((part) => Buffer.from(part).toString('base64url')).join('.'), qrCert: null, e2eeStorage: null });
-    const { worker, transport, events, init } = setup();
-    transport.sync = (syncCursor) => adapter.sync(syncCursor as Parameters<typeof adapter.sync>[0]);
-    transport.lastSyncHttpStatus = () => adapter.lastSyncHttpStatus();
-    try {
-      await init;
-      await authenticate(worker);
-      for (let attempt = 0; attempt < 12; attempt++) await pollAndAckStartup(worker, events);
-      expect(physicalTransport).toHaveBeenCalledTimes(12);
-      expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toEqual([]);
-      expect(events.filter((event) => event.type === 'error')).toEqual([]);
-      expect(events.filter((event) => event.type === 'batch').every((event) => event.startupSync === true)).toBe(true);
-
-      // HTTP 500 is a server rejection: five of them suspend the connection and no later poll reaches LINE.
-      vi.useFakeTimers({ toFake: ['Date'] });
-      httpStatus = 500;
-      for (let attempt = 0; attempt < 5; attempt++) await pollAfterBackoff(worker);
-      expect(events.filter((event) => event.type === 'status' && event.state === 'degraded')).toHaveLength(1);
-      expect(events.filter((event) => event.type === 'status').at(-1)).toMatchObject({ message: 'LINE_CONNECTION_SUSPENDED' });
-      httpStatus = 410;
-      await pollAfterBackoff(worker);
-      expect(physicalTransport).toHaveBeenCalledTimes(17);
-    } finally { adapter.revoke(); }
   });
 
   it('keeps the failure count and the poll result when the syncConfirmed emit rejects', async () => {

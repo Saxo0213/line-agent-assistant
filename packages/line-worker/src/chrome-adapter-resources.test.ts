@@ -200,7 +200,7 @@ describe('ChromeAdapter.readChatResource through LineWorkerLoop', () => {
       ok({ mid: SELF, displayName: 'Agent', picturePath: '/0h' }));
     const events: LineWorkerEvent[] = [];
     const worker = new LineWorkerLoop({ transport: harness.adapter, emit: (event) => { events.push(LineWorkerEventSchema.parse(event)); }, validateLease: () => true });
-    await worker.handle({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor0, lineTransport: 'CHROMEOS' });
+    await worker.handle({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor0, lineTransport: 'CHROMEOS' });
     await worker.handle({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1', secrets: { token: 'account-token', qrCert: null, e2eeStorage: snapshot() } });
     harness.server.on('/api/talk/thrift/Talk/TalkService/getAllChatMids', ok({ memberChatMids: [], invitedChatMids: [] }));
     harness.server.on('/api/talk/thrift/Talk/TalkService/getMessageBoxes', ok({ messageBoxes: [], hasNext: false }));
@@ -233,7 +233,7 @@ describe('ChromeAdapter.readChatResource through LineWorkerLoop', () => {
     const desktop = new FakeLineTransport({ ownMid: SELF, displayName: 'Agent' });
     const desktopEvents: LineWorkerEvent[] = [];
     const desktopWorker = new LineWorkerLoop({ transport: desktop, emit: (event) => { desktopEvents.push(LineWorkerEventSchema.parse(event)); }, validateLease: () => true });
-    await desktopWorker.handle({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor0 });
+    await desktopWorker.handle({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor0 });
     await desktopWorker.handle({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
     desktop.enqueueChatResource({ bytes: new Uint8Array([9, 8, 7]) });
     await desktopWorker.handle(command);

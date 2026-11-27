@@ -12,6 +12,7 @@ import type { ResidentReaped, ResidentTurnOptions } from '@line-agent/agent-brid
 import { decideSelfHeal, emptyReplyFailure, isBlankCompletion, markAfterSelfHeal, needsLineSendCheck, type FailedAgentEvent, type SelfHealContext } from './agent-self-heal.js';
 import { formatIdentityBlock, withAgentRoomHistoryHint, withIdentityBlock, withMcpSkill, withOutputChannel, type JobIdentityView } from './mcp-skill.js';
 import { buildTranscript, withTranscriptPreamble } from './agent-transcript.js';
+import { agentUpgradeNoticeText, type AgentUpgradeNotice } from './agent-upgrade-notice.js';
 import { buildResidentPrompt, parseResidentKey, residentIdentity, residentKey, type ResidentIdentity } from './agent-resident.js';
 import { isScheduledRunRequestId } from './agent-schedule-service.js';
 import type { AgentJobEnvironment, AgentJobPlan } from './agent-job-environment.js';
@@ -142,6 +143,11 @@ export interface AgentServiceResidentOptions {
   accountSources?: AgentAccountSources;
   /** The automatic failover. Without it, or with the switch off, a job keeps the P4 source binding and no route is chosen. */
   failover?: AgentFailover;
+  /**
+   * The one-time upgrade notice. The first job that resumes a provider session that existed before an app version change gets the
+   * notice at the start of its run message (never in the stored job prompt). A schedule run has no session and never takes it.
+   */
+  upgradeNotice?: AgentUpgradeNotice;
 }
 export const RESIDENT_TURN_TIMEOUT_MS = 900_000;
 export const RESIDENT_STALL_MS = 120_000;
@@ -1089,6 +1095,10 @@ ${scheduleContext}` : request.prompt;
               message = withTranscriptPreamble(message, buildTranscript(await this.agents.listTranscriptEvents({ jobId: job.jobId, generation: sessionGeneration })));
             }
           } catch (error) { this.reportFailure('prepare', error, job.jobId); message = built.message; }
+          // A resident process that is already running keeps its transcript; only a spawn with --resume loads the old session.
+          if (request.resumeSessionId && !this.bridge.hasResident?.(residentTurn.key) && this.residentOptions.upgradeNotice?.take(request.resumeSessionId)) {
+            message = `${agentUpgradeNoticeText(this.residentOptions.upgradeNotice.version)}\n\n${message}`;
+          }
           let model: 'haiku' | 'sonnet' | 'opus' | undefined;
           if (this.residentOptions.resolveClaudeModel) {
             try { model = await this.residentOptions.resolveClaudeModel(job) ?? undefined; }
@@ -1102,6 +1112,9 @@ ${scheduleContext}` : request.prompt;
             runRequest = { ...runRequest, prompt: withTranscriptPreamble(runRequest.prompt,
               buildTranscript(await this.agents.listTranscriptEvents({ jobId: job.jobId, generation: sessionGeneration, from: switchedFrom }))) };
           } catch (error) { this.reportFailure('prepare', error, job.jobId); }
+        }
+        if (codexOneShot && runRequest.resumeSessionId && this.residentOptions.upgradeNotice?.take(runRequest.resumeSessionId)) {
+          runRequest = { ...runRequest, prompt: `${agentUpgradeNoticeText(this.residentOptions.upgradeNotice.version)}\n\n${runRequest.prompt}` };
         }
         if (codexOneShot && this.residentOptions.resolveCodexModel) {
           try { const codexModel = await this.residentOptions.resolveCodexModel(job); if (codexModel) runRequest = { ...runRequest, model: codexModel }; }

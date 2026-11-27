@@ -7,6 +7,8 @@ type Props = {
   enabled: boolean;
   target?: LineMediaTarget | undefined;
   attachment?: { key: ConversationKey; attachmentId: string };
+  /** Stored state of the attachment (for example status and size). It is part of the component key. */
+  revision?: string;
   fallback?: string;
   accessibleFallback?: boolean;
   fallbackKind?: 'person' | 'group';
@@ -37,7 +39,7 @@ export function accountAvatarRefreshed(accountId: string, ownMid: string): void 
 }
 
 function avatarRefreshVersion(target: LineMediaTarget | undefined): number {
-  if (!target) return 0;
+  if (!target || target.type === 'profilePicture') return 0;
   const refreshed = refreshedAccountAvatars.get(target.accountId);
   if (!refreshed) return 0;
   if (target.type === 'account') return refreshed.version;
@@ -72,7 +74,8 @@ export function LineMediaImage(props: Props) {
   const refreshedAt = useSyncExternalStore(subscribeToAccountAvatarRefresh,
     () => avatarRefreshVersion(target),
     () => 0);
-  return <LineMediaImageRequest key={JSON.stringify([scope, props.enabled, refreshedAt])} {...props} target={target} />;
+  // `revision` is the stored state of the attachment. A change of it clears a failed load, so a file that was downloaded again loads at once.
+  return <LineMediaImageRequest key={JSON.stringify([scope, props.enabled, refreshedAt, props.revision ?? null])} {...props} target={target} />;
 }
 
 function LineMediaImageRequest({ enabled, target, fallback, fallbackKind, accessibleFallback, className, alt = '', title }: Props) {

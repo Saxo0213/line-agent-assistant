@@ -1,17 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { captureScheduleForward } from './schedule-forward-repository.js';
-import { InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, UnsendSchema, type UnsendDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpActiveChat, type McpMessageRecord, type McpTargetSummary, type MessageSearchScope, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
+import { ArchiveInboundEnvelopeSchema, SQUARE_BATCH_MAX_ENVELOPES, type ArchiveInboundEnvelope, InboundEnvelopeSchema, normalizeMentionRanges, ReadReceiptSchema, type ReadReceiptDto, UnsendSchema, type UnsendDto, TalkCursorV1Schema, type MessageContent, type AgentProvider, type ConversationKey, type InboundEnvelope, type JsonValue, type LineWorkerEvent, type McpActiveChat, type McpMessageRecord, type McpTargetSummary, type MessageSearchScope, type MentionRange, type TalkCursorV1Dto } from '@line-agent/contracts';
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { parseLineStickerDescriptor, type StickerDescriptor } from './sticker-descriptor.js';
 import { CONVERSATION_TITLE_SQL, MEMBER_NAME_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nameFragments, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, upsertLineContacts, type LineContactInput } from './name-resolution.js';
 import { NativeSourceEnvelopeSchema, type NativeSourceEnvelope } from '@line-agent/contracts';
 import { ATTACHMENT_BLOCK_REASONS, isAttachmentBlockReason, type AttachmentBlockReason } from '@line-agent/contracts';
-import { bridgeLiveMessage, liveChatEventMids, postNotificationSubtypeFromRaw } from './content-bridge/index.js';
+import { bridgeLiveMessage, liveChatEventMids, messageEditMarkerFromRaw, postNotificationSubtypeFromRaw } from './content-bridge/index.js';
 import { loadChatEventNames } from './content-bridge/chat-event-names.js';
 import { nativeReactions, type MessageReaction } from './native-reactions.js';
 import { ensureLineageSessionRow, expandAgentLineage, mergeLineageConversations, resolveAgentLineage } from './agent-lineage.js';
 import { promptWithContactCards } from './agent-contact-cards.js';
-import { stageSystemLoginObservation, lockMonitorAgentReceipt, lockMonitorRouteReceipt, projectMonitorAgentReceipt, type ExternalMonitorAgentReceipt, type ExternalObservation } from './external-monitor-repository.js';
+import { stageSystemLoginObservation, upsertCommunityMemberNames, lockMonitorAgentReceipt, lockMonitorRouteReceipt, projectMonitorAgentReceipt, type ExternalMonitorAgentReceipt, type ExternalObservation } from './external-monitor-repository.js';
 
 export type ReadPositionChange = Readonly<{ key: ConversationKey; messageId: string }>;
 const ReadReceiptsSchema = ReadReceiptSchema.array().max(500);
@@ -19,7 +19,11 @@ const UnsendsSchema = UnsendSchema.array().max(500);
 
 /** Upper bound for a stored pre-recall native envelope returned to the desktop timeline. */
 const RECALL_ORIGINAL_MAX_BYTES = 262144;
-export type TimelineMessageRecord = MessageListResult & { sourceDeleted: boolean; recallOriginal: NativeSourceEnvelope | null };
+/** Earlier versions of an edited message. `until` is when that text stopped being current. */
+export type MessageEditedInfo = { editedAt: string | null; versions: Array<{ text: string; until: string }> };
+export type TimelineMessageRecord = MessageListResult & { sourceDeleted: boolean; recallOriginal: NativeSourceEnvelope | null; edited: MessageEditedInfo | null };
+const EDIT_VERSIONS_MAX = 20;
+const EDIT_VERSION_TEXT_MAX = 4000;
 function parseRecallOriginal(value: unknown): NativeSourceEnvelope | null {
   if (value === null || value === undefined) return null;
   const parsed = NativeSourceEnvelopeSchema.safeParse(value);
@@ -44,6 +48,42 @@ function systemLoginObservation(envelope: InboundEnvelope, receipt?: { controlEp
     chatType: envelope.chatType, chatId: envelope.chatId, senderId: envelope.senderId,
     livePayload: { raw: envelope.raw, eventId: envelope.eventId, ...(envelope.contact ? { contact: envelope.contact } : {}),
       ...(receipt && envelope.ingestion.source === 'live' ? { recovery: { envelope, ...receipt } } : {}) },
+    mentionIds: envelope.mentionIds, mentionRanges: envelope.mentionRanges,
+    attachments: envelope.attachments.map((item) => ({ ...item, expiresAt: null })),
+    kind: envelope.kind, text: envelope.text, occurredAt: envelope.occurredAt };
+}
+
+export type SquareCursorState = Readonly<{ syncToken: string; lastBatchId: string | null; lastDigest: string | null }>;
+export type SquareBatchInput = Readonly<{
+  accountId: string; batchId: string; tokenBefore: string | null; tokenAfter: string;
+  envelopes: readonly ArchiveInboundEnvelope[]; titles?: readonly { chatId: string; title: string }[];
+  /** When given, the worker lease must match the account binding, as for a Talk batch. */
+  lease?: Readonly<{ workerInstanceId: string; controlEpoch: number }>;
+}>;
+export type SquareBatchResult =
+  | { status: 'stored'; inserted: number }
+  | { status: 'replay' }
+  | { status: 'digest_conflict' }
+  | { status: 'token_conflict' };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** JSON with sorted object keys, so equal batches always give equal digests. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().filter((key) => value[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+
+function squareObservation(envelope: ArchiveInboundEnvelope): ExternalObservation {
+  return { observationId: envelope.messageId, canonicalMessageId: envelope.messageId,
+    nativeConversationKind: envelope.chatType, nativeConversationId: envelope.chatId, nativeMessageId: envelope.messageId,
+    chatType: envelope.chatType, chatId: envelope.chatId, senderId: envelope.senderId,
+    ...(envelope.senderName === undefined ? {} : { senderName: envelope.senderName }),
+    livePayload: { raw: envelope.raw, eventId: envelope.eventId, ...(envelope.contact ? { contact: envelope.contact } : {}) },
     mentionIds: envelope.mentionIds, mentionRanges: envelope.mentionRanges,
     attachments: envelope.attachments.map((item) => ({ ...item, expiresAt: null })),
     kind: envelope.kind, text: envelope.text, occurredAt: envelope.occurredAt };
@@ -105,7 +145,7 @@ export type MessageListResult = MessageSearchResult & {
   /** Readers whose position covers this own message (direct/group/room); absent when not applicable or 0. */
   readCount?: number;
   /** Reactions derived from raw.native.row._reactionStatus; absent when the message has none. */
-  reactions?: Array<MessageReaction & { reactorNames: string[] }>;
+  reactions?: Array<MessageReaction & { reactorNames: string[]; /** The account's own reaction is in this group. */ own?: boolean }>;
 };
 
 export interface MessageReaderRecord { mid: string; name: string; readAt: string }
@@ -189,7 +229,9 @@ export type ConversationCatalogEntry = Readonly<{
   chatId: string;
   title: string;
   picturePath?: string | null;
-  members: readonly Readonly<{ memberId: string; displayName: string | null; nickname?: string | null; picturePath?: string | null }>[];
+  /** `friend`: true is on the friend list (native_status 1); false is a blocked friend (2, FRIEND_BLOCKED); absent changes nothing. */
+  members: readonly Readonly<{ memberId: string; displayName: string | null; nickname?: string | null; picturePath?: string | null;
+    friend?: boolean }>[];
 }>;
 
 /** Recalled and source-deleted messages: MCP reads return their stored content with recalled: true; send and forward sources are masked with these predicates. */
@@ -440,7 +482,9 @@ export class MessageRepository {
             conversation.picturePath !== undefined, conversation.picturePath ?? null],
         );
         for (const member of conversation.members) contacts.set(member.memberId, {
-          mid: member.memberId, displayName: member.displayName, ...(member.nickname === undefined ? {} : { nickname: member.nickname }) });
+          mid: member.memberId, displayName: member.displayName, ...(member.nickname === undefined ? {} : { nickname: member.nickname }),
+          ...(member.picturePath === undefined ? {} : { picturePath: member.picturePath }),
+          ...(member.friend === undefined ? {} : { nativeStatus: member.friend ? 1 : 2 }) });
         for (const member of conversation.members) await client.query(
           `INSERT INTO conversation_members(account_id,chat_type,chat_id,member_id,display_name,picture_path) VALUES($1,$2,$3,$4,$5,$7)
            ON CONFLICT(account_id,chat_type,chat_id,member_id) DO UPDATE SET
@@ -647,6 +691,109 @@ export class MessageRepository {
         readPositionsChanged, readPositionChanges };
     } catch (error) {
       await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Stored community (Square) sync state of one account, or null when the account has no stored token. */
+  async readSquareCursor(accountId: string): Promise<SquareCursorState | null> {
+    const result = await this.pool.query<{ sync_token: string; last_batch_id: string | null; last_digest: string | null }>(
+      'SELECT sync_token,last_batch_id,last_digest FROM line_square_cursors WHERE account_id=$1', [accountId]);
+    const row = result.rows[0];
+    return row ? { syncToken: row.sync_token, lastBatchId: row.last_batch_id, lastDigest: row.last_digest } : null;
+  }
+
+  /**
+   * Stores one community (Square) batch for archive only, in one transaction, with a compare-and-set on the sync token.
+   * It never touches the Talk cursor, routes, jobs or read receipts.
+   */
+  async ingestSquareBatch(input: SquareBatchInput): Promise<SquareBatchResult> {
+    const envelopes = ArchiveInboundEnvelopeSchema.array().max(SQUARE_BATCH_MAX_ENVELOPES).parse(input.envelopes);
+    const titles = input.titles ?? [];
+    const digest = createHash('sha256').update(canonicalJson({ batchId: input.batchId, tokenBefore: input.tokenBefore,
+      tokenAfter: input.tokenAfter, envelopes, titles }), 'utf8').digest('hex');
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const control = await client.query<{ control_epoch: string }>('SELECT control_epoch FROM account_control WHERE singleton=true FOR SHARE');
+      const authority = await client.query<{ mode: string; worker_instance_id: string | null; worker_binding_epoch: string | null;
+        connection_mode: string; own_mid: string | null; selected_source_id: string | null; selected_source_generation: string | null;
+        source_type: string | null; source_state: string | null; verified_account_mid: string | null }>(
+        `SELECT a.mode,a.worker_instance_id,a.worker_binding_epoch,a.connection_mode,a.own_mid,a.selected_source_id,
+          a.selected_source_generation,s.source_type,s.state AS source_state,s.verified_account_mid
+         FROM line_accounts a LEFT JOIN line_account_sources s ON s.account_id=a.account_id
+           AND s.source_id=a.selected_source_id AND s.generation=a.selected_source_generation
+         WHERE a.account_id=$1 FOR SHARE OF a`, [input.accountId]);
+      const account = authority.rows[0];
+      if (!account) throw new Error('Square batch account is unknown');
+      if (input.lease && (account.worker_instance_id !== input.lease.workerInstanceId
+        || Number(account.worker_binding_epoch) !== input.lease.controlEpoch
+        || input.lease.controlEpoch > Number(control.rows[0]?.control_epoch)
+        || (account.mode === 'ACTIVE_CONTROL' && input.lease.controlEpoch !== Number(control.rows[0]?.control_epoch)))) {
+        throw new Error('Stale square batch control epoch');
+      }
+      if (account.connection_mode !== 'SYSTEM_LOGIN' || !account.selected_source_id || account.source_type !== 'SYSTEM_LOGIN'
+        || account.source_state !== 'ACTIVE' || account.own_mid !== account.verified_account_mid || !account.selected_source_generation) {
+        throw new Error('Logged-in source authority is stale');
+      }
+      const sourceId = account.selected_source_id;
+      const generation = Number(account.selected_source_generation);
+      for (const envelope of envelopes) if (envelope.accountId !== input.accountId) throw new Error('Batch envelope account mismatch');
+      // The cursor row is the compare-and-set point. Two batches for one account cannot pass this lock together.
+      // The advisory lock covers the first run, when there is no row to lock yet.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,3))', [`square:${input.accountId}`]);
+      const cursor = await client.query<{ sync_token: string; last_batch_id: string | null; last_digest: string | null }>(
+        'SELECT sync_token,last_batch_id,last_digest FROM line_square_cursors WHERE account_id=$1 FOR UPDATE', [input.accountId]);
+      const row = cursor.rows[0];
+      if (row?.last_batch_id === input.batchId) {
+        await client.query('ROLLBACK');
+        return row.last_digest === digest ? { status: 'replay' } : { status: 'digest_conflict' };
+      }
+      if ((row?.sync_token ?? null) !== input.tokenBefore) {
+        await client.query('ROLLBACK');
+        return { status: 'token_conflict' };
+      }
+      // The stage tables key every observation by batch, so the Square batch gets its own batch row.
+      const sourceBatchId = `square:${input.batchId}`;
+      await client.query(`INSERT INTO external_source_batches(source_id,account_id,generation,batch_id,payload_digest,result)
+        VALUES ($1,$2,$3,$4,$5,'{}'::jsonb) ON CONFLICT(source_id,generation,batch_id) DO NOTHING`,
+      [sourceId, input.accountId, generation, sourceBatchId, digest]);
+      for (const item of titles) await client.query(
+        `INSERT INTO conversations(account_id,chat_type,chat_id,title) VALUES($1,'community',$2,$3)
+         ON CONFLICT(account_id,chat_type,chat_id) DO UPDATE SET title=EXCLUDED.title,
+           updated_at=CASE WHEN conversations.title IS DISTINCT FROM EXCLUDED.title THEN now() ELSE conversations.updated_at END`,
+        [input.accountId, item.chatId, item.title]);
+      let inserted = 0;
+      const observations: ExternalObservation[] = [];
+      for (const envelope of envelopes) {
+        const observation = squareObservation(envelope);
+        observations.push(observation);
+        const staged = await stageSystemLoginObservation(client, {
+          accountId: input.accountId, sourceId, generation, batchId: sourceBatchId,
+          origin: envelope.ingestion.source === 'live' ? 'SYSTEM_LOGIN_LIVE' : 'SYSTEM_LOGIN_HISTORY',
+          captureCanonicalExistence: true, observation });
+        if (staged.conflict) throw new Error('Square observation ID was reused with changed identity');
+        if (staged.canonicalExisted === true) continue;
+        inserted++;
+        const own = isRecord(envelope.raw) && isRecord(envelope.raw.square) && envelope.raw.square.own === true;
+        if (envelope.ingestion.source === 'live' && envelope.kind !== 'event' && !own) await client.query(
+          `UPDATE conversations SET unread_count=unread_count+1, updated_at=now()
+           WHERE account_id=$1 AND chat_type='community' AND chat_id=$2`, [input.accountId, envelope.chatId]);
+      }
+      await upsertCommunityMemberNames(client, input.accountId, observations);
+      await client.query(`UPDATE external_source_batches SET result=$4::jsonb WHERE source_id=$1 AND generation=$2 AND batch_id=$3`,
+        [sourceId, generation, sourceBatchId, JSON.stringify({ inserted })]);
+      await client.query(
+        `INSERT INTO line_square_cursors(account_id,sync_token,last_batch_id,last_digest) VALUES($1,$2,$3,$4)
+         ON CONFLICT(account_id) DO UPDATE SET sync_token=EXCLUDED.sync_token,last_batch_id=EXCLUDED.last_batch_id,
+           last_digest=EXCLUDED.last_digest,updated_at=now()`,
+        [input.accountId, input.tokenAfter, input.batchId, digest]);
+      await client.query('COMMIT');
+      return { status: 'stored', inserted };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally {
       client.release();
@@ -1311,7 +1458,9 @@ export class MessageRepository {
     const reactionsByMessage = new Map(page.map((row) => [row.message_id, nativeReactions(row.raw)] as const).filter(([, list]) => list.length > 0));
     const reactorIds = [...new Set([...reactionsByMessage.values()].flatMap((list) => list.flatMap((group) => group.reactorIds)))];
     const reactorNames = new Map<string, string>();
+    let reactionOwnMid: string | null = null;
     if (reactorIds.length > 0) { // One batched lookup per page.
+      reactionOwnMid = (await this.pool.query<{ own_mid: string | null }>('SELECT own_mid FROM line_accounts WHERE account_id = $1', [key.accountId])).rows[0]?.own_mid ?? null;
       const names = await this.pool.query<{ mid: string; name: string | null }>(
         `SELECT r.mid, CASE WHEN la.own_mid = r.mid THEN NULLIF(la.display_name, '') ELSE ${MEMBER_NAME_SQL} END AS name
          FROM unnest($4::text[]) AS r(mid)
@@ -1322,6 +1471,32 @@ export class MessageRepository {
       for (const row of names.rows) if (row.name) reactorNames.set(row.mid, row.name);
     }
     const nameOf = (mid: string): string => reactorNames.get(mid) ?? `…${mid.slice(-4)}`;
+    const revisionsByMessage = new Map<string, Array<{ text: string; until: Date }>>();
+    if (page.length > 0) { // One batched lookup per page: newest EDIT_VERSIONS_MAX earlier versions of each message.
+      const revisions = await this.pool.query<{ message_id: string; text: string; revised_at: Date }>(
+        `SELECT message_id, text, revised_at FROM (
+           SELECT r.message_id, left(r.text_content, ${EDIT_VERSION_TEXT_MAX}) AS text, r.revised_at, r.revision_id,
+             row_number() OVER (PARTITION BY r.message_id ORDER BY r.revised_at DESC, r.revision_id DESC) AS rank_no
+           FROM message_revisions r
+           WHERE r.account_id = $1 AND r.message_id = ANY($2::text[]) AND r.text_content IS NOT NULL) ranked
+         WHERE rank_no <= ${EDIT_VERSIONS_MAX}
+         ORDER BY revised_at ASC, revision_id ASC`,
+        [key.accountId, page.map((row) => row.message_id)]);
+      for (const row of revisions.rows) {
+        const list = revisionsByMessage.get(row.message_id) ?? [];
+        list.push({ text: row.text, until: row.revised_at });
+        revisionsByMessage.set(row.message_id, list);
+      }
+    }
+    const editedOf = (row: { message_id: string; raw: unknown }): MessageEditedInfo | null => {
+      const versions = revisionsByMessage.get(row.message_id) ?? [];
+      const marker = messageEditMarkerFromRaw(row.raw);
+      if (versions.length === 0 && !marker.edited) return null;
+      const storedAt = marker.updatedTime !== null ? new Date(marker.updatedTime) : null;
+      const editedAt = storedAt !== null && Number.isFinite(storedAt.getTime()) ? storedAt : versions.at(-1)?.until ?? null;
+      return { editedAt: editedAt === null ? null : editedAt.toISOString(),
+        versions: versions.map((version) => ({ text: version.text, until: version.until.toISOString() })) };
+    };
     return { messages: [...page].reverse().map((row) => ({ accountId: row.account_id, chatType: row.chat_type,
       chatId: row.chat_id, messageId: row.message_id, senderId: row.sender_id, text: row.text_content,
       occurredAt: row.occurred_at.toISOString(), kind: row.kind,
@@ -1336,8 +1511,9 @@ export class MessageRepository {
       sourceDeleted: row.source_deleted === true,
       ...(Number(row.read_count) > 0 ? { readCount: Number(row.read_count) } : {}),
       ...(reactionsByMessage.has(row.message_id)
-        ? { reactions: reactionsByMessage.get(row.message_id)!.map((group) => ({ ...group, reactorNames: group.reactorIds.map(nameOf) })) } : {}),
-      recallOriginal: parseRecallOriginal(row.recall_original) })), nextCursor };
+        ? { reactions: reactionsByMessage.get(row.message_id)!.map((group) => ({ ...group, reactorNames: group.reactorIds.map(nameOf),
+          ...(reactionOwnMid !== null && group.reactorIds.includes(reactionOwnMid) ? { own: true } : {}) })) } : {}),
+      recallOriginal: parseRecallOriginal(row.recall_original), edited: editedOf(row) })), nextCursor };
   }
 
   async getMessage(key: ConversationKey, messageId: string): Promise<TimelineMessageRecord | null> {
@@ -1363,6 +1539,22 @@ export class MessageRepository {
        ORDER BY p.last_read_at DESC, p.reader_mid LIMIT $5`,
       [key.accountId, key.chatType, key.chatId, messageId, limit]);
     return result.rows.map((row) => ({ mid: row.reader_mid, name: row.name ?? '', readAt: row.last_read_at.toISOString() }));
+  }
+
+  /** The members of one group or room with their resolved names, for the @ mention list. The account's own MID is left out. Read only. */
+  async listConversationMembers(key: ConversationKey, opts: { limit?: number } = {}): Promise<Array<{ mid: string; name: string }>> {
+    if (key.chatType !== 'group' && key.chatType !== 'room') return [];
+    const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 500), 1), 1000);
+    const result = await this.pool.query<{ member_id: string; name: string | null }>(
+      `SELECT cm.member_id, ${MEMBER_NAME_SQL} AS name
+         FROM conversation_members cm
+         JOIN line_accounts la ON la.account_id = cm.account_id
+         LEFT JOIN line_contacts member_contact ON member_contact.account_id = cm.account_id AND member_contact.mid = cm.member_id
+        WHERE cm.account_id = $1 AND cm.chat_type = $2 AND cm.chat_id = $3
+          AND cm.member_id ~ '^u[0-9a-f]{32}$' AND cm.member_id IS DISTINCT FROM la.own_mid
+        ORDER BY lower(COALESCE(${MEMBER_NAME_SQL}, cm.member_id)), cm.member_id LIMIT $4`,
+      [key.accountId, key.chatType, key.chatId, limit]);
+    return result.rows.map((row) => ({ mid: row.member_id, name: row.name ?? '' }));
   }
 
   async listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[], automaticAttemptLimit = 3): Promise<AttachmentStateRecord[]> {
@@ -1671,9 +1863,41 @@ export class MessageRepository {
   }
 
   /**
+   * Corrects the stored length of a ready row to the real file length. It writes only while the row is still ready and its sha256 is the one
+   * that the caller checked against the file. It changes nothing else. Returns true when the row changed.
+   */
+  async correctReadyAttachmentSize(attachmentId: string, sha256: string, sizeBytes: number): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE attachments SET size_bytes = $3, updated_at = now()
+         WHERE attachment_id = $1 AND status = 'ready' AND lower(sha256) = lower($2) AND size_bytes IS DISTINCT FROM $3`,
+      [attachmentId, sha256, sizeBytes]);
+    return result.rowCount === 1;
+  }
+
+  /**
+   * Moves a ready row whose file failed the integrity check out of ready, so a new download can replace the file.
+   * The row becomes failed with the real code in `error`. retry_after is infinity, the state that the manual download accepts and that
+   * no automatic scan picks up. The stored path, sha256 and size stay as evidence until the next download overwrites them.
+   * It writes only while the row is still ready with the sha256 that the caller checked. `exhausted` is true when retry_count has reached the
+   * automatic attempt limit: the caller must not start a new download then. Returns null when the row did not change.
+   */
+  async moveReadyAttachmentOutOfReady(attachmentId: string, sha256: string, code: string, automaticAttemptLimit: number): Promise<{ exhausted: boolean } | null> {
+    const result = await this.pool.query<{ retry_count: number }>(
+      `UPDATE attachments SET status = 'failed', error = $3, retry_after = 'infinity'::timestamptz,
+           download_lease_expires_at = NULL, download_attempt_token = NULL, download_owner_id = NULL,
+           download_worker_instance_id = NULL, download_worker_binding_epoch = NULL, updated_at = now()
+         WHERE attachment_id = $1 AND status = 'ready' AND lower(sha256) = lower($2)
+         RETURNING retry_count`,
+      [attachmentId, sha256, code.slice(0, 200)]);
+    if (result.rowCount !== 1) return null;
+    return { exhausted: Number(result.rows[0]!.retry_count) >= automaticAttemptLimit };
+  }
+
+  /**
    * Counts the download bridge verification state of each attachment of one account, per kind (image, file).
    * The audit row `request_id` is the attachment id. Rows of other attachment kinds are not counted.
    * An attachment with a real mismatch row (at any time) counts as `mismatch`. Any other attachment counts by its newest row.
+   * A mismatch row whose detail starts with `identity:` compared no key. It is not a real mismatch and counts as `native_incomplete`.
    */
   async countBridgeVerification(accountId: string): Promise<BridgeVerificationCounts> {
     // Legacy rule: before the result `store_incomplete` existed, a placeholder store message was recorded as MISMATCH.
@@ -1681,8 +1905,12 @@ export class MessageRepository {
     // It is not a real mismatch. It counts as `store_incomplete` when it is the newest row.
     const result = await this.pool.query<{ kind: string; state: string; total: number }>(
       `WITH rows AS (
-         SELECT details->>'request_id' AS request_id, details->>'result_code' AS result_code, created_at, audit_id,
-                (details->>'result_code' = 'BRIDGE_VERIFY_MISMATCH' AND NOT (
+         SELECT details->>'request_id' AS request_id,
+                CASE WHEN details->>'result_code' = 'BRIDGE_VERIFY_MISMATCH' AND COALESCE(details->'diagnostic'->>'detail', '') LIKE 'identity:%'
+                     THEN 'BRIDGE_VERIFY_NATIVE_INCOMPLETE' ELSE details->>'result_code' END AS result_code,
+                created_at, audit_id,
+                (details->>'result_code' = 'BRIDGE_VERIFY_MISMATCH'
+                   AND COALESCE(details->'diagnostic'->>'detail', '') NOT LIKE 'identity:%' AND NOT (
                    COALESCE(details->'diagnostic'->>'detail', '') LIKE '%missing\\_chrome:%'
                    AND COALESCE(details->'diagnostic'->>'detail', '') NOT LIKE '%diff:%'
                    AND COALESCE(details->'diagnostic'->>'detail', '') NOT LIKE '%missing\\_official:%'
@@ -1743,6 +1971,16 @@ export class MessageRepository {
       [key.accountId, key.chatType, key.chatId, messageId, externalAttachmentId],
     );
     return result.rows[0] ? this.getAttachment(result.rows[0].attachment_id) : null;
+  }
+
+  /** The ids of the attachment rows of one message. A manual media send adds one message with one row. */
+  async listAttachmentIdsByMessage(key: ConversationKey, messageId: string): Promise<string[]> {
+    const result = await this.pool.query<{ attachment_id: string }>(
+      `SELECT attachment_id FROM attachments WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3 AND message_id = $4
+       ORDER BY attachment_id LIMIT 2`,
+      [key.accountId, key.chatType, key.chatId, messageId],
+    );
+    return result.rows.map((row) => row.attachment_id);
   }
 
   async markAttachmentDownloading(mutation: AttachmentMutation & { ownerId?: string }): Promise<boolean> {
@@ -1808,14 +2046,14 @@ export class MessageRepository {
    * The read model shows an old External Monitor row as `expired` while the table still holds `queued`, so all three states pass.
    * A row that holds a download lease (`downloading`) or that is already `ready` does not change.
    */
-  async markAttachmentRecoveredFromLocal(input: { attachmentId: string; accountId: string; relativePath: string; sha256: string; sizeBytes: number }): Promise<boolean> {
+  async markAttachmentRecoveredFromLocal(input: { attachmentId: string; accountId: string; relativePath: string; sha256: string; sizeBytes: number; name?: string }): Promise<boolean> {
     const result = await this.pool.query(
-      `UPDATE attachments SET status = 'ready', relative_path = $3, sha256 = $4, size_bytes = $5, error = NULL, retry_after = NULL,
+      `UPDATE attachments SET status = 'ready', relative_path = $3, sha256 = $4, size_bytes = $5, name = COALESCE($6, name), error = NULL, retry_after = NULL,
          download_lease_expires_at = NULL, download_attempt_token = NULL, download_owner_id = NULL,
          download_worker_instance_id = NULL, download_worker_binding_epoch = NULL, updated_at = now()
        WHERE attachment_id = $1 AND account_id = $2 AND status IN ('queued', 'failed', 'expired')
        RETURNING attachment_id`,
-      [input.attachmentId, input.accountId, input.relativePath, input.sha256, input.sizeBytes]);
+      [input.attachmentId, input.accountId, input.relativePath, input.sha256, input.sizeBytes, input.name ?? null]);
     return result.rowCount === 1;
   }
 
@@ -2153,6 +2391,48 @@ export class MessageRepository {
       [accountId, chatType, chatId]);
     const row = result.rows[0];
     return row ? { accountId, chatType: row.chat_type, chatId } : null;
+  }
+
+  /**
+   * Agent send only: the existing conversation (as getSendTarget) or, for a direct chat id that is a user MID without a row, a new
+   * direct target. The MID must be a FRIEND contact of the account (native_status 1) or a member of a group or room of the account
+   * (not the local Agent room). Refused (null): the own MID, a contact that LINE marks blocked (ContactStatus 2 FRIEND_BLOCKED,
+   * 4 RECOMMEND_BLOCKED, 6 DELETED_BLOCKED, also when it shares a group) and every other MID (a stranger).
+   * Group and room ids still need an existing row.
+   */
+  async getAgentSendTarget(
+    accountId: string, chatType: string, chatId: string,
+    queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'> = this.pool,
+  ): Promise<{ accountId: string; chatType: SendChatType; chatId: string; newDirect: boolean } | null> {
+    const existing = await this.getSendTarget(accountId, chatType, chatId, queryable);
+    if (existing) return { ...existing, newDirect: false };
+    if (chatType !== 'direct' || !/^u[0-9a-f]{32}$/.test(chatId)) return null;
+    const known = await queryable.query<{ refused: boolean; friend: boolean; shared: boolean }>(
+      `SELECT
+         (EXISTS (SELECT 1 FROM line_accounts WHERE account_id = $1 AND own_mid = $2)
+           OR EXISTS (SELECT 1 FROM line_contacts WHERE account_id = $1 AND mid = $2 AND native_status IN (2, 4, 6))) AS refused,
+         EXISTS (SELECT 1 FROM line_contacts WHERE account_id = $1 AND mid = $2 AND native_status = 1) AS friend,
+         EXISTS (SELECT 1 FROM conversation_members
+                  WHERE account_id = $1 AND member_id = $2 AND chat_type IN ('group', 'room') AND chat_id <> '__local_agent_room__') AS shared`,
+      [accountId, chatId]);
+    const row = known.rows[0];
+    if (!row || row.refused || !(row.friend || row.shared)) return null;
+    return { accountId, chatType: 'direct', chatId, newDirect: true };
+  }
+
+  /** Creates the direct conversation row of a first successful Agent send; an existing row is kept. Throws when no row exists afterwards. */
+  async ensureDirectConversation(
+    accountId: string, chatId: string,
+    queryable: Pick<Pool, 'query'> | Pick<PoolClient, 'query'> = this.pool,
+  ): Promise<void> {
+    await queryable.query(
+      `INSERT INTO conversations(account_id, chat_type, chat_id, title, agent_enabled, unread_count, native_metadata)
+       VALUES ($1, 'direct', $2, '', false, 0, '{"midType":null,"parentChatId":null,"communityId":null}'::jsonb)
+       ON CONFLICT (account_id, chat_type, chat_id) DO NOTHING`,
+      [accountId, chatId]);
+    const check = await queryable.query(
+      "SELECT 1 FROM conversations WHERE account_id = $1 AND chat_type = 'direct' AND chat_id = $2", [accountId, chatId]);
+    if (check.rows.length === 0) throw new Error('direct conversation row missing after insert');
   }
 
   /** The archived message to forward. `masked` is true for recalled and source-deleted messages (text is then null). */

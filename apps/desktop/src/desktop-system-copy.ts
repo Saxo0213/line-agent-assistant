@@ -34,8 +34,11 @@ export const EXTRA_DESKTOP_COPY = {
   searchAgentTab: 'Agent', searchPrimaryAdminTab: 'Primary Admin', formerAgentAccount: 'Former Agent account',
   loginMethodLabel: 'Login method',
   loginMethodLogoutFirst: 'Log out to change the login method',
-  loginMethodWindows: 'Windows version',
-  loginMethodChrome: 'Chrome version',
+  loginMethodWindows: 'Windows',
+  loginMethodMac: 'Mac',
+  loginMethodAndroid: 'Android (secondary)',
+  loginMethodIpad: 'iPad',
+  loginMethodChrome: 'Chrome',
   chromeLoginUnavailableTitle: 'Chrome login is not available',
   chromeLoginReadyTitle: 'Chrome login is ready',
   chromeLoginNeedsExtension: 'Chrome login needs the official LINE Chrome extension 3.7.2 on this computer.',
@@ -50,6 +53,9 @@ export const EXTRA_DESKTOP_COPY = {
   chromeLoginReady: 'The LINE Chrome extension is ready. You can continue to log in.',
   chromeLoginContinue: 'Continue login',
   chromeLoginDetecting: 'Detecting…',
+  reactionButton: 'React', reactionNice: 'Nice', reactionLove: 'Love', reactionFun: 'Fun', reactionAmazing: 'Amazing', reactionSad: 'Sad', reactionOmg: 'OMG',
+  reactionFailed: 'Unable to send the reaction.',
+  mentionListLabel: 'Members to mention', mentionNoMatch: 'No matching members',
 } as const;
 
 export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
@@ -62,6 +68,9 @@ export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, str
   loginMethodLabel: '登入方式',
   loginMethodLogoutFirst: '登出後才能切換登入方式',
   loginMethodWindows: 'Windows 版',
+  loginMethodMac: 'Mac 版',
+  loginMethodAndroid: 'Android 副裝置',
+  loginMethodIpad: 'iPad',
   loginMethodChrome: 'Chrome 版',
   chromeLoginUnavailableTitle: '無法使用 Chrome 版登入',
   chromeLoginReadyTitle: '可以使用 Chrome 版登入',
@@ -77,6 +86,9 @@ export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, str
   chromeLoginReady: '已找到 LINE Chrome 擴充功能，可以繼續登入。',
   chromeLoginContinue: '繼續登入',
   chromeLoginDetecting: '偵測中…',
+  reactionButton: '表情', reactionNice: '讚', reactionLove: '愛心', reactionFun: '好笑', reactionAmazing: '驚訝', reactionSad: '難過', reactionOmg: 'OMG',
+  reactionFailed: '無法送出反應',
+  mentionListLabel: '可提及的成員', mentionNoMatch: '沒有符合的成員',
 };
 export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
   optionalLocalAnalysis: '任意のローカル分析', agents: 'Agent', operations: '操作', agentQueue: 'Agent キュー', bytes: 'バイト', lineAccounts: 'LINE アカウント',
@@ -88,6 +100,9 @@ export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string
   loginMethodLabel: 'ログイン方法',
   loginMethodLogoutFirst: 'ログイン方法はログアウト後に変更できます',
   loginMethodWindows: 'Windows 版',
+  loginMethodMac: 'Mac 版',
+  loginMethodAndroid: 'Android サブ端末',
+  loginMethodIpad: 'iPad',
   loginMethodChrome: 'Chrome 版',
   chromeLoginUnavailableTitle: 'Chrome 版ログインは利用できません',
   chromeLoginReadyTitle: 'Chrome 版でログインできます',
@@ -103,6 +118,9 @@ export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string
   chromeLoginReady: 'LINE Chrome 拡張機能を確認しました。ログインを続行できます。',
   chromeLoginContinue: 'ログインを続行',
   chromeLoginDetecting: '検出中…',
+  reactionButton: 'リアクション', reactionNice: 'いいね', reactionLove: 'ラブ', reactionFun: '面白い', reactionAmazing: 'びっくり', reactionSad: '悲しい', reactionOmg: 'OMG',
+  reactionFailed: 'リアクションを送信できません',
+  mentionListLabel: 'メンションするメンバー', mentionNoMatch: '一致するメンバーがいません',
 };
 export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
   optionalLocalAnalysis: '선택적 로컬 분석', agents: 'Agent', operations: '작업', agentQueue: 'Agent 대기열', bytes: '바이트', lineAccounts: 'LINE 계정',
@@ -114,6 +132,9 @@ export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> 
   loginMethodLabel: '로그인 방식',
   loginMethodLogoutFirst: '로그아웃한 후 로그인 방식을 변경할 수 있습니다',
   loginMethodWindows: 'Windows 버전',
+  loginMethodMac: 'Mac 버전',
+  loginMethodAndroid: 'Android 보조 기기',
+  loginMethodIpad: 'iPad',
   loginMethodChrome: 'Chrome 버전',
   chromeLoginUnavailableTitle: 'Chrome 버전 로그인을 사용할 수 없습니다',
   chromeLoginReadyTitle: 'Chrome 버전으로 로그인할 수 있습니다',
@@ -129,6 +150,9 @@ export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> 
   chromeLoginReady: 'LINE Chrome 확장 프로그램을 찾았습니다. 로그인을 계속할 수 있습니다.',
   chromeLoginContinue: '로그인 계속',
   chromeLoginDetecting: '감지 중…',
+  reactionButton: '반응', reactionNice: '좋아요', reactionLove: '사랑', reactionFun: '웃겨요', reactionAmazing: '놀라워요', reactionSad: '슬퍼요', reactionOmg: 'OMG',
+  reactionFailed: '반응을 보낼 수 없습니다',
+  mentionListLabel: '멘션할 멤버', mentionNoMatch: '일치하는 멤버가 없습니다',
 };
 
 const JAPANESE_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
@@ -173,19 +197,23 @@ const NATIVE_ENGLISH_COPY = {
   newAttachmentFolder: 'Choose a new LINE attachment folder', attachmentFolder: 'Choose a LINE attachment folder',
   agentWorkspace: 'Choose an Agent workspace', showConsole: 'Show console', quit: 'Quit',
   chromeLtsmFolder: 'Choose the LINE Chrome extension folder',
+  projectFolder: 'Choose a project folder',
 } as const;
 const NATIVE_TRADITIONAL_COPY: Record<keyof typeof NATIVE_ENGLISH_COPY, string> = {
   newAttachmentFolder: '選擇新的 LINE 附件儲存資料夾', attachmentFolder: '選擇 LINE 附件儲存資料夾',
   agentWorkspace: '選擇 Agent 工作目錄', showConsole: '顯示操作台', quit: '結束',
   chromeLtsmFolder: '選擇 LINE Chrome 擴充功能資料夾',
+  projectFolder: '選擇專案資料夾',
 };
 const NATIVE_JAPANESE_COPY: Record<keyof typeof NATIVE_ENGLISH_COPY, string> = {
   newAttachmentFolder: '新しい LINE 添付ファイルフォルダーを選択', attachmentFolder: 'LINE 添付ファイルフォルダーを選択', agentWorkspace: 'Agent ワークスペースを選択', showConsole: 'コンソールを表示', quit: '終了',
   chromeLtsmFolder: 'LINE Chrome 拡張機能のフォルダーを選択',
+  projectFolder: 'プロジェクトフォルダーを選択',
 };
 const NATIVE_KOREAN_COPY: Record<keyof typeof NATIVE_ENGLISH_COPY, string> = {
   newAttachmentFolder: '새 LINE 첨부 파일 폴더 선택', attachmentFolder: 'LINE 첨부 파일 폴더 선택', agentWorkspace: 'Agent 작업 공간 선택', showConsole: '콘솔 표시', quit: '종료',
   chromeLtsmFolder: 'LINE Chrome 확장 프로그램 폴더 선택',
+  projectFolder: '프로젝트 폴더 선택',
 };
 export function nativeDesktopText(locale: import('./locale.js').Locale, key: keyof typeof NATIVE_ENGLISH_COPY): string {
   return ({ en: NATIVE_ENGLISH_COPY, 'zh-TW': NATIVE_TRADITIONAL_COPY, ja: NATIVE_JAPANESE_COPY, ko: NATIVE_KOREAN_COPY }[locale] ?? NATIVE_ENGLISH_COPY)[key];

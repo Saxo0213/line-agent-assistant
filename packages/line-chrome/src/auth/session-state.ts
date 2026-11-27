@@ -168,7 +168,7 @@ export function parseSessionSnapshot(value: unknown): SnapshotData & { expire: n
 
 /**
  * Mutable session state shared by the QR login, token refresh, logout and resume paths. It owns the secret slots, the
- * ReqSeq allocator and the worker-facing events. One listener per event (like the linejs adapter's `on`).
+ * ReqSeq allocator and the worker-facing events. One listener per event (like the `on` of the linejs Client engine).
  */
 export class ChromeSessionState {
   private token: string | null = null;
@@ -269,8 +269,7 @@ export class ChromeSessionState {
 
   /**
    * After a successful qrCodeLoginV2: adopt tokens, certificate, mid and exported E2EE keys, then tell the worker
-   * (qrCert, storage, token), as the linejs adapter does via update:qrcert / storage / update:authtoken
-   * (linejs-adapter.ts:818-830).
+   * (qrCert, storage, token), as the linejs Client engine does via update:qrcert / storage / update:authtoken.
    */
   adoptLogin(login: LoginAdoption): void {
     this.token = login.accessToken;
@@ -292,7 +291,7 @@ export class ChromeSessionState {
 
   /**
    * After a successful tokenRefresh: new access token, rotated refresh token, new schedule (OkLine
-   * _apply_refresh_response auth.py:1100-1117). Like the linejs adapter (linejs-adapter.ts:751) the worker gets ONE
+   * _apply_refresh_response auth.py:1100-1117). Like the linejs Client engine, the worker gets ONE
    * `credentials` event carrying token + the full snapshot, not separate token/storage events.
    */
   adoptRefresh(issue: TokenIssue): void {

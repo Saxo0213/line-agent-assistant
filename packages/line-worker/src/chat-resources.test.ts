@@ -13,7 +13,7 @@ function setup() {
   return { worker, transport, events };
 }
 async function ready(worker: LineWorkerLoop) {
-  await worker.handle({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await worker.handle({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await worker.handle({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
 }
 
@@ -69,7 +69,7 @@ it('cancels a pending read when the matching request is cancelled', async () => 
 
 it('rejects reads after pause, stop, or revoke before calling LINE transport', async () => {
   const paused = setup();
-  await paused.worker.handle({ type: 'init', ...binding, protocolVersion: 4, mode: 'PAUSED', durableCursor: cursor });
+  await paused.worker.handle({ type: 'init', ...binding, protocolVersion: 5, mode: 'PAUSED', durableCursor: cursor });
   await paused.worker.handle({ type: 'chatResourceRead', ...binding, chatType: 'group', chatId, requestId: 'paused', action: 'listNotes', timeoutMs: 10_000 });
   expect(paused.transport.chatResourceCalls).toHaveLength(0);
   expect(paused.events.at(-1)).toMatchObject({ type: 'chatResourceResult', error: 'WORKER_NOT_ACTIVE' });

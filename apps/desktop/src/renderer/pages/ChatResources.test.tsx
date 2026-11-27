@@ -1,16 +1,24 @@
 // @vitest-environment jsdom
 import React from 'react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { IpcRequestSchema, type ConversationKey } from '@line-agent/contracts';
+import { IpcRequestSchema, lineMediaUrl, type ConversationKey } from '@line-agent/contracts';
 import { LocaleProvider } from '../locale-context.js';
 import { ChatResources, type ChatResourceApi } from './ChatResources.js';
 
-afterEach(() => cleanup());
+// jsdom does not load images. This stub answers each `new Image()` probe by `unsaved`: a src that contains a listed id errors, others load.
+const unsaved = new Set<string>();
+class StubImage {
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  set src(value: string) { const missing = [...unsaved].some((id) => value === lineMediaUrl({ type: 'albumPhoto', ...route, albumId: album.albumId, photoId: id })); queueMicrotask(() => (missing ? this.onerror : this.onload)?.()); }
+}
+beforeEach(() => { unsaved.clear(); vi.stubGlobal('Image', StubImage); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 const route: ConversationKey = { accountId: 'agent-1', chatType: 'group', chatId: 'group-1' };
 const note = { postId: 'note-1', createdTime: 1_760_000_000_000, text: 'Agenda\nNext week' };
-const album = { albumId: 'album-1', chatId: route.chatId, title: 'Trip', photoCount: 1, createTime: null, updateTime: null };
+const album = { albumId: 'album-1', chatId: route.chatId, title: 'Trip', photoCount: 1, createTime: null, updateTime: null, coverPhotoIds: ['photo-1'] };
 const photo = { photoId: 'photo-1', oid: 'oid-1', prefix: 'album/a' as const, shotTime: null, width: 640, height: 480 };
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -39,10 +47,10 @@ function renderControls(client = api(), status: 'connected' | 'disconnected' = '
 }
 
 describe('ChatResources', () => {
-  it('hides the Notes action and never reads Notes while keeping Albums available', async () => {
+  it('shows the Notes action, reads no Notes until it is opened, and keeps Albums available', async () => {
     const client = api();
     renderControls(client);
-    expect(screen.queryByRole('button', { name: 'Open chat notes' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Open chat notes' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     expect(await screen.findByRole('dialog', { name: 'Albums' })).toBeTruthy();
     expect(client.listChatNotes).not.toHaveBeenCalled();
@@ -59,15 +67,6 @@ describe('ChatResources', () => {
     renderControls(api(), 'connected', 'MONITOR_ONLY');
     expect(screen.queryByRole('button', { name: 'Open chat notes' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Open chat albums' })).toBeNull();
-  });
-
-  it('never exposes a Notes dialog', () => {
-    const client = api();
-    renderControls(client);
-    expect(screen.queryByRole('button', { name: 'Open chat notes' })).toBeNull();
-    expect(screen.queryByRole('dialog', { name: 'Notes' })).toBeNull();
-    expect(client.listChatNotes).not.toHaveBeenCalled();
-    expect(client.getChatNote).not.toHaveBeenCalled();
   });
 
   it('opens Albums from its header action without an in-dialog Notes or Albums switcher', async () => {
@@ -92,7 +91,7 @@ describe('ChatResources', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
-    await screen.findByRole('button', { name: 'Download photo' });
+    await screen.findByRole('button', { name: 'Photo 1' });
 
     expect(client.listChatNotes).not.toHaveBeenCalled();
     expect(client.listChatAlbums).toHaveBeenCalledWith(route, null, expect.any(String));
@@ -105,6 +104,7 @@ describe('ChatResources', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
     expect(await screen.findByText('1 photo')).toBeTruthy();
+    fireEvent.click(await screen.findByRole('button', { name: 'Photo 1' }));
     fireEvent.click(screen.getByRole('button', { name: 'Download photo' }));
     expect(await screen.findByText('Image saved')).toBeTruthy();
     const preview = await screen.findByTestId('album-photo-preview-photo-1');
@@ -131,6 +131,37 @@ describe('ChatResources', () => {
     expect(client.downloadChatAlbumPhoto).not.toHaveBeenCalled();
   });
 
+  it('preloads every photo that is not saved, two at a time, then shows it; a failure keeps the Download button', async () => {
+    const client = api();
+    const photos = ['photo-1', 'photo-2', 'photo-3'].map((photoId) => ({ ...photo, photoId, oid: `oid-${photoId}` }));
+    client.listChatAlbumPhotos = vi.fn(async () => ({ photos, nextCursor: null }));
+    const gates = new Map<string, ReturnType<typeof deferred<{ albumId: string; photoId: string; sizeBytes: number }>>>();
+    client.downloadChatAlbumPhoto = vi.fn((_key, _albumId, photoId) => { const gate = deferred<{ albumId: string; photoId: string; sizeBytes: number }>(); gates.set(photoId, gate); return gate.promise; });
+    for (const { photoId } of photos) unsaved.add(photoId);
+    renderControls(client);
+    fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
+    await waitFor(() => expect(client.downloadChatAlbumPhoto).toHaveBeenCalledTimes(2));
+    expect(screen.queryByTestId('album-photo-preview-photo-1')).toBeNull();
+    expect(screen.getAllByText('Loading…').length).toBeGreaterThanOrEqual(3);
+    unsaved.delete('photo-1');
+    gates.get('photo-1')!.resolve({ albumId: album.albumId, photoId: 'photo-1', sizeBytes: 1 });
+    await waitFor(() => expect(client.downloadChatAlbumPhoto).toHaveBeenCalledTimes(3));
+    expect(await screen.findByTestId('album-photo-preview-photo-1')).toBeTruthy();
+    gates.get('photo-2')!.resolve({ albumId: album.albumId, photoId: 'photo-2', sizeBytes: 1 });
+    expect(await screen.findByText('Unable to load')).toBeTruthy();
+    expect(screen.queryByTestId('album-photo-preview-photo-2')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Download photo' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Photo 2' }));
+    expect(screen.getByRole('button', { name: 'Download photo' })).toBeTruthy();
+    expect(screen.getByText('2 / 3')).toBeTruthy();
+    fireEvent.keyDown(document, { key: 'ArrowRight' });
+    expect(screen.getByText('3 / 3')).toBeTruthy();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('button', { name: 'Download photo' })).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'Albums' })).toBeTruthy();
+  });
+
   it('selects an album for display without starting archive reconciliation', async () => {
     const client = api();
     client.openChatAlbum = vi.fn(async () => ({ albumId: album.albumId, savedCount: 2, failedCount: 0, totalCount: 2,
@@ -138,7 +169,7 @@ describe('ChatResources', () => {
     renderControls(client);
     fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
-    await screen.findByRole('button', { name: 'Download photo' });
+    await screen.findByRole('button', { name: 'Photo 1' });
     fireEvent.click(screen.getByRole('button', { name: 'Back' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
     await waitFor(() => expect(client.listChatAlbumPhotos).toHaveBeenCalledTimes(2));
@@ -162,7 +193,7 @@ describe('ChatResources', () => {
     renderControls(client);
     fireEvent.click(screen.getByRole('button', { name: 'Open chat albums' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Trip' }));
-    await screen.findByRole('button', { name: 'Download photo' });
+    await screen.findByRole('button', { name: 'Photo 1' });
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
     await waitFor(() => expect(client.listChatAlbumPhotos).toHaveBeenCalledTimes(2));
     expect(client.listChatAlbumPhotos).toHaveBeenLastCalledWith(route, album.albumId, null, expect.any(String), true);
@@ -209,7 +240,6 @@ describe('ChatResources', () => {
   ] as const)('localizes the Album action in %s', (locale, label) => {
     renderControls(api(), 'connected', 'ACTIVE_CONTROL', locale);
     expect(screen.getByRole('button', { name: label })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /notes|記事|노트/i })).toBeNull();
   });
 
   it('refreshes Albums when closing and reopening its header action', async () => {
@@ -245,8 +275,9 @@ describe('ChatResources', () => {
     expect(client.listChatAlbumPhotos).toHaveBeenCalledTimes(2);
     expect(client.listChatAlbumPhotos).toHaveBeenLastCalledWith(route, albumB.albumId, null, expect.any(String));
     pendingB.resolve({ photos: [photoB], nextCursor: null });
-    await screen.findByRole('button', { name: 'Download photo' });
+    await screen.findByRole('button', { name: 'Photo 1' });
     pendingA.resolve({ photos: [photoA], nextCursor: null });
+    fireEvent.click(await screen.findByRole('button', { name: 'Photo 1' }));
     fireEvent.click(screen.getByRole('button', { name: 'Download photo' }));
     await waitFor(() => expect(client.downloadChatAlbumPhoto).toHaveBeenCalledWith(route, albumB.albumId, photoB.photoId, photoB.oid, photoB.prefix, expect.any(String)));
   });

@@ -2,16 +2,23 @@ import { PRIMARY_ADMIN_LINE_LOGIN_ENABLED } from '../../primary-admin-line-login
 import { desktopTextFor, generatedMessageText, useDesktopLocale, useDesktopText, useDownloadBridgeErrorText, useExtraText, useSafeErrorText } from '../desktop-i18n.js';
 import React, { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
-import { DEFAULT_DOWNLOAD_BRIDGE_INTERVALS, DOWNLOAD_BRIDGE_INTERVAL_SECONDS_MAX } from '@line-agent/contracts';
-import type { ChromeLtsmInstallResult, ChromeLtsmUnavailableStatus, DownloadBridgeIntervalRange, DownloadBridgeIntervals, DownloadBridgeState, IpcResult, LineAccountSummary } from '@line-agent/contracts';
+import { DEFAULT_DOWNLOAD_BRIDGE_INTERVALS, DOWNLOAD_BRIDGE_INTERVAL_SECONDS_MAX, isLinejsTransport } from '@line-agent/contracts';
+import { LineMediaImage } from '../LineMediaImage.js';
+import type { ChromeLtsmInstallResult, ChromeLtsmUnavailableStatus, ConversationKey, DownloadBridgeIntervalRange, DownloadBridgeIntervals, DownloadBridgeState, IpcResult, LineAccountSummary, LineTransportKind } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import { InlineBusy } from '../components/InlineBusy.js';
 import { ProgressOverlay } from '../components/ProgressOverlay.js';
 
 export type LineLoginView = { accountId: string; loginAttemptId: string | null; state: 'connecting' | 'connected' | 'disconnected' | 'degraded' | 'reauth_required'; message: string | null; imageDataUrl?: string; pin?: string };
 type PendingAction = 'add' | 'restart' | 'login';
-/** DESKTOPWIN is the default login method. CHROMEOS needs the LINE Chrome extension files. */
-type LoginMethod = 'DESKTOPWIN' | 'CHROMEOS';
+/** DESKTOPWIN is the default login method. DESKTOPMAC, ANDROIDSECONDARY and IOSIPAD are the other linejs devices. CHROMEOS needs the LINE Chrome extension files. */
+type LoginMethod = LineTransportKind;
+/** Menu order of the login methods. */
+const LOGIN_METHODS: readonly LoginMethod[] = ['DESKTOPWIN', 'DESKTOPMAC', 'ANDROIDSECONDARY', 'IOSIPAD', 'CHROMEOS'];
+const LOGIN_METHOD_TEXT_KEY = {
+  DESKTOPWIN: 'loginMethodWindows', DESKTOPMAC: 'loginMethodMac', ANDROIDSECONDARY: 'loginMethodAndroid',
+  IOSIPAD: 'loginMethodIpad', CHROMEOS: 'loginMethodChrome',
+} as const satisfies Record<LoginMethod, string>;
 /** State of the dialog that explains why Chrome login cannot start. */
 type ChromeSetup = { status: ChromeLtsmUnavailableStatus | null; ready: boolean; busy: boolean; notFound: boolean; error: string | null; retry: () => void };
 type PendingTarget = string;
@@ -92,9 +99,12 @@ function BridgeIntervalRow({ label, minLabel, maxLabel, unit, value, disabled, o
     <span>{unit}</span>
   </div>;
 }
-type Props = { api: DesktopApi; accounts: LineAccountSummary[]; headingRef?: React.RefObject<HTMLHeadingElement | null>; embedded?: boolean; live?: LineLoginView | null; onNotice?: (message: string) => void };
+type Props = { api: DesktopApi; accounts: LineAccountSummary[]; headingRef?: React.RefObject<HTMLHeadingElement | null>; embedded?: boolean; live?: LineLoginView | null; onNotice?: (message: string) => void;
+  /** Stored conversations; the lookup card offers 開啟聊天 only for a friend that has a direct row here. */
+  conversations?: readonly ConversationKey[]; onOpenConversation?: (key: ConversationKey) => void };
+const NO_CONVERSATIONS: readonly ConversationKey[] = [];
 
-export function LineLogin({ api, accounts, headingRef, embedded = false, live = null, onNotice }: Props) {
+export function LineLogin({ api, accounts, headingRef, embedded = false, live = null, onNotice, conversations = NO_CONVERSATIONS, onOpenConversation }: Props) {
   const desktopText = useDesktopText();
   const extraText = useExtraText();
   const safeErrorText = useSafeErrorText();
@@ -134,8 +144,8 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   const [methodByAccount, setMethodByAccount] = useState<Record<string, LoginMethod>>({});
   const accountMethod = (account: LineAccountSummary): LoginMethod => methodByAccount[account.accountId] ?? account.lineTransport ?? 'DESKTOPWIN';
   const chooseLoginMethod = (method: LoginMethod) => { loginMethodRef.current = method; setLoginMethod(method); };
-  // Only CHROMEOS goes to main. A request without lineTransport keeps the DESKTOPWIN flow as before.
-  const chosenTransport = (): 'CHROMEOS' | undefined => loginMethodRef.current === 'CHROMEOS' ? 'CHROMEOS' : undefined;
+  // Every method except DESKTOPWIN goes to main. A request without lineTransport keeps the DESKTOPWIN flow as before.
+  const chosenTransport = (): LoginMethod | undefined => loginMethodRef.current === 'DESKTOPWIN' ? undefined : loginMethodRef.current;
   const notify = (message: string) => { if (onNotice) onNotice(message); else setStatus(message); };
   // LEGY encrypted transport setting of the Agent worker. Null until the main process answers. It applies at the next login.
   const [legyEncrypted, setLegyEncrypted] = useState<boolean | null>(null);
@@ -149,6 +159,64 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     try {
       setLegyEncrypted(await api.setLineLegyEncrypted(enabled));
       notify(desktopText('legyEncryptedTransportHint'));
+    } catch (cause) { notify(safeErrorText(cause, desktopText('unableToSave'))); }
+  }
+  // LINE link lookup (test). The 查詢 button is the only trigger; typing or pasting never starts a query.
+  const [lookupText, setLookupText] = useState('');
+  const [lookupBusy, setLookupBusy] = useState(false);
+  const [lookupResult, setLookupResult] = useState<Awaited<ReturnType<DesktopApi['lineLookupContact']>> | null>(null);
+  async function runLookup(): Promise<void> {
+    if (lookupBusy || typeof api.lineLookupContact !== 'function') return;
+    setLookupBusy(true);
+    try { setLookupResult(await api.lineLookupContact(lookupText)); }
+    catch { setLookupResult({ ok: false, error: 'CONTACT_LOOKUP_FAILED' }); }
+    finally { setLookupBusy(false); }
+  }
+  const lookupRelationText = {
+    friend: desktopText('lineLookupRelationFriend'), not_friend: desktopText('lineLookupRelationNotFriend'),
+    blocked: desktopText('lineLookupRelationBlocked'), self: desktopText('lineLookupRelationSelf'), unknown: desktopText('lineLookupRelationUnknown'),
+  } as const;
+  const lookupSection = (account: LineAccountSummary) => {
+    const contact = lookupResult?.ok ? lookupResult.contact : null;
+    const hasChat = contact !== null && contact.relation === 'friend' && onOpenConversation !== undefined
+      && conversations.some((item) => item.accountId === account.accountId && item.chatType === 'direct' && item.chatId === contact.mid);
+    return <section className="line-lookup" aria-label={desktopText('lineLookupTitle')}>
+      <h3>{desktopText('lineLookupTitle')}</h3>
+      <div className="button-row">
+        <input type="text" value={lookupText} placeholder={desktopText('lineLookupPlaceholder')} aria-label={desktopText('lineLookupTitle')}
+          onChange={(event) => setLookupText(event.target.value)} />
+        <button disabled={lookupBusy || lookupText.trim() === ''} onClick={() => void runLookup()}>
+          {lookupBusy ? desktopText('lineLookupBusy') : desktopText('lineLookupButton')}</button>
+      </div>
+      {lookupResult && !lookupResult.ok && <p role="alert" className="line-lookup-error">
+        {lookupResult.error === 'INVALID_LINE_LINK' ? desktopText('lineLookupInvalid') : null}
+        <small className="error-code"> {desktopText('lineLookupErrorCode')}{lookupResult.error}</small></p>}
+      {contact && <div className="line-lookup-card" role="status">
+        <LineMediaImage api={api} enabled={contact.picturePath !== null} {...(contact.picturePath !== null ? { target: { type: 'profilePicture' as const, picturePath: contact.picturePath } } : {})}
+          fallbackKind="person" className="conversation-avatar" />
+        <div>
+          <strong>{contact.displayName ?? desktopText('lineLookupNoName')}</strong>
+          {contact.statusMessage !== null && <p>{contact.statusMessage}</p>}
+          <p>{lookupRelationText[contact.relation]} <small>{maskMid(contact.mid)}</small></p>
+          {hasChat
+            ? <button onClick={() => onOpenConversation?.({ accountId: account.accountId, chatType: 'direct', chatId: contact.mid })}>{desktopText('lineLookupOpenChat')}</button>
+            : <p>{desktopText('lineLookupNotFriendNotice')}</p>}
+        </div>
+      </div>}
+    </section>;
+  };
+  // Community message receive setting of the Agent worker. Null until the main process answers. It applies at the next login.
+  const [squareReceive, setSquareReceive] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (typeof api.getLineSquareReceive !== 'function') return;
+    let live = true;
+    void api.getLineSquareReceive().then((value) => { if (live) setSquareReceive(value); }).catch(() => undefined);
+    return () => { live = false; };
+  }, [api]);
+  async function changeSquareReceive(enabled: boolean): Promise<void> {
+    try {
+      setSquareReceive(await api.setLineSquareReceive(enabled));
+      notify(desktopText('squareReceiveHint'));
     } catch (cause) { notify(safeErrorText(cause, desktopText('unableToSave'))); }
   }
   const previousLive = useRef(live);
@@ -345,8 +413,8 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     setPending({ target: accountId, action: 'login' });
     const account = accounts.find((item) => item.accountId === accountId);
     const method = methodByAccount[accountId] ?? account?.lineTransport ?? 'DESKTOPWIN';
-    // Only CHROMEOS is sent. DESKTOPWIN is sent only to leave a CHROMEOS account. Otherwise Main keeps the current method.
-    const lineTransport = method === 'CHROMEOS' ? 'CHROMEOS' as const : account?.lineTransport === 'CHROMEOS' ? 'DESKTOPWIN' as const : undefined;
+    // Every method except DESKTOPWIN is sent. DESKTOPWIN is sent only to leave an account that uses another method. Otherwise Main keeps the current method.
+    const lineTransport: LoginMethod | undefined = method !== 'DESKTOPWIN' ? method : account?.lineTransport !== undefined && account.lineTransport !== 'DESKTOPWIN' ? 'DESKTOPWIN' : undefined;
     let result: IpcResult;
     try { result = lineTransport ? await api.lineLoginQr(accountId, lineTransport) : await api.lineLoginQr(accountId); }
     catch (cause) { setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: safeErrorText(cause, desktopText('unableToStartLineLogin')) }); return; }
@@ -596,7 +664,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
     const stopping = stoppingExternalImport === account.accountId;
     const starting = startingExternalImport === account.accountId;
     return <article className={`${embedded ? 'account-record' : 'panel'} route-${account.mode}`} data-account-id={account.accountId} key={account.accountId}>
-      {account.lineTransport === 'CHROMEOS' && <p className="login-method-badge">{extraText('loginMethodChrome')}</p>}
+      {account.lineTransport !== undefined && account.lineTransport !== 'DESKTOPWIN' && <p className="login-method-badge">{extraText(LOGIN_METHOD_TEXT_KEY[account.lineTransport])}</p>}
       <p>{desktopText('connectionStatus')}{monitoring && account.productRole === 'PRIMARY_ADMIN' ? desktopText('externalMonitoringActive') : account.status === 'connected' ? desktopText('connected') : account.status === 'reauth_required' ? desktopText('lineLoginRequiredAgain') : account.status === 'disconnected' ? desktopText('loggedOut') : desktopText('connectionError')}</p>
       {(!embedded || account.productRole === 'AGENT') && <p>{desktopText('lastSynced')}{account.lastSyncedAt ? new Date(account.lastSyncedAt).toLocaleString(locale) : desktopText('notSyncedYet')}</p>}
       {account.adminLineage === 'former' && <p className="former-admin-label">{desktopText('formerAdministratorAccount')}</p>}
@@ -630,8 +698,11 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       {!isAdmin && <label className="auto-login-option"><input type="checkbox" checked={account.autoLoginOnStartup === true} disabled={monitoring}
         title={monitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={monitoring ? `auto-login-disabled-${account.accountId}` : undefined}
         onChange={(event) => void setAutoLogin(account, event.target.checked)} /> {desktopText('logInAutomaticallyAtStartup')}</label>}
-      {!isAdmin && accountMethod(account) === 'DESKTOPWIN' && legyEncrypted !== null && <label className="auto-login-option"><input type="checkbox" checked={legyEncrypted}
+      {!isAdmin && isLinejsTransport(accountMethod(account)) && accountMethod(account) !== 'IOSIPAD' && legyEncrypted !== null && <label className="auto-login-option"><input type="checkbox" checked={legyEncrypted}
         onChange={(event) => void changeLegyEncrypted(event.target.checked)} /> {desktopText('legyEncryptedTransport')}<small> {desktopText('legyEncryptedTransportHint')}</small></label>}
+      {account.productRole === 'AGENT' && isLinejsTransport(accountMethod(account)) && lookupSection(account)}
+      {!isAdmin && isLinejsTransport(accountMethod(account)) && squareReceive !== null && <label className="auto-login-option"><input type="checkbox" checked={squareReceive}
+        onChange={(event) => void changeSquareReceive(event.target.checked)} /> {desktopText('squareReceive')}<small> {desktopText('squareReceiveHint')}</small></label>}
       {!isAdmin && monitoring && <span id={`auto-login-disabled-${account.accountId}`} className="sr-only">{desktopText('unavailableDuringExternalMonitoring')}</span>}
       <div className="button-row account-actions">
         {account.status === 'connected' && !monitoring && <button disabled={refreshingAvatar !== null || busy}
@@ -646,8 +717,7 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
           disabled={!loggedOut || busy || loginActive || adminMonitoring}
           title={!loggedOut ? extraText('loginMethodLogoutFirst') : adminMonitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined}
           onChange={(event) => void chooseAccountMethod(account.accountId, event.target.value as LoginMethod)}>
-          <option value="DESKTOPWIN">{extraText('loginMethodWindows')}</option>
-          <option value="CHROMEOS">{extraText('loginMethodChrome')}</option>
+          {LOGIN_METHODS.map((method) => <option key={method} value={method}>{extraText(LOGIN_METHOD_TEXT_KEY[method])}</option>)}
         </select>}
         {busy && <InlineBusy>{desktopText('startingLineLogin')}</InlineBusy>}
         {loggingOut === account.accountId && <InlineBusy>{desktopText('loggingOut')}</InlineBusy>}
@@ -717,9 +787,9 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       }} />)}
   </div> : null;
   const methodChoice = <div className="button-row login-method-choice" role="group" aria-label={extraText('loginMethodLabel')}>
-    {(['DESKTOPWIN', 'CHROMEOS'] as const).map((method) => <button key={method} type="button" aria-pressed={loginMethod === method}
+    {LOGIN_METHODS.map((method) => <button key={method} type="button" aria-pressed={loginMethod === method}
       className={loginMethod === method ? 'primary' : undefined} disabled={loginActive || addPending}
-      onClick={() => chooseLoginMethod(method)}>{method === 'CHROMEOS' ? extraText('loginMethodChrome') : extraText('loginMethodWindows')}</button>)}
+      onClick={() => chooseLoginMethod(method)}>{extraText(LOGIN_METHOD_TEXT_KEY[method])}</button>)}
   </div>;
   const chromeStatus = chromeSetup?.status ?? null;
   const vacantPending = (slot: PendingTarget) => pending?.target === slot ? desktopText('startingLineLogin') : null;

@@ -9,7 +9,7 @@ import { FakeLineTransport } from './fake-transport.js';
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const cursor = { version: 1 as const, revision: '0', globalRev: '0', individualRev: '0' };
 type Init = Extract<LineWorkerCommand, { type: 'init' }>;
-const init = (extra: Record<string, unknown> = {}): Init => LineWorkerCommandSchema.parse({ type: 'init', ...binding, protocolVersion: 4,
+const init = (extra: Record<string, unknown> = {}): Init => LineWorkerCommandSchema.parse({ type: 'init', ...binding, protocolVersion: 5,
   mode: 'MONITOR_ONLY', durableCursor: cursor, ...extra }) as Init;
 
 function port() {
@@ -42,29 +42,46 @@ function port() {
   };
 }
 
-it('builds the DESKTOPWIN adapter exactly as before when lineTransport is absent or DESKTOPWIN', async () => {
+it('builds the linejs Client engine with no device when lineTransport is absent or DESKTOPWIN', async () => {
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
-  const createLinejs = vi.fn(async () => transport as never);
+  const createClientEngine = vi.fn(() => transport as never);
   const createChrome = vi.fn(async () => transport as never);
-  const factory = createTransportFactory({ createLinejs, createChrome });
+  const factory = createTransportFactory({ createClientEngine, createChrome });
   await factory(init());
   await factory(init({ lineTransport: 'DESKTOPWIN' }));
   expect(createChrome).not.toHaveBeenCalled();
-  expect(createLinejs).toHaveBeenCalledTimes(2);
-  expect(createLinejs.mock.calls[0]![0]).toEqual({ ...binding, mode: 'MONITOR_ONLY', validateLease: expect.any(Function),
-    physicalTransport: expect.any(Function) });
-  expect(Object.keys(createLinejs.mock.calls[0]![0]).sort()).toEqual(['accountId', 'controlEpoch', 'mode', 'physicalTransport', 'validateLease', 'workerInstanceId']);
+  expect(createClientEngine).toHaveBeenCalledTimes(2);
+  expect(createClientEngine.mock.calls[0]![0]).toEqual({ ...binding, mode: 'MONITOR_ONLY' });
+});
+
+it.each(['DESKTOPMAC', 'ANDROIDSECONDARY', 'IOSIPAD'] as const)('passes the init device %s to the linejs Client engine', async (lineTransport) => {
+  const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+  const createClientEngine = vi.fn(() => transport as never);
+  const createChrome = vi.fn(async () => transport as never);
+  await createTransportFactory({ createClientEngine, createChrome })(init({ lineTransport }));
+  expect(createChrome).not.toHaveBeenCalled();
+  expect(createClientEngine.mock.calls[0]![0]).toMatchObject({ device: lineTransport });
+});
+
+it('passes legyEncrypted to the linejs Client engine only when it is true', async () => {
+  const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
+  const createClientEngine = vi.fn(() => transport as never);
+  const factory = createTransportFactory({ createClientEngine });
+  await factory(init({ legyEncrypted: true }));
+  await factory(init());
+  expect(createClientEngine.mock.calls[0]![0]).toMatchObject({ legyEncrypted: true });
+  expect(createClientEngine.mock.calls[1]![0]).not.toHaveProperty('legyEncrypted');
 });
 
 it('builds the Chrome adapter for lineTransport CHROMEOS with the store root and Node fetch', async () => {
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
-  const createLinejs = vi.fn(async () => transport as never);
+  const createClientEngine = vi.fn(() => transport as never);
   const createChrome = vi.fn(async () => transport as never);
   const chromeFetch = vi.fn(async () => new Response('{}'));
-  const factory = createTransportFactory({ createLinejs, createChrome, chromeFetch });
+  const factory = createTransportFactory({ createClientEngine, createChrome, chromeFetch });
   await factory(init({ lineTransport: 'CHROMEOS', chromeLtsmDir: '/abs/line-chrome/ltsm' }));
   await factory(init({ lineTransport: 'CHROMEOS' }));
-  expect(createLinejs).not.toHaveBeenCalled();
+  expect(createClientEngine).not.toHaveBeenCalled();
   expect(createChrome.mock.calls[0]![0]).toMatchObject({ ...binding, mode: 'MONITOR_ONLY', ltsmRoot: '/abs/line-chrome/ltsm', fetch: expect.any(Function) });
   expect(createChrome.mock.calls[1]![0]).not.toHaveProperty('ltsmRoot');
   await createChrome.mock.calls[0]![0].fetch('https://example.invalid/x', { method: 'GET' }).catch(() => undefined);
@@ -85,7 +102,7 @@ it('uses the global fetch (undici) for CHROMEOS by default', async () => {
 async function bootstrap(chromeLtsmDir: string | undefined): Promise<any[]> {
   const channel = port();
   runWorkerLoopOnPort(channel, createTransportFactory());
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor,
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor,
     lineTransport: 'CHROMEOS', ...(chromeLtsmDir === undefined ? {} : { chromeLtsmDir }) });
   await channel.waitForEvents(1);
   return channel.events;
@@ -123,7 +140,7 @@ it('reports a corrupt store without leaking its path or file contents', async ()
 it('keeps the process alive after a failed CHROMEOS bootstrap and rejects further commands normally', async () => {
   const channel = port();
   runWorkerLoopOnPort(channel, createTransportFactory());
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor, lineTransport: 'CHROMEOS' });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor, lineTransport: 'CHROMEOS' });
   await channel.waitForEvents(1);
   await channel.send({ type: 'poll', ...binding });
   await channel.waitForEvents(2);

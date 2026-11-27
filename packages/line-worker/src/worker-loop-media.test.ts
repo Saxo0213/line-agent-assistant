@@ -26,7 +26,7 @@ async function setup(mode: 'ACTIVE_CONTROL' | 'MONITOR_ONLY' = 'ACTIVE_CONTROL',
   const events: any[] = [];
   let leaseValid = true;
   const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: () => leaseValid });
-  await worker.handle({ type: 'init', ...owner, protocolVersion: 4, mode, durableCursor: cursor });
+  await worker.handle({ type: 'init', ...owner, protocolVersion: 5, mode, durableCursor: cursor });
   await worker.handle({ type: 'loginQr', ...owner, loginAttemptId: 'login-1' });
   const command = { type: 'sendMedia' as const, ...owner, chatType: 'direct' as const, chatId: 'u-peer', requestId: 'media-1',
     kind: 'image' as const, filePath, fileName: 'a.png', sizeBytes: content.length,

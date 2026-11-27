@@ -12,7 +12,6 @@ import { IpcResultSchema, LineWorkerCommandSchema, lineMediaUrl, parseLineMediaU
 import { AccountRepository, AdminRepository, AgentPermissionRepository, AgentRepository, ExternalMonitorRepository, MessageRepository, SettingsRepository } from '@line-agent/database';
 import { createTestDatabase } from '../../../../packages/database/src/test-database.js';
 import { plainEnvelope } from '../../../../packages/database/src/content-bridge/test-support.js';
-import { createLinejsAdapter } from '../../../../packages/line-worker/src/linejs-adapter.js';
 import { FRIEND_LIST_LIMIT, FriendListSchema, MessagePageSchema, MessageReadersSchema } from '../desktop-protocol.js';
 import { createConnectedFacade, createPermissionCommandService, resolveMcpLocalClientBridgePath, sameJsonValue, toExternalObservation, type ConnectedFacadeOptions, type IntegratedAgent, type IntegratedWorkerGateway } from './connected-facade.js';
 import { isNativeNotePostNotification, type ChatResourceReadResult, type ChatResourceRequest, type ChatResourceStore } from './services/chat-resources.js';
@@ -2071,27 +2070,8 @@ database('connected facade account login semantics', () => {
     }
     stops.length = 0;
     const commandsBeforeInvalidation = commands.length;
-    const { RequestClient } = await import(new URL('./request/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
-      RequestClient: { prototype: { request: (...args: any[]) => Promise<unknown> } };
-    };
-    const { InternalError } = await import(new URL('./core/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
-      InternalError: new (type: string, message: string, data: Record<string, unknown>) => Error;
-    };
-    const authError = new InternalError('RequestError', 'Request internal failed', { code: 'NOT_AUTHORIZED_DEVICE' });
-    const request = vi.spyOn(RequestClient.prototype, 'request').mockRejectedValue(authError);
-    let invalidation = Promise.resolve();
-    const adapter = await createLinejsAdapter({ accountId: accountA.accountId, workerInstanceId: accountA.workerInstanceId,
-      controlEpoch: accountA.controlEpoch, mode: 'ACTIVE_CONTROL', validateLease: () => true,
-      physicalTransport: async () => new Response() });
-    await adapter.installSecrets({ token: [Buffer.from('{"alg":"HS256"}').toString('base64url'),
-      Buffer.from('{"sub":"u-self"}').toString('base64url'), 'signature'].join('.'), qrCert: null, e2eeStorage: null });
-    adapter.on('authInvalidated', () => {
-      invalidation = workerEventHandler!(accountA.workerInstanceId, { type: 'authInvalidated', ...accountA });
-    });
-    try {
-      await expect(adapter.sync({ version: 1, revision: '0', globalRev: '0', individualRev: '0' })).rejects.toBe(authError);
-      await invalidation;
-    } finally { request.mockRestore(); }
+    // The worker engine reports the auth invalidation as this event; the facade reaction is under test.
+    await workerEventHandler!(accountA.workerInstanceId, { type: 'authInvalidated', ...accountA });
     const statuses = await pool.query('SELECT account_id,status FROM line_accounts ORDER BY account_id');
     expect(stops).toEqual(['account-a']);
     expect(statuses.rows).toEqual([{ account_id: 'account-a', status: 'reauth_required' },
@@ -2125,27 +2105,8 @@ database('connected facade account login semantics', () => {
     }
     stops.length = 0;
     const commandsBeforeInvalidation = commands.length;
-    const { RequestClient } = await import(new URL('./request/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
-      RequestClient: { prototype: { request: (...args: any[]) => Promise<unknown> } };
-    };
-    const { InternalError } = await import(new URL('./core/mod.js', import.meta.resolve('@evex/linejs/base')).href) as {
-      InternalError: new (type: string, message: string, data: Record<string, unknown>) => Error;
-    };
-    const authError = new InternalError('RequestError', 'Request internal failed', { code: 'NOT_AUTHORIZED_DEVICE' });
-    const request = vi.spyOn(RequestClient.prototype, 'request').mockRejectedValue(authError);
-    let invalidation = Promise.resolve();
-    const adapter = await createLinejsAdapter({ accountId: accountA.accountId, workerInstanceId: accountA.workerInstanceId,
-      controlEpoch: accountA.controlEpoch, mode: 'ACTIVE_CONTROL', validateLease: () => true,
-      physicalTransport: async () => new Response() });
-    await adapter.installSecrets({ token: [Buffer.from('{"alg":"HS256"}').toString('base64url'),
-      Buffer.from('{"sub":"u-self"}').toString('base64url'), 'signature'].join('.'), qrCert: null, e2eeStorage: null });
-    adapter.on('authInvalidated', () => {
-      invalidation = workerEventHandler!(accountA.workerInstanceId, { type: 'authInvalidated', ...accountA });
-    });
-    try {
-      await expect(adapter.sync({ version: 1, revision: '0', globalRev: '0', individualRev: '0' })).rejects.toBe(authError);
-      await invalidation;
-    } finally { request.mockRestore(); }
+    // The worker engine reports the auth invalidation as this event; the facade reaction is under test.
+    await workerEventHandler!(accountA.workerInstanceId, { type: 'authInvalidated', ...accountA });
     const statuses = await pool.query('SELECT account_id,status FROM line_accounts ORDER BY account_id');
     expect(stops).toEqual(['account-a']);
     expect(statuses.rows).toEqual([{ account_id: 'account-a', status: 'reauth_required' },
@@ -2157,14 +2118,6 @@ database('connected facade account login semantics', () => {
       chatType: 'direct', chatId: 'chat-a', text: 'must be blocked' })).toMatchObject({ ok: false });
     expect(commands.some((command) => command.type === 'manualSendText' && command.requestId === 'after-auth-invalidation')).toBe(false);
     expect(commands.slice(commandsBeforeInvalidation).some((command) => command.type === 'loginToken' || command.type === 'loginQr')).toBe(false);
-  });
-
-  it('rejects direct facade Notes reads without sending a LINE resource request', async () => {
-    const key = { accountId: 'account-a', chatType: 'group' as const, chatId: 'archive-chat' };
-    const readsBefore = archiveReads;
-    await expect(facade.listChatNotes(key, null)).rejects.toThrow('Notes are disabled.');
-    await expect(facade.getChatNote(key, 'note-a')).rejects.toThrow('Notes are disabled.');
-    expect(archiveReads).toBe(readsBefore);
   });
 
   it('returns the IPC error code UNSUPPORTED for a worker UNSUPPORTED result and keeps other codes', async () => {
@@ -2385,6 +2338,17 @@ database('connected facade account login semantics', () => {
        AND raw #>> '{message,contentType}' IN ('16', 'POSTNOTIFICATION')
        AND raw #>> '{message,contentMetadata,serviceType}' = 'AB'`, [accountId]);
     expect(persisted.rows).toContainEqual({ chat_type: chatType, chat_id: chatId });
+  });
+
+  it('audits the LINE error code of an authentication invalidation', async () => {
+    await addStoredAccounts('account-a');
+    await activate('account-a');
+    await facade.dispatch({ type: 'lineLoginQr', requestId: 'start-qr-a', accountId: 'account-a' });
+    const current = bindings.get('account-a')!;
+    await workerEventHandler!(current.workerInstanceId, { type: 'authInvalidated', ...current,
+      code: 'LINE_TALK_NOT_AUTHORIZED_DEVICE', upstreamCode: 8 });
+    await waitForState(() => expect(auditEvents.find((event) => event.action === 'line_auth_invalidated'))
+      .toMatchObject({ phase: 'observed', accountId: 'account-a', errorCode: 'LINE_TALK_NOT_AUTHORIZED_DEVICE' }));
   });
 
   it('ignores an invalidation whose database binding has already been replaced', async () => {
@@ -2873,6 +2837,19 @@ database('connected facade account login semantics', () => {
     expect(commands.filter((command) => command.type === 'manualSendText' && command.requestId === 'poisoned-send')).toHaveLength(1);
     await audit.flush();
     expect(JSON.stringify(auditEvents)).not.toContain(privateServerText);
+  });
+
+  it('sends a manual reaction and UNDO through the worker with the manual send checks', async () => {
+    await addStoredAccounts('react-facade-account');
+    const binding = await loginReady('react-facade-account');
+    const key = { accountId: binding.accountId, chatType: 'group' as const, chatId: 'react-chat' };
+    const react = (requestId: string, reaction: 'NICE' | 'UNDO') => facade.dispatch({ type: 'reactMessage', requestId, ...key, messageId: '4242', reaction });
+    expect(await react('react-nice', 'NICE'), 'nice').toMatchObject({ ok: true });
+    expect(await react('react-undo', 'UNDO'), 'undo').toMatchObject({ ok: true });
+    expect(commands.filter((command) => command.type === 'reactMessage')).toEqual([
+      expect.objectContaining({ type: 'reactMessage', accountId: binding.accountId, chatType: 'group', chatId: 'react-chat', messageId: '4242', reaction: 'NICE' }),
+      expect.objectContaining({ type: 'reactMessage', messageId: '4242', reaction: 'UNDO' }),
+    ]);
   });
 
   it('reconciles a confirmed unsend into the exact older timeline row and refuses other senders', async () => {

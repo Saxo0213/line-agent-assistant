@@ -3,7 +3,7 @@ import { FakeLineTransport } from './fake-transport.js';
 import { LineWorkerLoop } from './worker-loop.js';
 import { LineServerRejection } from './line-server-error.js';
 
-const protocolVersion = 4 as const;
+const protocolVersion = 5 as const;
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const cursor = { version: 1 as const, revision: '0', globalRev: '0', individualRev: '0' };
 const item = (chatId: string, title: string) => ({ chatType: chatId.startsWith('r') ? 'room' as const : 'group' as const, chatId, title,

@@ -9,8 +9,8 @@ const installedRoot = resolve(dirname(fileURLToPath(import.meta.resolve('@evex/l
 const temporary: string[] = [];
 afterEach(async () => { for (const path of temporary.splice(0)) await rm(path, { recursive: true, force: true }); });
 
-it('accepts the exact official JSR 3.5.0 package and fixture source files', async () => {
-  await expect(verifyLinejsPackage(installedRoot)).resolves.toMatchObject({ status: 'verified', version: '3.5.0' });
+it('accepts the exact official JSR 3.6.9 package and fixture source files', async () => {
+  await expect(verifyLinejsPackage(installedRoot)).resolves.toMatchObject({ status: 'verified', version: '3.6.9' });
 });
 
 it('fails closed when a pinned RequestClient fixture drifts', async () => {

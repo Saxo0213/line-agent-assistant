@@ -128,3 +128,38 @@ describe('mention rules and rule actions', () => {
     }
   });
 });
+
+describe('photo text rules', () => {
+  const imageTask = (match: object = {}, actions: object | null = { forward: true, agent: { target: agentTarget } }) => ({
+    type: 'message_forward' as const, match: { mode: 'image_text', keywords: ['王小明'], ...match }, ...(actions ? { actions } : {}) });
+  const line = { mode: 'line_target' as const, target: destination };
+  it('parses the mode with defaults and limits', () => {
+    const parsed = AgentScheduleForwardTaskSchema.parse(imageTask({ keywords: [' 王小明 ', '張三豐'] }));
+    expect(parsed.match).toEqual({ mode: 'image_text', keywords: ['王小明', '張三豐'], verifyUnclear: true });
+    expect(AgentScheduleForwardTaskSchema.safeParse(imageTask({ keywords: [] })).success).toBe(false);
+    expect(AgentScheduleForwardTaskSchema.safeParse(imageTask({ keywords: ['  '] })).success).toBe(false);
+    expect(AgentScheduleForwardTaskSchema.safeParse(imageTask({ keywords: Array.from({ length: 21 }, (_, i) => `k${i}`) })).success).toBe(false);
+    expect(AgentScheduleForwardTaskSchema.safeParse(imageTask({ keywords: ['x'.repeat(201)] })).success).toBe(false);
+  });
+  it('needs forwarding, and an Agent target when it verifies unclear photos', () => {
+    const issue = (value: unknown) => { const r = AgentScheduleForwardTaskSchema.safeParse(value); return r.success ? null : r.error.issues.map((i) => i.message).join('|'); };
+    expect(issue(imageTask({}, null))).toContain('Agent target');
+    expect(issue(imageTask({}, { forward: false, notify: true, agent: { target: agentTarget } }))).toContain('must forward');
+    expect(issue(imageTask({ verifyUnclear: false }, { forward: true }))).toBeNull();
+    expect(issue(imageTask({}, { forward: true, agent: { target: agentTarget } }))).toBeNull();
+    const shape = (task: unknown, delivery: unknown) => agentScheduleShapeError({ prompt: '', targets: [], task: AgentScheduleTaskSchema.parse(task), delivery: delivery as never, recurrence: { kind: 'message' } });
+    expect(shape(imageTask(), line)).toBeNull();
+    expect(shape(imageTask(), { mode: 'record_only' })).toBe('Message forwarding requires an explicit LINE destination');
+  });
+  it('matches only image messages here and may use an LLM only when it verifies', () => {
+    const base = { accountId: 'admin', senderId: 's1', text: '' };
+    const task = AgentScheduleForwardTaskSchema.parse(imageTask());
+    expect(matchesScheduleForward(task, { ...base, kind: 'image' })).toBe(true);
+    expect(matchesScheduleForward(task, { ...base, kind: 'text', text: '王小明' })).toBe(false);
+    expect(matchesScheduleForward(task, base)).toBe(false);
+    expect(matchesScheduleForward({ ...task, sender: { accountId: 'admin', mid: 's2', label: '' } }, { ...base, kind: 'image' })).toBe(false);
+    expect(scheduleMayUseLlm(task)).toBe(true);
+    expect(scheduleMayUseLlm(AgentScheduleForwardTaskSchema.parse(imageTask({ verifyUnclear: false }, { forward: true })))).toBe(false);
+    expect(scheduleExecutionKind(task)).toBe('program');
+  });
+});

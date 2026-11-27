@@ -310,6 +310,7 @@ export class AgentScheduleService {
     return composeForwardRunContext({
       prompt: agent.prompt, agentTarget: await this.currentDeliveryTarget(agent.target), work, message,
       mention: match.mode === 'mention' ? { admin: match.admin, members: match.members, all: match.all } : null,
+      imageText: match.mode === 'image_text' ? { keywords: match.keywords, near: (work?.ocrDetail ?? '').split(',').filter((keyword) => keyword.length > 0) } : null,
     });
   }
 

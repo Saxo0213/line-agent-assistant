@@ -74,6 +74,8 @@ export const KOREAN_DESKTOP_COPY_PART3 = {
   loading251: '불러오는 중…',
   noMessagesForThisChatInTheDatabase: '데이터베이스에 이 채팅의 메시지가 없습니다',
   arg0NoData: '{arg0} (데이터 없음)',
+  messageEdited: '수정됨',
+  messageEditHistory: '수정 기록',
   quotedMessage: '인용한 메시지',
   replyToArg0Arg1: '{arg0}님에게 답장: {arg1}',
   sharedLineContact: '공유된 LINE 연락처',

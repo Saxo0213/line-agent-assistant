@@ -1,6 +1,9 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { ScheduleForwardRepository } from '@line-agent/database';
 import { ScheduleForwardService } from './services/schedule-forward-service.js';
+import { PhotoTextService } from './services/photo-text-service.js';
+import { createPhotoOcrEngine } from './services/photo-ocr.js';
+import { resolveManagedAttachment } from './security.js';
 import type { ForwardNotify } from './services/forward-notifier.js';
 import type { Pool } from 'pg';
 import type {
@@ -30,13 +33,14 @@ import type { Locale } from '../locale.js';
 import { boundedSticonRawSql, projectSticons } from './sticon-projection.js';
 import { AccountSupervisor, isTokenLoginRejection, LineService } from './services/line-service.js';
 import { ProviderFailoverProbe } from './services/provider-failover-probe.js';
+import type { AgentUpgradeNotice } from './services/agent-upgrade-notice.js';
 import { AgentService, type AgentFailover, type AgentRunner, type InternalMcpLauncher } from './services/agent-service.js';
 import { AgentScheduleService } from './services/agent-schedule-service.js';
 import { FreeModeService } from './services/free-mode-service.js';
 import { createReplyContextResolver } from './services/agent-reply-context.js';
 import { PERSONA_DESCRIPTION_SETTING, PERSONA_LIVELINESS_SETTING, readGlobalPersona, resolveEffectivePersona } from './services/agent-persona.js';
 import { defaultProjectPathPolicy } from './services/project-folder-path.js';
-import { ProjectFolderService } from './services/project-folder-service.js';
+import { ProjectFolderService, ProjectFolderUiError } from './services/project-folder-service.js';
 import { createScheduleMessageReader } from './services/agent-schedule-reader.js';
 import { createAgentScheduleTargetResolver } from './services/agent-schedule-targets.js';
 import { AgentAttachmentError } from './services/agent-attachments.js';
@@ -46,7 +50,7 @@ import { AgentExtensionsService, AgentExtensionsServiceError, BackendSecretCodec
 import { defaultImportLocations, type AgentExtensionImportLocations } from './services/agent-extension-import.js';
 import { ChatFolderError, ChatFolderService } from './services/chat-folders.js';
 import { AlbumArchiveFailure, albumFailureContextFrom, albumTaskFailureStage, ChatResourceArchiveService, nativePostNotificationSubtype,
-  ChatResourceUnsupportedError, type ChatResourceBinding, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
+  ChatResourceUnsupportedError, ChatResourceNoHomeChatError, type ChatResourceBinding, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
 import { AlbumNotificationDispatcher, archiveAlbumContinuations } from './services/album-notification-dispatcher.js';
 import { ChatResourceAccountAdmission } from './services/chat-resource-admission.js';
 import { ChatResourceArchive, createChatResourceStoreAdapter } from './services/chat-resource-archive.js';
@@ -76,6 +80,7 @@ import { McpHttpServer } from './services/mcp-http-server.js';
 import { LocalMcpConfigError, McpLocalClients, type LocalClientKind } from './services/mcp-local-clients.js';
 import { DpapiUserSecretBackend, type SecretBackend, type SecretStore } from './services/secret-store.js';
 import { AttachmentPreviewService, createRepositoryPreviewAuthority, type PreviewPresenter } from './attachment-preview.js';
+import { createAttachmentIntegrity } from './attachment-integrity.js';
 import { AttachmentOpenService } from './attachment-open.js';
 import { LineMediaService } from './line-media.js';
 import { toDataURL } from 'qrcode';
@@ -104,6 +109,7 @@ import { createManualMediaAdmission } from './services/manual-media-admission.js
 import { ManualSendNotStartedError } from './services/manual-send-errors.js';
 import { gatewayFault, recordSendFault, workerFault } from './services/send-failure.js';
 import { pickWorkerBinding } from './worker-binding-fields.js';
+import { parseLineContactLink } from './line-contact-link.js';
 
 const REPLY_SENDER_NAME_SQL = senderNameSql({ m: 'qm', la: 'qla', c: 'qc', cm: 'qcm',
   senderContact: 'quoted_sender_contact', peerContact: 'quoted_peer_contact' });
@@ -161,6 +167,8 @@ export interface IntegratedWorkerGateway {
   checkFriendRelation(command: Extract<LineWorkerCommand, { type: 'checkFriendRelation' }>): Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>;
   refreshOwnProfile?(command: Extract<LineWorkerCommand, { type: 'refreshOwnProfile' }>): Promise<Extract<LineWorkerEvent, { type: 'ownProfileResult' }>>;
   addFriendByMid(command: Extract<LineWorkerCommand, { type: 'addFriendByMid' }>): Promise<Extract<LineWorkerEvent, { type: 'addFriendResult' }>>;
+  /** One user-started contact read. Only the lineLookupContact IPC calls it. */
+  lookupContact?(command: Extract<LineWorkerCommand, { type: 'lookupContact' }>): Promise<Extract<LineWorkerEvent, { type: 'contactLookupResult' }>>;
   download(command: Extract<LineWorkerCommand, { type: 'downloadAttachment' }>, signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'attachmentResult' }>>;
   readChatResource?(command: ChatResourceRequest, signal?: AbortSignal): Promise<ChatResourceReadResult>;
   /** Effective per-operation bound of the gateway (child boot/protocol guard and in-flight sends). */
@@ -199,6 +207,8 @@ export interface ConnectedFacadeOptions {
   attachmentRoot: string;
   /** `userData/llm-accounts`: the directories of the managed CLI accounts. Without it the account source actions are unavailable. */
   accountsDirectory?: string;
+  /** The one-time notice for the first resumed job of a session that existed before an app version change. */
+  agentUpgradeNotice?: AgentUpgradeNotice;
   attachmentBrokerHelperPath?: string;
   /** App-managed empty directory used as the working directory of the free-mode judge. */
   freeModeJudgeDirectory?: string;
@@ -212,6 +222,8 @@ export interface ConnectedFacadeOptions {
   openAttachmentPath?: (file: string) => Promise<string>;
   /** Opens a chat folder in Explorer (shell.openPath); falls back to openAttachmentPath. Resolves to '' on success. */
   openFolderPath?: (folder: string) => Promise<string>;
+  /** Opens the OS folder picker for Settings → 資料夾; resolves to the chosen path, or null when cancelled. */
+  chooseProjectFolder?: () => Promise<string | null>;
   secretStore?: SecretStore;
   /** Support for CHROMEOS login: the ltsm asset service, the native folder picker and the Chrome Web Store opener. If absent, CHROMEOS is not available. */
   chromeLogin?: { ltsm: ChromeLtsmControl; chooseFolder(): Promise<string | null>; openStore(url: string): Promise<void> };
@@ -290,6 +302,8 @@ export type OfficialSnapshotImporter = {
   }): Promise<void>;
 };
 
+/** Shortest gap between two user-started catalog refreshes of one account. */
+const CATALOG_REFRESH_MIN_GAP_MS = 60_000;
 const accepted = (requestId: string): IpcResult => ({ type: 'accepted', requestId, ok: true });
 const failure = (requestId: string, code: string, message: string, retryable = false,
   serverErrorCode?: LineServerErrorCode): IpcResult =>
@@ -687,6 +701,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const assertLineWriteAllowed = async (accountId: string): Promise<void> => {
     if (!await canWriteLine(accountId)) throw new Error('EXTERNAL_MONITOR_READ_ONLY');
   };
+  const catalogRefreshAt = new Map<string, number>();
   const sendLineCommand = async (command: LineWorkerCommand, signal?: AbortSignal): Promise<SendResult> => {
     if (command.type === 'sendText' || command.type === 'reactMessage' || command.type === 'unsendMessage') await assertLineWriteAllowed(command.accountId);
     return options.workers.send(command, signal);
@@ -766,6 +781,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         ...(safe.failureKind ? { failureKind: safe.failureKind } : {}),
         ...(safe.upstreamStatus === undefined ? {} : { upstreamStatus: safe.upstreamStatus }),
         ...(safe.upstreamCode === undefined ? {} : { upstreamCode: safe.upstreamCode }),
+        ...(safe.chatType === undefined && safe.upstreamMessage === undefined ? {} : { detail: [safe.chatType,
+          safe.upstreamMessage === undefined ? undefined : safe.upstreamMessage.replace(/[^A-Za-z0-9_.:-]+/g, '_')]
+          .filter((part): part is string => part !== undefined).join(':').slice(0, 160) }),
         ...(typeof safe.responseCode === 'number' ? { statusCode: safe.responseCode } : {}) }, { accountId: safe.accountId }) : undefined;
       if (safe) diagnostics?.record({ ...safe, ...(correlationId ? { correlationId } : {}) });
     },
@@ -781,6 +799,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       && options.workers.isCurrentActiveControlBinding(binding),
     conversationExists: async (key) => (await options.pool.query('SELECT 1 FROM conversations WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 LIMIT 1',
       [key.accountId, key.chatType, key.chatId])).rowCount === 1,
+    // Read only. The notebook and album notifications (POSTNOTIFICATION rows) of a direct chat carry the "o" + 32 hex chat id in contentMetadata.chatId.
+    directHomeChatId: async (key) => (await options.pool.query<{ home: string }>(
+      `SELECT COALESCE(raw->'message'->'contentMetadata'->>'chatId', raw->'contentMetadata'->>'chatId') AS home
+         FROM messages WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3
+          AND COALESCE(raw->'message'->'contentMetadata'->>'chatId', raw->'contentMetadata'->>'chatId') ~ '^o[0-9a-f]{32}$'
+        ORDER BY occurred_at DESC LIMIT 1`, [key.accountId, key.chatType, key.chatId])).rows[0]?.home ?? null,
   });
   const reconcileAlbumChat = async (key: ConversationKey, binding: ChatResourceBinding): Promise<void> => {
     let albumCursor: string | null = null;
@@ -939,7 +963,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     submitAgent:(input)=>agentService.submitScheduled(input),resolveAgentTarget:(target)=>agentSchedules.resolveAgentSendTarget(target),
     accountScope:(scope)=>agentSchedules.currentAccountScope(scope),
     publish:()=>options.publish?.({type:'agentSchedulesChanged'}),onError:(error)=>options.audit?.failure(diagnosticFailure('agent','execute',error))});
-  stopAgentSchedules = onceCleanup(async () => { await scheduleForward.stop(); await agentSchedules.stop(); });
+  // Photo text rules: the local Windows OCR engine reads the photos; ScheduleForwardService then sends the matches.
+  const photoText=new PhotoTextService({store:forwardStore,ocr:createPhotoOcrEngine(),
+    resolveImage:(relativePath)=>resolveManagedAttachment(options.attachmentRoot,relativePath),
+    publish:()=>options.publish?.({type:'agentSchedulesChanged'}),onError:(error)=>options.audit?.failure(diagnosticFailure('agent','execute',error))});
+  stopAgentSchedules = onceCleanup(async () => { await photoText.stop(); await scheduleForward.stop(); await agentSchedules.stop(); });
   startupCleanup.add(stopAgentSchedules);
   mcpService = new McpService({ pool: options.pool, tokens: mcpTokens, messages, approvalBroker, lineSend: agentLineSend, schedules: agentSchedules,
     // attachmentService is created below; read_message_attachment reads it only when an Agent job calls the tool.
@@ -1062,7 +1090,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     options.audit?.observed('bridge_message_verify', { initiator: 'system', accountId: record.accountId, requestId: record.attachmentId,
       correlationId: record.correlationId, resultCode: BRIDGE_VERIFY_RESULT_CODES[result],
       diagnostic: { operation: 'attachment', stage: 'read', detail, recovery: 'none',
-        category: result === 'match' ? 'unknown' : result === 'mismatch' ? 'invalid_response' : result === 'not_in_store' || result === 'store_incomplete' ? 'unavailable' : 'invalid_input' } });
+        category: result === 'match' || result === 'identity_match' ? 'unknown' : result === 'mismatch' ? 'invalid_response' : result === 'not_in_store' || result === 'store_incomplete' ? 'unavailable' : 'invalid_input' } });
     scheduleBridgeVerificationRefresh(record.accountId);
   };
   publishSnapshot = createCoalescedSnapshotPublisher(async () => {
@@ -1093,8 +1121,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return { ...account, canSendManually, canStartExternalImport: false, hasVerifiedLineIdentity: !!stored?.ownMid,
         externalImportProgress: externalImportProgress.get(account.accountId) ?? null, ...officialBuildFor(account) };
     }));
-    const accountsWithTransport = await Promise.all(accountsWithManualSend.map(async (account) =>
-      await transportOf(account.accountId) === 'CHROMEOS' ? { ...account, lineTransport: 'CHROMEOS' as const } : account));
+    // Every device other than the default DESKTOPWIN shows its device value; DESKTOPWIN leaves the field absent.
+    const accountsWithTransport = await Promise.all(accountsWithManualSend.map(async (account) => {
+      const kind = await transportOf(account.accountId);
+      return kind === 'DESKTOPWIN' ? account : { ...account, lineTransport: kind };
+    }));
     const bridgeStatus = downloadBridge?.status();
     const accountsWithBridge = await Promise.all(accountsWithTransport.map(async (account) => account.productRole === 'PRIMARY_ADMIN' && downloadBridge
       ? { ...account, downloadBridge: bridgeStatus?.accountId === account.accountId
@@ -1289,7 +1320,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     // attachmentService is created below; the resolver reads it only when a LINE reply job runs.
     createReplyContextResolver({ database: options.pool, attachments: { resolveReadyPath: (attachmentId) => attachmentService.resolveReadyPath(attachmentId),
       downloadById: (attachmentId, signal) => attachmentService.downloadById(attachmentId, signal) } }),
-    { accountSources, failover, residentTurnTimeoutMs: agentRuntime.turnTimeoutSeconds * 1000, residentStallMs: agentRuntime.turnStallSeconds * 1000,
+    { accountSources, failover, ...(options.agentUpgradeNotice ? { upgradeNotice: options.agentUpgradeNotice } : {}), residentTurnTimeoutMs: agentRuntime.turnTimeoutSeconds * 1000, residentStallMs: agentRuntime.turnStallSeconds * 1000,
       // Decision D1: a job with a committed LINE send is never replayed by the self-heal.
       committedLineSends: (jobId) => messages.countJobLineSends(jobId),
       // /model: a LINE job uses its chat's model. A room job uses the model of the admin-direct chat while the claim fixed that
@@ -1391,14 +1422,25 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   attachmentStorageService.start();
   attachmentService.setAutomaticAttemptLimit(conversationSettings.attachmentAutoAttemptLimit);
   void attachmentService.backfillBlockReasons();
+  // One repair for every reader of a ready attachment file: a bad file moves its row out of ready and starts a new download.
+  const attachmentIntegrity = createAttachmentIntegrity({ repository: messages,
+    attemptLimit: () => conversationSettings.attachmentAutoAttemptLimit,
+    onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
+    notifyChanged: (attachmentId) => { options.publish?.({ type: 'attachmentChanged', attachmentId }); void publishSnapshot().catch(() => undefined); },
+    requeue: async (attachmentId) => {
+      const row = await messages.getAttachment(attachmentId);
+      if (!row) return false;
+      return attachmentService.downloadManually({ accountId: row.accountId, chatType: row.chatType, chatId: row.chatId }, attachmentId);
+    } });
   previewService = options.previewPresenter ? new AttachmentPreviewService({ root: options.attachmentRoot,
+    integrity: attachmentIntegrity,
     onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
     ...(options.previewCacheRoot ? { cacheRoot: options.previewCacheRoot } : {}),
     authority: createRepositoryPreviewAuthority(messages), presenter: options.previewPresenter }) : null;
   stopPreview = onceCleanup(() => previewService?.shutdown());
   if (previewService) startupCleanup.add(stopPreview);
   if (options.openAttachmentPath) {
-    attachmentOpenService = new AttachmentOpenService({ root: options.attachmentRoot,
+    attachmentOpenService = new AttachmentOpenService({ root: options.attachmentRoot, integrity: attachmentIntegrity,
       onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
       authority: createRepositoryPreviewAuthority(messages), openPath: options.openAttachmentPath,
       viewImage: (attachmentId, requester) => previewService?.open(attachmentId, requester) ?? Promise.resolve(false) });
@@ -1440,9 +1482,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       throw new Error('Stopped LINE worker binding changed before compare-clear');
     }
   };
-  /** Binding fields that depend on the login method. DESKTOPWIN adds no field, so its bindings do not change. */
-  const transportFields = (lineTransport: LineTransportKind | undefined) =>
-    resolveLineTransport(lineTransport) === 'CHROMEOS' ? { lineTransport: 'CHROMEOS' as const } : {};
+  /** Binding fields that depend on the login method. DESKTOPWIN adds no field, so its bindings do not change. Every other device adds its value. */
+  const transportFields = (lineTransport: LineTransportKind | undefined): { lineTransport?: LineTransportKind } => {
+    const kind = resolveLineTransport(lineTransport);
+    return kind === 'DESKTOPWIN' ? {} : { lineTransport: kind };
+  };
   /** Login method of the account. The marker file in the secret store holds it. If there is no marker, it is DESKTOPWIN. */
   function transportOf(accountId: string): Promise<LineTransportKind> {
     return options.secretStore?.getTransport(accountId) ?? Promise.resolve('DESKTOPWIN' as const);
@@ -1754,6 +1798,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   unsubscribeEvent = options.workers.onEvent((instance, event) => closing ? Promise.resolve() : track(async () => {
     if (!lineService.isCurrentWorkerEvent(instance, event)) return;
     if (event.type === 'authInvalidated') {
+      try {
+        options.audit?.observed('line_auth_invalidated', { initiator: 'worker', accountId: event.accountId,
+          workerInstanceId: event.workerInstanceId, reasonCode: 'auth_invalidated',
+          ...(event.code !== undefined && AUDIT_ERROR_CODES.includes(event.code) ? { errorCode: event.code } : {}) });
+      } catch { /* The audit never changes the invalidation teardown. */ }
       // Settle a pending user logout from this exact binding before teardown unbinds it.
       await lineService.handleWorkerEvent(instance, event);
       // Fence archived resource IO before lifecycle/database teardown can yield.
@@ -1944,7 +1993,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       await publishSnapshot();
     }
-    if (event.type === 'batch') {
+    if (event.type === 'batch' || event.type === 'squareBatch') {
       const inserted = new Set(insertedMessageIds ?? []);
       const latestByConversation = new Map<string, typeof event.envelopes[number]>();
       for (const envelope of event.envelopes) if (inserted.has(envelope.messageId)) {
@@ -2980,6 +3029,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         await settings.setLineLegyEncrypted(request.enabled);
         return { type: request.type, requestId, ok: true, enabled: request.enabled };
       }
+      if (request.type === 'getLineSquareReceive') {
+        return { type: request.type, requestId, ok: true, enabled: await settings.getLineSquareReceive().catch(() => false) };
+      }
+      if (request.type === 'setLineSquareReceive') {
+        await settings.setLineSquareReceive(request.enabled);
+        return { type: request.type, requestId, ok: true, enabled: request.enabled };
+      }
       if (request.type === 'getAgentPersona') return { type: request.type, requestId, ok: true, persona: await readGlobalPersona(settings) };
       if (request.type === 'setAgentPersona') {
         const description = request.persona.description.trim();
@@ -3018,6 +3074,40 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       if (request.type === 'refreshLineAvatar') {
         return refreshOwnAvatar(request.accountId, request.requestId);
+      }
+      if (request.type === 'lineLookupContact') {
+        // User-started contact read. One worker call per IPC call. No Agent, MCP or schedule path reaches this branch.
+        const lookupFailure = (error: string): IpcResult => ({ type: request.type, requestId, ok: true, lookup: { ok: false, error } });
+        const targetMid = parseLineContactLink(request.link);
+        if (!targetMid) return lookupFailure('INVALID_LINE_LINK');
+        const agent = (await accounts.listAuthenticatedAccounts()).find((item) => item.productRole === 'AGENT');
+        const binding = agent ? await options.workers.binding(agent.accountId) : null;
+        if (!agent?.ownMid || !binding || binding.mode === 'PAUSED' || !options.workers.lookupContact) return lookupFailure('LINE_NOT_CONNECTED');
+        try {
+          const result = await options.workers.lookupContact({ ...pickWorkerBinding(binding), type: 'lookupContact',
+            requestId: `lookup-${randomUUID()}`, targetMid });
+          return result.status === 'ok'
+            ? { type: request.type, requestId, ok: true, lookup: { ok: true, contact: result.contact } }
+            : lookupFailure(result.error);
+        } catch (error) {
+          options.audit?.failure({ ...diagnosticFailure('ipc', 'execute', error), ipcAction: request.type }, { accountId: agent.accountId, requestId, initiator: 'user' });
+          return lookupFailure('CONTACT_LOOKUP_FAILED');
+        }
+      }
+      if (request.type === 'refreshLineCatalog') {
+        // Friends tab opened by the user: one catalog read for the account, at most one in 60 seconds. No timer sends this request.
+        const account = await accounts.getAccount(request.accountId);
+        const binding = account?.ownMid ? await options.workers.binding(request.accountId) : null;
+        if (!binding || binding.mode === 'PAUSED') return accepted(requestId);
+        const now = Date.now();
+        const last = catalogRefreshAt.get(request.accountId);
+        if (last !== undefined && now - last < CATALOG_REFRESH_MIN_GAP_MS) return accepted(requestId);
+        catalogRefreshAt.set(request.accountId, now);
+        try { await options.workers.send({ ...pickWorkerBinding(binding), type: 'refreshCatalog' }); }
+        catch (error) {
+          options.audit?.failure({ ...diagnosticFailure('catalog_refresh', 'execute', error), ipcAction: request.type }, { accountId: request.accountId, requestId, initiator: 'user' });
+        }
+        return accepted(requestId);
       }
       if (request.type === 'externalImportStop') {
         return await supervisor.runLifecycle(async () => {
@@ -3074,9 +3164,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         // A pending login has no server session in the worker, so the worker cannot log out. Cancel it locally.
         const loginPending = !!loginAttemptId && completedLoginAttempts.get(request.accountId) !== loginAttemptId;
         if (account.ownMid && !loginPending) {
-          if (!binding) throw new Error('LINE_LOGOUT_WORKER_UNAVAILABLE');
+          // The real code goes on `code`: the diagnostic reads only that field, never the message.
+          if (!binding) throw Object.assign(new Error('LINE_LOGOUT_WORKER_UNAVAILABLE'), { code: 'LINE_LOGOUT_WORKER_UNAVAILABLE' });
           const logout = await lineService.requestLogout(request.accountId, binding.workerInstanceId);
-          if (!logout.ok && logout.error !== 'LINE_AUTH_INVALIDATED') throw new Error('LINE_LOGOUT_FAILED');
+          if (!logout.ok && logout.error !== 'LINE_AUTH_INVALIDATED') throw Object.assign(new Error('LINE_LOGOUT_FAILED'), { code: logout.error ?? 'LINE_LOGOUT_FAILED' });
         }
         await releaseAccountSession(request.accountId, binding, loginAttemptId, 'user');
         // A cancelled login saved no secret, and the old method keeps its own. A real logout removes only the secrets of the
@@ -3092,7 +3183,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         await publishSnapshot();
         return accepted(request.requestId);
         }).catch((error: unknown) => {
-          options.audit?.failure({ ...diagnosticFailure('revokeControl', 'execute', error), ipcAction: request.type }, { accountId: request.accountId, requestId: request.requestId });
+          const realCode = safeErrorCode(error);
+          options.audit?.failure({ ...diagnosticFailure('revokeControl', 'execute', error), ipcAction: request.type }, { accountId: request.accountId, requestId: request.requestId },
+            realCode !== undefined && realCode !== 'UNKNOWN' && AUDIT_ERROR_CODES.includes(realCode as AuditErrorCode) ? realCode as AuditErrorCode : 'UNKNOWN');
           return failure(request.requestId, 'LINE_LOGOUT_FAILED', 'LINE 登出未能安全完成，請確認帳號狀態後再試。', true);
         });
       }
@@ -3194,7 +3287,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           // await its physical outcome after releasing the lifecycle lane.
           sendResult = options.workers.sendManual({ type: 'sendText', ...binding, accountId: request.accountId,
             chatType: request.chatType, chatId: request.chatId, requestId: request.requestId, text: request.text,
-            replyToMessageId: request.type === 'replyText' ? request.replyToMessageId : null });
+            replyToMessageId: request.type === 'replyText' ? request.replyToMessageId : null,
+            ...(request.mentions?.length ? { mentions: request.mentions } : {}) });
           return null;
         });
         if (admissionFailure) return failure(request.requestId, 'LINE_SEND_NOT_STARTED', admissionFailure.message);
@@ -3208,6 +3302,29 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', lineResultErrorMessage(result.error, 'LINE message was not sent.'), false,
             isLineServerErrorCode(result.error) ? result.error : undefined)
           : failure(request.requestId, 'LINE_SEND_OUTCOME_UNKNOWN', 'LINE send outcome is unknown.');
+      }
+      if (request.type === 'reactMessage') {
+        // A manual reaction has the same admission checks as a manual send, and the account must be in ACTIVE_CONTROL.
+        const admissionFailure = await supervisor.runLifecycle(async () => {
+          if (!await canWriteLine(request.accountId)) return { code: 'EXTERNAL_MONITOR_READ_ONLY', message: 'External monitoring is read-only.' };
+          if (isLocalAgentRoom(request)) return { code: 'LOCAL_ROUTE_DENIED', message: 'Agent 室是本機對話，不會傳送到 LINE。' };
+          const account = await accounts.getAccount(request.accountId);
+          if (!account?.ownMid || (account.productRole !== 'AGENT' && account.productRole !== 'PRIMARY_ADMIN') || account.mode !== 'ACTIVE_CONTROL') {
+            return { code: 'ACCOUNT_NOT_ACTIVE', message: 'LINE account is not ready for reactions.' };
+          }
+          const binding = await options.workers.binding(request.accountId);
+          if (!binding || binding.mode !== 'ACTIVE_CONTROL' || !options.workers.isCurrentManualSendBinding(binding)) {
+            return { code: 'ACCOUNT_NOT_ACTIVE', message: 'LINE worker is not ready for reactions.' };
+          }
+          if (!lineService.isAuthenticatedReady(binding)) return { code: 'ACCOUNT_NOT_READY', message: 'LINE account has not completed native login and connection readiness.' };
+          await lineService.reactToMessage({ accountId: request.accountId, chatType: request.chatType, chatId: request.chatId }, request.messageId, request.reaction);
+          return null;
+        }).catch((error: unknown) => {
+          options.audit?.failure({ ...diagnosticFailure('reactMessage', 'execute', error), ipcAction: request.type }, { accountId: request.accountId, requestId: request.requestId });
+          return { code: 'LINE_REACTION_FAILED', message: 'The LINE reaction could not be sent.' };
+        });
+        if (admissionFailure) return failure(request.requestId, admissionFailure.code, admissionFailure.message);
+        return accepted(request.requestId);
       }
       if (request.type === 'sendManualMedia') {
         type ManualMediaAdmissionResult = { failure: { code: string; message: string } }
@@ -3235,7 +3352,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         try {
           staged = await stageManualMedia(request.files, undefined, signal);
           if (signal?.aborted) return failure(request.requestId, 'LINE_SEND_NOT_STARTED', 'LINE attachment send was cancelled before worker admission.');
-          for (const item of staged.items) {
+          for (const [itemIndex, item] of staged.items.entries()) {
             const result = await options.workers.sendMedia!({ accountId: request.accountId, workerInstanceId: admission.binding.workerInstanceId,
               controlEpoch: admission.binding.controlEpoch, chatType: admission.chatType, chatId: request.chatId, requestId: randomUUID(),
               kind: item.kind, filePath: item.filePath, fileName: item.fileName, sizeBytes: item.sizeBytes, sha256: item.sha256,
@@ -3246,6 +3363,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
               ? failure(request.requestId, 'LINE_SEND_NOT_STARTED', lineResultErrorMessage(result.error, 'LINE attachment was not sent.', result.detail), false,
                 isLineServerErrorCode(result.error) ? result.error : undefined)
               : failure(request.requestId, 'LINE_SEND_OUTCOME_UNKNOWN', 'LINE attachment outcome is unknown.');
+            // The sent file is stored from the local bytes. The app does not download its own file again from LINE.
+            const sentBytes = request.files[itemIndex]?.bytes;
+            if (result.messageId && sentBytes) {
+              void attachmentService.storeSentMedia({ accountId: request.accountId, chatType: admission.chatType, chatId: request.chatId,
+                messageId: result.messageId, name: item.fileName, bytes: sentBytes }).catch(() => undefined);
+            }
           }
           return accepted(request.requestId);
         } catch (error) {
@@ -3684,6 +3807,23 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const open = options.openFolderPath ?? options.openAttachmentPath;
         return { type: request.type, requestId, ok: true, opened: open ? (await open(path)) === '' : false };
       }
+      if (request.type === 'listProjectFolders' || request.type === 'chooseProjectFolder' || request.type === 'bindProjectFolder' || request.type === 'unbindProjectFolder') {
+        // Settings → 資料夾 (local operator UI only). A change writes the row and the audit row; it never sends a LINE message.
+        if (request.type === 'chooseProjectFolder') {
+          if (!options.chooseProjectFolder) return failure(requestId, 'PROJECT_FOLDER_PICKER_UNAVAILABLE', '此環境無法開啟資料夾選擇視窗。');
+          return { type: request.type, requestId, ok: true, path: await options.chooseProjectFolder() };
+        }
+        if (!projectFolders || (await accounts.getAccount(request.accountId))?.productRole !== 'AGENT') {
+          return failure(requestId, 'PROJECT_FOLDER_ACCOUNT_INVALID', '專案資料夾只能設定在已連線的 Agent 帳號上。');
+        }
+        const key = { accountId: request.accountId, chatType: request.chatType, chatId: request.chatId };
+        if (request.type === 'listProjectFolders') return { type: request.type, requestId, ok: true, folders: await projectFolders.listFolders(key) };
+        if (request.type === 'bindProjectFolder') {
+          const bound = await projectFolders.bindFromSettings(key, request.path, request.mode);
+          return { type: request.type, requestId, ok: true, status: bound.status, folder: bound.folder };
+        }
+        return { type: request.type, requestId, ok: true, removed: await projectFolders.unbindFromSettings(key, request.path) };
+      }
       if (request.type === 'getAgentExtensions') {
         return { type: request.type, requestId, ok: true, extensions: await agentExtensions.state() };
       }
@@ -3732,7 +3872,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return failure(requestId, error.code, error.code === 'APPROVAL_NOT_PENDING' ? '這項核可已結束或不存在。' : '這個命令太長，無法記住，只能允許一次或拒絕。');
       }
       if (error instanceof ChatFolderError) return failure(requestId, error.code, error.message);
-      if (error instanceof ChatResourceUnsupportedError) return failure(requestId, error.code, error.message);
+      if (error instanceof ProjectFolderUiError) return failure(requestId, error.code, error.message);
+      if (error instanceof ChatResourceUnsupportedError || error instanceof ChatResourceNoHomeChatError) return failure(requestId, error.code, error.message);
       if (error instanceof AgentScheduleError) {
         return failure(requestId, error.code, error.code === 'SCHEDULE_NOT_FOUND' ? '找不到這個排程。'
           : error.code === 'SCHEDULE_LIMIT' ? '啟用中的排程最多 50 個。'
@@ -3867,6 +4008,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return serve(lineMedia.attachmentSource(target.attachmentId, target));
       }
       if (target.type === 'albumPhoto') return serve(lineMedia.albumPhotoSource(target.albumId, target.photoId, target));
+      if (target.type === 'profilePicture') return serve(lineMedia.avatarSource(target.picturePath));
       let result: { rows: Array<{ picture_path: string | null }> };
       if (target.type === 'account') {
         result = await options.pool.query('SELECT picture_path FROM line_accounts WHERE account_id=$1 AND own_mid IS NOT NULL', [target.accountId]);
@@ -4011,9 +4153,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         ...(outbound && (item.readCount ?? 0) > 0 ? { readCount: Math.min(item.readCount!, MESSAGE_READER_LIMIT) } : {}),
         ...(itemReactions && itemReactions.length > 0 ? { reactions: itemReactions.slice(0, 20).map((group) => ({ kind: group.kind,
           ...(group.productId ? { productId: group.productId } : {}), ...(group.emojiId ? { emojiId: group.emojiId } : {}),
-          count: Math.min(group.count, 10000), reactorNames: group.reactorNames.slice(0, 50).map((name) => name.slice(0, 100)) })) } : {}),
+          count: Math.min(group.count, 10000), reactorNames: group.reactorNames.slice(0, 50).map((name) => name.slice(0, 100)),
+          ...(group.own ? { own: true } : {}) })) } : {}),
         recalledContent: recalledBridge?.content?.type === 'unsent' ? null : recalledBridge?.content ?? null,
-        recalledKind: recalledBridge?.kind ?? null, recalledText, attachments: (detail?.attachments ?? []).map((attachment) => ({ id: attachment.id, kind: attachment.kind, name: attachment.name,
+        recalledKind: recalledBridge?.kind ?? null, recalledText,
+        edited: item.edited ? { editedAt: item.edited.editedAt, versions: item.edited.versions.slice(0, 20).map((version) => ({ text: version.text.slice(0, 4000), until: version.until })) } : null,
+        attachments: (detail?.attachments ?? []).map((attachment) => ({ id: attachment.id, kind: attachment.kind, name: attachment.name,
           mimeType: attachment.mimeType ?? 'application/octet-stream', sizeBytes: Number(attachment.sizeBytes ?? 0), status: attachment.status,
           canRetryManually: attachment.canRetryManually,
           ...(isAttachmentBlockReason(attachment.blockReason) ? { blockReason: attachment.blockReason } : {}) })) }); });
@@ -4055,6 +4200,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
          WHERE lc.account_id = $1 AND lc.native_status = 1
          ORDER BY name, lc.mid LIMIT ${FRIEND_LIST_LIMIT}`, [accountId]);
       return result.rows.map((row) => ({ mid: row.mid, name: row.name, avatarAvailable: row.avatar_available, hasConversation: row.has_conversation }));
+    },
+    async listConversationMembers(key) {
+      return { members: await messages.listConversationMembers(key) };
     },
     async listMessageReaders(key, messageId) {
       return { readers: await messages.listMessageReaders(key, messageId, { limit: MESSAGE_READER_LIMIT }) };
@@ -4151,6 +4299,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   await freeMode.start().catch((error: unknown) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); });
   await agentSchedules.start().catch((error: unknown) => { options.audit?.failure(diagnosticFailure('agent', 'execute', error)); });
   await scheduleForward.start().catch((error:unknown)=>options.audit?.failure(diagnosticFailure('agent','execute',error)));
+  photoText.start();
   void resumeExternalMonitor('startup_resume');
   ownAvatarRefreshScheduler = createOwnAvatarRefreshScheduler(async (accounts) => {
     try { await runPeriodicOwnAvatarRefreshes(accounts); }
@@ -4185,6 +4334,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     listWorkRecords: (...args) => admitted(() => facade.listWorkRecords(...args), { operation: 'agent' }),
     listFriends: (...args) => admitted(() => facade.listFriends!(...args), { operation: 'ipc', identity: { accountId: args[0] } }),
     listMessageReaders: (...args) => admitted(() => facade.listMessageReaders!(...args), { operation: 'chat_resource', identity: { accountId: args[0].accountId } }),
+    listConversationMembers: (...args) => admitted(() => facade.listConversationMembers!(...args), { operation: 'ipc', identity: { accountId: args[0].accountId } }),
     listSystemActivity: (...args) => admitted(() => facade.listSystemActivity!(...args), { operation: 'ipc' }),
     listSystemErrors: (...args) => admitted(() => facade.listSystemErrors!(...args), { operation: 'ipc' }),
     controlState: (...args) => admitted(() => facade.controlState(...args), { operation: 'ipc' }),

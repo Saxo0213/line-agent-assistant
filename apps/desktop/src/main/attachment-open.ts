@@ -2,7 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { lstat, open, realpath, type FileHandle } from 'node:fs/promises';
 import { lstatSync } from 'node:fs';
 import path from 'node:path';
-import type { PreviewAuthority, PreviewRequester, PreviewRecord } from './attachment-preview.js';
+import { isMissingFileError, type PreviewAuthority, type PreviewRequester, type PreviewRecord } from './attachment-preview.js';
+import { classifyReadyFile, type AttachmentIntegrity, type IntegrityObservation, type IntegrityRecord } from './attachment-integrity.js';
 import { diagnosticFailure, sniffImageMimeType, type SafeDiagnostic } from '@line-agent/contracts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -52,6 +53,7 @@ export class AttachmentOpenService {
   readonly #viewImage: ((attachmentId: string, requester: PreviewRequester) => Promise<boolean>) | undefined;
   readonly #afterAcquire: (() => Promise<void>) | undefined;
   readonly #onDiagnostic: ((diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void) | undefined;
+  readonly #integrity: AttachmentIntegrity | undefined;
   readonly #handles = new Set<FileHandle>();
   readonly #cancelSubscribers = new Set<() => void>();
   #closed = false;
@@ -60,7 +62,10 @@ export class AttachmentOpenService {
   constructor(options: { root: string; authority: PreviewAuthority; openPath(file: string): Promise<string>;
     /** Opens the in-app viewer. Used for image files whose stored name has no image extension. */
     viewImage?(attachmentId: string, requester: PreviewRequester): Promise<boolean>; afterAcquire?: () => Promise<void>;
+    /** Repairs a ready row whose file failed the integrity check. */
+    integrity?: AttachmentIntegrity;
     onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void }) {
+    this.#integrity = options.integrity;
     if (!path.isAbsolute(options.root)) throw new Error('Attachment root must be absolute');
     const configuredRoot = path.resolve(options.root), rootInfo = lstatSync(configuredRoot);
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error('Attachment root must be a managed directory');
@@ -107,12 +112,19 @@ export class AttachmentOpenService {
     try {
       const first = await this.#authority.lookup(id, requester);
       if (this.#closed || !validRecord(first, id)) return false;
-      source = await this.#acquire(first.relativePath);
-      if (this.#closed || !source) return false;
+      const ready: IntegrityRecord = { attachmentId: id, accountId: first.accountId, relativePath: first.relativePath, sizeBytes: first.sizeBytes, sha256: first.sha256 };
+      try { source = await this.#acquire(first.relativePath); }
+      catch (error) {
+        if (!isMissingFileError(error)) throw error;
+        source = null;
+      }
+      if (this.#closed) return false;
+      // A ready row whose file is absent or cannot be held is an integrity failure. Shutdown stays silent.
+      if (!source) { await this.#integrity?.settle(ready, { kind: 'missing' }); return false; }
       await this.#afterAcquire?.();
       if (this.#closed) return false;
       const initial = await source.handle.stat();
-      if (this.#closed || !this.#sameIdentity(source, initial) || initial.size !== first.sizeBytes || initial.size > MAX_FILE_BYTES) return false;
+      if (this.#closed || !this.#sameIdentity(source, initial) || initial.size > MAX_FILE_BYTES) return false;
       const hash = createHash('sha256'), chunk = Buffer.alloc(HASH_CHUNK_BYTES);
       let position = 0;
       let prefix = Buffer.alloc(0);
@@ -124,11 +136,20 @@ export class AttachmentOpenService {
         if (prefix.length < 12) prefix = Buffer.concat([prefix, chunk.subarray(0, Math.min(read.bytesRead, 12 - prefix.length))]);
         position += read.bytesRead;
       }
-      if (this.#closed || hash.digest('hex') !== first.sha256.toLowerCase()) return false;
+      if (this.#closed) return false;
+      // The length of the file is checked here against the row, after the hash. A file with the right hash and another length is the right file.
+      let expectedSize = first.sizeBytes;
+      const observation: IntegrityObservation = { kind: 'read', byteLength: initial.size, sha256: hash.digest('hex') };
+      const verdict = classifyReadyFile(ready, observation);
+      if (verdict.kind !== 'ok') {
+        await this.#integrity?.settle(ready, observation);
+        if (verdict.kind !== 'size_record_wrong') return false;
+        expectedSize = initial.size;
+      }
       const afterHash = await source.handle.stat();
       if (this.#closed || !this.#sameIdentity(source, afterHash) || !await this.#namedSourceIsSame(first.relativePath, source)) return false;
       const latest = await this.#authority.lookup(id, requester);
-      if (this.#closed || !sameRecord(first, latest)) return false;
+      if (this.#closed || !sameRecord({ ...first, sizeBytes: expectedSize }, latest)) return false;
       const immediatelyBeforeLaunch = await source.handle.stat();
       if (this.#closed || !this.#sameIdentity(source, immediatelyBeforeLaunch)
         || !await this.#namedSourceIsSame(first.relativePath, source) || this.#closed) return false;

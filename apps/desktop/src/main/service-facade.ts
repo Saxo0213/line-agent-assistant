@@ -25,11 +25,13 @@ export type TimelineMessage = {
   /** Readers covering this own message (direct/group/room); only present when greater than 0. */
   readCount?: number | undefined;
   /** Reactions under the bubble (derived from the native row); only present when non-empty. */
-  reactions?: Array<{ kind: 'NICE' | 'LOVE' | 'FUN' | 'AMAZING' | 'SAD' | 'OMG' | 'PAID'; productId?: string | undefined; emojiId?: string | undefined; count: number; reactorNames: string[] }> | undefined;
+  reactions?: Array<{ kind: 'NICE' | 'LOVE' | 'FUN' | 'AMAZING' | 'SAD' | 'OMG' | 'PAID'; productId?: string | undefined; emojiId?: string | undefined; count: number; reactorNames: string[]; own?: boolean | undefined }> | undefined;
   /** Display-only original from raw.recall.original; never written back to `content`. */
   recalledContent?: MessageContent | null | undefined;
   recalledKind?: TimelineMessage['kind'] | null | undefined;
   recalledText?: string | null | undefined;
+  /** Set when the message was edited at LINE (edit marker or a stored earlier version); `versions` are the earlier texts, oldest first. */
+  edited?: { editedAt: string | null; versions: Array<{ text: string; until: string }> } | null | undefined;
   attachments: { id: string; kind: 'image' | 'video' | 'audio' | 'file'; name: string; mimeType: string; sizeBytes: number; status: string; canRetryManually?: boolean | undefined; blockReason?: AttachmentBlockReason | undefined }[];
 };
 export type MessagePage = { messages: TimelineMessage[]; olderCursor: string | null };
@@ -58,6 +60,8 @@ export type DesktopServiceFacade = {
   listWorkRecords(): Promise<WorkRecord[]>;
   listFriends?(accountId: string): Promise<FriendRow[]>;
   listMessageReaders?(key: ConversationKey, messageId: string): Promise<{ readers: MessageReader[] }>;
+  /** Members of a group or room with resolved names, for the @ mention list. */
+  listConversationMembers?(key: ConversationKey): Promise<{ members: Array<{ mid: string; name: string }> }>;
   listSystemActivity?(): Promise<SystemActivityResult>;
   listSystemErrors?(): Promise<SystemErrorsResult>;
   controlState(): Promise<{ activeAccountId: string | null; epoch: number; pendingOutbound: number }>;
@@ -98,6 +102,7 @@ export function createDisconnectedFacade(reason = '服務尚未接入；請完�
     async listWorkRecords() { return []; },
     async listFriends() { return []; },
     async listMessageReaders() { return { readers: [] }; },
+    async listConversationMembers() { return { members: [] }; },
     async controlState() { return { activeAccountId: null, epoch: 0, pendingOutbound: 0 }; },
     async shutdown() {},
   };

@@ -191,6 +191,8 @@ database('single read entry for person and conversation names', () => {
     expect(await evalRow('self', 'self', { message: { text: 'live' } })).toBe(true);
     expect(await evalRow('member', 'self', { message: { text: 'live' } })).toBe(false);
     expect(await evalRow('member', 'self', { native: { row: { columns: 'broken', cells: [] } } })).toBe(false);
+    expect(await evalRow('member', 'self', { square: { own: true } })).toBe(true);
+    expect(await evalRow('member', 'self', { square: { own: false } })).toBe(false);
   });
 
   it('returns outbound direction for an own native community row in MCP message queries', async () => {

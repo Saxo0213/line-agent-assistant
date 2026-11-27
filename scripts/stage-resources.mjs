@@ -3,8 +3,8 @@ import { cp, lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } fr
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const LINEJS_VERSION = '3.5.0';
-const LINEJS_INTEGRITY = 'sha512-LdE2YYA48FAa0NBm8Tq0VyCre5xJ5gQ7+HmJy/VNAE0GozqiuNlB5Y7dKvM1QYe0oyOacYtHHdIknc0xVv8z4w==';
+const LINEJS_VERSION = '3.6.9';
+const LINEJS_INTEGRITY = 'sha512-3P6+e5z9nG0yZ9V0D+3r4svmkmDqOE1cki1uyW65z6ZGSMShLQkt2SkXnvqSrJWVRCFcbGUfJwA9RxLinw5jOg==';
 const thisRepositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const STAGING_MARKER = '.line-agent-managed-staging';
 
@@ -173,7 +173,7 @@ async function hashFiles(root) {
 function lineJsLockContract(lock) {
   const record = lock.packages?.['node_modules/@evex/linejs'];
   if (!record || record.name !== '@jsr/evex__linejs' || record.version !== LINEJS_VERSION || record.integrity !== LINEJS_INTEGRITY) {
-    throw new Error('package-lock.json does not pin the approved physical @jsr/evex__linejs@3.5.0 artifact');
+    throw new Error('package-lock.json does not pin the approved physical @jsr/evex__linejs@3.6.9 artifact');
   }
   return { name: record.name, version: record.version, integrity: record.integrity, resolved: record.resolved };
 }
@@ -219,7 +219,7 @@ export async function verifyStagedResources(outputRoot) {
   }
   const packageJson = await readJson(path.join(outputRoot, 'line-worker', 'node_modules', '@evex', 'linejs', 'package.json'));
   if (packageJson.name !== '@jsr/evex__linejs' || packageJson.version !== LINEJS_VERSION) {
-    throw new Error('Staged physical @evex/linejs package is not @jsr/evex__linejs@3.5.0');
+    throw new Error('Staged physical @evex/linejs package is not @jsr/evex__linejs@3.6.9');
   }
   const lineChromePackage = await readJson(path.join(outputRoot, 'line-worker', 'node_modules', '@line-agent', 'line-chrome', 'package.json'));
   if (lineChromePackage.name !== '@line-agent/line-chrome' || lineChromePackage.exports?.['.'] !== './dist/index.js') {

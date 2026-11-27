@@ -35,6 +35,18 @@ class FakeRepository {
   getSendTarget = vi.fn(async (accountId: string, chatType: string, chatId: string) =>
     this.chats.has(`${chatType}:${chatId}`) && accountId === ACCOUNT && chatId !== '__local_agent_room__'
       ? { accountId, chatType: chatType as 'direct' | 'group' | 'room', chatId } : null);
+  /** Mirrors the repository rule: an existing chat, or a direct user MID that is a friend or a group member and not refused. */
+  refusedMids = new Set<string>();
+  friendMids = new Set<string>();
+  sharedGroupMids = new Set<string>();
+  getAgentSendTarget = vi.fn(async (accountId: string, chatType: string, chatId: string) => {
+    const existing = await this.getSendTarget(accountId, chatType, chatId);
+    if (existing) return { ...existing, newDirect: false };
+    if (chatType !== 'direct' || !/^u[0-9a-f]{32}$/.test(chatId) || this.refusedMids.has(chatId)) return null;
+    if (!this.friendMids.has(chatId) && !this.sharedGroupMids.has(chatId)) return null;
+    return { accountId, chatType: 'direct' as const, chatId, newDirect: true };
+  });
+  ensureDirectConversation = vi.fn(async (_accountId: string, chatId: string) => { this.chats.add(`direct:${chatId}`); });
   resolveSendSourceMessage = vi.fn(async (input: { messageId: string }) => this.messages.get(input.messageId) ?? null);
   getSendAttachment = vi.fn(async (attachmentId: string) => this.attachments.get(attachmentId) ?? null);
   recordLineSend = vi.fn(async (row: LineSendAuditRow) => { this.audit.push(row); });
@@ -142,6 +154,41 @@ afterEach(async () => {
   await service.shutdown();
   vi.useRealTimers();
   await rm(root, { recursive: true, force: true });
+});
+
+describe('direct send to a user MID without a conversation', () => {
+  const newMid = `u${'a'.repeat(32)}`;
+  it('plans the send to a friend or a group member, and creates the row only after the first sent item', async () => {
+    repo.friendMids.add(newMid);
+    const outcome = await authorize([{ type: 'text', text: 'hello' }], { chatId: newMid });
+    expect(outcome.kind).toBe('plan');
+    expect(repo.ensureDirectConversation).not.toHaveBeenCalled();
+    expect(statuses(await submit([{ type: 'text', text: 'hello' }, { type: 'text', text: 'again' }], { chatId: newMid }))).toEqual(['sent', 'sent']);
+    expect(worker.sent.map((entry) => entry.chatType)).toEqual(['direct', 'direct']);
+    expect(repo.chats.has(`direct:${newMid}`)).toBe(true);
+  });
+  it('plans the send to a member of a group or room', async () => {
+    repo.sharedGroupMids.add(newMid);
+    expect((await authorize([{ type: 'text', text: 'hello' }], { chatId: newMid })).kind).toBe('plan');
+  });
+  it('refuses a stranger MID', async () => {
+    expect(codes(await submit([{ type: 'text', text: 'x' }], { chatId: newMid }))).toEqual(['send_target_invalid']);
+    expect(worker.sent).toHaveLength(0);
+  });
+  it('writes no row when the first item is not sent', async () => {
+    repo.friendMids.add(newMid);
+    worker.outcomes.set(1, 'failed');
+    expect(statuses(await submit([{ type: 'text', text: 'hello' }], { chatId: newMid }))).toEqual(['failed']);
+    expect(repo.ensureDirectConversation).not.toHaveBeenCalled();
+    expect(repo.chats.has(`direct:${newMid}`)).toBe(false);
+  });
+  it('refuses a refused MID and a group id without a row', async () => {
+    repo.sharedGroupMids.add(newMid);
+    repo.refusedMids.add(newMid);
+    expect(codes(await submit([{ type: 'text', text: 'x' }], { chatId: newMid }))).toEqual(['send_target_invalid']);
+    expect(codes(await submit([{ type: 'text', text: 'x' }], { chatType: 'group', chatId: `c${'b'.repeat(32)}` }))).toEqual(['send_target_invalid']);
+    expect(worker.sent).toHaveLength(0);
+  });
 });
 
 describe('target and account authorization', () => {

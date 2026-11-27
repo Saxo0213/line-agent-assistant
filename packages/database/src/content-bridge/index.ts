@@ -315,6 +315,46 @@ export function nativeContentMetadataText(envelope: unknown): string | null {
   } catch { return null; }
 }
 
+export type MessageEditMarker = { edited: boolean; updatedTime: number | null };
+const NOT_EDITED: MessageEditMarker = { edited: false, updatedTime: null };
+
+/** Edit marker of one `contentMetadata` value (object, or the JSON text of the native cell): positive decimal UPDATED_TIME or EDITED "true". */
+function editMarkerFromMetadata(metadata: unknown): MessageEditMarker {
+  let record: unknown = metadata;
+  if (typeof record === 'string') {
+    if (Buffer.byteLength(record, 'utf8') > MAX_METADATA_BYTES) return NOT_EDITED;
+    try { record = JSON.parse(record) as unknown; } catch { return NOT_EDITED; }
+  }
+  if (!isRecord(record)) return NOT_EDITED;
+  const stamp = record.UPDATED_TIME;
+  const stampText = typeof stamp === 'number' && Number.isSafeInteger(stamp) ? String(stamp) : typeof stamp === 'string' ? stamp : '';
+  const updatedTime = /^[1-9]\d{0,14}$/.test(stampText) ? Number(stampText) : null;
+  return { edited: updatedTime !== null || record.EDITED === 'true' || record.EDITED === true, updatedTime };
+}
+
+function mergeEditMarkers(first: MessageEditMarker, second: MessageEditMarker): MessageEditMarker {
+  const times = [first.updatedTime, second.updatedTime].filter((value): value is number => value !== null);
+  return { edited: first.edited || second.edited, updatedTime: times.length > 0 ? Math.max(...times) : null };
+}
+
+/**
+ * Edit marker of a stored or live raw: `raw.message.contentMetadata` (live worker shape, object or JSON text)
+ * and the `_contentMetadata` cell of the plain native `_message` envelope in `raw.native`.
+ */
+export function messageEditMarkerFromRaw(raw: unknown): MessageEditMarker {
+  try {
+    if (!isRecord(raw)) return NOT_EDITED;
+    const live = isRecord(raw.message) ? editMarkerFromMetadata(raw.message.contentMetadata) : NOT_EDITED;
+    const nativeText = nativeContentMetadataText(raw.native);
+    return mergeEditMarkers(live, nativeText === null ? NOT_EDITED : editMarkerFromMetadata(nativeText));
+  } catch { return NOT_EDITED; }
+}
+
+/** Edit marker of a plain native `_message` envelope (observation.nativePayload). */
+export function messageEditMarkerFromNative(envelope: unknown): MessageEditMarker {
+  return messageEditMarkerFromRaw({ native: envelope });
+}
+
 /** Bounded `_text` of a plain native `_message` envelope (display of a recalled text original); null otherwise. */
 export function nativeMessageText(envelope: unknown): string | null {
   try {

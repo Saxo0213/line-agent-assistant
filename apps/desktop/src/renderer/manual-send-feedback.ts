@@ -6,6 +6,8 @@ export type ManualSendFeedback = {
   routeKey: string;
   text: string;
   replyToMessageId: string | null;
+  /** The @ mentions of the text, as sent. A retry sends them again. */
+  mentions?: ReadonlyArray<{ start: number; end: number; userId: string }>;
   createdAt: string;
   status: 'pending' | 'failed' | 'unknown';
 };

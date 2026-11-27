@@ -12,8 +12,12 @@ type AdapterOptions = { webContentsId: number; rendererUrl: string; service?: Ip
   onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void;
   resolveFileTypeIcon?: (extension: string) => Promise<string | null>; openExternalUrl?: (url: string) => Promise<void> };
 
+/** The only `line:` form that may open: a profile popup of one user MID. No other line:// form is allowed. */
+const LINE_PROFILE_POPUP_URL = /^line:\/\/nv\/profilePopup\/mid=u[0-9a-f]{32}$/;
+
 function canonicalExternalUrl(value: string): string | null {
   if (value.length > 8192 || /[\u0000-\u001f\u007f-\u009f]/.test(value)) return null;
+  if (LINE_PROFILE_POPUP_URL.test(value)) return value;
   try {
     const url = new URL(value);
     if ((url.protocol !== 'http:' && url.protocol !== 'https:') || !url.hostname || url.username || url.password) return null;
@@ -45,7 +49,7 @@ export function createIpcAdapter(options: AdapterOptions) {
     }
     if (parsed.data.type === 'openExternalUrl') {
       const url = canonicalExternalUrl(parsed.data.url);
-      if (!url) return fail('INVALID_URL', 'Only absolute HTTP or HTTPS URLs without credentials are allowed');
+      if (!url) return fail('INVALID_URL', 'Only absolute HTTP or HTTPS URLs without credentials, or a LINE profile popup link, are allowed');
       if (!options.openExternalUrl) return fail('SERVICE_UNAVAILABLE', 'External browser unavailable');
       try {
         await options.openExternalUrl(url);
@@ -89,7 +93,13 @@ export function createIpcAdapter(options: AdapterOptions) {
         result.data.type === parsed.data.type || result.data.type === 'accepted' || result.data.type === 'error'
         || (parsed.data.type === 'lineBeginAdminPairing' && result.data.type === 'lineAdminPairing')
       );
-      if (!result.success || result.data.requestId !== parsed.data.requestId || !responseTypeMatches) return fail('INVALID_SERVICE_RESPONSE', 'Service returned invalid response');
+      if (!result.success || result.data.requestId !== parsed.data.requestId || !responseTypeMatches) {
+        try {
+          options.onDiagnostic?.({ ...diagnosticFailure('ipc', 'response', Object.assign(new Error('INVALID_SERVICE_RESPONSE'), { code: 'INVALID_SERVICE_RESPONSE' })),
+            ipcAction: parsed.data.type }, identity);
+        } catch { /* Observation cannot escape IPC. */ }
+        return fail('INVALID_SERVICE_RESPONSE', 'Service returned invalid response');
+      }
       return result.data;
     } catch (error) {
       if (resourceSignal?.aborted && (error === resourceSignal.reason || (error instanceof Error && error.name === 'AbortError')))
@@ -102,7 +112,7 @@ export function createIpcAdapter(options: AdapterOptions) {
 
 type ReadFacade = Pick<DesktopServiceFacade, 'listMessages' | 'listAttachmentStates' | 'listAgentStatuses' | 'listWorkRecords' | 'controlState'>
   & Partial<Pick<DesktopServiceFacade, 'listStoredAttachments'>>
-  & Partial<Pick<DesktopServiceFacade, 'listFriends' | 'listMessageReaders'>>
+  & Partial<Pick<DesktopServiceFacade, 'listFriends' | 'listMessageReaders' | 'listConversationMembers'>>
   & Partial<Pick<DesktopServiceFacade, 'listSystemActivity' | 'listSystemErrors'>>;
 export function createReadAdapter(options: { webContentsId: number; rendererUrl: string; service?: ReadFacade; resolveService?: () => ReadFacade;
   onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void }) {
@@ -122,6 +132,7 @@ export function createReadAdapter(options: { webContentsId: number; rendererUrl:
     else if (request.type === 'listWorkRecords') result = { type: 'listWorkRecords', records: await service.listWorkRecords() };
     else if (request.type === 'listFriends') result = { type: 'listFriends', friends: service.listFriends ? await service.listFriends(request.accountId) : [] };
     else if (request.type === 'listMessageReaders') result = { type: 'listMessageReaders', ...(service.listMessageReaders ? await service.listMessageReaders(request.key, request.messageId) : { readers: [] }) };
+    else if (request.type === 'listConversationMembers') result = { type: 'listConversationMembers', ...(service.listConversationMembers ? await service.listConversationMembers(request.key) : { members: [] }) };
     else if (request.type === 'listSystemActivity') {
       if (!service.listSystemActivity) throw new Error('System activity unavailable');
       result = { type: 'listSystemActivity', ...await service.listSystemActivity() };

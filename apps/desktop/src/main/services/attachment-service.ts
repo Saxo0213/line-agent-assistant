@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { IMAGE_EXTENSION_BY_MIME, diagnosticFailure, type AttachmentBlockReason, type SafeDiagnostic } from '@line-agent/contracts';
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { createReadStream } from 'node:fs';
@@ -7,8 +7,8 @@ import { isWritableChatType, type AttachmentResult, type LineWorkerCommand, type
 import { OFFICIAL_BRIDGE_WORKER_ID, type Attachment, type AttachmentAttemptMutation, type AttachmentPriorState, type MessageRepository } from '@line-agent/database';
 import { pickWorkerBinding } from '../worker-binding-fields.js';
 import {
-  BRIDGE_VERIFY_WAIT_MS, BridgeDownloadError, isBridgeGateOpen, nativeRowFromEnvelope,
-  type BridgeAttempt, type BridgeAttemptStage, type BridgeDownloadRequest, type BridgeDownloadedFile, type BridgeKind, type BridgeVerification, type BridgeVerifyRequest,
+  BRIDGE_VERIFY_WAIT_MS, BridgeDownloadError, buildMessageFromNativeRow, isBridgeGateOpen, nativeRowFromEnvelope,
+  type BridgeAttempt, type BridgeAttemptStage, type BridgeDownloadRequest, type BridgeDownloadedFile, type BridgeIdentity, type BridgeKind, type BridgeVerification, type BridgeVerifyRequest,
 } from './official-download-bridge/index.js';
 import type { BridgeAttachmentStore, BridgeStoredAttachment } from './official-download-bridge/bridge-attachment-store.js';
 
@@ -18,6 +18,17 @@ export interface LocalDownloadsRecovery {
   readonly downloadsDir: string;
   /** The managed store that a normal download uses. */
   readonly store: BridgeAttachmentStore;
+}
+
+/** The bytes of a file that this app sent, with the id of the sent message. */
+export interface SentMediaInput {
+  readonly accountId: string;
+  readonly chatType: Attachment['chatType'];
+  readonly chatId: string;
+  readonly messageId: string;
+  /** The name of the sent file. */
+  readonly name: string;
+  readonly bytes: Uint8Array;
 }
 
 export type LocalRecoveryResult = 'recovered' | 'not_found' | 'not_eligible';
@@ -67,6 +78,9 @@ export interface BridgeVerificationRecord {
 type BridgeDownloadPlan = { readonly source: BridgeAttemptStage } | { readonly fail: string; readonly stage: BridgeAttemptStage };
 /** Upper bound of the in-memory verification sets. The oldest entry goes first. */
 const BRIDGE_VERIFY_MEMORY_LIMIT = 5_000;
+/** Verification detail and row code of a recalled message. */
+const BRIDGE_UNSENT_DETAIL = 'identity:unsent';
+const BRIDGE_UNSENT_CODE = 'BRIDGE_MESSAGE_UNSENT';
 const BRIDGE_MAX_BYTES = 100 * 1024 * 1024;
 
 type DownloadCommand = Extract<LineWorkerCommand, { type: 'downloadAttachment' }>;
@@ -97,6 +111,9 @@ export class AttachmentService {
   private readonly manualQueued = new Set<string>();
   /** Queued attachments of a new message that the bridge must download at once. They skip `nextAutomaticAt` and the durable due time. */
   private readonly liveQueued = new Set<string>();
+  /** Bytes of files that this app sent, until the sent message row arrives (2 minutes at most). */
+  private static readonly SENT_MEDIA_MEMORY_MS = 120_000;
+  private readonly sentMedia = new Map<string, { input: SentMediaInput; timer: ReturnType<typeof setTimeout> }>();
   /** Attachments that the passive verification already started in this app run. */
   private readonly verifyStarted = new Set<string>();
   /** Attachments whose passive verification gave `match` in this app run. Only these may download by the automatic path. */
@@ -187,8 +204,69 @@ export class AttachmentService {
     try { void Promise.resolve(this.onChanged?.(attachmentId)).catch(() => undefined); } catch { /* State publication must not affect attachment durability. */ }
   }
 
-  downloadById(attachmentId: string, signal?: AbortSignal): Promise<boolean> {
-    return this.enqueue(attachmentId, false, signal);
+  /** `live`: the attachment of a message that the Agent worker ingested as live. It skips the 10 s wait and the gap. */
+  downloadById(attachmentId: string, signal?: AbortSignal, live = false): Promise<boolean> {
+    if (this.sentMedia.size === 0) return this.enqueue(attachmentId, false, signal, live);
+    // A row of our own sent file takes the local bytes. Any other row, or a failed store, goes to the normal download.
+    return this.adoptSentMedia(attachmentId).catch(() => false)
+      .then((adopted) => adopted ? true : this.enqueue(attachmentId, false, signal, live));
+  }
+
+  /**
+   * Keeps the bytes of a file that this app sent and stores them as the attachment of the sent message. No LINE download is made.
+   * When the message row is already there, the bytes are stored now. Otherwise they stay in memory (2 minutes at most)
+   * until the row arrives and `downloadById` adopts them. Returns true when the bytes are stored now.
+   */
+  async storeSentMedia(input: SentMediaInput): Promise<boolean> {
+    if (!this.localRecovery || this.closed || input.bytes.byteLength === 0) return false;
+    const key = this.sentMediaKey(input);
+    const previous = this.sentMedia.get(key);
+    if (previous) clearTimeout(previous.timer);
+    const timer = setTimeout(() => { this.sentMedia.delete(key); }, AttachmentService.SENT_MEDIA_MEMORY_MS);
+    timer.unref?.();
+    this.sentMedia.set(key, { input, timer });
+    try {
+      const ids = await this.messages.listAttachmentIdsByMessage({ accountId: input.accountId, chatType: input.chatType, chatId: input.chatId }, input.messageId);
+      // One sent message has one row. Any other count is not our own file, so the normal download stays.
+      if (ids.length === 1) return await this.adoptSentMedia(ids[0]!);
+    } catch { /* The bytes stay in memory. The normal download is the fallback. */ }
+    return false;
+  }
+
+  private sentMediaKey(value: { accountId: string; chatType: string; chatId: string; messageId: string }): string {
+    return JSON.stringify([value.accountId, value.chatType, value.chatId, value.messageId]);
+  }
+
+  private async adoptSentMedia(attachmentId: string): Promise<boolean> {
+    const recovery = this.localRecovery;
+    if (!recovery || this.closed || this.sentMedia.size === 0) return false;
+    const attachment = await this.messages.getAttachment(attachmentId);
+    if (!attachment || attachment.externalSource) return false;
+    const key = this.sentMediaKey(attachment);
+    const entry = this.sentMedia.get(key);
+    if (!entry) return false;
+    if (attachment.status !== 'queued' && attachment.status !== 'failed' && attachment.status !== 'expired') return false;
+    // Take the entry now (no await before this line), so two callers cannot store the same bytes twice.
+    this.sentMedia.delete(key);
+    clearTimeout(entry.timer);
+    const { bytes, name } = entry.input;
+    let stored: BridgeStoredAttachment | null = null;
+    try {
+      stored = await recovery.store({ attachment, name, source: (async function* () { yield bytes; })(),
+        maxBytes: bytes.byteLength, signal: new AbortController().signal });
+      if (stored.sizeBytes !== bytes.byteLength || stored.sha256 !== createHash('sha256').update(bytes).digest('hex')) throw new Error('size or hash mismatch');
+      const marked = await this.messages.markAttachmentRecoveredFromLocal({ attachmentId, accountId: attachment.accountId,
+        relativePath: stored.relativePath, sha256: stored.sha256, sizeBytes: stored.sizeBytes, name: stored.name });
+      if (!marked) { await this.removeStoredCopy(stored.relativePath); return false; }
+    } catch {
+      if (stored) await this.removeStoredCopy(stored.relativePath);
+      return false;
+    }
+    const identity = { requestId: attachmentId, accountId: attachment.accountId, workerInstanceId: OFFICIAL_BRIDGE_WORKER_ID, correlationId: randomUUID() };
+    void Promise.resolve(this.onPrimaryReady?.({ accountId: attachment.accountId, chatType: attachment.chatType as import('@line-agent/contracts').WritableConversationKey['chatType'], chatId: attachment.chatId }, attachmentId))
+      .catch((error: unknown) => this.reportFailure('persist', error, identity));
+    this.notifyChanged(attachmentId);
+    return true;
   }
 
   /** For an expired or failed row, try the local Downloads folder first. It never throws. */
@@ -366,6 +444,16 @@ export class AttachmentService {
     return attachment.kind === 'image' || attachment.kind === 'file' ? attachment.kind : null;
   }
 
+  /**
+   * Identity of the message for the bridge verification. It is read only when the official row cannot build a full message.
+   * The chat and the sender are not compared. Returns undefined when the row can build a full message or the kind is not supported.
+   */
+  private bridgeIdentity(attachment: Attachment, nativeRow: ReturnType<typeof nativeRowFromEnvelope>): BridgeIdentity | undefined {
+    const kind = this.bridgeKind(attachment);
+    if (!kind || buildMessageFromNativeRow(nativeRow)) return undefined;
+    return { chatType: attachment.chatType, kind };
+  }
+
   private remember(set: Set<string>, value: string): void {
     if (set.size >= BRIDGE_VERIFY_MEMORY_LIMIT) {
       const oldest = set.values().next().value;
@@ -411,13 +499,21 @@ export class AttachmentService {
     this.remember(this.verifyStarted, attachmentId);
     const identity = { requestId: attachmentId, accountId: attachment.accountId, workerInstanceId: OFFICIAL_BRIDGE_WORKER_ID, correlationId: randomUUID() };
     try {
+      const nativeRow = nativeRowFromEnvelope(attachment.nativeEnvelope);
+      const bridgeIdentity = this.bridgeIdentity(attachment, nativeRow);
       const verification = await bridge.downloader.verify({
-        messageId: attachment.messageId, nativeRow: nativeRowFromEnvelope(attachment.nativeEnvelope), waitMs: recovered ? 0 : BRIDGE_VERIFY_WAIT_MS,
+        messageId: attachment.messageId, nativeRow, waitMs: recovered ? 0 : BRIDGE_VERIFY_WAIT_MS,
+        ...(bridgeIdentity ? { identity: bridgeIdentity } : {}),
       });
       if (this.closed) return;
       // A recovered message that is not in the store is a normal case. It gets no record and no download.
       if (!(recovered && verification.result === 'not_in_store')) this.recordVerification(attachment, verification);
-      if (verification.result !== 'match') return;
+      // A recalled message has no media. The row gets its final state one time, so no later app run verifies it again.
+      if (verification.result === 'mismatch' && verification.detail === BRIDGE_UNSENT_DETAIL) {
+        await this.expireUnsentExternal(attachment);
+        return;
+      }
+      if (verification.result !== 'match' && verification.result !== 'identity_match') return;
       this.remember(this.verifiedMatch, attachmentId);
       if (recovered) this.remember(this.recoveredMatch, attachmentId);
       if (bridge.isDownloadEnabled() && bridge.isAutoDownloadEnabled()) void this.enqueue(attachmentId, false, undefined, !recovered);
@@ -433,6 +529,19 @@ export class AttachmentService {
     }
   }
 
+  /** Final state of the row of a recalled message: status expired, error BRIDGE_MESSAGE_UNSENT. It uses the one bridge claim of the repository. */
+  private async expireUnsentExternal(attachment: Attachment): Promise<void> {
+    const attempt = { attachmentId: attachment.attachmentId, accountId: attachment.accountId, attemptToken: randomUUID() };
+    try {
+      if (!await this.messages.claimExternalAttachmentForBridge(attempt)) return;
+      await this.messages.markExternalAttachmentExpiredByBridge(attempt, BRIDGE_UNSENT_CODE);
+      this.notifyChanged(attachment.attachmentId);
+    } catch (error) {
+      this.reportFailure('persist', error, { requestId: attachment.attachmentId, accountId: attachment.accountId,
+        workerInstanceId: OFFICIAL_BRIDGE_WORKER_ID, correlationId: randomUUID() });
+    }
+  }
+
   /**
    * Manual click with the download switch on. Decides which message `eB` gets, before the claim:
    * the store message after a `match`; the built message when the message is not in the store and the old-message gate is open;
@@ -443,14 +552,18 @@ export class AttachmentService {
     if (!kind) return { fail: 'BRIDGE_CONTENT_TYPE_UNSUPPORTED', stage: 'native' };
     let verification: BridgeVerification;
     try {
-      verification = await bridge.downloader.verify({ messageId: attachment.messageId, nativeRow: nativeRowFromEnvelope(attachment.nativeEnvelope), waitMs: 0 });
+      const nativeRow = nativeRowFromEnvelope(attachment.nativeEnvelope);
+      const bridgeIdentity = this.bridgeIdentity(attachment, nativeRow);
+      verification = await bridge.downloader.verify({ messageId: attachment.messageId, nativeRow, waitMs: 0, ...(bridgeIdentity ? { identity: bridgeIdentity } : {}) });
     } catch (error) {
       const code = (error as { code?: unknown } | null)?.code;
       return { fail: typeof code === 'string' && code.length > 0 ? code : 'BRIDGE_VERIFY_FAILED', stage: 'store' };
     }
     if (verification.result !== 'not_in_store') this.recordVerification(attachment, verification);
-    if (verification.result === 'match') return { source: 'store' };
-    if (verification.result === 'mismatch') return { fail: 'BRIDGE_MESSAGE_MISMATCH', stage: 'store' };
+    if (verification.result === 'match' || verification.result === 'identity_match') return { source: 'store' };
+    if (verification.result === 'mismatch') {
+      return { fail: verification.detail === BRIDGE_UNSENT_DETAIL ? BRIDGE_UNSENT_CODE : 'BRIDGE_MESSAGE_MISMATCH', stage: 'store' };
+    }
     if (verification.result === 'native_incomplete') return { fail: 'NATIVE_MESSAGE_INCOMPLETE', stage: 'native' };
     // Not in the extension store (an old message), or only a placeholder there (`store_incomplete`). The built message is allowed only when the gate is open for this kind.
     let open = false;
@@ -467,10 +580,11 @@ export class AttachmentService {
   private bridgeDiagnostic(failure: BridgeDownloadError | undefined, attempts: readonly BridgeAttempt[], fallbackCode: string): SafeDiagnostic {
     const code = failure?.code ?? fallbackCode;
     const chain = attempts.map((attempt) => `${attempt.stage}:${attempt.code ?? 'ok'}`).join('.');
-    const detail = (chain || code).replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 160);
+    // The real code comes first. A failure after a good `eB` call has an attempt chain of `native:ok`, which alone would hide the code.
+    const detail = (chain && !chain.includes(code) ? `${code}.${chain}` : chain || code).replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 160);
     const category: SafeDiagnostic['category'] = code === 'BRIDGE_NOT_LOGGED_IN' ? 'authentication_required'
       : code === 'CDP_TIMEOUT' ? 'timeout' : code === 'DOWNLOAD_ABORTED' ? 'cancelled'
-        : code === 'CDP_CLOSED' ? 'unavailable' : 'transport_failed';
+        : code === 'CDP_CLOSED' ? 'unavailable' : code === 'BRIDGE_SIZE_MISMATCH' ? 'invalid_response' : 'transport_failed';
     const status = failure?.httpStatus ?? undefined;
     return { operation: 'attachment', stage: 'download', category, outcome: 'failed', detail,
       recovery: category === 'authentication_required' ? 'relogin' : category === 'cancelled' ? 'none' : 'retry',
@@ -573,6 +687,14 @@ export class AttachmentService {
     if (!signal.aborted && attachment && !manual && attachment.externalSource && isWritableChatType(attachment.chatType)
       && (attachment.status === 'queued' || attachment.status === 'failed') && !this.externalSourceExpired(attachment)) {
       await this.recordBlock(attachment, 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE');
+    }
+    // A community message of a logged-in account is archive only. No worker call, no claim, no retry. The row keeps the reason.
+    // The reason is a row value only: it is not an account-level worker reason, so it does not go to the account audit.
+    if (!signal.aborted && attachment && !attachment.externalSource && attachment.chatType === 'community' && attachment.status === 'queued') {
+      try {
+        if (await this.messages.setAttachmentBlockReason(attachment.attachmentId, 'COMMUNITY_DOWNLOAD_UNSUPPORTED')) this.notifyChanged(attachment.attachmentId);
+      } catch { /* A reason write must not change attachment handling. */ }
+      return false;
     }
     if (signal.aborted || !attachment || attachment.status === 'ready' || attachment.status === 'downloading'
       || !isWritableChatType(attachment.chatType)
@@ -878,6 +1000,8 @@ export class AttachmentService {
     this.queued.clear();
     this.manualQueued.clear();
     this.liveQueued.clear();
+    for (const entry of this.sentMedia.values()) clearTimeout(entry.timer);
+    this.sentMedia.clear();
     this.recoveryScans.length = 0;
     this.scanGenerations.clear();
     const drain = Promise.allSettled([...this.inFlight.values()]).then(() => undefined);

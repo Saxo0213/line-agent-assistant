@@ -1,14 +1,14 @@
 import { LineWorkerCommandSchema, LineWorkerEventSchema, LOGIN_FAILURES,
   type LineWorkerCommand, type LineWorkerEvent, type WorkerErrorCode } from '@line-agent/contracts';
-import { resolveLineTransport } from '@line-agent/contracts';
-import { createLinejsAdapter } from './linejs-adapter.js';
+import { resolveLineTransport, type LinejsTransportKind } from '@line-agent/contracts';
+import { createLinejsClientEngine } from './linejs-client-engine.js';
 import { isChromeLtsmUnavailable } from './chrome-ltsm-error.js';
 import { LineWorkerLoop, type LineTransport, type LineWorkerOptions } from './worker-loop.js';
 import { createWindowsAttachmentBroker } from './windows-attachment-broker.js';
 import { DIAGNOSTIC_OPERATIONS, diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { isLineServerRejection } from './line-server-error.js';
 import { buildLoginFailureDetail, loginHttpStatus } from './login-failure-detail.js';
-import { startTrafficLog } from './traffic-log.js';
+import { flushTrafficLogSync, startTrafficLog } from './traffic-log.js';
 
 const COMMAND_TYPES: ReadonlySet<string> = new Set(LineWorkerCommandSchema.options.map((option) => option.shape.type.value));
 const DIAGNOSTIC_OPERATION_SET: ReadonlySet<string> = new Set(DIAGNOSTIC_OPERATIONS);
@@ -48,11 +48,6 @@ function operationError(command: LineWorkerCommand | undefined): Readonly<{ code
 export interface WorkerPort {
   onMessage(handler: (value: unknown) => void): void;
   postMessage(value: LineWorkerEvent): void | Promise<void>;
-}
-
-/** Production transport preserves LINEJS's native deadline and cancellation signal. */
-export function fetchLineRequest(request: Request): Promise<Response> {
-  return fetch(request);
 }
 
 export type WorkerHostOptions = Readonly<Pick<LineWorkerOptions, 'attachmentRoot' | 'attachmentRuntime' | 'minFreeBytes'> & {
@@ -216,10 +211,18 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
         const diagnostic = commandExecutionStarted ? operationError(command)
           : { code: 'INVALID_COMMAND' as const, message: 'Worker command rejected' };
         const serverRejection = isLineServerRejection(error) ? error : null;
+        if (serverRejection) flushTrafficLogSync(); // The response of the rejected call must be on disk before Main reacts.
+        const base = diagnosticFailure(command?.type === 'lookupContact' ? 'unknown' : command?.type === 'refreshCatalog' ? 'catalog_refresh' : command?.type ?? rejectedOperation(input), commandExecutionStarted ? 'execute'
+            : command?.type === 'init' && initializing ? 'bootstrap' : 'admission', error);
+        // The event code is the fixed operation code. The real error class, method and code stay in the diagnostic detail and status.
+        const fallbackDetail = base.detail === undefined && !serverRejection ? buildLoginFailureDetail(error) : undefined;
+        const fallbackStatus = serverRejection ? undefined : loginHttpStatus(error);
         await emit({ type: 'error', ...identity, ...diagnostic,
           ...(serverRejection ? { code: serverRejection.code, message: serverRejection.message } : {}), retryable: false,
-          diagnostic: { ...diagnosticFailure(command?.type ?? rejectedOperation(input), commandExecutionStarted ? 'execute'
-            : command?.type === 'init' && initializing ? 'bootstrap' : 'admission', error),
+          // lookupContact has no audit operation value (the audit trigger list stays as it is), so its rare unexpected failure reads as unknown.
+          diagnostic: { ...base,
+            ...(fallbackDetail === undefined ? {} : { detail: fallbackDetail }),
+            ...(fallbackStatus === undefined ? {} : { upstreamStatus: fallbackStatus }),
             ...(serverRejection ? { category: 'denied' as const, recovery: 'none' as const, upstreamCode: serverRejection.upstreamCode } : {}) },
           ...(command ? ('requestId' in command ? { requestId: command.requestId } : {})
             : rejectedRequestId(input) !== undefined ? { requestId: rejectedRequestId(input)! } : {}) });
@@ -319,6 +322,9 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
       } else if (command.type === 'addFriendByMid') {
         void emit({ type: 'addFriendResult', ...requestBinding, requestId: command.requestId,
           targetMid: command.targetMid, status: 'failed', error: 'QUEUE_FULL' });
+      } else if (command.type === 'lookupContact') {
+        void emit({ type: 'contactLookupResult', ...requestBinding, requestId: command.requestId,
+          status: 'failed', error: 'QUEUE_FULL' });
       } else {
         void emit({ type: 'error', ...requestBinding,
           code: 'QUEUE_FULL', message: 'Worker capability is busy', retryable: true });
@@ -344,14 +350,14 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
 }
 
 export type TransportFactoryDeps = Readonly<{
-  createLinejs?: typeof createLinejsAdapter;
+  createClientEngine?: typeof createLinejsClientEngine;
   createChrome?: typeof import('./chrome-adapter.js').createChromeAdapter;
   /** CHROMEOS HTTP client (Node global fetch / undici by default; never Electron net). */
   chromeFetch?: (input: string, init: RequestInit) => Promise<Response>;
 }>;
 
 /**
- * Selects the transport by `init.lineTransport` (absent means DESKTOPWIN). DESKTOPWIN is constructed exactly as before;
+ * Selects the transport by `init.lineTransport` (absent means DESKTOPWIN). Every linejs transport uses the linejs Client engine;
  * CHROMEOS gets its own factory and a store root from `init.chromeLtsmDir`.
  */
 export function createTransportFactory(deps: TransportFactoryDeps = {}): (init: Init) => Promise<LineTransport> {
@@ -373,12 +379,13 @@ export function createTransportFactory(deps: TransportFactoryDeps = {}): (init: 
         ...(init.chromeLtsmDir === undefined ? {} : { ltsmRoot: init.chromeLtsmDir }),
       });
     }
-    return (deps.createLinejs ?? createLinejsAdapter)({
+    return (deps.createClientEngine ?? createLinejsClientEngine)({
       accountId: init.accountId, workerInstanceId: init.workerInstanceId,
       controlEpoch: init.controlEpoch, mode: init.mode,
-      validateLease: () => true,
-      physicalTransport: fetchLineRequest,
+      // The init device selects the linejs device. DESKTOPWIN is the engine default.
+      ...(resolveLineTransport(init.lineTransport) === 'DESKTOPWIN' ? {} : { device: resolveLineTransport(init.lineTransport) as LinejsTransportKind }),
       ...(init.legyEncrypted === true ? { legyEncrypted: true } : {}),
+      // No custom fetch: linejs uses its own undici Agent and HTTP/2 for /PUSH (base/core/mod.js:154-163).
     });
   };
 }

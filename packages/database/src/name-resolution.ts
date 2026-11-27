@@ -30,9 +30,12 @@ export const PEER_CONTACT_JOIN =
   `LEFT JOIN line_contacts peer_contact ON peer_contact.account_id = c.account_id
         AND c.chat_type = 'direct' AND peer_contact.mid = c.chat_id`;
 
-/** True for messages authored by this account, including native community rows where sender_id is not own_mid. */
+/**
+ * True for messages authored by this account, including native community rows where sender_id is not own_mid
+ * and Square rows that the login source marked own (raw.square.own).
+ */
 export function ownMessageSql(m: string, la: string): string {
-  return `(( ${la}.own_mid IS NOT NULL AND ${m}.sender_id = ${la}.own_mid) OR COALESCE((
+  return `(( ${la}.own_mid IS NOT NULL AND ${m}.sender_id = ${la}.own_mid) OR COALESCE(${m}.raw->'square'->>'own', '') = 'true' OR COALESCE((
     SELECT (CASE WHEN jsonb_typeof(${m}.raw->'native'->'row'->'columns') = 'array' THEN
       ${m}.raw->'native'->'row'->'cells'->((c.i - 1)::int)->>'value'
     END) IN ('2','4')

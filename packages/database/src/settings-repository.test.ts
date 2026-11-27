@@ -95,4 +95,15 @@ database('conversation settings repository', () => {
       expect(await repository.getExternalBridgeDownloadIntervals()).toEqual(DEFAULT_DOWNLOAD_BRIDGE_INTERVALS);
     }
   });
+
+  it('keeps the community receive setting off by default and stores only a boolean', async () => {
+    expect(await repository.getLineSquareReceive()).toBe(false);
+    await repository.setLineSquareReceive(true);
+    expect(await repository.getLineSquareReceive()).toBe(true);
+    await expect(repository.setLineSquareReceive('yes' as never)).rejects.toThrow();
+    await pool.query("UPDATE app_settings SET value = '\"text\"'::jsonb WHERE key = 'line_square_receive'");
+    expect(await repository.getLineSquareReceive()).toBe(false);
+    await repository.setLineSquareReceive(false);
+    expect(await repository.getLineSquareReceive()).toBe(false);
+  });
 });

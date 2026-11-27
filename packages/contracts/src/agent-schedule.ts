@@ -260,6 +260,12 @@ export const AgentScheduleForwardTaskSchema = z.strictObject({
     z.strictObject({ mode: z.literal('contains'), keywords: z.array(z.string().min(1).max(200).refine((s) => s.trim().length > 0)).min(1).max(20) }),
     z.strictObject({ mode: z.literal('exact'), text: z.string().min(1).max(20000).refine((s) => s.trim().length > 0) }),
     z.strictObject({ mode: z.literal('sender') }),
+    /** A new photo whose text (read by the local Windows OCR engine) contains one of the keywords. `verifyUnclear`: an unclear photo goes to the Agent. */
+    z.strictObject({
+      mode: z.literal('image_text'),
+      keywords: z.array(z.string().trim().min(1).max(200)).min(1).max(20),
+      verifyUnclear: z.boolean().default(true),
+    }),
     /** A new message that mentions the Primary Admin (admin), one of the members, or everyone (all). */
     z.strictObject({
       mode: z.literal('mention'),
@@ -280,6 +286,10 @@ export const AgentScheduleForwardTaskSchema = z.strictObject({
     if (!task.match.admin && !task.match.all && mids.length === 0) ctx.addIssue({ code: 'custom', message: 'A mention rule needs at least one mention target' });
   }
   if (task.actions && !task.actions.forward && !task.actions.notify && !task.actions.agent) ctx.addIssue({ code: 'custom', message: 'A forwarding rule needs at least one action' });
+  if (task.match.mode === 'image_text') {
+    if (!task.actions?.forward) ctx.addIssue({ code: 'custom', message: 'A photo text rule must forward the photo' });
+    if (task.match.verifyUnclear && !task.actions?.agent) ctx.addIssue({ code: 'custom', message: 'A photo text rule that verifies unclear photos needs an Agent target' });
+  }
 });
 export type AgentScheduleForwardTask = z.infer<typeof AgentScheduleForwardTaskSchema>;
 /** The actions of a forward task; a task without `actions` only forwards. */
@@ -288,9 +298,11 @@ export function scheduleForwardActions(task: AgentScheduleForwardTask): AgentSch
 }
 /** Literal, case-sensitive matching against the original text. The mention mode reads the stored mention MIDs ('@all' = everyone). */
 export function matchesScheduleForward(task: AgentScheduleForwardTask,
-  source: { accountId: string; senderId: string; text: string; mentionIds?: readonly string[]; adminMid?: string | null }): boolean {
+  source: { accountId: string; senderId: string; text: string; kind?: string; mentionIds?: readonly string[]; adminMid?: string | null }): boolean {
   if (task.sender && (task.sender.accountId !== source.accountId || task.sender.mid !== source.senderId)) return false;
   const match = task.match;
+  // Photo text is read later by OCR; here only the message kind is checked.
+  if (match.mode === 'image_text') return source.kind === 'image';
   if (match.mode === 'mention') {
     const mentioned = new Set(source.mentionIds ?? []);
     return match.members.some((member) => mentioned.has(member.mid))
@@ -322,7 +334,8 @@ export function scheduleExecutionKind(task: Pick<AgentScheduleTask, 'type'>): Ag
 }
 /** True when a run of the task can start an LLM: every Agent task, and a new_messages task with a rule that says llm. */
 export function scheduleMayUseLlm(task: AgentScheduleTask): boolean {
-  if (task.type === 'message' || task.type === 'message_forward') return false;
+  if (task.type === 'message_forward') return task.match.mode === 'image_text' && task.match.verifyUnclear;
+  if (task.type === 'message') return false;
   if (task.type === 'new_messages') return (task.rules ?? []).some((rule) => rule.then === 'llm');
   return true;
 }

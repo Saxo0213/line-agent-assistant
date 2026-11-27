@@ -7,6 +7,7 @@ export const JAPANESE_DESKTOP_COPY_PART7: Partial<Record<keyof typeof ENGLISH_DE
   manageTheDatabaseAttachmentsAndAgents: 'データベース、添付ファイル、Agent を管理します。',
   settingsCategories: '設定カテゴリ',
   system: 'システム',
+  folders: 'フォルダー',
   conversations: '会話',
   commands: 'コマンド',
   records: '記録',

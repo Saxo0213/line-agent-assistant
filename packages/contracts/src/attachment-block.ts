@@ -13,6 +13,8 @@ export const ATTACHMENT_BLOCK_REASONS = [
   'BRIDGE_IDENTITY_PENDING',
   'BRIDGE_VERIFICATION_PENDING',
   'BRIDGE_MESSAGE_MISMATCH',
+  /** An attachment of a community message of a logged-in account. The app does not download it. It does not retry. */
+  'COMMUNITY_DOWNLOAD_UNSUPPORTED',
 ] as const;
 export type AttachmentBlockReason = (typeof ATTACHMENT_BLOCK_REASONS)[number];
 

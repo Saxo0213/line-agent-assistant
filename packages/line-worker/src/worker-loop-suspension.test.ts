@@ -10,7 +10,7 @@ async function setup() {
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   const events: any[] = [];
   const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: async () => true });
-  await worker.handle({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await worker.handle({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await worker.handle({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
   const poll = () => worker.handle({ type: 'poll', ...binding });
   return { worker, transport, events, poll };

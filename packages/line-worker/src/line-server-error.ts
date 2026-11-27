@@ -38,6 +38,19 @@ export function isTalkAuthInvalidation(error: unknown, path: string, method: str
   return name === 'AUTHENTICATION_FAILED' || name === 'NOT_AVAILABLE_USER' || name === 'NOT_AUTHORIZED_DEVICE';
 }
 
+/** The LINE error code that made the session invalid. Unlike a rejection, it also covers NOT_AUTHORIZED_DEVICE (upstream 8). */
+export type AuthInvalidationDetail = Readonly<{ code: LineServerErrorCode; upstreamCode: number }>;
+
+/** The detail for a TalkException name, or undefined when the name is not a known code. */
+export function authInvalidationDetailOfName(name: unknown): AuthInvalidationDetail | undefined {
+  const projection = talkServerError(name);
+  return projection ? { code: projection.code, upstreamCode: projection.upstreamCode } : undefined;
+}
+
+export function talkAuthInvalidationDetail(error: unknown, path: string, method: string, protocol: unknown): AuthInvalidationDetail | undefined {
+  return authInvalidationDetailOfName(trustedTalkErrorName(error, path, method, protocol));
+}
+
 export function decodeLinejsServerRejection(error: unknown, path: string, method: string, protocol: unknown): LineServerRejection | null {
   const projection = talkServerError(trustedTalkErrorName(error, path, method, protocol));
   if (!projection || projection.upstreamCode === 8 || projection.upstreamCode === 119) return null;
@@ -46,4 +59,42 @@ export function decodeLinejsServerRejection(error: unknown, path: string, method
 
 export function isLineServerRejection(error: unknown): error is LineServerRejection {
   return error instanceof LineServerRejection;
+}
+
+const SQUARE_READ_METHODS = new Set(['fetchMyEvents', 'getSquareChat']);
+const SQUARE_ERROR_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+/**
+ * A SquareException returned by LINE for a community read. `upstreamName` is the SquareErrorCode name and
+ * `upstreamCode` its number; each is undefined when LINE gave no usable value. It keeps no LINE text.
+ */
+export class LineSquareRejection extends Error {
+  readonly name = 'LineSquareRejection';
+  constructor(readonly upstreamName: string | undefined, readonly upstreamCode: number | undefined) {
+    super('LINE_SQUARE_REJECTED');
+  }
+}
+
+/**
+ * Accepts only the pinned LINEJS RequestError shape on /SQ1 for the two community reads. It reads only the
+ * `errorCode` field (a SquareErrorCode name or number), never the error text.
+ */
+export function decodeSquareRejection(error: unknown, method: string): LineSquareRejection | null {
+  if (!SQUARE_READ_METHODS.has(method)) return null;
+  try {
+    if (!(error instanceof InternalError) || error.name !== 'RequestError') return null;
+    const data = (error as InternalError).data;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    const prototype = Object.getPrototypeOf(data);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const descriptor = Object.getOwnPropertyDescriptor(data, 'errorCode');
+    const value = descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+    const name = typeof value === 'string' && SQUARE_ERROR_NAME.test(value) ? value : undefined;
+    const code = typeof value === 'number' && Number.isSafeInteger(value) && Math.abs(value) <= 1_000_000_000 ? value : undefined;
+    return new LineSquareRejection(name, code);
+  } catch { return null; }
+}
+
+export function isLineSquareRejection(error: unknown): error is LineSquareRejection {
+  return error instanceof LineSquareRejection;
 }

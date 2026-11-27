@@ -8,6 +8,7 @@ export const KOREAN_DESKTOP_COPY_PART7 = {
   manageTheDatabaseAttachmentsAndAgents: '데이터베이스, 첨부 파일 및 Agent를 관리합니다.',
   settingsCategories: '설정 항목',
   system: '시스템',
+  folders: '폴더',
   conversations: '대화',
   commands: '명령어',
   records: '기록',

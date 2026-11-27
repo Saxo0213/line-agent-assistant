@@ -1,4 +1,4 @@
-export const SETTINGS_TAB_IDS = ['system', 'conversation', 'agent', 'help', 'work', 'about'] as const;
+export const SETTINGS_TAB_IDS = ['system', 'folders', 'conversation', 'agent', 'help', 'work', 'about'] as const;
 export type SettingsTabId = typeof SETTINGS_TAB_IDS[number];
 
 export const SETTINGS_TAB_KEY = 'line-agent:settings-tab';

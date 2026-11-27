@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { resolveLineTransport } from './account.js';
-import { LineWorkerCommandSchema, LineWorkerEventSchema } from './worker-v2.js';
+import { ArchiveInboundEnvelopeSchema, InboundEnvelopeSchema } from './line.js';
+import { LineWorkerCommandSchema, LineWorkerEventSchema, SQUARE_BATCH_MAX_ENVELOPES } from './worker-v2.js';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
 const cursor = { version: 1, revision: '1', globalRev: '2', individualRev: '3' };
@@ -113,11 +114,11 @@ it('accepts only enumerated worker command failure codes', () => {
 it('requires the owner-bound worker protocol version on init and acknowledges only the same version', () => {
   expect(LineWorkerCommandSchema.safeParse({ type: 'init', ...binding, mode: 'MONITOR_ONLY', durableCursor: cursor }).success).toBe(false);
   expect(LineWorkerCommandSchema.safeParse({ type: 'init', ...binding, transportOwnerId: 'owner-1', transportGeneration: 1,
-    writeGrantVersion: 1, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor }).success).toBe(true);
+    writeGrantVersion: 1, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor }).success).toBe(true);
   expect(LineWorkerEventSchema.safeParse({ type: 'workerProtocolAck', ...binding, transportOwnerId: 'owner-1',
-    transportGeneration: 1, writeGrantVersion: 1, protocolVersion: 4, manualSend: true }).success).toBe(true);
+    transportGeneration: 1, writeGrantVersion: 1, protocolVersion: 5, manualSend: true }).success).toBe(true);
   expect(LineWorkerEventSchema.safeParse({ type: 'workerProtocolAck', ...binding, transportOwnerId: 'owner-1',
-    transportGeneration: 1, writeGrantVersion: 1, protocolVersion: 4 }).success).toBe(false);
+    transportGeneration: 1, writeGrantVersion: 1, protocolVersion: 5 }).success).toBe(false);
   expect(LineWorkerCommandSchema.safeParse({ type: 'init', ...binding, protocolVersion: 2, mode: 'MONITOR_ONLY', durableCursor: cursor }).success).toBe(false);
   expect(LineWorkerEventSchema.safeParse({ type: 'workerProtocolAck', ...binding, protocolVersion: 2 }).success).toBe(false);
 });
@@ -194,6 +195,21 @@ it('binds relation commands and results to the exact LINE user MID and current w
     targetMid: add.targetMid, status: 'added', error: null }).success).toBe(true);
   expect(LineWorkerEventSchema.safeParse({ type: 'friendRelationResult', ...binding, requestId: 'check-1',
     targetMid: 'u-peer', status: 'friend', error: null }).success).toBe(false);
+});
+
+it('accepts the lookupContact command only with a user MID and checks the lookup result shape', () => {
+  const lookup = { type: 'lookupContact', ...binding, requestId: 'lookup-1', targetMid: `u${'a'.repeat(32)}` };
+  expect(LineWorkerCommandSchema.safeParse(lookup).success).toBe(true);
+  for (const targetMid of ['u-peer', `c${'a'.repeat(32)}`, `u${'a'.repeat(31)}`]) {
+    expect(LineWorkerCommandSchema.safeParse({ ...lookup, targetMid }).success).toBe(false);
+  }
+  const contact = { mid: lookup.targetMid, displayName: 'Ann', statusMessage: null, picturePath: null, relation: 'not_friend' };
+  expect(LineWorkerEventSchema.safeParse({ type: 'contactLookupResult', ...binding, requestId: 'lookup-1',
+    status: 'ok', error: null, contact }).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ type: 'contactLookupResult', ...binding, requestId: 'lookup-1',
+    status: 'failed', error: 'LINE_TALK_NOT_AUTHORIZED_DEVICE' }).success).toBe(true);
+  expect(LineWorkerEventSchema.safeParse({ type: 'contactLookupResult', ...binding, requestId: 'lookup-1',
+    status: 'ok', error: null, contact: { ...contact, relation: 'stranger' } }).success).toBe(false);
 });
 
 it('requires batch and cursor-after identities on durable acknowledgement', () => {
@@ -322,13 +338,14 @@ describe('sendText mentions', () => {
     expect(LineWorkerCommandSchema.safeParse({ ...command, text: '😀@Amy', mentions: [{ start: 1, end: 6, userId: user }] }).success).toBe(false);
     expect(LineWorkerCommandSchema.safeParse({ ...command, text: '😀@Amy', mentions: [{ start: 2, end: 6, userId: user }] }).success).toBe(true);
   });
-  it('does not allow mentions on manualSendText', () => {
-    expect(LineWorkerCommandSchema.safeParse({ ...command, type: 'manualSendText', mentions: [{ start: 3, end: 7, userId: user }] }).success).toBe(false);
+  it('allows valid mentions on manualSendText and rejects an invalid range there', () => {
+    expect(LineWorkerCommandSchema.safeParse({ ...command, type: 'manualSendText', mentions: [{ start: 3, end: 7, userId: user }] }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...command, type: 'manualSendText', mentions: [{ start: 3, end: 99, userId: user }] }).success).toBe(false);
   });
 });
 
 describe('lineTransport on init', () => {
-  const init = { type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor };
+  const init = { type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor };
   it('defaults to DESKTOPWIN and keeps every existing init valid', () => {
     const parsed = LineWorkerCommandSchema.parse(init);
     expect(parsed).not.toHaveProperty('lineTransport');
@@ -359,6 +376,12 @@ describe('lineTransport on init', () => {
     expect(LineWorkerCommandSchema.safeParse({ ...init, legyEncrypted: true }).success).toBe(true);
     expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'DESKTOPWIN', legyEncrypted: false }).success).toBe(true);
     expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', legyEncrypted: true }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'IOSIPAD', legyEncrypted: true }).success).toBe(false);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'IOSIPAD', squareReceive: true }).success).toBe(true);
+    for (const device of ['DESKTOPMAC', 'ANDROIDSECONDARY']) {
+      expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: device, legyEncrypted: true, squareReceive: true }).success).toBe(true);
+      expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: device, chromeLtsmDir: '/abs/ltsm' }).success).toBe(false);
+    }
   });
   it('carries the transport on the shared binding and types the unavailable-store error', () => {
     expect(LineWorkerCommandSchema.safeParse({ type: 'poll', ...binding, lineTransport: 'CHROMEOS' }).success).toBe(true);
@@ -379,4 +402,44 @@ it('accepts an optional bounded detail on a LOGIN_FAILED failure only', () => {
   expect(LineWorkerEventSchema.safeParse({ ...failure, detail: '' }).success).toBe(false);
   expect(LineWorkerEventSchema.safeParse({ ...failure, detail: 'a'.repeat(161) }).success).toBe(false);
   expect(LineWorkerEventSchema.safeParse({ ...failure, code: 'LOGIN_TIMEOUT', message: 'LINE login timed out. Try again.', detail: 'x' }).success).toBe(false);
+});
+
+describe('community (Square) receive protocol', () => {
+  const chatId = `m${'1'.repeat(32)}`;
+  const senderId = `p${'2'.repeat(32)}`;
+  const envelope = { eventId: 'e-1', accountId: 'account-A', chatType: 'community', chatId, senderId, messageId: '9001',
+    kind: 'text', text: 'hello', mentionIds: [], mentionRanges: [], replyToMessageId: null,
+    ingestion: { source: 'live', cursor: null }, occurredAt: '2026-10-15T00:00:00.000Z', attachments: [],
+    raw: { square: { eventType: 'RECEIVE_MESSAGE', own: false } } };
+  const batch = { type: 'squareBatch', ...binding, batchId: 'sq-1', tokenBefore: null, tokenAfter: 'token-1', envelopes: [envelope],
+    titles: [{ chatId, title: 'Synthetic Community' }] };
+
+  it('accepts a community envelope with m and p ids and rejects a Talk id or a Talk chat type', () => {
+    expect(ArchiveInboundEnvelopeSchema.safeParse(envelope).success).toBe(true);
+    expect(ArchiveInboundEnvelopeSchema.safeParse({ ...envelope, senderName: 'Synthetic Member' }).success).toBe(true);
+    expect(ArchiveInboundEnvelopeSchema.safeParse({ ...envelope, chatId: `c${'1'.repeat(32)}` }).success).toBe(false);
+    expect(ArchiveInboundEnvelopeSchema.safeParse({ ...envelope, senderId: `u${'2'.repeat(32)}` }).success).toBe(false);
+    expect(ArchiveInboundEnvelopeSchema.safeParse({ ...envelope, chatType: 'group' }).success).toBe(false);
+  });
+
+  it('keeps community out of the writable envelope', () => {
+    expect(InboundEnvelopeSchema.safeParse(envelope).success).toBe(false);
+  });
+
+  it('accepts squareBatch with a null first token and bounds its arrays', () => {
+    expect(LineWorkerEventSchema.safeParse(batch).success).toBe(true);
+    expect(LineWorkerEventSchema.safeParse({ ...batch, tokenBefore: 'token-0' }).success).toBe(true);
+    expect(LineWorkerEventSchema.safeParse({ ...batch, tokenAfter: null }).success).toBe(false);
+    expect(LineWorkerEventSchema.safeParse({ ...batch, envelopes: [{ ...envelope, chatType: 'group' }] }).success).toBe(false);
+    expect(LineWorkerEventSchema.safeParse({ ...batch, envelopes: Array.from({ length: SQUARE_BATCH_MAX_ENVELOPES + 1 }, () => envelope) }).success).toBe(false);
+  });
+
+  it('accepts ackSquareBatch and the new init fields only for DESKTOPWIN', () => {
+    expect(LineWorkerCommandSchema.safeParse({ type: 'ackSquareBatch', ...binding, batchId: 'sq-1', tokenAfter: 'token-1' }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ type: 'ackSquareBatch', ...binding, batchId: 'sq-1' }).success).toBe(false);
+    const init = { type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor };
+    expect(LineWorkerCommandSchema.safeParse({ ...init, squareCursor: null, squareReceive: true }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, squareCursor: 'token-1', squareReceive: false }).success).toBe(true);
+    expect(LineWorkerCommandSchema.safeParse({ ...init, lineTransport: 'CHROMEOS', squareReceive: true }).success).toBe(false);
+  });
 });

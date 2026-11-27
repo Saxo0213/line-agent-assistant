@@ -18,8 +18,10 @@ export type ScheduleFormState = {
   focus: string;
   /** Text of a system message task (task type 'message'). */
   messageText: string;
-  forwardMode:'contains'|'exact'|'sender'|'mention';
+  forwardMode:'contains'|'exact'|'sender'|'mention'|'image_text';
   forwardText:string;
+  /** Photo text mode: an unclear photo goes to the Agent, which gets the delivery chat as its output chat. */
+  imageVerify:boolean;
   senderAccount:string;
   senderMid:string;
   senderLabel:string;
@@ -103,7 +105,7 @@ export function defaultFormState(provider: 'codex' | 'claude', now = new Date())
   const timezone = AGENT_SCHEDULE_DEFAULT_TIMEZONE;
   const nextHour = new Date(Math.ceil((now.getTime() + 60_000) / 3_600_000) * 3_600_000);
   return {
-    title: '', taskType: 'custom', focus: '', messageText: '', forwardMode:'contains',forwardText:'',senderAccount:'',senderMid:'',senderLabel:'',
+    title: '', taskType: 'custom', focus: '', messageText: '', forwardMode:'contains',forwardText:'',imageVerify:true,senderAccount:'',senderMid:'',senderLabel:'',
     mentionAdmin: false, mentionMembers: [], mentionAll: false, actForward: true, actNotify: false, actAgent: false, agentPrompt: '', agentTarget: null,
     keywords: [], newMessages: defaultNewMessagesDraft(), targets: [], prompt: '',
     kind: 'daily', onceAt: isoToWall(nextHour, timezone), time: '09:00', days: [1, 2, 3, 4, 5], everyMinutes: '60',
@@ -125,7 +127,8 @@ export function formStateFromSchedule(schedule: AgentSchedule): ScheduleFormStat
   if (schedule.task.type === 'message') next.messageText = schedule.task.text;
   if(schedule.task.type==='message_forward') {
     next.forwardMode=schedule.task.match.mode;
-    next.forwardText=schedule.task.match.mode==='contains'?schedule.task.match.keywords.join('\n'):schedule.task.match.mode==='exact'?schedule.task.match.text:'';
+    next.forwardText=schedule.task.match.mode==='contains'||schedule.task.match.mode==='image_text'?schedule.task.match.keywords.join('\n'):schedule.task.match.mode==='exact'?schedule.task.match.text:'';
+    if(schedule.task.match.mode==='image_text') next.imageVerify=schedule.task.match.verifyUnclear;
     next.senderAccount=schedule.task.sender?.accountId??'';next.senderMid=schedule.task.sender?.mid??'';next.senderLabel=schedule.task.sender?.label??'';
     if(schedule.task.match.mode==='mention') {
       next.mentionAdmin=schedule.task.match.admin;next.mentionAll=schedule.task.match.all;
@@ -231,22 +234,28 @@ export function buildScheduleInput(form: ScheduleFormState): { input: AgentSched
   let newMessagesTask: AgentScheduleNewMessagesTask | undefined;
   let forwardTask:AgentScheduleForwardTask|undefined;
   if(isForward) {
-    const agentPrompt=form.agentPrompt.trim();
+    // Photo text mode: the photo is always forwarded, and the Agent (when it checks unclear photos) writes to the delivery chat.
+    const isImage=form.forwardMode==='image_text';
+    const forwardOn=isImage||form.actForward;
+    const agentOn=isImage?form.imageVerify:form.actAgent;
+    const agentTarget=isImage?form.deliveryTarget:form.agentTarget;
+    const agentPrompt=isImage?'':form.agentPrompt.trim();
     // An empty list of source chats means all readable chats. A rule that does not forward is record-only.
-    const forwardDelivery:AgentScheduleCreateInput['delivery']=form.actForward&&form.deliveryTarget ? {mode:'line_target',target:form.deliveryTarget} : {mode:'record_only'};
+    const forwardDelivery:AgentScheduleCreateInput['delivery']=forwardOn&&form.deliveryTarget ? {mode:'line_target',target:form.deliveryTarget} : {mode:'record_only'};
     if(form.forwardMode==='mention'&&!form.mentionAdmin&&!form.mentionAll&&form.mentionMembers.length===0) errors.mention={key:'mentionNone'};
-    if(!form.actForward&&!form.actNotify&&!form.actAgent) errors.actions={key:'errActionNone'};
-    if(form.actAgent&&agentPrompt.length>AGENT_SCHEDULE_PROMPT_MAX) errors.agentPrompt={key:'errPromptTooLong'};
-    if(form.actAgent&&!form.agentTarget) errors.agentTarget={key:'errDeliveryTarget'};
-    if(form.actForward&&(!form.deliveryTarget||form.deliveryTarget.chatType==='room')) errors.delivery={key:'forwardInvalid'};
+    if(!forwardOn&&!form.actNotify&&!agentOn) errors.actions={key:'errActionNone'};
+    if(agentOn&&agentPrompt.length>AGENT_SCHEDULE_PROMPT_MAX) errors.agentPrompt={key:'errPromptTooLong'};
+    if(agentOn&&!agentTarget&&!isImage) errors.agentTarget={key:'errDeliveryTarget'};
+    if(forwardOn&&(!form.deliveryTarget||form.deliveryTarget.chatType==='room')) errors.delivery={key:'forwardInvalid'};
     if(!errors.mention&&!errors.actions&&!errors.agentPrompt&&!errors.agentTarget) {
-      // Mention rules always store their actions; the other modes store them only when they differ from the old forward-only default.
-      const storeActions=form.forwardMode==='mention'||form.actNotify||form.actAgent||!form.actForward;
+      // Mention and photo text rules always store their actions; the other modes store them only when they differ from the old forward-only default.
+      const storeActions=form.forwardMode==='mention'||isImage||form.actNotify||form.actAgent||!form.actForward;
       const parsed=AgentScheduleForwardTaskSchema.safeParse({type:'message_forward',match:form.forwardMode==='contains'
         ?{mode:'contains',keywords:form.forwardText.split('\n').filter((s)=>s.trim().length>0)}:form.forwardMode==='exact'?{mode:'exact',text:form.forwardText}
+        :isImage?{mode:'image_text',keywords:form.forwardText.split('\n').filter((s)=>s.trim().length>0),verifyUnclear:form.imageVerify}
         :form.forwardMode==='mention'?{mode:'mention',admin:form.mentionAdmin,members:form.mentionMembers.map(({accountId,mid,label})=>({accountId,mid,label})),all:form.mentionAll}:{mode:'sender'},
         ...(form.senderMid.trim()||form.senderAccount.trim()?{sender:{accountId:form.senderAccount.trim(),mid:form.senderMid.trim(),label:form.senderLabel}}:{}),
-        ...(storeActions?{actions:{forward:form.actForward,notify:form.actNotify,agent:form.actAgent&&form.agentTarget?{prompt:agentPrompt,target:{accountId:form.agentTarget.accountId,chatType:form.agentTarget.chatType,chatId:form.agentTarget.chatId,title:form.agentTarget.title}}:null}}:{})});
+        ...(storeActions?{actions:{forward:forwardOn,notify:form.actNotify,agent:agentOn&&agentTarget?{prompt:agentPrompt,target:{accountId:agentTarget.accountId,chatType:agentTarget.chatType,chatId:agentTarget.chatId,title:agentTarget.title}}:null}}:{})});
       if(parsed.success) forwardTask=parsed.data; else errors.rules={key:'forwardInvalid'};
       if(forwardTask&&!errors.delivery&&agentScheduleShapeError({prompt:'',targets:form.targets,task:forwardTask,recurrence:{kind:'message'},delivery:forwardDelivery})) errors.rules={key:'forwardInvalid'};
     }
@@ -274,7 +283,7 @@ export function buildScheduleInput(form: ScheduleFormState): { input: AgentSched
     input: {
       title, prompt, provider: form.provider, recurrence: recurrence.recurrence, timezone: form.timezone, targets: isMessage ? [] : form.targets,
       task, window,
-      delivery: isForward ? (form.actForward && form.deliveryTarget ? { mode: 'line_target', target: form.deliveryTarget } : { mode: 'record_only' })
+      delivery: isForward ? ((form.actForward || form.forwardMode === 'image_text') && form.deliveryTarget ? { mode: 'line_target', target: form.deliveryTarget } : { mode: 'record_only' })
         : form.deliveryMode === 'line_target' && form.deliveryTarget ? { mode: 'line_target', target: form.deliveryTarget }
         : form.deliveryMode === 'record_only' && !isProgramTask(form.taskType) ? { mode: 'record_only' } : { mode: 'primary_admin' },
       jitterMinutes: isForward?0:Math.max(0, Math.min(AGENT_SCHEDULE_JITTER_MAX_MINUTES, Math.floor(form.jitterMinutes))),

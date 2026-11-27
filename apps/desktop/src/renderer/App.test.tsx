@@ -217,6 +217,9 @@ function fakeApi(): DesktopApi {
     setManualUnsendWindow: vi.fn(async (window) => window),
     getLineLegyEncrypted: vi.fn(async () => false),
     setLineLegyEncrypted: vi.fn(async (enabled) => enabled),
+    lineLookupContact: vi.fn(async () => ({ ok: false as const, error: 'LINE_NOT_CONNECTED' })),
+    getLineSquareReceive: vi.fn(async () => false),
+    setLineSquareReceive: vi.fn(async (enabled) => enabled),
     getAgentPersona: vi.fn(async () => ({ description: '', liveliness: 'normal' as const })),
     setAgentPersona: vi.fn(async (persona) => persona),
     submitAgentRoomPrompt: vi.fn(async () => ({ type: 'submitAgentRoomPrompt', requestId: 'x', ok: true, jobId: 'job-1' } as const)),
@@ -293,6 +296,10 @@ function fakeApi(): DesktopApi {
     setAgentFolderLink: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
     createChatFolder: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
     openChatFolder: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
+    listProjectFolders: vi.fn(async () => ({ type: 'listProjectFolders' as const, requestId: 'r', ok: true as const, folders: [] })),
+    chooseProjectFolder: vi.fn(async () => ({ type: 'chooseProjectFolder' as const, requestId: 'r', ok: true as const, path: null })),
+    bindProjectFolder: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
+    unbindProjectFolder: vi.fn(async () => ({ type: 'accepted' as const, requestId: 'r', ok: true as const })),
     getAgentExtensions: vi.fn(async () => ({ servers: [], tools: { webSearch: false, webFetch: false, bash: false, fileRead: false, fileWrite: false } })),
     saveAgentMcpServer: vi.fn(async () => ({ type: 'error', requestId: 'r', ok: false, code: 'UNUSED', message: 'unused', retryable: false }) as never),
     deleteAgentMcpServer: vi.fn(async () => ({ type: 'deleteAgentMcpServer', requestId: 'r', ok: true }) as never),
@@ -570,7 +577,7 @@ describe('last visited page', () => {
     expect(within(navigation).getByRole('button', { name: '排程' }).previousElementSibling?.classList.contains('nav-divider')).toBe(true);
     fireEvent.click(within(navigation).getByRole('button', { name: '設定' }));
     await screen.findByRole('tablist', { name: '設定分類' });
-    expect(settingsTabs().slice(0, 2)).toEqual(['系統', '對話']);
+    expect(settingsTabs().slice(0, 3)).toEqual(['系統', '資料夾', '對話']);
     fireEvent.click(screen.getByRole('tab', { name: '系統' }));
     const accountSettings = await screen.findByRole('region', { name: 'LINE 帳號設定' });
     const agentSlot = within(accountSettings).getByRole('region', { name: 'Agent 帳號欄位' });
@@ -1042,8 +1049,8 @@ describe('operator console', () => {
     const inboundRow = inbound.closest('.message-row')!;
     const inboundMarker = inboundRow.querySelector('.message-recalled-label')!;
     expect(inboundMarker.textContent).toBe('已收回（無資料）');
-    expect(inboundMarker.parentElement?.classList.contains('message-meta')).toBe(true);
-    expect(inboundMarker.nextElementSibling).toBe(inboundRow.querySelector('.message-time'));
+    expect(inboundMarker.parentElement?.classList.contains('message-meta-status')).toBe(true);
+    expect(inboundRow.querySelector('.message-meta .message-time')).not.toBeNull();
     expect(inbound.querySelector('.message-recalled-label')).toBeNull();
     expect(inbound.textContent).not.toContain('已收回訊息');
     expect(inbound.closest('.message-row')?.classList.contains('inbound')).toBe(true);
@@ -1055,7 +1062,7 @@ describe('operator console', () => {
     const outboundRow = outRecalled.closest('.message-row')!;
     const outboundMarker = outboundRow.querySelector('.message-recalled-label')!;
     expect(outboundMarker.textContent).toBe('已收回（無資料）');
-    expect(outboundMarker.nextElementSibling).toBe(outboundRow.querySelector('.message-time'));
+    expect(outboundMarker.parentElement?.classList.contains('message-meta-status')).toBe(true);
     expect(outRecalled.textContent).toBe('');
     const kept = container.querySelector('#message-recalled-kept')!;
     expect(kept.classList.contains('system-event-message')).toBe(false);
@@ -1065,7 +1072,7 @@ describe('operator console', () => {
     const keptRow = kept.closest('.message-row')!;
     const keptLabel = keptRow.querySelector('.message-recalled-label')!;
     expect(keptLabel.textContent).toBe('已收回');
-    expect(keptLabel.nextElementSibling).toBe(keptRow.querySelector('.message-time'));
+    expect(keptLabel.parentElement?.classList.contains('message-meta-status')).toBe(true);
     expect(kept.querySelector('.message-recalled-divider')).toBeNull();
     expect(kept.textContent).not.toContain('已收回訊息');
     const queued = container.querySelector('#message-recalled-queued')!;
@@ -1099,21 +1106,21 @@ describe('operator console', () => {
     const noneRow = none.closest('.message-row')!;
     const noneMarker = noneRow.querySelector('.message-recalled-label')!;
     expect(noneMarker.textContent).toBe('已收回（無資料）');
-    expect(noneMarker.nextElementSibling).toBe(noneRow.querySelector('.message-time'));
-    expect(noneMarker.closest('.message-meta')?.parentElement?.classList.contains('message-trailing-meta')).toBe(true);
+    expect(noneMarker.closest('.message-meta-status')?.parentElement?.classList.contains('message-meta-line')).toBe(true);
+    expect(noneRow.querySelector('.message-meta .message-time')).not.toBeNull();
     const kept = container.querySelector('#message-rq-kept')!;
     const keptRow = kept.closest('.message-row')!;
     const keptMarker = keptRow.querySelector('.message-recalled-label')!;
-    expect(keptMarker.nextElementSibling).toBe(kept.closest('.message-row')!.querySelector('.message-time'));
-    expect(keptMarker.closest('.message-meta')?.parentElement?.classList.contains('message-trailing-meta')).toBe(true);
+    expect(keptMarker.closest('.message-meta-status')?.parentElement?.classList.contains('message-meta-line')).toBe(true);
+    expect(keptRow.querySelector('.message-meta .message-time')).not.toBeNull();
     expect(before(kept.querySelector('.reply-reference')!, kept.querySelector('.message-text')!)).toBe(true);
     expect(kept.querySelector('.message-recalled-label, .message-recalled-divider')).toBeNull();
     expect(keptMarker.textContent).toBe('已收回');
     const src = container.querySelector('#message-rq-src')!;
     const srcMarker = src.closest('.message-row')!.querySelector('.message-recalled-label')!;
     expect(srcMarker.textContent).toBe('已刪除（無資料）');
-    expect(srcMarker.nextElementSibling).toBe(src.closest('.message-row')!.querySelector('.message-time'));
-    expect(srcMarker.closest('.message-meta')?.parentElement?.classList.contains('message-trailing-meta')).toBe(true);
+    expect(srcMarker.closest('.message-meta-status')?.parentElement?.classList.contains('message-meta-line')).toBe(true);
+    expect(src.closest('.message-row')!.querySelector('.message-meta .message-time')).not.toBeNull();
   });
 
   it('presents source-deleted messages like recalled ones with the 已刪除 label and recalled stickers below 已收回', async () => {
@@ -1137,7 +1144,7 @@ describe('operator console', () => {
     const label = deletedRow.querySelector('.message-recalled-label')!;
     const text = deleted.querySelector('.message-text')!;
     expect(label.textContent).toBe('已刪除');
-    expect(label.nextElementSibling).toBe(deletedRow.querySelector('.message-time'));
+    expect(label.parentElement?.classList.contains('message-meta-status')).toBe(true);
     expect(deleted.querySelector('.message-recalled-divider')).toBeNull();
     expect(deleted.classList.contains('system-event-message')).toBe(false);
     const sticker = container.querySelector('#message-recalled-sticker')!;
@@ -1154,7 +1161,7 @@ describe('operator console', () => {
     const deletedStickerRow = deletedSticker.closest('.message-row')!;
     const deletedStickerMarker = deletedStickerRow.querySelector('.message-recalled-label')!;
     expect(deletedStickerMarker.textContent).toBe('已刪除');
-    expect(deletedStickerMarker.nextElementSibling).toBe(deletedStickerRow.querySelector('.message-time'));
+    expect(deletedStickerMarker.parentElement?.classList.contains('message-meta-status')).toBe(true);
     expect(deletedSticker.querySelector('.message-sticker')).not.toBeNull();
     expect(deletedSticker.textContent).not.toContain('已刪除訊息');
     const deletedLocation = container.querySelector('#message-deleted-location')!;
@@ -1171,7 +1178,7 @@ describe('operator console', () => {
     const capsuleOutRow = capsuleOut.closest('.message-row')!;
     const capsuleOutMarker = capsuleOutRow.querySelector('.message-recalled-label')!;
     expect(capsuleOutMarker.textContent).toBe('已刪除（無資料）');
-    expect(capsuleOutMarker.nextElementSibling).toBe(capsuleOutRow.querySelector('.message-time'));
+    expect(capsuleOutMarker.parentElement?.classList.contains('message-meta-status')).toBe(true);
   });
 
   it('shows a placeholder for a contact message with no text', async () => {
@@ -1343,6 +1350,41 @@ describe('operator console', () => {
     expect(screen.getByText('dropped.txt')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '傳送' }));
     await waitFor(() => expect(order).toEqual(['text', 'media:picked.txt', 'media:dropped.txt']));
+  });
+
+  it('inserts a picked member as an @ mention and sends the mention with the text', async () => {
+    const api = fakeApi();
+    const amy = `u${'a'.repeat(32)}`;
+    const bob = `u${'b'.repeat(32)}`;
+    api.listConversationMembers = vi.fn(async () => ({ members: [{ mid: amy, name: 'Amy' }, { mid: bob, name: 'Bob' }] }));
+    await renderLineApp(api);
+    const box = screen.getByRole('textbox', { name: 'LINE 訊息' }) as HTMLTextAreaElement;
+    await waitFor(() => expect(api.listConversationMembers).toHaveBeenCalled());
+    fireEvent.change(box, { target: { value: 'hi @b' } });
+    expect(await screen.findByRole('option', { name: 'Bob' })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: 'Amy' })).toBeNull();
+    fireEvent.keyDown(box, { key: 'Enter' });
+    await waitFor(() => expect(box.value).toBe('hi @Bob '));
+    expect(screen.queryByRole('listbox')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '傳送' }));
+    await waitFor(() => expect(api.sendText).toHaveBeenCalledTimes(1));
+    expect(api.sendText).toHaveBeenCalledWith(expect.objectContaining({ chatType: 'group', chatId: 'same-chat' }), 'hi @Bob', [{ start: 3, end: 7, userId: bob }]);
+  });
+
+  it('sends the own reaction again as UNDO and another reaction as itself', async () => {
+    const api = fakeApi();
+    api.listMessages = vi.fn(async () => ({ messages: [{ ...message('account-A', 'm1'),
+      reactions: [{ kind: 'NICE' as const, count: 1, reactorNames: ['工作'], own: true }] }], olderCursor: null }));
+    api.reactMessage = vi.fn(async () => ({ type: 'accepted', requestId: 'react-1', ok: true } as const));
+    await renderLineApp(api);
+    fireEvent.click(await screen.findByRole('button', { name: '表情' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '讚' }));
+    await waitFor(() => expect(api.reactMessage).toHaveBeenCalledTimes(1));
+    expect(api.reactMessage).toHaveBeenLastCalledWith(expect.objectContaining({ chatId: 'same-chat' }), 'm1', 'UNDO');
+    fireEvent.click(screen.getByRole('button', { name: '表情' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '愛心' }));
+    await waitFor(() => expect(api.reactMessage).toHaveBeenCalledTimes(2));
+    expect(api.reactMessage).toHaveBeenLastCalledWith(expect.objectContaining({ chatId: 'same-chat' }), 'm1', 'LOVE');
   });
 
   it('keeps the uncertain attachment and stops the remaining media batch', async () => {
@@ -3079,7 +3121,8 @@ describe('operator console', () => {
     expect(actions).toBeTruthy();
     expect(row?.contains(bubble)).toBe(true);
     expect(bubble?.nextElementSibling?.classList.contains('message-trailing-meta')).toBe(true);
-    expect(actions?.parentElement?.classList.contains('message-trailing-meta')).toBe(true);
+    expect(actions?.parentElement?.classList.contains('message-meta-line')).toBe(true);
+    expect(actions?.parentElement?.parentElement?.classList.contains('message-trailing-meta')).toBe(true);
     expect(bubble?.contains(actions!)).toBe(false);
     fireEvent.click(replyButton);
 

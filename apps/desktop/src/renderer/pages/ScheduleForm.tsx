@@ -97,6 +97,7 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
   const providerOptions = (['claude', 'codex'] as const).filter((provider) => provider === form.provider || availableProviders(providers).includes(provider));
   const isMessage = form.taskType === 'message';
   const isForward=form.taskType==='message_forward';
+  const isImageText=isForward&&form.forwardMode==='image_text';
   const isNewMessages = form.taskType === 'new_messages';
   const isProgram = isProgramTask(form.taskType);
   const usesLlm = formUsesLlm(form);
@@ -183,10 +184,18 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
         </>}
         {isForward && <fieldset className="schedule-field">
           <legend className="schedule-label">{text('forwardEvent')}</legend>
-          <label>{text('forwardMatch')}<select aria-label={text('forwardMatch')} value={form.forwardMode} onChange={(event)=>set({forwardMode:event.target.value as ScheduleFormState['forwardMode']})}>
-            <option value="contains">{text('forwardContains')}</option><option value="exact">{text('forwardExact')}</option><option value="sender">{text('forwardSender')}</option><option value="mention">{text('forwardMention')}</option>
+          <label>{text('forwardMatch')}<select aria-label={text('forwardMatch')} value={form.forwardMode} onChange={(event)=>{
+            const forwardMode=event.target.value as ScheduleFormState['forwardMode'];
+            // A photo text rule always forwards the photo to a LINE chat.
+            set({forwardMode,...(forwardMode==='image_text'?{actForward:true,deliveryMode:'line_target' as const}:{})});
+          }}>
+            <option value="contains">{text('forwardContains')}</option><option value="exact">{text('forwardExact')}</option><option value="sender">{text('forwardSender')}</option><option value="mention">{text('forwardMention')}</option><option value="image_text">{text('forwardImageText')}</option>
           </select></label>
-          {(form.forwardMode==='contains'||form.forwardMode==='exact') && <label>{text('forwardText')}<textarea aria-label={text('forwardText')} value={form.forwardText} onChange={(event)=>set({forwardText:event.target.value})}/></label>}
+          {(form.forwardMode==='contains'||form.forwardMode==='exact'||form.forwardMode==='image_text') && <label>{text('forwardText')}<textarea aria-label={text('forwardText')} value={form.forwardText} onChange={(event)=>set({forwardText:event.target.value})}/></label>}
+          {form.forwardMode==='image_text' && <>
+            <label className="schedule-check"><input type="checkbox" checked={form.imageVerify} onChange={(event)=>set({imageVerify:event.target.checked})}/>{text('imageVerify')}</label>
+            <p className="schedule-hint">{text('imageTextHint')}</p>
+          </>}
           {form.forwardMode==='mention' && <>
             <label className="schedule-check"><input type="checkbox" checked={form.mentionAdmin} onChange={(event)=>set({mentionAdmin:event.target.checked})}/>{text('mentionAdmin')}</label>
             <ScheduleMentionMembers api={api} text={text} members={form.mentionMembers} max={AGENT_SCHEDULE_MENTION_MEMBERS_MAX} onChange={(mentionMembers)=>set({mentionMembers})} error={visible.mention} errorId={errorIds.mention}/>
@@ -201,7 +210,7 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
           <label>{text('forwardSenderMid')}<input aria-label={text('forwardSenderMid')} value={form.senderMid} onChange={(event)=>set({senderMid:event.target.value})}/></label>
           <label>{text('forwardSenderLabel')}<input aria-label={text('forwardSenderLabel')} value={form.senderLabel} onChange={(event)=>set({senderLabel:event.target.value})}/></label>
           </details>
-          <p className="schedule-hint">{text('forwardLiteral')}</p>{form.forwardMode!=='mention' && <p className="schedule-hint">{text('forwardTextOnly')}</p>}{err('rules',errorIds.rules)}
+          <p className="schedule-hint">{text('forwardLiteral')}</p>{form.forwardMode!=='mention' && form.forwardMode!=='image_text' && <p className="schedule-hint">{text('forwardTextOnly')}</p>}{err('rules',errorIds.rules)}
         </fieldset>}
 
         {form.taskType === 'summary' && <div className="schedule-field">
@@ -270,12 +279,12 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
 
         {isForward && <fieldset className="schedule-field">
           <legend className="schedule-label">{text('fieldActions')}</legend>
-          <label className="schedule-check"><input type="checkbox" checked={form.actForward} onChange={(event)=>set({actForward:event.target.checked,...(event.target.checked?{deliveryMode:'line_target' as const}:{})})}/>{text('actionForward')}</label>
-          {form.actForward && <ChatCombobox api={api} text={text} label={text('fieldDeliveryTarget')} purpose="delivery" selected={form.deliveryTarget ? [form.deliveryTarget] : []} max={1}
+          {!isImageText && <label className="schedule-check"><input type="checkbox" checked={form.actForward} onChange={(event)=>set({actForward:event.target.checked,...(event.target.checked?{deliveryMode:'line_target' as const}:{})})}/>{text('actionForward')}</label>}
+          {(form.actForward || isImageText) && <ChatCombobox api={api} text={text} label={text('fieldDeliveryTarget')} purpose="delivery" selected={form.deliveryTarget ? [form.deliveryTarget] : []} max={1}
             onChange={(targets) => set({ deliveryTarget: targets[0] ? toSendTarget(targets[0]) : null })} error={visible.delivery} errorId={errorIds.delivery} />}
           <label className="schedule-check"><input type="checkbox" checked={form.actNotify} onChange={(event)=>set({actNotify:event.target.checked})}/>{text('actionNotify')}</label>
-          <label className="schedule-check"><input type="checkbox" checked={form.actAgent} onChange={(event)=>{ set({actAgent:event.target.checked}); if(event.target.checked) defaultAgentTarget(); }}/>{text('actionAgent')}</label>
-          {form.actAgent && <>
+          {!isImageText && <label className="schedule-check"><input type="checkbox" checked={form.actAgent} onChange={(event)=>{ set({actAgent:event.target.checked}); if(event.target.checked) defaultAgentTarget(); }}/>{text('actionAgent')}</label>}
+          {form.actAgent && !isImageText && <>
             <div className="schedule-field">
               <label htmlFor={ids.agentPrompt} className="schedule-label">{text('fieldAgentPrompt')}</label>
               <textarea name="agent-prompt" autoComplete="off" id={ids.agentPrompt} value={form.agentPrompt} onChange={(event) => set({ agentPrompt: event.target.value })} {...invalid('agentPrompt', errorIds.agentPrompt)} />
@@ -303,7 +312,7 @@ export function ScheduleForm({ api, schedule, defaultProvider, providers, onSubm
           buildInput={() => buildPreviewInput(form).input ?? null} onInvalid={() => { setPreviewTried(true); setFailTick((tick) => tick + 1); }} />}
 
         <div className="schedule-settings">
-          {(usesLlm || (isForward && form.actAgent)) && <><label htmlFor={ids.provider} className="schedule-label">{text('fieldProvider')}</label>
+          {(usesLlm || (isForward && (isImageText ? form.imageVerify : form.actAgent))) && <><label htmlFor={ids.provider} className="schedule-label">{text('fieldProvider')}</label>
             <select name="provider" id={ids.provider} value={form.provider} onChange={(event) => set({ provider: event.target.value as 'codex' | 'claude' })}>{providerOptions.map((provider) => <option key={provider} value={provider}>{provider === 'claude' ? 'Claude' : 'Codex'}</option>)}</select></>}
           <span className="schedule-label" id={ids.enabled}>{text('fieldEnabled')}</span>
           <button type="button" role="switch" aria-checked={form.enabled} aria-labelledby={ids.enabled} className="schedule-switch" onClick={() => set({ enabled: !form.enabled })}><span className="schedule-switch-thumb" /></button>

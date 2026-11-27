@@ -28,7 +28,7 @@ class FakeChild {
   }
   ack(current: Record<string, unknown>) {
     const { accountId, workerInstanceId, controlEpoch } = current as { accountId: string; workerInstanceId: string; controlEpoch: number };
-    this.emitRaw({ type: 'workerProtocolAck', accountId, workerInstanceId, controlEpoch, protocolVersion: 4, manualSend: true });
+    this.emitRaw({ type: 'workerProtocolAck', accountId, workerInstanceId, controlEpoch, protocolVersion: 5, manualSend: true });
     this.emitRaw({ type: 'modeAck', ...current, mode: 'ACTIVE_CONTROL', drained: true });
   }
   sent(current: Record<string, unknown>, requestId: string, status: 'sent' | 'failed' = 'sent') {

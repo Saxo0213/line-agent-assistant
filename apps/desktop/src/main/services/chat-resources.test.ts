@@ -365,13 +365,19 @@ describe('ChatResourceArchiveService', () => {
     expect(store.publishAlbumPhoto).toHaveBeenCalledOnce();
   });
 
-  it('rejects direct Notes service calls without reading LINE', async () => {
+  it('reads Notes through the worker', async () => {
     const { service, readChatResource } = await setup();
-    await expect(service.listNotes(key, null)).rejects.toThrow('Notes are disabled.');
-    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('Notes are disabled.');
+    await expect(service.listNotes(key, null)).resolves.toMatchObject({ notes: [expect.objectContaining({ postId: noteA.postId })] });
+    expect(readChatResource.mock.calls.map(([command]) => command.action)).toEqual(['listNotes']);
+  });
+
+  it('makes no worker call for a direct chat without a stored one-to-one chat id', async () => {
+    const directKey = { accountId: 'account-1', chatType: 'direct' as const, chatId: `u${'a'.repeat(32)}` };
+    const directHomeChatId = vi.fn(async () => null);
+    const { service, readChatResource } = await setup({ directHomeChatId });
+    await expect(service.listAlbums(directKey, null)).rejects.toMatchObject({ code: 'CHAT_RESOURCE_NO_HOME_CHAT' });
+    expect(directHomeChatId).toHaveBeenCalledOnce();
     expect(readChatResource).not.toHaveBeenCalled();
-    await expect(service.listAlbums(key, null)).resolves.toMatchObject({ albums: expect.any(Array) });
-    expect(readChatResource.mock.calls.map(([command]) => command.action)).toEqual(['listAlbums']);
   });
 
   it('repairs a missing saved-file catalog row from native inspection without reading LINE', async () => {
@@ -1030,18 +1036,6 @@ describe('ChatResourceArchiveService', () => {
     expect(JSON.stringify(records[0])).not.toContain('message');
   });
 
-  it('preserves existing Note archive records while Note service reads are disabled', async () => {
-    const { service, readChatResource, store } = await setup();
-    const content = Buffer.from('existing archived note');
-    const controller = new AbortController();
-    await store.publish({ key, kind: 'note', resourceId: noteA.postId, content, signal: controller.signal, guard() {} });
-    await expect(service.listNotes(key, null)).rejects.toThrow('Notes are disabled.');
-    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('Notes are disabled.');
-    const saved = await store.read({ key, kind: 'note', resourceId: noteA.postId });
-    expect(saved && Buffer.from(saved.content).toString()).toBe('existing archived note');
-    expect(readChatResource).not.toHaveBeenCalled();
-  });
-
   it('closes account admission on invalidation until the facade confirms authenticated readiness', async () => {
     const { service, readChatResource, published } = await setup();
     service.invalidateAccount(key.accountId, 'logout');
@@ -1108,7 +1102,7 @@ describe('ChatResourceArchiveService', () => {
     expect(published).toHaveLength(0);
   });
 
-  it('rejects disabled Note IPC actions without reading LINE and keeps Album reads available', async () => {
+  it('serves Album IPC actions through the worker', async () => {
     const { service, readChatResource } = await setup({}, {
       inspectAlbumPhoto: vi.fn(async () => null),
       publishAlbumPhoto: vi.fn(async () => ({ folderName: createHash('sha256').update(album.albumId).digest('hex'),
@@ -1116,8 +1110,6 @@ describe('ChatResourceArchiveService', () => {
         byteCount: 3, revision: 1, savedAt: new Date().toISOString() })),
     });
     const base = { accountId: key.accountId, chatType: key.chatType, chatId: key.chatId };
-    await expect(service.dispatchIpc({ ...base, requestId: 'renderer-list-notes', type: 'listChatNotes', cursor: null })).rejects.toThrow('Notes are disabled.');
-    await expect(service.dispatchIpc({ ...base, requestId: 'renderer-get-note', type: 'getChatNote', postId: noteA.postId })).rejects.toThrow('Notes are disabled.');
     await service.dispatchIpc({ ...base, requestId: 'renderer-list-albums', type: 'listChatAlbums', cursor: null });
     await service.dispatchIpc({ ...base, requestId: 'renderer-list-photos', type: 'listChatAlbumPhotos', albumId: album.albumId, cursor: null });
     await service.dispatchIpc({ ...base, requestId: 'renderer-download-photo', type: 'downloadChatAlbumPhoto', albumId: album.albumId, photoId: photo.photoId, oid: photo.oid, prefix: photo.prefix });
@@ -1130,14 +1122,15 @@ describe('ChatResourceArchiveService', () => {
     }
   });
 
-  it('rejects disabled Note IPC actions even when a caller signal is provided', async () => {
+  it('cancels a Note IPC read when the caller signal aborts', async () => {
     const { service, readChatResource, published } = await setup({ readChatResource: (_command, signal) => new Promise((resolve, reject) => {
       signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
     }) });
     const controller = new AbortController();
     const request = service.dispatchIpc({ ...key, requestId: 'cancel-read', type: 'listChatNotes', cursor: null }, controller.signal);
-    await expect(request).rejects.toThrow('Notes are disabled.');
-    expect(readChatResource).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(readChatResource).toHaveBeenCalledOnce());
+    controller.abort(new Error('modal closed'));
+    await expect(request).rejects.toThrow('modal closed');
     expect(published).toHaveLength(0);
   });
 
@@ -1234,17 +1227,6 @@ describe('ChatResourceArchiveService', () => {
     await service.shutdown();
     expect(Date.now() - started).toBeLessThan(1500);
     expect(forceClose).toHaveBeenCalledOnce();
-  });
-
-  it('assigns a newer revision for A→B→A and retains every snapshot', async () => {
-    const { service, readChatResource, store } = await setup();
-    await store.publish({ key, kind: 'note', resourceId: noteA.postId, content: Buffer.from('existing archive'),
-      signal: new AbortController().signal, guard() {} });
-    await expect(service.listNotes(key, null)).rejects.toThrow('Notes are disabled.');
-    await expect(service.getNote(key, noteA.postId)).rejects.toThrow('Notes are disabled.');
-    const archived = await store.read({ key, kind: 'note', resourceId: noteA.postId });
-    expect(archived && Buffer.from(archived.content).toString()).toBe('existing archive');
-    expect(readChatResource).not.toHaveBeenCalled();
   });
 
   it('rejects stale worker responses and caller cancellation', async () => {

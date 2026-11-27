@@ -144,11 +144,16 @@ database('send tools end to end (real database, fake worker)', () => {
   let messages: MessageRepository;
   const accountId = `acct-send-${randomUUID().slice(0, 8)}`;
   const sent: Array<{ chatType: string; chatId: string; text?: string; fileName?: string }> = [];
+  let failSends = false;
   const worker = {
     binding: async (account: string) => ({ accountId: account, workerInstanceId: 'w-1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' as const }),
     waitModeAck: async () => true,
     send: async (command: { accountId: string; workerInstanceId: string; controlEpoch: number; requestId: string; chatType: string; chatId: string; text: string }) => {
       sent.push({ chatType: command.chatType, chatId: command.chatId, text: command.text });
+      if (failSends) {
+        return { type: 'sendResult' as const, accountId: command.accountId, workerInstanceId: command.workerInstanceId,
+          controlEpoch: command.controlEpoch, requestId: command.requestId, status: 'failed' as const, messageId: null, error: 'LINE_REJECTED' };
+      }
       return { type: 'sendResult' as const, accountId: command.accountId, workerInstanceId: command.workerInstanceId,
         controlEpoch: command.controlEpoch, requestId: command.requestId, status: 'sent' as const, messageId: `m-${sent.length}`, error: null };
     },
@@ -287,6 +292,57 @@ database('send tools end to end (real database, fake worker)', () => {
       const stored = JSON.stringify(rows);
       for (const forbidden of ['SECRET-WORD', 'report.txt', 'community announcement']) expect(stored).not.toContain(forbidden);
     } finally { await h.close(); }
+  });
+
+  it('sends to a friend or group member MID without a chat, creates the row after a sent item, and refuses strangers, blocked, own and group ids', async () => {
+    const mid = (digit: string) => `u${digit.repeat(32)}`;
+    const [friend, failing, blocked, own, member, stranger] = [mid('a'), mid('b'), mid('c'), mid('d'), mid('e'), mid('f')];
+    const rowCount = async (chatId: string) => Number((await pool.query(
+      "SELECT count(*)::int AS n FROM conversations WHERE account_id = $1 AND chat_type = 'direct' AND chat_id = $2", [accountId, chatId])).rows[0].n);
+    const job = await uiJob();
+    await pool.query('INSERT INTO line_contacts (account_id, mid, native_status) VALUES ($1,$2,1), ($3,$4,1), ($5,$6,6)',
+      [accountId, friend, accountId, failing, accountId, blocked]);
+    await pool.query("INSERT INTO conversation_members (account_id, chat_type, chat_id, member_id) VALUES ($1,'group','g-team',$2), ($1,'group','g-team',$3)",
+      [accountId, member, blocked]);
+    await pool.query('UPDATE line_accounts SET own_mid = $2 WHERE account_id = $1', [accountId, own]);
+    const h = harness();
+    try {
+      const { call } = h.open(job);
+      sent.length = 0;
+      expect(await rowCount(friend)).toBe(0);
+      const ok = await call('send_to_target', { chatType: 'direct', chatId: friend, items: [{ type: 'text', text: 'hi friend' }] });
+      expect(ok.result?.structuredContent?.results).toEqual([{ index: 0, status: 'sent' }]);
+      expect(sent).toEqual([{ chatType: 'direct', chatId: friend, text: 'hi friend' }]);
+      expect(await rowCount(friend)).toBe(1);
+
+      expect(await rowCount(member)).toBe(0);
+      const viaGroup = await call('send_to_target', { chatType: 'direct', chatId: member, items: [{ type: 'text', text: 'hi member' }] });
+      expect(viaGroup.result?.structuredContent?.results).toEqual([{ index: 0, status: 'sent' }]);
+      expect(await rowCount(member)).toBe(1);
+
+      failSends = true;
+      const failed = await call('send_to_target', { chatType: 'direct', chatId: failing, items: [{ type: 'text', text: 'x' }] });
+      failSends = false;
+      expect(failed.result?.structuredContent?.results?.[0]).toMatchObject({ index: 0, status: 'failed', code: 'send_failed' });
+      expect(await rowCount(failing)).toBe(0);
+
+      sent.length = 0;
+      for (const chatId of [stranger, blocked, own]) {
+        const refused = await call('send_to_target', { chatType: 'direct', chatId, items: [{ type: 'text', text: 'x' }] });
+        expect(refused.result?.structuredContent?.results).toEqual([{ index: 0, status: 'failed', code: 'send_target_invalid' }]);
+        expect(await rowCount(chatId)).toBe(0);
+      }
+      const group = await call('send_to_target', { chatType: 'group', chatId: `c${'e'.repeat(32)}`, items: [{ type: 'text', text: 'x' }] });
+      expect(group.result?.structuredContent?.results).toEqual([{ index: 0, status: 'failed', code: 'send_target_invalid' }]);
+      expect(sent).toHaveLength(0);
+    } finally {
+      failSends = false;
+      await h.close();
+      await pool.query('UPDATE line_accounts SET own_mid = NULL WHERE account_id = $1', [accountId]);
+      await pool.query('DELETE FROM line_contacts WHERE account_id = $1 AND mid = ANY($2::text[])', [accountId, [friend, failing, blocked]]);
+      await pool.query("DELETE FROM conversation_members WHERE account_id = $1 AND chat_id = 'g-team' AND member_id = ANY($2::text[])", [accountId, [member, blocked]]);
+      await pool.query("UPDATE agent_jobs SET status = 'cancelled' WHERE source_type = 'ui' AND status IN ('queued', 'running')");
+    }
   });
 
   it('refuses community and unknown targets, an escaping path and the per-job cap', async () => {

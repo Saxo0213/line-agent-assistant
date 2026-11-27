@@ -107,6 +107,60 @@ export function buildMessageFromNativeRow(row: NativeRowInput | null | undefined
   return { id, contentType, contentMetadata };
 }
 
+/**
+ * Reads only the message id and the content type of the official row. It needs no key and no SID.
+ * Returns null when `_id` is missing. `contentType` is null when `_contentType` is not an integer.
+ * `createdTime` is the `_createdTime` integer as text, or null when it is not an integer.
+ */
+export function nativeIdentityFromRow(row: NativeRowInput | null | undefined): {
+  id: string; contentType: number | null; createdTime: string | null; encrypted: boolean; unsent: boolean;
+} | null {
+  if (!row || !Array.isArray(row.columns) || !Array.isArray(row.cells)) return null;
+  const id = cellId(row, '_id');
+  if (id === null) return null;
+  const created = cellInteger(row, '_createdTime');
+  const { encrypted, unsent } = nativeFlags(row);
+  return { id, contentType: cellInteger(row, '_contentType'), createdTime: created === null ? null : String(created), encrypted, unsent };
+}
+
+/** Unparsable metadata or info counts as an empty object. Only the presence of keys is read, never a value. */
+function nativeFlags(row: NativeRowInput): { encrypted: boolean; unsent: boolean } {
+  const metadata = parseObject(cellText(row, '_contentMetadata')) ?? {};
+  const info = parseObject(cellText(row, '_contentInfo')) ?? {};
+  const encrypted = scalarText(metadata.e2eeVersion) !== null || scalarText(metadata.e2eeMark) !== null
+    || (typeof info.keyMaterial === 'string' && info.keyMaterial.length > 0) || scalarText(metadata.SID) !== null;
+  return { encrypted, unsent: Object.prototype.hasOwnProperty.call(metadata, 'UNSENT') };
+}
+
+const LINE_INT64_ID = /^(?:0|[1-9][0-9]{0,18})$/;
+const INT64_MAX = 9223372036854775807n;
+
+/**
+ * Message of a plain (V1, not E2EE) official row. It has no `SID`, no key and no e2ee version.
+ * Returns null unless `_id` is a LINE int64, `_contentType` is 1 or 14, the row is not encrypted and not `UNSENT`.
+ */
+export function buildPlainMessageFromNativeRow(row: NativeRowInput | null | undefined): BridgeMessage | null {
+  if (!row || !Array.isArray(row.columns) || !Array.isArray(row.cells)) return null;
+  const id = cellId(row, '_id');
+  const contentType = cellInteger(row, '_contentType');
+  if (id === null || !LINE_INT64_ID.test(id) || BigInt(id) > INT64_MAX) return null;
+  if (contentType === null || !NATIVE_CONTENT_TYPES.includes(contentType)) return null;
+  const { encrypted, unsent } = nativeFlags(row);
+  if (encrypted || unsent) return null;
+  const metadata = parseObject(cellText(row, '_contentMetadata')) ?? {};
+  const info = parseObject(cellText(row, '_contentInfo')) ?? {};
+  const contentMetadata: Record<string, string> = {};
+  for (const name of ['OID', 'OBS_POP', 'MEDIA_CONTENT_INFO'] as const) {
+    const value = metadata[name];
+    if (typeof value === 'string' && value.length > 0) contentMetadata[name] = value;
+  }
+  const fileSize = scalarText(metadata.FILE_SIZE);
+  if (fileSize !== null) contentMetadata.FILE_SIZE = fileSize;
+  const fileName = scalarText(metadata.FILE_NAME) ?? (contentType === 14 ? scalarText(info.fileName) : null);
+  if (fileName !== null) contentMetadata.FILE_NAME = fileName;
+  return { id, contentType, contentMetadata };
+}
+
 /** Takes the native envelope (raw.native of an External Monitor message) and returns the plain _message row. Null for any other shape. */
 export function nativeRowFromEnvelope(native: unknown): NativeRowInput | null {
   if (!isRecord(native)) return null;

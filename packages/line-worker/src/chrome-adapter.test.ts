@@ -6,7 +6,7 @@ import {
   createChromeAdapter, type ChromeAdapter, type ChromeAdapterBridge,
 } from './chrome-adapter.js';
 import { EffectDeniedError } from './mutation-gate.js';
-import { fetchLinejsConversationCatalog, normalizeLinePicturePath } from './linejs-adapter.js';
+import { fetchLinejsConversationCatalog, normalizeLinePicturePath } from './linejs-catalog.js';
 import { LineWorkerLoop } from './worker-loop.js';
 
 const binding = { accountId: 'account-A', workerInstanceId: 'worker-1', controlEpoch: 7 };
@@ -794,7 +794,7 @@ describe('ChromeAdapter through LineWorkerLoop', () => {
     const events: LineWorkerEvent[] = [];
     const worker = new LineWorkerLoop({ transport: harness.adapter, emit: (event) => { events.push(LineWorkerEventSchema.parse(event)); },
       validateLease: () => true });
-    await worker.handle({ type: 'init', ...binding, protocolVersion: 4, mode: options.mode ?? 'MONITOR_ONLY', durableCursor: cursor0, lineTransport: 'CHROMEOS' });
+    await worker.handle({ type: 'init', ...binding, protocolVersion: 5, mode: options.mode ?? 'MONITOR_ONLY', durableCursor: cursor0, lineTransport: 'CHROMEOS' });
     await worker.handle({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
       secrets: { token: 'tok', qrCert: null, e2eeStorage: snapshot() } });
     await worker.handle({ type: 'loginToken', ...binding, loginAttemptId: 'login-1' });

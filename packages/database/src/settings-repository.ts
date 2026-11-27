@@ -63,6 +63,9 @@ function validateConversationSettings(settings: ConversationSettings): void {
 /** Switch of the LEGY encrypted transport for the Agent (DESKTOPWIN) worker. Value: {"enabled": boolean}. A missing row means false (plain transport). */
 export const LINE_LEGY_ENCRYPTED_KEY = 'line_legy_encrypted';
 
+/** Switch of community (Square) message receive for the Agent (DESKTOPWIN) worker. Value: {"enabled": boolean}. A missing row means false. */
+export const LINE_SQUARE_RECEIVE_KEY = 'line_square_receive';
+
 export const OFFICIAL_LINE_BUILD_TRUST_KEY = 'official_line_build_trust';
 /** Toggle of the automatic download of new External Monitor attachments through the download bridge. Value: {"enabled": boolean}. */
 export const EXTERNAL_BRIDGE_AUTO_DOWNLOAD_KEY = 'external_bridge_auto_download';
@@ -131,6 +134,21 @@ export class SettingsRepository {
     await this.pool.query(
       'INSERT INTO app_settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
       [LINE_LEGY_ENCRYPTED_KEY, JSON.stringify({ enabled })],
+    );
+  }
+
+  /** A missing or malformed row means false. */
+  async getLineSquareReceive(): Promise<boolean> {
+    const result = await this.pool.query<{ value: unknown }>('SELECT value FROM app_settings WHERE key = $1', [LINE_SQUARE_RECEIVE_KEY]);
+    const value = result.rows[0]?.value;
+    return typeof value === 'object' && value !== null && (value as { enabled?: unknown }).enabled === true;
+  }
+
+  async setLineSquareReceive(enabled: boolean): Promise<void> {
+    if (typeof enabled !== 'boolean') throw new Error('Community message receive must be a boolean');
+    await this.pool.query(
+      'INSERT INTO app_settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
+      [LINE_SQUARE_RECEIVE_KEY, JSON.stringify({ enabled })],
     );
   }
 

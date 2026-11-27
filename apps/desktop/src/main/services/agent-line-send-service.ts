@@ -60,8 +60,8 @@ export interface AgentLineSendWorker {
 }
 
 export type AgentLineSendRepository = Pick<MessageRepository,
-  'findAgentSendAccount' | 'listSendTargets' | 'getSendTarget' | 'resolveSendSourceMessage' | 'getSendAttachment'
-  | 'recordLineSend' | 'countJobLineSends'>;
+  'findAgentSendAccount' | 'listSendTargets' | 'getSendTarget' | 'getAgentSendTarget' | 'ensureDirectConversation'
+  | 'resolveSendSourceMessage' | 'getSendAttachment' | 'recordLineSend' | 'countJobLineSends'>;
 
 export interface AgentLineSendOptions {
   messages: AgentLineSendRepository;
@@ -122,6 +122,8 @@ export interface SendPlan {
   chatId: string;
   workspacePath: string | null;
   items: PlannedItem[];
+  /** The direct chat has no conversation row yet; the first sent item creates it. */
+  createDirectConversation?: boolean;
   managedForward?: { attachmentId: string; source: { accountId: string; chatType: string; chatId: string; messageId: string } };
 }
 export type AuthorizeOutcome = { kind: 'rejected'; output: McpSendToTargetOutput } | { kind: 'plan'; plan: SendPlan };
@@ -247,7 +249,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     const accountId = await messages.findAgentSendAccount(client);
     if (input.accountScope !== undefined && input.accountScope !== null && (!accountId || !input.accountScope.includes(accountId))) return reject(0, 'send_line_unavailable');
     if (!accountId || !await this.options.canWriteLine(accountId)) return reject(0, 'send_line_unavailable');
-    const target = await messages.getSendTarget(accountId, chatType, chatId, client);
+    const target = await messages.getAgentSendTarget(accountId, chatType, chatId, client);
     if (!target) return reject(0, 'send_target_invalid');
     const sentSoFar = await messages.countJobLineSends(input.jobId, client);
     if (sentSoFar + this.pendingForJob(input.jobId) + items.length > SEND_ITEMS_PER_JOB_MAX) return reject(0, 'send_limit_exceeded');
@@ -268,7 +270,17 @@ export class AgentLineSendService implements AgentLineSendHandler {
       planned.push(outcome);
     }
     return { kind: 'plan', plan: { jobId: input.jobId, principalId: input.principalId, accountId, chatType: target.chatType,
-      chatId: target.chatId, workspacePath, items: planned } };
+      chatId: target.chatId, workspacePath, items: planned, ...(target.newDirect ? { createDirectConversation: true } : {}) } };
+  }
+
+  /** After a sent item of a direct chat without a row: creates the row (idempotent). A failure never changes the send result. */
+  private async ensureConversation(plan: SendPlan): Promise<void> {
+    if (!plan.createDirectConversation) return;
+    try { await this.options.messages.ensureDirectConversation(plan.accountId, plan.chatId); } catch {
+      // The send already happened, so the result stays "sent"; the failure goes to the operational audit.
+      recordSendFault(this.options.audit, { accountId: plan.accountId, jobId: plan.jobId, requestId: randomUUID(), operation: 'sendText' },
+        { source: 'local', outcome: 'failed', code: 'conversation_write_failed' });
+    }
   }
 
   private async planItem(client: Queryable, item: McpSendItem, index: number, workspacePath: string | null, accountScope?: readonly string[] | null):
@@ -550,6 +562,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
         sentParts += 1;
       }
       await record('sent', null);
+      await this.ensureConversation(plan);
       return { index, status: 'sent' };
     }
 
@@ -592,6 +605,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     } catch (error) { outcome = gatewayFault(error); }
     if (outcome !== 'sent') return outcomeResult(outcome, requestId);
     await record('sent', null);
+    await this.ensureConversation(plan);
     return { index, status: 'sent' };
   }
 

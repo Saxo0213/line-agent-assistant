@@ -154,7 +154,8 @@ export function attachmentBlockReasonKey(reason: AttachmentBlockReason): PlainCo
     : reason === 'BRIDGE_DOWNLOAD_DISABLED' ? 'attachmentBlockBridgeDownloadDisabled'
     : reason === 'BRIDGE_IDENTITY_PENDING' ? 'attachmentBlockBridgeIdentityPending'
     : reason === 'BRIDGE_VERIFICATION_PENDING' ? 'attachmentBlockBridgeVerificationPending'
-    : reason === 'BRIDGE_MESSAGE_MISMATCH' ? 'attachmentBlockBridgeMessageMismatch' : 'attachmentBlockWorkerNotReady';
+    : reason === 'BRIDGE_MESSAGE_MISMATCH' ? 'attachmentBlockBridgeMessageMismatch'
+    : reason === 'COMMUNITY_DOWNLOAD_UNSUPPORTED' ? 'attachmentBlockCommunityUnsupported' : 'attachmentBlockWorkerNotReady';
 }
 
 /** Call text shared by the chat timeline and the chat-list preview: same wording and duration format in every locale. */

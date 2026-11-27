@@ -239,7 +239,7 @@ database('AccountSupervisor with PostgreSQL', () => {
             writeGrantVersion: command.writeGrantVersion };
           if (this.acknowledgeInit) queueMicrotask(() => {
             this.message?.({ type: 'workerProtocolAck', ...this.owner, accountId: command.accountId,
-              workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch, protocolVersion: 4, manualSend: true });
+              workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch, protocolVersion: 5, manualSend: true });
             this.message?.({ type: 'modeAck', ...this.owner, accountId: command.accountId,
               workerInstanceId: command.workerInstanceId, controlEpoch: command.controlEpoch, mode: command.mode, drained: true });
           });

@@ -374,6 +374,18 @@ describe('inline account action status', () => {
     expect(notices.at(-1)).toBe(desktopTextFor('zh-TW', 'legyEncryptedTransportHint'));
   });
 
+  it('reads and writes the community receive setting for the Agent account', async () => {
+    const api = { getLineSquareReceive: vi.fn(async () => false), setLineSquareReceive: vi.fn(async (enabled: boolean) => enabled) } as unknown as DesktopApi;
+    const notices: string[] = [];
+    render(<LineLogin api={api} accounts={[buildAgent]} headingRef={React.createRef()} onNotice={(message) => notices.push(message)} />);
+    const checkbox = await screen.findByLabelText(/接收社群訊息/) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    fireEvent.click(checkbox);
+    await waitFor(() => expect(api.setLineSquareReceive).toHaveBeenCalledWith(true));
+    await waitFor(() => expect((screen.getByLabelText(/接收社群訊息/) as HTMLInputElement).checked).toBe(true));
+    expect(notices.at(-1)).toBe(desktopTextFor('zh-TW', 'squareReceiveHint'));
+  });
+
   it('disables automatic login while monitoring and leaves it enabled otherwise', () => {
     const { rerender } = render(<LineLogin api={{ lineSetAutoLogin: vi.fn() } as unknown as DesktopApi}
       accounts={[{ ...autoLoginAccount(), externalImportProgress: { stage: 'monitoring', copiedBytes: null, totalBytes: null,

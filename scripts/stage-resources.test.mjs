@@ -17,8 +17,8 @@ test('stages and verifies the complete packaged runtime resource contract', asyn
   const manifest = await stageResources({ repositoryRoot, outputRoot: temporaryRoot });
 
   assert.equal(manifest.lineJs.name, '@jsr/evex__linejs');
-  assert.equal(manifest.lineJs.version, '3.5.0');
-  assert.equal(manifest.lineJs.integrity, 'sha512-LdE2YYA48FAa0NBm8Tq0VyCre5xJ5gQ7+HmJy/VNAE0GozqiuNlB5Y7dKvM1QYe0oyOacYtHHdIknc0xVv8z4w==');
+  assert.equal(manifest.lineJs.version, '3.6.9');
+  assert.equal(manifest.lineJs.integrity, 'sha512-3P6+e5z9nG0yZ9V0D+3r4svmkmDqOE1cki1uyW65z6ZGSMShLQkt2SkXnvqSrJWVRCFcbGUfJwA9RxLinw5jOg==');
   const required = [
     'line-worker/process-entry.js',
     'line-worker/native/AttachmentBroker.exe',

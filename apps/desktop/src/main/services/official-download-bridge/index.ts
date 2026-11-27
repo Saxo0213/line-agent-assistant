@@ -51,10 +51,10 @@ export {
   BridgeDownloadError, OfficialDownloadBridgeDownloader,
   type BridgeDownloadCode, type BridgeDownloadRequest, type BridgeVerifyRequest, type BridgeDownloadStage, type BridgeDownloadedFile, type BridgeDownloaderOptions, type LiveBridge,
 } from './bridge-download.js';
-export { buildMessageFromNativeRow, nativeRowFromEnvelope, type BridgeMessage, type NativeRowInput } from './native-message.js';
+export { buildMessageFromNativeRow, nativeIdentityFromRow, nativeRowFromEnvelope, type BridgeMessage, type NativeRowInput } from './native-message.js';
 export type { BridgeAttempt, BridgeAttemptStage } from './bridge-download.js';
 export {
   BRIDGE_VERIFY_POLL_MS, BRIDGE_VERIFY_WAIT_MS, BRIDGE_GATE_IMAGE_MATCH_THRESHOLD, BRIDGE_GATE_FILE_MATCH_THRESHOLD, BRIDGE_VERIFY_RESULT_CODES,
-  bridgeGateThreshold, isBridgeGateOpen, isSupportedImageHead, classifyBridgeComparison,
-  type BridgeKind, type BridgeVerification, type BridgeVerifyResult,
+  bridgeGateThreshold, isBridgeGateOpen, isSupportedImageHead, classifyBridgeComparison, classifyBridgeIdentity,
+  type BridgeIdentity, type BridgeKind, type BridgeVerification, type BridgeVerifyResult,
 } from './bridge-verification.js';

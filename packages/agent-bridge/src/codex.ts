@@ -41,7 +41,9 @@ function codexImageArguments(request:AgentRunRequest):string[] {
 /**
  * Codex `exec --json` reader. Port of CliTalkAgent adapters.rs `parse_codex_jsonl_output`.
  * A line or a field of the wrong type is skipped. It never fails the job.
- * The reply is the trimmed text of every completed `agent_message` item, joined with a new line.
+ * The reply is the trimmed text of the completed `agent_message` items after the last tool item, joined with a new line.
+ * With no message after the last tool item, the reply is the last message before it. With no tool item, every message is used.
+ * Intended difference from CliTalkAgent `parse_codex_jsonl_output`: the commentary Codex writes before a tool call is not part of the reply.
  * An `error` event and a `turn.failed` event both fail the turn. The last message wins.
  * After the first terminal event, later events are ignored.
  */
@@ -49,6 +51,8 @@ export class CodexEvents {
   private terminal=false;
   private sessionSeen=false;
   private messages:string[]=[];
+  /** The number of messages received when the last tool item was seen. */
+  private toolBoundary=0;
   private lastError:string|undefined;
   private lastLabel:string|undefined;
   private toolCount=0;
@@ -64,6 +68,12 @@ export class CodexEvents {
   pendingFailure():AgentEvent|undefined {
     return this.terminal || !this.errorText()?undefined:classifyProviderFailure('Codex',this.errorText());
   }
+  /** The messages after the last tool item; else the last message before it; else an empty string. */
+  private finalReply():string {
+    const after=this.messages.slice(this.toolBoundary);
+    if(after.length) return after.join('\n').trim();
+    return (this.messages.at(-1) ?? '').trim();
+  }
   private errorText():string|undefined {
     return this.lastError!==undefined && this.lastError.trim()?this.lastError:undefined;
   }
@@ -72,7 +82,7 @@ export class CodexEvents {
     if(!data || this.terminal) return [];
     const events:AgentEvent[]=[];
     const item=asObject(data.item);
-    this.hadToolActivity||=codexLineHasToolActivity(data,item);
+    if(codexLineHasToolActivity(data,item)) {this.hadToolActivity=true;this.toolBoundary=this.messages.length;}
     this.hadEffectiveOutput||=codexLineHasEffectiveOutput(data,item);
     switch(data.type) {
       case 'thread.started': {
@@ -100,7 +110,7 @@ export class CodexEvents {
         this.terminal=true;
         const error=this.errorText();
         if(error!==undefined) {events.push(classifyProviderFailure('Codex',error));break;}
-        const finalText=this.messages.join('\n').trim();
+        const finalText=this.finalReply();
         if(!finalText) {
           events.push({type:'failed',code:'NO_ASSISTANT_TEXT',message:'Codex 沒有回傳任何回覆文字。',retryable:false,detail:'no_assistant_text'});
           break;

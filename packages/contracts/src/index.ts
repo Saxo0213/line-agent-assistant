@@ -2,6 +2,7 @@ export * from './account.js';
 export * from './autoresponder.js';
 export * from './agent.js';
 export * from './agent-permissions.js';
+export * from './project-folders.js';
 export * from './agent-extensions.js';
 export * from './agent-schedule.js';
 export * from './agent-execution-policy.js';

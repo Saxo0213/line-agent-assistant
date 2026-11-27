@@ -89,6 +89,17 @@ database('attachment block reasons', () => {
     expect((await repository.countBridgeVerification(accountId)).file).toMatchObject({ mismatch: 1, storeIncomplete: 1 });
   });
 
+  it('does not count an identity mismatch row as a mismatch', async () => {
+    const accountId = 'block-bridge-identity';
+    const target = await ingest(accountId);
+    await pool.query(
+      `INSERT INTO audit_logs(action, actor, details) VALUES ('bridge_message_verify', 'system', $1::jsonb)`,
+      [JSON.stringify({ account_id: accountId, request_id: target.attachmentId, correlation_id: randomUUID(), phase: 'observed',
+        result_code: 'BRIDGE_VERIFY_MISMATCH',
+        diagnostic: { operation: 'attachment', stage: 'read', category: 'invalid_response', recovery: 'none', detail: 'identity:false:chat:sender' } })]);
+    expect((await repository.countBridgeVerification(accountId)).file).toMatchObject({ match: 0, mismatch: 0, nativeIncomplete: 1, storeIncomplete: 0 });
+  });
+
   it('keeps a real error and writes nothing on a row that is not queued', async () => {
     const { attachmentId } = await ingest('block-real');
     await pool.query("UPDATE attachments SET error='LINE_NATIVE_DOWNLOAD_FAILED' WHERE attachment_id=$1", [attachmentId]);

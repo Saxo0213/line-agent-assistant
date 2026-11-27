@@ -4,6 +4,8 @@ import {
   AgentSchedulePreviewNewMessagesInputSchema,
   PendingAgentApprovalSchema,
   type DownloadBridgeIntervals,
+  type OutgoingMention,
+  type ContactLookupDto,
   type AgentApprovalDecision,
   type AgentExtensionTools,
   type AgentExtensionsState,
@@ -21,6 +23,9 @@ import {
   AgentPermissionDefaultsViewSchema,
   type AgentPermissionDefaultsView,
   type SetAgentFolderLinkInput,
+  type ProjectFolderBindInput,
+  type ProjectFolderChatInput,
+  type ProjectFolderUnbindInput,
   type SetAgentPermissionInput,
   type SetAgentPermissionDefaultInput,
   type AgentExecutionPolicy,
@@ -67,7 +72,7 @@ import {
   type ChatResourceAlbum,
   type ChatResourcePhoto,
 } from '@line-agent/contracts';
-import { FriendListSchema, MessageReadersSchema, AttachmentStateListSchema, ControlStateSchema, DesktopReadResultSchema, MessagePageSchema, SystemActivityResultSchema, SystemErrorsResultSchema, WorkRecordSchema } from '../desktop-protocol.js';
+import { ConversationMembersSchema, FriendListSchema, MessageReadersSchema, AttachmentStateListSchema, ControlStateSchema, DesktopReadResultSchema, MessagePageSchema, SystemActivityResultSchema, SystemErrorsResultSchema, WorkRecordSchema } from '../desktop-protocol.js';
 import { StoredAttachmentPageSchema } from '@line-agent/contracts';
 import { DatabaseSetupResultSchema, SETUP_PROGRESS_CHANNEL, SetupProgressEventSchema, type DatabaseConnectionInput, type DatabaseSetupStatus,
   type EmbeddedConnectionInfo, type SetupProgressEvent } from '../setup-protocol.js';
@@ -105,20 +110,28 @@ export type DesktopApi = {
   listWorkRecords(): Promise<WorkRecord[]>;
   listFriends(accountId: string): Promise<FriendRow[]>;
   listMessageReaders(key: ConversationKey, messageId: string): Promise<{ readers: MessageReader[] }>;
+  /** Members of a group or room with resolved names, for the @ mention list. Optional so that older test doubles stay valid. */
+  listConversationMembers?(key: ConversationKey): Promise<{ members: Array<{ mid: string; name: string }> }>;
   listSystemActivity(): Promise<ReturnType<typeof SystemActivityResultSchema.parse>>;
   listSystemErrors(): Promise<ReturnType<typeof SystemErrorsResultSchema.parse>>;
   getControlState(): Promise<{ activeAccountId: string | null; epoch: number; pendingOutbound: number }>;
   getJobEvents(key: WritableConversationKey, jobId: string): Promise<AgentEvent[]>;
   searchMessages(query: { key?: ConversationKey; accountId?: string; scope?: MessageSearchScope; senderId?: string; text?: string; limit: number }): Promise<MessageSearchResult[]>;
   searchAgentJobs(query: AgentJobSearchQuery): Promise<{ jobs: AgentJobSummary[]; nextCursor: NonNullable<AgentJobSearchQuery['cursor']> | null }>;
-  sendText(key: WritableConversationKey, text: string): Promise<IpcResult>;
-  replyText(key: WritableConversationKey, replyToMessageId: string, text: string): Promise<IpcResult>;
+  sendText(key: WritableConversationKey, text: string, mentions?: readonly OutgoingMention[]): Promise<IpcResult>;
+  replyText(key: WritableConversationKey, replyToMessageId: string, text: string, mentions?: readonly OutgoingMention[]): Promise<IpcResult>;
+  /** A manual reaction on one message. `UNDO` removes the own reaction. */
+  reactMessage?(key: WritableConversationKey, messageId: string, reaction: 'NICE' | 'AMAZING' | 'FUN' | 'LOVE' | 'SAD' | 'OMG' | 'UNDO'): Promise<IpcResult>;
   sendManualMedia?(key: WritableConversationKey, files: AgentAttachmentUpload[]): Promise<IpcResult>;
   unsendMessage(key: ConversationKey, messageId: string): Promise<IpcResult>;
   getManualUnsendWindow(): Promise<'1h' | '7d'>;
   setManualUnsendWindow(window: '1h' | '7d'): Promise<'1h' | '7d'>;
   getLineLegyEncrypted(): Promise<boolean>;
   setLineLegyEncrypted(enabled: boolean): Promise<boolean>;
+  /** User-started contact read from a pasted LINE profile link or MID. Only the settings button calls it. */
+  lineLookupContact(link: string): Promise<{ ok: true; contact: ContactLookupDto } | { ok: false; error: string }>;
+  getLineSquareReceive(): Promise<boolean>;
+  setLineSquareReceive(enabled: boolean): Promise<boolean>;
   /** The global Agent persona (Settings > Assistant). */
   getAgentPersona(): Promise<AgentPersona>;
   setAgentPersona(persona: AgentPersona): Promise<AgentPersona>;
@@ -140,6 +153,8 @@ export type DesktopApi = {
   openChromeExtensionStore(): Promise<IpcResult>;
   lineLogout(accountId: string): Promise<IpcResult>;
   refreshLineAvatar(accountId: string): Promise<IpcResult>;
+  /** Friends tab opened: asks Main for one catalog refresh from LINE. Main allows one for each account in 60 seconds. */
+  refreshLineCatalog?(accountId: string): Promise<IpcResult>;
   lineSetAutoLogin(accountId: string, enabled: boolean): Promise<IpcResult>;
   lineBeginAdminPairing(accountId: string): Promise<{ token: string; expiresAt: string }>;
   /** Starts the administrator change for the Agent account; resolves with code 1. Later stages arrive as `adminChangeProgress` events. */
@@ -209,6 +224,12 @@ export type DesktopApi = {
   setAgentFolderLink(input: SetAgentFolderLinkInput): Promise<IpcResult>;
   createChatFolder(input: { accountId: string; chatType: 'direct' | 'group' | 'room'; chatId: string }): Promise<IpcResult>;
   openChatFolder(folderId: string): Promise<IpcResult>;
+  /** Settings → 資料夾. Each resolves to its own result type or an error result with a PROJECT_FOLDER_* code. */
+  listProjectFolders(input: ProjectFolderChatInput): Promise<IpcResult>;
+  /** Opens the OS folder picker in Main; resolves to `{ type: 'chooseProjectFolder', path }` (path is null when cancelled). */
+  chooseProjectFolder(): Promise<IpcResult>;
+  bindProjectFolder(input: ProjectFolderBindInput): Promise<IpcResult>;
+  unbindProjectFolder(input: ProjectFolderUnbindInput): Promise<IpcResult>;
   /** Extra Agent tools (Settings → 助理). Secrets are masked on the way out and never come back. Mutations resolve to the result or an `AGENT_EXTENSION_*` error. */
   getAgentExtensions(): Promise<AgentExtensionsState>;
   saveAgentMcpServer(server: AgentMcpServerInput): Promise<IpcResult>;
@@ -271,7 +292,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     if (result.requestId !== requestId) throw new Error('IPC correlation mismatch');
     return result;
   };
-  const read = async <T extends 'listMessages' | 'listAttachmentStates' | 'listStoredAttachments' | 'listAgentStatuses' | 'listWorkRecords' | 'listFriends' | 'listMessageReaders' | 'listSystemActivity' | 'listSystemErrors' | 'getControlState'>(body: { type: T; [key: string]: unknown }): Promise<Extract<ReturnType<typeof DesktopReadResultSchema.parse>, { type: T }>> => {
+  const read = async <T extends 'listMessages' | 'listAttachmentStates' | 'listStoredAttachments' | 'listAgentStatuses' | 'listWorkRecords' | 'listFriends' | 'listMessageReaders' | 'listConversationMembers' | 'listSystemActivity' | 'listSystemErrors' | 'getControlState'>(body: { type: T; [key: string]: unknown }): Promise<Extract<ReturnType<typeof DesktopReadResultSchema.parse>, { type: T }>> => {
     const result = DesktopReadResultSchema.parse(await transport.invoke('line-agent:read', body));
     if (result.type !== body.type) throw new Error('IPC read response mismatch');
     return result as Extract<ReturnType<typeof DesktopReadResultSchema.parse>, { type: T }>;
@@ -317,6 +338,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async listAgentStatuses(key, messageIds) { if (messageIds.length > 225) throw new Error('Agent status lookup exceeds 225 IDs'); const result = await read({ type: 'listAgentStatuses', key, messageIds: [...new Set(messageIds)] }); return result.statuses; },
     async listWorkRecords() { const result = await read({ type: 'listWorkRecords' }); return WorkRecordSchema.array().parse(result.records); },
     async listFriends(accountId) { const result = await read({ type: 'listFriends', accountId }); return FriendListSchema.parse(result.friends); },
+    async listConversationMembers(key) { const result = await read({ type: 'listConversationMembers', key }); return ConversationMembersSchema.parse({ members: result.members }); },
     async listMessageReaders(key, messageId) { const result = await read({ type: 'listMessageReaders', key, messageId }); return MessageReadersSchema.parse({ readers: result.readers }); },
     async listSystemActivity() { const result = await read({ type: 'listSystemActivity' }); return SystemActivityResultSchema.parse({ activity: result.activity, partial: result.partial }); },
     async listSystemErrors() { const result = await read({ type: 'listSystemErrors' }); return SystemErrorsResultSchema.parse({ errors: result.errors, partial: result.partial }); },
@@ -324,13 +346,17 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async getJobEvents(key, jobId) { const result = await request({ type: 'getJobEvents', ...key, jobId }); if (result.type !== 'getJobEvents') throw new Error(result.type === 'error' ? result.message : 'Unexpected job events response'); return result.events; },
     async searchMessages(query) { const result = await request({ type: 'searchMessages', query }); if (result.type !== 'searchMessages') throw new Error(result.type === 'error' ? result.message : 'Unexpected search response'); return MessageSearchResultSchema.array().parse(result.messages); },
     async searchAgentJobs(query) { const result = await request({ type: 'searchAgentJobs', query }); if (result.type !== 'searchAgentJobs') throw new Error(result.type === 'error' ? result.message : 'Unexpected task search response'); return { jobs: result.jobs, nextCursor: result.nextCursor }; },
-    sendText: (key, text) => request({ type: 'sendText', ...key, text }),
-    replyText: (key, replyToMessageId, text) => request({ type: 'replyText', ...key, replyToMessageId, text }),
+    sendText: (key, text, mentions) => request({ type: 'sendText', ...key, text, ...(mentions?.length ? { mentions: [...mentions] } : {}) }),
+    replyText: (key, replyToMessageId, text, mentions) => request({ type: 'replyText', ...key, replyToMessageId, text, ...(mentions?.length ? { mentions: [...mentions] } : {}) }),
+    reactMessage: (key, messageId, reaction) => request({ type: 'reactMessage', ...key, messageId, reaction }),
     sendManualMedia: (key, files) => request({ type: 'sendManualMedia', ...key, files }),
     unsendMessage: (key, messageId) => request({ type: 'unsendMessage', ...key, messageId }),
     async getManualUnsendWindow() { const result = await request({ type: 'getManualUnsendWindow' }); if (result.type !== 'getManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },
     async getLineLegyEncrypted() { const result = await request({ type: 'getLineLegyEncrypted' }); if (result.type !== 'getLineLegyEncrypted') throwIpcErrorOrUnexpected(result, 'Unexpected transport setting response'); return result.enabled; },
     async setLineLegyEncrypted(enabled) { const result = await request({ type: 'setLineLegyEncrypted', enabled }); if (result.type !== 'setLineLegyEncrypted') throwIpcErrorOrUnexpected(result, 'Unexpected transport setting response'); return result.enabled; },
+    async lineLookupContact(link) { const result = await request({ type: 'lineLookupContact', link }); if (result.type !== 'lineLookupContact') throwIpcErrorOrUnexpected(result, 'Unexpected contact lookup response'); return result.lookup; },
+    async getLineSquareReceive() { const result = await request({ type: 'getLineSquareReceive' }); if (result.type !== 'getLineSquareReceive') throwIpcErrorOrUnexpected(result, 'Unexpected community receive setting response'); return result.enabled; },
+    async setLineSquareReceive(enabled) { const result = await request({ type: 'setLineSquareReceive', enabled }); if (result.type !== 'setLineSquareReceive') throwIpcErrorOrUnexpected(result, 'Unexpected community receive setting response'); return result.enabled; },
     async setManualUnsendWindow(window) { const result = await request({ type: 'setManualUnsendWindow', window }); if (result.type !== 'setManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },
     async getAgentPersona() { const result = await request({ type: 'getAgentPersona' }); if (result.type !== 'getAgentPersona') throwIpcErrorOrUnexpected(result, 'Unexpected persona response'); return result.persona; },
     async setAgentPersona(persona) { const result = await request({ type: 'setAgentPersona', persona }); if (result.type !== 'setAgentPersona') throwIpcErrorOrUnexpected(result, 'Unexpected persona response'); return result.persona; },
@@ -352,6 +378,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     openChromeExtensionStore: () => request({ type: 'openChromeExtensionStore' }),
     lineLogout: (accountId) => request({ type: 'lineLogout', accountId }),
     refreshLineAvatar: (accountId) => request({ type: 'refreshLineAvatar', accountId }),
+    refreshLineCatalog: (accountId) => request({ type: 'refreshLineCatalog', accountId }),
     lineSetAutoLogin: (accountId, enabled) => request({ type: 'lineSetAutoLogin', accountId, enabled }),
     async lineBeginAdminPairing(accountId) { const result = await request({ type: 'lineBeginAdminPairing', accountId }); if (result.type !== 'lineAdminPairing') throw new Error(result.type === 'error' ? result.message : 'Unexpected pairing response'); return { token: result.token, expiresAt: result.expiresAt }; },
     async lineBeginAdminChange(accountId) { const result = await request({ type: 'lineBeginAdminChange', accountId }); if (result.type !== 'lineBeginAdminChange') throw new Error(result.type === 'error' ? result.message : 'Unexpected administrator change response'); return { token: result.token, expiresAt: result.expiresAt, stage: result.stage }; },
@@ -458,6 +485,10 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     setAgentFolderLink: (input) => request({ type: 'setAgentFolderLink', ...input }),
     createChatFolder: (input) => request({ type: 'createChatFolder', ...input }),
     openChatFolder: (folderId) => request({ type: 'openChatFolder', folderId }),
+    listProjectFolders: (input) => request({ type: 'listProjectFolders', ...input }),
+    chooseProjectFolder: () => request({ type: 'chooseProjectFolder' }),
+    bindProjectFolder: (input) => request({ type: 'bindProjectFolder', ...input }),
+    unbindProjectFolder: (input) => request({ type: 'unbindProjectFolder', ...input }),
     async getAgentExtensions() {
       const result = await request({ type: 'getAgentExtensions' });
       if (result.type !== 'getAgentExtensions') throw new Error(result.type === 'error' ? result.message : 'Unexpected extensions response');

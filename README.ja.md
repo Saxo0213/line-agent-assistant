@@ -4,6 +4,8 @@
 
 [![Latest release](https://img.shields.io/github/v/release/Saxo0213/line-agent-assistant)](https://github.com/Saxo0213/line-agent-assistant/releases/latest) [![Downloads](https://img.shields.io/github/downloads/Saxo0213/line-agent-assistant/total)](https://github.com/Saxo0213/line-agent-assistant/releases) ![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6) [![License: MIT](https://img.shields.io/github/license/Saxo0213/line-agent-assistant)](LICENSE)
 
+### [⬇️ 最新版をダウンロード（Windows インストーラー）](https://github.com/Saxo0213/line-agent-assistant/releases/latest)
+
 **Claude や Codex に LINE のトークを任せましょう。** AI エージェントが LINE で指示を受け取り、トーク履歴を検索・要約し、ローカルの MCP bridge を通じて Claude Desktop や Codex から LINE を使えるようにする Windows デスクトップアプリです。
 
 ## 機能
@@ -24,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.359 では、Claude を常駐プロセスで実行し、Claude と Codex にそれぞれ複数の CLI アカウントと自動切り替え、チャットごとの `/model` コマンド、Agent による添付ファイルの読み取り、ダウンロード間隔の設定、外部監視の自動再試行を追加しました。アプリの「更新を確認」からインストールできます。詳細は [v1.0.342 → v1.0.359 リリースノート](docs/releases/v1.0.359.md)をご覧ください。
+v1.0.385 では、linejs 3.6.9 の新しい LINE エンジンに移行し、オープンチャットのメッセージ保存、リアクションと @ メンション、1 対 1 のノートとアルバム、添付ファイルの自動修復、「設定 → フォルダー」でのプロジェクトフォルダー管理、写真の文字によるスケジュールルールを追加しました。アプリの「更新を確認」からインストールできます。詳細は [v1.0.359 → v1.0.385 リリースノート](docs/releases/v1.0.385.md)をご覧ください。
 
 ## インストール
 

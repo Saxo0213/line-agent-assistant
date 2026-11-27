@@ -1,13 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
 import { createTestDatabase } from './test-database.js';
-import { PROJECT_FOLDERS_PER_CHAT_MAX, ProjectFolderRepository, type ProjectFolderKey } from './project-folder-repository.js';
+import { ProjectFolderRepository, type ProjectFolderKey } from './project-folder-repository.js';
 import { AGENT_PERMISSION_IDS } from '@line-agent/contracts';
 import { allPermissions, deriveToolPolicy } from './agent-permissions.js';
 
 const database = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 const KEY: ProjectFolderKey = { accountId: 'acc', chatType: 'group', chatId: 'g1' };
 const OTHER: ProjectFolderKey = { accountId: 'acc', chatType: 'direct', chatId: 'admin' };
+const FOLDER_COUNT = 8;
 
 database('Project folder repository (real database)', () => {
   let pool: Pool;
@@ -31,22 +32,20 @@ database('Project folder repository (real database)', () => {
     expect(await repo.list(OTHER)).toEqual([]);
   });
 
-  it('keeps chats separate and refuses a ninth folder', async () => {
-    for (let index = 2; index <= PROJECT_FOLDERS_PER_CHAT_MAX; index += 1) {
+  it('keeps chats separate', async () => {
+    for (let index = 2; index <= FOLDER_COUNT; index += 1) {
       expect((await repo.bind(KEY, `D:\\Company\\P${index}`, 'READ', 'mid-admin')).status).toBe('created');
     }
-    expect(await repo.bind(KEY, 'D:\\Company\\Extra', 'READ', 'mid-admin')).toEqual({ status: 'limit' });
-    // An existing path can still change mode when the chat is full; another chat has its own count.
     expect(await repo.bind(KEY, 'D:\\Company\\P2', 'READ_WRITE', 'mid-admin')).toMatchObject({ status: 'updated' });
     expect((await repo.bind(OTHER, 'D:\\Company\\Extra', 'READ', 'mid-admin')).status).toBe('created');
-    expect(await repo.list(KEY)).toHaveLength(PROJECT_FOLDERS_PER_CHAT_MAX);
+    expect(await repo.list(KEY)).toHaveLength(FOLDER_COUNT);
   });
 
   it('unbinds one path, then every path of the chat', async () => {
     expect(await repo.unbind(KEY, 'D:\\Company\\P2', 'mid-admin')).toBe(true);
     expect(await repo.unbind(KEY, 'D:\\Company\\P2', 'mid-admin')).toBe(false);
     const removed = await repo.unbindAll(KEY, 'mid-admin');
-    expect(removed).toHaveLength(PROJECT_FOLDERS_PER_CHAT_MAX - 1);
+    expect(removed).toHaveLength(FOLDER_COUNT - 1);
     expect(await repo.list(KEY)).toEqual([]);
     expect(await repo.unbindAll(KEY, 'mid-admin')).toEqual([]);
     expect((await repo.list(OTHER)).map((row) => row.path)).toEqual(['D:\\Company\\Extra']);
@@ -56,10 +55,10 @@ database('Project folder repository (real database)', () => {
     await repo.recordSkipped(OTHER, 'D:\\Company\\Extra', 'missing');
     const rows = await audits();
     const actions = rows.map((row) => row.detail.action);
-    expect(actions.filter((action) => action === 'bind')).toHaveLength(PROJECT_FOLDERS_PER_CHAT_MAX + 1);
+    expect(actions.filter((action) => action === 'bind')).toHaveLength(FOLDER_COUNT + 1);
     expect(actions).toEqual(expect.arrayContaining(['update', 'unbind', 'unbind_all', 'skipped']));
     expect(rows.find((row) => row.detail.action === 'skipped')).toMatchObject({ actor: 'system:agent-job', detail: { path: 'D:\\Company\\Extra' } });
-    expect(rows.find((row) => row.detail.action === 'unbind_all')?.detail.paths).toHaveLength(PROJECT_FOLDERS_PER_CHAT_MAX - 1);
+    expect(rows.find((row) => row.detail.action === 'unbind_all')?.detail.paths).toHaveLength(FOLDER_COUNT - 1);
     expect(rows.find((row) => row.detail.action === 'bind')?.actor).toBe('mid-admin');
   });
 

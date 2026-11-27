@@ -29,12 +29,22 @@ function defineOnce(error: object, key: string, value: unknown): void {
   } catch { /* A frozen error keeps no tag. */ }
 }
 
+/** The HTTP status number of a linejs `Request internal failed: status=<n>` error. Only the three digits are read; the rest of the text is not copied. */
+function httpStatusFromMessage(error: object): number | undefined {
+  try {
+    const message = (error as { message?: unknown }).message;
+    const match = typeof message === 'string' ? /^Request internal failed: status=(\d{3})(?!\d)/.exec(message) : null;
+    return match ? Number(match[1]) : undefined;
+  } catch { return undefined; }
+}
+
 /** Record the LINEJS method, the HTTP status and a fixed failure kind on a thrown error. The first tag of each field stays. */
 export function tagLinejsFailure(error: unknown, info: { method?: string; httpStatus?: number; kind?: string }): void {
   if (typeof error !== 'object' || error === null) return;
   if (info.method !== undefined && METHOD_PATTERN.test(info.method)) defineOnce(error, METHOD_KEY, info.method);
-  if (info.httpStatus !== undefined && Number.isInteger(info.httpStatus) && info.httpStatus >= 100 && info.httpStatus <= 599) {
-    defineOnce(error, STATUS_KEY, info.httpStatus);
+  const status = info.httpStatus ?? httpStatusFromMessage(error);
+  if (status !== undefined && Number.isInteger(status) && status >= 100 && status <= 599) {
+    defineOnce(error, STATUS_KEY, status);
   }
   if (info.kind !== undefined && KIND_PATTERN.test(info.kind)) defineOnce(error, KIND_KEY, info.kind);
 }

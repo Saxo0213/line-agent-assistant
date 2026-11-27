@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { win32 } from 'node:path';
-import type { WritableConversationKey } from '@line-agent/contracts';
-import { PROJECT_FOLDERS_PER_CHAT_MAX, type ProjectFolderMode, type ProjectFolderRepository } from '@line-agent/database';
+import type { ProjectFolderEntry, ProjectFolderErrorCode, WritableConversationKey } from '@line-agent/contracts';
+import { type ProjectFolderMode, type ProjectFolderRepository } from '@line-agent/database';
 import type { SystemTextInput, SystemTextResult } from './agent-line-send-service.js';
 import { validateProjectFolderPath, type ProjectPathPolicy, type ProjectPathReason } from './project-folder-path.js';
 import type { FolderCommand } from './trigger-router.js';
@@ -25,7 +25,6 @@ export const PROJECT_FOLDER_TEXT = {
   notAbsolute: '請提供完整的絕對路徑，例如 D:\\公司\\專案',
   forbidden: '此路徑不允許綁定',
   unsupportedChars: '路徑含有不支援的字元：( ) [ ] { } * ? ! ^ # " ` < > |',
-  limit: `每個聊天室最多綁定 ${PROJECT_FOLDERS_PER_CHAT_MAX} 個專案資料夾`,
   usage: '用法：/folder <絕對路徑>（唯讀）、/folder rw <絕對路徑>（讀寫）、/folder（列出）、/folder off [絕對路徑]（解除）',
   failed: '專案資料夾設定失敗，請稍後再試',
 } as const;
@@ -37,7 +36,22 @@ const REASON_TEXT: Record<ProjectPathReason, string> = {
   forbidden: PROJECT_FOLDER_TEXT.forbidden,
 };
 
-export type ProjectFolderStore = Pick<ProjectFolderRepository, 'list' | 'bind' | 'unbind' | 'unbindAll' | 'recordSkipped'>;
+/** Audit actor of a change made in Settings → 資料夾. A `system:` actor is stored without a user MID. */
+export const PROJECT_FOLDER_UI_ACTOR = 'system:desktop_settings' as const;
+
+const REASON_CODE: Record<ProjectPathReason, ProjectFolderErrorCode> = {
+  not_absolute: 'PROJECT_FOLDER_NOT_ABSOLUTE',
+  unsupported_chars: 'PROJECT_FOLDER_UNSUPPORTED_CHARS',
+  not_found: 'PROJECT_FOLDER_NOT_FOUND',
+  forbidden: 'PROJECT_FOLDER_FORBIDDEN',
+};
+
+/** A path that the Settings page cannot bind; `code` names the reason (same reasons as `REASON_TEXT`). */
+export class ProjectFolderUiError extends Error {
+  constructor(readonly code: ProjectFolderErrorCode, message: string) { super(message); this.name = 'ProjectFolderUiError'; }
+}
+
+export type ProjectFolderStore =Pick<ProjectFolderRepository, 'list' | 'bind' | 'unbind' | 'unbindAll' | 'recordSkipped'>;
 
 export interface ProjectFolderServiceOptions {
   store: ProjectFolderStore;
@@ -94,6 +108,27 @@ export class ProjectFolderService {
     return mounts;
   }
 
+  /** Settings → 資料夾: the folders of one chat. */
+  async listFolders(key: WritableConversationKey): Promise<ProjectFolderEntry[]> {
+    return (await this.options.store.list(key)).map((row) => ({ path: row.path, mode: row.mode }));
+  }
+
+  /**
+   * Settings → 資料夾: binds a folder, or changes the mode of a bound one. Same path check as `/folder`.
+   * It writes the row and the audit row only; it never sends a LINE message.
+   */
+  async bindFromSettings(key: WritableConversationKey, path: string, mode: ProjectFolderMode): Promise<{ status: 'created' | 'updated' | 'unchanged'; folder: ProjectFolderEntry }> {
+    const check = await validateProjectFolderPath(path, this.options.policy);
+    if (!check.ok) throw new ProjectFolderUiError(REASON_CODE[check.reason], REASON_TEXT[check.reason]);
+    const result = await this.options.store.bind(key, check.path, mode, PROJECT_FOLDER_UI_ACTOR);
+    return { status: result.status, folder: { path: result.row.path, mode: result.row.mode } };
+  }
+
+  /** Settings → 資料夾: removes the binding only. The folder on disk is not touched. Resolves to false when the path was not bound. */
+  async unbindFromSettings(key: WritableConversationKey, path: string): Promise<boolean> {
+    return this.options.store.unbind(key, path, PROJECT_FOLDER_UI_ACTOR);
+  }
+
   private async execute(key: WritableConversationKey, actor: string, command: FolderCommand): Promise<string> {
     const store = this.options.store;
     switch (command.action) {
@@ -106,7 +141,6 @@ export class ProjectFolderService {
         const check = await validateProjectFolderPath(command.path, this.options.policy);
         if (!check.ok) return REASON_TEXT[check.reason];
         const result = await store.bind(key, check.path, command.mode, actor);
-        if (result.status === 'limit') return PROJECT_FOLDER_TEXT.limit;
         return PROJECT_FOLDER_TEXT[result.status === 'created' ? 'bound' : result.status](result.row.path, result.row.mode);
       }
       case 'off': {

@@ -677,6 +677,16 @@ database('MessageRepository with PostgreSQL (set TEST_DATABASE_URL to run)', () 
     expect(results[0]).toMatchObject({ senderName: '王小明', conversationTitle: '工程群組' });
   });
 
+  it('writes native_status 1 for a friend member, 2 for a blocked one and nothing when friend is absent', async () => {
+    await repository.upsertConversationCatalog('account-A', [{ chatType: 'direct', chatId: 'u-friend', title: 'F',
+      members: [{ memberId: 'u-friend', displayName: 'F', picturePath: '/p/f', friend: true },
+        { memberId: 'u-blocked', displayName: 'B', friend: false }, { memberId: 'u-other', displayName: 'O' }] }]);
+    const rows = await pool.query('SELECT mid,native_status,picture_path FROM line_contacts WHERE account_id=$1 AND mid LIKE $2 ORDER BY mid',
+      ['account-A', 'u-%']);
+    expect(rows.rows.map((row) => [row.mid, row.native_status])).toEqual([['u-blocked', 2], ['u-friend', 1], ['u-other', null]]);
+    expect(rows.rows.find((row) => row.mid === 'u-friend')?.picture_path).toBeTruthy();
+  });
+
   it('fills a missing MIME type when an attachment becomes ready and keeps a known one', async () => {
     const input = envelope({ attachments: [
       { id: 'mime-unknown', kind: 'image', name: null, mimeType: null, sizeBytes: null },

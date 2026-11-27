@@ -485,3 +485,14 @@ span.avatar-placeholder{background:#e6ecea;color:#6c817d}
 .account-source-add input{flex:1 1 140px;min-width:0}
 .account-source-actions{display:flex;flex-wrap:wrap;gap:6px}
 .account-source-usage{margin:0;padding-left:18px;font-size:12px}
+.project-folders-chat,.project-folders-pending{display:flex;align-items:center;gap:12px;min-width:0}
+.project-folders-chat label,.project-folders-pending>span:first-child{flex:none;white-space:nowrap}
+.project-folders-chat select{flex:1 1 auto;min-width:0}
+.project-folders-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px}
+.project-folders-count{margin:0}
+.project-folders-pending{margin-top:12px}
+.project-folders-path{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.project-folders-pending-actions{flex:none;display:flex;gap:8px}
+.project-folders-note{margin:12px 0 0}
+.project-folders-table{margin-top:12px}
+.project-folders .perm-message-slot{margin:12px 0 0}

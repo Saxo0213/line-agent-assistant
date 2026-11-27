@@ -12,7 +12,8 @@ import { DownloadBridgeIntervalsSchema } from './download-bridge-intervals.js';
 import { AutoResponderRuleSchema, AutoResponderSettingsSchema, validateAutoresponderConfig } from './autoresponder.js';
 import { AccountModeSchema, ChatTypeSchema, ConversationKeySchema, LineTransportKindSchema, WritableConversationKeySchema } from './account.js';
 import { ChromeLtsmInstallResultSchema, ChromeLtsmStatusSchema, ChromeLtsmUnavailableStatusSchema } from './chrome-login.js';
-import { MentionRangeSchema, MessageContentSchema, MessageKindSchema, SticonRangeSchema } from './line.js';
+import { ContactLookupSchema } from './worker-v2.js';
+import { MentionRangeSchema, MessageContentSchema, MessageKindSchema, OutgoingMentionSchema, OUTGOING_MENTIONS_MAX, outgoingMentionsIssue, SticonRangeSchema } from './line.js';
 import {
   AgentPermissionsViewSchema,
   ChatFolderChatTypeSchema,
@@ -25,6 +26,7 @@ import {
   AgentExecutionPolicySchema,
   AgentToolAllowlistEntrySchema,
 } from './agent-permissions.js';
+import { ProjectFolderBindInputSchema, ProjectFolderBindStatusSchema, ProjectFolderChatInputSchema, ProjectFolderEntrySchema, ProjectFolderUnbindInputSchema } from './project-folders.js';
 import {
   McpServerStatusSchema,
   McpToolInputUnionSchema,
@@ -50,7 +52,7 @@ export const ChatResourceNoteSchema = z.strictObject({ postId: IdSchema.max(256)
   content: z.record(z.string(), z.unknown()).optional() });
 export const ChatResourceAlbumSchema = z.strictObject({ albumId: IdSchema.max(256), chatId: IdSchema.max(256), title: z.string().max(20000).nullable(),
   photoCount: z.number().int().min(0).max(100000).nullable(), createTime: z.number().nullable(), updateTime: z.number().nullable(),
-  coverPhotoIds: z.array(IdSchema.max(256)).max(2).optional() });
+  coverPhotoIds: z.array(IdSchema.max(256)).max(3).optional() });
 export const ChatResourcePhotoSchema = z.strictObject({ photoId: IdSchema.max(256), oid: IdSchema.max(256), prefix: z.string().max(512),
   shotTime: z.number().nullable(), width: z.number().int().min(0).nullable(), height: z.number().int().min(0).nullable() });
 export const AlbumFailureContextSchema = z.strictObject({
@@ -80,6 +82,8 @@ export type AgentJobSearchQuery = z.infer<typeof AgentJobSearchQuerySchema>;
 
 export const LineMediaTargetSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('account'), accountId: IdSchema }),
+  /** A LINE profile picture by its path (contact lookup). Main serves it only from a LINE picture origin, through the avatar disk cache. */
+  z.strictObject({ type: z.literal('profilePicture'), picturePath: z.string().min(1).max(2048) }),
   z.strictObject({ type: z.literal('conversation') }).merge(ConversationKeySchema),
   z.strictObject({ type: z.literal('member'), memberId: IdSchema }).merge(ConversationKeySchema),
   z.strictObject({ type: z.literal('sticker'), accountId: IdSchema, chatType: ChatTypeSchema, chatId: IdSchema, messageId: IdSchema }),
@@ -174,15 +178,26 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('openChatAlbum'), albumId: IdSchema.max(256) }),
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('openReadableChatAlbumFolder'), albumId: IdSchema.max(256) }),
   RequestIdSchema.extend({ type: z.literal('cancelChatResourceRequest'), targetRequestId: IdSchema }),
-  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('sendText'), text: z.string().min(1) }),
-  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('replyText'), replyToMessageId: IdSchema, text: z.string().min(1) }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('sendText'), text: z.string().min(1),
+    mentions: z.array(OutgoingMentionSchema).max(OUTGOING_MENTIONS_MAX).optional() }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('replyText'), replyToMessageId: IdSchema, text: z.string().min(1),
+    mentions: z.array(OutgoingMentionSchema).max(OUTGOING_MENTIONS_MAX).optional() }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('sendManualMedia'),
     files: AgentAttachmentUploadsSchema.min(1) }),
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('unsendMessage'), messageId: z.string().regex(/^(?:0|[1-9][0-9]*)$/) }),
+  /** A manual reaction on one message. UNDO removes the own reaction. Main applies the same checks as a manual send. */
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('reactMessage'), messageId: z.string().regex(/^(?:0|[1-9][0-9]*)$/),
+    reaction: z.enum(['NICE', 'AMAZING', 'FUN', 'LOVE', 'SAD', 'OMG', 'UNDO']) }),
   RequestIdSchema.extend({ type: z.literal('getManualUnsendWindow') }),
   RequestIdSchema.extend({ type: z.literal('setManualUnsendWindow'), window: z.enum(['1h', '7d']) }),
   RequestIdSchema.extend({ type: z.literal('getLineLegyEncrypted') }),
   RequestIdSchema.extend({ type: z.literal('setLineLegyEncrypted'), enabled: z.boolean() }),
+  RequestIdSchema.extend({ type: z.literal('getLineSquareReceive') }),
+  RequestIdSchema.extend({ type: z.literal('setLineSquareReceive'), enabled: z.boolean() }),
+  /** A user-started contact read from a pasted LINE profile link or MID. The renderer button is the only caller. */
+  RequestIdSchema.extend({ type: z.literal('lineLookupContact'), link: z.string().min(1).max(512) }),
+  /** Friends tab opened: one conversation catalog refresh from LINE. Main allows one for each account in 60 seconds. */
+  RequestIdSchema.extend({ type: z.literal('refreshLineCatalog'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('getAgentPersona') }),
   RequestIdSchema.extend({ type: z.literal('setAgentPersona'), persona: AgentPersonaSchema }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('stopJob'), jobId: IdSchema }),
@@ -246,6 +261,10 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.merge(SetAgentFolderLinkInputSchema).extend({ type: z.literal('setAgentFolderLink') }),
   RequestIdSchema.extend({ type: z.literal('createChatFolder'), accountId: IdSchema, chatType: ChatFolderChatTypeSchema, chatId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('openChatFolder'), folderId: z.uuid() }),
+  RequestIdSchema.merge(ProjectFolderChatInputSchema).extend({ type: z.literal('listProjectFolders') }),
+  RequestIdSchema.extend({ type: z.literal('chooseProjectFolder') }),
+  RequestIdSchema.merge(ProjectFolderBindInputSchema).extend({ type: z.literal('bindProjectFolder') }),
+  RequestIdSchema.merge(ProjectFolderUnbindInputSchema).extend({ type: z.literal('unbindProjectFolder') }),
   RequestIdSchema.extend({ type: z.literal('listAgentSchedules') }),
   RequestIdSchema.extend({ type: z.literal('createAgentSchedule'), schedule: AgentScheduleCreateInputSchema }),
   RequestIdSchema.extend({ type: z.literal('updateAgentSchedule'), scheduleId: z.uuid(), patch: AgentScheduleUpdatePatchSchema }),
@@ -262,6 +281,10 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('importAgentMcpServers'), items: z.array(AgentMcpImportSelectionSchema).min(1).max(64) }),
 ]).superRefine((request, context) => {
   if (request.type === 'switchControl') context.addIssue({ code: 'custom', message: 'Account control is managed internally.' });
+  if ((request.type === 'sendText' || request.type === 'replyText') && request.mentions && request.mentions.length > 0) {
+    const issue = outgoingMentionsIssue(request.text, request.mentions);
+    if (issue) context.addIssue({ code: 'custom', path: ['mentions'], message: issue });
+  }
 });
 export type IpcRequest = z.infer<typeof IpcRequestSchema>;
 
@@ -516,6 +539,12 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('setManualUnsendWindow'), requestId: IdSchema, ok: z.literal(true), window: z.enum(['1h', '7d']) }),
     z.strictObject({ type: z.literal('getLineLegyEncrypted'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
     z.strictObject({ type: z.literal('setLineLegyEncrypted'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
+    z.strictObject({ type: z.literal('getLineSquareReceive'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
+    z.strictObject({ type: z.literal('setLineSquareReceive'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
+    z.strictObject({ type: z.literal('lineLookupContact'), requestId: IdSchema, ok: z.literal(true), lookup: z.union([
+      z.strictObject({ ok: z.literal(true), contact: ContactLookupSchema }),
+      z.strictObject({ ok: z.literal(false), error: z.string().min(1).max(80) }),
+    ]) }),
     z.strictObject({ type: z.literal('getAgentPersona'), requestId: IdSchema, ok: z.literal(true), persona: AgentPersonaSchema }),
     z.strictObject({ type: z.literal('setAgentPersona'), requestId: IdSchema, ok: z.literal(true), persona: AgentPersonaSchema }),
     z.strictObject({ type: z.literal('setAutoResponderSettings'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().positive() }),
@@ -582,6 +611,10 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('setAgentFolderLink'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().nonnegative() }),
     z.strictObject({ type: z.literal('createChatFolder'), requestId: IdSchema, ok: z.literal(true), folder: ChatFolderSummarySchema }),
     z.strictObject({ type: z.literal('openChatFolder'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
+    z.strictObject({ type: z.literal('listProjectFolders'), requestId: IdSchema, ok: z.literal(true), folders: z.array(ProjectFolderEntrySchema) }),
+    z.strictObject({ type: z.literal('chooseProjectFolder'), requestId: IdSchema, ok: z.literal(true), path: z.string().min(1).max(1024).nullable() }),
+    z.strictObject({ type: z.literal('bindProjectFolder'), requestId: IdSchema, ok: z.literal(true), status: ProjectFolderBindStatusSchema, folder: ProjectFolderEntrySchema }),
+    z.strictObject({ type: z.literal('unbindProjectFolder'), requestId: IdSchema, ok: z.literal(true), removed: z.boolean() }),
     z.strictObject({ type: z.literal('listAgentSchedules'), requestId: IdSchema, ok: z.literal(true), schedules: z.array(AgentScheduleSchema).max(200) }),
     z.strictObject({ type: z.literal('createAgentSchedule'), requestId: IdSchema, ok: z.literal(true), schedule: AgentScheduleSchema }),
     z.strictObject({ type: z.literal('updateAgentSchedule'), requestId: IdSchema, ok: z.literal(true), schedule: AgentScheduleSchema }),

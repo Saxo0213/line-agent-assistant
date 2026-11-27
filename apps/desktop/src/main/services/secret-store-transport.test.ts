@@ -43,6 +43,21 @@ describe('SecretStore per-transport secrets', () => {
     expect((await readdir(join(folder, 'secrets'))).sort()).toEqual(['a.bin', 'b.chromeos.bin']);
   });
 
+  it('keeps one secret file per device and never loads the secrets of another device', async () => {
+    const { folder, store } = await makeStore();
+    const devices = ['DESKTOPWIN', 'DESKTOPMAC', 'ANDROIDSECONDARY', 'IOSIPAD'] as const;
+    for (const device of devices) {
+      store.beginLogin('a', `w-${device}`, `l-${device}`, device);
+      await store.saveRotation('a', `w-${device}`, `l-${device}`, { ...desktop, token: `token-${device}` });
+    }
+    expect((await readdir(join(folder, 'secrets'))).sort()).toEqual(
+      ['a.bin', 'a.desktopmac.bin', 'a.androidsecondary.bin', 'a.iosipad.bin', 'a.transport'].sort());
+    for (const device of devices) expect((await store.load('a', device))?.token).toBe(`token-${device}`);
+    expect(await store.getTransport('a')).toBe('IOSIPAD');
+    await store.clear('a');
+    expect(await readdir(join(folder, 'secrets'))).toEqual(['a.transport']);
+  });
+
   it('a CHROMEOS session without e2ee state yet is still loadable', async () => {
     const { store } = await makeStore();
     store.beginLogin('a', 'w1', 'l1', 'CHROMEOS');

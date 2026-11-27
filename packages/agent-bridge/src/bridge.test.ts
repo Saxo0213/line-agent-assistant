@@ -523,6 +523,12 @@ describe('output protocol (same as CliTalkAgent)',()=>{
     expect(events.filter(event=>event.type==='text_delta').map(event=>event.text).join('')).toBe('one\ntwo');
     expect(feed(new CodexEvents(),[{type:'turn.completed'}])).toMatchObject([{type:'failed',code:'NO_ASSISTANT_TEXT'}]);
   });
+  it('replies with the messages after the last tool item, or the last earlier message',()=>{
+    const message=(text:string)=>({type:'item.completed',item:{type:'agent_message',text}});
+    const tool={type:'item.completed',item:{id:'t',type:'command_execution'}};
+    expect(feed(new CodexEvents(),[message('before'),tool,message('answer'),{type:'turn.completed'}]).at(-1)).toEqual({type:'completed',finalText:'answer'});
+    expect(feed(new CodexEvents(),[message('before'),tool,{type:'turn.completed'}]).at(-1)).toEqual({type:'completed',finalText:'before'});
+  });
   // 1.8
   it('ignores usage that is not valid',()=>{
     expect(feed(new CodexEvents(),[{type:'item.completed',item:{type:'agent_message',text:'a'}},{type:'turn.completed',usage:{input_tokens:-1,output_tokens:'x'}}]).at(-1)).toEqual({type:'completed',finalText:'a'});

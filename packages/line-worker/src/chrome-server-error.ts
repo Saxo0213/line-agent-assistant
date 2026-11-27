@@ -1,7 +1,7 @@
 import { ChromeApiError, ChromeTransportError, thriftPath, type ThriftEndpointKey } from '@line-agent/line-chrome';
 import { TALK_SERVER_ERRORS, talkServerError, type RelationAddServerErrorCode } from '@line-agent/contracts';
 import { LineServerRejection } from './line-server-error.js';
-import { friendAddResultCode, friendAddRejectionReason } from './linejs-adapter.js';
+import { friendAddResultCode, friendAddRejectionReason } from './friend-add-error.js';
 
 /** Talk endpoints whose TalkException is projected into a stable `LINE_TALK_*` code (same set the DESKTOPWIN decoder trusts). */
 const TRUSTED_TALK_KEYS: ReadonlySet<ThriftEndpointKey> = new Set<ThriftEndpointKey>([

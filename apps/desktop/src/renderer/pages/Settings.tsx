@@ -7,6 +7,7 @@ import { storeSettingsTab, type SettingsTabId } from '../settings-tab-storage.js
 import {AgentProviderAuthControl} from './AgentProviderAuthControl.js';
 import { AgentAccountSources, AgentAutoFailoverSwitch } from './AgentAccountSources.js';
 import { AgentPermissions } from './AgentPermissions.js';
+import { ProjectFolders, type ProjectFolderChat } from './ProjectFolders.js';
 import { LineLogin, type LineLoginView } from './LineLogin.js';
 import { WorkRecords } from './WorkRecords.js';
 import { AGENT_STATUS_MARKERS, AgentStatusMarker } from '../AgentStatusMarker.js';
@@ -18,6 +19,7 @@ import { AgentPersonaSettings } from './AgentPersonaSettings.js';
 
 const EMPTY_PROVIDERS: ProviderStatus[] = [];
 const EMPTY_ACCOUNTS: LineAccountSummary[] = [];
+const EMPTY_CONVERSATIONS: readonly ProjectFolderChat[] = [];
 
 function splitDisplayPath(path: string): { start: string; middle: string; tail: string } {
   const separator = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'));
@@ -39,7 +41,7 @@ function splitDisplayPath(path: string): { start: string; middle: string; tail: 
   };
 }
 
-export function Settings({ api, headingRef, defaultProvider = 'claude', providers = EMPTY_PROVIDERS, agentAccountSources, agentAutoFailoverEnabled = true, accounts = EMPTY_ACCOUNTS, components = [], initialTab = 'system', live = null, onOpenWorkConversation = () => undefined, onNotice }: { api: DesktopApi; headingRef: React.RefObject<HTMLHeadingElement | null>; defaultProvider?: 'codex' | 'claude'; providers?: ProviderStatus[]; agentAccountSources?: AgentAccountSource[] | undefined; agentAutoFailoverEnabled?: boolean | undefined; accounts?: LineAccountSummary[]; components?: ComponentHealth[]; initialTab?: SettingsTabId; live?: LineLoginView | null; onOpenWorkConversation?: (key: ConversationKey) => void; onNotice?: (message: string) => void }) {
+export function Settings({ api, headingRef, defaultProvider = 'claude', providers = EMPTY_PROVIDERS, agentAccountSources, agentAutoFailoverEnabled = true, accounts = EMPTY_ACCOUNTS, components = [], initialTab = 'system', live = null, conversations = EMPTY_CONVERSATIONS, onOpenWorkConversation = () => undefined, onNotice }: { conversations?: readonly ProjectFolderChat[]; api: DesktopApi; headingRef: React.RefObject<HTMLHeadingElement | null>; defaultProvider?: 'codex' | 'claude'; providers?: ProviderStatus[]; agentAccountSources?: AgentAccountSource[] | undefined; agentAutoFailoverEnabled?: boolean | undefined; accounts?: LineAccountSummary[]; components?: ComponentHealth[]; initialTab?: SettingsTabId; live?: LineLoginView | null; onOpenWorkConversation?: (key: ConversationKey) => void; onNotice?: (message: string) => void }) {
   const [tab, setTabState] = useState<SettingsTabId>(initialTab);
   // Only the user's own tab choices are remembered; the app's default and redirects are stored by App.
   const setTab = (next: SettingsTabId) => { setTabState(next); storeSettingsTab(next); };
@@ -478,6 +480,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
   return <div className="page settings-page"><div ref={settingsContentRef} className="settings-content" aria-hidden={connectionInfo !== null || passwordDialog || localeState.restartChoice}><header className="page-header"><div><span className="eyebrow">{extraText('preferences')}</span><div className="page-title-row"><h1 tabIndex={-1} ref={headingRef}>{desktopText('settings')}</h1><p>{desktopText('manageTheDatabaseAttachmentsAndAgents')}</p></div></div></header>
     <div className="settings-tabs" role="tablist" aria-label={desktopText('settingsCategories')}>
       <button role="tab" aria-selected={tab === 'system'} className={tab === 'system' ? 'active' : ''} onClick={() => setTab('system')}>{desktopText('system')}</button>
+      <button role="tab" aria-selected={tab === 'folders'} className={tab === 'folders' ? 'active' : ''} onClick={() => setTab('folders')}>{desktopText('folders')}</button>
       <button role="tab" aria-selected={tab === 'conversation'} className={tab === 'conversation' ? 'active' : ''} onClick={() => setTab('conversation')}>{desktopText('conversations')}</button>
       <button role="tab" aria-selected={tab === 'agent'} className={tab === 'agent' ? 'active' : ''} onClick={() => setTab('agent')}>{desktopText('assistant')}</button>
       <button role="tab" aria-selected={tab === 'help'} className={tab === 'help' ? 'active' : ''} onClick={() => setTab('help')}>{desktopText('commands')}</button>
@@ -485,7 +488,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
       <button role="tab" aria-selected={tab === 'about'} className={tab === 'about' ? 'active' : ''} onClick={() => setTab('about')}>{desktopText('about')}</button>
     </div>
     <div className="settings-panel-scroll" ref={panelScrollRef}>
-    {tab === 'system' ? <div role="tabpanel" className="settings-card-stack system-settings-card-stack"><LineLogin api={api} accounts={accounts} live={live} embedded {...(onNotice ? { onNotice } : {})} />
+    {tab === 'system' ? <div role="tabpanel" className="settings-card-stack system-settings-card-stack"><LineLogin api={api} accounts={accounts} live={live} embedded conversations={conversations} onOpenConversation={onOpenWorkConversation} {...(onNotice ? { onNotice } : {})} />
       <section className="panel database-settings database-summary"><div className="panel-top"><div><h2>{desktopText('databaseAndAttachments')}</h2><p>{desktopText('viewCurrentDatabaseAndAttachmentStorageLocations')}</p></div></div>
       <div className="system-location-rows">
         <div className="system-location-row"><label>{desktopText('database')}</label><div className="system-location-field"><span className="system-location-value">{databaseStatusText}</span>{embedded && <div className="button-row"><button onClick={() => void showConnectionInfo()}>{desktopText('showPassword')}</button><button onClick={() => setPasswordDialog(true)}>{desktopText('changePassword')}</button></div>}</div></div>
@@ -515,6 +518,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
         </fieldset>
       </div></div>
     </div></section></div>
+      : tab === 'folders' ? <div role="tabpanel" className="settings-card-stack"><ProjectFolders api={api} accounts={accounts} conversations={conversations} /></div>
       : tab === 'conversation' ? <div role="tabpanel" className="settings-card-stack"><section className="panel conversation-settings">
       <div className="panel-top"><div><h2>{desktopText('conversations')}</h2></div><button className="primary"
         disabled={conversationSettingsBusy || !Number.isInteger(attachmentAttemptLimit) || attachmentAttemptLimit < 3 || attachmentAttemptLimit > 10

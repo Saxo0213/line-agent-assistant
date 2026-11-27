@@ -30,7 +30,7 @@ class FakeChild {
   emit(value: unknown) {
     if ((value as { type?: string })?.type === 'modeAck') {
       const { accountId, workerInstanceId, controlEpoch } = value as { accountId: string; workerInstanceId: string; controlEpoch: number };
-      this.emitRaw({ type: 'workerProtocolAck', accountId, workerInstanceId, controlEpoch, protocolVersion: 4, manualSend: true });
+      this.emitRaw({ type: 'workerProtocolAck', accountId, workerInstanceId, controlEpoch, protocolVersion: 5, manualSend: true });
     }
     this.emitRaw(value);
   }
@@ -713,6 +713,29 @@ describe('utility worker gateway', () => {
     await on.shutdown(); await failing.shutdown();
   });
 
+  it('sends squareReceive and the stored sync token in the init of DESKTOPWIN workers only, and sends neither when the setting is off or unreadable', async () => {
+    const children: FakeChild[] = [];
+    const spawn = () => { const child = new FakeChild(); children.push(child); return child; };
+    const seen: string[] = [];
+    const on = createUtilityWorkerGateway({ durableCursor: async () => null, spawn,
+      squareReceive: async (accountId) => { seen.push(accountId); return true; }, squareCursor: async () => 'token-1' });
+    await on.start('a1', { accountId: 'a1', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await on.start('a2', { accountId: 'a2', workerInstanceId: 'w2', controlEpoch: 1, mode: 'ACTIVE_CONTROL', lineTransport: 'CHROMEOS' });
+    const off = createUtilityWorkerGateway({ durableCursor: async () => null, spawn, squareReceive: async () => false, squareCursor: async () => 'token-1' });
+    await off.start('a3', { accountId: 'a3', workerInstanceId: 'w3', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    const failing = createUtilityWorkerGateway({ durableCursor: async () => null, spawn, squareReceive: async () => { throw new Error('read failed'); } });
+    await failing.start('a4', { accountId: 'a4', workerInstanceId: 'w4', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    const [desktopOn, chrome, desktopOff, desktopFailed] = children.map((child) => child.posted[0] as Record<string, unknown>);
+    expect(desktopOn).toMatchObject({ type: 'init', squareReceive: true, squareCursor: 'token-1' });
+    expect(LineWorkerCommandSchema.safeParse(desktopOn).success).toBe(true);
+    expect(seen).toEqual(['a1']);
+    for (const init of [chrome!, desktopOff!, desktopFailed!]) {
+      expect(Object.hasOwn(init, 'squareReceive')).toBe(false);
+      expect(Object.hasOwn(init, 'squareCursor')).toBe(false);
+    }
+    await on.shutdown(); await off.shutdown(); await failing.shutdown();
+  });
+
   it('passes lineTransport and the ltsm store root to a CHROMEOS worker only', async () => {
     const children: FakeChild[] = [];
     const gateway = createUtilityWorkerGateway({ durableCursor: async () => null, chromeLtsmDir: 'C:/ltsm',
@@ -1199,7 +1222,7 @@ describe('utility worker gateway', () => {
     const gateway = createUtilityWorkerGateway({ spawn: () => child, pollIntervalMs: 100 });
     const binding = { accountId: 'account-a', workerInstanceId: 'worker-a', controlEpoch: 7, mode: 'ACTIVE_CONTROL' as const };
     await gateway.start('account-a', binding);
-    expect(child.posted[0]).toMatchObject({ type: 'init', protocolVersion: 4, ...binding });
+    expect(child.posted[0]).toMatchObject({ type: 'init', protocolVersion: 5, ...binding });
     await vi.advanceTimersByTimeAsync(100);
     expect(child.posted[1]).toMatchObject({ type: 'poll', accountId: 'account-a', workerInstanceId: 'worker-a',
       controlEpoch: 7, transportOwnerId: expect.any(String), transportGeneration: 1, writeGrantVersion: 1 });

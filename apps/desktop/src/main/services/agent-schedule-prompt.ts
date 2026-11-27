@@ -182,6 +182,8 @@ export interface ForwardRunContextInput {
   prompt: string;
   /** The mention condition of the rule; null for a rule with another match mode. */
   mention: { admin: boolean; members: readonly { label: string }[]; all: boolean } | null;
+  /** The photo text rule: all keywords of the rule and the keywords that the OCR found near (unclear); null for another match mode. */
+  imageText?: { keywords: readonly string[]; near: readonly string[] } | null;
   agentTarget: AgentScheduleSendTarget;
   /** The captured source of the run; null when the work row is gone. */
   work: { accountId: string; chatType: string; chatId: string; messageId: string; senderName: string; sourceTitle: string } | null;
@@ -215,7 +217,8 @@ export function composeForwardRunContext(input: ForwardRunContextInput): string 
   if (input.mention) {
     const names = [...(input.mention.admin ? ['管理員'] : []), ...input.mention.members.map((member) => safe(member.label) || '指定成員'), ...(input.mention.all ? ['全體'] : [])];
     lines.push(`觸發：這則訊息提及了規則指定的對象（${names.join('、')}）。`);
-  } else lines.push('觸發：這則訊息符合排程規則。');
+  } else if (input.imageText) lines.push(`觸發：照片文字辨識不確定，可能含有：${input.imageText.near.map(safe).join('、')}。`);
+  else lines.push('觸發：這則訊息符合排程規則。');
   const title = safe(work.sourceTitle) || UNNAMED_CHAT;
   lines.push(`來源：${title}（accountId=${work.accountId}，chatType=${work.chatType}，chatId=${work.chatId}，messageId=${work.messageId}）`);
   const text = safe(message.text.slice(0, FORWARD_TEXT_MAX));
@@ -226,8 +229,14 @@ export function composeForwardRunContext(input: ForwardRunContextInput): string 
     lines.push(`附件：[${kindLabel(attachment.kind)}]${name ? ` ${name}` : ''}（${safe(attachment.status)}）`);
   }
   lines.push('上下文：需要前後文時，用 query_target_messages 帶上述 accountId、chatType、chatId 查詢這則訊息附近的訊息。');
-  lines.push(`指示：${input.prompt.trim() || '判斷這則訊息需要怎麼處理，整理重點與建議的回覆。'}`);
   const target = input.agentTarget;
+  if (input.imageText) {
+    const keywords = input.imageText.keywords.map(safe).join('、');
+    lines.push(`指示：${input.prompt.trim() || `用 read_message_attachment 開啟這則訊息的照片，確認照片中是否有以下任一名字：${keywords}。有命中：用 send_to_target 把原照片傳到輸出對象，並附一行「發送者、時間（台灣時間）、命中的名字」。沒有命中：不要傳送任何訊息，只在回覆寫「未命中」。`}`);
+    lines.push(`輸出：只有確認命中時，才用 send_to_target 傳到 ${targetLabel(target)}（accountId=${target.accountId}，chatType=${target.chatType}，chatId=${target.chatId}）；沒有命中不要傳送任何訊息；不要傳到其他聊天室，也不要在來源聊天室回覆。`);
+    return lines.join('\n');
+  }
+  lines.push(`指示：${input.prompt.trim() || '判斷這則訊息需要怎麼處理，整理重點與建議的回覆。'}`);
   lines.push(`輸出：完成後用 send_to_target 傳一次結果到 ${targetLabel(target)}（accountId=${target.accountId}，chatType=${target.chatType}，chatId=${target.chatId}）；不要傳到其他聊天室，也不要在來源聊天室回覆，除非來源就是這個輸出對象。`);
   return lines.join('\n');
 }

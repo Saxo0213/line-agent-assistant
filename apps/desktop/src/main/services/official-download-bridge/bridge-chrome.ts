@@ -30,6 +30,15 @@ export function bridgeChromeArgs(profileDir: string, extraArgs: readonly string[
     '--no-default-browser-check',
     '--window-size=800,580',
     '--mute-audio',
+    // These flags stop Chrome components that the extension page does not use.
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-features=SpareRendererForSitePerProcess,AudioServiceOutOfProcess,MediaRouter,OptimizationHints',
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-sync',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-default-apps',
     // Keeps the session cookie `lct` after a clean close. Chrome then restores the old pages.
     '--restore-last-session',
     ...extraArgs,

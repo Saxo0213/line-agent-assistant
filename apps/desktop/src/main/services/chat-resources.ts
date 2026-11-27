@@ -42,6 +42,11 @@ export class ChatResourceUnsupportedError extends Error {
   readonly code = 'UNSUPPORTED';
   constructor() { super('UNSUPPORTED'); this.name = 'ChatResourceUnsupportedError'; }
 }
+/** A direct chat has no stored notebook or album notification, so its one-to-one chat id is unknown. No worker call is made. */
+export class ChatResourceNoHomeChatError extends Error {
+  readonly code = 'CHAT_RESOURCE_NO_HOME_CHAT';
+  constructor() { super('CHAT_RESOURCE_NO_HOME_CHAT'); this.name = 'ChatResourceNoHomeChatError'; }
+}
 export class AlbumArchiveFailure extends Error {
   constructor(readonly failureContext: AlbumFailureContext) { super(failureContext.code); this.name = 'AlbumArchiveFailure'; }
 }
@@ -57,11 +62,13 @@ export function albumFailureContextFrom(error: unknown): AlbumFailureContext | u
 export type ChatResourceRequest = ConversationKey & { requestId: string; type: 'chatResourceRead'; action: ChatResourceAction;
   workerInstanceId: string; controlEpoch: number; transportOwnerId: string; transportGeneration: number; writeGrantVersion: number;
   timeoutMs: number; limit?: number; maxBytes?: number; cursor?: string;
+  /** Direct chat only: the LINE one-to-one chat id ("o" + 32 lowercase hex) that Notes and Albums use instead of the peer MID. */
+  homeChatId?: string;
   postId?: string; albumId?: string; photoId?: string; oid?: string; prefix?: string };
 export type ChatResourceReadResult = { type: 'chatResourceResult'; requestId: string; action: ChatResourceAction; ok: boolean; error?: string | null | undefined;
   responseCode?: number | 'missing' | 'non_numeric' | undefined;
   failureKind?: 'linejs_internal' | 'effect_denied' | 'type_error' | 'range_error' | 'timeout_error' | 'abort_error' | 'other' | undefined;
-  upstreamStatus?: number | undefined; upstreamCode?: number | 'missing' | 'non_numeric' | undefined;
+  upstreamStatus?: number | undefined; upstreamCode?: number | 'missing' | 'non_numeric' | undefined; upstreamMessage?: string | undefined;
   accountId: string; workerInstanceId: string; controlEpoch: number; chatType: ConversationKey['chatType']; chatId: string;
   notes?: NoteDto[] | undefined; note?: NoteDto | undefined; albums?: AlbumDto[] | undefined; photos?: PhotoDto[] | undefined;
   photoPageShape?: { rawPhotoCount: number; hasMorePresent: boolean; hasMore?: boolean | undefined; nextCursorRelation: 'absent' | 'same' | 'advanced' } | undefined;
@@ -100,6 +107,11 @@ export interface ChatResourceStore {
 
 export type ChatResourceArchiveDependencies = {
   readChatResource(command: ChatResourceRequest, signal?: AbortSignal): Promise<ChatResourceReadResult>;
+  /**
+   * The newest "o" + 32 hex chat id that a stored message of this direct chat carries (a notebook or album notification), or null.
+   * A direct chat read needs it. When it is null, the read gives `UNSUPPORTED` and makes no worker call.
+   */
+  directHomeChatId?(key: ConversationKey): Promise<string | null>;
   store?: ChatResourceStore;
   catalog?: {
     albumScanState(key: ConversationKey): Promise<{ complete: boolean; generation: number; cursor: string | null; previousCursor: string | null; nextOrdinal: number }>;
@@ -337,7 +349,8 @@ export class ChatResourceArchiveService {
     | { albums: AlbumDto[]; nextCursor: string | null } | { photos: PhotoDto[]; nextCursor: string | null }
     | { albumId: string; photoId: string; sizeBytes: number } | AlbumOpenResult | ReadableAlbumFolderResult> {
     const key = chatResourceConversationKey(request);
-    if (request.type === 'listChatNotes' || request.type === 'getChatNote') throw new Error('Notes are disabled.');
+    if (request.type === 'listChatNotes') return this.listNotes(key, request.cursor ?? null, signal);
+    if (request.type === 'getChatNote') return { note: await this.getNote(key, request.postId ?? '', signal) };
     if (request.type === 'listChatAlbums') return this.listAlbums(key, request.cursor ?? null, signal, 'modal', undefined, request.refresh === true);
     if (request.type === 'listChatAlbumPhotos') return this.listAlbumPhotos(key, request.albumId ?? '', request.cursor ?? null, signal, request.refresh === true);
     if (request.type === 'downloadChatAlbumPhoto') return this.downloadAlbumPhoto(key, request.albumId ?? '', request.photoId ?? '', request.oid ?? '', request.prefix ?? '', signal);
@@ -402,9 +415,9 @@ export class ChatResourceArchiveService {
     return this.shutdownPromise;
   }
 
-  async listNotes(_key: ConversationKey, _cursor: string | null, _signal?: AbortSignal, _source: 'modal' | 'notification' = 'modal')
+  async listNotes(key: ConversationKey, cursor: string | null, signal?: AbortSignal, source: 'modal' | 'notification' = 'modal')
     : Promise<{ notes: NoteDto[]; nextCursor: string | null }> {
-    throw new Error('Notes are disabled.');
+    return this.admit(key, signal, (operationSignal, generation) => this.listNotesImpl(key, cursor, operationSignal, generation, source));
   }
   private async listNotesImpl(key: ConversationKey, cursor: string | null, signal: AbortSignal, generation: number, source: 'modal' | 'notification' = 'modal') {
     const { value, binding } = await this.read(key, 'listNotes', { cursor, limit: CHAT_RESOURCE_PAGE_LIMIT }, signal, generation, source);
@@ -415,8 +428,8 @@ export class ChatResourceArchiveService {
     return { notes, nextCursor: page.nextCursor };
   }
 
-  async getNote(_key: ConversationKey, _postId: string, _signal?: AbortSignal): Promise<NoteDto> {
-    throw new Error('Notes are disabled.');
+  async getNote(key: ConversationKey, postId: string, signal?: AbortSignal): Promise<NoteDto> {
+    return this.admit(key, signal, (operationSignal, generation) => this.getNoteImpl(key, postId, operationSignal, generation));
   }
   private async getNoteImpl(key: ConversationKey, postId: string, signal: AbortSignal, generation: number) {
     const id = boundedId(postId, 'post ID');
@@ -464,7 +477,7 @@ export class ChatResourceArchiveService {
       const after = catalogCursor?.ordinal.toString() ?? null;
       const page = await catalog.listAlbums(key, after, CHAT_RESOURCE_PAGE_LIMIT);
       this.assertCurrent(key.accountId, generation, requestBinding, signal);
-      const covers = catalog.firstPhotoIds ? await catalog.firstPhotoIds(key, page.items.map(({ albumId }) => albumId), 2) : new Map<string, string[]>();
+      const covers = catalog.firstPhotoIds ? await catalog.firstPhotoIds(key, page.items.map(({ albumId }) => albumId), 3) : new Map<string, string[]>();
       const albums = page.items.map((album) => ({ ...album, coverPhotoIds: covers.get(album.albumId) ?? [] }));
       const nextOrdinal = page.nextCursor === null ? scan.nextOrdinal - 1 : Number(page.nextCursor);
       const nextCursor = page.nextCursor !== null || !scan.complete ? encodeCatalogCursor('db-album:', scan.generation, nextOrdinal) : null;
@@ -1046,8 +1059,17 @@ export class ChatResourceArchiveService {
     if (extra.cursor !== undefined && extra.cursor !== null && (typeof extra.cursor !== 'string' || extra.cursor.length > 2048)) throw new Error('Invalid chat resource cursor.');
     if (!this.deps.store) throw new Error('CHAT_RESOURCE_STORE_UNAVAILABLE');
     const binding = await this.authorize(key, signal, generation, expectedBinding);
+    // A direct chat uses its one-to-one chat id. Without a stored one, nothing is read and no worker call is made.
+    let homeChatId: string | undefined;
+    if (key.chatType === 'direct' && this.deps.directHomeChatId) {
+      const found = await this.deps.directHomeChatId(key);
+      this.assertCurrent(key.accountId, generation, binding, signal);
+      if (found === null || !/^o[0-9a-f]{32}$/.test(found)) throw new ChatResourceNoHomeChatError();
+      homeChatId = found;
+    }
     const { cursor, ...commandOptions } = extra;
     const command: ChatResourceRequest = { type: 'chatResourceRead', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId, ...commandOptions,
+      ...(homeChatId === undefined ? {} : { homeChatId }),
       ...(cursor !== undefined && cursor !== null ? { cursor } : {}), action, requestId: randomUUID(), timeoutMs: 30_000,
       workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch, transportOwnerId: binding.transportOwnerId,
       transportGeneration: binding.transportGeneration, writeGrantVersion: binding.writeGrantVersion };
@@ -1057,7 +1079,7 @@ export class ChatResourceArchiveService {
     try { response = await this.deps.readChatResource(command, signal); }
     catch (error) {
       const failure = diagnosticFailure(error);
-      this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, action: diagnosticAction(action), occurredAt, correlationId: command.requestId,
+      this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, chatType: key.chatType, action: diagnosticAction(action), occurredAt, correlationId: command.requestId,
         ...(typeof extra.albumId === 'string' ? { albumId: extra.albumId } : {}),
         durationMs: Date.now() - startedAt, status: 'failure', errorCode: diagnosticErrorCode(error), ...failure, itemCount: 0, byteCount: 0, responseFields: [] });
       markChatResourceDiagnosticLogged(error);
@@ -1069,7 +1091,7 @@ export class ChatResourceArchiveService {
     const rows = response.notes ?? response.albums ?? response.photos;
     let byteCount = 0;
     try { byteCount = response.bytes?.byteLength ?? Buffer.byteLength(JSON.stringify(response), 'utf8'); } catch { byteCount = 0; }
-    this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, action: diagnosticAction(action), occurredAt, correlationId: command.requestId,
+    this.logDiagnostic({ source, accountId: key.accountId, chatId: key.chatId, chatType: key.chatType, action: diagnosticAction(action), occurredAt, correlationId: command.requestId,
       ...(typeof extra.albumId === 'string' ? { albumId: extra.albumId } : {}),
       durationMs: Date.now() - startedAt, status: response.ok ? 'success' : 'failure',
       ...(!response.ok ? { errorCode: diagnosticErrorCode(response.error), failureStage: 'worker_response', failureReason: 'worker_response_error',
@@ -1077,6 +1099,7 @@ export class ChatResourceArchiveService {
         ...(response.failureKind ? { failureKind: response.failureKind } : {}),
         ...(response.upstreamStatus === undefined ? {} : { upstreamStatus: response.upstreamStatus }),
         ...(response.upstreamCode === undefined ? {} : { upstreamCode: response.upstreamCode }),
+        ...(response.upstreamMessage === undefined ? {} : { upstreamMessage: response.upstreamMessage }),
         ...(source === 'modal' && (action === 'listNotes' || action === 'getNote') && response.error === 'response_code_invalid'
           && response.responseCode !== undefined ? { responseCode: response.responseCode } : {}),
       } : {}), ...(response.photoPageShape ? { photoPageShape: response.photoPageShape } : {}),

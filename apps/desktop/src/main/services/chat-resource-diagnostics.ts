@@ -18,6 +18,7 @@ export type ChatResourceDiagnostic = {
   source: 'modal' | 'notification' | 'mcp';
   accountId: string;
   chatId: string;
+  chatType?: 'direct' | 'group' | 'room';
   albumId?: string;
   action: ChatResourceDiagnosticAction;
   correlationId?: string;
@@ -32,6 +33,8 @@ export type ChatResourceDiagnostic = {
   failureKind?: typeof CHAT_RESOURCE_FAILURE_KINDS[number];
   upstreamStatus?: number;
   upstreamCode?: number | 'missing' | 'non_numeric';
+  /** Bounded LINE `message` text of a failed reply: at most 200 characters, no control characters. */
+  upstreamMessage?: string;
   currentBindingMatch?: boolean;
   currentEpochMatch?: boolean;
   workerReady?: boolean;
@@ -79,6 +82,10 @@ export function parseChatResourceDiagnostic(value: unknown): ChatResourceDiagnos
   if (input.upstreamCode !== undefined && (input.status !== 'failure' || !(typeof input.upstreamCode === 'number'
     && Number.isFinite(input.upstreamCode) && Number.isInteger(input.upstreamCode) && Math.abs(input.upstreamCode) <= 1_000_000_000
     || input.upstreamCode === 'missing' || input.upstreamCode === 'non_numeric'))) return null;
+  if (input.chatType !== undefined && !['direct', 'group', 'room'].includes(input.chatType as string)) return null;
+  if (input.upstreamMessage !== undefined && (input.status !== 'failure' || typeof input.upstreamMessage !== 'string'
+    || input.upstreamMessage.length < 1 || input.upstreamMessage.length > 200
+    || /[\u0000-\u001f\u007f-\u009f]/.test(input.upstreamMessage))) return null;
   for (const field of ['currentBindingMatch', 'currentEpochMatch', 'workerReady'] as const) {
     if (input[field] !== undefined && typeof input[field] !== 'boolean') return null;
   }
@@ -114,6 +121,7 @@ export function parseChatResourceDiagnostic(value: unknown): ChatResourceDiagnos
     if (!boundedId(input.correlationId)) return null;
     result.correlationId = input.correlationId;
   }
+  if (input.chatType !== undefined) result.chatType = input.chatType as NonNullable<ChatResourceDiagnostic['chatType']>;
   if (input.albumId !== undefined) result.albumId = input.albumId;
   if (input.errorCode !== undefined) result.errorCode = input.errorCode as NonNullable<ChatResourceDiagnostic['errorCode']>;
   if (input.failureStage !== undefined) result.failureStage = input.failureStage as NonNullable<ChatResourceDiagnostic['failureStage']>;
@@ -123,6 +131,7 @@ export function parseChatResourceDiagnostic(value: unknown): ChatResourceDiagnos
   if (input.failureKind !== undefined) result.failureKind = input.failureKind as NonNullable<ChatResourceDiagnostic['failureKind']>;
   if (input.upstreamStatus !== undefined) result.upstreamStatus = input.upstreamStatus as number;
   if (input.upstreamCode !== undefined) result.upstreamCode = input.upstreamCode as NonNullable<ChatResourceDiagnostic['upstreamCode']>;
+  if (input.upstreamMessage !== undefined) result.upstreamMessage = input.upstreamMessage as string;
   if (input.currentBindingMatch !== undefined) result.currentBindingMatch = input.currentBindingMatch as boolean;
   if (input.currentEpochMatch !== undefined) result.currentEpochMatch = input.currentEpochMatch as boolean;
   if (input.workerReady !== undefined) result.workerReady = input.workerReady as boolean;

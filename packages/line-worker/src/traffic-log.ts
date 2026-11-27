@@ -4,6 +4,7 @@ import { subscribe, unsubscribe } from 'node:diagnostics_channel';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { LineTransportKind } from '@line-agent/contracts';
 
 /*
  * Local log of the HTTP requests that this process sends to LINE hosts.
@@ -14,7 +15,8 @@ import { join } from 'node:path';
  */
 
 export type TrafficProcessKind = 'worker' | 'main';
-export type TrafficTransport = 'DESKTOPWIN' | 'CHROMEOS' | null;
+/** The device value of the account (a linejs device or CHROMEOS), or null for a process without an account. */
+export type TrafficTransport = LineTransportKind | null;
 export type TrafficBodyKind = 'none' | 'buffer' | 'string' | 'stream' | 'other';
 
 export type TrafficRecord = Readonly<{
@@ -61,6 +63,8 @@ export type TrafficLogOptions = Readonly<{
 export type TrafficLogHandle = Readonly<{
   /** Writes all queued records. It never rejects. */
   flush(): Promise<void>;
+  /** Writes all queued records with the synchronous writer. It never throws. A record is written once, by whichever flush takes it first. */
+  flushSync(): void;
   /** Unsubscribes, flushes and stops the timer. It never rejects. */
   stop(): Promise<void>;
   stats(): { written: number; dropped: number };
@@ -371,6 +375,7 @@ export function startTrafficLog(options: TrafficLogOptions): TrafficLogHandle {
 
   const handle: TrafficLogHandle = {
     flush,
+    flushSync: flushOnExit,
     stats: () => ({ written, dropped }),
     async stop() {
       if (stopped) return;
@@ -389,6 +394,14 @@ export function startTrafficLog(options: TrafficLogOptions): TrafficLogHandle {
   };
   active = handle;
   return handle;
+}
+
+/**
+ * Writes the queued records of the running log in this process, synchronously. It does nothing when no log runs. It never throws.
+ * Main kills a worker without an 'exit' event, so the worker calls this before it reports an event that Main may answer with a kill.
+ */
+export function flushTrafficLogSync(): void {
+  try { active?.flushSync(); } catch { /* The log never throws. */ }
 }
 
 function tryJsonShape(text: string, contentType: string | null): unknown {

@@ -73,6 +73,8 @@ export const JAPANESE_DESKTOP_COPY_PART3: Partial<Record<keyof typeof ENGLISH_DE
   loading251: '読み込み中…',
   noMessagesForThisChatInTheDatabase: 'このチャットのメッセージはデータベースにありません',
   arg0NoData: '{arg0}（データなし）',
+  messageEdited: '編集済み',
+  messageEditHistory: '編集履歴',
   quotedMessage: '引用メッセージ',
   replyToArg0Arg1: '{arg0} への返信：{arg1}',
   sharedLineContact: '共有された LINE の連絡先',

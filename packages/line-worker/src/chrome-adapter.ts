@@ -35,7 +35,7 @@ import { ChatResourceFailure, ChatResourceUnsupportedError, safeChatResourceUpst
 import { validateAttachmentMessage, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { decodeChromeFriendAddRejection, decodeChromeServerRejection } from './chrome-server-error.js';
 import { isLineServerRejection } from './line-server-error.js';
-import { decryptLinejsHistoryMessages, fetchLinejsConversationCatalog, fetchLinejsConversationDetails, normalizeLinePicturePath, type DownloadedAttachment } from './linejs-adapter.js';
+import { decryptLinejsHistoryMessages, fetchLinejsConversationCatalog, fetchLinejsConversationDetails, normalizeLinePicturePath, type DownloadedAttachment } from './linejs-catalog.js';
 
 /** `SyncReason` values from the Chrome registry notes: catalog reads use 4, the message box list uses 2. */
 const CATALOG_SYNC_REASON = 4;
@@ -195,7 +195,7 @@ export class ChromeAdapter implements LineTransport {
     this.#closeable = parts.closeable;
     this.#gate = createChromeMutationGate({
       accountId: options.accountId, workerInstanceId: options.workerInstanceId, controlEpoch: options.controlEpoch,
-      // Identical lease rules to the DESKTOPWIN adapter (linejs-adapter.ts validateControlLease).
+      // Same lease rules as the linejs Client engine (lease validation before every write).
       validateControlLease: async (lease, phase: ControlLeasePhase) => {
         const identityMatches = lease.accountId === options.accountId &&
           lease.workerInstanceId === options.workerInstanceId && lease.controlEpoch === options.controlEpoch;
@@ -211,7 +211,7 @@ export class ChromeAdapter implements LineTransport {
       ...(options.now === undefined ? {} : { now: options.now }),
     });
     this.#friends = new FriendCache(options.now);
-    // The physical-start hook of addFriendByMid sits between the gate's ticket check and the network (linejs-adapter.ts:790-799).
+    // The physical-start hook of addFriendByMid sits between the gate's ticket check and the network.
     const physicalFetch: FetchLike = async (input, init) => {
       const active = this.#activeRelationAdd;
       if (active !== undefined && new URL(input).pathname === ADD_FRIEND_PATH) {
@@ -440,7 +440,7 @@ export class ChromeAdapter implements LineTransport {
       const operations: unknown[] = [...this.#pendingCatchup.slice(0, reserved), ...built.operations];
       this.#pendingCatchup = this.#pendingCatchup.slice(reserved);
       // A read receipt can be the first sighting of a chat whose messages predate login. Recover its recent messages once,
-      // without rendering the receipt (linejs-adapter.ts:1117-1132). The worker rejects a batch above 100 operations, so the
+      // without rendering the receipt. The worker rejects a batch above 100 operations, so the
       // items that do not fit wait in `#pendingCatchup`. The chat stays seen: only a failed read makes it unseen.
       for (const chatId of built.catchupChatIds.slice(0, CATCHUP_MAX_CHATS)) {
         try {

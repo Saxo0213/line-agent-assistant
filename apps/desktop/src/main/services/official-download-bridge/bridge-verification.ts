@@ -17,7 +17,17 @@ export const BRIDGE_GATE_IMAGE_MATCH_THRESHOLD = 50;
 export const BRIDGE_GATE_FILE_MATCH_THRESHOLD = 20;
 
 export type BridgeKind = 'image' | 'file';
-export type BridgeVerifyResult = 'match' | 'mismatch' | 'not_in_store' | 'native_incomplete' | 'store_incomplete';
+/**
+ * `identity_match`: the official row cannot build a full message, but the store message has the same id, content type,
+ * created time and chat type, and it has all three keys. It is not counted as `match` by the old-message gate.
+ */
+export type BridgeVerifyResult = 'match' | 'identity_match' | 'mismatch' | 'not_in_store' | 'native_incomplete' | 'store_incomplete';
+
+/** What the bridge knows about the message when the official row is incomplete. The chat and the sender are not compared. */
+export interface BridgeIdentity {
+  readonly chatType: string;
+  readonly kind: BridgeKind;
+}
 
 export interface BridgeVerification {
   readonly result: BridgeVerifyResult;
@@ -28,6 +38,7 @@ export interface BridgeVerification {
 /** Audit result codes of the five results. */
 export const BRIDGE_VERIFY_RESULT_CODES = {
   match: 'BRIDGE_VERIFY_MATCH',
+  identity_match: 'BRIDGE_VERIFY_IDENTITY_MATCH',
   mismatch: 'BRIDGE_VERIFY_MISMATCH',
   not_in_store: 'BRIDGE_VERIFY_NOT_IN_STORE',
   native_incomplete: 'BRIDGE_VERIFY_NATIVE_INCOMPLETE',
@@ -99,6 +110,44 @@ export function classifyBridgeComparison(raw: unknown): BridgeVerification | nul
   else if (!blocking) segments.unshift('match');
   const result: BridgeVerifyResult = placeholder ? 'store_incomplete' : blocking ? 'mismatch' : 'match';
   return { result, detail: segments.join('.').slice(0, 160) };
+}
+
+/** Content type of the extension for each kind: IMAGE=1, FILE=14. */
+export function bridgeKindContentType(kind: BridgeKind): number {
+  return kind === 'image' ? 1 : 14;
+}
+
+/**
+ * Runs on the store message (`this`) when the official row is incomplete. The argument is by value:
+ * `{id, contentType, createdTime, chatType}`. `createdTime` is the official `_createdTime` as an integer string.
+ * The extension uses other chat and user ID forms than the official app, so chat and sender are not compared.
+ * `toType` must agree with the chat type: direct = 0 or USER, room = 1 or ROOM, group = 2 or GROUP.
+ * It reads memory only. It gives back booleans only and never a value.
+ */
+export const BRIDGE_IDENTITY_FUNCTION = `function(a){
+  const c=this.contentMetadata||{};
+  const e=v=>v===undefined||v===null||v==='';
+  const t=a.chatType==='direct'?[0,'USER']:a.chatType==='room'?[1,'ROOM']:a.chatType==='group'?[2,'GROUP']:null;
+  const tt=this.toType;
+  const toType=t!==null&&!e(tt)&&(Number(tt)===t[0]||String(tt).toUpperCase()===t[1]);
+  return {id:String(this.id)===a.id,contentType:Number(this.contentType)===a.contentType,
+    createdTime:String(this.createdTime)===a.createdTime,toType:toType,
+    keys:!e(c.ENC_KM)&&!e(c.SID)&&!e(c.e2eeVersion),
+    plain:a.plain===true&&e(c.ENC_KM)&&e(c.e2eeVersion)&&e(c.SID)&&!(Array.isArray(this.chunks)&&this.chunks.length>0)}
+}`;
+
+const IDENTITY_FLAG_NAMES = ['id', 'contentType', 'createdTime', 'toType'] as const;
+
+/** Turns the answer of `BRIDGE_IDENTITY_FUNCTION` into a result. Returns null when the answer has a wrong shape. */
+export function classifyBridgeIdentity(raw: unknown): BridgeVerification | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const input = raw as Record<string, unknown>;
+  for (const name of [...IDENTITY_FLAG_NAMES, 'keys', 'plain']) if (typeof input[name] !== 'boolean') return null;
+  const failed = IDENTITY_FLAG_NAMES.filter((name) => input[name] !== true);
+  if (failed.length > 0) return { result: 'mismatch', detail: `identity:false:${failed.join(':')}` };
+  if (input.keys !== true && input.plain === true) return { result: 'identity_match', detail: 'identity_match.plain' };
+  if (input.keys !== true) return { result: 'store_incomplete', detail: 'identity:store_incomplete' };
+  return { result: 'identity_match', detail: 'identity_match' };
 }
 
 /** First bytes of a photo: JPEG, PNG, GIF, WEBP or HEIF/HEIC. */

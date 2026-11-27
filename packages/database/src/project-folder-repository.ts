@@ -6,12 +6,7 @@ export type ProjectFolderMode = 'READ' | 'READ_WRITE';
 export interface ProjectFolderKey { accountId: string; chatType: ProjectFolderChatType; chatId: string }
 export interface ProjectFolderRow extends ProjectFolderKey { path: string; mode: ProjectFolderMode; createdBy: string; createdAt: Date; updatedAt: Date }
 
-/** Most folders one chat can have. */
-export const PROJECT_FOLDERS_PER_CHAT_MAX = 8;
-
-export type ProjectFolderBindResult =
-  | { status: 'created' | 'updated' | 'unchanged'; row: ProjectFolderRow }
-  | { status: 'limit' };
+export type ProjectFolderBindResult = { status: 'created' | 'updated' | 'unchanged'; row: ProjectFolderRow };
 
 interface DbRow { account_id: string; chat_type: ProjectFolderChatType; chat_id: string; path: string; mode: ProjectFolderMode;
   created_by: string; created_at: Date; updated_at: Date }
@@ -44,7 +39,7 @@ export class ProjectFolderRepository {
     return result.rows.map(toRow);
   }
 
-  /** Binds `path` (already canonical) or updates its mode. A ninth folder is refused (`limit`). */
+  /** Binds `path` (already canonical) or updates its mode. */
   async bind(key: ProjectFolderKey, path: string, mode: ProjectFolderMode, actor: string): Promise<ProjectFolderBindResult> {
     return withBoundedTransaction(this.pool, async (client) => {
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
@@ -61,10 +56,6 @@ export class ProjectFolderRepository {
         await audit(client, key, actor, 'update', { path, from: current.mode, mode });
         return { status: 'updated' as const, row: toRow(updated) };
       }
-      const count = Number((await client.query<{ n: string }>(
-        'SELECT count(*) AS n FROM agent_project_folders WHERE account_id = $1 AND chat_type = $2 AND chat_id = $3',
-        [key.accountId, key.chatType, key.chatId])).rows[0]!.n);
-      if (count >= PROJECT_FOLDERS_PER_CHAT_MAX) return { status: 'limit' as const };
       const inserted = (await client.query<DbRow>(
         `INSERT INTO agent_project_folders (account_id, chat_type, chat_id, path, mode, created_by) VALUES ($1,$2,$3,$4,$5,$6)
          RETURNING ${COLUMNS}`, [key.accountId, key.chatType, key.chatId, path, mode, actor])).rows[0]!;

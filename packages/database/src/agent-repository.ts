@@ -472,6 +472,13 @@ export class AgentRepository {
     return row ? { externalSessionId: row.external_session_id, generation: row.generation } : null;
   }
 
+  /** Read only: every provider session ID that exists now (all providers, all source types). */
+  async listExternalSessionIds(): Promise<string[]> {
+    const result = await this.pool.query<{ external_session_id: string }>(
+      'SELECT DISTINCT external_session_id FROM agent_sessions WHERE external_session_id IS NOT NULL');
+    return result.rows.map((row) => row.external_session_id);
+  }
+
   async validateResumeSession(request: AgentRunRequest): Promise<ResumeSessionValidationResult> {
     // A scheduled run never resumes: it always starts a brand-new provider session.
     if (!request.resumeSessionId || request.source.type === 'schedule') return { status: 'invalid' };

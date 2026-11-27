@@ -8,10 +8,10 @@ import { DEFAULT_DOWNLOAD_BRIDGE_INTERVALS } from '@line-agent/contracts';
 import { BridgeError } from './errors.js';
 import type { CdpPipe } from './cdp-pipe.js';
 import type { ExtensionHandles } from './extension-handles.js';
-import { buildMessageFromNativeRow, type BridgeMessage, type NativeRowInput } from './native-message.js';
+import { buildMessageFromNativeRow, buildPlainMessageFromNativeRow, nativeIdentityFromRow, type BridgeMessage, type NativeRowInput } from './native-message.js';
 import {
-  BRIDGE_COMPARE_FUNCTION, BRIDGE_VERIFY_POLL_MS, classifyBridgeComparison, isSupportedImageHead,
-  type BridgeKind, type BridgeVerification,
+  BRIDGE_COMPARE_FUNCTION, BRIDGE_IDENTITY_FUNCTION, BRIDGE_VERIFY_POLL_MS, bridgeKindContentType, classifyBridgeComparison, classifyBridgeIdentity,
+  isSupportedImageHead, type BridgeIdentity, type BridgeKind, type BridgeVerification,
 } from './bridge-verification.js';
 
 /** Random time in ms from a range in seconds. `random` gives a value from 0 up to (not including) 1. */
@@ -29,6 +29,8 @@ const SLICE_TIMEOUT_MS = 60_000;
 const IMAGE_HEAD_BYTES = 12;
 /** Content types of the extension: IMAGE=1, FILE=14 (main.js@2071833). */
 const SUPPORTED_CONTENT_TYPES: readonly number[] = [1, 14];
+/** Length of the HMAC-SHA256 tag at the end of an E2EE v2 media object. */
+const BRIDGE_E2EE_V2_TAG_BYTES = 32;
 
 export type BridgeDownloadStage = 'precheck' | 'locate' | 'download' | 'read';
 /** Which message goes to `eB`: `native` is the message built from the official desktop row, `store` is the extension store message. */
@@ -75,9 +77,9 @@ export class BridgeDownloadError extends Error {
     this.httpStatus = options.httpStatus ?? null;
   }
 
-  /** True when the server says that the file is gone. */
+  /** True when the server says that the file is gone, or the message was recalled. Both are final. */
   get isExpired(): boolean {
-    return this.code === 'OBJECT_NOT_EXIST';
+    return this.code === 'OBJECT_NOT_EXIST' || this.code === 'BRIDGE_MESSAGE_UNSENT';
   }
 }
 
@@ -101,6 +103,8 @@ export interface BridgeDownloadRequest {
 export interface BridgeVerifyRequest {
   readonly messageId: string;
   readonly nativeRow?: NativeRowInput | null;
+  /** Used only when the official row cannot build a full message. Without it that row gives `native_incomplete`. */
+  readonly identity?: BridgeIdentity;
   /** Time to wait for the message to come into the store. 0 means one read and no wait. */
   readonly waitMs: number;
   readonly signal?: AbortSignal;
@@ -222,20 +226,50 @@ export class OfficialDownloadBridgeDownloader {
    */
   async verify(request: BridgeVerifyRequest): Promise<BridgeVerification> {
     const built = buildMessageFromNativeRow(request.nativeRow);
-    if (!built) return { result: 'native_incomplete', detail: 'native_incomplete' };
-    if (request.waitMs <= 0) return this.#verifyStore(request, built, 0);
+    let compare: (live: LiveBridge, objectId: string) => Promise<BridgeVerification>;
+    if (built) {
+      compare = (live, objectId) => this.#compareStoreMessage(live, objectId, built);
+    } else {
+      // The official row is incomplete. Only the identity of the message can be checked against the store message.
+      const identity = request.identity;
+      const native = nativeIdentityFromRow(request.nativeRow);
+      if (!identity || !native || native.createdTime === null) return { result: 'native_incomplete', detail: 'native_incomplete' };
+      const contentType = bridgeKindContentType(identity.kind);
+      if (native.contentType !== null && native.contentType !== contentType) {
+        return { result: 'mismatch', detail: 'identity:false:contentType' };
+      }
+      // A recalled message has no media to download. The result starts with `identity:`, so it is not a sticky gate mismatch.
+      if (native.unsent) return { result: 'mismatch', detail: 'identity:unsent' };
+      const argument = { id: request.messageId, contentType, createdTime: native.createdTime, chatType: identity.chatType, plain: !native.encrypted };
+      compare = (live, objectId) => this.#compareIdentity(live, objectId, argument);
+    }
+    if (request.waitMs <= 0) return this.#verifyStore(request, compare, 0);
     const previous = this.#verifyTail;
     let unlock!: () => void;
     this.#verifyTail = new Promise<void>((resolve) => { unlock = resolve; });
     try {
       await previous;
-      return await this.#verifyStore(request, built, request.waitMs);
+      return await this.#verifyStore(request, compare, request.waitMs);
     } finally {
       unlock();
     }
   }
 
-  async #verifyStore(request: BridgeVerifyRequest, built: BridgeMessage, waitMs: number): Promise<BridgeVerification> {
+  /** One page call. The page gives back booleans only. */
+  async #compareIdentity(live: LiveBridge, objectId: string,
+    argument: { id: string; contentType: number; createdTime: string; chatType: string; plain: boolean }): Promise<BridgeVerification> {
+    let response: RemoteObject;
+    try {
+      response = await this.#call(live, objectId, BRIDGE_IDENTITY_FUNCTION, [{ value: argument }], { byValue: true });
+    } catch (error) {
+      throw this.#normalize(error);
+    }
+    const verification = classifyBridgeIdentity(response.value);
+    if (!verification) throw new BridgeDownloadError('BRIDGE_VERIFY_FAILED', 'locate', 'identity result has a wrong shape');
+    return verification;
+  }
+
+  async #verifyStore(request: BridgeVerifyRequest, compare: (live: LiveBridge, objectId: string) => Promise<BridgeVerification>, waitMs: number): Promise<BridgeVerification> {
     const reads = Math.floor(waitMs / BRIDGE_VERIFY_POLL_MS) + 1;
     // The store message can be a placeholder until the upload ends. With waitMs above 0 the read repeats while it is one.
     let incomplete: BridgeVerification | null = null;
@@ -246,7 +280,7 @@ export class OfficialDownloadBridgeDownloader {
       const objectId = await this.#findStoreMessage(live, request.messageId);
       if (objectId) {
         try {
-          const verification = await this.#compareStoreMessage(live, objectId, built);
+          const verification = await compare(live, objectId);
           if (verification.result !== 'store_incomplete' || waitMs <= 0) return verification;
           incomplete = verification;
         } finally {
@@ -292,6 +326,7 @@ export class OfficialDownloadBridgeDownloader {
       this.#checkAbort(request, 'locate');
       let file: { objectId: string; name: string; size: number };
       let expectedSize: number | null;
+      let e2eeV2 = false;
       // One `eB` call. There is no second attempt, no chat load and no other store action.
       try {
         let messageArgument: { objectId: string } | { value: BridgeMessage };
@@ -304,11 +339,13 @@ export class OfficialDownloadBridgeDownloader {
             throw new BridgeDownloadError('BRIDGE_CONTENT_TYPE_UNSUPPORTED', 'precheck', 'content type is not image or file');
           }
           expectedSize = info.fileSize;
+          e2eeV2 = info.e2eeVersion === '2';
           messageArgument = { objectId: storeId };
         } else {
-          const built = buildMessageFromNativeRow(request.nativeRow);
+          const built = buildMessageFromNativeRow(request.nativeRow) ?? buildPlainMessageFromNativeRow(request.nativeRow);
           if (!built) throw new BridgeDownloadError('NATIVE_MESSAGE_INCOMPLETE', 'precheck', 'the official row cannot build a message');
           expectedSize = parseFileSize(built.contentMetadata.FILE_SIZE);
+          e2eeV2 = built.contentMetadata.e2eeVersion === '2';
           messageArgument = { value: built };
         }
         this.#checkAbort(request, 'download');
@@ -324,7 +361,12 @@ export class OfficialDownloadBridgeDownloader {
         throw new BridgeDownloadError('LINE_MEDIA_SIZE_LIMIT', 'download', 'file is above the size limit');
       }
       // These checks run before the first byte goes to the attachment store. A failed check leaves no file there.
-      if (expectedSize !== null && file.size !== expectedSize) {
+      // E2EE v2 media is the AES-CTR ciphertext plus a 32-byte HMAC tag (linejs base/e2ee/mod.ts:1232, :1248-1249).
+      // The sender declares FILE_SIZE with the tag (linejs base/obs/mod.ts:406 for non-video) or without it (video, :404-406).
+      // The decrypted File has neither the tag nor any other overhead, so it equals FILE_SIZE - 32, or FILE_SIZE for a declared size without the tag.
+      const sizeMatches = expectedSize === null || file.size === expectedSize
+        || (e2eeV2 && expectedSize >= BRIDGE_E2EE_V2_TAG_BYTES && file.size === expectedSize - BRIDGE_E2EE_V2_TAG_BYTES);
+      if (!sizeMatches) {
         throw new BridgeDownloadError('BRIDGE_SIZE_MISMATCH', 'download', 'File size differs from the message size');
       }
       if (request.kind === 'image') {
@@ -382,15 +424,15 @@ export class OfficialDownloadBridgeDownloader {
   }
 
   /** Reads two numbers of the store message: the content type and the FILE_SIZE (null when it is absent or not an integer). */
-  async #readStoreInfo(live: LiveBridge, objectId: string): Promise<{ contentType: number; fileSize: number | null }> {
+  async #readStoreInfo(live: LiveBridge, objectId: string): Promise<{ contentType: number; fileSize: number | null; e2eeVersion: string | null }> {
     const result = await this.#call(live, objectId,
-      "function(){const c=this.contentMetadata||{};const v=c.FILE_SIZE;const s=(v===undefined||v===null||v==='')?'':String(v);return {contentType:Number(this.contentType),fileSize:/^\\d{1,15}$/.test(s)?Number(s):null}}",
+      "function(){const c=this.contentMetadata||{};const v=c.FILE_SIZE;const s=(v===undefined||v===null||v==='')?'':String(v);const e=c.e2eeVersion;return {contentType:Number(this.contentType),fileSize:/^\\d{1,15}$/.test(s)?Number(s):null,e2eeVersion:(e===undefined||e===null||e==='')?null:String(e)}}",
       [], { byValue: true });
-    const value = result.value as { contentType?: unknown; fileSize?: unknown } | undefined;
+    const value = result.value as { contentType?: unknown; fileSize?: unknown; e2eeVersion?: unknown } | undefined;
     if (typeof value?.contentType !== 'number' || !(value.fileSize === null || (typeof value.fileSize === 'number' && Number.isSafeInteger(value.fileSize)))) {
       throw new BridgeDownloadError('BRIDGE_FILE_READ_FAILED', 'locate', 'store message info is not readable');
     }
-    return { contentType: value.contentType, fileSize: value.fileSize };
+    return { contentType: value.contentType, fileSize: value.fileSize, e2eeVersion: typeof value.e2eeVersion === 'string' ? value.e2eeVersion : null };
   }
 
   /** Reads the first bytes of the File. */

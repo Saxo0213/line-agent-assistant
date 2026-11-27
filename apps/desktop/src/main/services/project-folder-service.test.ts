@@ -22,7 +22,6 @@ function memoryStore() {
         if (current.mode === mode) return { status: 'unchanged', row: current };
         current.mode = mode; audit.push(`update:${actor}`); return { status: 'updated', row: current };
       }
-      if (rows.filter((row) => row.chatId === key.chatId).length >= 8) return { status: 'limit' };
       const row: ProjectFolderRow = { ...key, path, mode, createdBy: actor, createdAt: new Date(), updatedAt: new Date() };
       rows.push(row); audit.push(`bind:${actor}`); return { status: 'created', row };
     },
@@ -97,12 +96,6 @@ windows('ProjectFolderService', () => {
     const second = await dir('two');
     await bind(first); await bind(second, 'READ_WRITE');
     expect(await run({ type: 'folder', action: 'list' })).toBe(`本聊天室的專案資料夾：\n1. ${first}（唯讀）\n2. ${second}（讀寫）`);
-  });
-
-  it('keeps at most 8 folders per chat', async () => {
-    for (let index = 0; index < 8; index += 1) await bind(await dir(`p${index}`));
-    expect(await bind(await dir('p8'))).toBe(PROJECT_FOLDER_TEXT.limit);
-    expect(memory.rows).toHaveLength(8);
   });
 
   it('unbinds one path (also after the folder is gone, and by a different spelling), then all', async () => {

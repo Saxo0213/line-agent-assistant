@@ -123,23 +123,18 @@ function sharedContact(message: RecordValue): ContactDescriptor | null {
   }
 }
 
-export function normalizeOperation(
-  operationValue: unknown,
-  context: NormalizeContext,
-  decryptionFailure?: DecryptionFailure,
-): InboundEnvelope {
-  const operation = record(operationValue);
-  const message = record(operation.message);
+/** Safe JSON copy of one Talk-shaped Message (bigint as string, native chunks bounded). */
+export function safeRawMessage(value: unknown): InboundEnvelope['raw'] {
+  return jsonValue(value, new WeakSet(), true) as InboundEnvelope['raw'];
+}
+
+/** Content fields of a Talk-shaped Message. The Talk and the community normalizers share it, so both give the same row shape. */
+export function messageContent(message: RecordValue, messageId: string, decryptionFailure?: DecryptionFailure): Readonly<{
+  kind: InboundEnvelope['kind']; text: string | null; attachments: InboundEnvelope['attachments'];
+  contact: ContactDescriptor | null; isNativeContact: boolean; rejectedContact: boolean;
+  mentions: Pick<InboundEnvelope, 'mentionIds' | 'mentionRanges'>; replyToMessageId: string | null;
+}> {
   const metadata = record(message.contentMetadata);
-  const messageId = stringId(message.id ?? operation.revision, 'messageId');
-  const senderId = stringId(message.from ?? operation.param2 ?? context.ownMid, 'senderId');
-  const destination = stringId(message.to ?? operation.param1 ?? senderId, 'destination');
-  const toType = message.toType;
-  const chatType = toType === 2 || destination.startsWith('c') ? 'group'
-    : toType === 1 || destination.startsWith('r') ? 'room' : 'direct';
-  const chatId = chatType === 'direct' && destination === context.ownMid ? senderId : destination;
-  const timestamp = message.createdTime ?? message.deliveredTime ?? Date.now();
-  const occurredAt = new Date(Number(timestamp)).toISOString();
   const isNativeContact = !decryptionFailure && (message.contentType === 'CONTACT' || message.contentType === 13);
   const contact = isNativeContact ? sharedContact(message) : null;
   const rejectedContact = isNativeContact && contact === null;
@@ -157,12 +152,37 @@ export function normalizeOperation(
       sizeBytes: Number.isSafeInteger(size) && size >= 0 ? size : null }]
     : [];
   return {
-    eventId: stringId(operation.revision ?? messageId, 'eventId'),
-    accountId: context.accountId, chatId, chatType, senderId, messageId, kind, text,
-    ...(decryptionFailure ? { mentionIds: [], mentionRanges: [] } : mentions(text, metadata)),
+    kind, text, attachments, contact, isNativeContact, rejectedContact,
+    mentions: decryptionFailure ? { mentionIds: [], mentionRanges: [] } : mentions(text, metadata),
     replyToMessageId: !decryptionFailure && message.relatedMessageId != null &&
       (message.messageRelationType === 3 || message.messageRelationType === 'REPLY')
       ? stringId(message.relatedMessageId, 'relatedMessageId') : null,
+  };
+}
+
+export function normalizeOperation(
+  operationValue: unknown,
+  context: NormalizeContext,
+  decryptionFailure?: DecryptionFailure,
+): InboundEnvelope {
+  const operation = record(operationValue);
+  const message = record(operation.message);
+  const messageId = stringId(message.id ?? operation.revision, 'messageId');
+  const senderId = stringId(message.from ?? operation.param2 ?? context.ownMid, 'senderId');
+  const destination = stringId(message.to ?? operation.param1 ?? senderId, 'destination');
+  const toType = message.toType;
+  const chatType = toType === 2 || destination.startsWith('c') ? 'group'
+    : toType === 1 || destination.startsWith('r') ? 'room' : 'direct';
+  const chatId = chatType === 'direct' && destination === context.ownMid ? senderId : destination;
+  const timestamp = message.createdTime ?? message.deliveredTime ?? Date.now();
+  const occurredAt = new Date(Number(timestamp)).toISOString();
+  const { kind, text, attachments, contact, isNativeContact, rejectedContact, mentions: mentionFields, replyToMessageId } =
+    messageContent(message, messageId, decryptionFailure);
+  return {
+    eventId: stringId(operation.revision ?? messageId, 'eventId'),
+    accountId: context.accountId, chatId, chatType, senderId, messageId, kind, text,
+    ...mentionFields,
+    replyToMessageId,
     ingestion: { source: context.source, cursor: context.cursor }, occurredAt, attachments,
     ...(contact ? { contact } : {}),
     raw: isNativeContact ? rejectedContact ? { contentState: 'contact_rejected' } : {}

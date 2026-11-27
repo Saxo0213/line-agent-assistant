@@ -43,7 +43,8 @@ import { embeddedPaths } from './services/embedded-postgres/pin.js';
 import { runProcess } from './services/embedded-postgres/process.js';
 import { changeEmbeddedPassword, connectWithPasswordRecovery, passwordFromDatabaseUrl, resetAdminPasswordViaLocalSocket, setRolePassword } from './services/embedded-postgres/password.js';
 import { AgentCliBridge, NodeProcessRunner } from '@line-agent/agent-bridge';
-import { AgentRepository, MessageRepository, SettingsRepository, createPool, migrate } from '@line-agent/database';
+import { prepareAgentUpgradeNotice } from './services/agent-upgrade-notice.js';
+import { AccountRepository, AgentRepository, MessageRepository, SettingsRepository, createPool, migrate } from '@line-agent/database';
 import { StartupCleanup } from './startup-cleanup.js';
 import { startTrafficLog } from '../../../../packages/line-worker/src/traffic-log.js';
 import { startTrafficLogRetention } from '../../../../packages/line-worker/src/traffic-log-retention.js';
@@ -269,6 +270,13 @@ async function initializeServices(): Promise<void> {
     durableCursor: (accountId, signal) => messages.getLiveCursor(accountId, signal),
     chromeLtsmDir: chromeLtsm.rootDir,
     legyEncrypted: () => settings.getLineLegyEncrypted(),
+    // Community receive is for an Agent account with a SYSTEM_LOGIN source only. The worker reads it at start.
+    squareReceive: async (accountId) => {
+      if (!await settings.getLineSquareReceive()) return false;
+      const capability = await new AccountRepository(pool).resolveCapabilities(accountId);
+      return capability?.productRole === 'AGENT' && capability.connectionMode === 'SYSTEM_LOGIN';
+    },
+    squareCursor: async (accountId) => (await messages.readSquareCursor(accountId))?.syncToken ?? null,
   });
   startupCleanup.add(() => workers.shutdown());
   const previewPresenter = createElectronPreviewPresenter({
@@ -277,7 +285,11 @@ async function initializeServices(): Promise<void> {
     createWindow: (options) => new BrowserWindow(options),
   });
   const publish = createDomainEventPublisher((channel, event) => window?.webContents.send(channel, event));
-  const connected = await createConnectedFacade({ pool, workers, agent: bridge, workspaceAuthority, attachmentRoot: bootstrap.attachmentRoot,
+  // After a version change, the first resumed job of each older session gets a one-time notice. The state is read before any Agent job can start.
+  const agentUpgradeNotice = await prepareAgentUpgradeNotice({ file: path.join(app.getPath('userData'), 'agent', 'upgrade-notice.json'),
+    version: app.getVersion(), listSessionIds: () => agents.listExternalSessionIds(),
+    onError: (error) => audit.failure(diagnosticFailure('agent', 'persist', error)) });
+  const connected = await createConnectedFacade({ pool, workers, agent: bridge, workspaceAuthority, attachmentRoot: bootstrap.attachmentRoot, agentUpgradeNotice,
     accountsDirectory: path.join(app.getPath('userData'), 'llm-accounts'),
     // A click on a message-rule notification shows and focuses the main window, then asks the renderer to open the chat.
     forwardNotify: createForwardNotifier({ Notification, onError: (error) => audit.failure(diagnosticFailure('agent', 'execute', error)),
@@ -299,7 +311,12 @@ async function initializeServices(): Promise<void> {
     previewCacheRoot: path.join(app.getPath('userData'), 'cache', 'line-image-previews'),
     mediaCacheRoot: path.join(app.getPath('userData'), 'avatar-cache'),
     downloadBridgeRoot: path.join(app.getPath('userData'), 'official-download-bridge'),
-    openAttachmentPath: (file) => shell.openPath(file), openFolderPath: (folder) => shell.openPath(folder), secretStore, audit, previewPresenter,
+    openAttachmentPath: (file) => shell.openPath(file), openFolderPath: (folder) => shell.openPath(folder),
+    chooseProjectFolder: async () => {
+      const result = await dialog.showOpenDialog(window!, { title: nativeDesktopText(getEffectiveLocale(), 'projectFolder'), properties: ['openDirectory'] });
+      return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]!;
+    },
+    secretStore, audit, previewPresenter,
     chromeLogin: {
       ltsm: chromeLtsm,
       chooseFolder: async () => {

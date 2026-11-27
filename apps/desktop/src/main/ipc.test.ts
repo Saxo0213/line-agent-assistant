@@ -120,6 +120,21 @@ describe('renderer IPC boundary', () => {
     expect(openExternalUrl).toHaveBeenCalledTimes(3);
   });
 
+  it('opens the line:// profile popup of one user MID and no other line:// form', async () => {
+    const openExternalUrl = vi.fn(async (_url: string) => undefined);
+    const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', openExternalUrl });
+    const sender = { senderId: 7, url: 'file:///app/index.html' };
+    const request = (url: string) => ({ type: 'openExternalUrl', requestId: 'line-link', url });
+    const mid = `u${'0123456789abcdef'.repeat(2)}`;
+    expect((await adapter(sender, request(`line://nv/profilePopup/mid=${mid}`))).ok).toBe(true);
+    expect(openExternalUrl).toHaveBeenCalledWith(`line://nv/profilePopup/mid=${mid}`);
+    for (const url of [`line://nv/profilePopup/mid=${mid}0`, `line://nv/profilePopup/mid=${mid.toUpperCase()}`, `line://nv/profilePopup/mid=c${'a'.repeat(32)}`,
+      `line://nv/profilePopup/mid=${mid}&x=1`, `line://nv/chat/${mid}`, 'line://ti/p/~someone', `line://nv/profilePopup/mid=${mid}\n`, ` line://nv/profilePopup/mid=${mid}`]) {
+      expect((await adapter(sender, request(url))).ok, url).toBe(false);
+    }
+    expect(openExternalUrl).toHaveBeenCalledTimes(1);
+  });
+
   it('returns an IPC error when opening an external URL fails', async () => {
     const openExternalUrl = vi.fn(async () => { throw new Error('browser unavailable'); });
     const adapter = createIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', openExternalUrl });

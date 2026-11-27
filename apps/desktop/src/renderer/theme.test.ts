@@ -66,7 +66,7 @@ describe('operator palette and scaling', () => {
       expect(wrapperStyle.lineHeight).toBe(directStyle.lineHeight);
       expect(replyStyle.lineHeight).toBe(timeStyle.lineHeight);
       expect(replyStyle.marginTop).toBe('0px');
-      expect(getComputedStyle(actions).alignItems).toBe('flex-end');
+      expect(getComputedStyle(actions).flexDirection).toBe('row');
       // The shared rule is outside viewport media queries, so narrow layouts keep these metrics too.
       expect(style.textContent).toMatch(/\.message-row \.message-trailing-meta :is\([^)]*\.message-read-root[^)]*\)\s*\{[^}]*font-size:\s*11px;[^}]*line-height:\s*16px/s);
     } finally { row.remove(); style.remove(); }
@@ -97,7 +97,7 @@ describe('operator palette and scaling', () => {
         expect(computed.paddingTop).toBe('0px');
         expect(computed.paddingBottom).toBe('0px');
       }
-      expect(getComputedStyle(actions).alignItems).toBe('flex-end');
+      expect(getComputedStyle(actions).flexDirection).toBe('row');
       expect(style.textContent).toContain('.message-row .message-actions .reply-action::before');
       expect(style.textContent).toContain('.message-read-button:focus-visible');
       expect(getComputedStyle(trailing).gap).toBe('0');
@@ -116,10 +116,10 @@ describe('operator palette and scaling', () => {
     const time = document.createElement('time'); time.className = 'message-time';
     meta.append(time); row.append(actions, meta); document.body.append(row);
     try {
-      expect(getComputedStyle(time).alignSelf).toBe('flex-start');
-      expect(getComputedStyle(actions).width).toBe('100%');
-      expect(getComputedStyle(actions).alignItems).toBe('flex-start');
-      expect(getComputedStyle(meta).width).toBe('100%');
+      expect(getComputedStyle(actions).flexDirection).toBe('row');
+      expect(getComputedStyle(meta).flexDirection).toBe('row');
+      expect(getComputedStyle(meta).flexWrap).toBe('nowrap');
+      expect(getComputedStyle(time).whiteSpace).toBe('nowrap');
     } finally { row.remove(); style.remove(); }
   });
 

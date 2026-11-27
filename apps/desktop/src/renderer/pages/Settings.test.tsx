@@ -771,7 +771,7 @@ describe('database settings', () => {
       { name: 'codex', status: 'stopped', message: '尚未設定', lastSuccessAt: null, restartCount: 0 },
     ]} />, 'en');
 
-    expect(screen.getAllByRole('tab').map((item) => item.textContent)).toEqual(['System', 'Conversations', 'Assistant', 'Commands', 'Records', 'About']);
+    expect(screen.getAllByRole('tab').map((item) => item.textContent)).toEqual(['System', 'Folders', 'Conversations', 'Assistant', 'Commands', 'Records', 'About']);
     expect(screen.queryByRole('tab', { name: 'Status' })).toBeNull();
     expect(within(document.querySelector('.database-summary') as HTMLElement).getByText('Database').nextElementSibling?.textContent).toBe('Connected');
     expect(screen.queryByRole('heading', { name: '選用 Agent' })).toBeNull();

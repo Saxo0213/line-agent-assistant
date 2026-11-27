@@ -1,9 +1,11 @@
-import { safeErrorTextFor, desktopTextFor, callSummaryFor, generatedPreviewFor, useDesktopLocale, useDesktopText } from '../desktop-i18n.js';
+import { safeErrorTextFor, desktopTextFor, callSummaryFor, generatedPreviewFor, useDesktopLocale, useDesktopText, useExtraText } from '../desktop-i18n.js';
+import { buildOutgoingMentions, filterMentionMembers, findMentionQuery, insertMention, mentionDisplayName, reconcileMentionRecords, type MentionMember, type MentionRecord } from '../mention-composer.js';
 import type { Locale } from '../../locale.js';
 import { AgentStatusMarker } from '../AgentStatusMarker.js';
 import { MessageReactions } from './MessageReactions.js';
+import { MessageReactionPicker } from './MessageReactionPicker.js';
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { AGENT_ATTACHMENT_LIMITS, type AgentAttachmentUpload, type AppSnapshot, type ConversationSummary, type LineAccountSummary, type ConversationKey } from '@line-agent/contracts';
+import { AGENT_ATTACHMENT_LIMITS, type AgentAttachmentUpload, type OutgoingMention, type AppSnapshot, type ConversationSummary, type LineAccountSummary, type ConversationKey } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import type { TimelineMessage } from '../../main/service-facade.js';
 import { ComposerStatus, useComposerStatus, type ComposerMessage } from './ComposerStatus.js';
@@ -122,6 +124,7 @@ function trimUrlPunctuation(value: string): { url: string; suffix: string } {
   }
   return { url: value.slice(0, end), suffix: value.slice(end) };
 }
+const LINE_PROFILE_URL = /^line:\/\/nv\/profilePopup\/mid=u[0-9a-f]{32}$/;
 function isHttpUrl(value: string): boolean {
   if (value.length > 8192 || /[\u0000-\u001f\u007f]/u.test(value)) return false;
   try {
@@ -149,17 +152,21 @@ function normalizeMentionRanges(text: string, ranges: readonly MessageMentionRan
 function renderMessageText(text: string, onOpenUrl: (url: string) => void, mentionRanges?: readonly MessageMentionRange[]): React.ReactNode {
   const parts: React.ReactNode[] = [];
   const appendLinkifiedText = (segment: string, offset: number) => {
-    const urlPattern = /https?:\/\/[^\s<>]+/giu;
+    // Only this exact LINE form is a link besides HTTP and HTTPS: line://nv/profilePopup/mid=<u + 32 lowercase hex>.
+    const urlPattern = /https?:\/\/[^\s<>]+|line:\/\/nv\/profilePopup\/mid=u[0-9a-f]{32}(?![0-9A-Za-z])/giu;
     let cursor = 0;
     for (const match of segment.matchAll(urlPattern)) {
       const start = match.index;
       const raw = match[0];
       if (start === undefined) continue;
-      const { url, suffix } = trimUrlPunctuation(raw);
-      if (!url || !isHttpUrl(url)) continue;
+      const isLineProfile = LINE_PROFILE_URL.test(raw);
+      if (!isLineProfile && /^line:/i.test(raw)) continue;
+      const { url, suffix } = isLineProfile ? { url: raw, suffix: '' } : trimUrlPunctuation(raw);
+      if (!url || (!isLineProfile && !isHttpUrl(url))) continue;
       if (start > cursor) parts.push(segment.slice(cursor, start));
       let parsedUrl: string;
-      try { parsedUrl = new URL(url).href; } catch { continue; }
+      if (isLineProfile) parsedUrl = raw;
+      else try { parsedUrl = new URL(url).href; } catch { continue; }
       parts.push(<React.Fragment key={`link-${offset + start}`}><a href={parsedUrl} onClick={(event) => { event.preventDefault(); onOpenUrl(parsedUrl); }} onAuxClick={(event) => { if (event.button === 1) event.preventDefault(); }}>{url}</a>{suffix}</React.Fragment>);
       cursor = start + raw.length;
     }
@@ -298,6 +305,12 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   const [listHeight, setListHeight] = useState(720);
   const [focusedRow, setFocusedRow] = useState<string | null>(null);
   const [lineDrafts, setLineDrafts] = useState<Record<string, string>>({});
+  const [mentionRecords, setMentionRecords] = useState<Record<string, MentionRecord[]>>({});
+  const [mentionMembers, setMentionMembers] = useState<{ routeKey: string; members: MentionMember[] } | null>(null);
+  const [mentionMenu, setMentionMenu] = useState<{ start: number; query: string; index: number } | null>(null);
+  const draftBox = useRef<HTMLTextAreaElement>(null);
+  const pendingCaret = useRef<number | null>(null);
+  const extra = useExtraText();
   const [manualFiles, setManualFiles] = useState<Record<string, Array<{ id: string; file: File }>>>({});
   const manualFileInput = useRef<HTMLInputElement>(null);
   const [fileDragActive, setFileDragActive] = useState(false);
@@ -353,6 +366,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   const [unsendMenu, setUnsendMenu] = useState<{ messageId: string; x: number; y: number; routeKey: string } | null>(null);
   const [unsendBusy, setUnsendBusy] = useState(false);
   const [manualUnsendWindow, setManualUnsendWindow] = useState<'1h' | '7d'>('1h');
+  const [editHistoryOpen, setEditHistoryOpen] = useState<Record<string, boolean>>({});
   useEffect(() => { if (typeof api.getManualUnsendWindow !== 'function') return; let live = true; void api.getManualUnsendWindow().then((window) => { if (live) setManualUnsendWindow(window); }).catch(() => undefined); return () => { live = false; }; }, [api]);
   const requestGeneration = useRef(0);
   const latestRequest = useRef<number | null>(null);
@@ -421,6 +435,67 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
   const routeFiles = manualFiles[routeKey] ?? [];
   const canAttachMedia = !!writableRoute && route?.chatType !== 'room';
   const canSendLine = !!writableRoute && !!account && account.canSendManually === true && account.status === 'connected' && coreReady;
+  // The @ mention list: members of a group or room only. The own MID is not in the list (Main leaves it out).
+  const mentionable = canSendLine && (route?.chatType === 'group' || route?.chatType === 'room');
+  const routeMentions = mentionRecords[routeKey] ?? [];
+  const mentionCandidates = mentionMenu !== null && mentionable && mentionMembers?.routeKey === routeKey
+    ? filterMentionMembers(mentionMembers.members, mentionMenu.query) : [];
+  function loadMentionMembers() {
+    if (!route || typeof api.listConversationMembers !== 'function') return;
+    const capturedRouteKey = routeKey;
+    void api.listConversationMembers(route).then((result) => { if (currentRoute.current === capturedRouteKey) setMentionMembers({ routeKey: capturedRouteKey, members: result.members }); })
+      .catch(() => { if (currentRoute.current === capturedRouteKey) setMentionMembers({ routeKey: capturedRouteKey, members: [] }); });
+  }
+  useEffect(() => {
+    setMentionMenu(null);
+    if (!mentionable) { setMentionMembers(null); return; }
+    loadMentionMembers();
+  }, [api, routeKey, mentionable]);
+  useLayoutEffect(() => {
+    const caret = pendingCaret.current;
+    if (caret === null || !draftBox.current) return;
+    pendingCaret.current = null;
+    draftBox.current.focus();
+    draftBox.current.setSelectionRange(caret, caret);
+  });
+  function changeDraft(next: string, caret: number | null) {
+    draftRevisions.current[lineRevisionKey] = (draftRevisions.current[lineRevisionKey] ?? 0) + 1;
+    if (routeMentions.length > 0) setMentionRecords((all) => ({ ...all, [routeKey]: reconcileMentionRecords(all[routeKey] ?? [], lineDraft, next) }));
+    setLineDrafts((drafts) => ({ ...drafts, [routeKey]: next }));
+    const found = mentionable && caret !== null ? findMentionQuery(next, caret) : null;
+    if (found && mentionMenu === null) loadMentionMembers();
+    setMentionMenu(found ? { start: found.start, query: found.query, index: 0 } : null);
+  }
+  function pickMention(member: MentionMember) {
+    const box = draftBox.current;
+    if (!mentionMenu || !box) return;
+    const caret = box.selectionStart ?? lineDraft.length;
+    const inserted = insertMention(lineDraft, mentionMenu.start, Math.max(caret, mentionMenu.start), member, routeMentions);
+    draftRevisions.current[lineRevisionKey] = (draftRevisions.current[lineRevisionKey] ?? 0) + 1;
+    setMentionRecords((all) => ({ ...all, [routeKey]: inserted.records }));
+    setLineDrafts((drafts) => ({ ...drafts, [routeKey]: inserted.text }));
+    pendingCaret.current = inserted.caret;
+    setMentionMenu(null);
+  }
+  /** Arrow keys, Enter, Tab and Escape of the open mention list. Returns true when the key was used. */
+  function handleMentionKey(event: React.KeyboardEvent<HTMLTextAreaElement>): boolean {
+    if (!mentionMenu || !mentionable || event.nativeEvent.isComposing) return false;
+    if (event.key === 'Escape') { event.preventDefault(); setMentionMenu(null); return true; }
+    const count = mentionCandidates.length;
+    if (count === 0) return false;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const step = event.key === 'ArrowDown' ? 1 : count - 1;
+      setMentionMenu({ ...mentionMenu, index: (Math.min(mentionMenu.index, count - 1) + step) % count });
+      return true;
+    }
+    if ((event.key === 'Enter' && !event.ctrlKey && !event.shiftKey) || event.key === 'Tab') {
+      event.preventDefault();
+      pickMention(mentionCandidates[Math.min(mentionMenu.index, count - 1)]!);
+      return true;
+    }
+    return false;
+  }
   function addManualFiles(incoming: File[]) {
     if (sending || incoming.length === 0 || !canAttachMedia) return;
     let total = routeFiles.reduce((sum, item) => sum + item.file.size, 0);
@@ -477,6 +552,12 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     } finally { setUnsendBusy(false); }
   }
   function chooseReply(target: TimelineMessage | null) { replyRevision.current += 1; setReply(target); }
+  // A recalled or deleted message is gone on LINE: drop it as the reply target at once.
+  useEffect(() => {
+    if (reply === null) return;
+    const current = messages.find((item) => item.accountId === reply.accountId && item.messageId === reply.messageId);
+    if (current?.deleted) { replyRevision.current += 1; setReply(null); }
+  }, [messages, reply]);
   function visibleMessageIds(items = messagesRef.current, start = windowStart): string[] {
     const first = Math.min(start, Math.max(0, items.length - RENDER_WINDOW));
     return items.slice(first, first + RENDER_WINDOW).map((item) => item.messageId);
@@ -725,9 +806,10 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     if (!current || current.status !== 'failed') return;
     replaceFeedback(sendFeedbackRef.current.map((item) => item.id === entry.id ? { ...item, status: 'pending' } : item));
     try {
+      const retryMentions: [OutgoingMention[]] | [] = current.mentions?.length ? [current.mentions.map((mention) => ({ ...mention }))] : [];
       const result = current.replyToMessageId
-        ? await api.replyText(writableRoute, current.replyToMessageId, current.text)
-        : await api.sendText(writableRoute, current.text);
+        ? await api.replyText(writableRoute, current.replyToMessageId, current.text, ...retryMentions)
+        : await api.sendText(writableRoute, current.text, ...retryMentions);
       if (result.ok) settleFeedback(current.id, 'remove');
       else settleFeedback(current.id, result.type === 'error' && result.code === 'LINE_SEND_NOT_STARTED' ? 'failed' : 'unknown');
     } catch { settleFeedback(current.id, 'unknown'); }
@@ -965,6 +1047,9 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     const submittedRevision = draftRevisions.current[revisionKey] ?? 0;
     const text = lineDraft.trim();
     const submittedFiles = [...routeFiles];
+    // The mentions of the sent text. The offsets follow `text`, which is the trimmed draft.
+    const sendMentions = mentionable ? buildOutgoingMentions(lineDraft, routeMentions) : [];
+    const mentionArgument: [typeof sendMentions] | [] = sendMentions.length > 0 ? [sendMentions] : [];
     if (!text && submittedFiles.length === 0) return;
     if (!canSendLine) return;
     const capturedRoute = writableRoute;
@@ -977,6 +1062,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
         setComposerError(desktopText('sendFeedbackIsFullTrySendingAgainLater')); return;
       }
       const pendingEntry: ManualSendFeedback = { id: id!, key: capturedRoute, routeKey, text, replyToMessageId: capturedReplyId,
+        ...(sendMentions.length > 0 ? { mentions: sendMentions } : {}),
         createdAt: new Date().toISOString(), status: 'pending' };
       const nextEntries = addManualSendFeedback(currentEntries, pendingEntry);
       if (!nextEntries) { setComposerError(desktopText('sendFeedbackIsFullTrySendingAgainLater')); return; }
@@ -989,7 +1075,8 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     setSending(true); clearComposerStatus();
     try {
       if (text && id) {
-        const result = capturedReplyId ? await api.replyText(capturedRoute, capturedReplyId, text) : await api.sendText(capturedRoute, text);
+        const result = capturedReplyId ? await api.replyText(capturedRoute, capturedReplyId, text, ...mentionArgument) : await api.sendText(capturedRoute, text, ...mentionArgument);
+        if (draftRevisions.current[revisionKey] === submittedRevision && routeMentions.length > 0) setMentionRecords((all) => ({ ...all, [routeKey]: [] }));
         if (result.ok) {
           settleFeedback(id, 'remove');
           if (currentRoute.current === routeKey) setComposerNotice(desktopText('sentToLine'));
@@ -1091,7 +1178,7 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
     : undefined;
   return <div className="conversation-layout">
     <section className={`conversation-list ${listOpen ? 'open' : ''}`} id="conversation-list" tabIndex={-1} aria-label={desktopText('chatList')}><div className="conversation-search-top"><label className="search-field"><span className="sr-only">{friendsView ? desktopText('searchFriends') : desktopText('searchChats')}</span><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder={friendsView ? desktopText('searchFriends') : desktopText('searchChats')} /></label></div>
-      <div className="conversation-sort"><div className="conversation-view-toggle" role="radiogroup" aria-label={desktopText('listType')}>{(['chats', 'friends'] as const).map((value) => <button key={value} type="button" role="radio" aria-checked={listView === value} className={listView === value ? 'active' : undefined} onClick={() => { if (listView === value) return; setListView(value); if (listNode.current) listNode.current.scrollTop = 0; setListTop(0); }}>{value === 'chats' ? desktopText('chats') : desktopText('friends')}</button>)}</div><ConversationSortMenu value={sort} onChange={(next) => { setSort(next); if (listNode.current) listNode.current.scrollTop = 0; setListTop(0); }} /></div>
+      <div className="conversation-sort"><div className="conversation-view-toggle" role="radiogroup" aria-label={desktopText('listType')}>{(['chats', 'friends'] as const).map((value) => <button key={value} type="button" role="radio" aria-checked={listView === value} className={listView === value ? 'active' : undefined} onClick={() => { if (listView === value) return; setListView(value); if (value === 'friends' && account?.accountId) void api.refreshLineCatalog?.(account.accountId).catch(() => undefined); if (listNode.current) listNode.current.scrollTop = 0; setListTop(0); }}>{value === 'chats' ? desktopText('chats') : desktopText('friends')}</button>)}</div><ConversationSortMenu value={sort} onChange={(next) => { setSort(next); if (listNode.current) listNode.current.scrollTop = 0; setListTop(0); }} /></div>
        {friendsView ? <div className="list-scroll" ref={listNode} onScroll={(event) => { setListTop(event.currentTarget.scrollTop); setListHeight(event.currentTarget.clientHeight || 720); }}><div className="friend-list" style={friendItems.length > 100 ? { height: friendItems.length * 66 } : undefined}>{friendRows.map(({ entry, index }) => {
         const { friend, conversation: chat, name } = entry;
         const rowStyle = friendItems.length > 100 ? { position: 'absolute' as const, top: index * 66, height: 66 } : undefined;
@@ -1153,6 +1240,16 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
             const recalledMarker = message.deleted
               ? <span className="message-recalled-label">{recalledOriginal ? recalledMarkerLabel(message, locale) : desktopText('arg0NoData', { arg0: recalledMarkerLabel(message, locale) })}</span>
               : null;
+            const showReadReceipt = message.direction === 'outbound' && message.readCount !== undefined && message.readCount > 0 && !isEvent;
+            const editVersions = message.edited?.versions ?? [];
+            const editKey = `${message.accountId}/${message.messageId}`;
+            const editHistoryShown = editVersions.length > 0 && editHistoryOpen[editKey] === true;
+            const editedMarker = message.edited && !message.deleted
+              ? editVersions.length > 0
+                ? <button type="button" className="message-edited-label message-edited-button" aria-expanded={editHistoryShown}
+                  onClick={() => setEditHistoryOpen((open) => ({ ...open, [editKey]: !open[editKey] }))}>{desktopText('messageEdited')}</button>
+                : <span className="message-edited-label">{desktopText('messageEdited')}</span>
+              : null;
             return <React.Fragment key={`${message.accountId}/${message.messageId}`}>
             {dateChanged && <div className="date-separator">{new Date(message.occurredAt).toLocaleDateString(locale)}</div>}
             <div className={`message-row ${message.direction} ${route.chatType}${showIdentity ? ' has-inbound-identity' : ''}${showSenderName ? ' has-sender-name' : ''}${runStart ? ' run-start' : ' run-cont'}${message.reactions?.length ? ' has-reactions' : ''}`} data-message-date={message.occurredAt}
@@ -1200,8 +1297,13 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
                           accessibleFallback className="sticker-image" alt={message.sticker.altText || desktopText('lineSticker')} />
                         : <span className="sticker-fallback" role="img" aria-label={desktopText('sticker')}>{desktopText('sticker')}</span>}
                     </div>}</>}
+                {editHistoryShown && !message.deleted && <div className="message-edit-history" role="region" aria-label={desktopText('messageEditHistory')}>
+                  <strong>{desktopText('messageEditHistory')}</strong>
+                  <ul>{editVersions.map((version, versionIndex) => <li key={`${version.until}/${versionIndex}`}>
+                    <time dateTime={version.until}>{new Date(version.until).toLocaleString(locale)}</time><span className="message-edit-history-text">{version.text}</span></li>)}</ul>
+                </div>}
                 {(!message.deleted || recalledOriginal) && message.attachments.filter((attachment) => !message.deleted || attachment.status === 'ready').map((attachment) => <div className={`attachment-wrap${attachment.status === 'ready' ? ' ready' : ''}`} key={attachment.id}>
-                  {attachment.kind === 'image' && attachment.status === 'ready' && <LineMediaImage api={api} enabled attachment={{ key: route, attachmentId: attachment.id }} fallback={desktopText('imagePreviewUnavailable')} className="inline-attachment-image" alt={attachment.name || desktopText('imageAttachment')} />}
+                  {attachment.kind === 'image' && attachment.status === 'ready' && <LineMediaImage api={api} enabled attachment={{ key: route, attachmentId: attachment.id }} revision={`${attachment.status}:${attachment.sizeBytes}`} fallback={desktopText('imagePreviewUnavailable')} className="inline-attachment-image" alt={attachment.name || desktopText('imageAttachment')} />}
                   {attachment.kind === 'image' && attachment.status === 'ready'
                     ? null
                     : <FileAttachmentCard attachment={(() => { const view = externalAttachmentView(attachment, route?.chatType ?? '', account.downloadBridge);
@@ -1210,14 +1312,19 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
                 </div>)}
               </article>
               <div className="message-trailing-meta">
-                {(message.attachments.some((attachment) => attachment.status === 'ready') || canSendLine) && <div className="message-actions">
-                  {message.attachments.filter((attachment) => attachment.status === 'ready').map((attachment) => <button key={attachment.id} className="reply-action" onClick={() => void openAttachment(attachment.id)}>{desktopText('open')}</button>)}
-                  {canSendLine && <button className="reply-action" disabled={message.direction === 'outbound'} onClick={() => chooseReply(message)}>{desktopText('reply')}</button>}
+                <div className="message-meta-line">
+                {(message.attachments.some((attachment) => attachment.status === 'ready') || (canSendLine && !message.deleted)) && <div className={`message-actions${message.attachments.some((attachment) => attachment.status === 'ready') ? ' has-open' : ''}`}>
+                  {message.attachments.filter((attachment) => attachment.status === 'ready').map((attachment, attachmentIndex) => <React.Fragment key={attachment.id}>{attachmentIndex > 0 && <span className="meta-sep" aria-hidden="true">｜</span>}<button className="reply-action" onClick={() => void openAttachment(attachment.id)}>{desktopText('open')}</button></React.Fragment>)}
+                  {canSendLine && !message.deleted && <>{message.attachments.some((attachment) => attachment.status === 'ready') && <span className="meta-sep reply-sep" aria-hidden="true">｜</span>}<button className="reply-action reply-hover" disabled={message.direction === 'outbound'} onClick={() => chooseReply(message)}>{desktopText('reply')}</button></>}
                 </div>}
-                <div className="message-meta">
-                  {message.direction === 'outbound' && message.readCount !== undefined && message.readCount > 0 && !isEvent
-                    ? <MessageReadReceipt api={api} route={route} messageId={message.messageId} count={message.readCount} /> : null}
-                  {recalledMarker}<time className="message-time" dateTime={message.occurredAt}>{formatMessageTime(message.occurredAt)}</time>
+                {(showReadReceipt || recalledMarker || editedMarker) && <div className="message-meta-status">
+                  {showReadReceipt ? <MessageReadReceipt api={api} route={route} messageId={message.messageId} count={message.readCount!} /> : null}
+                  {recalledMarker}{editedMarker}
+                </div>}
+                </div>
+                <div className="message-meta-bottom">
+                  <div className="message-meta"><time className="message-time" dateTime={message.occurredAt}>{formatMessageTime(message.occurredAt)}</time></div>
+                  {canSendLine && !isEvent && !message.deleted && writableRoute && typeof api.reactMessage === 'function' && <MessageReactionPicker api={api} route={writableRoute} message={message} />}
                 </div>
               </div>
               {message.reactions && message.reactions.length > 0 && <MessageReactions api={api} message={message} />}
@@ -1245,7 +1352,14 @@ export function Conversations({ api, snapshot, conversation, selected, onSelect,
         </div>
         {canSendLine ? <div className={`composer route-${account.mode}`} id="composer" tabIndex={-1}>
           {reply && <div className="reply-preview"><LineMediaImage api={api} enabled={reply.senderAvatarAvailable === true} target={reply.direction === 'outbound' ? { type: 'account', accountId: reply.accountId } : { type: 'member', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId, memberId: reply.senderId }} fallbackKind="person" className="reply-avatar" /><span className="reply-copy"><strong className="reply-name">{replyName}</strong><span className="reply-quote">{renderMessageText(replyContent, openMessageUrl, replyMentionRanges)}</span></span><button className="reply-cancel" aria-label={desktopText('cancelReply')} onClick={() => chooseReply(null)}><span aria-hidden="true">×</span></button></div>}
-          <label className="sr-only" htmlFor="line-draft">{desktopText('lineMessage')}</label><textarea id="line-draft" className={fileDragActive ? 'composer-drop-active' : undefined} aria-label={desktopText('lineMessage')} value={lineDraft} onChange={(event) => { draftRevisions.current[lineRevisionKey] = (draftRevisions.current[lineRevisionKey] ?? 0) + 1; setLineDrafts((drafts) => ({ ...drafts, [routeKey]: event.target.value })); }} onKeyDown={(event) => { if (event.ctrlKey && event.key === 'Enter') { event.preventDefault(); void submit(); } }} onDragOver={(event) => { if (!canAttachMedia || !Array.from(event.dataTransfer.types).includes('Files')) return; event.preventDefault(); setFileDragActive(true); }} onDragLeave={() => setFileDragActive(false)} onDrop={(event) => { if (!canAttachMedia) return; event.preventDefault(); setFileDragActive(false); addManualFiles(Array.from(event.dataTransfer.files)); }} placeholder={desktopText('enterAMessageToSendToLine')} />
+          <label className="sr-only" htmlFor="line-draft">{desktopText('lineMessage')}</label>{mentionMenu !== null && mentionable && <ul role="listbox" id="mention-list" className="mention-menu" aria-label={extra('mentionListLabel')}>
+            {mentionCandidates.length === 0
+              ? <li role="option" aria-disabled="true" aria-selected="false" className="mention-empty">{extra('mentionNoMatch')}</li>
+              : mentionCandidates.map((member, index) => <li key={member.mid} role="option" aria-selected={index === Math.min(mentionMenu.index, mentionCandidates.length - 1)}
+                className={`mention-option${index === Math.min(mentionMenu.index, mentionCandidates.length - 1) ? ' active' : ''}`}
+                onMouseDown={(event) => { event.preventDefault(); pickMention(member); }}>{mentionDisplayName(member)}</li>)}
+          </ul>}
+          <textarea id="line-draft" ref={draftBox} className={fileDragActive ? 'composer-drop-active' : undefined} aria-label={desktopText('lineMessage')} value={lineDraft} {...(mentionMenu !== null && mentionable ? { 'aria-controls': 'mention-list', 'aria-autocomplete': 'list' as const } : {})} onChange={(event) => changeDraft(event.target.value, event.target.selectionStart)} onBlur={() => setMentionMenu(null)} onKeyDown={(event) => { if (handleMentionKey(event)) return; if (event.ctrlKey && event.key === 'Enter') { event.preventDefault(); void submit(); } }} onDragOver={(event) => { if (!canAttachMedia || !Array.from(event.dataTransfer.types).includes('Files')) return; event.preventDefault(); setFileDragActive(true); }} onDragLeave={() => setFileDragActive(false)} onDrop={(event) => { if (!canAttachMedia) return; event.preventDefault(); setFileDragActive(false); addManualFiles(Array.from(event.dataTransfer.files)); }} placeholder={desktopText('enterAMessageToSendToLine')} />
           {routeFiles.length > 0 && <ul className="manual-media-chips" aria-label={desktopText('pendingAttachments')}>{routeFiles.map(({ id: fileId, file }) => <li key={fileId}><span aria-hidden="true">{file.type.startsWith('image/') ? '▧' : '▤'}</span><span title={file.name}>{file.name}</span><small>{new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(file.size / (1024 * 1024))} MB</small><button type="button" aria-label={desktopText('removeArg0', { arg0: file.name })} disabled={sending} onClick={() => removeManualFile(fileId)}>×</button></li>)}</ul>}
           <div className="composer-actions"><span className="composer-actions-hint">{desktopText('ctrlEnterToSendEnterForANewLine')}</span><ComposerStatus message={composerStatus ?? accountComposerStatus(account, coreReady, locale)} onDismiss={clearComposerStatus} />{showCoreWarning && <span className="health bad" role="status">{desktopText('coreFeaturesNeedAttention')}</span>}{route?.chatType === 'room' && <span className="muted" role="status">{desktopText('mediaSendingRequiresDirectOrGroupChat')}</span>}<input ref={manualFileInput} className="sr-only" type="file" multiple data-testid="line-media-file-input" aria-label={desktopText('attachFiles')} onChange={(event) => { addManualFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ''; }} /><button type="button" className="attach-button" aria-label={desktopText('attachFiles')} title={canAttachMedia ? desktopText('attachFiles') : desktopText('mediaSendingRequiresDirectOrGroupChat')} disabled={!canSendLine || !canAttachMedia || sending} onClick={() => manualFileInput.current?.click()}><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21.4 11.6l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5" /></svg></button><button className="primary" disabled={!canSendLine || (!lineDraft.trim() && routeFiles.length === 0) || sending} onClick={() => void submit()}>{sending ? desktopText('sending') : desktopText('sendToLine')}</button></div>
         </div> : <div className={`composer route-${account.mode}`}><div className="composer-actions"><ComposerStatus message={composerStatus ?? accountComposerStatus(account, coreReady, locale)} onDismiss={clearComposerStatus} />{showCoreWarning && <span className="health bad" role="status">{desktopText('coreFeaturesNeedAttention')}</span>}</div></div>}

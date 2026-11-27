@@ -51,6 +51,19 @@ describe('message forwarding form',()=>{
     const input=AgentScheduleCreateInputSchema.parse(buildScheduleInput(forwardForm({forwardMode:'contains',forwardText:'x',actNotify:true})).input);
     expect(input.task).toMatchObject({actions:{forward:true,notify:true,agent:null}});
   });
+  it('maps a photo text rule: the photo is always forwarded and the Agent writes to the delivery chat',()=>{
+    const form=forwardForm({forwardMode:'image_text',forwardText:'王小明\n\n張三豐\n',actForward:false,actAgent:false,agentTarget:null});
+    const result=buildScheduleInput(form);
+    expect(result.errors).toBeUndefined();
+    const input=AgentScheduleCreateInputSchema.parse(result.input);
+    expect(input).toMatchObject({delivery:{mode:'line_target',target:{chatId:'dest'}},task:{type:'message_forward',
+      match:{mode:'image_text',keywords:['王小明','張三豐'],verifyUnclear:true},actions:{forward:true,notify:false,agent:{prompt:'',target:{chatId:'dest'}}}}});
+    expect(formStateFromSchedule(saved(input))).toMatchObject({forwardMode:'image_text',forwardText:'王小明\n張三豐',imageVerify:true});
+    const plain=AgentScheduleCreateInputSchema.parse(buildScheduleInput({...form,imageVerify:false}).input);
+    expect(plain.task).toMatchObject({match:{verifyUnclear:false},actions:{forward:true,agent:null}});
+    expect(buildScheduleInput({...form,deliveryTarget:null}).errors?.delivery).toBeDefined();
+    expect(buildScheduleInput({...form,forwardText:' \n'}).errors?.rules).toEqual({key:'forwardInvalid'});
+  });
   it('reports a missing mention target, a missing action and a missing Agent output chat',()=>{
     expect(buildScheduleInput(forwardForm({forwardMode:'mention'})).errors?.mention).toEqual({key:'mentionNone'});
     expect(buildScheduleInput(forwardForm({forwardMode:'contains',forwardText:'x',actForward:false})).errors?.actions).toEqual({key:'errActionNone'});

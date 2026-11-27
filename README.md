@@ -4,6 +4,8 @@
 
 [![Latest release](https://img.shields.io/github/v/release/Saxo0213/line-agent-assistant)](https://github.com/Saxo0213/line-agent-assistant/releases/latest) [![Downloads](https://img.shields.io/github/downloads/Saxo0213/line-agent-assistant/total)](https://github.com/Saxo0213/line-agent-assistant/releases) ![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6) [![License: MIT](https://img.shields.io/github/license/Saxo0213/line-agent-assistant)](LICENSE)
 
+### [⬇️ Download the latest version (Windows installer)](https://github.com/Saxo0213/line-agent-assistant/releases/latest)
+
 **Put Claude or Codex to work on your LINE chats.** A Windows desktop app that lets an AI agent take instructions over LINE, search and summarize your chat history, and give Claude Desktop and Codex access to LINE through a local MCP bridge.
 
 ## Features
@@ -24,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.359 runs Claude on a resident process, adds several CLI account sources per provider with automatic failover, a `/model` command per chat, attachment reading for the Agent, adjustable download intervals, and automatic retry of the external monitor. Install through the app's **Check for updates**. See the [v1.0.342 → v1.0.359 release notes](docs/releases/v1.0.359.md) for the complete changes.
+v1.0.385 moves to a new LINE engine on linejs 3.6.9 and adds community message archiving, message reactions and @-mentions, one-to-one notes and albums, attachment self-repair, project folder management in **Settings → Folders**, and a photo-text schedule rule. Install through the app's **Check for updates**. See the [v1.0.359 → v1.0.385 release notes](docs/releases/v1.0.385.md) for the complete changes.
 
 ## Installation
 

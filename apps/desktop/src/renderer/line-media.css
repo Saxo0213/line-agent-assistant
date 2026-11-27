@@ -84,6 +84,7 @@
   width: 36px;
   height: 36px;
 }
+.message-row.has-sender-name .sender-avatar { grid-row: 1 / span 2; }
 .inbound-avatar-spacer { grid-column: 1; grid-row: var(--bubble-row); width: 36px; height: 1px; }
 
 .message-sender-name {
@@ -114,18 +115,20 @@
 .message-row .message-trailing-meta {
   display: flex;
   flex-direction: column;
-  align-items: stretch;
+  flex-wrap: nowrap;
+  align-items: flex-start;
   gap: 0;
   align-self: end;
+  white-space: nowrap;
   width: max-content;
   min-width: max-content;
   grid-row: var(--bubble-row);
 }
-.message-row.inbound .message-trailing-meta { grid-column: 3; }
-.message-row.outbound .message-trailing-meta { grid-column: 2; grid-row: 1; }
+.message-row.inbound .message-trailing-meta { grid-column: 3; align-items: flex-start; }
+.message-row.outbound .message-trailing-meta { grid-column: 2; grid-row: 1; align-items: flex-end; }
 
 /* The trailing metadata column owns one fixed pitch for every visible row. */
-.message-row .message-trailing-meta :is(.reply-action, .message-read, .message-read-root, .message-time, .message-recalled-label) {
+.message-row .message-trailing-meta :is(.reply-action, .message-read, .message-read-root, .message-time, .message-recalled-label, .message-edited-label) {
   box-sizing: border-box;
   display: flex;
   align-items: center;
@@ -141,15 +144,47 @@
 .message-row .message-trailing-meta .message-time { white-space: nowrap; }
 .message-row .message-actions .reply-action::before { content: ""; position: absolute; inset: 0 -4px; }
 
-/* Message metadata stacks markers directly above the time. */
+/* Message metadata: line 1 holds the actions and the status items, line 2 holds the time (or the smiley trigger).
+   Both lines sit against the bubble side. The status items are nearest the bubble; the actions are outward.
+   Inbound line 1 uses row-reverse, so the bar between the actions and the status items is the ::after of the status group there
+   and its ::before on outbound. Bars inside the status group are always ::before (that group keeps the normal direction). */
+.message-row .message-meta-line,
+.message-row .message-meta-bottom { display: flex; flex-direction: row; flex-wrap: nowrap; align-items: center; gap: 0; white-space: nowrap; }
+.message-row.inbound .message-meta-line { flex-direction: row-reverse; }
 .message-row .message-actions,
-.message-row .message-meta { display: flex; flex-direction: column; align-items: flex-start; width: 100%; gap: 0; }
-.message-row.inbound .message-meta { grid-column: 3; grid-row: var(--bubble-row); align-self: end; }
-.message-row.inbound .message-meta .message-time { align-self: flex-start; }
-.message-row.outbound .message-actions,
-.message-row.outbound .message-meta { align-items: flex-end; }
-.message-row.outbound .message-meta { grid-column: 2; grid-row: 1; align-self: end; }
+.message-row .message-meta-status,
+.message-row .message-meta { display: flex; flex-direction: row; flex-wrap: nowrap; align-items: center; width: auto; gap: 0; white-space: nowrap; }
+.message-row.inbound .message-actions { flex-direction: row-reverse; }
 .message-meta .message-time { grid-column: auto; grid-row: auto; }
+.message-row .message-trailing-meta .meta-sep,
+.message-row .message-meta-status > * + *::before,
+.message-row.outbound .message-actions.has-open + .message-meta-status::before,
+.message-row.inbound .message-actions.has-open + .message-meta-status::after { content: "｜"; box-sizing: border-box; display: inline-block; flex: none; color: var(--secondary); font-size: 11px; line-height: 16px; height: 16px; padding: 0 2px; }
+/* The hovered or focused row swaps the status items for the reply button and the time for the smiley trigger. */
+.message-row:hover .message-trailing-meta:has(.reply-hover) .message-meta-status,
+.message-trailing-meta:has(.reply-hover:focus, .reaction-picker:focus-within):has(.reply-hover) .message-meta-status,
+.message-trailing-meta:has(.reaction-picker.open):has(.reply-hover) .message-meta-status { display: none; }
+.message-row:hover .message-trailing-meta:has(.reaction-picker) .message-meta,
+.message-trailing-meta:has(.reply-hover:focus, .reaction-picker:focus-within):has(.reaction-picker) .message-meta,
+.message-trailing-meta:has(.reaction-picker.open) .message-meta { display: none; }
+/* Idle: the reply button and its bar are out of the flow and invisible, but the button stays in the Tab order. */
+.message-row .message-actions .reply-hover,
+.message-row .message-actions .reply-sep { position: absolute; opacity: 0; pointer-events: none; }
+.message-row:hover .message-trailing-meta .message-actions .reply-hover,
+.message-row:hover .message-trailing-meta .message-actions .reply-sep,
+.message-trailing-meta:has(.reply-hover:focus, .reaction-picker:focus-within) .message-actions .reply-hover,
+.message-trailing-meta:has(.reply-hover:focus, .reaction-picker:focus-within) .message-actions .reply-sep,
+.message-trailing-meta:has(.reaction-picker.open) .message-actions .reply-hover,
+.message-trailing-meta:has(.reaction-picker.open) .message-actions .reply-sep { position: relative; opacity: 1; pointer-events: auto; }
+.message-row .message-actions .reply-sep { pointer-events: none; }
+.message-edited-label { color: var(--secondary); white-space: nowrap; }
+.message-row .message-trailing-meta .message-edited-button { border: 0; background: transparent; font-family: inherit; cursor: pointer; }
+.message-row .message-trailing-meta .message-edited-button:hover { text-decoration: underline; }
+.message-edit-history { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border, rgba(127, 127, 127, 0.35)); font-size: 12px; }
+.message-edit-history ul { margin: 4px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.message-edit-history li { display: flex; flex-direction: column; gap: 1px; }
+.message-edit-history time { color: var(--secondary); font-size: 11px; }
+.message-edit-history-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .message-read-root { display: flex; font-size: 11px; line-height: 16px; }
 .message-read { color: var(--secondary); font-size: 11px; line-height: 16px; white-space: nowrap; }
 .message-read-button { min-height: 16px; padding: 0; border: 0; background: transparent; cursor: pointer; }
@@ -253,9 +288,8 @@
 .reply-reference-placeholder { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Row actions (reply / open) stay visible above their message time. */
-.message-row .message-actions { display: flex; flex-direction: column; }
-.message-row.inbound .message-actions .reply-action { align-self: flex-start; }
-.message-row.outbound .message-actions .reply-action { align-self: flex-end; }
+.message-row .message-actions { display: flex; flex-direction: row; }
+.message-row .message-actions .reply-action { align-self: center; }
 
 .message-row .agent-status-marker {
   margin: 2px 0 0;
@@ -275,6 +309,30 @@
 .message-reaction-icon { display: block; flex: none; width: 16px; height: 16px; max-width: none; max-height: none; object-fit: contain; }
 .message-reaction span.message-reaction-icon { width: auto; height: auto; font-size: 11px; line-height: 1; white-space: nowrap; }
 .message-reaction-count,.message-reaction-fallback { font-size: 11px; line-height: 1; white-space: nowrap; }
+
+/* Manual reaction: the button shows on hover or focus of the message row; the six choices open above it. */
+/* Idle: out of the flow and invisible, but still in the Tab order. Active: in the flow in the place of the time. */
+.message-row .message-meta-bottom .reaction-picker { position: absolute; display: flex; align-items: center; opacity: 0; pointer-events: none; }
+.message-row:hover .message-meta-bottom .reaction-picker,
+.message-row .message-meta-bottom .reaction-picker:focus-within,
+.message-row .message-meta-bottom .reaction-picker.open { position: relative; opacity: 1; pointer-events: auto; }
+.message-row .message-meta-bottom .reaction-action { cursor: pointer; background: transparent; color: var(--primary); }
+.message-row .message-meta-bottom .reaction-action svg { display: block; }
+.reaction-menu { position: absolute; bottom: 100%; z-index: 30; display: flex; gap: 2px; padding: 4px; border: 1px solid var(--border); border-radius: 20px;
+  background: var(--surface, #fff); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18); }
+.message-row.inbound .reaction-menu { left: 0; }
+.message-row.outbound .reaction-menu { right: 0; }
+.reaction-choice { display: inline-flex; align-items: center; justify-content: center; padding: 3px; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
+.reaction-choice:hover, .reaction-choice:focus-visible, .reaction-choice[aria-pressed="true"] { background: rgba(127, 127, 127, 0.22); }
+/* @ mention list: opens above the composer; the active row follows the arrow keys. */
+#composer { position: relative; }
+.mention-menu { position: absolute; left: 12px; bottom: calc(100% + 4px); z-index: 40; width: min(320px, calc(100% - 24px)); max-height: 220px; margin: 0; padding: 4px;
+  overflow-y: auto; list-style: none; border: 1px solid var(--border); border-radius: 8px; background: var(--surface, #fff); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18); }
+.mention-option, .mention-empty { padding: 6px 10px; border-radius: 6px; font-size: 13px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-option { cursor: pointer; }
+.mention-option.active, .mention-option:hover { background: rgba(127, 127, 127, 0.22); }
+.mention-empty { color: var(--secondary); }
+.message-reaction-error { max-width: 180px; color: var(--danger, #c0392b); font-size: 11px; line-height: 14px; overflow-wrap: anywhere; }
 
 /* System events: centered small pill without avatar or time. */
 .message-row:has(.message-system-event) {

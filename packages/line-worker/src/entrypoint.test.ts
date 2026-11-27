@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import { FakeLineTransport } from './fake-transport.js';
-import { fetchLineRequest, fetchWithTimeout, runWorkerLoopOnPort } from './entrypoint.js';
+import { fetchWithTimeout, runWorkerLoopOnPort } from './entrypoint.js';
 import { LineServerRejection } from './line-server-error.js';
 import { ChromeApiError, ChromeLoginProtocolError, tagLoginStage } from '@line-agent/line-chrome';
 import { classifyLinejsFailure, tagLinejsFailure } from './login-failure-detail.js';
@@ -16,7 +16,7 @@ it('projects a rejected reaction into fixed event text and numeric audit diagnos
     { reason: secret, parameterMap: { token: secret }, rawBody: secret });
   transport.react = async () => { throw rejection; };
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
   await channel.send({ type: 'reactMessage', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'reaction-rejected',
     messageId: '9', reaction: 'NICE' });
@@ -25,22 +25,6 @@ it('projects a rejected reaction into fixed event text and numeric audit diagnos
     message: 'LINE_TALK_MESSAGE_NOT_FOUND',
     diagnostic: expect.objectContaining({ category: 'denied', recovery: 'none', upstreamCode: 64 }) })));
   expect(JSON.stringify(channel.events)).not.toContain(secret);
-});
-
-it('passes the native LINE request signal and body straight to production fetch', async () => {
-  const controller = new AbortController();
-  const request = new Request('https://legy.line-apps.com/S4', { method: 'POST', body: 'native-body',
-    headers: { 'content-type': 'application/octet-stream' }, signal: controller.signal });
-  const nativeFetch = vi.fn(async (input: Request) => new Response(new Uint8Array([1, 2, 3])));
-  vi.stubGlobal('fetch', nativeFetch);
-  try {
-    const response = await fetchLineRequest(request);
-    expect(nativeFetch).toHaveBeenCalledOnce();
-    expect(nativeFetch.mock.calls[0]?.[0]).toBe(request);
-    expect(nativeFetch.mock.calls[0]?.[0].signal).toBe(request.signal);
-    expect(await nativeFetch.mock.calls[0]?.[0].text()).toBe('native-body');
-    expect((await response.arrayBuffer()).byteLength).toBe(3);
-  } finally { vi.unstubAllGlobals(); }
 });
 
 it('aborts a stalled physical LINE request before the outer worker timeout', async () => {
@@ -116,7 +100,7 @@ it('keeps poll and text sends moving while the independent Reaction lane is unre
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   Object.defineProperty(transport, 'react', { value: async () => await new Promise<void>((resolve) => { releaseReaction = resolve; }) });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
 
   await channel.send({ type: 'reactMessage', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'reaction-1',
@@ -139,7 +123,7 @@ it('cancels a resource read without fencing later authorized sends', async () =>
     options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
   });
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
   const request = { accountId: binding.accountId, workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch,
     chatType: 'group' as const, chatId: 'c-group', requestId: 'read-cancelled', action: 'listNotes' as const, timeoutMs: 10_000 };
@@ -170,7 +154,7 @@ async function reactionHarness() {
     active -= 1;
   } });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   const react = (requestId: string, messageId: string, reaction = 'AMAZING') => channel.send({ type: 'reactMessage', ...binding,
     chatType: 'direct', chatId: 'u-peer', requestId, messageId, reaction });
   return { seen, reactions, react, release: () => releaseFirst(), maximumActive: () => maximumActive };
@@ -214,7 +198,7 @@ it('keeps one active Reaction and coalesces pending Reactions per message', asyn
     active -= 1;
   } });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   const react = (requestId: string, messageId: string) => channel.send({ type: 'reactMessage', ...binding,
     chatType: 'direct', chatId: 'u-peer', requestId, messageId, reaction: 'AMAZING' });
 
@@ -245,9 +229,9 @@ it('binds the port to its first account and emits a correlated grant acknowledge
   const channel = port();
   let created = 0;
   runWorkerLoopOnPort(channel, async () => { created += 1; return new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' }); });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   expect(channel.events).toContainEqual({ type: 'modeAck', ...binding, mode: 'MONITOR_ONLY', drained: true });
-  await channel.send({ type: 'init', ...binding, accountId: 'account-B', protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, accountId: 'account-B', protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   expect(created).toBe(1);
   expect(channel.events.at(-1)).toMatchObject({ type: 'error', ...binding, code: 'INVALID_COMMAND' });
 });
@@ -255,7 +239,7 @@ it('binds the port to its first account and emits a correlated grant acknowledge
 it('retains command and admission stage without exposing rejected command content', async () => {
   const channel = port();
   runWorkerLoopOnPort(channel, async () => new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' }));
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   await channel.send({ type: 'history', ...binding, accountId: 'other-account', chatType: 'direct', chatId: 'private-chat',
     requestId: 'history-request', cursor: null, limit: 10 });
   expect(channel.events.at(-1)).toMatchObject({ type: 'error', code: 'INVALID_COMMAND', requestId: 'history-request',
@@ -267,7 +251,7 @@ it('rejects a cross-binding addFriendByMid command before it reaches the worker 
   const channel = port();
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
   await channel.send({ type: 'addFriendByMid', ...binding, accountId: 'account-B', requestId: 'cross-add',
     targetMid: `u${'a'.repeat(32)}` });
@@ -278,7 +262,7 @@ it('rejects a cross-binding addFriendByMid command before it reaches the worker 
 it('rejects protocol drift before login and exposes no secret in status/error events', async () => {
   const channel = port();
   runWorkerLoopOnPort(channel, async () => { throw Object.assign(new Error('secret token abc'), { code: 'PROTOCOL_UNVERIFIED' }); });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   expect(channel.events).toContainEqual({ type: 'status', ...binding, state: 'PROTOCOL_UNVERIFIED', message: null });
   expect(JSON.stringify(channel.events)).not.toContain('secret token abc');
 });
@@ -289,7 +273,7 @@ it('reports login timeouts through a fixed correlated diagnostic without exposin
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   Object.defineProperty(transport, 'loginQr', { value: async () => { throw timeout; } });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'timeout-attempt' });
 
   expect(channel.events.at(-1)).toMatchObject({ type: 'loginFailure', ...binding, loginAttemptId: 'timeout-attempt',
@@ -303,7 +287,7 @@ it('classifies a rejected history command with a fixed safe operation code', asy
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   Object.defineProperty(transport, 'history', { value: async () => { throw new Error('private chat text and access token'); } });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   await channel.send({ type: 'history', ...binding, chatType: 'direct', chatId: `u${'a'.repeat(32)}`,
     requestId: 'history-1', cursor: null, limit: 20 });
 
@@ -317,7 +301,7 @@ it('maps the exact local stale-attempt rejection to the replacement code', async
   const channel = port();
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'attempt-one' });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'attempt-two' });
 
@@ -339,7 +323,7 @@ it('lets a triggered authentication invalidation own the terminal result', async
     throw new Error('authentication was invalidated with private data');
   } });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'invalidated-attempt' });
 
   expect(channel.events).toContainEqual(expect.objectContaining({ type: 'authInvalidated' }));
@@ -353,7 +337,7 @@ it('classifies a failed credential restore without exposing the exception', asyn
   const channel = port();
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'first-attempt',
     secrets: { token: null, qrCert: null, e2eeStorage: null } });
   await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'second-attempt',
@@ -372,7 +356,7 @@ it('serializes commands received while the LINE transport is still initializing'
     return transport;
   });
 
-  void channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  void channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   void channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
     secrets: { token: 'token-1', qrCert: null, e2eeStorage: null } });
   void channel.send({ type: 'loginToken', ...binding, loginAttemptId: 'login-1' });
@@ -391,7 +375,7 @@ it('fences sends queued behind an in-flight send when revoke arrives on the work
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   const release = transport.pauseSend();
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   const first = { type: 'sendText', ...binding, chatType: 'direct', chatId: 'u-peer', requestId: 'first',
     text: 'first', replyToMessageId: null };
   channel.events.length = 0;
@@ -412,7 +396,7 @@ it('coalesces repeated port polls while preserving the ordered worker command qu
   const channel = port();
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
     secrets: { token: 'token-1', qrCert: null, e2eeStorage: null } });
   await channel.send({ type: 'loginToken', ...binding, loginAttemptId: 'login-1' });
@@ -440,7 +424,7 @@ it('admits a send while a previously dispatched poll is still waiting on LINE', 
     return { cursorAfter: syncCursor as typeof cursor, operations: [] };
   };
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
     secrets: { token: 'token-1', qrCert: null, e2eeStorage: null } });
   await channel.send({ type: 'loginToken', ...binding, loginAttemptId: 'login-1' });
@@ -477,7 +461,7 @@ it('keeps receiving while an admitted physical send is still in flight', async (
     return { cursorAfter: { ...syncCursor as typeof cursor, revision: '1' }, operations: [] };
   };
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
     secrets: { token: 'token-1', qrCert: null, e2eeStorage: null } });
   await channel.send({ type: 'loginToken', ...binding, loginAttemptId: 'login-1' });
@@ -525,7 +509,7 @@ it('serializes multiple sends admitted during a held poll without waiting for th
     return { messageId: `sent-${sendCount}` };
   };
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
     secrets: { token: 'token-1', qrCert: null, e2eeStorage: null } });
   await channel.send({ type: 'loginToken', ...binding, loginAttemptId: 'login-1' });
@@ -578,7 +562,7 @@ it('keeps history independent of the FIFO send capability while receive is pendi
     return { messageId: `sent-${text}` };
   };
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
     secrets: { token: 'token-1', qrCert: null, e2eeStorage: null } });
   await channel.send({ type: 'loginToken', ...binding, loginAttemptId: 'login-1' });
@@ -624,7 +608,7 @@ it('fences priority-queued sends on revoke and stop while the poll remains block
       return { cursorAfter: syncCursor as typeof cursor, operations: [] };
     };
     runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-    await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+    await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
     await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
       secrets: { token: 'token-1', qrCert: null, e2eeStorage: null } });
     await channel.send({ type: 'loginToken', ...binding, loginAttemptId: 'login-1' });
@@ -682,7 +666,7 @@ it('bounds the priority send queue by the ordinary command capacity', async () =
     return { messageId: `sent-${sendCount}` };
   };
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'setSecretState', ...binding, loginAttemptId: 'login-1',
     secrets: { token: 'token-1', qrCert: null, e2eeStorage: null } });
   await channel.send({ type: 'loginToken', ...binding, loginAttemptId: 'login-1' });
@@ -716,7 +700,7 @@ it('keeps polling and sends responsive while a Relation lookup is pending', asyn
   const relationWait = new Promise<void>((resolve) => { releaseRelation = resolve; });
   transport.checkFriendRelation = async () => { signalRelation(); await relationWait; return 'friend'; };
   runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
   channel.post({ type: 'checkFriendRelation', ...binding, requestId: 'relation-1', targetMid: `u${'a'.repeat(32)}` });
   try {
@@ -743,7 +727,7 @@ it('lets revokeControl and stop fence a relation add queued behind an in-flight 
     const relationWait = new Promise<void>((resolve) => { releaseRelation = resolve; });
     transport.checkFriendRelation = async () => { signalRelation(); await relationWait; return 'friend'; };
     runWorkerLoopOnPort(channel, async () => transport, { validateLease: () => true });
-    await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
+    await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor });
     await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'login-1' });
     channel.post({ type: 'checkFriendRelation', ...binding, requestId: 'relation-1', targetMid: `u${'a'.repeat(32)}` });
     try {
@@ -763,7 +747,7 @@ it('lets revokeControl and stop fence a relation add queued behind an in-flight 
 it('names the rejected command type and a bounded requestId when the command fails schema parsing', async () => {
   const channel = port();
   runWorkerLoopOnPort(channel, async () => new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' }));
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   await channel.send({ type: 'history', ...binding, chatType: 'direct', chatId: 'private-chat', requestId: 'bad-history', cursor: null, limit: 9999 });
   expect(channel.events.at(-1)).toMatchObject({ type: 'error', code: 'INVALID_COMMAND', requestId: 'bad-history',
     diagnostic: { operation: 'history', stage: 'admission' } });
@@ -781,7 +765,7 @@ async function loginFailureOf(loginQr: () => Promise<unknown>): Promise<{ detail
   const transport = new FakeLineTransport({ ownMid: 'u-self', displayName: 'Agent' });
   Object.defineProperty(transport, 'loginQr', { value: loginQr });
   runWorkerLoopOnPort(channel, async () => transport);
-  await channel.send({ type: 'init', ...binding, protocolVersion: 4, mode: 'MONITOR_ONLY', durableCursor: cursor });
+  await channel.send({ type: 'init', ...binding, protocolVersion: 5, mode: 'MONITOR_ONLY', durableCursor: cursor });
   await channel.send({ type: 'loginQr', ...binding, loginAttemptId: 'detail-attempt' });
   const failure = channel.events.at(-1) as { detail?: string; code: string } & Record<string, unknown>;
   expect(JSON.stringify(channel.events)).not.toContain('Tk9x');

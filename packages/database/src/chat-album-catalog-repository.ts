@@ -187,7 +187,7 @@ export class ChatAlbumCatalogRepository {
   async firstPhotoIds(key: ConversationKey, albumIds: readonly string[], limit = 2): Promise<Map<string, string[]>> {
     const ids = albumIds.slice(0, 50);
     if (!ids.length) return new Map();
-    const bounded = Math.max(1, Math.min(2, Math.trunc(limit)));
+    const bounded = Math.max(1, Math.min(3, Math.trunc(limit)));
     const result = await this.pool.query<{ album_id: string; photo_id: string }>(
       `SELECT album_id,photo_id FROM (
          SELECT p.album_id,p.photo_id,row_number() OVER(PARTITION BY p.album_id ORDER BY p.photo_scan_ordinal) AS position

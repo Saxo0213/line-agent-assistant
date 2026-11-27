@@ -1,4 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtemp } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { agentUpgradeNoticeText, prepareAgentUpgradeNotice, type AgentUpgradeNotice } from './agent-upgrade-notice.js';
+import { AgentService } from './agent-service.js';
+import { fullToolsEnvironment } from './agent-service-test-support.js';
 import type { AgentEvent, AgentRunRequest, WritableConversationKey } from '@line-agent/contracts';
 import type { AgentRepository } from '@line-agent/database';
 import { buildResidentPrompt, parseResidentKey, residentIdentity, residentKey } from './agent-resident.js';
@@ -55,7 +61,8 @@ describe('resident prompt builder', () => {
 
 const key: WritableConversationKey = { accountId: 'a', chatType: 'direct', chatId: 'c' };
 
-function serviceFixture(provider: 'claude' | 'codex', sourceType: 'line' | 'schedule', bridgeExtra: Partial<AgentRunner>) {
+function serviceFixture(provider: 'claude' | 'codex', sourceType: 'line' | 'schedule', bridgeExtra: Partial<AgentRunner>,
+  resumed?: { sessionId: string; notice: AgentUpgradeNotice }) {
   const job = { jobId: 'job-r', accountId: sourceType === 'line' ? 'a' : null, chatType: sourceType === 'line' ? 'direct' as const : null,
     chatId: sourceType === 'line' ? 'c' : null, provider, prompt: 'hi', workspacePath: 'C:\\trusted', generation: 3, status: 'running' as const,
     sourceType, sourceMessageId: sourceType === 'line' ? 'm1' : null, sourceRequestId: sourceType === 'line' ? null : 'schedule:1', creationEpoch: 1, revision: '1' };
@@ -66,7 +73,7 @@ function serviceFixture(provider: 'claude' | 'codex', sourceType: 'line' | 'sche
     async getJob() { return job; },
     async sharesAgentRoomHistory() { return false; },
     async describeJobIdentity() { return { agent: null, admin: null, current: null }; },
-    async lookupSession() { return null; },
+    async lookupSession() { return resumed ? { externalSessionId: resumed.sessionId, generation: 3 } : null; },
     async appendEvent(_id: string, event: AgentEvent) { appended.push(event); },
     async bindSession() {},
     async completeJob() { return { ...job, status: 'completed' as const, revision: '2' }; },
@@ -95,9 +102,16 @@ function serviceFixture(provider: 'claude' | 'codex', sourceType: 'line' | 'sche
     { key: residentKey(['line', 'a', 'direct', 'other'], 3, 'claude'), hit: false }];
   const launcher: InternalMcpLauncher = { mint: () => null, release: () => undefined, skill: async () => 'SKILL', endpoint: () => 'http://127.0.0.1:1/mcp',
     bindResident: (input) => (input.fresh ? { endpoint: 'http://127.0.0.1:1/mcp', token: 'tok' } : { endpoint: 'http://127.0.0.1:1/mcp', rebound: true }) };
-  const service = newAgentService(repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' }, bridge,
-    undefined, undefined, 1, 30_000, 5_000, 1, undefined, undefined, undefined, launcher);
-  return { service, calls, turns, bound, appended, this_keys, repository };
+  const runs: AgentRunRequest[] = [];
+  const baseRun = bridge.run.bind(bridge);
+  bridge.run = (request, ...rest) => { runs.push(request); return baseRun(request, ...rest); };
+  const service = resumed
+    ? new AgentService(repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' }, bridge,
+      undefined, undefined, 1, 30_000, 5_000, 1, undefined, undefined, undefined, launcher, fullToolsEnvironment,
+      undefined, undefined, undefined, { upgradeNotice: resumed.notice })
+    : newAgentService(repository as unknown as AgentRepository, { current: async () => 'C:\\trusted' }, bridge,
+      undefined, undefined, 1, 30_000, 5_000, 1, undefined, undefined, undefined, launcher);
+  return { service, calls, turns, runs, bound, appended, this_keys, repository };
 }
 
 describe('AgentService resident path', () => {
@@ -123,6 +137,26 @@ describe('AgentService resident path', () => {
     schedule.service.kick({ accountId: null, chatType: 'schedule', chatId: null });
     await schedule.service.idle();
     expect(schedule.calls).toEqual(['run']);
+  });
+
+  it('puts the upgrade notice at the start of the run message of the first resumed job only, never in the stored prompt', async () => {
+    const text = agentUpgradeNoticeText('9.9.9');
+    for (const provider of ['claude', 'codex'] as const) {
+      const notice = await prepareAgentUpgradeNotice({ file: path.join(await mkdtemp(path.join(os.tmpdir(), 'agent-notice-')), 'n.json'),
+        version: '9.9.9', listSessionIds: async () => ['old-session'] });
+      const sentPrompt = (f: ReturnType<typeof serviceFixture>) => (provider === 'claude' ? f.turns[0]! .request : f.runs[0]!);
+      const first = serviceFixture(provider, 'line', {}, { sessionId: 'old-session', notice });
+      first.service.kick(key);
+      await first.service.idle();
+      expect(sentPrompt(first).prompt).toBe(`${text}\n\nhi`);
+      expect(sentPrompt(first).resumeSessionId).toBe('old-session');
+      expect(await first.repository.getJob()).toMatchObject({ prompt: 'hi' });
+      // The same session again: no second notice.
+      const second = serviceFixture(provider, 'line', {}, { sessionId: 'old-session', notice });
+      second.service.kick(key);
+      await second.service.idle();
+      expect(sentPrompt(second).prompt).toBe('hi');
+    }
   });
 
   it('stopChat resets the residents of that chat only', async () => {

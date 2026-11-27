@@ -47,6 +47,7 @@ export function describeForwardRule(schedule: AgentSchedule, text: Text): { cond
   const actions = scheduleForwardActions(task);
   const tags = [...(actions.forward ? [text('tagForward')] : []), ...(actions.notify ? [text('tagNotify')] : []), ...(actions.agent ? [text('tagAgent')] : [])];
   const match = task.match;
+  if (match.mode === 'image_text') return { condition: text('summaryImageText', { arg0: match.keywords.join(text('listSeparator')) }), tags };
   if (match.mode !== 'mention') return { condition: '', tags };
   const parts = [...(match.admin ? [text('mentionAdminShort')] : []), ...match.members.map((member) => member.label || member.mid), ...(match.all ? [text('mentionAllShort')] : [])];
   return { condition: text('summaryMention', { arg0: parts.join(text('listSeparator')) }), tags };

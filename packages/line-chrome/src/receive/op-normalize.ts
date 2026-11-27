@@ -1,5 +1,5 @@
-// Chrome operation -> worker sync items. Mirrors what packages/line-worker/src/linejs-adapter.ts `sync()` (:1076-1139)
-// hands to `normalizeOperation`, so the shared worker loop, DB and Agent flow stay unchanged:
+// Chrome operation -> worker sync items. Mirrors what the sync of the linejs Client engine
+// (packages/line-worker/src/linejs-client-engine.ts) hands to `normalizeOperation`, so the shared worker loop, DB and Agent flow stay unchanged:
 //   - a message operation becomes `{...operation, message}` (decrypted), or `{operation, decryptionError}` on failure;
 //   - op 55 NOTIFIED_READ_MESSAGE becomes a read receipt (same validation as `#collectReadReceipt`) and may name a chat
 //     we have not seen, which the adapter catches up once via getRecentMessagesV2 (`catchupChatIds`).
@@ -42,7 +42,7 @@ export interface ChromeMessageDecryptor {
   decrypt(message: ChromeMessage): Promise<ChromeMessage>;
 }
 
-/** In-memory drop counters, same meaning as the linejs adapter's `readReceiptCounters`. */
+/** In-memory drop counters, same meaning as the read receipt counters of the linejs Client engine. */
 export interface ReadReceiptCounters {
   readReceiptShapeDropped: number;
   readReceiptOverflowDropped: number;
@@ -54,7 +54,7 @@ export interface BuildSyncOptions {
   cursorAfter: string;
   decryptor: ChromeMessageDecryptor;
   ownMid: string | null;
-  /** Conversation ids already seen; updated in place (linejs-adapter `#seenConversationIds`). */
+  /** Conversation ids already seen; updated in place (the seen conversation set of the linejs Client engine). */
   seenConversationIds: Set<string>;
   counters?: ReadReceiptCounters;
 }
@@ -92,7 +92,7 @@ export async function buildChromeSyncResult(options: BuildSyncOptions): Promise<
 
   for (const operation of options.operations) {
     const type = operationType(operation);
-    // Every operation that carries a message is normalised, not only types 25 and 26 (linejs-adapter.ts:1091-1106).
+    // Every operation that carries a message is normalised, not only types 25 and 26 (same as the linejs Client engine).
     if (isRecord(operation.message)) {
       try {
         const message = isE2eeMessage(operation.message) ? await decryptor.decrypt(operation.message) : operation.message;
@@ -102,7 +102,7 @@ export async function buildChromeSyncResult(options: BuildSyncOptions): Promise<
         const chatId = to === ownMid ? from : to;
         if (chatId) seenConversationIds.add(chatId);
       } catch {
-        // linejs-adapter.ts:1105-1108: any decrypt failure is a missing key, not retryable.
+        // Same as the linejs Client engine: any decrypt failure is a missing key, not retryable.
         operations.push({ operation, decryptionError: { code: 'MISSING_E2EE_KEY', retryable: false } });
       }
     } else if (type === OP_TYPE.NOTIFIED_READ_MESSAGE) {
@@ -129,7 +129,7 @@ export async function buildChromeSyncResult(options: BuildSyncOptions): Promise<
   };
 }
 
-/** linejs-adapter.ts `#collectReadReceipt` (:1146-1175), unchanged validation. */
+/** Read receipt collection with the same validation as the linejs Client engine (linejs-client-engine-ops.ts). */
 function collectReadReceipt(
   value: ChromeOperation,
   ownMid: string | null,
@@ -171,7 +171,7 @@ function collectReadReceipt(
 
 /**
  * Catch-up helper for the adapter: `getRecentMessagesV2` rows (newest first) become oldest-first `history` items, each
- * decrypted; one that cannot be decrypted is skipped, never faked (linejs-adapter.ts:1125-1135).
+ * decrypted; one that cannot be decrypted is skipped, never faked (same as the linejs Client engine).
  */
 export async function buildCatchupItems(messages: readonly unknown[], decryptor: ChromeMessageDecryptor): Promise<ChromeSyncItem[]> {
   const items: ChromeSyncItem[] = [];

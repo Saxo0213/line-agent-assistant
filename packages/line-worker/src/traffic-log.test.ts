@@ -264,6 +264,25 @@ describe('traffic log failure', () => {
     expect(handle.stats()).toEqual({ written: 0, dropped: 1 });
   });
 
+  it('writes queued records with the sync writer on flushSync and never writes them again', async () => {
+    const directory = await tempDirectory();
+    const syncWrites: string[] = [];
+    const asyncWrites: string[] = [];
+    const handle = await startLog(directory, { flushIntervalMs: 60_000,
+      appendLinesSync: (_file, text) => { syncWrites.push(text); },
+      appendLines: async (_file, text) => { asyncWrites.push(text); } });
+    const server = await rawServer();
+    const agent = loopbackAgent(server.port);
+    await (await fetch(`${LINE_ORIGIN}/S4`, { method: 'POST', body: 'payload', dispatcher: agent } as RequestInit)).text();
+    handle.flushSync();
+    expect(syncWrites).toHaveLength(1);
+    expect(handle.stats()).toEqual({ written: 1, dropped: 0 });
+    await handle.flush();
+    handle.flushSync();
+    expect(syncWrites).toHaveLength(1);
+    expect(asyncWrites).toHaveLength(0);
+  });
+
   it('does not throw into the publisher when a handler receives bad data', async () => {
     const directory = await tempDirectory();
     const handle = await startLog(directory);

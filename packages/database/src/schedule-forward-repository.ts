@@ -16,8 +16,20 @@ export interface ForwardNotification { workId:string; runId:string; scheduleId:s
   messageId:string; sourceTitle:string; senderName:string; text:string; attachmentKinds:string[]; occurredAt:Date }
 export interface ForwardAgentDispatch { workId:string; runId:string; scheduleId:string; title:string; matchMode:string; scheduledFor:Date; provider:string;
   agent:{prompt:string;target:AgentScheduleSendTarget}; accountId:string; chatType:string; chatId:string; messageId:string; senderId:string; senderName:string; sourceTitle:string; externalAccountScope:string[]|null }
+/** A photo text work row that waits for OCR. `keywords` and `verifyUnclear` come from the rule of the captured revision. */
+export interface ForwardOcrWork { workId:string; runId:string; scheduleId:string; accountId:string; chatType:string; chatId:string; messageId:string;
+  senderName:string; sourceTitle:string; createdAt:Date; occurredAt:Date; keywords:string[]; verifyUnclear:boolean }
+export interface ForwardOcrImage { attachmentId:string; name:string|null; status:string; relativePath:string|null }
+/** The result of the OCR step of one work row. `detail` is a list of keywords or a code, never photo text. */
+export type ForwardOcrOutcome =
+  | {state:'hit';keywords:string[];images:ReadonlyArray<{attachmentId:string;name:string|null}>;text:string}
+  | {state:'unclear';keywords:string[]}
+  | {state:'miss'}
+  | {state:'unavailable';detail:string;text:string};
 export interface ForwardRunMessage { text:string; kind:string; occurredAt:Date; attachments:Array<{kind:string;name:string|null;status:string}> }
-export interface ForwardRunWork { workId:string; runId:string; accountId:string; chatType:string; chatId:string; messageId:string; senderId:string; senderName:string; sourceTitle:string }
+export interface ForwardRunWork { workId:string; runId:string; accountId:string; chatType:string; chatId:string; messageId:string; senderId:string; senderName:string; sourceTitle:string;
+  /** Photo text rules: the near keywords of the OCR, joined by commas; null for another rule or when there is none. */
+  ocrDetail?:string|null }
 
 /** Snapshot only authority, never credentials or native message payloads. */
 async function authority(client: Queryable, accountId: string): Promise<Record<string, unknown> | null> {
@@ -102,7 +114,7 @@ export async function captureScheduleForward(client: Queryable, source: ForwardS
     if(!actions.forward && !actions.notify && !actions.agent) continue;
     // Empty targets: every readable chat of the AGENT and PRIMARY_ADMIN accounts; the source chat itself is the selected source.
     const matches=(accountId:string)=>(accountId!==source.accountId || message.sender!==message.own_mid)
-      && matchesScheduleForward(rule.task,{accountId,senderId:message.sender,text:message.text,mentionIds,adminMid:message.admin_mid});
+      && matchesScheduleForward(rule.task,{accountId,senderId:message.sender,text:message.text,kind:message.kind,mentionIds,adminMid:message.admin_mid});
     const selected:{accountId:string;chatType:string;chatId:string;title?:string}|undefined=rule.targets.length===0
       ? (matches(candidates[0]!.accountId) ? candidates[0] : undefined)
       : rule.targets.find((target)=>candidates.some((candidate)=>candidate.accountId===target.accountId && candidate.chatType===target.chatType && candidate.chatId===target.chatId)
@@ -116,12 +128,19 @@ export async function captureScheduleForward(client: Queryable, source: ForwardS
       [rule.schedule_id,rule.rule_revision,logicalMessage])).rowCount) continue;
     const senderName=forwardSenderName(message.name,rule.task.sender?.label,message.sender);
     const runId=randomUUID(), workId=randomUUID();
+    const photoText=rule.task.match.mode==='image_text';
     await client.query(`INSERT INTO agent_schedule_runs(run_id,schedule_id,scheduled_for,outcome) VALUES($1,$2,clock_timestamp(),'submitting')`,[runId,rule.schedule_id]);
-    await client.query(`INSERT INTO agent_schedule_forward_work(work_id,schedule_id,revision,logical_message,account_id,chat_type,chat_id,message_id,sender_id,sender_name,source_title,authority,run_id,selected_source,notify_state,agent_state)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb,$15,$16)`,
+    await client.query(`INSERT INTO agent_schedule_forward_work(work_id,schedule_id,revision,logical_message,account_id,chat_type,chat_id,message_id,sender_id,sender_name,source_title,authority,run_id,selected_source,notify_state,agent_state,ocr_state)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb,$15,$16,$17)`,
     [workId,rule.schedule_id,rule.rule_revision,logicalMessage,source.accountId,source.chatType,source.chatId,source.messageId,message.sender,senderName,redactSensitiveString(selected.title||message.title),JSON.stringify(snapshot),runId,
       JSON.stringify({...selected,ownMid:selected.accountId===source.accountId?message.own_mid:message.agent_mid}),
-      actions.notify?'pending':null,actions.agent?'pending':null]);
+      photoText?null:actions.notify?'pending':null,photoText?null:actions.agent?'pending':null,photoText?'pending':null]);
+    if(photoText) {
+      // The photo text processor reads the photo later and inserts the parts, the notice and the Agent copy.
+      await client.query(`UPDATE agent_schedules SET last_fire_at=(SELECT scheduled_for FROM agent_schedule_runs WHERE run_id=$2),last_outcome='submitting' WHERE schedule_id=$1`,[rule.schedule_id,runId]);
+      captured++;
+      continue;
+    }
     if(!actions.forward) {
       await client.query(`UPDATE agent_schedules SET last_fire_at=(SELECT scheduled_for FROM agent_schedule_runs WHERE run_id=$2),last_outcome='submitting' WHERE schedule_id=$1`,[rule.schedule_id,runId]);
       captured++;
@@ -226,7 +245,10 @@ export class ScheduleForwardRepository {
       agent_error=CASE WHEN w.agent_state='pending' THEN 'forwarding_cancelled' ELSE w.agent_error END
       FROM agent_schedules s WHERE s.schedule_id=w.schedule_id AND (w.notify_state='pending' OR w.agent_state='pending')
       AND (NOT s.enabled OR s.rule_revision<>w.revision)`);
-    // A work row with parts forwards, and its run waits for the parts only. A work row without parts waits for its notice and Agent copy.
+    // A disabled or changed rule closes a work row that still waits for OCR.
+    await this.pool.query(`UPDATE agent_schedule_forward_work w SET ocr_state='unavailable',ocr_detail='forwarding_cancelled'
+      FROM agent_schedules s WHERE s.schedule_id=w.schedule_id AND w.ocr_state='pending' AND (NOT s.enabled OR s.rule_revision<>w.revision)`);
+    // A work row with parts forwards, and its run waits for the parts only. A work row without parts waits for its OCR, notice and Agent copy.
     await this.pool.query(`UPDATE agent_schedule_runs r SET outcome=CASE
       WHEN EXISTS(SELECT 1 FROM agent_schedule_forward_parts p WHERE p.work_id=w.work_id) THEN CASE
         WHEN EXISTS(SELECT 1 FROM agent_schedule_forward_parts p WHERE p.work_id=w.work_id AND p.state='unknown') THEN 'send_unknown'
@@ -235,7 +257,10 @@ export class ScheduleForwardRepository {
       WHEN w.agent_state='submitted' THEN 'submitted'
       WHEN w.agent_state IN ('failed','skipped') THEN 'failed'
       WHEN w.notify_state='shown' THEN 'notified'
+      WHEN w.ocr_state IN ('miss','unclear') AND w.agent_state IS NULL AND w.notify_state IS NULL THEN 'no_messages'
+      WHEN w.ocr_state='unavailable' THEN 'failed'
       ELSE 'send_failed' END FROM agent_schedule_forward_work w WHERE r.run_id=w.run_id AND r.outcome='submitting'
+      AND w.ocr_state IS DISTINCT FROM 'pending'
       AND NOT EXISTS(SELECT 1 FROM agent_schedule_forward_parts p WHERE p.work_id=w.work_id AND p.state IN ('pending','waiting','sending'))
       AND (EXISTS(SELECT 1 FROM agent_schedule_forward_parts p WHERE p.work_id=w.work_id)
         OR (w.agent_state IS DISTINCT FROM 'pending' AND w.notify_state IS DISTINCT FROM 'pending'))`);
@@ -276,11 +301,73 @@ export class ScheduleForwardRepository {
     if(done) await this.settle();
     return done;
   }
+  /**
+   * Photo text work rows that wait for OCR, oldest first. A row whose rule, message or authority changed is closed as unavailable,
+   * so it cannot fill the LIMIT window for ever. A row whose photos still download (and is younger than 15 minutes) is not returned.
+   */
+  async pendingOcrWork(limit=5):Promise<ForwardOcrWork[]> {
+    const rows=(await this.pool.query<ForwardOcrWork>(`SELECT w.work_id AS "workId",w.run_id AS "runId",w.schedule_id AS "scheduleId",
+      w.account_id AS "accountId",w.chat_type AS "chatType",w.chat_id AS "chatId",w.message_id AS "messageId",w.sender_name AS "senderName",
+      w.source_title AS "sourceTitle",w.created_at AS "createdAt",m.occurred_at AS "occurredAt",
+      ARRAY(SELECT jsonb_array_elements_text(s.task->'match'->'keywords')) AS keywords,
+      COALESCE((s.task->'match'->>'verifyUnclear')::boolean,true) AS "verifyUnclear"
+      FROM agent_schedule_forward_work w JOIN agent_schedules s USING(schedule_id)
+      JOIN messages m ON m.account_id=w.account_id AND m.chat_type=w.chat_type AND m.chat_id=w.chat_id AND m.message_id=w.message_id
+      WHERE w.ocr_state='pending' AND s.enabled AND s.rule_revision=w.revision AND s.task->'match'->>'mode'='image_text'
+        AND (w.created_at<clock_timestamp()-interval '15 minutes' OR NOT EXISTS(SELECT 1 FROM attachments a WHERE a.account_id=w.account_id
+          AND a.chat_type=w.chat_type AND a.chat_id=w.chat_id AND a.message_id=w.message_id AND a.kind='image'
+          AND a.status NOT IN ('ready','failed','expired','unavailable')))
+      ORDER BY w.created_at,w.work_id LIMIT $1`,[limit])).rows;
+    return this.keepValid(rows,async (workId)=>{
+      await this.pool.query(`UPDATE agent_schedule_forward_work SET ocr_state='unavailable',ocr_detail='authority_changed' WHERE work_id=$1 AND ocr_state='pending'`,[workId]);
+      await this.settle();
+    });
+  }
+  /** The image attachments of the message of a work row, in message order. */
+  async ocrImages(work:Pick<ForwardOcrWork,'accountId'|'chatType'|'chatId'|'messageId'>):Promise<ForwardOcrImage[]> {
+    return (await this.pool.query<ForwardOcrImage>(`SELECT attachment_id AS "attachmentId",name,status,relative_path AS "relativePath" FROM attachments
+      WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 AND message_id=$4 AND kind='image' ORDER BY created_at,attachment_id LIMIT 20`,
+      [work.accountId,work.chatType,work.chatId,work.messageId])).rows;
+  }
+  /**
+   * Writes the OCR result of one work row in one transaction. Returns false when the row is no longer pending OCR or its rule changed
+   * (then settle closes it). hit: text part + one image part per photo (+ notice); unclear: Agent copy; unavailable: one text part.
+   */
+  async finishOcr(workId:string,outcome:ForwardOcrOutcome):Promise<boolean> {
+    const client=await this.pool.connect();
+    let done=false;
+    try {
+      await client.query('BEGIN');
+      const row=(await client.query<{task:AgentScheduleForwardTask}>(`SELECT s.task FROM agent_schedule_forward_work w JOIN agent_schedules s USING(schedule_id)
+        WHERE w.work_id=$1 AND w.ocr_state='pending' AND s.enabled AND s.rule_revision=w.revision FOR UPDATE OF w`,[workId])).rows[0];
+      if(row) {
+        const actions=scheduleForwardActions(row.task);
+        const detail=outcome.state==='miss' ? null : (outcome.state==='unavailable' ? outcome.detail : outcome.keywords.join(',')).slice(0,200);
+        const verify=outcome.state==='unclear' && actions.agent!==null && row.task.match.mode==='image_text' && row.task.match.verifyUnclear;
+        const notify=outcome.state==='hit' && actions.notify;
+        await client.query(`UPDATE agent_schedule_forward_work SET ocr_state=$2,ocr_detail=$3,notify_state=$4,agent_state=$5 WHERE work_id=$1`,
+          [workId,outcome.state,detail,notify?'pending':null,verify?'pending':null]);
+        if(outcome.state==='hit' || outcome.state==='unavailable') {
+          let index=0;
+          await client.query(`INSERT INTO agent_schedule_forward_parts(work_id,part_index,kind,text,state) VALUES($1,$2,'text',$3,'pending')`,[workId,index++,outcome.text]);
+          if(outcome.state==='hit') for(const image of outcome.images.slice(0,20)) await client.query(`INSERT INTO agent_schedule_forward_parts(work_id,part_index,kind,attachment_id,filename,state)
+            VALUES($1,$2,'image',$3,$4,'pending')`,[workId,index++,image.attachmentId,image.name]);
+        }
+        done=true;
+      }
+      await client.query('COMMIT');
+    } catch(error) {
+      await client.query('ROLLBACK').catch(()=>undefined);
+      throw error;
+    } finally { client.release(); }
+    if(done) await this.settle();
+    return done;
+  }
   /** The captured source of one work row of this schedule (the Agent run context); null when there is none. */
   async forwardWorkById(scheduleId:string,workId:string):Promise<ForwardRunWork|null> {
     return (await this.pool.query<ForwardRunWork>(`SELECT w.work_id AS "workId",w.run_id AS "runId",w.account_id AS "accountId",w.chat_type AS "chatType",
-      w.chat_id AS "chatId",w.message_id AS "messageId",w.sender_id AS "senderId",w.sender_name AS "senderName",w.source_title AS "sourceTitle"
-      FROM agent_schedule_forward_work w WHERE w.schedule_id=$1 AND w.work_id=$2`,[scheduleId,workId])).rows[0] ?? null;
+      w.chat_id AS "chatId",w.message_id AS "messageId",w.sender_id AS "senderId",w.sender_name AS "senderName",w.source_title AS "sourceTitle",
+      w.ocr_detail AS "ocrDetail" FROM agent_schedule_forward_work w WHERE w.schedule_id=$1 AND w.work_id=$2`,[scheduleId,workId])).rows[0] ?? null;
   }
   /** The stored message of a work row, in the same account and chat, with its attachment kinds, names and states. Null when it is gone. */
   async forwardMessage(work:Pick<ForwardRunWork,'accountId'|'chatType'|'chatId'|'messageId'>):Promise<ForwardRunMessage|null> {

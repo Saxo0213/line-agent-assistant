@@ -129,7 +129,7 @@ try {
     const timer = setTimeout(() => { child.kill(); reject(new Error('worker modeAck timeout')); }, 20000);
     child.on('message', (event) => {
       if (event?.type === 'workerProtocolAck') {
-        if (event.protocolVersion !== 4) {
+        if (event.protocolVersion !== 5) {
           clearTimeout(timer); child.kill(); reject(new Error('worker protocolAck version mismatch'));
           return;
         }
@@ -144,7 +144,7 @@ try {
       clearTimeout(timer); child.kill(); resolve(event);
     });
     child.on('exit', (code) => { if (code !== 0) { clearTimeout(timer); reject(new Error('worker exited ' + code)); } });
-    child.postMessage({ type: 'init', protocolVersion: 4, accountId: 'packaged-smoke-account', workerInstanceId: 'packaged-smoke-worker', mode: 'MONITOR_ONLY', controlEpoch: 7, durableCursor: { version: 1, revision: '0', globalRev: '0', individualRev: '0' } });
+    child.postMessage({ type: 'init', protocolVersion: 5, accountId: 'packaged-smoke-account', workerInstanceId: 'packaged-smoke-worker', mode: 'MONITOR_ONLY', controlEpoch: 7, durableCursor: { version: 1, revision: '0', globalRev: '0', individualRev: '0' } });
     });
   })()`;
   const workerResult = await mainProtocol.call('Runtime.evaluate', { expression: workerExpression, awaitPromise: true, returnByValue: true });
@@ -174,7 +174,7 @@ try {
         if (!event || typeof event !== 'object') return;
         messages.push(event.type);
         if (event.type === 'workerProtocolAck') {
-          if (event.protocolVersion !== 4 || event.manualSend !== true) fail('production worker protocolAck mismatch');
+          if (event.protocolVersion !== 5 || event.manualSend !== true) fail('production worker protocolAck mismatch');
           return;
         }
         if (event.type !== 'modeAck') return;
@@ -192,7 +192,7 @@ try {
           child.kill();
         }, 100);
       });
-      child.postMessage({ type: 'init', protocolVersion: 4, accountId: 'production-smoke-account',
+      child.postMessage({ type: 'init', protocolVersion: 5, accountId: 'production-smoke-account',
         workerInstanceId: 'production-smoke-worker', mode: 'MONITOR_ONLY', controlEpoch: 9,
         durableCursor: { version: 1, revision: '0', globalRev: '0', individualRev: '0' } });
     });

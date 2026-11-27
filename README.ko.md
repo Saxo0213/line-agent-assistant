@@ -4,6 +4,8 @@
 
 [![Latest release](https://img.shields.io/github/v/release/Saxo0213/line-agent-assistant)](https://github.com/Saxo0213/line-agent-assistant/releases/latest) [![Downloads](https://img.shields.io/github/downloads/Saxo0213/line-agent-assistant/total)](https://github.com/Saxo0213/line-agent-assistant/releases) ![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6) [![License: MIT](https://img.shields.io/github/license/Saxo0213/line-agent-assistant)](LICENSE)
 
+### [⬇️ 최신 버전 다운로드 (Windows 설치 파일)](https://github.com/Saxo0213/line-agent-assistant/releases/latest)
+
 **Claude나 Codex에게 LINE 대화를 맡기세요.** AI 에이전트가 LINE으로 지시를 받고, 대화 기록을 검색·요약하며, 로컬 MCP bridge를 통해 Claude Desktop과 Codex에서 LINE을 사용할 수 있게 해 주는 Windows 데스크톱 앱입니다.
 
 ## 기능
@@ -24,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.359에서는 Claude를 상주 프로세스에서 실행하고, Claude와 Codex에 각각 여러 CLI 계정과 자동 전환, 대화별 `/model` 명령, Agent의 첨부 파일 읽기, 다운로드 간격 설정, 외부 모니터링 자동 재시도가 추가되었습니다. 앱의 '업데이트 확인'으로 설치할 수 있습니다. 자세한 내용은 [v1.0.342 → v1.0.359 릴리스 노트](docs/releases/v1.0.359.md)를 참조하세요.
+v1.0.385에서는 linejs 3.6.9 기반의 새 LINE 엔진으로 바꾸고, 오픈채팅 메시지 저장, 메시지 반응과 @ 멘션, 1:1 노트와 앨범, 첨부 파일 자동 복구, '설정 → 폴더'의 프로젝트 폴더 관리, 사진 텍스트 예약 규칙을 추가했습니다. 앱의 '업데이트 확인'으로 설치할 수 있습니다. 자세한 내용은 [v1.0.359 → v1.0.385 릴리스 노트](docs/releases/v1.0.385.md)를 참조하세요.
 
 ## 설치
 

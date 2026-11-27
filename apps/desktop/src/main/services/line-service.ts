@@ -43,7 +43,7 @@ export interface AgentControl {
   queryQuota?(provider: import('@line-agent/contracts').AgentProvider, account?: import('./provider-quota-service.js').QuotaAccount): Promise<unknown>;
 }
 
-interface AttachmentControl { downloadById(attachmentId: string): Promise<boolean>; }
+interface AttachmentControl { downloadById(attachmentId: string, signal?: AbortSignal, live?: boolean): Promise<boolean>; }
 export interface RoomControlHandler {
   handle(command: RoomActivationCommand): Promise<void>;
   isEnabled?(key: WritableConversationKey): Promise<boolean>;
@@ -420,9 +420,9 @@ export class LineService {
     await this.sendChatText(binding, key, text, messageId);
   }
 
-  private queueAttachmentDownload(attachmentId: string): void {
+  private queueAttachmentDownload(attachmentId: string, live = false): void {
     if (!this.attachments) return;
-    void Promise.resolve().then(() => this.attachments!.downloadById(attachmentId)).catch(() => undefined);
+    void Promise.resolve().then(() => live ? this.attachments!.downloadById(attachmentId, undefined, true) : this.attachments!.downloadById(attachmentId)).catch(() => undefined);
   }
 
   async requestQrLogin(accountId: string, workerInstanceId: string, loginAttemptId: string): Promise<void> {
@@ -549,6 +549,67 @@ export class LineService {
     }
   }
 
+  /** One diagnostic for each worker instance, batch and reason. The set is bounded: it is cleared at 256 keys. */
+  private readonly squareDiagnosticKeys = new Set<string>();
+
+  private reportSquareOnce(binding: BoundWorker, batchId: string, diagnostic: SafeDiagnostic): void {
+    const key = `${binding.workerInstanceId}:${batchId}:${diagnostic.detail ?? ''}`;
+    if (this.squareDiagnosticKeys.has(key)) return;
+    if (this.squareDiagnosticKeys.size >= 256) this.squareDiagnosticKeys.clear();
+    this.squareDiagnosticKeys.add(key);
+    try { this.onDiagnostic?.(diagnostic); } catch { /* Diagnostics cannot affect ingestion. */ }
+  }
+
+  /**
+   * Community (Square) batch: archive only. It runs no routing, Agent job, room control, command, LINE ACK or read receipt.
+   * It does not use the account ingress lane, so it cannot take a slot from Talk batches. The repository holds its own lock.
+   * It returns the message IDs of a stored batch with new rows, so the caller can refresh the renderer.
+   */
+  private async handleSquareBatch(binding: BoundWorker, event: Extract<LineWorkerEvent, { type: 'squareBatch' }>): Promise<readonly string[] | undefined> {
+    const capability = await this.accounts.resolveCapabilities?.(event.accountId);
+    const receiving = capability?.productRole === 'AGENT' && capability.connectionMode === 'SYSTEM_LOGIN'
+      && await this.settings.getLineSquareReceive().catch(() => false);
+    if (!receiving) {
+      this.reportSquareOnce(binding, 'setting', { operation: 'ackSquareBatch', stage: 'admission', category: 'denied',
+        recovery: 'check_configuration', outcome: 'not_started', detail: 'square_receive_off' });
+      return;
+    }
+    if (!this.isCurrentWorkerEvent(binding.workerInstanceId, event)) return;
+    let result: Awaited<ReturnType<MessageRepository['ingestSquareBatch']>>;
+    try {
+      result = await this.messages.ingestSquareBatch({ accountId: event.accountId, batchId: event.batchId, tokenBefore: event.tokenBefore,
+        tokenAfter: event.tokenAfter, envelopes: event.envelopes, ...(event.titles ? { titles: event.titles } : {}),
+        lease: { workerInstanceId: binding.workerInstanceId, controlEpoch: binding.controlEpoch } });
+    } catch (error) {
+      this.reportSquareOnce(binding, event.batchId, { ...diagnosticFailure('ackSquareBatch', 'persist', error), detail: 'square_batch:store_failed' });
+      return;
+    }
+    if (result.status === 'token_conflict' || result.status === 'digest_conflict') {
+      this.reportSquareOnce(binding, event.batchId, { operation: 'ackSquareBatch', stage: 'store', category: 'invalid_input',
+        recovery: 'none', outcome: 'failed', detail: `square_batch:${result.status}` });
+      return;
+    }
+    // Community attachments are never downloaded. Mark each new row now, so the renderer shows it as not available at once.
+    // The attachment service writes the same reason for a row that this step missed.
+    if (result.status === 'stored' && result.inserted > 0) {
+      try {
+        for (const envelope of event.envelopes) for (const descriptor of envelope.attachments) {
+          const item = await this.messages.getAttachmentBySource(
+            { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId }, envelope.messageId, descriptor.id);
+          if (item) await this.messages.setAttachmentBlockReason(item.attachmentId, 'COMMUNITY_DOWNLOAD_UNSUPPORTED');
+        }
+      } catch (error) { this.reportSquareOnce(binding, event.batchId, { ...diagnosticFailure('ackSquareBatch', 'persist', error), detail: 'square_batch:attachment_mark_failed' }); }
+    }
+    if (!this.isCurrentWorkerEvent(binding.workerInstanceId, event)) return;
+    try {
+      await this.worker.send({ type: 'ackSquareBatch', accountId: binding.accountId, workerInstanceId: binding.workerInstanceId,
+        controlEpoch: binding.controlEpoch, batchId: event.batchId, tokenAfter: event.tokenAfter });
+    } catch (error) {
+      this.reportSquareOnce(binding, event.batchId, { ...diagnosticFailure('ackSquareBatch', 'dispatch', error), detail: 'square_batch:ack_failed' });
+    }
+    return result.status === 'stored' && result.inserted > 0 ? event.envelopes.map((envelope) => envelope.messageId) : undefined;
+  }
+
   async handleWorkerEvent(processInstanceId: string, event: LineWorkerEvent): Promise<readonly string[] | undefined> {
     if (event.type !== 'batch') return this.handleWorkerEventInLane(processInstanceId, event);
     return this.inAccountIngress(event.accountId, () => this.handleWorkerEventInLane(processInstanceId, event));
@@ -640,6 +701,7 @@ export class LineService {
     }
     await this.bindingReady.get(processInstanceId);
     if (!this.isCurrentWorkerEvent(processInstanceId, event)) return;
+    if (event.type === 'squareBatch') return this.handleSquareBatch(binding, event);
     if (binding.mode === 'ACTIVE_CONTROL' && !recovered) {
       const recovery = this.recoveryReady.get(processInstanceId) ?? this.drainPendingActions(binding);
       this.recoveryReady.set(processInstanceId, recovery);
@@ -754,8 +816,9 @@ export class LineService {
         ...catalog,
         ...(picturePath === undefined ? {} : { picturePath }),
         members: members.map((member) => {
-          const { picturePath: memberPicturePath, nickname, ...memberData } = member;
+          const { picturePath: memberPicturePath, nickname, friend, ...memberData } = member;
           return { ...memberData, ...(nickname === undefined ? {} : { nickname }),
+            ...(friend === undefined ? {} : { friend }),
             ...(memberPicturePath === undefined ? {} : { picturePath: memberPicturePath }) };
         }),
         title: conversation.title ?? '',
@@ -1041,6 +1104,8 @@ export class LineService {
     }
     const queued = new Set(result.jobMessageIds);
     const attachmentIds: string[] = [];
+    // An attachment of a message that this worker ingested as live downloads at once. Any other source keeps the normal pacing.
+    const liveAttachmentIds = new Set<string>();
     if (this.attachments && !recovered?.monitorReceipt) {
       for (const envelope of prepared.map(({ envelope }) => envelope).filter((envelope) => inserted.has(envelope.messageId))) {
         for (const descriptor of envelope.attachments) {
@@ -1048,7 +1113,10 @@ export class LineService {
             { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId },
             envelope.messageId, descriptor.id,
           );
-          if (attachment) attachmentIds.push(attachment.attachmentId);
+          if (attachment) {
+            attachmentIds.push(attachment.attachmentId);
+            if (!recovered && envelope.accountId === binding.accountId && envelope.ingestion.source === 'live') liveAttachmentIds.add(attachment.attachmentId);
+          }
         }
       }
     }
@@ -1102,7 +1170,7 @@ export class LineService {
       const quotaKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
       this.scheduleRoomEffect(() => this.applyQuotaCommand(binding, quotaKey, envelope.messageId));
     }
-    for (const attachmentId of attachmentIds) this.queueAttachmentDownload(attachmentId);
+    for (const attachmentId of attachmentIds) this.queueAttachmentDownload(attachmentId, liveAttachmentIds.has(attachmentId));
     for (const { control, envelope, ownMid } of admitted) {
       if (primaryAdminLookupFailedIds.has(envelope.messageId)) continue;
       if (control.type === 'command') {

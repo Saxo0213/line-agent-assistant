@@ -150,13 +150,14 @@ describe('authoritative attachment preview', () => {
     await expect(service.open(ATTACHMENT_ID, { senderId: 7 })).resolves.toBe(false);
     current.mimeType = 'image/png'; current.kind = 'audio';
     await expect(service.open(ATTACHMENT_ID, { senderId: 7 })).resolves.toBe(false);
+    // A correct file (its SHA-256 equals the row) with a wrong row size is served: only the row size is wrong.
     current.kind = 'image'; current.sizeBytes = PNG.byteLength + 1;
-    await expect(service.open(ATTACHMENT_ID, { senderId: 7 })).resolves.toBe(false);
+    await expect(service.open(ATTACHMENT_ID, { senderId: 7 })).resolves.toBe(true);
     current.sizeBytes = PNG.byteLength; current.sha256 = '0'.repeat(64);
     await expect(service.open(ATTACHMENT_ID, { senderId: 7 })).resolves.toBe(false);
     current.sha256 = digest(PNG); current.name = 'photo:stream.png';
     await expect(service.open(ATTACHMENT_ID, { senderId: 7 })).resolves.toBe(false);
-    expect(calls).toBe(1);
+    expect(calls).toBe(2);
   });
 
   it('does not look up an image when its read signal is already aborted', async () => {

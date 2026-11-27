@@ -30,6 +30,16 @@ export function safeChatResourceUpstreamCode(value: unknown): ChatResourceRespon
     ? value : 'non_numeric';
 }
 
+export const CHAT_RESOURCE_UPSTREAM_MESSAGE_MAX_CHARS = 200;
+
+/** The LINE `message` text of a failed reply: control characters removed, at most 200 characters. */
+export function safeChatResourceUpstreamMessage(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/\s+/g, ' ').trim()
+    .slice(0, CHAT_RESOURCE_UPSTREAM_MESSAGE_MAX_CHARS).trim();
+  return text.length === 0 ? undefined : text;
+}
+
 export function safeChatResourceFailureDetails(error: unknown): Readonly<{ failureKind: ChatResourceFailureKind;
   upstreamStatus?: number; upstreamCode?: ChatResourceResponseCode }> {
   const failureKind = safeChatResourceFailureKind(error);
@@ -46,7 +56,8 @@ export function safeChatResourceFailureDetails(error: unknown): Readonly<{ failu
 
 export class ChatResourceFailure extends Error {
   constructor(readonly category: ChatResourceFailureCategory, readonly responseCode?: ChatResourceResponseCode,
-    readonly failureKind?: ChatResourceFailureKind, readonly upstreamStatus?: number, readonly upstreamCode?: ChatResourceResponseCode) {
+    readonly failureKind?: ChatResourceFailureKind, readonly upstreamStatus?: number, readonly upstreamCode?: ChatResourceResponseCode,
+    readonly upstreamMessage?: string) {
     super(category);
     this.name = 'ChatResourceFailure';
   }

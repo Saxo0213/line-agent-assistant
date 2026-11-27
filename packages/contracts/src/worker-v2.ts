@@ -1,8 +1,8 @@
 import { z } from 'zod';
 import { DIAGNOSTIC_DETAIL_PATTERN, SafeDiagnosticSchema, SendDetailSchema } from './diagnostics.js';
-import { AccountModeSchema, resolveLineTransport, WritableConversationKeySchema, WorkerBindingSchema } from './account.js';
+import { AccountModeSchema, isLinejsTransport, WritableConversationKeySchema, WorkerBindingSchema } from './account.js';
 import { JsonValueSchema } from './json.js';
-import { AttachmentResultSchema, InboundEnvelopeSchema, OutgoingMentionSchema, OUTGOING_MENTIONS_MAX, outgoingMentionsIssue } from './line.js';
+import { ArchiveInboundEnvelopeSchema, AttachmentResultSchema, InboundEnvelopeSchema, OutgoingMentionSchema, OUTGOING_MENTIONS_MAX, outgoingMentionsIssue } from './line.js';
 import { lineServerErrorMessage, type LineServerErrorCode } from './line-server-error.js';
 
 const Id = z.string().min(1);
@@ -32,15 +32,27 @@ export const UnsendSchema = z.strictObject({
 export type UnsendDto = z.infer<typeof UnsendSchema>;
 
 const Bound = WorkerBindingSchema;
-export const WORKER_PROTOCOL_VERSION = 4 as const;
+export const WORKER_PROTOCOL_VERSION = 5 as const;
+const SquareToken = z.string().min(1).max(4096);
+/** Upper bound of envelopes in one squareBatch (LINE returns at most 100 events per fetch). */
+export const SQUARE_BATCH_MAX_ENVELOPES = 500;
 export const WORKER_ERROR_CODES = ['INVALID_COMMAND', 'QUEUE_FULL', 'CATALOG_REFRESH_FAILED', 'WORKER_OPERATION_FAILED',
   'HISTORY_READ_FAILED', 'CHAT_RESOURCE_READ_FAILED', 'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED',
   'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED', 'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED',
-  'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED', 'CHROME_LTSM_UNAVAILABLE', 'LINE_CONNECTION_SUSPENDED'] as const;
+  'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED', 'CHROME_LTSM_UNAVAILABLE', 'LINE_CONNECTION_SUSPENDED', 'LINE_SQUARE_SUSPENDED'] as const;
 export type WorkerErrorCode = typeof WORKER_ERROR_CODES[number] | LineServerErrorCode;
 const WorkerErrorCodeSchema = z.union([z.enum(WORKER_ERROR_CODES),
   z.custom<LineServerErrorCode>((value) => lineServerErrorMessage(value) !== null)]);
 const UserMid = z.string().regex(/^u[0-9a-fA-F]{32}$/);
+export const CONTACT_LOOKUP_RELATIONS = ['friend', 'not_friend', 'blocked', 'self', 'unknown'] as const;
+export const ContactLookupSchema = z.strictObject({
+  mid: UserMid,
+  displayName: z.string().max(256).nullable(),
+  statusMessage: z.string().max(1024).nullable(),
+  picturePath: z.string().max(2048).nullable(),
+  relation: z.enum(CONTACT_LOOKUP_RELATIONS),
+});
+export type ContactLookupDto = z.infer<typeof ContactLookupSchema>;
 const SourceChatMid = z.string().regex(/^[ucr][0-9a-fA-F]{32}$/);
 const Conversation = Bound.merge(WritableConversationKeySchema);
 const LoginAttempt = Bound.extend({ loginAttemptId: Id });
@@ -64,6 +76,8 @@ export const ConversationCatalogMemberSchema = z.strictObject({
   /** The name the account owner set locally for this contact (LINE Contact.displayNameOverridden); absent when the response did not carry it. */
   nickname: z.string().max(256).nullable().optional(),
   picturePath: z.string().max(2048).nullable().optional(),
+  /** True: on the friend list. False: a blocked friend. Absent: the response did not say. */
+  friend: z.boolean().optional(),
 });
 export const ConversationCatalogItemSchema = z.strictObject({
   chatType: z.enum(['direct', 'group', 'room']),
@@ -89,6 +103,8 @@ const ChatResourcePhoto = z.strictObject({ photoId: ResourceId, oid: ResourceId,
   shotTime: z.number().int().nonnegative().nullable(), width: z.number().int().positive().nullable(), height: z.number().int().positive().nullable() });
 export const ChatResourceReadCommandSchema = Conversation.extend({ type: z.literal('chatResourceRead'), requestId: Id.max(128),
   action: ChatResourceAction, cursor: ResourceCursor.optional(), limit: z.number().int().min(1).max(50).optional(),
+  /** The LINE one-to-one chat id of a direct chat ("o" + 32 lowercase hex). Notes and albums of a direct chat use it, not the peer MID. */
+  homeChatId: z.string().regex(/^o[0-9a-f]{32}$/).optional(),
   postId: ResourceId.optional(), albumId: ResourceId.optional(), photoId: ResourceId.optional(), oid: ResourceId.optional(),
   prefix: z.enum(['album/a', 'album/v']).optional(), maxBytes: z.number().int().positive().max(CHAT_RESOURCE_MAX_BYTES).optional(),
   timeoutMs: z.number().int().min(1_000).max(120_000) }).superRefine((command, context) => {
@@ -110,6 +126,8 @@ export const ChatResourceReadResultSchema = Conversation.extend({ type: z.litera
   failureKind: z.enum(['linejs_internal', 'effect_denied', 'type_error', 'range_error', 'timeout_error', 'abort_error', 'other']).optional(),
   upstreamStatus: z.number().int().min(100).max(599).optional(),
   upstreamCode: z.union([z.number().finite().min(-1_000_000_000).max(1_000_000_000), z.enum(['missing', 'non_numeric'])]).optional(),
+  /** Bounded LINE `message` text of a failed reply: at most 200 characters, no control characters. */
+  upstreamMessage: z.string().min(1).max(200).regex(/^[^\u0000-\u001f\u007f-\u009f]+$/).optional(),
   nextCursor: ResourceCursor.optional(),
   photoPageShape: ChatResourcePhotoPageShapeSchema.optional(),
   notes: z.array(ChatResourceNote).max(50).optional(), note: ChatResourceNote.optional(), albums: z.array(ChatResourceAlbum).max(50).optional(),
@@ -123,7 +141,8 @@ export const ChatResourceReadResultSchema = Conversation.extend({ type: z.litera
     || (result.action !== 'listNotes' && result.action !== 'getNote'))) {
     context.addIssue({ code: 'custom', path: ['responseCode'], message: 'Response code is restricted to failed Note reads' });
   }
-  if ((result.failureKind !== undefined || result.upstreamStatus !== undefined || result.upstreamCode !== undefined) && result.ok) {
+  if ((result.failureKind !== undefined || result.upstreamStatus !== undefined || result.upstreamCode !== undefined
+    || result.upstreamMessage !== undefined) && result.ok) {
     context.addIssue({ code: 'custom', path: ['failureKind'], message: 'Failure diagnostics require a failed read' });
   }
   if (!result.ok) {
@@ -145,21 +164,34 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
     chromeLtsmDir: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/).optional(),
     /** Absolute path of the LINE traffic log directory under app userData. A worker without it does not log. */
     trafficLogDir: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/).optional(),
-    /** True turns on the LEGY encrypted transport. Absent or false means the plain transport. Only allowed for DESKTOPWIN. */
-    legyEncrypted: z.boolean().optional() }).superRefine((command, context) => {
-    if (resolveLineTransport(command.lineTransport) === 'DESKTOPWIN') {
+    /** True turns on the LEGY encrypted transport. Absent or false means the plain transport. Only allowed for the linejs devices. */
+    legyEncrypted: z.boolean().optional(),
+    /** Stored community (Square) sync token. Absent or null means no stored token (first run). */
+    squareCursor: SquareToken.nullable().optional(),
+    /** True turns on community message receive. Absent or false means off. Only allowed for the linejs devices. */
+    squareReceive: z.boolean().optional() }).superRefine((command, context) => {
+    if (isLinejsTransport(command.lineTransport)) {
       if (command.chromeLtsmDir !== undefined) context.addIssue({ code: 'custom', path: ['chromeLtsmDir'], message: 'chromeLtsmDir requires lineTransport CHROMEOS' });
+      // IOSIPAD has no LEGY encrypted transport. Its direct legacy token never goes to the LEGY outer URL.
+      if (command.lineTransport === 'IOSIPAD' && command.legyEncrypted === true) {
+        context.addIssue({ code: 'custom', path: ['legyEncrypted'], message: 'legyEncrypted is not available for lineTransport IOSIPAD' });
+      }
       return;
     }
-    if (command.legyEncrypted !== undefined) context.addIssue({ code: 'custom', path: ['legyEncrypted'], message: 'legyEncrypted requires lineTransport DESKTOPWIN' });
+    if (command.squareReceive === true) context.addIssue({ code: 'custom', path: ['squareReceive'], message: 'squareReceive requires a linejs lineTransport' });
+    if (command.legyEncrypted !== undefined) context.addIssue({ code: 'custom', path: ['legyEncrypted'], message: 'legyEncrypted requires a linejs lineTransport' });
   }),
   LoginAttempt.extend({ type: z.literal('loginQr') }),
   LoginAttempt.extend({ type: z.literal('loginToken') }),
   LoginAttempt.extend({ type: z.literal('setSecretState'), secrets: Secrets }),
   Bound.extend({ type: z.literal('poll') }),
+  /** One user-started catalog read (`listConversations`). The worker answers with a `conversationCatalog` event and nothing else. */
+  Bound.extend({ type: z.literal('refreshCatalog') }),
   Bound.extend({ type: z.literal('ackBatch'), batchId: Id, cursorAfter: TalkCursorV1Schema,
     /** Releases startup suppression only after the final startup batch was durably stored. */
     startupComplete: z.boolean().optional() }),
+  /** Confirms that a squareBatch was durably stored. tokenAfter must match the batch. */
+  Bound.extend({ type: z.literal('ackSquareBatch'), batchId: Id.max(128), tokenAfter: SquareToken }),
   Conversation.extend({ type: z.literal('history'), requestId: Id, cursor: Id.nullable(), limit: z.number().int().min(1).max(100) }),
   ChatResourceReadCommandSchema,
   Bound.extend({ type: z.literal('refreshOwnProfile'), requestId: Id.max(128), timeoutMs: z.number().int().min(1_000).max(30_000) }),
@@ -172,7 +204,11 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
     if (issue) context.addIssue({ code: 'custom', path: ['mentions'], message: issue });
   }),
   Conversation.extend({ type: z.literal('manualSendText'), requestId: Id, text: Id, replyToMessageId: Id.nullable(),
-    operationId: Id.optional(), attemptId: Id.optional(), effectPermit: Id.optional() }),
+    mentions: z.array(OutgoingMentionSchema).max(OUTGOING_MENTIONS_MAX).optional(),
+    operationId: Id.optional(), attemptId: Id.optional(), effectPermit: Id.optional() }).superRefine((command, context) => {
+    const issue = command.mentions && command.mentions.length > 0 ? outgoingMentionsIssue(command.text, command.mentions) : null;
+    if (issue) context.addIssue({ code: 'custom', path: ['mentions'], message: issue });
+  }),
   Conversation.extend({ type: z.literal('sendMedia'), chatType: z.enum(['direct', 'group']), requestId: Id,
     manualSend: z.literal(true).optional(),
     kind: z.enum(['image', 'file']), filePath: z.string().min(1).max(1024).regex(/^(?:[A-Za-z]:[\\/]|\/)/),
@@ -186,6 +222,8 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Conversation.extend({ type: z.literal('unsendMessage'), requestId: Id, messageId: Decimal }),
   Bound.extend({ type: z.literal('checkFriendRelation'), requestId: Id, targetMid: UserMid }),
   Bound.extend({ type: z.literal('addFriendByMid'), requestId: Id, targetMid: UserMid, sourceChatMid: SourceChatMid.optional() }),
+  /** One user-started contact read (getContactsV3). It never adds a friend and never sends a message. */
+  Bound.extend({ type: z.literal('lookupContact'), requestId: Id.max(128), targetMid: UserMid }),
   Conversation.extend({ type: z.literal('downloadAttachment'), requestId: Id, attemptToken: z.uuid(), messageId: Id, attachmentId: z.uuid(), externalAttachmentId: Id, kind: z.enum(['image', 'video', 'audio', 'file']), occurredAt: z.iso.datetime({ offset: true }), originalFileName: z.string(), senderId: Id.optional(), senderDisplayName: z.string().max(256).nullable().optional(), lineMessage: JsonValueSchema, maxBytes: z.number().int().positive(), timeoutMs: z.number().int().positive() }),
   Bound.extend({ type: z.literal('cancelAttachmentDownload'), attachmentId: z.uuid(), attemptToken: z.uuid() }),
   Bound.extend({ type: z.literal('revokeControl') }),
@@ -202,7 +240,8 @@ export const LineWorkerEventSchema = z.union([
   Bound.extend({ type: z.literal('status'), state: z.enum(['disconnected', 'connecting', 'ready', 'degraded', 'stopped', 'PROTOCOL_UNVERIFIED']), message: z.string().nullable() }),
   Bound.extend({ type: z.literal('modeAck'), mode: AccountModeSchema, drained: z.boolean() }),
   Bound.extend({ type: z.literal('workerProtocolAck'), protocolVersion: z.literal(WORKER_PROTOCOL_VERSION), manualSend: z.literal(true) }),
-  Bound.extend({ type: z.literal('authInvalidated') }),
+  Bound.extend({ type: z.literal('authInvalidated'), code: z.custom<LineServerErrorCode>((value) => lineServerErrorMessage(value) !== null).optional(),
+    upstreamCode: z.union([z.number().finite().min(-1_000_000_000).max(1_000_000_000), z.enum(['missing', 'non_numeric'])]).optional() }),
   Bound.extend({ type: z.literal('syncConfirmed') }),
   Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('degraded'), code: z.literal('CATALOG_REFRESH_FAILED'),
     serverError: z.string().max(80).refine((value) => lineServerErrorMessage(value) !== null).optional() }),
@@ -221,6 +260,11 @@ export const LineWorkerEventSchema = z.union([
     startupSync: z.boolean().optional(), startupFinal: z.boolean().optional(),
     readReceipts: z.array(ReadReceiptSchema).max(500).optional(),
     unsends: z.array(UnsendSchema).max(500).optional() }),
+  /** Community (Square) events for archive only. tokenBefore is null on the first run (no stored token). */
+  Bound.extend({ type: z.literal('squareBatch'), batchId: Id.max(128), tokenBefore: SquareToken.nullable(), tokenAfter: SquareToken,
+    envelopes: z.array(ArchiveInboundEnvelopeSchema).max(SQUARE_BATCH_MAX_ENVELOPES),
+    titles: z.array(z.strictObject({ chatId: z.string().regex(/^m[0-9a-f]{32}$/), title: z.string().min(1).max(256) }))
+      .max(SQUARE_BATCH_MAX_ENVELOPES).optional() }),
   Bound.extend({ type: z.literal('startupSyncComplete'), batchId: Id }),
   Bound.extend({ type: z.literal('conversationCatalog'), conversations: z.array(ConversationCatalogItemSchema) }),
   Conversation.extend({ type: z.literal('historyResult'), requestId: Id, nextCursor: Id.nullable(), envelopes: z.array(InboundEnvelopeSchema) }),
@@ -243,6 +287,11 @@ export const LineWorkerEventSchema = z.union([
   }),
   Bound.extend({ type: z.literal('addFriendResult'), requestId: Id, targetMid: UserMid,
     status: z.enum(['added', 'failed', 'unknown']), error: z.string().nullable() }),
+  z.discriminatedUnion('status', [
+    Bound.extend({ type: z.literal('contactLookupResult'), requestId: Id.max(128), status: z.literal('ok'), error: z.null(),
+      contact: ContactLookupSchema }),
+    Bound.extend({ type: z.literal('contactLookupResult'), requestId: Id.max(128), status: z.literal('failed'), error: z.string().min(1).max(80) }),
+  ]),
   Bound.extend({ type: z.literal('error'), code: WorkerErrorCodeSchema, message: Id, retryable: z.boolean(),
     diagnostic: SafeDiagnosticSchema.optional(), requestId: Id.max(128).optional(),
     /** Status of the CHROMEOS ltsm store; present only with code CHROME_LTSM_UNAVAILABLE. */

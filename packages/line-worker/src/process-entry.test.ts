@@ -20,7 +20,7 @@ it('unwraps Electron MessageEvent data and discards malformed private-port event
   vi.resetModules();
   await import('./process-entry.js');
 
-  const init = { type: 'init', protocolVersion: 4, accountId: 'account-A', workerInstanceId: 'worker-1',
+  const init = { type: 'init', protocolVersion: 5, accountId: 'account-A', workerInstanceId: 'worker-1',
     controlEpoch: 7, mode: 'MONITOR_ONLY', durableCursor: {
       version: 1, revision: '0', globalRev: '0', individualRev: '0',
     } };
@@ -31,5 +31,5 @@ it('unwraps Electron MessageEvent data and discards malformed private-port event
   incoming?.({ ports: [], type: 'stop', accountId: 'account-A' });
   await new Promise((resolve) => setTimeout(resolve, 10));
   expect(posted).toHaveLength(2);
-  expect(posted[0]).toMatchObject({ type: 'workerProtocolAck', protocolVersion: 4, manualSend: true });
+  expect(posted[0]).toMatchObject({ type: 'workerProtocolAck', protocolVersion: 5, manualSend: true });
 });

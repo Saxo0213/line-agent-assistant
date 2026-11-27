@@ -39,6 +39,7 @@ export function lineMediaUrl(input: LineMediaTarget): string | null {
   if (!parsed.success) return null;
   const target = parsed.data;
   const ids = target.type === 'account' ? [target.accountId]
+    : target.type === 'profilePicture' ? [target.picturePath]
     : target.type === 'conversation' ? [target.accountId, target.chatId]
     : target.type === 'member' ? [target.accountId, target.chatId, target.memberId]
     : target.type === 'sticker' || target.type === 'sticon' || target.type === 'reaction' ? [target.accountId, target.chatId, target.messageId]
@@ -47,6 +48,7 @@ export function lineMediaUrl(input: LineMediaTarget): string | null {
   if (ids.some((id) => !wellFormed(id))) return null;
   switch (target.type) {
     case 'account': return `line-media://avatar/account/${encode(target.accountId)}`;
+    case 'profilePicture': return `line-media://avatar/picture/${encode(target.picturePath)}`;
     case 'conversation': return `line-media://avatar/conversation/${encode(target.accountId)}/${target.chatType}/${encode(target.chatId)}`;
     case 'member': return `line-media://avatar/member/${encode(target.accountId)}/${target.chatType}/${encode(target.chatId)}/${encode(target.memberId)}`;
     case 'sticker': return `line-media://sticker/${encode(target.accountId)}/${target.chatType}/${encode(target.chatId)}/${encode(target.messageId)}`;
@@ -70,6 +72,9 @@ export function parseLineMediaUrl(value: string): LineMediaTarget | null {
   if (route === 'avatar' && segments[0] === 'account' && segments.length === 2) {
     const accountId = id(segments[1]); if (accountId === null) return null;
     target = { type: 'account', accountId };
+  } else if (route === 'avatar' && segments[0] === 'picture' && segments.length === 2) {
+    const picturePath = id(segments[1]); if (picturePath === null) return null;
+    target = { type: 'profilePicture', picturePath };
   } else if (route === 'avatar' && segments[0] === 'conversation' && segments.length === 4) {
     const accountId = id(segments[1]), ct = chatType(segments[2]), chatId = id(segments[3]);
     if (accountId === null || !ct || chatId === null) return null;

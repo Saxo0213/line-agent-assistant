@@ -111,6 +111,20 @@ describe('AttachmentService block reasons', () => {
     } finally { await h.service.shutdown(); }
   });
 
+  it('keeps COMMUNITY_DOWNLOAD_UNSUPPORTED on a community row of a logged-in account with no worker call, claim or audit', async () => {
+    const attachment = row('community', { chatType: 'community', chatId: `m${'0'.repeat(32)}` });
+    const h = harness(attachment, { binding: (accountId) => active(accountId) });
+    try {
+      await expect(h.service.downloadById(attachment.attachmentId)).resolves.toBe(false);
+      await expect(h.service.downloadById(attachment.attachmentId)).resolves.toBe(false);
+      expect(h.writes).toEqual([[attachment.attachmentId, 'COMMUNITY_DOWNLOAD_UNSUPPORTED']]);
+      expect(h.audits).toEqual([]);
+      expect(h.claims).toEqual([]);
+      expect(h.download).not.toHaveBeenCalled();
+      expect(attachment).toMatchObject({ status: 'queued', error: 'COMMUNITY_DOWNLOAD_UNSUPPORTED', retryCount: 0 });
+    } finally { await h.service.shutdown(); }
+  });
+
   it('keeps the External Monitor reason on the row and refuses a manual attempt without a worker check', async () => {
     const attachment = row('external-manual', { externalSource: true, error: 'EXTERNAL_SOURCE_DOWNLOAD_UNAVAILABLE' });
     const h = harness(attachment, { binding: () => null });

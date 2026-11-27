@@ -190,7 +190,7 @@ database('external monitor foundation', () => {
   it('bridges plain native envelopes at write time and replaces a dpapi envelope with the same digest', async () => {
     const accountId = 'external-bridge-plain';
     const { sourceId, generation, modeRevision } = await createSource(accountId, {
-      snapshotDigest: 'e'.repeat(64), schemaVersion: 'line-schema-v1', highWater: { createdTime: '300', id: 'bridge-dpapi' }, eligibleCount: '3',
+      snapshotDigest: 'e'.repeat(64), schemaVersion: 'line-schema-v1', highWater: { createdTime: '300', id: '9000000000000000011' }, eligibleCount: '3',
     });
     const base = { chatType: 'direct' as const, chatId: 'bridge-chat', senderId: 'bridge-sender', occurredAt: '2026-10-20T00:00:00Z' };
     const contact = { ...base, observationId: 'official-line-db:bridge-contact', canonicalMessageId: 'bridge-contact', nativeMessageId: 'bridge-contact',
@@ -199,10 +199,10 @@ database('external monitor foundation', () => {
     const location = { ...base, observationId: 'official-line-db:bridge-location', canonicalMessageId: 'bridge-location', nativeMessageId: 'bridge-location',
       kind: 'event', text: 'Bridge cafe', nativeContentType: 15, nativePayload: plainEnvelope({ _id: 'bridge-location', _contentType: 15, _text: 'Bridge cafe' }) };
     const legacyDigest = 'f'.repeat(64);
-    const legacy = { ...base, observationId: 'official-line-db:bridge-dpapi', canonicalMessageId: 'bridge-dpapi', nativeMessageId: 'bridge-dpapi',
+    const legacy = { ...base, observationId: 'official-line-db:bridge-dpapi', canonicalMessageId: '9000000000000000011', nativeMessageId: '9000000000000000011',
       kind: 'event', text: 'ring', nativeContentType: 6, nativePayload: dpapiEnvelope(legacyDigest) };
     await repository.stageAndProjectBatch({ accountId, sourceId, generation, expectedModeRevision: modeRevision, expectedCheckpoint: {},
-      batchId: 'bridge-initial', cursor: { createdTime: '300', id: 'bridge-dpapi' }, initialImport: true,
+      batchId: 'bridge-initial', cursor: { createdTime: '300', id: '9000000000000000011' }, initialImport: true,
       observations: [contact, location, legacy] as unknown as ExternalObservationBatch['observations'] });
     const read = async (id: string) => (await pool.query<{ kind: string; content: unknown; content_rule_version: number; reply_to_message_id: string | null; native: unknown }>(
       "SELECT kind,content,content_rule_version,reply_to_message_id,raw->'native' AS native FROM messages WHERE account_id=$1 AND message_id=$2", [accountId, id])).rows[0];
@@ -213,16 +213,16 @@ database('external monitor foundation', () => {
     expect(await read('bridge-location')).toMatchObject({ kind: 'location', content_rule_version: 1,
       content: { type: 'location', title: 'Bridge cafe', latitude: null } });
     // C7: a dpapi envelope is accepted and skipped by the bridge.
-    expect(await read('bridge-dpapi')).toMatchObject({ kind: 'event', content: null, content_rule_version: 0, native: legacy.nativePayload });
+    expect(await read('9000000000000000011')).toMatchObject({ kind: 'event', content: null, content_rule_version: 0, native: legacy.nativePayload });
 
     // C7: the same row's plain envelope replaces the dpapi one although sourceDigest is equal.
-    const checkpoint = { createdTime: '300', id: 'bridge-dpapi' };
-    const plainLegacy = { ...legacy, nativePayload: { ...plainEnvelope({ _id: 'bridge-dpapi', _contentType: 6, _text: 'ring' }), sourceDigest: legacyDigest } };
+    const checkpoint = { createdTime: '300', id: '9000000000000000011' };
+    const plainLegacy = { ...legacy, nativePayload: { ...plainEnvelope({ _id: '9000000000000000011', _contentType: 6, _text: 'ring' }), sourceDigest: legacyDigest } };
     const replaced = await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
       expectedCheckpoint: checkpoint, batchId: 'bridge-backfill', cursor: checkpoint, forwardObservations: [],
       tailObservations: [plainLegacy as unknown as ExternalObservationBatch['observations'][number]] });
-    expect(replaced.changedMessages).toEqual([{ chatType: 'direct', chatId: 'bridge-chat', messageId: 'bridge-dpapi' }]);
-    expect(await read('bridge-dpapi')).toMatchObject({ kind: 'event', content_rule_version: 1, native: plainLegacy.nativePayload,
+    expect(replaced.changedMessages).toEqual([{ chatType: 'direct', chatId: 'bridge-chat', messageId: '9000000000000000011' }]);
+    expect(await read('9000000000000000011')).toMatchObject({ kind: 'event', content_rule_version: 1, native: plainLegacy.nativePayload,
       content: { type: 'event', nativeContentType: 6, text: 'ring' } });
 
     // An unchanged plain digest stays a no-op (Layer 1 is write-once per source row).
@@ -235,58 +235,58 @@ database('external monitor foundation', () => {
       expectedCheckpoint: checkpoint, batchId: 'bridge-no-downgrade', cursor: checkpoint, forwardObservations: [],
       tailObservations: [legacy as unknown as ExternalObservationBatch['observations'][number]] });
     expect(downgrade.changedMessages).toEqual([]);
-    expect((await read('bridge-dpapi'))?.native).toEqual(plainLegacy.nativePayload);
+    expect((await read('9000000000000000011'))?.native).toEqual(plainLegacy.nativePayload);
   });
 
   it('updates projected content when the same official row becomes unsent', async () => {
     const accountId = 'external-projected-unsent-update';
     const occurredAt = '2026-10-21T00:00:00Z';
     const { sourceId, generation, modeRevision } = await createSource(accountId, {
-      snapshotDigest: 'a'.repeat(64), schemaVersion: 'line-schema-v1', highWater: { id: 'unsent-file' }, eligibleCount: '1',
+      snapshotDigest: 'a'.repeat(64), schemaVersion: 'line-schema-v1', highWater: { id: '9000000000000000012' }, eligibleCount: '1',
     });
-    const base = { observationId: 'official-line-db:unsent-file', canonicalMessageId: 'unsent-file', nativeMessageId: 'unsent-file',
+    const base = { observationId: 'official-line-db:unsent-file', canonicalMessageId: '9000000000000000012', nativeMessageId: '9000000000000000012',
       chatType: 'direct' as const, chatId: 'unsent-chat', senderId: 'unsent-sender', kind: 'file', text: null,
       occurredAt, nativeContentType: 3 };
-    const original = { ...base, nativePayload: plainEnvelope({ _id: 'unsent-file', _contentType: 3, _text: '' }) };
+    const original = { ...base, nativePayload: plainEnvelope({ _id: '9000000000000000012', _contentType: 3, _text: '' }) };
     await repository.stageAndProjectBatch({ accountId, sourceId, generation, expectedModeRevision: modeRevision, expectedCheckpoint: {},
-      batchId: 'unsent-initial', cursor: { id: 'unsent-file' }, initialImport: true, observations: [original] as unknown as ExternalObservationBatch['observations'] });
-    await expect(pool.query<{ content: unknown }>('SELECT content FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, 'unsent-file']))
+      batchId: 'unsent-initial', cursor: { id: '9000000000000000012' }, initialImport: true, observations: [original] as unknown as ExternalObservationBatch['observations'] });
+    await expect(pool.query<{ content: unknown }>('SELECT content FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, '9000000000000000012']))
       .resolves.toMatchObject({ rows: [{ content: { type: 'media' } }] });
-    const changed = { ...base, nativePayload: { ...plainEnvelope({ _id: 'unsent-file', _contentType: 3, _text: '',
+    const changed = { ...base, nativePayload: { ...plainEnvelope({ _id: '9000000000000000012', _contentType: 3, _text: '',
       _contentMetadata: JSON.stringify({ UNSENT: true }) }), sourceDigest: 'b'.repeat(64) } };
     await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
-      expectedCheckpoint: { id: 'unsent-file' }, batchId: 'unsent-refresh', cursor: { id: 'unsent-file' }, forwardObservations: [],
+      expectedCheckpoint: { id: '9000000000000000012' }, batchId: 'unsent-refresh', cursor: { id: '9000000000000000012' }, forwardObservations: [],
       tailObservations: [changed as unknown as ExternalObservationBatch['observations'][number]] });
-    await expect(pool.query<{ content: unknown }>('SELECT content FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, 'unsent-file']))
+    await expect(pool.query<{ content: unknown }>('SELECT content FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, '9000000000000000012']))
       .resolves.toMatchObject({ rows: [{ content: { format: 1, type: 'unsent' } }] });
   });
 
   it('keeps the original text when a text message is later observed as unsent', async () => {
     const accountId = 'external-unsent-keep-text';
     const { sourceId, generation, modeRevision } = await createSource(accountId, {
-      snapshotDigest: 'a'.repeat(64), schemaVersion: 'line-schema-v1', highWater: { id: 'unsent-text' }, eligibleCount: '2',
+      snapshotDigest: 'a'.repeat(64), schemaVersion: 'line-schema-v1', highWater: { id: '9000000000000000013' }, eligibleCount: '2',
     });
     const base = { chatType: 'direct' as const, chatId: 'unsent-text-chat', senderId: 'unsent-sender', kind: 'text',
       occurredAt: '2026-10-22T00:00:00Z', nativeContentType: 0 };
-    const keptBase = { ...base, observationId: 'official-line-db:unsent-text', canonicalMessageId: 'unsent-text', nativeMessageId: 'unsent-text' };
-    const original = { ...keptBase, text: 'original words', nativePayload: plainEnvelope({ _id: 'unsent-text', _contentType: 0, _text: 'original words' }) };
+    const keptBase = { ...base, observationId: 'official-line-db:unsent-text', canonicalMessageId: '9000000000000000013', nativeMessageId: '9000000000000000013' };
+    const original = { ...keptBase, text: 'original words', nativePayload: plainEnvelope({ _id: '9000000000000000013', _contentType: 0, _text: 'original words' }) };
     await repository.stageAndProjectBatch({ accountId, sourceId, generation, expectedModeRevision: modeRevision, expectedCheckpoint: {},
-      batchId: 'unsent-text-initial', cursor: { id: 'unsent-text' }, initialImport: true, observations: [original] as unknown as ExternalObservationBatch[observations] });
-    const recalled = { ...keptBase, text: null, nativePayload: { ...plainEnvelope({ _id: 'unsent-text', _contentType: 0, _text: '',
+      batchId: 'unsent-text-initial', cursor: { id: '9000000000000000013' }, initialImport: true, observations: [original] as unknown as ExternalObservationBatch[observations] });
+    const recalled = { ...keptBase, text: null, nativePayload: { ...plainEnvelope({ _id: '9000000000000000013', _contentType: 0, _text: '',
       _contentMetadata: JSON.stringify({ UNSENT: true }) }), sourceDigest: 'b'.repeat(64) } };
     await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
-      expectedCheckpoint: { id: 'unsent-text' }, batchId: 'unsent-text-refresh', cursor: { id: 'unsent-text' }, forwardObservations: [],
+      expectedCheckpoint: { id: '9000000000000000013' }, batchId: 'unsent-text-refresh', cursor: { id: '9000000000000000013' }, forwardObservations: [],
       tailObservations: [recalled as unknown as ExternalObservationBatch[observations][number]] });
     const read = (id: string) => pool.query<{ content: { type: string }; text_content: string | null }>(
       'SELECT content,text_content FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, id]);
-    await expect(read('unsent-text')).resolves.toMatchObject({ rows: [{ content: { type: 'unsent' }, text_content: 'original words' }] });
+    await expect(read('9000000000000000013')).resolves.toMatchObject({ rows: [{ content: { type: 'unsent' }, text_content: 'original words' }] });
     // First seen already recalled: nothing original exists to keep.
-    const lateBase = { ...base, observationId: 'official-line-db:unsent-late', canonicalMessageId: 'unsent-late', nativeMessageId: 'unsent-late', text: null,
-      nativePayload: plainEnvelope({ _id: 'unsent-late', _contentType: 0, _text: '', _contentMetadata: JSON.stringify({ UNSENT: true }) }) };
+    const lateBase = { ...base, observationId: 'official-line-db:unsent-late', canonicalMessageId: '9000000000000000014', nativeMessageId: '9000000000000000014', text: null,
+      nativePayload: plainEnvelope({ _id: '9000000000000000014', _contentType: 0, _text: '', _contentMetadata: JSON.stringify({ UNSENT: true }) }) };
     await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
-      expectedCheckpoint: { id: 'unsent-text' }, batchId: 'unsent-late-first', cursor: { id: 'unsent-late' }, forwardObservations: [],
+      expectedCheckpoint: { id: '9000000000000000013' }, batchId: 'unsent-late-first', cursor: { id: '9000000000000000014' }, forwardObservations: [],
       tailObservations: [lateBase as unknown as ExternalObservationBatch[observations][number]] });
-    const late = await read('unsent-late');
+    const late = await read('9000000000000000014');
     expect(late.rows[0]?.content.type).toBe('unsent');
     expect(late.rows[0]?.text_content ?? '').toBe('');
   });
@@ -338,91 +338,91 @@ database('external monitor foundation', () => {
   it('stores protected native message envelopes and safe sticker metadata, and refreshes source-only changes', async () => {
     const accountId = 'external-native-source-message';
     const { sourceId, generation, modeRevision } = await createSource(accountId, {
-      snapshotDigest: 'c'.repeat(64), schemaVersion: 'line-schema-v1', highWater: { createdTime: '123', id: 'native-source-message' }, eligibleCount: '1',
+      snapshotDigest: 'c'.repeat(64), schemaVersion: 'line-schema-v1', highWater: { createdTime: '123', id: '9000000000000000015' }, eligibleCount: '1',
     });
     const nativePayload = { format: 1 as const, table: '_message' as const, sourceDigest: '1'.repeat(64), encoding: 'dpapi' as const, data: 'AAAA' };
-    const observation = { observationId: 'official-line-db:native-source-message', canonicalMessageId: 'native-source-message',
-      nativeMessageId: 'native-source-message', chatType: 'direct' as const, chatId: 'native-chat', senderId: 'native-sender',
+    const observation = { observationId: 'official-line-db:native-source-message', canonicalMessageId: '9000000000000000015',
+      nativeMessageId: '9000000000000000015', chatType: 'direct' as const, chatId: 'native-chat', senderId: 'native-sender',
       kind: 'sticker', text: null, occurredAt: '2026-10-17T00:00:00Z', nativeContentType: 7,
       nativePayload, nativeStickerMetadata: { STKID: '123456', STKPKGID: '456789', STKVER: '12', STKTXT: ' safe sticker ', STKOPT: 'A' },
-      attachments: [{ id: 'native-source-message', kind: 'image' as const, name: 'native.png', mimeType: null, sizeBytes: 25, expiresAt: null }] };
+      attachments: [{ id: '9000000000000000015', kind: 'image' as const, name: 'native.png', mimeType: null, sizeBytes: 25, expiresAt: null }] };
     const first = await repository.stageAndProjectBatch({ accountId, sourceId, generation, expectedModeRevision: modeRevision, expectedCheckpoint: {},
-      batchId: 'native-source-initial', cursor: { createdTime: '123', id: 'native-source-message' }, initialImport: true,
+      batchId: 'native-source-initial', cursor: { createdTime: '123', id: '9000000000000000015' }, initialImport: true,
       observations: [observation as unknown as ExternalObservationBatch['observations'][number]] });
-    expect(first.changedMessages).toEqual([{ chatType: 'direct', chatId: 'native-chat', messageId: 'native-source-message' }]);
+    expect(first.changedMessages).toEqual([{ chatType: 'direct', chatId: 'native-chat', messageId: '9000000000000000015' }]);
     const normalizedFields = await pool.query<{ content: unknown; reply_to_message_id: string | null }>(
-      'SELECT content,reply_to_message_id FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, 'native-source-message']);
+      'SELECT content,reply_to_message_id FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, '9000000000000000015']);
     // A dpapi envelope cannot be read by the bridge: the projection stays empty.
     expect(normalizedFields.rows[0]).toEqual({ content: null, reply_to_message_id: null });
     const inserted = await pool.query<{ raw: Record<string, unknown> }>(
-      'SELECT raw FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, 'native-source-message']);
-    expect(inserted.rows[0]?.raw).toEqual({ message: { id: 'native-source-message', from: 'native-sender', contentType: 7,
+      'SELECT raw FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, '9000000000000000015']);
+    expect(inserted.rows[0]?.raw).toEqual({ message: { id: '9000000000000000015', from: 'native-sender', contentType: 7,
       createdTime: new Date('2026-10-17T00:00:00.000Z').getTime(), text: null, contentMetadata: { STKID: '123456', STKPKGID: '456789', STKVER: '12', STKTXT: 'safe sticker', STKOPT: 'A' } }, native: nativePayload });
     const attachment = await pool.query<{ status: string; name: string; mime_type: string | null; size_bytes: string | null }>(
-      'SELECT status,name,mime_type,size_bytes FROM attachments WHERE account_id=$1 AND message_id=$2', [accountId, 'native-source-message']);
+      'SELECT status,name,mime_type,size_bytes FROM attachments WHERE account_id=$1 AND message_id=$2', [accountId, '9000000000000000015']);
     expect(attachment.rows).toEqual([{ status: 'queued', name: 'native.png', mime_type: null, size_bytes: '25' }]);
     await pool.query("UPDATE attachments SET status='ready',relative_path='native/hash/native.png',sha256=$3 WHERE account_id=$1 AND message_id=$2",
-      [accountId, 'native-source-message', 'd'.repeat(64)]);
+      [accountId, '9000000000000000015', 'd'.repeat(64)]);
 
     const rotatedCiphertext = { ...nativePayload, data: 'BBBB' };
-    const sparseAttachment = { ...observation, attachments: [{ id: 'native-source-message', kind: 'image' as const,
+    const sparseAttachment = { ...observation, attachments: [{ id: '9000000000000000015', kind: 'image' as const,
       name: null, mimeType: null, sizeBytes: null, expiresAt: null }] };
     const noop = await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
-      expectedCheckpoint: { createdTime: '123', id: 'native-source-message' }, batchId: 'native-source-cipher-rotation',
-      cursor: { createdTime: '123', id: 'native-source-message' }, forwardObservations: [],
+      expectedCheckpoint: { createdTime: '123', id: '9000000000000000015' }, batchId: 'native-source-cipher-rotation',
+      cursor: { createdTime: '123', id: '9000000000000000015' }, forwardObservations: [],
       tailObservations: [{ ...sparseAttachment, nativePayload: rotatedCiphertext } as unknown as ExternalObservationBatch['observations'][number]] });
     expect(noop).toMatchObject({ tailRepaired: 0, changedMessages: [] });
     expect((await pool.query("SELECT status,name,size_bytes,relative_path FROM attachments WHERE account_id=$1 AND message_id=$2",
-      [accountId, 'native-source-message'])).rows[0]).toEqual({ status: 'ready', name: 'native.png', size_bytes: '25', relative_path: 'native/hash/native.png' });
+      [accountId, '9000000000000000015'])).rows[0]).toEqual({ status: 'ready', name: 'native.png', size_bytes: '25', relative_path: 'native/hash/native.png' });
     expect((await pool.query('SELECT raw->\'native\' AS native FROM messages WHERE account_id=$1 AND message_id=$2',
-      [accountId, 'native-source-message'])).rows[0]?.native).toEqual(nativePayload);
+      [accountId, '9000000000000000015'])).rows[0]?.native).toEqual(nativePayload);
 
     const updatedPayload = { ...rotatedCiphertext, sourceDigest: '2'.repeat(64) };
     const refreshed = await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
-      expectedCheckpoint: { createdTime: '123', id: 'native-source-message' }, batchId: 'native-source-data-refresh',
-      cursor: { createdTime: '123', id: 'native-source-message' }, forwardObservations: [],
+      expectedCheckpoint: { createdTime: '123', id: '9000000000000000015' }, batchId: 'native-source-data-refresh',
+      cursor: { createdTime: '123', id: '9000000000000000015' }, forwardObservations: [],
       tailObservations: [{ ...observation, nativePayload: updatedPayload } as unknown as ExternalObservationBatch['observations'][number]] });
-    expect(refreshed.changedMessages).toEqual([{ chatType: 'direct', chatId: 'native-chat', messageId: 'native-source-message' }]);
+    expect(refreshed.changedMessages).toEqual([{ chatType: 'direct', chatId: 'native-chat', messageId: '9000000000000000015' }]);
     expect((await pool.query('SELECT raw->\'native\' AS native FROM messages WHERE account_id=$1 AND message_id=$2',
-      [accountId, 'native-source-message'])).rows[0]?.native).toEqual(updatedPayload);
+      [accountId, '9000000000000000015'])).rows[0]?.native).toEqual(updatedPayload);
 
     const legacyObservation = { ...observation, nativePayload: undefined, nativeStickerMetadata: undefined };
     const legacyReplay = await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
-      expectedCheckpoint: { createdTime: '123', id: 'native-source-message' }, batchId: 'native-source-legacy-omission',
-      cursor: { createdTime: '123', id: 'native-source-message' }, forwardObservations: [],
+      expectedCheckpoint: { createdTime: '123', id: '9000000000000000015' }, batchId: 'native-source-legacy-omission',
+      cursor: { createdTime: '123', id: '9000000000000000015' }, forwardObservations: [],
       tailObservations: [legacyObservation as unknown as ExternalObservationBatch['observations'][number]] });
     expect(legacyReplay.changedMessages).toEqual([]);
     expect((await pool.query('SELECT raw FROM messages WHERE account_id=$1 AND message_id=$2',
-      [accountId, 'native-source-message'])).rows[0]?.raw).toMatchObject({ native: updatedPayload,
+      [accountId, '9000000000000000015'])).rows[0]?.raw).toMatchObject({ native: updatedPayload,
       message: { contentMetadata: { STKID: '123456', STKPKGID: '456789', STKVER: '12', STKTXT: 'safe sticker', STKOPT: 'A' } } });
 
     const changedIdentity = { ...observation, observationId: 'native-source-sticker-identity-change',
       nativeStickerMetadata: { STKID: '654321' } };
     await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
-      expectedCheckpoint: { createdTime: '123', id: 'native-source-message' }, batchId: 'native-source-sticker-identity-change',
-      cursor: { createdTime: '123', id: 'native-source-message' }, forwardObservations: [],
+      expectedCheckpoint: { createdTime: '123', id: '9000000000000000015' }, batchId: 'native-source-sticker-identity-change',
+      cursor: { createdTime: '123', id: '9000000000000000015' }, forwardObservations: [],
       tailObservations: [changedIdentity as unknown as ExternalObservationBatch['observations'][number]] });
     const changedRaw = await pool.query<{ raw: Record<string, unknown> }>(
-      'SELECT raw FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, 'native-source-message']);
+      'SELECT raw FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, '9000000000000000015']);
     expect((changedRaw.rows[0]?.raw.message as Record<string, unknown>).contentMetadata).toEqual({ STKID: '654321' });
 
     const invalidObservation: unknown = { ...observation, observationId: 'invalid-source', nativePayload: { ...nativePayload, table: '_chat' } };
     await expect(repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
-      expectedCheckpoint: { createdTime: '123', id: 'native-source-message' }, batchId: 'native-source-invalid-envelope',
-      cursor: { createdTime: '124', id: 'native-source-message' }, forwardObservations: [],
+      expectedCheckpoint: { createdTime: '123', id: '9000000000000000015' }, batchId: 'native-source-invalid-envelope',
+      cursor: { createdTime: '124', id: '9000000000000000015' }, forwardObservations: [],
       tailObservations: [invalidObservation as ExternalObservationBatch['observations'][number]] }))
       .rejects.toThrow('Invalid external native message payload table');
 
-    const invalidStickerObservation: unknown = { ...observation, observationId: 'native-source-invalid-sticker',
-      canonicalMessageId: 'native-source-invalid-sticker', nativeMessageId: 'native-source-invalid-sticker', kind: 'text', text: 'private LW-ABCDEFGH',
+    const invalidStickerObservation: unknown = { ...observation, observationId: '9000000000000000016',
+      canonicalMessageId: '9000000000000000016', nativeMessageId: '9000000000000000016', kind: 'text', text: 'private LW-ABCDEFGH',
       nativePayload: { ...nativePayload, sourceDigest: '4'.repeat(64) }, nativeStickerMetadata: { STKID: 'not-a-sticker-id' } };
     await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
-      expectedCheckpoint: { createdTime: '123', id: 'native-source-message' }, batchId: 'native-source-redacted-text',
-      cursor: { createdTime: '124', id: 'native-source-message' }, forwardObservations: [
+      expectedCheckpoint: { createdTime: '123', id: '9000000000000000015' }, batchId: 'native-source-redacted-text',
+      cursor: { createdTime: '124', id: '9000000000000000015' }, forwardObservations: [
         invalidStickerObservation as ExternalObservationBatch['observations'][number],
       ], tailObservations: [] });
     const redacted = await pool.query<{ text_content: string | null; raw: Record<string, unknown> }>(
-      'SELECT text_content,raw FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, 'native-source-invalid-sticker']);
+      'SELECT text_content,raw FROM messages WHERE account_id=$1 AND message_id=$2', [accountId, '9000000000000000016']);
     expect(redacted.rows[0]?.text_content).toBe('private [REDACTED_VERIFICATION_CODE]');
     expect(redacted.rows[0]?.raw).toMatchObject({ message: { text: 'private [REDACTED_VERIFICATION_CODE]' },
       native: { sourceDigest: '4'.repeat(64) } });
@@ -507,8 +507,8 @@ database('external monitor foundation', () => {
       sourceDigest, encoding: 'dpapi' as const, data });
     const initialPayload = payload('5'.repeat(64), 'AAAA');
     const observation: ExternalObservationBatch['observations'][number] = {
-      observationId: 'official-line-db:native-replay-message', canonicalMessageId: 'native-replay-message',
-      nativeMessageId: 'native-replay-message', chatType: 'direct', chatId: 'native-replay-chat', senderId: 'native-sender',
+      observationId: 'official-line-db:native-replay-message', canonicalMessageId: '9000000000000000017',
+      nativeMessageId: '9000000000000000017', chatType: 'direct', chatId: 'native-replay-chat', senderId: 'native-sender',
       kind: 'text', text: 'source core', occurredAt: '2026-10-17T00:00:00Z', nativePayload: initialPayload,
     };
     const persistedSource = async () => pool.query<{ observation: Record<string, unknown>; raw: Record<string, unknown>; status: string }>(
@@ -526,7 +526,7 @@ database('external monitor foundation', () => {
     const initialRefresh = await repository.stageAndProjectBatch({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
       expectedCheckpoint: { head: 1 }, batchId: 'native-replay-initial-refresh', cursor: { head: 1 }, initialImport: true,
       observations: [{ ...observation, nativePayload: initialRefreshPayload }] });
-    expect(initialRefresh.changedMessages).toEqual([{ chatType: 'direct', chatId: 'native-replay-chat', messageId: 'native-replay-message' }]);
+    expect(initialRefresh.changedMessages).toEqual([{ chatType: 'direct', chatId: 'native-replay-chat', messageId: '9000000000000000017' }]);
     await expect(persistedSource()).resolves.toMatchObject({ rows: [{
       observation: { nativePayload: initialRefreshPayload }, raw: { native: initialRefreshPayload },
     }] });
@@ -547,7 +547,7 @@ database('external monitor foundation', () => {
     const ordinaryRefresh = await repository.stageAndProjectBatch({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
       expectedCheckpoint: { head: 1 }, batchId: 'native-replay-ordinary-refresh', cursor: { head: 1 },
       observations: [{ ...observation, nativePayload: ordinaryRefreshPayload }] });
-    expect(ordinaryRefresh).toMatchObject({ conflicts: 0, changedMessages: [{ messageId: 'native-replay-message' }] });
+    expect(ordinaryRefresh).toMatchObject({ conflicts: 0, changedMessages: [{ messageId: '9000000000000000017' }] });
     await expect(persistedSource()).resolves.toMatchObject({ rows: [{
       observation: { nativePayload: ordinaryRefreshPayload }, raw: { native: ordinaryRefreshPayload },
     }] });
@@ -555,7 +555,7 @@ database('external monitor foundation', () => {
     const coreOnly = await repository.stageAndProjectBatch({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
       expectedCheckpoint: { head: 1 }, batchId: 'native-replay-core-only', cursor: { head: 1 },
       observations: [{ ...observation, text: 'updated core', nativePayload: undefined }] });
-    expect(coreOnly).toMatchObject({ conflicts: 0, changedMessages: [{ messageId: 'native-replay-message' }] });
+    expect(coreOnly).toMatchObject({ conflicts: 0, changedMessages: [{ messageId: '9000000000000000017' }] });
     await expect(persistedSource()).resolves.toMatchObject({ rows: [{
       observation: { nativePayload: ordinaryRefreshPayload }, raw: { native: ordinaryRefreshPayload, message: { text: 'updated core' } },
     }] });
@@ -566,7 +566,7 @@ database('external monitor foundation', () => {
     const forward = await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
       expectedCheckpoint: { head: 1 }, batchId: 'native-replay-direct-forward', cursor: { head: 2 },
       forwardObservations: [{ ...observation, text: 'updated core', nativePayload: forwardPayload }], tailObservations: [] });
-    expect(forward).toMatchObject({ conflicts: 0, changedMessages: [{ messageId: 'native-replay-message' }] });
+    expect(forward).toMatchObject({ conflicts: 0, changedMessages: [{ messageId: '9000000000000000017' }] });
     await expect(persistedSource()).resolves.toMatchObject({ rows: [{
       observation: { nativePayload: forwardPayload }, raw: { native: forwardPayload },
     }] });
@@ -575,7 +575,7 @@ database('external monitor foundation', () => {
     const tail = await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
       expectedCheckpoint: { head: 2 }, batchId: 'native-replay-direct-tail', cursor: { head: 2 },
       forwardObservations: [], tailObservations: [{ ...observation, text: 'updated core', nativePayload: tailPayload }] });
-    expect(tail).toMatchObject({ tailRepaired: 1, changedMessages: [{ messageId: 'native-replay-message' }] });
+    expect(tail).toMatchObject({ tailRepaired: 1, changedMessages: [{ messageId: '9000000000000000017' }] });
     await expect(persistedSource()).resolves.toMatchObject({ rows: [{
       observation: { nativePayload: tailPayload }, raw: { native: tailPayload },
     }] });
@@ -1764,6 +1764,28 @@ database('external monitor foundation', () => {
       'attachment-native-0', 'attachment-native-0')).resolves.toMatchObject({ name: 'changed.png', sizeBytes: 22 });
   });
 
+  it('skips a PC LINE local sending row with a text id and still commits the batch', async () => {
+    const accountId = 'external-local-sending-row';
+    const occurredAt = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
+    const { sourceId, generation, modeRevision } = await createSource(accountId);
+    await stageBatch({ accountId, sourceId, generation, expectedCheckpoint: null,
+      batchId: 'local-sending-baseline', cursor: { rowid: '0' }, observations: [] });
+    const localId = 'A1B2C3D4-E5F6-4789-8ABC-0123456789AB-';
+    expect(localId).toHaveLength(37);
+    const local = { observationId: 'local-sending-forward', canonicalMessageId: localId, nativeMessageId: localId, chatType: 'direct' as const,
+      chatId: 'local-sending-chat', senderId: 'person', kind: 'image', text: null, occurredAt,
+      nativePayload: plainEnvelope({ _id: localId, _contentType: 1, _text: '' }),
+      attachments: [{ id: localId, kind: 'image' as const, name: 'local.png', mimeType: null, sizeBytes: 12, expiresAt: null }] };
+    const result = await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision,
+      expectedCheckpoint: { rowid: '0' }, batchId: 'local-sending-forward-batch', cursor: { rowid: '1' },
+      forwardObservations: [local as never], tailObservations: [] });
+    expect(result).toMatchObject({ projected: 0 });
+    expect((await pool.query('SELECT 1 FROM messages WHERE account_id=$1', [accountId])).rowCount).toBe(0);
+    await expect(new MessageRepository(pool).getAttachmentBySource({ accountId, chatType: 'direct', chatId: 'local-sending-chat' }, localId, localId))
+      .resolves.toBeNull();
+    expect((await pool.query('SELECT cursor FROM external_source_checkpoints WHERE source_id=$1', [sourceId])).rows[0]?.cursor).toEqual({ rowid: '1' });
+  });
+
   it('rolls back the live forward page and cursor when tail reconciliation fails', async () => {
     const accountId = 'external-live-poll-atomic';
     const { sourceId, generation, modeRevision } = await createSource(accountId);
@@ -2007,20 +2029,20 @@ database('external monitor foundation', () => {
     it('keeps the pre-recall native snapshot once and never overwrites it', async () => {
       const accountId = 'recall-original-snapshot';
       const { sourceId, generation, modeRevision } = await createSource(accountId);
-      const original = obs('r1', 1, 'before', { nativePayload: plainEnvelope({ _id: 'r1', _contentType: 0, _text: 'before' }) });
+      const original = obs('9000000000000000018', 1, 'before', { nativePayload: plainEnvelope({ _id: '9000000000000000018', _contentType: 0, _text: 'before' }) });
       await stageBatch({ accountId, sourceId, generation, expectedCheckpoint: null, batchId: 'recall-seed', cursor: { rowid: '1' },
         observations: [original] as unknown as Obs });
-      const recalled = (digest: string) => ({ ...obs('r1', 1, null), nativePayload: { ...plainEnvelope({ _id: 'r1', _contentType: 0,
+      const recalled = (digest: string) => ({ ...obs('9000000000000000018', 1, null), nativePayload: { ...plainEnvelope({ _id: '9000000000000000018', _contentType: 0,
         _text: '', _contentMetadata: JSON.stringify({ UNSENT: true }) }), sourceDigest: digest } });
       const run = (batchId: string, row: unknown) => repository.commitDirectPoll({ accountId, sourceId, generation,
         expectedModeRevision: modeRevision, expectedCheckpoint: { rowid: '1' }, batchId, cursor: { rowid: '1' }, forwardObservations: [],
         tailObservations: [row] as unknown as Obs });
       await run('recall-1', recalled('b'.repeat(64)));
-      const first = await raw(accountId, 'r1');
+      const first = await raw(accountId, '9000000000000000018');
       expect(first.recall).toMatchObject({ original: original.nativePayload, recalledAt: expect.any(String) });
       expect((first.native as { sourceDigest: string }).sourceDigest).toBe('b'.repeat(64));
       await run('recall-2', recalled('c'.repeat(64)));
-      const second = await raw(accountId, 'r1');
+      const second = await raw(accountId, '9000000000000000018');
       expect(second.recall).toEqual(first.recall);
       expect((second.native as { sourceDigest: string }).sourceDigest).toBe('c'.repeat(64));
       expect(await run('recall-3', recalled('c'.repeat(64)))).toMatchObject({ tailRepaired: 0, changedMessages: [] });
@@ -2029,16 +2051,16 @@ database('external monitor foundation', () => {
     it('does not capture a snapshot for a first-seen recalled row or a dpapi envelope', async () => {
       const accountId = 'recall-no-capture';
       const { sourceId, generation, modeRevision } = await createSource(accountId);
-      const late = obs('n1', 1, null, { nativePayload: plainEnvelope({ _id: 'n1', _contentType: 0, _text: '', _contentMetadata: JSON.stringify({ UNSENT: true }) }) });
-      const legacy = obs('n2', 2, 'x', { nativePayload: dpapiEnvelope('d'.repeat(64)) });
+      const late = obs('9000000000000000019', 1, null, { nativePayload: plainEnvelope({ _id: '9000000000000000019', _contentType: 0, _text: '', _contentMetadata: JSON.stringify({ UNSENT: true }) }) });
+      const legacy = obs('9000000000000000020', 2, 'x', { nativePayload: dpapiEnvelope('d'.repeat(64)) });
       await stageBatch({ accountId, sourceId, generation, expectedCheckpoint: null, batchId: 'nocap-seed', cursor: { rowid: '2' },
         observations: [late, legacy] as unknown as Obs });
-      const recalledPlain = { ...obs('n2', 2, null), nativePayload: plainEnvelope({ _id: 'n2', _contentType: 0, _text: '',
+      const recalledPlain = { ...obs('9000000000000000020', 2, null), nativePayload: plainEnvelope({ _id: '9000000000000000020', _contentType: 0, _text: '',
         _contentMetadata: JSON.stringify({ UNSENT: true }) }) };
       await repository.commitDirectPoll({ accountId, sourceId, generation, expectedModeRevision: modeRevision, expectedCheckpoint: { rowid: '2' },
         batchId: 'nocap-poll', cursor: { rowid: '2' }, forwardObservations: [], tailObservations: [recalledPlain] as unknown as Obs });
-      expect((await raw(accountId, 'n1')).recall).toBeUndefined();
-      expect((await raw(accountId, 'n2')).recall).toBeUndefined();
+      expect((await raw(accountId, '9000000000000000019')).recall).toBeUndefined();
+      expect((await raw(accountId, '9000000000000000020')).recall).toBeUndefined();
     });
 
     it('marks only in-range missing rows, never the lower-boundary millisecond, and is idempotent', async () => {

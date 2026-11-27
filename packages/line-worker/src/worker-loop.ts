@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   isLineServerErrorCode, isLocalAgentRoom, talkServerError, MEDIA_FILE_MAX_BYTES, MEDIA_IMAGE_MAX_BYTES, LineWorkerCommandSchema, LineWorkerEventSchema,
   WORKER_PROTOCOL_VERSION, type ConversationCatalogItem, type JsonValue as ContractJsonValue, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto,
-  type ChatResourceReadCommand, type OutgoingMention, type ChatResourcePhotoPageShape,
+  type ChatResourceReadCommand, type ContactLookupDto, type LineServerErrorCode, type OutgoingMention, type ChatResourcePhotoPageShape,
 } from '@line-agent/contracts';
 import { DurableCursorSession, cursorsEqual, decodeHistoryCursor, encodeHistoryCursor,
   type HistoryCursorV1, type JsonValue } from './cursor.js';
@@ -14,8 +14,10 @@ import { IMAGE_SNIFF_PREFIX_BYTES, fallbackAttachmentFileName, peekAttachmentSou
 import { SafeAttachmentError } from './attachment-error.js';
 import { validateAttachmentMessage, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { isChatResourceFailure, isChatResourceUnsupported, safeChatResourceFailureDetails, type ChatResourceFailureKind, type ChatResourceResponseCode } from './chat-resource-error.js';
-import { isLineServerRejection } from './line-server-error.js';
+import { isLineServerRejection, isLineSquareRejection } from './line-server-error.js';
 import { tagLoginStage } from './login-failure-detail.js';
+import { flushTrafficLogSync } from './traffic-log.js';
+import { normalizeSquareEvents } from './square-normalizer.js';
 
 export type TransportIdentity = Readonly<{ ownMid: string; displayName: string | null; picturePath?: string | null }>;
 export type SyncItem = unknown | Readonly<{
@@ -27,10 +29,14 @@ export type SyncResult = Readonly<{ cursorAfter: TalkCursorV1Dto; operations: re
   readReceipts?: readonly Readonly<{ chatId: string; readerMid: string; messageId: string; readAt: string }>[];
   /** LINE unsend operations (OpType 64 and 65) observed in this sync response. */
   unsends?: readonly Readonly<{ chatId: string; messageId: string; kind: 'self' | 'notified'; observedAt: string }>[] }>;
+/** One community (Square) event fetch: raw LINE events plus the tokens of the response (null when LINE gave none). */
+export type SquareSyncResult = Readonly<{ events: readonly unknown[]; syncToken: string | null; continuationToken: string | null }>;
 export type FriendRelation = 'friend' | 'not_friend' | 'unknown';
 export type FriendRelationDiagnostic = Readonly<{ status: FriendRelation; error: string | null; failureKind?: ChatResourceFailureKind;
   upstreamStatus?: number; upstreamCode?: ChatResourceResponseCode }>;
 export type FriendAddResult = Readonly<{ status: 'added' | 'failed' | 'unknown'; error: string | null }>;
+/** One contact read by the user (`lookupContact`). It carries no add-friend or send right. */
+export type ContactLookup = ContactLookupDto;
 
 const FRIEND_ADD_LOCAL_FAILURES = new Set(['SIDE_EFFECT_DENIED', 'NOT_STARTED', 'NOT_READY', 'REQUEST_ID_CONFLICT', 'QUEUE_FULL']);
 const CHAT_DETAIL_BATCH_LIMIT = 100;
@@ -40,6 +46,17 @@ export const SYNC_CONFIRMED_INTERVAL_MS = 60_000;
 const POLL_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000, 300_000] as const;
 const POLL_SUSPEND_AFTER_REJECTIONS = 5;
 const SUSPENDED = 'LINE_CONNECTION_SUSPENDED';
+// Community (Square) receive step. It has its own timer and counters; the Talk poll does not change.
+const SQUARE_START_DELAY_MS = 1_000;
+const SQUARE_IDLE_MS = 10_000;
+const SQUARE_CONTINUATION_MS = 1_000;
+const SQUARE_MAX_PAGES_IN_ROW = 5;
+/** Wait before Main gets the same unacknowledged squareBatch again. */
+const SQUARE_RESEND_MS = 10_000;
+const SQUARE_EVENTS_MAX = 500;
+/** Title reads in one fetch step. Chats beyond it are asked in a later step that sees them again. */
+const SQUARE_TITLES_PER_STEP = 20;
+const SQUARE_SUSPEND_AFTER_REJECTIONS = 5;
 function safeFriendAddResult(result: FriendAddResult): FriendAddResult {
   if (result.status === 'added') return { status: 'added', error: null };
   if (result.status === 'failed' && typeof result.error === 'string' &&
@@ -61,6 +78,12 @@ export interface LineTransport {
   sync(cursor: TalkCursorV1Dto): Promise<SyncResult>;
   /** Optional: physical HTTP status of the last `sync` attempt, or null when none was seen. */
   lastSyncHttpStatus?(): number | null;
+  /** Optional: one community (Square) event fetch. A transport without it (CHROMEOS) gets no community step. */
+  syncSquare?(request: Readonly<{ syncToken?: string; continuationToken?: string }>): Promise<SquareSyncResult>;
+  /** Optional: name of one community chat, or null when LINE gave none. */
+  getSquareChatTitle?(squareChatMid: string): Promise<string | null>;
+  /** Optional: physical HTTP status of the last `syncSquare` attempt, or null when none was seen. */
+  lastSquareHttpStatus?(): number | null;
   history(conversation: { chatType: 'direct' | 'group' | 'room'; chatId: string },
     cursor: HistoryCursorV1 | null, limit: number): Promise<readonly unknown[]>;
   readChatResource?(command: ChatResourceReadCommand, options: Readonly<{ signal: AbortSignal }>): Promise<Readonly<{
@@ -84,6 +107,8 @@ export interface LineTransport {
   checkFriendRelationDiagnostic?(targetMid: string, lease: ControlLease, signal?: RelationCancellation): Promise<FriendRelationDiagnostic>;
   addFriendByMid(targetMid: string, lease: ControlLease, onPhysicalStart: () => void, signal?: RelationCancellation,
     sourceChatMid?: string): Promise<FriendAddResult>;
+  /** Optional: one contact read. Only the linejs Client engine has it; the loop answers LOOKUP_UNSUPPORTED when it is absent. */
+  lookupContact?(targetMid: string): Promise<ContactLookup>;
   revoke?(): void;
 }
 
@@ -207,6 +232,24 @@ export class LineWorkerLoop {
   #rejectedPolls = 0;
   #connectionSuspended = false;
   #lastSyncConfirmedAt = 0;
+  // Community (Square) step. Started once after login; stopped for good at revoke, stop, logout and auth loss.
+  #squareStarted = false;
+  #squareTimer: ReturnType<typeof setTimeout> | undefined;
+  #squareGeneration = 0;
+  #squareInFlight = false;
+  #squareToken: string | null = null;
+  #squareContinuation: string | null = null;
+  #squarePagesInRow = 0;
+  // True from a fetch without a token until a page without a continuation token: those pages hold old events.
+  #squareHistoryChain = false;
+  #squarePending: { batchId: string; tokenAfter: string; nextDelayMs: number; event: LineWorkerEvent } | undefined;
+  #squareLastAcked: { batchId: string; tokenAfter: string } | undefined;
+  #squareFailures = 0;
+  #squareRejections = 0;
+  #squareSuspended = false;
+  readonly #squareTitlesAsked = new Set<string>();
+  // Counts only (no text): events seen, ignored, thread, duplicate and invalid items.
+  readonly #squareCounts = { events: 0, ignored: 0, thread: 0, duplicate: 0, invalid: 0 };
   #sending = false;
   #currentSend: Promise<void> | undefined;
   readonly #addLedger = new Map<string, { targetMid: string; sourceChatMid?: string; result: Promise<FriendAddResult> }>();
@@ -250,13 +293,17 @@ export class LineWorkerLoop {
     this.#attachmentRoot = options.attachmentRoot;
     this.#attachmentRuntime = options.attachmentRuntime ?? {};
     this.#minFreeBytes = options.minFreeBytes ?? 512 * 1024 * 1024;
-    this.#transport.on('authInvalidated', () => {
+    this.#transport.on('authInvalidated', (detail?: { code?: LineServerErrorCode; upstreamCode?: number }) => {
       if (this.#authInvalidated || !this.#binding) return;
       this.#authInvalidated = true;
+      this.#stopSquare();
       this.#receiveGeneration += 1;
       this.#catalogRefreshGeneration += 1;
       this.#transport.revoke?.();
-      void this.#emit({ type: 'authInvalidated', ...this.#identity() }).catch(() => undefined);
+      flushTrafficLogSync(); // Main may kill the worker on this event; the rejected response must be on disk first.
+      void this.#emit({ type: 'authInvalidated', ...this.#identity(),
+        ...(detail?.code === undefined ? {} : { code: detail.code }),
+        ...(detail?.upstreamCode === undefined ? {} : { upstreamCode: detail.upstreamCode }) }).catch(() => undefined);
     });
     // Listener registration is deliberately ahead of every login call.
     this.#transport.on('qr', (code: string) => { if (!this.#stopped) this.#emitLoginEvent('qr', { code }); });
@@ -309,6 +356,7 @@ export class LineWorkerLoop {
       command.accountId === bound.accountId && command.workerInstanceId === bound.workerInstanceId &&
       command.controlEpoch === bound.controlEpoch) {
       this.#revoked = true;
+      this.#stopSquare();
       if (command.type === 'stop') this.#stopped = true;
       for (const controller of this.#activeChatResourceReads.values()) controller.abort(new Error('Worker authority changed'));
       this.#transport.revoke?.();
@@ -338,7 +386,7 @@ export class LineWorkerLoop {
       if (command.type === 'poll') return;
       throw new Error('LINE authentication is invalidated');
     }
-    if (binding.mode === 'PAUSED' && ['loginQr', 'loginToken', 'poll', 'history', 'downloadAttachment', 'refreshOwnProfile'].includes(command.type)) {
+    if (binding.mode === 'PAUSED' && ['loginQr', 'loginToken', 'poll', 'history', 'downloadAttachment', 'refreshOwnProfile', 'lookupContact', 'refreshCatalog'].includes(command.type)) {
       throw new Error('paused worker cannot access LINE');
     }
     switch (command.type) {
@@ -385,6 +433,7 @@ export class LineWorkerLoop {
               ownMid: result.ownMid, displayName: result.displayName, ...(result.picturePath === undefined ? {} : { picturePath: result.picturePath }) });
             await this.#emit({ type: 'status', ...this.#identity(), state: 'ready', message: null });
             this.#startCatalogRefresh();
+            this.#startSquare();
           } catch (error) {
             // A diagnostic tag only; the first tag (from the transport) stays.
             tagLoginStage(error, loginStage);
@@ -423,6 +472,21 @@ export class LineWorkerLoop {
           await this.#emit({ type: 'startupSyncComplete', ...this.#identity(), batchId: command.batchId });
         } else if (startupFinal) this.#startupFinalBatchId = undefined;
         return;
+      case 'ackSquareBatch': {
+        const pending = this.#squarePending;
+        if (!pending) {
+          // Main may ack a re-emitted copy of a batch it already acknowledged; that repeat is already done.
+          if (this.#squareLastAcked?.batchId === command.batchId && this.#squareLastAcked.tokenAfter === command.tokenAfter) return;
+          throw new Error('square batch is not pending');
+        }
+        if (pending.batchId !== command.batchId) throw new Error('square batch mismatch');
+        if (pending.tokenAfter !== command.tokenAfter) throw new Error('square token mismatch');
+        this.#squareToken = pending.tokenAfter;
+        this.#squareLastAcked = { batchId: pending.batchId, tokenAfter: pending.tokenAfter };
+        this.#squarePending = undefined;
+        this.#scheduleSquare(pending.nextDelayMs);
+        return;
+      }
       case 'history':
         if (this.#connectionSuspended) throw new Error(SUSPENDED);
         await this.#withTransportCall(() => this.#history(command));
@@ -457,6 +521,7 @@ export class LineWorkerLoop {
         return;
       }
       case 'logout': {
+        this.#stopSquare();
         const identity = this.#identity();
         let ok = false;
         let error: 'LINE_LOGOUT_FAILED' | 'LINE_AUTH_INVALIDATED' | null = null;
@@ -481,6 +546,7 @@ export class LineWorkerLoop {
             if (!ok) this.#transportQuarantined = false;
           }
         }
+        flushTrafficLogSync();
         await this.#emit({ type: 'logoutResult', ...identity, requestId: command.requestId, ok, error });
         return;
       }
@@ -546,6 +612,26 @@ export class LineWorkerLoop {
         }
         await this.#checkFriendRelation(command);
         return;
+      case 'lookupContact': {
+        const identity = this.#identity();
+        const failedResult = (error: string) => this.#emit({ type: 'contactLookupResult', ...identity, requestId: command.requestId,
+          status: 'failed', error });
+        if (this.#connectionSuspended) { await failedResult(SUSPENDED); return; }
+        if (!this.#transport.lookupContact) { await failedResult('LOOKUP_UNSUPPORTED'); return; }
+        if (!this.#ownMid) { await failedResult('LOOKUP_NOT_READY'); return; }
+        try {
+          // One call, no retry. The transport call reads the contact and changes nothing at LINE.
+          const contact = await this.#withTransportCall(() => this.#transport.lookupContact!(command.targetMid));
+          if (this.#stopped || this.#revoked) { await failedResult('LOOKUP_BINDING_REVOKED'); return; }
+          await this.#emit({ type: 'contactLookupResult', ...identity, requestId: command.requestId, status: 'ok', error: null, contact });
+        } catch (error) {
+          await failedResult(isLineServerRejection(error) ? error.code : 'CONTACT_LOOKUP_FAILED');
+        }
+        return;
+      }
+      case 'refreshCatalog':
+        this.#userCatalogRefresh();
+        return;
       case 'addFriendByMid':
         if (this.#connectionSuspended) {
           await this.#emit({ type: 'addFriendResult', ...this.#identity(), requestId: command.requestId,
@@ -560,6 +646,7 @@ export class LineWorkerLoop {
         return;
       case 'stop':
         if (this.#currentSend) await this.#currentSend;
+        flushTrafficLogSync();
         await this.#emit({ type: 'status', ...this.#identity(), state: 'stopped', message: null });
         return;
       default:
@@ -747,6 +834,45 @@ export class LineWorkerLoop {
     void task.catch(() => undefined);
   }
 
+  /**
+   * One catalog read that the user started (Friends tab). It runs only after the first catalog read of the session ended and
+   * while no other catalog read runs. It has no retry: a failure emits the same degraded status as the startup read, the next user request tries again.
+   */
+  #userCatalogRefresh(): void {
+    if (!this.#catalogRefreshComplete || this.#catalogRefreshFlight || !this.#ownMid
+      || this.#revoked || this.#authInvalidated || this.#connectionSuspended) return;
+    const generation = this.#catalogRefreshGeneration;
+    const receiveGeneration = this.#receiveGeneration;
+    const transportGeneration = this.#transportGeneration;
+    let task!: Promise<void>;
+    task = (async () => {
+      try {
+        const conversations = await this.#withTransportCall(() => this.#transport.listConversations());
+        if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
+        // Same status events as the startup read.
+        if (this.#catalogFailureReported) {
+          this.#catalogFailureReported = false;
+          await this.#emit({ type: 'catalogRefreshStatus', ...this.#identity(), state: 'ready', code: 'CATALOG_REFRESH_RECOVERED' });
+        }
+        if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
+        await this.#emit({ type: 'conversationCatalog', ...this.#identity(), conversations });
+        for (const item of conversations) this.#knownChatIds.add(item.chatId);
+      } catch (error) {
+        // No retry. The failure is reported as the startup read reports it, with the real LINE server code when there is one.
+        if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
+        if (!this.#catalogFailureReported) {
+          this.#catalogFailureReported = true;
+          await this.#emit({ type: 'catalogRefreshStatus', ...this.#identity(), state: 'degraded', code: 'CATALOG_REFRESH_FAILED',
+            ...(isLineServerRejection(error) ? { serverError: error.code } : {}) }).catch(() => undefined);
+        }
+      } finally {
+        if (this.#catalogRefreshFlight === task) this.#catalogRefreshFlight = undefined;
+      }
+    })();
+    this.#catalogRefreshFlight = task;
+    void task.catch(() => undefined);
+  }
+
   #ownsCatalogRefresh(generation: number, receiveGeneration: number, transportGeneration: number): boolean {
     return generation === this.#catalogRefreshGeneration && receiveGeneration === this.#receiveGeneration
       && transportGeneration === this.#transportGeneration && !this.#revoked && !this.#authInvalidated;
@@ -790,6 +916,150 @@ export class LineWorkerLoop {
       this.#queueEvent({ type: 'secretRotation', ...this.#identity(), loginAttemptId: this.#loginAttemptId,
         secrets: structuredClone(this.#secrets) });
     } catch (error) { tagLoginStage(error, 'secret_export'); this.#eventFailure = error instanceof Error ? error : new Error('private event queue failed'); }
+  }
+  #squareRunning(): boolean {
+    return this.#squareStarted && !this.#squareSuspended && !this.#stopped && !this.#revoked && !this.#authInvalidated;
+  }
+  /** Starts the community step once, only when the init command turned it on and the transport can read Square events. */
+  #startSquare(): void {
+    const binding = this.#binding;
+    if (!binding || binding.squareReceive !== true || binding.mode === 'PAUSED' || this.#squareStarted
+      || !this.#transport.syncSquare || this.#stopped || this.#revoked || this.#authInvalidated) return;
+    this.#squareStarted = true;
+    this.#squareToken = binding.squareCursor ?? null;
+    this.#scheduleSquare(SQUARE_START_DELAY_MS);
+  }
+  /** Ends the community step for good: no timer, no pending batch, and a fetch in flight is dropped. */
+  #stopSquare(): void {
+    this.#squareGeneration += 1;
+    if (this.#squareTimer) clearTimeout(this.#squareTimer);
+    this.#squareTimer = undefined;
+    this.#squarePending = undefined;
+    this.#squareHistoryChain = false;
+  }
+  /** The only timer of the community step. */
+  #scheduleSquare(delayMs: number): void {
+    if (this.#squareTimer) clearTimeout(this.#squareTimer);
+    this.#squareTimer = undefined;
+    if (!this.#squareRunning()) return;
+    const timer = setTimeout(() => { void this.#squareTick(); }, delayMs);
+    timer.unref?.();
+    this.#squareTimer = timer;
+  }
+  async #squareTick(): Promise<void> {
+    this.#squareTimer = undefined;
+    if (!this.#squareRunning() || this.#squareInFlight) return;
+    const generation = this.#squareGeneration;
+    const pending = this.#squarePending;
+    if (pending) {
+      // A batch waits for its ack. No fetch: only the same batch goes to Main again.
+      this.#squareInFlight = true;
+      try { await this.#emit(pending.event); } catch { /* The next tick sends it again. */ }
+      finally { this.#squareInFlight = false; }
+      if (generation === this.#squareGeneration) this.#scheduleSquare(SQUARE_RESEND_MS);
+      return;
+    }
+    // The Talk suspension means LINE refuses this account: no Square request either.
+    if (!this.#ownMid || this.#loginInFlight || this.#secretRestoreInFlight || this.#connectionSuspended) {
+      this.#scheduleSquare(SQUARE_IDLE_MS);
+      return;
+    }
+    this.#squareInFlight = true;
+    let delayMs: number;
+    try {
+      delayMs = await this.#withTransportCall(() => this.#squareStep(generation));
+    } catch {
+      // A local failure (busy transport, bad response, event sink). It backs off but is no LINE rejection.
+      this.#squareFailures += 1;
+      delayMs = POLL_BACKOFF_MS[Math.min(this.#squareFailures, POLL_BACKOFF_MS.length) - 1]!;
+    } finally { this.#squareInFlight = false; }
+    if (generation !== this.#squareGeneration) return;
+    this.#scheduleSquare(this.#squarePending ? SQUARE_RESEND_MS : delayMs);
+  }
+  /** One fetch. Returns the wait before the next fetch. A batch that was emitted is pending until its ack. */
+  async #squareStep(generation: number): Promise<number> {
+    const tokenBefore = this.#squareToken;
+    if (tokenBefore === null) this.#squareHistoryChain = true;
+    let result: SquareSyncResult;
+    try {
+      result = await this.#transport.syncSquare!({
+        ...(tokenBefore === null ? {} : { syncToken: tokenBefore }),
+        ...(this.#squareContinuation === null ? {} : { continuationToken: this.#squareContinuation }),
+      });
+    } catch (error) {
+      if (generation !== this.#squareGeneration) return SQUARE_IDLE_MS;
+      return await this.#squareFetchFailed(error);
+    }
+    if (generation !== this.#squareGeneration) return SQUARE_IDLE_MS;
+    this.#squareFailures = 0;
+    this.#squareRejections = 0;
+    if (result.events.length > SQUARE_EVENTS_MAX) throw new Error('square response exceeds bounded event limit');
+    const { envelopes, counts } = normalizeSquareEvents(result.events,
+      { accountId: this.#binding!.accountId, source: this.#squareHistoryChain ? 'history' : 'live' });
+    // The last page of the first-run chain is still old; later pages are live.
+    if (result.continuationToken === null) this.#squareHistoryChain = false;
+    for (const key of Object.keys(counts) as (keyof typeof counts)[]) this.#squareCounts[key] += counts[key];
+    this.#squareContinuation = result.continuationToken;
+    let delayMs = SQUARE_IDLE_MS;
+    if (result.continuationToken !== null) {
+      this.#squarePagesInRow += 1;
+      if (this.#squarePagesInRow >= SQUARE_MAX_PAGES_IN_ROW) this.#squarePagesInRow = 0;
+      else delayMs = SQUARE_CONTINUATION_MS;
+    } else this.#squarePagesInRow = 0;
+    const tokenAfter = result.syncToken ?? tokenBefore;
+    // Nothing to store: same token and no message.
+    if (envelopes.length === 0 && tokenAfter === tokenBefore) return delayMs;
+    if (tokenAfter === null) throw new Error('square response has no sync token');
+    const titles = await this.#squareTitles(envelopes, generation);
+    if (generation !== this.#squareGeneration) return SQUARE_IDLE_MS;
+    const event = LineWorkerEventSchema.parse({ type: 'squareBatch', ...this.#identity(), batchId: randomUUID(), tokenBefore, tokenAfter,
+      envelopes, ...(titles.length > 0 ? { titles } : {}) });
+    this.#squarePending = { batchId: (event as { batchId: string }).batchId, tokenAfter, nextDelayMs: delayMs, event };
+    await this.#emit(event);
+    return delayMs;
+  }
+  /** Chat names, at most one read per chat id in this worker session. A failed read gives no title; it does not stop the batch. */
+  async #squareTitles(envelopes: readonly Readonly<{ chatId: string }>[], generation: number): Promise<{ chatId: string; title: string }[]> {
+    const titles: { chatId: string; title: string }[] = [];
+    const read = this.#transport.getSquareChatTitle?.bind(this.#transport);
+    if (!read) return titles;
+    let asked = 0;
+    for (const { chatId } of envelopes) {
+      if (this.#squareTitlesAsked.has(chatId)) continue;
+      if (asked >= SQUARE_TITLES_PER_STEP) break;
+      this.#squareTitlesAsked.add(chatId);
+      asked += 1;
+      try {
+        const title = await read(chatId);
+        if (generation !== this.#squareGeneration) return [];
+        const clean = typeof title === 'string' ? title.replaceAll('\0', '�').trim().slice(0, 256) : '';
+        if (clean.length > 0) titles.push({ chatId, title: clean });
+      } catch { /* No title for this chat. */ }
+    }
+    return titles;
+  }
+  /** Back-off and suspension of the community step. The Talk counters do not change. */
+  async #squareFetchFailed(error: unknown): Promise<number> {
+    this.#squareFailures += 1;
+    const delayMs = POLL_BACKOFF_MS[Math.min(this.#squareFailures, POLL_BACKOFF_MS.length) - 1]!;
+    // Same rule as the Talk poll: a LINE rejection, or an HTTP status that is not 2xx. A network error is no rejection.
+    const httpStatus = this.#transport.lastSquareHttpStatus?.() ?? null;
+    const serverRejection = isLineSquareRejection(error)
+      || (typeof httpStatus === 'number' && (httpStatus < 200 || httpStatus > 299));
+    if (serverRejection) this.#squareRejections += 1;
+    if (serverRejection && this.#squareRejections >= SQUARE_SUSPEND_AFTER_REJECTIONS && !this.#squareSuspended) {
+      this.#squareSuspended = true;
+      if (this.#squareTimer) clearTimeout(this.#squareTimer);
+      this.#squareTimer = undefined;
+      const rejection = isLineSquareRejection(error) ? error : undefined;
+      const detail = ['square', 'fetchMyEvents', rejection?.upstreamName].filter((part) => part !== undefined).join(':');
+      await this.#emit({ type: 'error', ...this.#identity(), code: 'LINE_SQUARE_SUSPENDED',
+        message: 'LINE_SQUARE_SUSPENDED', retryable: false,
+        diagnostic: { operation: 'poll', stage: 'response', category: 'denied', recovery: 'reopen_app', outcome: 'failed', detail,
+          ...(rejection?.upstreamCode === undefined ? {} : { upstreamCode: rejection.upstreamCode }),
+          ...(typeof httpStatus === 'number' && httpStatus >= 100 && httpStatus <= 599 ? { upstreamStatus: httpStatus } : {}) } }).catch(() => undefined);
+    }
+    return delayMs;
   }
   async #poll(): Promise<void> {
     if (this.#polling || this.#authInvalidated) return;
@@ -893,11 +1163,12 @@ export class LineWorkerLoop {
     const base = { type: 'chatResourceResult' as const, ...identity, chatType: command.chatType, chatId: command.chatId,
       requestId: command.requestId, action: command.action };
     const fail = async (error: string, responseCode?: number | 'missing' | 'non_numeric', failureKind?: ReturnType<typeof safeChatResourceFailureDetails>['failureKind'],
-      upstreamStatus?: number, upstreamCode?: number | 'missing' | 'non_numeric') => this.#emit({ ...base, ok: false, error,
+      upstreamStatus?: number, upstreamCode?: number | 'missing' | 'non_numeric', upstreamMessage?: string) => this.#emit({ ...base, ok: false, error,
       ...(typeof responseCode === 'number' && Number.isFinite(responseCode) && Math.abs(responseCode) <= 1_000_000_000
         || responseCode === 'missing' || responseCode === 'non_numeric' ? { responseCode } : {}),
       ...(failureKind ? { failureKind } : {}), ...(upstreamStatus === undefined ? {} : { upstreamStatus }),
-      ...(upstreamCode === undefined ? {} : { upstreamCode }) });
+      ...(upstreamCode === undefined ? {} : { upstreamCode }),
+      ...(upstreamMessage === undefined ? {} : { upstreamMessage }) });
     if (this.#stopped || this.#revoked || this.#authInvalidated || this.#binding?.mode === 'PAUSED') {
       await fail('WORKER_NOT_ACTIVE'); return;
     }
@@ -934,7 +1205,7 @@ export class LineWorkerLoop {
       else if (isChatResourceUnsupported(error)) await fail('UNSUPPORTED');
       else if (isChatResourceFailure(error)) await fail(error.category,
         error.category === 'response_code_invalid' ? error.responseCode : undefined,
-        error.failureKind ?? safeChatResourceFailureDetails(error).failureKind, error.upstreamStatus, error.upstreamCode);
+        error.failureKind ?? safeChatResourceFailureDetails(error).failureKind, error.upstreamStatus, error.upstreamCode, error.upstreamMessage);
       else {
         const details = safeChatResourceFailureDetails(error);
         await fail('unknown', undefined, details.failureKind, details.upstreamStatus, details.upstreamCode);

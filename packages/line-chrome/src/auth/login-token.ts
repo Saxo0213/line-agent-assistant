@@ -1,5 +1,5 @@
 // Resume without QR. Ported from OkLine okline/client.py:279-316 (from_tokens_file) + services/profile.py:18-23
-// (getProfile), shaped like the linejs adapter's loginToken (linejs-adapter.ts:856-871) and #profile().
+// (getProfile), shaped like the loginToken of the linejs Client engine and its profile read.
 
 import type { ChromeGateway } from '../gateway.js';
 import { ChromeApiError, ChromeLoginRequiredError } from '../errors.js';
@@ -17,7 +17,7 @@ export interface ChromeIdentity {
 const GET_PROFILE_SYNC_REASON = 2;
 const MID_PATTERN = /^u[0-9a-f]{32}$/i;
 
-/** linejs-adapter normalizeLinePicturePath minus the native-path normalisation: only '/..' or 'https://' paths pass. */
+/** normalizeLinePicturePath (linejs-catalog.ts) minus the native-path normalisation: only '/..' or 'https://' paths pass. */
 function picturePath(value: unknown, present: boolean): string | null | undefined {
   if (!present) return undefined;
   if (value === null || value === '') return null;

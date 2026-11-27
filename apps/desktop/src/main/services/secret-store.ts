@@ -2,17 +2,18 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { resolveLineTransport, type LineTransportKind, type LineWorkerEvent } from '@line-agent/contracts';
+import { isLinejsTransport, LineTransportKindSchema, resolveLineTransport, type LineTransportKind, type LineWorkerEvent } from '@line-agent/contracts';
 
 export type WorkerSecrets = Extract<LineWorkerEvent, { type: 'secretRotation' }>['secrets'];
 
 /**
  * Secrets are stored for each pair of account and transport.
  * DESKTOPWIN keeps the original file `<account>.bin`, so existing installations read the same file.
- * CHROMEOS uses `<account>.chromeos.bin`. The file of the inactive transport stays on disk and is not changed.
+ * Every other device uses `<account>.<device in lower case>.bin` (for example `.chromeos.bin`, `.desktopmac.bin`).
+ * The file of an inactive device stays on disk and is not changed.
  */
 function secretFileName(accountId: string, transport: LineTransportKind): string {
-  return transport === 'CHROMEOS' ? `${accountId}.chromeos.bin` : `${accountId}.bin`;
+  return transport === 'DESKTOPWIN' ? `${accountId}.bin` : `${accountId}.${transport.toLowerCase()}.bin`;
 }
 
 /** A CHROMEOS e2eeStorage snapshot has the tag `transport: "CHROMEOS-3.7.2"`. A DESKTOPWIN (linejs) storage never has it. */
@@ -130,14 +131,15 @@ export class SecretStore {
     this.validAccount(accountId);
     try {
       const text = (await readFile(join(this.root, 'secrets', `${accountId}.transport`), 'utf8')).trim();
-      return text === 'CHROMEOS' ? 'CHROMEOS' : 'DESKTOPWIN';
+      const parsed = LineTransportKindSchema.safeParse(text);
+      return parsed.success ? parsed.data : 'DESKTOPWIN';
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'DESKTOPWIN';
       throw error;
     }
   }
 
-  /** Set the active transport. DESKTOPWIN removes the marker file. CHROMEOS writes it through a temporary file. */
+  /** Set the active transport. DESKTOPWIN removes the marker file. Any other device writes its name through a temporary file. */
   async setTransport(accountId: string, transport: LineTransportKind): Promise<void> {
     this.validAccount(accountId);
     const folder = join(this.root, 'secrets');
@@ -146,7 +148,7 @@ export class SecretStore {
     await mkdir(folder, { recursive: true });
     const temporary = join(folder, `${accountId}.${randomUUID()}.tmp`);
     try {
-      await writeFile(temporary, 'CHROMEOS', { mode: 0o600, flag: 'wx' });
+      await writeFile(temporary, transport, { mode: 0o600, flag: 'wx' });
       await rename(temporary, target);
     } finally { await rm(temporary, { force: true }); }
   }
@@ -160,7 +162,7 @@ export class SecretStore {
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
     const plain = await this.backend.unprotect(cipher);
     const secrets = JSON.parse(Buffer.from(plain).toString('utf8')) as WorkerSecrets;
-    if (kind === 'DESKTOPWIN' && hasChromeSnapshotTag(secrets)) return null;
+    if (isLinejsTransport(kind) && hasChromeSnapshotTag(secrets)) return null;
     if (kind === 'CHROMEOS' && secrets.e2eeStorage !== null && !hasChromeSnapshotTag(secrets)) return null;
     return secrets;
   }
@@ -202,7 +204,7 @@ export class SecretStore {
     this.pendingRotations.get(accountId)?.resolve(false);
     this.pendingRotations.delete(accountId);
     await (this.rotationLanes.get(accountId) ?? Promise.resolve());
-    const kinds: LineTransportKind[] = transport === undefined ? ['DESKTOPWIN', 'CHROMEOS'] : [transport];
+    const kinds: LineTransportKind[] = transport === undefined ? [...LineTransportKindSchema.options] : [transport];
     for (const kind of kinds) await rm(join(this.root, 'secrets', secretFileName(accountId, kind)), { force: true });
   }
 
