@@ -17,6 +17,14 @@ const sourceError = (error: unknown) => {
   return /^[A-Z0-9_]{2,48}$/.test(code) ? code : 'COPY_FAILED';
 };
 
+export type SecondaryRootErrorCode = 'NOT_ABSOLUTE' | 'NOT_DIRECTORY' | 'REPARSE_POINT' | 'PROTECTED_FOLDER' | 'OTHER_CHAT_FOLDER' | 'FAILED';
+export type SecondaryStatus = { root: string | null; queued: number; claimed: number; completed: number; failed: number };
+export type SecondaryRootResult = { ok: true; root: string | null } | { ok: false; code: SecondaryRootErrorCode };
+/** A validation failure of a secondary root. The code is stable; the message is for logs only. */
+class SecondaryRootError extends Error {
+  constructor(readonly code: Exclude<SecondaryRootErrorCode, 'FAILED'>, message: string) { super(message); }
+}
+
 export interface AttachmentStorageServiceOptions {
   repository: AttachmentStorageRepository;
   messages: Pick<import('@line-agent/database').MessageRepository, 'getAttachment'>;
@@ -59,38 +67,79 @@ export class AttachmentStorageService {
     })());
   }
 
-  executeFolderCommand(key: WritableConversationKey, _actor: string, command: import('./trigger-router.js').FolderCommand): Promise<string> {
-    const id = keyId(key);
-    const prior = this.lanes.get(id) ?? Promise.resolve('');
-    const run = prior.then(async () => {
+  async executeFolderCommand(key: WritableConversationKey, _actor: string, command: import('./trigger-router.js').FolderCommand): Promise<string> {
+    try {
       if (command.action === 'temp_show') {
-        const [setting, progress] = await Promise.all([this.options.repository.getSetting(key),this.options.repository.getProgress(key)]);
-        return setting.secondaryRoot
-          ? `本聊天室第二儲存位置：${setting.secondaryRoot}\n複製進度：佇列 ${progress.queued}、處理中 ${progress.claimed}、完成 ${progress.completed}、失敗 ${progress.failed}`
+        const status = await this.getSecondaryStatus(key);
+        return status.root
+          ? `本聊天室第二儲存位置：${status.root}\n複製進度：佇列 ${status.queued}、處理中 ${status.claimed}、完成 ${status.completed}、失敗 ${status.failed}`
           : '本聊天室尚未設定第二儲存位置';
       }
       if (command.action === 'temp_retry') {
-        const count = await this.options.repository.retryFailed(key);
-        void this.pump();
+        const count = await this.retrySecondaryFailed(key);
         return count ? `已排入 ${count} 個失敗附件重試` : '目前沒有失敗的第二份附件';
       }
       if (command.action !== 'temp_off' && command.action !== 'temp_set') throw new Error('Invalid secondary folder command');
-      const root = command.action === 'temp_set' ? await this.validateSecondaryRoot(command.path,key) : null;
-      this.pausedChats.set(id,key);
+      const result = await this.setSecondaryRoot(key, command.action === 'temp_set' ? command.path : null);
+      if (!result.ok) return '第二儲存位置設定失敗，請檢查資料夾後重試';
+      return result.root
+        ? `已設定本聊天室第二儲存位置：${result.root}；歷史附件正在背景補複製`
+        : '已停用本聊天室第二儲存位置；既有檔案會保留';
+    } catch (error) { this.options.onError?.(error); return '第二儲存位置設定失敗，請檢查資料夾後重試'; }
+  }
+
+  /** The extra folder of one chat and the progress of its copy queue. */
+  async getSecondaryStatus(key: WritableConversationKey): Promise<SecondaryStatus> {
+    const [setting, progress] = await Promise.all([this.options.repository.getSetting(key), this.options.repository.getProgress(key)]);
+    return { root: setting.secondaryRoot ?? null, queued: progress.queued, claimed: progress.claimed, completed: progress.completed, failed: progress.failed };
+  }
+
+  /** Set (path) or clear (null) the extra folder. A change runs in the lane of the chat and back-fills the history. */
+  setSecondaryRoot(key: WritableConversationKey, candidate: string | null): Promise<SecondaryRootResult> {
+    return this.inLane(key, async (): Promise<SecondaryRootResult> => {
+      let root: string | null = null;
+      if (candidate !== null) {
+        try { root = await this.validateSecondaryRoot(candidate, key); }
+        catch (error) {
+          if (!(error instanceof SecondaryRootError)) this.options.onError?.(error);
+          return { ok: false, code: error instanceof SecondaryRootError ? error.code : 'FAILED' };
+        }
+      }
+      const id = keyId(key);
+      this.pausedChats.set(id, key);
       try {
         await this.cancelAndDrain(key);
-        const setting = await this.options.repository.setSecondaryRoot(key,root);
-        if (!root) return '已停用本聊天室第二儲存位置；既有檔案會保留';
-        void this.trackAdmission(this.admitPages(key,setting.generation,'secondary')).catch((error: unknown)=>this.options.onError?.(error));
-        void this.pump();
-        return `已設定本聊天室第二儲存位置：${root}；歷史附件正在背景補複製`;
+        const setting = await this.options.repository.setSecondaryRoot(key, root);
+        if (root) {
+          void this.trackAdmission(this.admitPages(key, setting.generation, 'secondary')).catch((error: unknown) => this.options.onError?.(error));
+        }
+        return { ok: true, root };
+      } catch (error) {
+        this.options.onError?.(error);
+        return { ok: false, code: 'FAILED' };
       } finally {
         this.pausedChats.delete(id);
         void this.pump();
       }
-    }).catch((error: unknown) => { this.options.onError?.(error); return '第二儲存位置設定失敗，請檢查資料夾後重試'; });
-    this.lanes.set(id,run);
-    void run.finally(()=>{ if(this.lanes.get(id)===run)this.lanes.delete(id); });
+    });
+  }
+
+  /** Queue the failed secondary copies of one chat again. Returns the count. */
+  retrySecondaryFailed(key: WritableConversationKey): Promise<number> {
+    return this.inLane(key, async () => {
+      const count = await this.options.repository.retryFailed(key);
+      void this.pump();
+      return count;
+    });
+  }
+
+  private inLane<T>(key: WritableConversationKey, work: () => Promise<T>): Promise<T> {
+    const id = keyId(key);
+    const prior = this.lanes.get(id) ?? Promise.resolve('');
+    const run = prior.then(work);
+    const tail = run.then(() => '', () => '');
+    this.lanes.set(id, tail);
+    void tail.finally(() => { if (this.lanes.get(id) === tail) this.lanes.delete(id); });
     return run;
   }
 
@@ -112,30 +161,38 @@ export class AttachmentStorageService {
   }
 
   private async validateSecondaryRoot(candidate: string,key: WritableConversationKey): Promise<string> {
-    if (!isAbsolute(candidate) || candidate.startsWith('\\\\') || candidate.includes('\0')) throw new Error('Secondary root must be a local absolute directory');
+    if (!isAbsolute(candidate) || candidate.startsWith('\\\\') || candidate.includes('\0')) throw new SecondaryRootError('NOT_ABSOLUTE', 'Secondary root must be a local absolute directory');
     const configured = resolve(candidate);
-    const rootInfo = await lstat(configured);
-    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error('Secondary root must be an existing real directory');
+    // A path that does not exist is the same user error as a path that is not a directory.
+    const statEntry = (target: string) => lstat(target).catch((error: unknown) => {
+      const code = error && typeof error === 'object' && 'code' in error ? (error as { code: unknown }).code : '';
+      if (code === 'ENOENT' || code === 'ENOTDIR') throw new SecondaryRootError('NOT_DIRECTORY', 'Secondary root does not exist');
+      throw error;
+    });
+    const rootInfo = await statEntry(configured);
+    if (rootInfo.isSymbolicLink()) throw new SecondaryRootError('REPARSE_POINT', 'Secondary root cannot be a link');
+    if (!rootInfo.isDirectory()) throw new SecondaryRootError('NOT_DIRECTORY', 'Secondary root must be an existing real directory');
     let current = path.parse(configured).root;
     for (const segment of configured.slice(current.length).split(/[\\/]+/).filter(Boolean)) {
       current = path.join(current,segment);
-      const entry = await lstat(current);
-      if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error('Secondary root cannot contain reparse points');
+      const entry = await statEntry(current);
+      if (entry.isSymbolicLink()) throw new SecondaryRootError('REPARSE_POINT', 'Secondary root cannot contain reparse points');
+      if (!entry.isDirectory()) throw new SecondaryRootError('NOT_DIRECTORY', 'Secondary root path must contain only directories');
     }
     const canonical = await realpath(configured);
     const protectedPaths = await Promise.all([this.options.attachmentRoot,...(this.options.protectedPaths ?? []),
       process.env.SystemRoot,process.env.WINDIR,process.env.ProgramFiles,process.env['ProgramFiles(x86)'],process.env.ProgramData,
       process.env.CommonProgramFiles,process.env['CommonProgramFiles(x86)']].filter((value): value is string => Boolean(value))
       .map(async (value)=>realpath(resolve(value)).catch(()=>resolve(value))));
-    for (const protectedPath of protectedPaths) if (inside(protectedPath,canonical) || inside(canonical,protectedPath)) throw new Error('Secondary root overlaps a protected system folder');
+    for (const protectedPath of protectedPaths) if (inside(protectedPath,canonical) || inside(canonical,protectedPath)) throw new SecondaryRootError('PROTECTED_FOLDER', 'Secondary root overlaps a protected system folder');
     const workspace = await this.options.workspaceRoot?.();
     if (workspace) {
       const canonicalWorkspace = await realpath(workspace).catch(()=>resolve(workspace));
       if (inside(canonicalWorkspace,canonical)) {
         const own = await this.options.ownChatWorkspaceFolder?.(key);
-        if (!own) throw new Error('Secondary root cannot use another chat workspace folder');
+        if (!own) throw new SecondaryRootError('OTHER_CHAT_FOLDER', 'Secondary root cannot use another chat workspace folder');
         const ownCanonical = await realpath(own);
-        if (!inside(ownCanonical,canonical)) throw new Error('Secondary root must stay in this chat workspace folder');
+        if (!inside(ownCanonical,canonical)) throw new SecondaryRootError('OTHER_CHAT_FOLDER', 'Secondary root must stay in this chat workspace folder');
       }
     }
     return canonical;

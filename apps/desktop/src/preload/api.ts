@@ -55,6 +55,8 @@ import {
   type AutoResponderSettings,
   type ConversationKey,
   type StoredAttachmentPage,
+  type ChatExtraFolderStatus,
+  type ChatExtraFolderResult,
   type WritableConversationKey,
   type IpcEvent,
   type IpcRequest,
@@ -147,6 +149,13 @@ export type DesktopApi = {
   retryAgentRoomJob(jobId: string): Promise<IpcResult>;
   openAttachment(attachmentId: string): Promise<boolean>;
   openStoredAttachmentsFolder(route: ConversationKey): Promise<boolean>;
+  /** Extra attachment folder of one chat. The fixed location never changes. */
+  getChatExtraFolder(key: WritableConversationKey): Promise<ChatExtraFolderStatus>;
+  /** Opens the folder picker in Main. Resolves to null when the user cancels. */
+  chooseChatExtraFolder(key: WritableConversationKey): Promise<ChatExtraFolderResult | null>;
+  clearChatExtraFolder(key: WritableConversationKey): Promise<ChatExtraFolderResult>;
+  retryChatExtraFolder(key: WritableConversationKey): Promise<number>;
+  openChatExtraFolder(key: WritableConversationKey): Promise<boolean>;
   openExternalUrl(url: string): Promise<IpcResult>;
   downloadAttachment(key: WritableConversationKey, attachmentId: string): Promise<IpcResult>;
   resolveFileTypeIcon(extension: string): Promise<string | null>;
@@ -381,6 +390,11 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async openAttachment(attachmentId) { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)) throw new Error('Invalid attachment ID'); const result = await request({ type: 'openAttachment', attachmentId }); return result.type === 'openAttachment' && result.opened; },
     openExternalUrl: (url) => request({ type: 'openExternalUrl', url }),
     async openStoredAttachmentsFolder(route) { const result = await request({ type: 'openStoredAttachmentsFolder', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId }); return result.type === 'openStoredAttachmentsFolder' && result.opened; },
+    async getChatExtraFolder(key) { const result = await request({ type: 'getChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'getChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.status; },
+    async chooseChatExtraFolder(key) { const result = await request({ type: 'chooseChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'chooseChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.result; },
+    async clearChatExtraFolder(key) { const result = await request({ type: 'clearChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'clearChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.result; },
+    async retryChatExtraFolder(key) { const result = await request({ type: 'retryChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'retryChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.count; },
+    async openChatExtraFolder(key) { const result = await request({ type: 'openChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); return result.type === 'openChatExtraFolder' && result.opened; },
     async downloadAttachment(key, attachmentId) { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)) throw new Error('Invalid attachment ID'); return await request({ type: 'downloadAttachment', ...key, attachmentId }); },
     async resolveFileTypeIcon(extension) { if (!/^[a-z0-9]{1,12}$/.test(extension)) return null; const result = await request({ type: 'resolveFileTypeIcon', extension }); return result.type === 'resolveFileTypeIcon' ? result.dataUrl : null; },
     lineAddAccountQr: (lineTransport) => request({ type: 'lineAddAccountQr', ...(lineTransport ? { lineTransport } : {}) }),

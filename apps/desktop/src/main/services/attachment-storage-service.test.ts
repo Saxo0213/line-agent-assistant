@@ -61,6 +61,22 @@ describe('AttachmentStorageService folder command', () => {
     await service.shutdown();
   });
 
+  it('returns a stable error code from setSecondaryRoot and writes nothing', async () => {
+    directory = await mkdtemp(path.join(tmpdir(), 'line-secondary-code-'));
+    const repository = { setSecondaryRoot: vi.fn(), admitReadyPage: vi.fn(), claimJobs: vi.fn().mockResolvedValue([]) };
+    // The primary root exists, so its real path matches the real path of the parent folder.
+    await mkdir(path.join(directory, 'primary'));
+    const onError = vi.fn();
+    const service = new AttachmentStorageService({ repository: repository as never,
+      messages: { getAttachment: vi.fn() } as never, attachmentRoot: path.join(directory, 'primary'), onError });
+    const key = { accountId: 'account', chatType: 'direct' as const, chatId: 'peer' };
+    expect(await service.setSecondaryRoot(key, 'relative/folder')).toEqual({ ok: false, code: 'NOT_ABSOLUTE' });
+    expect(await service.setSecondaryRoot(key, path.join(directory, 'missing'))).toEqual({ ok: false, code: 'NOT_DIRECTORY' });
+    expect(await service.setSecondaryRoot(key, directory)).toEqual({ ok: false, code: 'PROTECTED_FOLDER' });
+    expect(repository.setSecondaryRoot).not.toHaveBeenCalled();
+    await service.shutdown();
+  });
+
   it('keeps the current chat workspace exception for a temp directory inside its own chat folder', async () => {
     directory = await mkdtemp(path.join(tmpdir(), 'line-secondary-workspace-'));
     const workspace = path.join(directory,'workspace');

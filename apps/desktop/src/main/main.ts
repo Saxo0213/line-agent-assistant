@@ -364,6 +364,10 @@ async function initializeServices(): Promise<void> {
       const result = await dialog.showOpenDialog(window!, { title: nativeDesktopText(getEffectiveLocale(), 'projectFolder'), properties: ['openDirectory'] });
       return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]!;
     },
+    chooseChatExtraFolder: async () => {
+      const result = await dialog.showOpenDialog(window!, { title: nativeDesktopText(getEffectiveLocale(), 'chatExtraFolder'), properties: ['openDirectory', 'createDirectory'] });
+      return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]!;
+    },
     secretStore, audit, previewPresenter,
     // A tool that the user installs after the app starts is on the registry PATH only. Status checks of the Agent CLIs refresh PATH first.
     refreshProcessEnvironment: async () => { await refreshProcessPath(); },

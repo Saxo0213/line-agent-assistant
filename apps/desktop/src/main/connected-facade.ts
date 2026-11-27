@@ -222,6 +222,8 @@ export interface ConnectedFacadeOptions {
   openFolderPath?: (folder: string) => Promise<string>;
   /** Opens the OS folder picker for Settings → 資料夾; resolves to the chosen path, or null when cancelled. */
   chooseProjectFolder?: () => Promise<string | null>;
+  /** Opens the OS folder picker for the extra attachment folder of one chat; resolves to the chosen path, or null when cancelled. */
+  chooseChatExtraFolder?: () => Promise<string | null>;
   secretStore?: SecretStore;
   /** Updates PATH of the Main process from the registry, so a CLI installed after the app started is found by the status checks. */
   refreshProcessEnvironment?: () => Promise<void>;
@@ -3833,6 +3835,22 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const { path } = await chatFolders.resolve(row.accountId, row.chatType, row.chatId, 'operator');
         const open = options.openFolderPath ?? options.openAttachmentPath;
         return { type: request.type, requestId, ok: true, opened: open ? (await open(path)) === '' : false };
+      }
+      if (request.type === 'getChatExtraFolder' || request.type === 'chooseChatExtraFolder' || request.type === 'clearChatExtraFolder'
+        || request.type === 'retryChatExtraFolder' || request.type === 'openChatExtraFolder') {
+        // The extra folder of one chat. The fixed attachment location never changes; a change here only adds a copy target.
+        const key = { accountId: request.accountId, chatType: request.chatType, chatId: request.chatId };
+        if (request.type === 'getChatExtraFolder') return { type: request.type, requestId, ok: true, status: await attachmentStorageService.getSecondaryStatus(key) };
+        if (request.type === 'retryChatExtraFolder') return { type: request.type, requestId, ok: true, count: await attachmentStorageService.retrySecondaryFailed(key) };
+        if (request.type === 'clearChatExtraFolder') return { type: request.type, requestId, ok: true, result: await attachmentStorageService.setSecondaryRoot(key, null) };
+        if (request.type === 'chooseChatExtraFolder') {
+          if (!options.chooseChatExtraFolder) return failure(requestId, 'CHAT_EXTRA_FOLDER_PICKER_UNAVAILABLE', '此環境無法開啟資料夾選擇視窗。');
+          const chosen = await options.chooseChatExtraFolder();
+          return { type: request.type, requestId, ok: true, result: chosen === null ? null : await attachmentStorageService.setSecondaryRoot(key, chosen) };
+        }
+        const open = options.openFolderPath ?? options.openAttachmentPath;
+        const root = (await attachmentStorageService.getSecondaryStatus(key)).root;
+        return { type: request.type, requestId, ok: true, opened: open && root ? (await open(root)) === '' : false };
       }
       if (request.type === 'listProjectFolders' || request.type === 'chooseProjectFolder' || request.type === 'bindProjectFolder' || request.type === 'unbindProjectFolder') {
         // Settings → 資料夾 (local operator UI only). A change writes the row and the audit row; it never sends a LINE message.

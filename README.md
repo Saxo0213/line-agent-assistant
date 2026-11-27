@@ -26,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.396 fixes the download Chrome that stayed at "Starting" because a background Chrome held its profile. Since v1.0.395 the app updates itself: a new version downloads in the background and installs when the app is idle, then the app reopens. Older versions update once with the app's **Check for updates**. See the [v1.0.395 → v1.0.396 release notes](docs/releases/v1.0.396.md) for the changes, and the [v1.0.395 release notes](docs/releases/v1.0.395.md) for the previous version.
+v1.0.397 adds a gear button in each chat to set an extra folder that also receives that chat's downloaded attachments, and fixes the download Chrome that stayed at "Starting" because a background Chrome held its profile. Since v1.0.395 the app updates itself: a new version downloads in the background and installs when the app is idle, then the app reopens. Older versions update once with the app's **Check for updates**. See the [v1.0.395 → v1.0.397 release notes](docs/releases/v1.0.397.md) for the changes, and the [v1.0.395 release notes](docs/releases/v1.0.395.md) for the previous version.
 
 ## Installation
 

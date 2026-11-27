@@ -218,22 +218,26 @@ const NATIVE_ENGLISH_COPY = {
   agentWorkspace: 'Choose an Agent workspace', showConsole: 'Show console', quit: 'Quit',
   chromeLtsmFolder: 'Choose the LINE Chrome extension folder',
   projectFolder: 'Choose a project folder',
+  chatExtraFolder: 'Choose an extra folder for this chat\'s attachments',
 } as const;
 const NATIVE_TRADITIONAL_COPY: Record<keyof typeof NATIVE_ENGLISH_COPY, string> = {
   newAttachmentFolder: '選擇新的 LINE 附件儲存資料夾', attachmentFolder: '選擇 LINE 附件儲存資料夾',
   agentWorkspace: '選擇 Agent 工作目錄', showConsole: '顯示操作台', quit: '結束',
   chromeLtsmFolder: '選擇 LINE Chrome 擴充功能資料夾',
   projectFolder: '選擇專案資料夾',
+  chatExtraFolder: '選擇此聊天室的額外附件儲存資料夾',
 };
 const NATIVE_JAPANESE_COPY: Record<keyof typeof NATIVE_ENGLISH_COPY, string> = {
   newAttachmentFolder: '新しい LINE 添付ファイルフォルダーを選択', attachmentFolder: 'LINE 添付ファイルフォルダーを選択', agentWorkspace: 'Agent ワークスペースを選択', showConsole: 'コンソールを表示', quit: '終了',
   chromeLtsmFolder: 'LINE Chrome 拡張機能のフォルダーを選択',
   projectFolder: 'プロジェクトフォルダーを選択',
+  chatExtraFolder: 'このチャットの追加の添付ファイル保存先を選択',
 };
 const NATIVE_KOREAN_COPY: Record<keyof typeof NATIVE_ENGLISH_COPY, string> = {
   newAttachmentFolder: '새 LINE 첨부 파일 폴더 선택', attachmentFolder: 'LINE 첨부 파일 폴더 선택', agentWorkspace: 'Agent 작업 공간 선택', showConsole: '콘솔 표시', quit: '종료',
   chromeLtsmFolder: 'LINE Chrome 확장 프로그램 폴더 선택',
   projectFolder: '프로젝트 폴더 선택',
+  chatExtraFolder: '이 채팅의 추가 첨부 파일 저장 폴더 선택',
 };
 export function nativeDesktopText(locale: import('./locale.js').Locale, key: keyof typeof NATIVE_ENGLISH_COPY): string {
   return ({ en: NATIVE_ENGLISH_COPY, 'zh-TW': NATIVE_TRADITIONAL_COPY, ja: NATIVE_JAPANESE_COPY, ko: NATIVE_KOREAN_COPY }[locale] ?? NATIVE_ENGLISH_COPY)[key];
