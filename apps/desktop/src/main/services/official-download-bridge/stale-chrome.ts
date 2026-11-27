@@ -1,4 +1,4 @@
-// Closes a left-over bridge Chrome of this app before a new start.
+// Closes a left-over Chrome of the bridge profile of this app (bridge or store install) before a new start.
 // A second Chrome with the same profile folder hands over to the first one and ends at once.
 
 import { execFile } from 'node:child_process';
@@ -17,11 +17,11 @@ function normalizePath(value: string): string {
 }
 
 /**
- * True only for a bridge Chrome of this profile: the command line has `--remote-debugging-pipe`
- * and `--user-data-dir=` with this profile folder (plain or quoted, any slash form, any case).
+ * True only for a Chrome of the bridge profile: the command line has `--user-data-dir=` with this profile folder
+ * (plain or quoted, any slash form, any case). The folder is only for this app, so every such Chrome belongs to this app
+ * (the bridge Chrome and the visible Chrome of the store install). A Chrome of any other profile never matches.
  */
-export function isBridgeChromeOfProfile(commandLine: string, profileDir: string): boolean {
-  if (!/(^|\s)"?--remote-debugging-pipe(\s|"|$)/.test(commandLine)) return false;
+export function isChromeOfBridgeProfile(commandLine: string, profileDir: string): boolean {
   const profile = normalizePath(profileDir);
   if (!profile) return false;
   const pattern = /(?:^|\s)"?--user-data-dir=(?:"([^"]*)"|(\S*))/g;
@@ -64,7 +64,7 @@ function listChromeProcesses(): Promise<ChromeProcessInfo[]> {
 }
 
 /**
- * Kills each left-over bridge Chrome process tree of this profile. Windows only.
+ * Kills each left-over Chrome process tree of the bridge profile. Windows only.
  * No other Chrome process is touched. A failed listing is reported and does not stop the start.
  * Returns the number of killed trees. `onError` also gets a count-only note for kills (no path, no command line).
  */
@@ -77,8 +77,8 @@ export async function closeStaleBridgeChrome(profileDir: string, onError?: (erro
     onError?.(error);
     return 0;
   }
-  const stale = processes.filter((info) => isBridgeChromeOfProfile(info.commandLine, profileDir));
+  const stale = processes.filter((info) => isChromeOfBridgeProfile(info.commandLine, profileDir));
   for (const info of stale) await killTree(info.pid);
-  if (stale.length > 0) onError?.(new Error(`closed ${stale.length} left-over bridge Chrome process tree(s) before start`));
+  if (stale.length > 0) onError?.(new Error(`closed ${stale.length} left-over bridge-profile Chrome process tree(s)`));
   return stale.length;
 }

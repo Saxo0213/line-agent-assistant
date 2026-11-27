@@ -13,6 +13,7 @@ import { killTree } from './cdp-pipe.js';
 import { locateChrome } from './chrome-locator.js';
 import { BridgeError, bridgeFailureDetail } from './errors.js';
 import { removeProfileData } from './profile-cleanup.js';
+import { closeStaleBridgeChrome } from './stale-chrome.js';
 import { detectStoreExtension, type StoreExtensionDetection } from './store-extension.js';
 import { startOfficialDownloadBridge, type OfficialDownloadBridge, type OfficialDownloadBridgeOptions } from './index.js';
 import { readLoginReading, requestQrRefresh, type LoginReading } from './login-state.js';
@@ -385,6 +386,8 @@ export class OfficialDownloadBridgeService {
   async #finishInstall(install: InstallRun): Promise<void> {
     if (this.#install !== install) return;
     this.#install = undefined;
+    // The window process ended. Chrome can keep a background process of this profile. Close it once.
+    await closeStaleBridgeChrome(this.#profileDir, this.#options.onError);
     if (this.#closed) return;
     let detection: StoreExtensionDetection = { kind: 'none' };
     try {
