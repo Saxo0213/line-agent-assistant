@@ -8,7 +8,7 @@ export const IPC_ACTION_CODES = [
   'listMessages', 'listAttachments', 'listChatNotes', 'getChatNote', 'listChatAlbums', 'listChatAlbumPhotos',
   'downloadChatAlbumPhoto', 'openChatAlbum', 'openReadableChatAlbumFolder', 'cancelChatResourceRequest',
   'sendText', 'replyText', 'sendManualMedia', 'unsendMessage', 'reactMessage', 'getManualUnsendWindow', 'setManualUnsendWindow', 'getLineLegyEncrypted', 'setLineLegyEncrypted', 'getLineSquareReceive', 'setLineSquareReceive','refreshLineCatalog', 'getAgentPersona', 'setAgentPersona',
-  'stopJob', 'retryJob', 'newSession', 'getJobEvents', 'searchMessages', 'openExternalUrl', 'openAttachment',
+  'stopJob', 'retryJob', 'newSession', 'getJobEvents', 'searchMessages', 'openExternalUrl', 'openAttachment', 'openStoredAttachmentsFolder',
   'downloadAttachment', 'revealAttachment', 'resolveFileTypeIcon', 'subscribeEvents', 'setConversationAgent',
   'switchControl', 'setDefaultAgent', 'setWorkspace', 'getConversationSettings', 'setConversationSettings',
   'getAutoResponderSettings', 'setAutoResponderSettings', 'agentLogin', 'agentLogout', 'agentRefreshStatus',

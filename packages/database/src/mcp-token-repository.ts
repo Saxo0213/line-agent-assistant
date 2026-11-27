@@ -1,6 +1,6 @@
 import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
-import { lockAndCheckAgentAuthorization, lockAndCheckRoomAgentGrant } from './agent-authorization.js';
+import { lockAndCheckAgentAuthorization, lockAndCheckFreeMode } from './agent-authorization.js';
 import { findSharedAdminChat, type SharedAdminChat } from './agent-repository.js';
 import { FREE_MODE_MEMBER_ID, allPermissions, findPrimaryAdminUser, resolveLinkedChats, resolveUserPermissions } from './agent-permissions.js';
 import { parseRoleScope, type ProductRole } from './managed-mcp-scopes.js';
@@ -349,12 +349,10 @@ export class McpTokenRepository {
       source_message_id: string | null;
       direct_friend_grant_id: string | null;
       direct_friend_grant_version: string | number | null;
-      room_agent_grant_id: string | null;
-      room_agent_grant_version: string | number | null;
       free_mode: boolean;
     }>(
       `SELECT job_id, account_id, chat_type, chat_id, source_type, source_message_id, direct_friend_grant_id, direct_friend_grant_version,
-              room_agent_grant_id, room_agent_grant_version, free_mode
+              free_mode
        FROM agent_jobs
        WHERE job_id = $1`,
       [context.jobId],
@@ -365,10 +363,8 @@ export class McpTokenRepository {
     }
     if (job.free_mode) {
       // Group free mode: always the room-member principal, even when the batch contains the administrator's messages.
-      // Only the stored room grant is rechecked (there is no per-sender friend grant); permissions are the default member rules.
-      const roomStillAuthorized = job.chat_type !== 'direct' && job.room_agent_grant_id !== null && job.room_agent_grant_version !== null
-        && await lockAndCheckRoomAgentGrant(client, job.account_id, job.chat_type, job.chat_id,
-          { grantId: job.room_agent_grant_id, version: Number(job.room_agent_grant_version) });
+      // Only the room's free-mode window is rechecked (there is no per-sender friend grant); permissions are the default member rules.
+      const roomStillAuthorized = await lockAndCheckFreeMode(client, job.account_id, job.chat_type, job.chat_id);
       if (!roomStillAuthorized) return this.rejectInternal(client, toolName, [job.account_id], 'The Agent job grant is no longer active.');
       const memberPermissions = await resolveUserPermissions(client, job.account_id, FREE_MODE_MEMBER_ID,
         { chatType: job.chat_type, chatId: job.chat_id });
@@ -390,9 +386,9 @@ export class McpTokenRepository {
       return { principalId: `internal:primary_admin:${adminUserId}`, scope: { kind: 'full' }, permissions: allPermissions('ALLOW'),
         history: { allowed: sharedHere, shared: sharedHere ? shared : null } };
     }
-    // Whitelisted friend (1:1) or Agent-enabled group member: only while the stored grants still pass the same
+    // Whitelisted friend (1:1) or whitelisted group member: only while the stored grant still passes the same
     // predicate message admission uses; the effective permissions then decide the scope (current chat by default).
-    if (job.direct_friend_grant_id !== null || job.room_agent_grant_id !== null) {
+    if (job.direct_friend_grant_id !== null) {
       const sender = (await client.query<{ sender_id: string }>(
         'SELECT sender_id FROM messages WHERE account_id = $1 AND message_id = $2', [job.account_id, job.source_message_id],
       )).rows[0];
@@ -400,8 +396,6 @@ export class McpTokenRepository {
         && await lockAndCheckAgentAuthorization(client, job.account_id, job.chat_type, job.chat_id, sender.sender_id, {
           directGrantId: job.direct_friend_grant_id,
           directGrantVersion: Number(job.direct_friend_grant_version),
-          ...(job.room_agent_grant_id !== null ? { roomGrantId: job.room_agent_grant_id } : {}),
-          ...(job.room_agent_grant_version !== null ? { roomGrantVersion: Number(job.room_agent_grant_version) } : {}),
         });
       if (!stillAuthorized) {
         return this.rejectInternal(client, toolName, [job.account_id], 'The Agent job grant is no longer active.');

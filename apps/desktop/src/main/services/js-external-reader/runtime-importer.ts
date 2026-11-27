@@ -241,10 +241,16 @@ export function isExecFileTimeout(error: unknown): boolean {
 }
 
 export function classifyPrivateDirectoryAclResult(result: { stdout: string } | undefined, error?: unknown):
-  'private_directory_acl_command_timeout' | 'private_directory_acl_command_failed' | 'private_directory_acl_unexpected_output' | undefined {
+  'private_directory_acl_command_timeout' | 'private_directory_acl_command_failed' | 'private_directory_acl_privilege_missing'
+  | 'private_directory_acl_unexpected_output' | undefined {
   if (error !== undefined) return isExecFileTimeout(error)
     ? 'private_directory_acl_command_timeout' : 'private_directory_acl_command_failed';
-  return result?.stdout.trim() === 'restricted' ? undefined : 'private_directory_acl_unexpected_output';
+  const output = result?.stdout.trim();
+  if (output === 'restricted') return undefined;
+  const failed = /^failed:([A-Za-z0-9_.]{1,120})$/.exec(output ?? '');
+  if (failed) return failed[1] === 'PrivilegeNotHeldException'
+    ? 'private_directory_acl_privilege_missing' : 'private_directory_acl_command_failed';
+  return 'private_directory_acl_unexpected_output';
 }
 
 /** Build the environment for the ACL command without changing the app's inherited environment. */
@@ -277,13 +283,17 @@ async function ensurePrivatePath(directory: string): Promise<void> {
 async function setPrivateDirectoryAcl(directory: string): Promise<{ stdout: string }> {
   const resolved = path.resolve(directory);
   const escaped = resolved.replaceAll("'", "''");
-  const script = `$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; ` +
+  // SetAccessControl writes only the owner and DACL sections. Set-Acl also writes the SACL and needs SeSecurityPrivilege,
+  // which a UAC-filtered token does not hold. A failure prints `failed:<exception type name>` and exits with code 0.
+  const script = `$ErrorActionPreference='Stop'; try { $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; ` +
     `$acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); ` +
     `$inherit=[System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'; ` +
     `$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl',$inherit,'None','Allow'))); ` +
     `$system=New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18'); ` +
     `$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($system,'FullControl',$inherit,'None','Allow'))); ` +
-    `Set-Acl -LiteralPath '${escaped}' -AclObject $acl; 'restricted'`;
+    `(Get-Item -LiteralPath '${escaped}').SetAccessControl($acl); 'restricted' } ` +
+    `catch { $e=$_.Exception; while ($e.InnerException) { $e=$e.InnerException }; $n=$e.GetType().Name; ` +
+    `if ($n -match '^[A-Za-z0-9_.]{1,120}$') { 'failed:' + $n } else { 'failed:unknown' } }`;
   const result = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
     windowsHide: true, timeout: PROCESS_IDENTITY_TIMEOUT_MS, maxBuffer: 1024,
     env: createPrivateDirectoryAclEnvironment(process.env, process.env.SystemRoot ?? process.env.WINDIR),

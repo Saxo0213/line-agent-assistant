@@ -174,10 +174,7 @@ export class ProviderQuotaRepository {
         AND (j.direct_friend_grant_id IS NULL OR EXISTS(SELECT 1 FROM line_friend_whitelist_grants f
           WHERE f.grant_id=j.direct_friend_grant_id AND f.account_id=j.account_id AND f.target_mid=j.source_sender_id
             AND f.version=j.direct_friend_grant_version AND f.state='ACTIVE'))
-        AND (j.room_agent_grant_id IS NULL OR EXISTS(SELECT 1 FROM room_agent_grants r
-          WHERE r.grant_id=j.room_agent_grant_id AND r.account_id=j.account_id AND r.chat_type=j.chat_type AND r.chat_id=j.chat_id
-            AND r.version=j.room_agent_grant_version AND r.state='ACTIVE'))
-        AND ((j.direct_friend_grant_id IS NOT NULL OR j.room_agent_grant_id IS NOT NULL)
+        AND ((j.direct_friend_grant_id IS NOT NULL OR j.free_mode)
           OR EXISTS(SELECT 1 FROM account_administrators aa WHERE aa.account_id=j.account_id AND aa.user_id=j.source_sender_id AND aa.role='PRIMARY_ADMIN'))`,
       [input.jobId,input.accountId,input.workerInstanceId,input.controlEpoch]);
     return result.rowCount===1;

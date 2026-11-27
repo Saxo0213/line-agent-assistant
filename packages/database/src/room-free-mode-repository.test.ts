@@ -18,7 +18,6 @@ database('Group free mode repository (real database)', () => {
   let close: () => Promise<void>;
   let repo: RoomFreeModeRepository;
   let agents: AgentRepository;
-  let grant: { grantId: string; version: number };
   const messageIds: string[] = [];
 
   beforeAll(async () => {
@@ -41,17 +40,6 @@ database('Group free mode repository (real database)', () => {
         `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, ingestion_source, occurred_at, raw)
          VALUES ($1, $2, $3, 'g1', 'group', $4, 'text', 'hi', 'live', now(), '{}'::jsonb)`, [ACCOUNT, id, `ev-${id}`, sender]);
     }
-    const requestId = randomUUID();
-    await pool.query(
-      `INSERT INTO room_activation_requests(request_id, account_id, chat_type, chat_id, source_message_id, requester_id,
-         admin_chat_id, admin_user_id, admin_version, room_authority_version, state, wait_expires_at)
-       VALUES ($1,$2,'group','g1',$3,'member','admin-direct','mid-admin',1,1,'CONSUMED',clock_timestamp())`, [requestId, ACCOUNT, randomUUID()]);
-    await pool.query("INSERT INTO room_agent_policies(account_id, chat_type, chat_id, state, authority_version) VALUES ($1,'group','g1','ENABLED',1)", [ACCOUNT]);
-    const grantId = randomUUID();
-    await pool.query(
-      `INSERT INTO room_agent_grants(grant_id, account_id, chat_type, chat_id, capability, version, state, request_id)
-       VALUES ($1,$2,'group','g1','AGENT_USE_ROOM',1,'ACTIVE',$3)`, [grantId, ACCOUNT, requestId]);
-    grant = { grantId, version: 1 };
   });
   afterAll(async () => { await close(); });
 
@@ -82,7 +70,8 @@ database('Group free mode repository (real database)', () => {
   });
 
   it('runs a free-mode job as the room member even when its source message is the administrator\'s, and honors [[NO_REPLY]]', async () => {
-    const input = { key: KEY, provider: 'claude' as const, prompt: 'batch', workspacePath: 'C:\w', roomGrant: grant };
+    await repo.activate(KEY, 'mid-admin', new Date(Date.now() + 60 * 60_000));
+    const input = { key: KEY, provider: 'claude' as const, prompt: 'batch', workspacePath: 'C:\w' };
     const job = await repo.enqueueJob({ ...input, sourceMessageId: messageIds[0]! });
     expect(job).not.toBeNull();
     expect(await repo.enqueueJob({ ...input, sourceMessageId: messageIds[0]! })).toBeNull(); // one job per source message
@@ -103,8 +92,12 @@ database('Group free mode repository (real database)', () => {
     expect((await pool.query('SELECT 1 FROM agent_deliveries WHERE job_id = $1', [second!.jobId])).rowCount).toBe(1);
   });
 
-  it('refuses a stale room grant', async () => {
-    await pool.query("UPDATE room_agent_policies SET authority_version = 2 WHERE account_id = $1 AND chat_id = 'g1'", [ACCOUNT]);
-    expect(await repo.enqueueJob({ key: KEY, sourceMessageId: messageIds[2]!, provider: 'claude', prompt: 'x', workspacePath: 'C:\w', roomGrant: grant })).toBeNull();
+  it('stores no room grant on a free-mode job and refuses a job once the free-mode window is over', async () => {
+    const stored = await pool.query('SELECT room_agent_grant_id, room_agent_grant_version FROM agent_jobs WHERE free_mode LIMIT 1');
+    expect(stored.rows[0]).toEqual({ room_agent_grant_id: null, room_agent_grant_version: null });
+    await repo.activate(KEY, 'mid-admin', new Date(Date.now() - 1_000));
+    expect(await repo.enqueueJob({ key: KEY, sourceMessageId: messageIds[2]!, provider: 'claude', prompt: 'x', workspacePath: 'C:\w' })).toBeNull();
+    await repo.deactivate(KEY);
+    expect(await repo.enqueueJob({ key: KEY, sourceMessageId: messageIds[2]!, provider: 'claude', prompt: 'x', workspacePath: 'C:\w' })).toBeNull();
   });
 });

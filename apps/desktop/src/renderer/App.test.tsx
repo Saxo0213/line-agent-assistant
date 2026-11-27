@@ -223,6 +223,7 @@ function fakeApi(): DesktopApi {
     setAgentPersona: vi.fn(async (persona) => persona),
     submitAgentRoomPrompt: vi.fn(async () => ({ type: 'submitAgentRoomPrompt', requestId: 'x', ok: true, jobId: 'job-1' } as const)),
     openAttachment: vi.fn(async () => false),
+    openStoredAttachmentsFolder: vi.fn(async () => false),
     openExternalUrl: vi.fn(async () => ({ type: 'openExternalUrl', requestId: 'x', ok: true } as const)),
     downloadAttachment: vi.fn(async () => accepted),
     resolveFileTypeIcon: vi.fn(async () => null),

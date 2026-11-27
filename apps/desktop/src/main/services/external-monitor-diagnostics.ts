@@ -27,13 +27,13 @@ export type ExternalMonitorFailureDetail =
   | 'node_enoent' | 'node_eacces' | 'node_eperm' | 'node_enotdir' | 'node_eisdir'
   | 'node_emfile' | 'node_enfile' | 'node_ebusy' | 'node_eio' | 'node_epipe' | 'node_etimedout'
   | 'private_directory_path_validation' | 'private_directory_acl_command_failed'
-  | 'private_directory_acl_command_timeout' | 'private_directory_acl_unexpected_output';
+  | 'private_directory_acl_command_timeout' | 'private_directory_acl_unexpected_output' | 'private_directory_acl_privilege_missing';
 const externalMonitorFailureDetails: readonly ExternalMonitorFailureDetail[] = [
   'reader_source_io_error', 'reader_source_identity_changed', 'reader_source_changed',
   'node_enoent', 'node_eacces', 'node_eperm', 'node_enotdir', 'node_eisdir', 'node_emfile',
   'node_enfile', 'node_ebusy', 'node_eio', 'node_epipe', 'node_etimedout',
   'private_directory_path_validation', 'private_directory_acl_command_failed',
-  'private_directory_acl_command_timeout', 'private_directory_acl_unexpected_output',
+  'private_directory_acl_command_timeout', 'private_directory_acl_unexpected_output', 'private_directory_acl_privilege_missing',
 ];
 
 const nativeFailureCodes = new Set([

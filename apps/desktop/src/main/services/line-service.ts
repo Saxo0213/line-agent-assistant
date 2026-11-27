@@ -4,10 +4,10 @@ import { isWritableChatType, diagnosticFailure, InboundEnvelopeSchema, normalize
 import type { AccountRepository, AdminRepository, AgentJobStatusProjection, FriendWhitelistRepository, MessageRepository, RoutingDecision, SettingsRepository } from '@line-agent/database';
 import type { ExternalMonitorAgentReceipt } from '@line-agent/database';
 import { bridgeNativeEnvelope, normalizedFallbackOrder, routeKeyFor, type AccountSource } from '@line-agent/database';
-import { hasOwnMention, isAgentSwitchText, isFolderCommandText, isFreeCommandText, isPersonaCommandText, routeTrigger, type FolderCommand, type FreeCommand, type PersonaCommand, type TriggerDecision } from './trigger-router.js';
+import { hasOwnMention, isAgentSwitchText, isFolderCommandText, isFreeCommandText, isPermissionCommandText, isPersonaCommandText, routeTrigger, type FolderCommand, type FreeCommand, type PersonaCommand, type TriggerDecision } from './trigger-router.js';
 import { executePersonaCommand } from './agent-persona.js';
 import { modelReply, normalizeModelForProvider, type ModelCommand } from './model-command.js';
-import { classifyRoomControl, ownMentionBody, sanitizeRoomControlEnvelope, type RoomActivationCommand } from './room-control.js';
+import { classifyRoomControl, ownMentionBody, sanitizeRoomControlEnvelope } from './room-control.js';
 import { sanitizeInbound } from './sensitive-message-sanitizer.js';
 import type { SecretStore } from './secret-store.js';
 import type { WorkspaceInspection } from './workspace-authority.js';
@@ -45,9 +45,6 @@ export interface AgentControl {
 
 interface AttachmentControl { downloadById(attachmentId: string, signal?: AbortSignal, live?: boolean): Promise<boolean>; }
 export interface RoomControlHandler {
-  handle(command: RoomActivationCommand): Promise<void>;
-  isEnabled?(key: WritableConversationKey): Promise<boolean>;
-  getActiveAuthorization?(key: WritableConversationKey): Promise<{ grantId: string; version: number } | null>;
   respond?(envelope: Extract<LineWorkerEvent, { type: 'batch' }>['envelopes'][number], body: string): Promise<void>;
 }
 
@@ -858,7 +855,7 @@ export class LineService {
       return { ...ingress, envelope: ingress.envelope,
         secretCandidate: original.accountId === binding.accountId && event.accountId === binding.accountId
           ? ingress.secretCandidate : null,
-        ownMid, control: classifyRoomControl(ingress.envelope, ownMid, binding.accountId),
+        ownMid, control: classifyRoomControl(ingress.envelope),
         ...(recovered && !recovered.monitorReceipt ? { sensitive: recovered.sensitive } : {}) };
     });
     const useIndependentIngest = typeof (this.messages as unknown as { ingestBatchSource?: unknown }).ingestBatchSource === 'function';
@@ -920,7 +917,9 @@ export class LineService {
     const freeDispatches = new Map<string, FreeDispatch>();
     const agentDispatches = new Map<string, AgentDispatch>();
       const quotaDispatches = new Set<string>();
+    const permissionHintDispatches = new Set<string>();
     const primaryAdminMessageIds = new Set<string>();
+    const noAutoReplyIds = new Set<string>();
     const folderDispatches = new Map<string, FolderCommand>();
     const folderAdminCommandIds = new Set<string>();
     const personaAdminCommandIds = new Set<string>();
@@ -939,7 +938,7 @@ export class LineService {
       const shouldCheckGroupAuthorization = envelope.chatType !== 'direct' && control.type === 'none'
         && envelope.ingestion.source === 'live' && envelope.kind === 'text' && envelope.senderId !== ownMid
         && !administrative.has(envelope.messageId) && (hasOwnMention(envelope, ownMid) || isFreeCommandText(envelope, ownMid) || isFolderCommandText(envelope, ownMid) || isPersonaCommandText(envelope, ownMid)
-          || (this.freeMode?.isActive(key) === true && isAgentSwitchText(envelope, ownMid)));
+          || isPermissionCommandText(envelope, ownMid) || (this.freeMode?.isActive(key) === true && isAgentSwitchText(envelope, ownMid)));
       let primaryAdminLookupFailed = false;
       const primaryAdmin = envelope.chatType === 'direct'
         ? directAdmin
@@ -953,13 +952,9 @@ export class LineService {
         : envelope.chatType === 'direct' || shouldCheckGroupAuthorization
           ? await this.friendWhitelist?.getActiveAuthorization(envelope.accountId, envelope.senderId,
             envelope.chatType === 'direct' ? { kind: 'ACCOUNT' } : { kind: 'CHAT', chatType: envelope.chatType, chatId: envelope.chatId }) ?? null : null;
-      const roomAuthorization = envelope.chatType === 'direct' || !shouldCheckGroupAuthorization || primaryAdmin || primaryAdminLookupFailed
-        || friendAuthorization?.scopeKind !== 'ACCOUNT' ? null
-        : await this.roomControl?.getActiveAuthorization?.(key) ?? null;
       const roomAgentEnabled = envelope.chatType === 'direct'
         ? conversation?.enabled ?? false
-        : primaryAdmin || (shouldCheckGroupAuthorization && friendAuthorization?.scopeKind === 'CHAT')
-          || (shouldCheckGroupAuthorization && friendAuthorization?.scopeKind === 'ACCOUNT' && roomAuthorization !== null);
+        : primaryAdmin || (shouldCheckGroupAuthorization && friendAuthorization !== null);
       const senderIsPrimaryAdmin = envelope.chatType === 'direct'
         ? primaryAdmin || friendAuthorization !== null
         : primaryAdmin;
@@ -971,17 +966,17 @@ export class LineService {
       const freeDispatch: FreeDispatch | null = !this.freeMode ? null : routed.type === 'free' || routed.type === 'free_range' ? { command: routed }
         : routed.type === 'free_message' ? { message: true } : null;
       if (primaryAdmin === true) primaryAdminMessageIds.add(envelope.messageId);
+      // The auto-reply answers only a sender that the Agent does not serve in any other way.
+      if (primaryAdmin === true || friendAuthorization !== null || routed.type !== 'ignore') noAutoReplyIds.add(envelope.messageId);
       const agentDispatch = routed.type === 'agent_provider' || routed.type === 'agent_usage' || routed.type === 'agent_model' ? routed : null;
       if (routed.type === 'agent_quota') quotaDispatches.add(envelope.messageId);
+      if (routed.type === 'permission_hint' && !permissionClaimed && control.type === 'none' && !sensitive) permissionHintDispatches.add(envelope.messageId);
       const decision: Exclude<TriggerDecision, FreeCommand | FolderCommand | PersonaCommand | { type: 'free_message' } | AgentDispatch> = routed.type === 'free' || routed.type === 'free_range' || routed.type === 'folder'
         || routed.type === 'persona' || routed.type === 'free_message' || routed.type === 'agent_provider' || routed.type === 'agent_usage' || routed.type === 'agent_model'
-        || routed.type === 'agent_quota' ? { type: 'ignore' } : routed;
+        || routed.type === 'agent_quota' || routed.type === 'permission_hint' ? { type: 'ignore' } : routed;
       const authorization = !primaryAdmin && friendAuthorization ? {
         directGrantId: friendAuthorization.grantId,
         directGrantVersion: friendAuthorization.version,
-        ...(envelope.chatType === 'direct' || !roomAuthorization ? {} : {
-          roomGrantId: roomAuthorization.grantId, roomGrantVersion: roomAuthorization.version,
-        }),
       } : undefined;
       const routeIsClosed = existingRoutes.has(envelope.messageId) || (recovered && !recovered.receiptCurrent);
       // `/folder` is applied after ingestion like free mode; for storage and admission it is a plain ignored message.
@@ -1035,13 +1030,11 @@ export class LineService {
           || (recovered && !recovered.receiptCurrent) || existingRoutes.has(envelope.messageId)
           || administrative.has(envelope.messageId) || sensitive || primaryAdminAction || promptAdmitted
           || primaryAdminLookupFailedIds.has(envelope.messageId) || agentDispatches.has(envelope.messageId)
+          || noAutoReplyIds.has(envelope.messageId)
           || (isFreeCommandText(envelope, ownMid) && primaryAdminMessageIds.has(envelope.messageId))
           || folderAdminCommandIds.has(envelope.messageId) || personaAdminCommandIds.has(envelope.messageId)) continue;
         const body = ownMentionBody(envelope, ownMid);
-        if (body !== null) this.scheduleRoomEffect(async () => {
-          const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
-          if (!await this.roomControl?.isEnabled?.(key)) await this.roomControl?.respond?.(envelope, body);
-        });
+        if (body !== null) this.scheduleRoomEffect(() => this.roomControl?.respond?.(envelope, body));
       }
     }
     type StoredBatch = Awaited<ReturnType<MessageRepository['ingestBatchSource']>>;
@@ -1170,21 +1163,23 @@ export class LineService {
       const quotaKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
       this.scheduleRoomEffect(() => this.applyQuotaCommand(binding, quotaKey, envelope.messageId));
     }
+    for (const { envelope } of admitted) {
+      if (!permissionHintDispatches.has(envelope.messageId) || administrative.has(envelope.messageId)
+        || primaryAdminLookupFailedIds.has(envelope.messageId) || this.bindings.get(binding.workerInstanceId) !== binding) continue;
+      const hintKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
+      this.scheduleRoomEffect(() => this.sendChatText(binding, hintKey, linePrompt(this.locale, 'permissionGroupHint'), envelope.messageId));
+    }
     for (const attachmentId of attachmentIds) this.queueAttachmentDownload(attachmentId, liveAttachmentIds.has(attachmentId));
     for (const { control, envelope, ownMid } of admitted) {
       if (primaryAdminLookupFailedIds.has(envelope.messageId)) continue;
-      if (control.type === 'command') {
-        this.scheduleRoomEffect(() => this.roomControl?.handle(control.command));
-      } else if (!useIndependentIngest && control.type === 'none' && !administrative.has(envelope.messageId)
+      if (!useIndependentIngest && control.type === 'none' && !administrative.has(envelope.messageId)
         && !primaryAdminActions.has(envelope.messageId) && !committedAgentActions.has(envelope.messageId)
         && !agentDispatches.has(envelope.messageId) && !quotaDispatches.has(envelope.messageId)
+        && !noAutoReplyIds.has(envelope.messageId)
         && !(isFreeCommandText(envelope, ownMid) && primaryAdminMessageIds.has(envelope.messageId))
         && !folderAdminCommandIds.has(envelope.messageId) && !personaAdminCommandIds.has(envelope.messageId) && this.roomControl?.respond) {
         const body = ownMentionBody(envelope, ownMid);
-        if (body !== null) this.scheduleRoomEffect(async () => {
-          const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
-          if (!await this.roomControl?.isEnabled?.(key)) await this.roomControl?.respond?.(envelope, body);
-        });
+        if (body !== null) this.scheduleRoomEffect(() => this.roomControl?.respond?.(envelope, body));
       }
     }
     return [...new Set([...result.insertedMessageIds, ...(result.changedMessageIds ?? [])])];

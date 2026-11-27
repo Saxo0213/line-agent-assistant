@@ -4,12 +4,16 @@ import {classifyProviderFailure} from './failure.js';
 import {codexMcpOverrides} from './mcp.js';
 import {codexExtensionPlan,codexWebSearchOverrides} from './extensions.js';
 
+/** Codex features that run commands or read local files. A job without the local tools permission runs with all of them off. */
+export const CODEX_LOCAL_FEATURES=['shell_tool','unified_exec','computer_use','browser_use','browser_use_external','code_mode_host','view_image','multi_agent'] as const;
 export function codexArguments(request:AgentRunRequest,workspace:string) {
   // Codex has no approval broker, so its sandbox is the enforcement boundary.
-  if(!request.tools.localTools) throw new Error('Codex requires the local tools permission');
+  // Without the local tools permission, the run is plain conversation plus the MCP tools: read-only sandbox and every local-execution feature off.
+  const chatOnly=!request.tools.localTools;
   const level=request.tools.level ?? 'workspace_write';
   // A read-only project folder cannot be protected inside danger-full-access, so such a job runs in workspace-write instead.
-  const sandbox=!request.tools.fileWrite||request.tools.ownFolderReadOnly||level==='read_only'?'read-only':level==='full'&&!(request.tools.projectDirs??[]).some(dir=>!dir.writable)?'danger-full-access':'workspace-write';
+  const sandbox=chatOnly||!request.tools.fileWrite||request.tools.ownFolderReadOnly||level==='read_only'?'read-only':level==='full'&&!(request.tools.projectDirs??[]).some(dir=>!dir.writable)?'danger-full-access':'workspace-write';
+  const disabled=chatOnly?CODEX_LOCAL_FEATURES.flatMap(feature=>['--disable',feature]):[];
   // `--add-dir` (an exec-level option, so it also precedes `resume`) adds writable roots to the workspace-write sandbox only; reading is never limited by directory.
   const writableDirs=sandbox==='workspace-write'?(request.tools.projectDirs??[]).filter(dir=>dir.writable).flatMap(dir=>['--add-dir',dir.path]):[];
   const images=codexImageArguments(request);
@@ -17,7 +21,7 @@ export function codexArguments(request:AgentRunRequest,workspace:string) {
   const model=request.model?.trim();
   // Order follows CliTalkAgent. A fresh `--image` is variadic, so it goes before `--sandbox`: the trailing `-` then cannot become an image value.
   // On `resume` the flag is a single-value option after the session id. The process cwd is the workspace, so there is no `-C`.
-  return ['exec','--json','--skip-git-repo-check','--ignore-user-config',...(resume?[]:images),'--sandbox',sandbox,...writableDirs,...(model?['-m',model]:[]),...(request.mcp?codexMcpOverrides(request.mcp):[]),...codexExtensionPlan(request.extensions).overrides,...codexWebSearchOverrides(request.extensions,request.tools.webTools),...(resume?['resume',request.resumeSessionId!,...images]:[]),'-'];
+  return ['exec','--json','--skip-git-repo-check','--ignore-user-config',...(resume?[]:images),'--sandbox',sandbox,...disabled,...writableDirs,...(model?['-m',model]:[]),...(request.mcp?codexMcpOverrides(request.mcp):[]),...codexExtensionPlan(request.extensions).overrides,...codexWebSearchOverrides(request.extensions,request.tools.webTools),...(resume?['resume',request.resumeSessionId!,...images]:[]),'-'];
 }
 /** CliTalkAgent `normalize_model_for_provider` (Codex): 1-128 characters, `[A-Za-z0-9._:/-]`, and not a Claude alias. */
 export function isValidCodexModel(value:string):boolean {

@@ -169,7 +169,7 @@ latestMessageAt: row.latest_occurred_at?.toISOString() ?? null,
 }
 
 const conversationSelect = `SELECT c.account_id, c.chat_type, c.chat_id, COALESCE(${CONVERSATION_TITLE_SQL}, '') AS title,
-    CASE WHEN c.chat_type IN ('group','room') THEN COALESCE(room_policy.state = 'ENABLED', false) ELSE c.agent_enabled END AS agent_enabled,
+    CASE WHEN c.chat_type IN ('group','room') THEN COALESCE(la.product_role = 'AGENT', false) ELSE c.agent_enabled END AS agent_enabled,
     COALESCE(c.default_provider, CASE WHEN (SELECT value #>> '{}' FROM app_settings WHERE key = 'default_provider') = 'codex' THEN 'codex' ELSE 'claude' END) AS default_provider,
     c.unread_count, ${CONVERSATION_PICTURE_SQL} picture_path, latest.message_id latest_message_id, latest.sticon_raw latest_sticon_raw, latest.text_content latest_text, latest.content latest_content, latest.is_own latest_is_own, latest.source_deleted latest_source_deleted, latest.kind latest_kind, latest.notification_projection latest_notification_projection, latest.occurred_at latest_occurred_at,
     latest.attachment_name latest_attachment_name, latest.attachment_kind latest_attachment_kind,
@@ -177,8 +177,6 @@ const conversationSelect = `SELECT c.account_id, c.chat_type, c.chat_id, COALESC
   FROM conversations c
   JOIN line_accounts la ON la.account_id=c.account_id
   ${PEER_CONTACT_JOIN}
-  LEFT JOIN room_agent_policies room_policy ON room_policy.account_id=c.account_id
-    AND room_policy.chat_type=c.chat_type AND room_policy.chat_id=c.chat_id
   LEFT JOIN LATERAL (
     SELECT m.message_id, m.text_content, ${boundedSticonRawSql('m.raw')} AS sticon_raw, m.content, ${ownMessageSql('m', 'la')} AS is_own, (m.raw ? 'sourceDeleted') AS source_deleted, m.kind,
       ${boundedNotificationProjectionSql} AS notification_projection,

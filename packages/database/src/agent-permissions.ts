@@ -329,14 +329,12 @@ export class AgentPermissionRepository {
        JOIN conversations c ON c.account_id = f.account_id AND c.chat_type = f.chat_type AND c.chat_id = f.chat_id
        ${CHAT_CONTACT_JOIN}
        WHERE f.account_id = $1 ORDER BY f.created_at, f.folder_id`, [accountId]);
-    // Agent-enabled groups/rooms, plus the 1:1 chats of friends whose whitelist grant covers the whole account.
+    // Every group/room of the Agent account, plus the 1:1 chats of friends whose whitelist grant covers the whole account.
     const chats = await this.pool.query<{ chat_type: ChatFolderChatType; chat_id: string; title: string }>(
       `SELECT c.chat_type, c.chat_id, ${CHAT_TITLE_SQL} AS title FROM conversations c
        ${CHAT_CONTACT_JOIN}
        WHERE c.account_id = $1 AND (
-         (c.chat_type IN ('group', 'room') AND EXISTS (
-            SELECT 1 FROM room_agent_policies p
-            WHERE p.account_id = c.account_id AND p.chat_type = c.chat_type AND p.chat_id = c.chat_id AND p.state = 'ENABLED'))
+         c.chat_type IN ('group', 'room')
          OR (c.chat_type = 'direct' AND EXISTS (
             SELECT 1 FROM line_friend_whitelist_grants g
             WHERE g.account_id = c.account_id AND g.target_mid = c.chat_id AND g.capability = 'AGENT_USE'
@@ -417,7 +415,7 @@ export class AgentPermissionRepository {
       const chat = await client.query(
         `SELECT 1 FROM conversations c
          WHERE c.account_id=$1 AND c.chat_type=$2 AND c.chat_id=$3 AND (
-           ($2 IN ('group','room') AND EXISTS (SELECT 1 FROM room_agent_policies p WHERE p.account_id=c.account_id AND p.chat_type=c.chat_type AND p.chat_id=c.chat_id AND p.state='ENABLED'))
+           $2 IN ('group','room')
            OR ($2='direct' AND c.chat_id=$4))`, [input.accountId, input.chatType, input.chatId, subjectMid]);
       if (!chat.rowCount) throw new AgentPermissionError('INVALID_CHAT', 'The selected chat is not eligible for Agent permissions.');
       const grant = await client.query(

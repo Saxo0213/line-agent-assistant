@@ -82,7 +82,8 @@ export async function prepareExtensionCopy(options: PrepareExtensionOptions): Pr
     await rename(temp, target);
   } catch (error) {
     await rm(temp, { recursive: true, force: true }).catch(() => undefined);
-    throw new BridgeError('EXTENSION_COPY_FAILED', error instanceof Error ? error.message : 'copy failed', { cause: error });
+    throw new BridgeError('EXTENSION_COPY_FAILED', error instanceof Error ? error.message : 'copy failed',
+      { cause: error, paths: [target, temp, sourceDir, extRoot] });
   }
   return { path: target, reused: false };
 }

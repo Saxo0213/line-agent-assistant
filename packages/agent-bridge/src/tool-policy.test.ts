@@ -1,7 +1,6 @@
 import {afterEach, beforeEach, describe, expect, it} from 'vitest';
 import {join} from 'node:path';
 import type {AgentEvent,AgentRunRequest} from '@line-agent/contracts';
-import {PROVIDER_TOOLS_UNSUPPORTED,PROVIDER_TOOLS_UNSUPPORTED_MESSAGE} from '@line-agent/contracts';
 import {AgentCliBridge} from './index.js';
 import {claudeArguments,claudeBuiltInTools,claudePermissionPath,claudeProjectDenyRules} from './claude.js';
 import {claudeMcpConfig,claudeMcpToolNames,claudePermissionPromptToolName} from './mcp.js';
@@ -175,15 +174,17 @@ describe('Codex fails closed without the local tools permission',()=>{
     expect(codexArguments(request('codex',root,{tools:{...request('codex',root).tools,level}}),root)).toContain(sandbox);
     expect(codexArguments(request('codex',root,{tools:{...request('codex',root).tools,fileWrite:false}}),root)).toContain('read-only');
   });
-  it('refuses to build arguments and the bridge reports PROVIDER_TOOLS_UNSUPPORTED without starting a process',async()=>{
-    expect(()=>codexArguments(request('codex',root,{tools:none}),root)).toThrow();
+  it('runs chat-only without the local tools permission: read-only sandbox and every local-execution feature disabled',async()=>{
+    const chat=codexArguments(request('codex',root,{tools:none}),root);
+    expect(value(chat,'--sandbox')).toBe('read-only');
+    for(const feature of ['shell_tool','unified_exec','computer_use','browser_use','code_mode_host']) expect(chat.some((arg,index)=>arg===feature&&chat[index-1]==='--disable')).toBe(true);
+    expect(codexArguments(request('codex',root),root)).not.toContain('--disable');
     expect(codexArguments(request('codex',root),root)).toContain('workspace-write');
     expect(codexArguments(request('codex',root,{tools:{...request('codex',root).tools,level:'read_only'}}),root)).toContain('read-only');
     expect(codexArguments(request('codex',root,{tools:{...request('codex',root).tools,level:'full'}}),root)).toContain('danger-full-access');
     expect(codexArguments(request('codex',root,{tools:{...request('codex',root).tools,fileWrite:false}}),root)).toContain('read-only');
     const events=await collect(bridge('codex').run(request('codex',root,{tools:{...none,fileRead:true,fileWrite:true}})));
-    expect(events).toEqual([{type:'failed',code:PROVIDER_TOOLS_UNSUPPORTED,message:PROVIDER_TOOLS_UNSUPPORTED_MESSAGE,retryable:false}]);
-    expect(PROVIDER_TOOLS_UNSUPPORTED_MESSAGE).toBe('Codex 無法限制本機工具，群組／好友工作請改用 Claude 或由管理者開放本機工作區權限');
+    expect(events.at(-1)?.type).toBe('completed');
     const allowed=await collect(bridge('codex').run(request('codex',root)));
     expect(allowed.at(-1)?.type).toBe('completed');
   });

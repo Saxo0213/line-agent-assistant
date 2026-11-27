@@ -3,11 +3,17 @@
 // It never sends a logout and it never starts the QR refresh by a timer.
 
 import { createHash } from 'node:crypto';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import nodePath from 'node:path';
+import { CHROME_EXTENSION_ID } from '@line-agent/line-chrome';
 import { toDataURL } from 'qrcode';
 import { BRIDGE_VERIFY_POLL_MS, BRIDGE_VERIFY_WAIT_MS } from './bridge-verification.js';
-import { BridgeError } from './errors.js';
+import { killTree } from './cdp-pipe.js';
+import { locateChrome } from './chrome-locator.js';
+import { BridgeError, bridgeFailureDetail } from './errors.js';
+import { removeProfileData } from './profile-cleanup.js';
+import { detectStoreExtension, type StoreExtensionDetection } from './store-extension.js';
 import { startOfficialDownloadBridge, type OfficialDownloadBridge, type OfficialDownloadBridgeOptions } from './index.js';
 import { readLoginReading, requestQrRefresh, type LoginReading } from './login-state.js';
 import type { CdpPipe } from './cdp-pipe.js';
@@ -48,6 +54,20 @@ export interface OfficialDownloadBridgeServiceOptions {
   readonly resumeTimeoutMs?: number;
   /** Time limit for a user-requested login (scan and confirm). */
   readonly interactiveTimeoutMs?: number;
+  /** Test seams of the store install action. */
+  readonly locateChrome?: () => Promise<string>;
+  readonly spawnChrome?: (file: string, args: readonly string[]) => ChildProcess;
+  readonly detectStore?: (profileDir: string) => Promise<StoreExtensionDetection>;
+}
+
+/** Status code (state `starting`) while the visible Chrome window of the store install is open. */
+export const STORE_INSTALLING_CODE = 'EXTENSION_STORE_INSTALLING';
+const STORE_PAGE_URL = `https://chromewebstore.google.com/detail/${CHROME_EXTENSION_ID}`;
+
+interface InstallRun {
+  readonly child: ChildProcess;
+  readonly accountId: string;
+  readonly adminMid: string;
 }
 
 const POLL_INTERVAL_MS = 1000;
@@ -282,6 +302,8 @@ export class OfficialDownloadBridgeService {
   readonly #markerFile: string;
   #status: DownloadBridgeStatus = { accountId: null, state: 'not_configured' };
   #session: Session | undefined;
+  /** The visible Chrome window of the store install. It never runs together with a session (one Chrome per profile). */
+  #install: InstallRun | undefined;
   #nextSessionId = 1;
   #closed = false;
   /** Serializes start, clear and close. */
@@ -310,15 +332,85 @@ export class OfficialDownloadBridgeService {
   /** User request. Returns at once; the work goes on in the background. */
   start(input: { accountId: string; adminMid: string }): Promise<void> {
     return this.#enqueue(async () => {
-      if (this.#closed || this.#session) return;
+      if (this.#closed || this.#session || this.#install) return;
       this.#begin(input, 'interactive');
     });
+  }
+
+  /**
+   * User request. Opens a visible Chrome on the download profile at the Web Store page of the extension.
+   * Returns false when a session or an install window already runs (one Chrome per profile).
+   * When that Chrome ends, the store install is detected again. If it is usable, the download login starts at once.
+   */
+  installExtensionFromStore(input: { accountId: string; adminMid: string }): Promise<boolean> {
+    return this.#enqueue(async () => {
+      if (this.#closed || this.#session || this.#install) return false;
+      let child: ChildProcess;
+      try {
+        const chromePath = await (this.#options.locateChrome ?? locateChrome)();
+        await mkdir(this.#profileDir, { recursive: true });
+        child = await this.#spawnInstallChrome(chromePath);
+      } catch (error) {
+        this.#options.onError?.(error);
+        const reasonDetail = bridgeFailureDetail(error)?.replace(/^code:[A-Z0-9_]+:/, '');
+        this.#setStatus({ accountId: input.accountId, state: 'error', code: errorCodeOf(error, 'CHROME_START_FAILED'), ...(reasonDetail ? { detail: reasonDetail } : {}) });
+        return true;
+      }
+      const install: InstallRun = { child, accountId: input.accountId, adminMid: input.adminMid };
+      this.#install = install;
+      this.#setStatus({ accountId: input.accountId, state: 'starting', code: STORE_INSTALLING_CODE });
+      child.once('exit', () => { void this.#enqueue(() => this.#finishInstall(install)).catch(() => undefined); });
+      return true;
+    });
+  }
+
+  /** Visible Chrome: no headless flag and no debugging pipe. */
+  async #spawnInstallChrome(chromePath: string): Promise<ChildProcess> {
+    const args = [`--user-data-dir=${this.#profileDir}`, '--no-first-run', '--no-default-browser-check', STORE_PAGE_URL];
+    const child = (this.#options.spawnChrome ?? ((file, list) => spawn(file, [...list], { stdio: 'ignore', windowsHide: false, detached: false })))(chromePath, args);
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', () => resolve());
+      child.once('error', (error) => reject(new BridgeError('CHROME_START_FAILED', error.message, { cause: error, paths: [chromePath, this.#profileDir] })));
+    });
+    return child;
+  }
+
+  /** The install window ended. Detects the store install again and starts the download login when it is usable. */
+  async #finishInstall(install: InstallRun): Promise<void> {
+    if (this.#install !== install) return;
+    this.#install = undefined;
+    if (this.#closed) return;
+    let detection: StoreExtensionDetection = { kind: 'none' };
+    try {
+      detection = await (this.#options.detectStore ?? detectStoreExtension)(this.#profileDir);
+    } catch (error) {
+      this.#options.onError?.(error);
+    }
+    if (this.#closed || this.#session) return;
+    if (detection.kind === 'ready') {
+      this.#begin({ accountId: install.accountId, adminMid: install.adminMid }, 'interactive');
+      return;
+    }
+    if (detection.kind === 'changed') {
+      const detail = `reason:signatures_${detection.failed.join('_')}`.replace(/[^A-Za-z0-9_.:/|=,-]/g, '').slice(0, MAX_DETAIL);
+      this.#setStatus({ accountId: install.accountId, state: 'error', code: 'EXTENSION_FEATURES_CHANGED', detail });
+      return;
+    }
+    this.#setStatus({ accountId: install.accountId, state: 'error', code: 'EXTENSION_STORE_INSTALL_REQUIRED' });
+  }
+
+  /** Closes the install window of this app (only the process that this app started). */
+  async #endInstall(): Promise<void> {
+    const install = this.#install;
+    this.#install = undefined;
+    const pid = install?.child.pid;
+    if (install && pid && install.child.exitCode === null && install.child.signalCode === null) await killTree(pid);
   }
 
   /** App start. Starts only when `login.json` has the MID of the Primary Admin. Returns at once. */
   startAtAppStart(input: { accountId: string; adminMid: string }): Promise<void> {
     return this.#enqueue(async () => {
-      if (this.#closed || this.#session) return;
+      if (this.#closed || this.#session || this.#install) return;
       const marker = await this.#readMarker();
       if (!marker || marker.mid !== input.adminMid) return;
       this.#begin(input, 'resume');
@@ -347,6 +439,7 @@ export class OfficialDownloadBridgeService {
   /** Closes Chrome, deletes the profile folder and `login.json`. */
   clear(): Promise<void> {
     return this.#enqueue(async () => {
+      await this.#endInstall();
       await this.#endSession(60_000);
       await this.#deleteLoginData();
       this.#setStatus({ accountId: this.#status.accountId, state: 'not_configured' });
@@ -358,6 +451,7 @@ export class OfficialDownloadBridgeService {
     this.#closed = true;
     return this.#enqueue(async () => {
       await this.#recordLctKind();
+      await this.#endInstall();
       await this.#endSession(5_000);
     });
   }
@@ -486,7 +580,8 @@ export class OfficialDownloadBridgeService {
   }
 
   async #deleteLoginData(): Promise<void> {
-    await rm(this.#profileDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    // A store-installed extension stays installed (see profile-cleanup.ts).
+    await removeProfileData(this.#profileDir);
     await rm(this.#markerFile, { force: true });
   }
 
@@ -682,7 +777,8 @@ export class OfficialDownloadBridgeService {
     } catch (error) {
       this.#options.onError?.(error);
       if (error instanceof BridgeError && error.code === 'CDP_CLOSED' && this.#isCurrent(session)) return 'crashed';
-      await this.#fail(session, errorCodeOf(error, 'BRIDGE_START_FAILED'));
+      const reasonDetail = bridgeFailureDetail(error)?.replace(/^code:[A-Z0-9_]+:/, '');
+      await this.#fail(session, errorCodeOf(error, 'BRIDGE_START_FAILED'), false, reasonDetail);
       return 'ended';
     }
     return this.#poll(session);

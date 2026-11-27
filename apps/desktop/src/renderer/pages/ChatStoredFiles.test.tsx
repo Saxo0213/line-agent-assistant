@@ -86,14 +86,14 @@ describe('ChatStoredFiles', () => {
     const trigger = screen.getByRole('button', { name: 'Open saved files' });
     fireEvent.click(trigger);
     const dialog = await screen.findByRole('dialog', { name: 'Saved files' });
-    const close = screen.getByRole('button', { name: 'Close' });
+    const firstButton = screen.getByRole('button', { name: 'Open folder' });
     const openFile = await screen.findByRole('button', { name: 'Open report.pdf' });
 
     expect(document.activeElement).toBe(dialog);
     fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
     expect(document.activeElement).toBe(openFile);
     fireEvent.keyDown(document, { key: 'Tab' });
-    expect(document.activeElement).toBe(close);
+    expect(document.activeElement).toBe(firstButton);
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(screen.queryByRole('dialog', { name: 'Saved files' })).toBeNull();
     expect(document.activeElement).toBe(trigger);
@@ -126,5 +126,18 @@ describe('ChatStoredFiles', () => {
     expect(await screen.findByText('Unable to open this file.')).toBeTruthy();
     pendingOpen.resolve(true);
     await waitFor(() => expect(screen.getByText('Unable to open this file.')).toBeTruthy());
+  });
+
+  it('opens the saved-files folder of this chat from the header and shows an alert when it fails', async () => {
+    const client = { listStoredAttachments: vi.fn(async () => ({ attachments: [item], nextCursor: null })), openAttachment: vi.fn(),
+      openStoredAttachmentsFolder: vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false) } as unknown as DesktopApi;
+    renderFiles(group, client);
+    fireEvent.click(screen.getByRole('button', { name: 'Open saved files' }));
+    await screen.findByRole('dialog', { name: 'Saved files' });
+    fireEvent.click(screen.getByRole('button', { name: 'Open folder' }));
+    await waitFor(() => expect(client.openStoredAttachmentsFolder).toHaveBeenCalledWith(group));
+    expect(screen.queryByText('Unable to open the folder.')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Open folder' }));
+    expect(await screen.findByText('Unable to open the folder.')).toBeTruthy();
   });
 });

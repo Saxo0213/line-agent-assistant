@@ -3054,7 +3054,7 @@ database('connected facade account login semantics', () => {
     pendingWelcomeSend = null;
   });
 
-  it('activates room controls and deterministic replies while withholding Agent admission without a room grant', async () => {
+  it('answers an unlisted group sender by the auto-reply rules with no room activation and withholds Agent admission', async () => {
     await addStoredAccounts('account-a');
     const ownMid = 'agent-mid';
     await pool.query("UPDATE line_accounts SET own_mid=$2 WHERE account_id=$1", ['account-a', ownMid]);
@@ -3073,14 +3073,12 @@ database('connected facade account login semantics', () => {
       cursorBefore: { version: 1, revision: '0', globalRev: '0', individualRev: '0' },
       cursorAfter: { version: 1, revision: '1', globalRev: '1', individualRev: '0' },
       envelopes: [makeEnvelope('disabled-monitor', 'monitor'), makeEnvelope('disabled-reply', 'anything')] });
-    await waitForState(() => expect(commands.filter((command) => command.type === 'sendText')).toHaveLength(3));
+    await waitForState(() => expect(commands.filter((command) => command.type === 'sendText')).toHaveLength(2));
     await facade.shutdown();
 
-    expect((await pool.query("SELECT count(*) FROM room_activation_requests WHERE account_id='account-a'")).rows[0].count).toBe('1');
     expect((await pool.query("SELECT count(*) FROM agent_jobs WHERE account_id='account-a' AND chat_type='group'")).rows[0].count).toBe('0');
     const sends = commands.filter((command) => command.type === 'sendText');
-    const adminTokenSend = sends.find((command) => command.chatType === 'direct' && command.chatId === 'admin-direct');
-    expect(adminTokenSend?.type === 'sendText' ? adminTokenSend.text : '').toMatch(/RA-[A-Za-z0-9_-]{43}/);
+    expect(sends.every((command) => command.chatType === 'group' && command.chatId === 'disabled-room')).toBe(true);
     expect(sends.some((command) => command.type === 'sendText' && command.chatType === 'group'
       && command.chatId === 'disabled-room' && command.text === '我不知道你在說甚麼')).toBe(true);
     expect(commands.some((command) => command.type === 'ackBatch' && command.batchId === 'disabled-room-batch')).toBe(true);

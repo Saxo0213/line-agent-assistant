@@ -52,6 +52,14 @@ function textWithoutOwnMention(envelope: InboundEnvelope, ownMid: string | null)
   return (mention ? text.slice(0, mention.start) + text.slice(mention.end) : text).trim();
 }
 
+/** `/權限` and `/permissions` (exact text). The dialogue lives in the Primary Administrator's direct chat only. */
+export const PERMISSION_COMMAND_PATTERN = /^(\/權限|\/permissions)$/i;
+
+/** True for a group/room text that is `/權限` or `/permissions` (with or without an Agent mention). */
+export function isPermissionCommandText(envelope: InboundEnvelope, ownMid: string | null): boolean {
+  return envelope.chatType !== 'direct' && envelope.text !== null && PERMISSION_COMMAND_PATTERN.test(textWithoutOwnMention(envelope, ownMid));
+}
+
 /** True for a group/room text that is a `/free` command (with or without an Agent mention). */
 export function isFreeCommandText(envelope: InboundEnvelope, ownMid: string | null): boolean {
   return envelope.chatType !== 'direct' && envelope.text !== null && parseFreeCommand(textWithoutOwnMention(envelope, ownMid)) !== null;
@@ -162,6 +170,8 @@ export type TriggerDecision =
   /** A served non-administrator sent a bare `/agent claude|codex`: reply with the usage hint, change nothing. */
   | { type: 'agent_usage'; provider: AgentProvider }
   | { type: 'agent_quota' }
+  /** `/權限` in a group or room, sent by a served sender: reply with the fixed hint, never route to the Agent. */
+  | { type: 'permission_hint' }
   /** Primary Administrator's `/model` or `/model <argument>`: show, set or clear this chat's Claude model. No Agent job. */
   | { type: 'agent_model'; command: ModelCommand }
   | FreeCommand
@@ -198,6 +208,10 @@ export function routeTrigger(envelope: InboundEnvelope, context: TriggerContext)
   if (group) {
     const persona = parsePersonaCommand(textWithoutOwnMention(envelope, context.ownMid));
     if (persona && (context.primaryAdmin ?? context.senderIsPrimaryAdmin)) return persona;
+  }
+  // `/權限` works only in the Primary Administrator's direct chat. A served sender gets the hint; anyone else gets nothing here.
+  if (group && PERMISSION_COMMAND_PATTERN.test(textWithoutOwnMention(envelope, context.ownMid))) {
+    if (context.agentEnabled || (context.primaryAdmin ?? context.senderIsPrimaryAdmin)) return { type: 'permission_hint' };
   }
   const free = group ? parseFreeCommand(textWithoutOwnMention(envelope, context.ownMid)) : null;
   if (free) {

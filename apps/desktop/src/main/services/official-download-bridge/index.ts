@@ -5,7 +5,7 @@ import type { CdpPipe } from './cdp-pipe.js';
 import { locateChrome } from './chrome-locator.js';
 import { getExtensionHandles, type ExtensionHandles } from './extension-handles.js';
 import { writeBridgePreferences } from './chrome-preferences.js';
-import { prepareExtensionCopy } from './extension-pin.js';
+import { resolveExtensionSource } from './extension-source.js';
 
 export { BridgeError, type BridgeErrorCode } from './errors.js';
 export { readLoginState, type ExtensionHandles } from './extension-handles.js';
@@ -30,12 +30,12 @@ export interface OfficialDownloadBridge {
 }
 
 export async function startOfficialDownloadBridge(options: OfficialDownloadBridgeOptions): Promise<OfficialDownloadBridge> {
-  const extension = await prepareExtensionCopy({ root: options.root });
+  const source = await resolveExtensionSource({ root: options.root, profileDir: options.profileDir });
   const chromePath = await locateChrome();
   await writeBridgePreferences(options.profileDir, options.onError);
   const chrome = await startBridgeChrome({
     chromePath,
-    extensionPath: extension.path,
+    ...(source.kind === 'unpacked' ? { extensionPath: source.path } : {}),
     profileDir: options.profileDir,
     ...(options.extraArgs ? { extraArgs: options.extraArgs } : {}),
   });

@@ -145,6 +145,7 @@ export type DesktopApi = {
   stopAgentRoomJob(jobId: string): Promise<IpcResult>;
   retryAgentRoomJob(jobId: string): Promise<IpcResult>;
   openAttachment(attachmentId: string): Promise<boolean>;
+  openStoredAttachmentsFolder(route: ConversationKey): Promise<boolean>;
   openExternalUrl(url: string): Promise<IpcResult>;
   downloadAttachment(key: WritableConversationKey, attachmentId: string): Promise<IpcResult>;
   resolveFileTypeIcon(extension: string): Promise<string | null>;
@@ -165,7 +166,7 @@ export type DesktopApi = {
   lineBeginAdminChange(accountId: string): Promise<{ token: string; expiresAt: string; stage: 'confirm_current' }>;
   lineCancelAdminChange(accountId: string): Promise<IpcResult>;
   /** Primary Admin download bridge. Progress arrives as `adminDownloadBridgeStatus` events. */
-  adminDownloadBridgeStart(accountId: string): Promise<IpcResult>;
+  adminDownloadBridgeStart(accountId: string, installExtension?: boolean): Promise<IpcResult>;
   adminDownloadBridgeRefreshQr(accountId: string): Promise<IpcResult>;
   adminDownloadBridgeClear(accountId: string): Promise<IpcResult>;
   adminDownloadBridgeSetAutoDownload(accountId: string, enabled: boolean): Promise<IpcResult>;
@@ -377,6 +378,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     retryAgentRoomJob: (jobId) => request({ type: 'retryAgentRoomJob', jobId }),
     async openAttachment(attachmentId) { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)) throw new Error('Invalid attachment ID'); const result = await request({ type: 'openAttachment', attachmentId }); return result.type === 'openAttachment' && result.opened; },
     openExternalUrl: (url) => request({ type: 'openExternalUrl', url }),
+    async openStoredAttachmentsFolder(route) { const result = await request({ type: 'openStoredAttachmentsFolder', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId }); return result.type === 'openStoredAttachmentsFolder' && result.opened; },
     async downloadAttachment(key, attachmentId) { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)) throw new Error('Invalid attachment ID'); return await request({ type: 'downloadAttachment', ...key, attachmentId }); },
     async resolveFileTypeIcon(extension) { if (!/^[a-z0-9]{1,12}$/.test(extension)) return null; const result = await request({ type: 'resolveFileTypeIcon', extension }); return result.type === 'resolveFileTypeIcon' ? result.dataUrl : null; },
     lineAddAccountQr: (lineTransport) => request({ type: 'lineAddAccountQr', ...(lineTransport ? { lineTransport } : {}) }),
@@ -393,7 +395,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async lineBeginAdminPairing(accountId) { const result = await request({ type: 'lineBeginAdminPairing', accountId }); if (result.type !== 'lineAdminPairing') throw new Error(result.type === 'error' ? result.message : 'Unexpected pairing response'); return { token: result.token, expiresAt: result.expiresAt }; },
     async lineBeginAdminChange(accountId) { const result = await request({ type: 'lineBeginAdminChange', accountId }); if (result.type !== 'lineBeginAdminChange') throw new Error(result.type === 'error' ? result.message : 'Unexpected administrator change response'); return { token: result.token, expiresAt: result.expiresAt, stage: result.stage }; },
     lineCancelAdminChange: (accountId) => request({ type: 'lineCancelAdminChange', accountId }),
-    adminDownloadBridgeStart: (accountId) => request({ type: 'adminDownloadBridgeStart', accountId }),
+    adminDownloadBridgeStart: (accountId, installExtension) => request({ type: 'adminDownloadBridgeStart', accountId, ...(installExtension === undefined ? {} : { installExtension }) }),
     adminDownloadBridgeRefreshQr: (accountId) => request({ type: 'adminDownloadBridgeRefreshQr', accountId }),
     adminDownloadBridgeClear: (accountId) => request({ type: 'adminDownloadBridgeClear', accountId }),
     adminDownloadBridgeSetAutoDownload: (accountId, enabled) => request({ type: 'adminDownloadBridgeSetAutoDownload', accountId, enabled }),

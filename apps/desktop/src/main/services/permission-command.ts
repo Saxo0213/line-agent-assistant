@@ -5,6 +5,7 @@ import { AgentPermissionError, type AgentPermissionRepository } from '@line-agen
 import type { RoomAutomationTransport } from './room-automation.js';
 import type { Locale } from '../../locale.js';
 import { linePrompt } from './line-prompts.js';
+import { PERMISSION_COMMAND_PATTERN } from './trigger-router.js';
 
 type Envelope = Extract<LineWorkerEvent, { type: 'batch' }>['envelopes'][number];
 type SendTextCommand = Extract<LineWorkerCommand, { type: 'sendText' }>;
@@ -43,7 +44,7 @@ const choices = new Map<string, AgentExecutionLevel>([
   ['１', 'read_only'], ['２', 'workspace_write'], ['３', 'trust'], ['４', 'full'],
 ]);
 const keyOf = (envelope: Envelope) => `${envelope.accountId}\0${envelope.chatId}`;
-const isCommand = (text: string) => /^(\/權限|\/permissions)$/i.test(text);
+const isCommand = (text: string) => PERMISSION_COMMAND_PATTERN.test(text);
 const isConfirmation = (text: string) => text === '確認' || text === '是' || /^yes$/i.test(text);
 
 /** True when the message belongs to the permission dialogue and must not reach an Agent. */

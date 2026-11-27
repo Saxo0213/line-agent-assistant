@@ -21,6 +21,10 @@ describe('JS official import Main adapter', () => {
     expect(classifyPrivateDirectoryAclResult({ stdout: 'unexpected' }))
       .toBe('private_directory_acl_unexpected_output');
     expect(classifyPrivateDirectoryAclResult({ stdout: 'restricted\r\n' })).toBeUndefined();
+    expect(classifyPrivateDirectoryAclResult({ stdout: 'failed:PrivilegeNotHeldException\r\n' }))
+      .toBe('private_directory_acl_privilege_missing');
+    expect(classifyPrivateDirectoryAclResult({ stdout: 'failed:UnauthorizedAccessException' }))
+      .toBe('private_directory_acl_command_failed');
   });
 
   it.skipIf(process.platform !== 'win32')('replaces only the ACL child module path with Windows system modules', () => {

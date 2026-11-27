@@ -637,8 +637,6 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
         </tbody>
         <tbody>
           <tr className="conversation-help-group"><th scope="rowgroup" colSpan={3}>{desktopText('cmdHelpGroupAdmin')}</th></tr>
-          <tr><th scope="row"><code>@Agent 監控</code>、<code>@Agent monitor</code></th><td>{desktopText('cmdHelpEnableGroupPurpose')}</td><td>{desktopText('cmdHelpEnableGroupDescription')}</td></tr>
-          <tr><th scope="row"><code>@Agent RA-…</code></th><td>{desktopText('cmdHelpConfirmCodePurpose')}</td><td>{desktopText('cmdHelpConfirmCodeDescription')}</td></tr>
           <tr><th scope="row"><code>/free</code>、<code>/free N</code>、<code>/free off</code></th><td>{desktopText('cmdHelpFreePurpose')}</td><td>{desktopText('cmdHelpFreeDescription')}</td></tr>
           <tr><th scope="row"><code>/persona &lt;描述&gt;</code></th><td>{desktopText('cmdHelpPersonaSetPurpose')}</td><td>{desktopText('cmdHelpPersonaSetDescription')}</td></tr>
           <tr><th scope="row"><code>/persona 安靜</code>、<code>/persona 一般</code>、<code>/persona 活潑</code></th><td>{desktopText('cmdHelpPersonaLivelinessPurpose')}</td><td>{desktopText('cmdHelpPersonaLivelinessDescription')}</td></tr>

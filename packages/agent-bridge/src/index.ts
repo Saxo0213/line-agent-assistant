@@ -2,7 +2,7 @@ import {createHash} from 'node:crypto';
 import {statSync} from 'node:fs';
 import {readFile,realpath, stat} from 'node:fs/promises';
 import {basename,join} from 'node:path';
-import {AgentRunRequestSchema, PROVIDER_TOOLS_UNSUPPORTED, PROVIDER_TOOLS_UNSUPPORTED_MESSAGE, type AgentEvent,type AgentProvider,type AgentRunRequest,type ResumeSessionValidationResult} from '@line-agent/contracts';
+import {AgentRunRequestSchema, type AgentEvent,type AgentProvider,type AgentRunRequest,type ResumeSessionValidationResult} from '@line-agent/contracts';
 import {AuthController,type AuthStatus} from './auth.js';
 import {accountCredentialFile} from './account-directory.js';
 import {accountEnvironment,buildChildEnvironment,CLAUDE_GIT_BASH_PATH_ENV,gitBashPath,type AccountEnv,type AccountRef} from './child-environment.js';
@@ -325,8 +325,7 @@ export class AgentCliBridge {
     if(!parsed.success) return {ok:false,event:failed('INVALID_REQUEST','Invalid agent request.')};
     const request=parsed.data;
     if(onlyProvider!==undefined && request.provider!==onlyProvider) return {ok:false,event:failed('INVALID_REQUEST','Invalid agent request.')};
-    // Codex cannot confine its shell/file tools, so a job without the local tools permission fails closed.
-    if(request.provider==='codex' && !request.tools.localTools) return {ok:false,event:failed(PROVIDER_TOOLS_UNSUPPORTED,PROVIDER_TOOLS_UNSUPPORTED_MESSAGE)};
+    // A Codex job without the local tools permission runs chat-only: codexArguments turns off every local-execution feature and uses the read-only sandbox.
     // Same rule as CliTalkAgent: a Codex model ID that is not valid does not start a run. A Claude one-shot run ignores `model`.
     if(request.provider==='codex' && request.model!==undefined && !isValidCodexModel(request.model)) return {ok:false,event:{type:'failed',code:'INVALID_MODEL',message:'The Codex model ID is not valid.',retryable:false}};
     if(this.jobs.has(request.jobId)) return {ok:false,event:failed('DUPLICATE_JOB','This job is already active.')};

@@ -60,19 +60,6 @@ database('Agent permissions, chat folders and folder links', () => {
       const grant = await friends.activate(ACCOUNT, mid, 'test');
       grants.set(mid, { grantId: grant.grantId, version: grant.version });
     }
-    for (const chatId of ['g1', 'g2']) {
-      const requestId = randomUUID();
-      await pool.query(
-        `INSERT INTO room_activation_requests(request_id, account_id, chat_type, chat_id, source_message_id, requester_id,
-           admin_chat_id, admin_user_id, admin_version, room_authority_version, state, wait_expires_at)
-         VALUES ($1,$2,'group',$3,$4,'member','admin-direct','mid-admin',1,1,'CONSUMED',clock_timestamp())`, [requestId, ACCOUNT, chatId, randomUUID()]);
-      await pool.query(`INSERT INTO room_agent_policies(account_id, chat_type, chat_id, state, authority_version) VALUES ($1,'group',$2,'ENABLED',1)`, [ACCOUNT, chatId]);
-      const grantId = randomUUID();
-      await pool.query(
-        `INSERT INTO room_agent_grants(grant_id, account_id, chat_type, chat_id, capability, version, state, request_id)
-         VALUES ($1,$2,'group',$3,'AGENT_USE_ROOM',1,'ACTIVE',$4)`, [grantId, ACCOUNT, chatId, requestId]);
-      grants.set(`room:${chatId}`, { grantId, version: 1 });
-    }
   });
   afterAll(async () => { await close(); });
 
@@ -86,15 +73,14 @@ database('Agent permissions, chat folders and folder links', () => {
          VALUES ($1, $2, $3, $4, $5, $6, 'text', 'trigger', 'live', now(), '{}'::jsonb)`, [ACCOUNT, messageId, `ev-${messageId}`, chatId, chatType, senderId]);
     }
     const direct = grants.get(senderId);
-    const room = chatType === 'group' ? grants.get(`room:${chatId}`) : undefined;
     await pool.query(
       `INSERT INTO agent_jobs (job_id, account_id, chat_type, chat_id, provider, source_type, source_message_id, source_request_id, prompt, workspace_path, generation, creation_epoch, status,
-         direct_friend_grant_id, direct_friend_grant_version, room_agent_grant_id, room_agent_grant_version)
-       VALUES ($1, $2, $3, $4, 'claude', $5, $6, $7, 'p', 'C:\\workspace', 1, $12, 'running', $8, $9, $10, $11)`,
+         direct_friend_grant_id, direct_friend_grant_version)
+       VALUES ($1, $2, $3, $4, 'claude', $5, $6, $7, 'p', 'C:\\workspace', 1, $10, 'running', $8, $9)`,
       // Shared Agent room jobs (UI) are account-less.
       [jobId, sourceType === 'ui' ? null : ACCOUNT, sourceType === 'ui' ? null : chatType, sourceType === 'ui' ? null : chatId, sourceType, sourceType === 'line' ? messageId : null, sourceType === 'ui' ? randomUUID() : null,
         sourceType === 'line' && senderId !== 'mid-admin' ? direct?.grantId ?? null : null, sourceType === 'line' && senderId !== 'mid-admin' ? direct?.version ?? null : null,
-        sourceType === 'line' && senderId !== 'mid-admin' ? room?.grantId ?? null : null, sourceType === 'line' && senderId !== 'mid-admin' ? room?.version ?? null : null, sourceType === 'line' ? 1 : null]);
+        sourceType === 'line' ? 1 : null]);
     return jobId;
   };
 

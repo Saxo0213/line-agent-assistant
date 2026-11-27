@@ -43,6 +43,33 @@ async function closeQuietly(handle: FileHandle): Promise<void> { await handle.cl
 
 type HeldSource = { handle: FileHandle; path: string; launchPath: string; dev: number; ino: number; size: number; mtimeMs: number };
 
+/**
+ * Finds the folder of one chat from the stored relative path of one of its files.
+ * The primary layout is accounts/<account>/<chatType>/<chat>/..., so the first four segments are the chat folder.
+ * An older layout gives the folder that holds the file. The path must stay inside the managed root.
+ * Returns null when the path is unsafe, outside the root, a link, or not an existing directory.
+ */
+export async function resolveStoredAttachmentFolder(root: string, relativePath: string): Promise<string | null> {
+  if (!path.isAbsolute(root) || !safeRelative(relativePath)) return null;
+  const segments = relativePath.split('/');
+  const folderSegments = segments[0] === 'accounts' && segments.length > 4 ? segments.slice(0, 4) : segments.slice(0, -1);
+  if (folderSegments.length === 0) return null;
+  try {
+    const configuredRoot = path.resolve(root);
+    const rootInfo = await lstat(configuredRoot);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return null;
+    const rootReal = await realpath(configuredRoot);
+    let current = rootReal;
+    for (const segment of folderSegments) {
+      current = path.join(current, segment);
+      const entry = await lstat(current), canonical = await realpath(current);
+      const withinRoot = path.relative(rootReal, canonical);
+      if (entry.isSymbolicLink() || !withinRoot || withinRoot === '..' || withinRoot.startsWith(`..${path.sep}`) || path.isAbsolute(withinRoot)) return null;
+    }
+    return (await lstat(current)).isDirectory() ? current : null;
+  } catch { return null; }
+}
+
 /** Opens an already-managed attachment by its original path after verifying the stored bytes. */
 export class AttachmentOpenService {
   readonly #root: string;

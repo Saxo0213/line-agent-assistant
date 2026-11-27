@@ -32,8 +32,6 @@ export const FREE_MODE_TEXT = {
   off: '自由模式已關閉',
   notOn: '自由模式未開啟',
   ended: '自由模式已結束',
-  roomNotEnabled: '此群組尚未啟用 Agent，無法開啟自由模式',
-  roomEnabled: '已啟用 Agent',
   range: `自由模式分鐘數須為 ${FREE_MODE_MIN_MINUTES} 到 ${FREE_MODE_MAX_MINUTES} 的整數`,
   remaining: (minutes: number) => `自由模式剩餘 ${minutes} 分鐘`,
   replyFailed: (reason: string) => `自由模式回覆失敗：${reason}`,
@@ -83,14 +81,8 @@ export type FreeModeAuditEvent =
 
 export interface FreeModeServiceOptions {
   store: FreeModeStore;
-  /** The room's active Agent grant (ENABLED policy + active AGENT_USE_ROOM grant), or null when the room is not enabled. */
-  roomGrant(key: FreeModeKey): Promise<{ grantId: string; version: number } | null>;
-  /**
-   * Enables the room on the Primary Administrator's word and returns its active grant (`announce` when this call enabled it),
-   * or null when the room cannot be enabled. The grant is committed before the call returns.
-   */
-  enableRoom?(key: FreeModeKey, adminUserId: string, sourceMessageId: string):
-    Promise<{ grant: { grantId: string; version: number }; announce: boolean } | null>;
+  /** True when the account is the Agent account and the group or room exists. Free mode turns on only then. */
+  roomAvailable(key: FreeModeKey): Promise<boolean>;
   sendSystemText(input: SystemTextInput): Promise<SystemTextResult>;
   provider(key: FreeModeKey): Promise<AgentProvider>;
   /** The Agent persona in force for the chat (docs/architecture/agent-persona.md). Absent or failing: the neutral, normal-liveliness default. */
@@ -260,12 +252,8 @@ export class FreeModeService {
         await this.notify(key, FREE_MODE_TEXT.off);
         return;
       }
-      // A room that is not enabled is first enabled on the Primary Administrator's word; the grant commits before free mode activates.
-      if (!await this.options.roomGrant(key)) {
-        const enabled = sourceMessageId === undefined ? null : await this.options.enableRoom?.(key, enabledBy, sourceMessageId) ?? null;
-        if (!enabled) { await this.notify(key, FREE_MODE_TEXT.roomNotEnabled); return; }
-        if (enabled.announce) await this.notify(key, FREE_MODE_TEXT.roomEnabled);
-      }
+      // Free mode turns on only for the Agent account and for a conversation that exists.
+      if (!await this.options.roomAvailable(key)) return;
       const row = await this.options.store.activate(key, enabledBy, new Date(this.now().getTime() + command.minutes * 60_000));
       this.arm(row);
       await this.notify(key, FREE_MODE_TEXT.on(command.minutes));
@@ -485,13 +473,13 @@ export class FreeModeService {
   /** Inserts the reply job for `messages`. A job that cannot be inserted leaves the messages unanswered. */
   private async startReply(state: ChatState, messages: PendingMessage[], interrupted: boolean): Promise<void> {
     const key = state.key;
-    const [grant, workspacePath] = await Promise.all([this.options.roomGrant(key), this.options.workspacePath()]);
-    if (!grant || !workspacePath || !state.expiresAt) { state.unanswered = capMessages([...messages, ...state.unanswered]); return; }
+    const workspacePath = await this.options.workspacePath();
+    if (!workspacePath || !state.expiresAt) { state.unanswered = capMessages([...messages, ...state.unanswered]); return; }
     const provider = await this.effectiveProvider(key);
     const names = await this.names(key, messages);
     const prompt = composeFreeModePrompt(this.batchMessages(messages, names), { interrupted });
     const job = await this.options.store.enqueueJob({ key, sourceMessageId: messages.at(-1)!.messageId, provider, prompt,
-      workspacePath, roomGrant: grant });
+      workspacePath });
     if (!job) { state.unanswered = capMessages([...messages, ...state.unanswered]); return; }
     state.inflight = { jobId: job.jobId, messages };
     state.recentJobs = [...state.recentJobs.slice(-9), job.jobId];

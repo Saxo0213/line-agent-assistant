@@ -8,7 +8,6 @@ import {
 
 const KEY: FreeModeKey = { accountId: 'acc', chatType: 'group', chatId: 'g1' };
 const START = new Date('2026-10-28T06:00:00Z'); // 14:00 Asia/Taipei
-const GRANT = { grantId: 'grant-1', version: 3 };
 
 const message = (id: string, senderId: string, text: string, at = new Date()): InboundEnvelope => ({
   eventId: `e-${id}`, accountId: 'acc', chatId: 'g1', chatType: 'group', senderId, messageId: id, kind: 'text', text,
@@ -17,8 +16,8 @@ const message = (id: string, senderId: string, text: string, at = new Date()): I
 
 type Scripted = { reply: boolean; urgency: number; reason?: string } | string | Error;
 
-function harness(over: { grant?: typeof GRANT | null; rows?: FreeModeRow[]; names?: Record<string, string>;
-  enable?: 'enabled' | 'refused'; fallback?: Scripted; provider?: 'claude' | 'codex'; canUseCodex?: boolean } = {}) {
+function harness(over: { available?: boolean; rows?: FreeModeRow[]; names?: Record<string, string>;
+  fallback?: Scripted; provider?: 'claude' | 'codex'; canUseCodex?: boolean } = {}) {
   const rows = new Map<string, FreeModeRow>();
   for (const row of over.rows ?? []) rows.set(row.chatId, row);
   const activeJobs = new Set<string>();
@@ -56,19 +55,10 @@ function harness(over: { grant?: typeof GRANT | null; rows?: FreeModeRow[]; name
     activeJobs.delete(jobId); cancelled.push(jobId); return true;
   });
   const events: FreeModeAuditEvent[] = [];
-  let grant = over.grant === undefined ? GRANT : over.grant;
-  const order: string[] = [];
-  const enableRoom = over.enable === undefined ? undefined : vi.fn(async (_key: FreeModeKey, _admin: string, _message: string) => {
-    if (over.enable === 'refused') return null;
-    grant = GRANT; order.push('enable'); return { grant: GRANT, announce: true };
-  });
-  store.activate.mockImplementationOnce(async (key: FreeModeKey, enabledBy: string, expiresAt: Date) => {
-    order.push('activate'); const row = { ...key, enabledBy, expiresAt }; rows.set(key.chatId, row); return row;
-  });
-  const service = new FreeModeService({ store, roomGrant: async () => grant, ...(enableRoom ? { enableRoom } : {}), sendSystemText, provider: async () => over.provider ?? 'claude',
+  const service = new FreeModeService({ store, roomAvailable: async () => over.available ?? true, sendSystemText, provider: async () => over.provider ?? 'claude',
     ...(over.canUseCodex === undefined ? {} : { canUseProvider: async (_key: FreeModeKey, provider: string) => provider !== 'codex' || over.canUseCodex! }),
     workspacePath: async () => 'C:\\work', persona: async () => personaNow.value, kick, judge, interruptJob, audit: (event) => events.push(event), now: () => new Date(Date.now()), onError: (error) => { throw error; } });
-  return { service, store, rows, sent, sendSystemText, kick, activeJobs, enableRoom, order, verdicts, judge, judgeInputs, interruptJob, cancelled, events, personaNow };
+  return { service, store, rows, sent, sendSystemText, kick, activeJobs, verdicts, judge, judgeInputs, interruptJob, cancelled, events, personaNow };
 }
 
 describe('FreeModeService', () => {
@@ -117,40 +107,12 @@ describe('FreeModeService', () => {
     expect(h.store.activate).not.toHaveBeenCalled();
   });
 
-  it('refuses when the room has no active Agent grant', async () => {
-    const h = harness({ grant: null });
+  it('does nothing when the account is not the Agent account or the conversation is missing', async () => {
+    const h = harness({ available: false });
     await h.service.handleCommand(KEY, 'admin', { type: 'free', action: 'on', minutes: 5 });
-    expect(h.sent).toEqual(['此群組尚未啟用 Agent，無法開啟自由模式']);
+    expect(h.sent).toEqual([]);
     expect(h.store.activate).not.toHaveBeenCalled();
     expect(h.service.isActive(KEY)).toBe(false);
-  });
-
-  it('enables a not-enabled room on the Primary Administrator word, commits the grant before activating, then confirms free mode', async () => {
-    const h = harness({ grant: null, enable: 'enabled' });
-    await h.service.handleCommand(KEY, 'admin', { type: 'free', action: 'on', minutes: 10 }, 'msg-1');
-    expect(h.enableRoom).toHaveBeenCalledWith(KEY, 'admin', 'msg-1');
-    expect(h.order).toEqual(['enable', 'activate']);
-    expect(h.sent).toEqual(['已啟用 Agent', 'AGENT自動回覆10分鐘']);
-    expect(h.service.isActive(KEY)).toBe(true);
-  });
-
-  it('refuses when the room cannot be enabled, and never enables for /free off', async () => {
-    const refused = harness({ grant: null, enable: 'refused' });
-    await refused.service.handleCommand(KEY, 'admin', { type: 'free', action: 'on', minutes: 5 }, 'msg-1');
-    expect(refused.sent).toEqual([FREE_MODE_TEXT.roomNotEnabled]);
-    expect(refused.store.activate).not.toHaveBeenCalled();
-    const off = harness({ grant: null, enable: 'enabled' });
-    await off.service.handleCommand(KEY, 'admin', { type: 'free', action: 'off' }, 'msg-2');
-    expect(off.enableRoom).not.toHaveBeenCalled();
-    expect(off.sent).toEqual([FREE_MODE_TEXT.notOn]);
-  });
-
-  it('a free-mode job after an on-the-spot enable carries the committed grant', async () => {
-    const h = harness({ grant: null, enable: 'enabled' });
-    await h.service.handleCommand(KEY, 'admin', { type: 'free', action: 'on', minutes: 5 }, 'msg-1');
-    h.service.addMessage(message('m1', 'alice', 'hello', new Date()));
-    await vi.advanceTimersByTimeAsync(4_000);
-    expect((h.store.enqueueJob.mock.calls[0]![0] as { roomGrant: unknown }).roomGrant).toEqual(GRANT);
   });
 
   it('announces expiry once and stops collecting messages', async () => {
@@ -188,10 +150,9 @@ describe('FreeModeService', () => {
       await vi.advanceTimersByTimeAsync(100);
       expect(h.judge).toHaveBeenCalledTimes(1);
       expect(h.store.enqueueJob).toHaveBeenCalledTimes(1);
-      const job = h.store.enqueueJob.mock.calls[0]![0] as { prompt: string; sourceMessageId: string; provider: string; roomGrant: unknown };
+      const job = h.store.enqueueJob.mock.calls[0]![0] as { prompt: string; sourceMessageId: string; provider: string };
       expect(job.sourceMessageId).toBe('m2');
       expect(job.provider).toBe('claude');
-      expect(job.roomGrant).toEqual(GRANT);
       expect(job.prompt).toContain('[Alice] 14:00 大家早');
       expect(job.prompt).toContain('[Bob] 14:00 早安');
       expect(job.prompt).not.toContain('[[NO_REPLY]]');
@@ -466,15 +427,6 @@ describe('FreeModeService', () => {
       expect(h.judgeInputs[0]!.prompt).not.toContain('do it');
       expect(jobPrompt(h, 0)).not.toContain('do it');
       expect(jobPrompt(h, 0)).toContain('chat');
-    });
-
-    it('creates no job when the room grant is gone at reply time', async () => {
-      const h = harness({ grant: null });
-      h.rows.set('g1', { ...KEY, enabledBy: 'admin', expiresAt: new Date(START.getTime() + 3_600_000) });
-      await h.service.start();
-      h.service.addMessage(message('m1', 'alice', 'hi'));
-      await vi.advanceTimersByTimeAsync(10_000);
-      expect(h.store.enqueueJob).not.toHaveBeenCalled();
     });
 
     it('does not carry pending messages past an off command, and ignores a judge answer that arrives after it', async () => {

@@ -59,7 +59,7 @@ export class CdpPipe {
     const child = spawn(chromePath, [...args], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], windowsHide: true });
     await new Promise<void>((resolve, reject) => {
       child.once('spawn', () => resolve());
-      child.once('error', (error) => reject(new BridgeError('CHROME_START_FAILED', error.message, { cause: error })));
+      child.once('error', (error) => reject(new BridgeError('CHROME_START_FAILED', error.message, { cause: error, paths: [chromePath, ...args.filter((a) => a.startsWith('--user-data-dir=')).map((a) => a.slice('--user-data-dir='.length))] })));
     });
     const toChrome = child.stdio[3] as Writable | null | undefined;
     const fromChrome = child.stdio[4] as Readable | null | undefined;
@@ -164,7 +164,8 @@ export class CdpPipe {
   }
 }
 
-function killTree(pid: number): Promise<void> {
+/** Kills the process tree of one process that this app started. */
+export function killTree(pid: number): Promise<void> {
   return new Promise((resolve) => {
     if (process.platform === 'win32') {
       execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve());

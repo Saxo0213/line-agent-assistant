@@ -982,9 +982,10 @@ describe('database settings', () => {
     fireEvent.click(screen.getByRole('tab', { name: '指令' }));
 
     const table = screen.getByRole('table', { name: '對話指令清單' });
-    for (const command of ['/stop', '/new', '/status', '/agent codex <提示內容>', '/agent claude <提示內容>', '/adduser', '/新增使用者', '/free off', '/agent claude', '/agent default', '/folder rw <路徑>', '/folder off [路徑]', '/persona default', '/權限', '/permissions', '@Agent 監控', '@Agent monitor', '@Agent RA-…']) {
+    for (const command of ['/stop', '/new', '/status', '/agent codex <提示內容>', '/agent claude <提示內容>', '/adduser', '/新增使用者', '/free off', '/agent claude', '/agent default', '/folder rw <路徑>', '/folder off [路徑]', '/persona default', '/權限', '/permissions']) {
       expect(table.textContent).toContain(command);
     }
+    for (const removed of ['@Agent 監控', '@Agent monitor', '@Agent RA-…']) expect(table.textContent).not.toContain(removed);
     for (const group of ['一般使用', '群組管理（主要管理者）', '專案資料夾（主要管理者）', '使用者授權（主要管理者）', '初始設定', '自動回覆']) expect(table.textContent).toContain(group);
     expect(table.querySelectorAll('tbody')).toHaveLength(6);
     expect(table.textContent).toContain('6 位數配對碼');

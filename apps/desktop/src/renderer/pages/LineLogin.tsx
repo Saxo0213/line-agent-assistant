@@ -55,6 +55,7 @@ const importDetailKeys = {
   key_unavailable: 'externalMonitorDetailKeyUnavailable', owner_invalid: 'externalMonitorDetailKeyUnavailable',
   private_directory_path_validation: 'externalMonitorDetailPrivateDirectory', private_directory_acl_command_failed: 'externalMonitorDetailPrivateDirectory',
   private_directory_acl_command_timeout: 'externalMonitorDetailPrivateDirectory', private_directory_acl_unexpected_output: 'externalMonitorDetailPrivateDirectory',
+  private_directory_acl_privilege_missing: 'externalMonitorDetailPrivateDirectory',
   node_eacces: 'externalMonitorDetailAccessDenied', node_eperm: 'externalMonitorDetailAccessDenied',
   official_account_not_active: 'theCurrentLineAccountIsNotThePrimaryAdministrator',
   reader_resource_integrity_failed: 'externalMonitorDetailResourceIntegrity', reader_main_identity_invalid: 'externalMonitorDetailMainIdentity',
@@ -726,9 +727,11 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   const bridge: { state: DownloadBridgeState; code?: string | undefined; detail?: string | undefined; qrImageDataUrl?: string | undefined; pin?: string | undefined; qrExpiresAt?: number | undefined; identity?: 'pending' | 'verified' | undefined } | null = admin?.downloadBridge
     ? (bridgeLive && bridgeLive.accountId === admin.accountId ? bridgeLive : admin.downloadBridge) : null;
   const bridgeStateText = !bridge ? '' : bridge.state === 'not_configured' ? desktopText('downloadBridgeNotConfigured')
-    : bridge.state === 'starting' ? desktopText('downloadBridgeStarting') : bridge.state === 'waiting_qr' ? desktopText('downloadBridgeWaitingQr')
+    : bridge.state === 'starting' ? (bridge.code === 'EXTENSION_STORE_INSTALLING' ? extraText('downloadBridgeStoreWindow') : desktopText('downloadBridgeStarting')) : bridge.state === 'waiting_qr' ? desktopText('downloadBridgeWaitingQr')
     : bridge.state === 'waiting_pin' ? desktopText('downloadBridgeWaitingPin') : bridge.state === 'logged_in' ? desktopText('downloadBridgeLoggedIn')
     : bridgeErrorText(bridge.code);
+  // The extension must be installed from the Web Store into the dedicated download Chrome profile.
+  const bridgeNeedsStoreInstall = bridge?.state === 'error' && (bridge.code === 'EXTENSION_STORE_INSTALL_REQUIRED' || bridge.code === 'EXTENSION_LOAD_FAILED' || bridge.code === 'EXTENSION_NOT_FOUND');
   const bridgeCanRefresh = bridge?.state === 'error' && (bridge.code === 'QR_EXPIRED' || bridge.code === 'QR_FLOW_ERROR' || bridge.code === 'PIN_CODE_TIMEOUT');
   const bridgeWaiting = bridge?.state === 'waiting_qr' || bridge?.state === 'waiting_pin';
   const bridgeQrExpiresAt = bridge?.state === 'waiting_qr' ? bridge.qrExpiresAt : undefined;
@@ -744,8 +747,9 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   const bridgeCountdownText = bridgeQrExpiresAt === undefined ? null : bridgeNow >= bridgeQrExpiresAt ? desktopText('downloadBridgeQrExpiredNow')
     : desktopText('downloadBridgeQrRemainingArg0', { arg0: `${Math.floor(Math.ceil((bridgeQrExpiresAt - bridgeNow) / 1000) / 60)}:${String(Math.ceil((bridgeQrExpiresAt - bridgeNow) / 1000) % 60).padStart(2, '0')}` });
   const downloadControls = admin && bridge ? <div className="admin-change download-bridge" role="group" aria-label={desktopText('downloadBridgeTitle')}>
-    <p role="status" className="download-bridge-state">{desktopText('downloadBridgeStatusLabel')}{bridgeStateText}{bridge.state === 'starting' && bridge.code && <small className="muted">（{bridge.code}）</small>}
-      {bridge.state === 'error' && bridge.code === 'EXTENSION_NOT_FOUND' && <> <button onClick={() => void openBridgeExtensionStore()}>{desktopText('downloadBridgeInstallExtension')}</button></>}</p>
+    <p role="status" className="download-bridge-state">{desktopText('downloadBridgeStatusLabel')}{bridgeStateText}{bridge.state === 'starting' && bridge.code && bridge.code !== 'EXTENSION_STORE_INSTALLING' && <small className="muted">（{bridge.code}）</small>}
+      {bridge.state === 'error' && bridge.code === 'EXTENSION_NOT_FOUND' && <> <button onClick={() => void openBridgeExtensionStore()}>{desktopText('downloadBridgeInstallExtension')}</button></>}
+      {bridge.state === 'error' && bridgeNeedsStoreInstall && <> <button disabled={bridgeBusy} onClick={() => void runBridgeRequest(() => api.adminDownloadBridgeStart(admin.accountId, true))}>{extraText('downloadBridgeStoreInstall')}</button></>}</p>
     {bridge.state === 'error' && bridge.code === 'EXTENSION_NOT_FOUND' && bridgeStoreError && <p role="alert">{bridgeStoreError}</p>}
     {(bridge.state === 'starting' || bridge.state === 'error' || (bridge.state === 'logged_in' && bridge.identity !== 'verified')) && bridge.detail && <p><small className="muted" style={{ wordBreak: 'break-all' }}>{bridge.detail}</small></p>}
     {bridgeCountdownText && <p><small className="muted">{bridgeCountdownText}</small></p>}

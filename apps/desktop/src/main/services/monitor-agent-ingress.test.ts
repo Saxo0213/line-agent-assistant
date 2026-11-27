@@ -221,7 +221,7 @@ database('monitor Agent real ingress',()=>{
     await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id) VALUES('agent','group','group-chat')");
     await pool.query("INSERT INTO conversation_members(account_id,chat_type,chat_id,member_id) VALUES('agent','group','group-chat',$1)",[agentMid]);
     const respond=vi.fn(async()=>{});
-    const {instance}=await service({async handle(){},async isEnabled(){return true;},respond});
+    const {instance}=await service({respond});
     const {observationId:_observationId,canonicalMessageId:_messageId,nativeMessageId:_nativeMessageId,...extra}=toExternalObservation({observationId:'native-group',canonicalMessageId:null,
       nativeConversationKind:'group',nativeConversationId:'group-chat',nativeMessageId:'12345678',chatType:'group',chatId:'group-chat',
       senderId:adminMid,kind:'text',text:'@Agent do this',mentionRanges:[{start:0,end:6,userId:agentMid}],createdTime:'1793577600000',readonlyForSending:false});
@@ -244,7 +244,7 @@ database('monitor Agent real ingress',()=>{
   it('leaves ignored group mentions to the original live auto-reply path',async()=>{
     await pool.query("INSERT INTO conversations(account_id,chat_type,chat_id) VALUES('agent','group','ignored-group')");
     await pool.query("INSERT INTO conversation_members(account_id,chat_type,chat_id,member_id) VALUES('agent','group','ignored-group',$1)",[agentMid]);
-    const respond=vi.fn(async()=>{}); const {instance}=await service({async handle(){},async isEnabled(){return false;},respond});
+    const respond=vi.fn(async()=>{}); const {instance}=await service({respond});
     const r=await receipt('@Agent hello',{chatType:'group',chatId:'ignored-group',senderId:`u${'c'.repeat(32)}`,
       mentionRanges:[{start:0,end:6,userId:agentMid}]});
     await instance.handleMonitorReceipt(r);

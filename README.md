@@ -26,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.390 adds an **Environment check** (Chrome, LINE extension, desktop LINE, Node.js, Claude CLI, Codex CLI, with install buttons) and a **Login guide**, both opened from buttons next to the Settings title. It also accepts Node.js 24 or higher for the CLIs, shows the real reason when the external monitor fails, and disables community receive for accounts without a phone number. Install through the app's **Check for updates**. See the [v1.0.385 → v1.0.390 release notes](docs/releases/v1.0.390.md) for the complete changes.
+v1.0.392 removes group activation, so a whitelisted member can use the Agent in any group. Codex now chats in read-only mode for members without the local workspace permission. The download login prefers the LINE extension installed from the Chrome Web Store and checks it by code features. The saved files dialog can open the chat folder. Install through the app's **Check for updates**. See the [v1.0.390 → v1.0.392 release notes](docs/releases/v1.0.392.md) for the complete changes.
 
 ## Installation
 

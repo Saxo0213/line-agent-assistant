@@ -5,7 +5,7 @@ import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import { DesktopReadRequestSchema, DesktopReadResultSchema } from '../desktop-protocol.js';
 
 type Sender = { senderId: number; url: string };
-type IpcFacade = Pick<DesktopServiceFacade, 'dispatch'> & Partial<Pick<DesktopServiceFacade, 'openAttachment' | 'downloadAttachment'>>;
+type IpcFacade = Pick<DesktopServiceFacade, 'dispatch'> & Partial<Pick<DesktopServiceFacade, 'openAttachment' | 'downloadAttachment' | 'openStoredAttachmentsFolder'>>;
 const RESOURCE_REQUEST_TYPES = new Set(['listChatNotes', 'getChatNote', 'listChatAlbums', 'listChatAlbumPhotos', 'downloadChatAlbumPhoto', 'openChatAlbum', 'openReadableChatAlbumFolder']);
 const MAX_ACTIVE_CHAT_RESOURCE_REQUESTS = 32;
 type AdapterOptions = { webContentsId: number; rendererUrl: string; service?: IpcFacade; resolveService?: () => IpcFacade;
@@ -70,6 +70,11 @@ export function createIpcAdapter(options: AdapterOptions) {
       if (parsed.data.type === 'openAttachment') {
         if (!service.openAttachment) return fail('SERVICE_UNAVAILABLE', 'Attachment service unavailable');
         return { type: 'openAttachment', requestId, ok: true, opened: await service.openAttachment(parsed.data.attachmentId, sender.senderId) };
+      }
+      if (parsed.data.type === 'openStoredAttachmentsFolder') {
+        if (!service.openStoredAttachmentsFolder) return fail('SERVICE_UNAVAILABLE', 'Attachment service unavailable');
+        const { accountId, chatType, chatId } = parsed.data;
+        return { type: 'openStoredAttachmentsFolder', requestId, ok: true, opened: await service.openStoredAttachmentsFolder({ accountId, chatType, chatId }) };
       }
       if (parsed.data.type === 'downloadAttachment') {
         if (!service.downloadAttachment) return fail('SERVICE_UNAVAILABLE', 'Attachment service unavailable');

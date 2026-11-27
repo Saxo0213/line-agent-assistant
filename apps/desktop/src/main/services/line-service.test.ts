@@ -5,7 +5,7 @@ import { LineWorkerCommandSchema } from '@line-agent/contracts';
 import type { InboundEnvelope, LineWorkerCommand, LineWorkerEvent } from '@line-agent/contracts';
 import { normalizeOperation } from '../../../../../packages/line-worker/src/normalizer.js';
 import { createTestDatabase } from '../../../../../packages/database/src/test-database.js';
-import { AccountRepository, AdminRepository, AgentPermissionRepository, FriendWhitelistRepository, MessageRepository, RoomActivationRepository, SettingsRepository } from '../../../../../packages/database/src/index.js';
+import { AccountRepository, AdminRepository, AgentPermissionRepository, FriendWhitelistRepository, MessageRepository, SettingsRepository } from '../../../../../packages/database/src/index.js';
 import { LineService as BaseLineService } from './line-service.js';
 import { PermissionCommandService, type PermissionCommandTransport } from './permission-command.js';
 import { SecretStore } from './secret-store.js';
@@ -248,7 +248,7 @@ describe('administrative archive admission', () => {
 });
 
 describe('LineService group mention authorization fast path', () => {
-  function setup(options: { primary?: boolean; primaryError?: boolean; friend?: boolean; room?: boolean; responder?: boolean; handledMessageId?: string;
+  function setup(options: { primary?: boolean; primaryError?: boolean; friend?: boolean; handledMessageId?: string;
     freeMode?: never; freeActive?: boolean; chatProvider?: 'claude' | 'codex'; quotaRoute?: { provider: 'claude' | 'codex'; sourceId: string | null } | null } = {}) {
     const providerChanges: Array<string | null> = [];
     const modelWrites: Array<{ provider: string; model: string | null }> = [];
@@ -293,9 +293,7 @@ describe('LineService group mention authorization fast path', () => {
       },
       { async isPrimaryAdministrator() { return options.primary ?? false; }, async isPrimaryUser() { calls.push('primary'); if (options.primaryError) throw new Error('admin lookup unavailable'); return options.primary ?? false; } } as never,
       { async inspect() { return { status: 'available', version: 1, path: 'C:\\trusted' }; } },
-      { async handle() { calls.push('control'); }, async isEnabled() { return options.responder ?? true; },
-        async getActiveAuthorization() { calls.push('room'); return options.room === false ? null : { grantId: 'room-grant', version: 1 }; },
-        async respond(_envelope, body) { replies.push(body); } },
+      { async respond(_envelope, body) { replies.push(body); } },
       { async getActiveAuthorization(_accountId: string, _senderId: string, scope: unknown) {
         calls.push('friend'); friendScopes.push(scope);
         return options.friend === false ? null : { grantId: 'friend-grant', version: 1, scopeKind: 'ACCOUNT' };
@@ -356,7 +354,7 @@ describe('LineService group mention authorization fast path', () => {
       expect(h.replies).toEqual([]);
     });
     it('lets a non-administrator mention of /persona take the ordinary auto-reply path', async () => {
-      const h = await run({ primary: false, friend: false, responder: false }, groupMessage({ messageId: 'persona-6', text: '@Agent /persona 活潑',
+      const h = await run({ primary: false, friend: false }, groupMessage({ messageId: 'persona-6', text: '@Agent /persona 活潑',
         mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] }));
       expect(h.personaChanges).toEqual([]);
       expect(h.replies).toEqual(['/persona 活潑']);
@@ -456,7 +454,7 @@ describe('LineService group mention authorization fast path', () => {
     });
 
     it('treats /agent default from a non-administrator in an unserved room as ordinary text for the responder', async () => {
-      const h = await run({ primary: false, room: false, friend: false, responder: false }, mentioned('@Agent /agent default'));
+      const h = await run({ primary: false, friend: false }, mentioned('@Agent /agent default'));
       expect(h.providerChanges).toEqual([]);
       expect(sentTexts(h.commands)).toEqual([]);
       expect(h.replies).toEqual(['/agent default']);
@@ -503,21 +501,19 @@ describe('LineService group mention authorization fast path', () => {
     await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ text: '@Agent do this',
       mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
-    expect(calls).toEqual(['primary', 'friend', 'room']);
+    expect(calls).toEqual(['primary', 'friend']);
     expect(friendScopes).toEqual([{ kind: 'CHAT', chatType: 'group', chatId: 'g' }]);
     expect(archived[0]!.decisions).toEqual([expect.objectContaining({ eligible: true, prompt: 'do this' })]);
     expect(kicked).toEqual(['g']);
   });
 
-  it('keeps the unapproved and disabled room branches ineligible', async () => {
-    for (const options of [{ friend: false }, { room: false }]) {
-      const { service, archived, kicked } = setup(options);
-      await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
-      await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ text: '@Agent do this',
-        mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
-      expect(archived[0]!.decisions).toEqual([{ eligible: false, action: 'ignore' }]);
-      expect(kicked).toEqual([]);
-    }
+  it('keeps a sender without a whitelist grant ineligible', async () => {
+    const { service, archived, kicked } = setup({ friend: false });
+    await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ text: '@Agent do this',
+      mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
+    expect(archived[0]!.decisions).toEqual([{ eligible: false, action: 'ignore' }]);
+    expect(kicked).toEqual([]);
   });
 
   it('admits a PRIMARY_ADMIN group mention without room or friend grants', async () => {
@@ -531,7 +527,7 @@ describe('LineService group mention authorization fast path', () => {
   });
 
   it('suppresses the disabled-room fallback after a primary-admin Agent route commits', async () => {
-    const { service, replies, kicked } = setup({ primary: true, responder: false });
+    const { service, replies, kicked } = setup({ primary: true });
     await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ text: '@Agent hello',
       mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
@@ -543,7 +539,7 @@ describe('LineService group mention authorization fast path', () => {
   it.each([
     ['/free', false, true], ['@Agent /free', true, true], ['/free 10', false, true],
   ])('never lets the disabled-room responder answer the Primary Administrator command %s (mention %s, Primary Admin %s)', async (text, mention, primary) => {
-    const { service, replies, freeCommands } = setup({ primary, responder: false });
+    const { service, replies, freeCommands } = setup({ primary });
     await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'free-command', text,
       ...(mention ? { mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] } : {}) })] });
@@ -557,7 +553,7 @@ describe('LineService group mention authorization fast path', () => {
     ['/folder off', false, true, 'off'], ['@Agent /folder off D:/Projects/Alpha', true, true, 'off'],
     ['/folder D:/Projects/Alpha', false, false, null], ['@Agent /folder rw D:/Projects/Alpha', true, false, null], ['@Agent /folder', true, false, null],
   ])('executes the group command %s (mention %s, Primary Admin %s) only for the Primary Admin', async (text, mention, primary, action) => {
-    const { service, replies, folderCommands, kicked, archived } = setup({ primary, responder: false });
+    const { service, replies, folderCommands, kicked, archived } = setup({ primary });
     await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'folder-command', senderId: 'u-sender', text,
       ...(mention ? { mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] } : {}) })] });
@@ -572,7 +568,7 @@ describe('LineService group mention authorization fast path', () => {
 
   it('lets a non-admin /folder with a mention reach the disabled-room responder like any other text, never the admin one', async () => {
     for (const primary of [false, true]) {
-      const { service, replies, folderCommands } = setup({ primary, friend: false, responder: false });
+      const { service, replies, folderCommands } = setup({ primary, friend: false });
       await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
       await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'folder-resp', text: '@Agent /folder D:/x',
         mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
@@ -595,7 +591,7 @@ describe('LineService group mention authorization fast path', () => {
   });
 
   it('treats /free from a non-Primary-Administrator as ordinary text: the responder answers a mention and nothing runs', async () => {
-    const { service, replies, freeCommands } = setup({ primary: false, responder: false });
+    const { service, replies, freeCommands } = setup({ primary: false, friend: false });
     await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'free-command', text: '@Agent /free',
       mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
@@ -604,8 +600,14 @@ describe('LineService group mention authorization fast path', () => {
     expect(freeCommands).toEqual([]);
   });
 
-  it('still answers ordinary mentioned text in a room that is not enabled', async () => {
-    const { service, replies } = setup({ responder: false });
+  it('answers ordinary mentioned text of a sender without a whitelist grant by the auto-reply, and never answers a served sender twice', async () => {
+    const served = setup({});
+    await served.service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
+    await served.service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ text: '@Agent hello there',
+      mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
+    await served.service.idleRoomEffects();
+    expect(served.replies).toEqual([]);
+    const { service, replies } = setup({ friend: false });
     await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ text: '@Agent hello there',
       mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
@@ -614,7 +616,7 @@ describe('LineService group mention authorization fast path', () => {
   });
 
   it('archives and acknowledges a mixed batch when primary-admin lookup fails for one mention', async () => {
-    const { service, archived, calls, commands, replies } = setup({ primaryError: true, responder: false });
+    const { service, archived, calls, commands, replies } = setup({ primaryError: true });
     await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await expect(service.handleWorkerEvent('w1', { ...batch(), envelopes: [
       groupMessage({ messageId: 'admin-lookup-fails', text: '@Agent prompt', mentionIds: ['agent-mid'],
@@ -628,7 +630,7 @@ describe('LineService group mention authorization fast path', () => {
   });
 
   it('archives handled enrollment mentions without creating an Agent job or disabled-room autoresponse', async () => {
-    const { service, calls, archived, kicked, replies } = setup({ responder: false, handledMessageId: 'add-user' });
+    const { service, calls, archived, kicked, replies } = setup({ handledMessageId: 'add-user' });
     await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await service.handleWorkerEvent('w1', { ...batch(), envelopes: [groupMessage({ messageId: 'add-user',
       text: '@Agent /adduser', mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] })] });
@@ -653,8 +655,8 @@ describe('LineService group mention authorization fast path', () => {
     expect(kicked).toEqual([]);
   });
 
-  it('checks mixed batch permissions independently and still runs room control and disabled-room replies', async () => {
-    const { service, calls, archived, kicked, replies } = setup({ responder: false });
+  it('checks mixed batch permissions independently; a former activation word is an ordinary prompt of a served sender', async () => {
+    const { service, calls, archived, kicked, replies } = setup({});
     await service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     const tagged = groupMessage({ messageId: 'tagged', text: '@Agent hello', mentionIds: ['agent-mid'],
       mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] });
@@ -663,15 +665,15 @@ describe('LineService group mention authorization fast path', () => {
       mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] });
     await service.handleWorkerEvent('w1', { ...batch(), envelopes: [tagged, untagged, monitor] });
     await service.idleRoomEffects();
-    expect(calls).toEqual(['primary', 'friend', 'room', 'control']);
+    expect(calls).toEqual(['primary', 'friend', 'primary', 'friend']);
     expect(archived[0]!.envelopes.map((item) => item.messageId)).toEqual(['tagged', 'untagged', 'monitor']);
     expect(archived[0]!.decisions).toEqual([
       expect.objectContaining({ eligible: true }),
       { eligible: false, action: 'ignore' },
-      { eligible: false, action: 'ignore' },
+      expect.objectContaining({ eligible: true, prompt: 'monitor' }),
     ]);
-    expect(replies).toContain('hello');
-    expect(kicked).toEqual(['g']);
+    expect(replies).toEqual([]);
+    expect(kicked).toEqual(['g', 'g']);
   });
 });
 
@@ -1281,33 +1283,6 @@ database('LineService transaction and worker identity', () => {
     expect(jobs.rows[0].count).toBe('0');
   });
 
-  it('archives live activation requests before dispatching them without blocking the receive ACK', async () => {
-    const commands: LineWorkerCommand[] = [];
-    const received: string[] = [];
-    let release!: () => void;
-    const blocked = new Promise<void>((resolve) => { release = resolve; });
-    await messages.upsertConversationCatalog('a', [{ chatType: 'group', chatId: 'live-activation-room',
-      title: 'Activation room', members: [] }]);
-    const service = new BaseLineService(accounts, messages, settings, { async send(command) { commands.push(command); } },
-      { kick() {}, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined, admins,
-      { async inspect() { return { status: 'available', version: 0, path: 'C:\\trusted' }; } },
-      { async handle(command: import('./room-control.js').RoomActivationCommand) { received.push(command.messageId); await blocked; } } as never);
-    const live = { ...batch().envelopes[0]!, chatType: 'group' as const, chatId: 'live-activation-room',
-      messageId: 'live-activation-message', eventId: 'live-activation-event',
-      senderId: 'member', text: '@Agent monitor', mentionIds: ['agent-mid'],
-      mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] };
-    expect(classifyRoomControl(live, 'agent-mid', 'a')).toMatchObject({ type: 'command', command: { type: 'request' } });
-    service.bind({ accountId: 'a', workerInstanceId: 'activation-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
-    await service.handleWorkerEvent('activation-worker', { ...batch(), workerInstanceId: 'activation-worker', batchId: 'live-activation', cursorAfter: cursor('950'),
-      envelopes: [live] });
-
-    expect(received).toEqual(['live-activation-message']);
-    expect(commands.at(-1)).toMatchObject({ type: 'ackBatch', batchId: 'live-activation' });
-    const archived = await pool.query("SELECT count(*) FROM messages WHERE account_id='a' AND message_id='m1'");
-    expect(archived.rows[0].count).toBe('1');
-    release();
-  });
-
   it('admits a PRIMARY_ADMIN group mention without room activation or friend authorization', async () => {
     await messages.upsertConversationCatalog('a', [{ chatType: 'group', chatId: 'admin-room',
       title: 'Admin room', members: [] }]);
@@ -1356,7 +1331,7 @@ database('LineService transaction and worker identity', () => {
         { kick() {}, async stopChat() { effects.push('stop'); }, async resetChat() { effects.push('new'); },
           async getChatStatus() { effects.push('status'); return { runningJobId: null }; } },
         undefined, undefined, undefined, admins, workspace,
-        { async handle() {}, async isEnabled() { return false; }, async respond(_envelope, body) { replies.push(body); } }, whitelist);
+        { async respond(_envelope, body) { replies.push(body); } }, whitelist);
       try {
         await service.bind({ accountId: 'a', workerInstanceId: workerId, controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
         const source = { ...batch().envelopes[0]!, eventId: `${messageId}-event`, messageId,
@@ -1389,7 +1364,7 @@ database('LineService transaction and worker identity', () => {
       { kick() {}, async stopChat() { effects.push('stop'); }, async resetChat() { effects.push('new'); },
         async getChatStatus() { effects.push('status'); return { runningJobId: null }; } },
       undefined, undefined, undefined, admins, undefined,
-      { async handle() {}, async isEnabled() { return false; }, async respond(_envelope, body) { replies.push(body); } }, whitelist);
+      { async respond(_envelope, body) { replies.push(body); } }, whitelist);
     await service.bind({ accountId: 'a', workerInstanceId: 'admin-control-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     const source = (name: string) => ({ ...batch().envelopes[0]!, eventId: `${name}-event`, messageId: `admin-control-${name}`,
       chatType: 'group' as const, chatId: 'admin-control-room', senderId: 'user', text: `@Agent /${name}`,
@@ -1528,7 +1503,7 @@ database('LineService transaction and worker identity', () => {
       [`admission-${chatId}`])).rows).toEqual([{ direct_friend_grant_id: grant.grantId, room_agent_grant_id: null }]);
   });
 
-  it('admits a room member only with both room authority and same-account friend authorization, while PRIMARY_ADMIN bypasses both', async () => {
+  it('admits a group member by whitelist grant alone with no room activation, while PRIMARY_ADMIN bypasses it and an unlisted member only gets the auto-reply', async () => {
     await messages.upsertConversationCatalog('a', [
       { chatType: 'group', chatId: 'authorized-room', title: 'Authorized room', members: [] },
       { chatType: 'group', chatId: 'friend-race-room', title: 'Friend revoke race room', members: [] },
@@ -1541,36 +1516,11 @@ database('LineService transaction and worker identity', () => {
     const chatAndAccountGrant = await whitelist.activate('a', 'account-member', 'user',
       { kind: 'CHAT', chatType: 'group', chatId: 'chat-only-room' });
     await whitelist.activate('a', 'user', 'user');
-    const rooms = new RoomActivationRepository(pool);
-    const scope = { accountId: 'a', chatType: 'group' as const, chatId: 'authorized-room' };
-    const friendRaceScope = { accountId: 'a', chatType: 'group' as const, chatId: 'friend-race-room' };
-    const digestKey = randomBytes(32);
-    const token = `RA-${randomBytes(32).toString('base64url')}`;
-    const activation = await rooms.requestActivation({ ...scope, sourceMessageId: 'authorize-room-request', requesterId: 'room-member' });
-    if (activation.disposition !== 'created') throw new Error('room activation was not created');
-    const claim = await rooms.claimWaitingToSend(activation.requestId, 'room-authorizer', 60_000);
-    if (!claim) throw new Error('room challenge was not claimable');
-    if (!await rooms.prepareChallengeSend({ requestId: activation.requestId, leaseToken: claim.leaseToken, token, digestKey, digestKeyVersion: 1 })) {
-      throw new Error('room challenge was not prepared');
-    }
-    expect((await rooms.confirmActivation({ ...scope, sourceMessageId: 'authorize-room-confirm', senderUserId: 'user', token, digestKey,
-      digestKeyVersion: 1 })).disposition).toBe('enabled');
-    const friendRaceActivation = await rooms.requestActivation({ ...friendRaceScope,
-      sourceMessageId: 'friend-race-room-request', requesterId: 'room-member' });
-    if (friendRaceActivation.disposition !== 'created') throw new Error('friend race room activation was not created');
-    const friendRaceClaim = await rooms.claimWaitingToSend(friendRaceActivation.requestId, 'friend-race-room-authorizer', 60_000);
-    if (!friendRaceClaim) throw new Error('friend race room challenge was not claimable');
-    const friendRaceToken = `RA-${randomBytes(32).toString('base64url')}`;
-    if (!await rooms.prepareChallengeSend({ requestId: friendRaceActivation.requestId, leaseToken: friendRaceClaim.leaseToken,
-      token: friendRaceToken, digestKey, digestKeyVersion: 1 })) throw new Error('friend race room challenge was not prepared');
-    expect((await rooms.confirmActivation({ ...friendRaceScope, sourceMessageId: 'friend-race-room-confirm', senderUserId: 'user',
-      token: friendRaceToken, digestKey, digestKeyVersion: 1 })).disposition).toBe('enabled');
     const kicked: string[] = [];
     const replies: string[] = [];
     const service = new LineService(accounts, messages, settings, { async send() {} },
       { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined,
-      admins, { async handle() {}, async isEnabled(key) { return key.chatType !== 'direct' && rooms.hasActiveRoomGrant(key as Parameters<RoomActivationRepository['hasActiveRoomGrant']>[0]); },
-        async getActiveAuthorization(key) { return key.chatType === 'direct' ? null : rooms.getActiveRoomAuthorization(key as Parameters<RoomActivationRepository['getActiveRoomAuthorization']>[0]); },
+      admins, {
         async respond(_envelope: InboundEnvelope, body: string) { replies.push(body); } }, whitelist);
     service.bind({ accountId: 'a', workerInstanceId: 'whitelist-room-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     const envelope = (messageId: string, senderId: string, chatId = 'authorized-room') => ({ ...batch().envelopes[0]!, eventId: `${messageId}-event`, messageId,
@@ -1586,17 +1536,18 @@ database('LineService transaction and worker identity', () => {
       .toEqual({ direct_friend_grant_id: expect.any(String), direct_friend_grant_version: '1',
         room_agent_grant_id: null, room_agent_grant_version: null });
     expect((await pool.query("SELECT direct_friend_grant_id, room_agent_grant_id, room_agent_grant_version FROM agent_jobs WHERE source_message_id='account-member-group-allowed'")).rows[0])
-      .toMatchObject({ direct_friend_grant_id: expect.any(String), room_agent_grant_id: expect.any(String), room_agent_grant_version: '2' });
+      .toMatchObject({ direct_friend_grant_id: expect.any(String), room_agent_grant_id: null, room_agent_grant_version: null });
     await service.handleWorkerEvent('whitelist-room-worker', { ...batch(), workerInstanceId: 'whitelist-room-worker', batchId: 'chat-only-no-room-policy',
       cursorBefore: cursor('962'), cursorAfter: cursor('9621'), envelopes: [envelope('chat-only-with-account-grant', 'account-member', 'chat-only-room')] });
     expect((await pool.query("SELECT direct_friend_grant_id, room_agent_grant_id FROM agent_jobs WHERE source_message_id='chat-only-with-account-grant'")).rows[0])
       .toEqual({ direct_friend_grant_id: chatAndAccountGrant.grantId, room_agent_grant_id: null });
-    expect(replies).toEqual([]);
+    await service.idleRoomEffects();
+    expect(replies).toEqual(['do work']);
     const failedWorkspaceReplies: string[] = [];
     const failedWorkspace = new BaseLineService(accounts, messages, settings, { async send() {} },
       { kick() {}, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined, admins,
       { async inspect() { return { status: 'unavailable', version: 0, configuredPath: 'D:\\missing', reason: 'Workspace directory is unavailable' }; } },
-      { async handle() {}, async isEnabled() { return false; }, async respond(_envelope: InboundEnvelope, body: string) { failedWorkspaceReplies.push(body); } } as never, whitelist);
+      { async respond(_envelope: InboundEnvelope, body: string) { failedWorkspaceReplies.push(body); } } as never, whitelist);
     failedWorkspace.bind({ accountId: 'a', workerInstanceId: 'whitelist-room-worker', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     await failedWorkspace.handleWorkerEvent('whitelist-room-worker', { ...batch(), workerInstanceId: 'whitelist-room-worker', batchId: 'chat-only-workspace-failure',
       cursorBefore: cursor('9621'), cursorAfter: cursor('9622'), envelopes: [envelope('chat-only-workspace-failure-message', 'account-member', 'chat-only-room')] });
@@ -1611,19 +1562,6 @@ database('LineService transaction and worker identity', () => {
         chatType: 'direct', chatId: 'c', senderId: 'room-member', text: 'hello' }] });
     expect((await pool.query("SELECT count(*) FROM agent_jobs WHERE source_message_id='chat-only-direct-denied'")).rows[0]?.count).toBe('0');
 
-    const original = messages.admitLiveBatch.bind(messages);
-    vi.spyOn(messages, 'admitLiveBatch').mockImplementation(async (...args) => {
-      await rooms.revokeRoom(scope, 'admin-revoke');
-      return original(...args);
-    });
-    try {
-      await service.handleWorkerEvent('whitelist-room-worker', { ...batch(), workerInstanceId: 'whitelist-room-worker', batchId: 'whitelist-room-revoked',
-        cursorBefore: cursor('9623'), cursorAfter: cursor('9624'), envelopes: [envelope('room-member-revoked-during-admission', 'account-member')] });
-    } finally {
-      vi.restoreAllMocks();
-    }
-    expect((await pool.query("SELECT count(*) FROM agent_jobs WHERE source_message_id='room-member-revoked-during-admission'")).rows[0]?.count).toBe('0');
-
     const beforeWhitelistRevoke = messages.admitLiveBatch.bind(messages);
     let requestedFriendRaceDecision: unknown;
     vi.spyOn(messages, 'admitLiveBatch').mockImplementation(async (...args) => {
@@ -1634,7 +1572,7 @@ database('LineService transaction and worker identity', () => {
     });
     try {
       await service.handleWorkerEvent('whitelist-room-worker', { ...batch(), workerInstanceId: 'whitelist-room-worker', batchId: 'chat-grant-revoked',
-        cursorBefore: cursor('9624'), cursorAfter: cursor('9625'), envelopes: [envelope('room-member-friend-revoked-during-admission', 'room-member', 'friend-race-room')] });
+        cursorBefore: cursor('9623'), cursorAfter: cursor('9625'), envelopes: [envelope('room-member-friend-revoked-during-admission', 'room-member', 'friend-race-room')] });
     } finally {
       vi.restoreAllMocks();
     }
@@ -1652,7 +1590,7 @@ database('LineService transaction and worker identity', () => {
     const service = new BaseLineService(accounts, messages, settings, { async send() {} },
       { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined, admins,
       { async inspect() { return { status: 'available', version: 0, path: 'C:\\trusted' }; } },
-      { async handle() {}, async isEnabled() { return false; }, async respond(_envelope: InboundEnvelope, body: string) { replies.push(body); } } as never);
+      { async respond(_envelope: InboundEnvelope, body: string) { replies.push(body); } } as never);
     const source = { ...batch().envelopes[0]!, eventId: 'responder-room-event', messageId: 'responder-room-message',
       chatType: 'group' as const, chatId: 'responder-room', senderId: 'member', text: '@Agent   hello   there',
       mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] };
@@ -1679,7 +1617,7 @@ database('LineService transaction and worker identity', () => {
     const kicked: string[] = [];
     const service = new LineService(accounts, messages, settings, { async send() {} },
       { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined, admins,
-      { async handle() {}, async isEnabled() { return true; } } as never);
+      {} as never);
     const binding = { accountId: 'a', workerInstanceId: 'ready-room-worker', controlEpoch: 1 };
     await service.bind({ ...binding, mode: 'ACTIVE_CONTROL' });
     const memberMention = (messageId: string) => ({ ...batch().envelopes[0]!, eventId: `${messageId}-event`, messageId,
@@ -1778,7 +1716,7 @@ database('LineService transaction and worker identity', () => {
     const kicked: string[] = [];
     const service = new LineService(accounts, messages, settings, { async send() {} },
       { kick(key) { kicked.push(key.chatId); }, async stopChat() {}, async resetChat() {} },
-      undefined, undefined, undefined, admins, { async handle() {}, async isEnabled() { return true; } });
+      undefined, undefined, undefined, admins, {});
     service.bind({ accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1, mode: 'ACTIVE_CONTROL' });
     const replyOnly = { ...base, eventId: 'reply-only-event', messageId: 'reply-only-message', text: 'continue',
       replyToMessageId: 'prior-agent-message' };
@@ -1930,8 +1868,7 @@ database('LineService transaction and worker identity', () => {
     const makeService = (commands: LineWorkerCommand[], responses: string[]) => new LineService(
       accounts, messages, settings, { async send(command) { commands.push(command); } },
       { kick() {}, async stopChat() {}, async resetChat() {} }, undefined, undefined, undefined, admins,
-      { async handle() {}, async getActiveAuthorization() { return { grantId: grant.grantId, version: grant.version }; },
-        async respond(_envelope, body) { responses.push(body); } }, whitelist);
+      { async respond(_envelope, body) { responses.push(body); } }, whitelist);
     const firstCommands: LineWorkerCommand[] = [];
     const first = makeService(firstCommands, []);
     const failOnce = vi.spyOn(messages, 'admitLiveBatch').mockRejectedValueOnce(new Error('forced admission failure'));
@@ -2134,16 +2071,18 @@ database('LineService transaction and worker identity', () => {
       expect(kicked).toEqual(['c']);
     });
 
-    it('routes a group @mention /權限 from the primary admin as before', async () => {
+    it('answers a group @mention /權限 from the primary admin once with the fixed hint and routes no Agent job', async () => {
       await messages.upsertConversationCatalog('a', [{ chatType: 'group', chatId: 'permission-room', title: 'Permission room', members: [] }]);
       const { service, binding, kicked, deliver, sent } = permissionService('permission-group-worker');
       await service.bind(binding);
       await deliver('permission-group-list', '1702', { chatType: 'group', chatId: 'permission-room', senderId: 'user',
         text: '@Agent /權限', mentionIds: ['agent-mid'], mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(sent()).toEqual([]);
-      expect(await routeOf('permission-group-list')).toEqual({ action: 'prompt', jobs: 1 });
-      expect(kicked).toEqual(['permission-room']);
+      await service.idleRoomEffects();
+      expect(sent()).toEqual([expect.objectContaining({ type: 'sendText', chatType: 'group', chatId: 'permission-room',
+        replyToMessageId: 'permission-group-list',
+        text: '/權限 只能在與 Agent 的一對一聊天使用；要把成員加入白名單，請用 /新增使用者。' })]);
+      expect(await routeOf('permission-group-list')).toEqual({ action: 'ignore', jobs: 0 });
+      expect(kicked).toEqual([]);
     });
 
     it('treats a number after the pending choice expires as a normal prompt', async () => {

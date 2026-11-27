@@ -43,6 +43,7 @@ export type WorkRecord = { id: string; title: string; status: 'todo' | 'doing' |
 export type DesktopServiceFacade = {
   dispatch(request: IpcRequest, signal?: AbortSignal): Promise<IpcResult>;
   openAttachment(attachmentId: string, senderId?: number): Promise<boolean>;
+  openStoredAttachmentsFolder?(key: ConversationKey): Promise<boolean>;
   downloadAttachment(key: WritableConversationKey, attachmentId: string): Promise<boolean>;
   handleLineMedia?(target: LineMediaTarget, signal?: AbortSignal): Promise<Response>;
   listMessages(key: ConversationKey, cursor: string | null, limit: number, exactMessageId?: string): Promise<MessagePage>;

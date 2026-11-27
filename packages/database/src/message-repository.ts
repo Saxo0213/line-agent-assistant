@@ -889,13 +889,12 @@ export class MessageRepository {
           const jobId = randomUUID();
           const inserted = await client.query<{ job_id: string; status: 'queued'|'failed'; revision: string }>(
             `INSERT INTO agent_jobs(job_id,account_id,chat_type,chat_id,provider,source_type,source_message_id,source_sender_id,prompt,workspace_path,
-               generation,creation_epoch,status,completed_at,direct_friend_grant_id,direct_friend_grant_version,room_agent_grant_id,room_agent_grant_version)
-             VALUES($1,$2,$3,$4,$5,'line',$6,$7,$8,$9,$10,$11,$12,CASE WHEN $12='failed' THEN now() ELSE NULL END,$13,$14,$15,$16)
+               generation,creation_epoch,status,completed_at,direct_friend_grant_id,direct_friend_grant_version)
+             VALUES($1,$2,$3,$4,$5,'line',$6,$7,$8,$9,$10,$11,$12,CASE WHEN $12='failed' THEN now() ELSE NULL END,$13,$14)
              ON CONFLICT(account_id,source_message_id) WHERE source_type='line' AND retry_of_job_id IS NULL DO NOTHING
              RETURNING job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision`,
             [jobId,batch.accountId,envelope.chatType,envelope.chatId,provider,envelope.messageId,envelope.senderId,prompt,workspacePath,session.rows[0]!.generation,
-              batch.controlEpoch,failure?'failed':'queued',requestedAuthorization?.directGrantId??null,requestedAuthorization?.directGrantVersion??null,
-              requestedAuthorization?.roomGrantId??null,requestedAuthorization?.roomGrantVersion??null]);
+              batch.controlEpoch,failure?'failed':'queued',requestedAuthorization?.directGrantId??null,requestedAuthorization?.directGrantVersion??null]);
           job = inserted.rows[0] ?? (await client.query<{ job_id: string; status: 'queued'|'failed'; revision: string }>(
             `SELECT job_id,status,((extract(epoch FROM updated_at)*1000000)::numeric(20,0))::text revision
              FROM agent_jobs WHERE account_id=$1 AND source_type='line' AND source_message_id=$2 AND retry_of_job_id IS NULL`, [batch.accountId,envelope.messageId])).rows[0];

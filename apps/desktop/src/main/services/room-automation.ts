@@ -1,11 +1,9 @@
-import { randomBytes, randomUUID } from 'node:crypto';
 import type { WritableConversationKey, LineWorkerCommand, LineWorkerEvent, WorkerBinding } from '@line-agent/contracts';
 import { selectAutoresponderReply, type AutoResponderSettings } from '@line-agent/contracts';
-import type { AutoResponderRepository, RoomActivationRepository, RoomActivationScope } from '@line-agent/database';
+import type { AutoResponderRepository, RoomActivationScope } from '@line-agent/database';
 import type { InboundEnvelope } from '@line-agent/contracts';
+import { randomUUID } from 'node:crypto';
 import type { RoomControlHandler } from './line-service.js';
-import type { Locale } from '../../locale.js';
-import { linePrompt } from './line-prompts.js';
 
 type SendTextCommand = Extract<LineWorkerCommand, { type: 'sendText' }>;
 type SendResult = Extract<LineWorkerEvent, { type: 'sendResult' }>;
@@ -21,38 +19,15 @@ export interface RoomAutomationTransport {
 
 export class RoomAutomationService implements RoomControlHandler {
   constructor(
-    private readonly rooms: RoomActivationRepository,
-  private readonly autoresponders: Pick<AutoResponderRepository, 'get' | 'beginReplyEffect' | 'finishReplyEffect'>,
-    private readonly digestKey: Buffer,
-    private readonly digestKeyVersion: number,
+    private readonly autoresponders: Pick<AutoResponderRepository, 'get' | 'beginReplyEffect' | 'finishReplyEffect'>,
     private readonly transport: RoomAutomationTransport,
-    private readonly locale: Locale | string = 'en',
-  ) {
-    if (digestKey.length !== 32 || !Number.isInteger(digestKeyVersion) || digestKeyVersion < 1) throw new Error('Invalid room token digest key');
-  }
+  ) {}
 
-  async isEnabled(key: WritableConversationKey): Promise<boolean> {
-    if (key.chatType === 'direct') return false;
-    return this.rooms.hasActiveRoomGrant(key as RoomActivationScope);
-  }
-
-  async getActiveAuthorization(key: WritableConversationKey): Promise<{ grantId: string; version: number } | null> {
-    if (key.chatType === 'direct') return null;
-    return this.rooms.getActiveRoomAuthorization(key as RoomActivationScope);
-  }
-
-  async handle(command: Parameters<RoomControlHandler['handle']>[0]): Promise<void> {
-    const binding = await this.transport.activeBinding(command.accountId);
-    if (!binding || !await this.transport.isCurrentControl(binding)) return;
-    if (command.type === 'request') await this.request(command, binding);
-    else await this.confirm(command);
-  }
-
+  /** Answers a group/room mention of a sender that the Agent does not serve, by the auto-reply rules. */
   async respond(envelope: InboundEnvelope, body: string): Promise<void> {
     if (envelope.chatType === 'direct') return;
     if (!await this.transport.isAgentAccount(envelope.accountId)) return;
     const key: RoomActivationScope = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
-    if (await this.isEnabled(key)) return;
     const settings: AutoResponderSettings = await this.autoresponders.get();
     const text = selectAutoresponderReply(body, settings.rules, settings.fallback);
     const binding = await this.transport.activeBinding(key.accountId);
@@ -61,57 +36,6 @@ export class RoomAutomationService implements RoomControlHandler {
     if (claim !== 'created') return;
     const sent = await this.sendOnce(key, text, envelope.messageId, binding);
     await this.autoresponders.finishReplyEffect(key, envelope.messageId, sent ? 'SENT' : 'UNKNOWN');
-  }
-
-  /**
-   * Enables a group/room on the word of the account's Primary Administrator (no token round-trip) and returns the
-   * room's active grant. `announce` is true only when this call enabled the room. Null for any other sender or a non-Agent account.
-   */
-  async enableByPrimaryAdmin(scope: RoomActivationScope, adminUserId: string, sourceMessageId: string)
-    : Promise<{ grant: { grantId: string; version: number }; announce: boolean } | null> {
-    if (!await this.transport.isAgentAccount(scope.accountId)) return null;
-    const result = await this.rooms.enableByPrimaryAdmin(scope, { sourceMessageId, adminUserId });
-    if (result.disposition === 'not_primary_admin' || result.disposition === 'room_missing') return null;
-    const grant = await this.rooms.getActiveRoomAuthorization(scope);
-    return grant ? { grant, announce: result.disposition === 'enabled' } : null;
-  }
-
-  /** The room's name by the app-wide title rule, else a localized placeholder; the chat id is never shown. */
-  private async roomLabel(scope: RoomActivationScope): Promise<{ level: string; name: string }> {
-    const group = scope.chatType === 'group';
-    const title = await this.rooms.getRoomTitle(scope).catch(() => null);
-    return { level: linePrompt(this.locale, group ? 'roomTypeGroup' : 'roomTypeRoom'),
-      name: title ?? linePrompt(this.locale, group ? 'roomUnnamedGroup' : 'roomUnnamedRoom') };
-  }
-
-  private async request(command: Extract<Parameters<RoomControlHandler['handle']>[0], { type: 'request' }>, binding: WorkerBinding): Promise<void> {
-    const scope: RoomActivationScope = { accountId: command.accountId, chatType: command.chatType, chatId: command.chatId };
-    const direct = await this.enableByPrimaryAdmin(scope, command.senderId, command.messageId);
-    if (direct) {
-      if (direct.announce) await this.sendOnce(scope, linePrompt(this.locale, 'roomActivated'), command.messageId, binding);
-      return;
-    }
-    const created = await this.rooms.requestActivation({ accountId: command.accountId, chatType: command.chatType,
-      chatId: command.chatId, sourceMessageId: command.messageId, requesterId: command.senderId });
-    if (created.disposition !== 'created') return;
-    const claim = await this.rooms.claimWaitingToSend(created.requestId, binding.workerInstanceId, 60_000);
-    if (!claim) return;
-    const token = `RA-${randomBytes(32).toString('base64url')}`;
-    const prepared = await this.rooms.prepareChallengeSend({ requestId: created.requestId, leaseToken: claim.leaseToken,
-      token, digestKey: this.digestKey, digestKeyVersion: this.digestKeyVersion });
-    if (!prepared) return;
-    const adminSent = await this.sendOnce({ accountId: command.accountId, chatType: 'direct', chatId: claim.adminChatId },
-      linePrompt(this.locale, 'roomActivationAdmin', { ...await this.roomLabel(scope), token }),
-      command.messageId, binding);
-    if (!adminSent) await this.rooms.markChallengeDeliveryUnknown(created.requestId);
-    await this.sendOnce({ accountId: command.accountId, chatType: command.chatType, chatId: command.chatId },
-      linePrompt(this.locale, 'roomActivationWaiting'), command.messageId, binding);
-  }
-
-  private async confirm(command: Extract<Parameters<RoomControlHandler['handle']>[0], { type: 'confirmation-candidate' }>): Promise<void> {
-    await this.rooms.confirmActivation({ accountId: command.accountId, chatType: command.chatType, chatId: command.chatId,
-      sourceMessageId: command.messageId, senderUserId: command.senderId, token: command.token,
-      digestKey: this.digestKey, digestKeyVersion: this.digestKeyVersion });
   }
 
   private async sendOnce(key: WritableConversationKey, text: string, sourceMessageId: string, expected?: WorkerBinding): Promise<boolean> {

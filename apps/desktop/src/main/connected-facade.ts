@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { ScheduleForwardRepository } from '@line-agent/database';
 import { ScheduleForwardService } from './services/schedule-forward-service.js';
 import { PhotoTextService } from './services/photo-text-service.js';
@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, DEFAULT_DOWNLOAD_BRIDGE_INTERVALS, NativeAttachmentDescriptorSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
 import {
-  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AGENT_RUNTIME_DEFAULTS, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, AttachmentStorageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomActivationRepository, RoomFreeModeRepository, SettingsRepository, ProviderQuotaRepository, AccountSourceRepository, PendingTurnRepository, effectiveDefaultId, normalizedFallbackOrder, migrate, parseLineStickerDescriptor,
+  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AGENT_RUNTIME_DEFAULTS, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, AttachmentStorageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomFreeModeRepository, SettingsRepository, ProviderQuotaRepository, AccountSourceRepository, PendingTurnRepository, effectiveDefaultId, normalizedFallbackOrder, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
 import type { Attachment, BridgeVerificationCounts, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
@@ -68,6 +68,7 @@ import { ContentReprojectionService } from './services/content-reprojection-serv
 import { HealthService, kindPreview } from './services/health-service.js';
 import { AdminChangeError, AdminPairingService, type AdminChangeOutcome } from './services/admin-pairing-service.js';
 import { OfficialDownloadBridgeService } from './services/official-download-bridge/official-download-bridge-service.js';
+import { bridgeFailureDetail } from './services/official-download-bridge/errors.js';
 import { OfficialDownloadBridgeDownloader, randomIntervalMs } from './services/official-download-bridge/bridge-download.js';
 import { BRIDGE_VERIFY_RESULT_CODES, bridgeGateThreshold, isBridgeGateOpen, type BridgeKind, type BridgeVerifyResult } from './services/official-download-bridge/bridge-verification.js';
 import { createBridgeAttachmentStore } from './services/official-download-bridge/bridge-attachment-store.js';
@@ -81,7 +82,7 @@ import { LocalMcpConfigError, McpLocalClients, type LocalClientKind } from './se
 import { DpapiUserSecretBackend, type SecretBackend, type SecretStore } from './services/secret-store.js';
 import { AttachmentPreviewService, createRepositoryPreviewAuthority, type PreviewPresenter } from './attachment-preview.js';
 import { createAttachmentIntegrity } from './attachment-integrity.js';
-import { AttachmentOpenService } from './attachment-open.js';
+import { AttachmentOpenService, resolveStoredAttachmentFolder } from './attachment-open.js';
 import { LineMediaService } from './line-media.js';
 import { toDataURL } from 'qrcode';
 import { createCoalescedSnapshotPublisher } from './domain-event-publisher.js';
@@ -762,7 +763,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   let settingsTail: Promise<void> = Promise.resolve();
   const friendWhitelist = new FriendWhitelistRepository(options.pool);
   const autoresponders = new AutoResponderRepository(options.pool);
-  const roomActivation = new RoomActivationRepository(options.pool);
   const workspace = options.workspaceAuthority ?? await WorkspaceAuthority.load(settings);
   const admins = new AdminRepository(options.pool);
   const permissionRepository = new AgentPermissionRepository(options.pool);
@@ -1565,7 +1565,10 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
           ...(status.identity ? { identity: status.identity } : {}) });
         void publishSnapshot().catch(() => undefined);
       },
-      onError: (error) => options.audit?.failure(diagnosticFailure('ipc', 'execute', error), { background: true }),
+      onError: (error) => {
+        const reasonDetail = bridgeFailureDetail(error);
+        options.audit?.failure({ ...diagnosticFailure('ipc', 'execute', error), ...(reasonDetail ? { detail: reasonDetail } : {}) }, { background: true });
+      },
     });
     stopDownloadBridge = onceCleanup(() => downloadBridge?.close());
     startupCleanup.add(stopDownloadBridge);
@@ -1653,15 +1656,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     isCurrentControl: roomIsCurrentControl,
     send: (command, signal) => sendLineCommand(command, signal),
   };
-  const roomAutomation = new RoomAutomationService(roomActivation, autoresponders,
-    await options.secretStore?.loadOrCreateRoomActivationDigestKey() ?? randomBytes(32), 1, lineReplyTransport, options.locale ?? 'en');
+  const roomAutomation = new RoomAutomationService(autoresponders, lineReplyTransport);
   const permissionCommands = createPermissionCommandService(permissionRepository, lineReplyTransport,
     publishExecutionPolicyChanged, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic));
   // Group free mode: durable window per chat, debounced member messages, one room-member Agent job per batch.
   freeMode = new FreeModeService({ store: freeModeStore,
-    roomGrant: (key) => roomActivation.getActiveRoomAuthorization(key).then((grant) => grant ? { grantId: grant.grantId, version: grant.version } : null),
-    enableRoom: (key, adminUserId, sourceMessageId) => roomAutomation.enableByPrimaryAdmin(
-      { accountId: key.accountId, chatType: key.chatType as 'group' | 'room', chatId: key.chatId }, adminUserId, sourceMessageId),
+    roomAvailable: async (key) => (await accounts.getAccount(key.accountId))?.productRole === 'AGENT'
+      && (await settings.getConversationAgent(key)) !== null,
     sendSystemText: (input) => agentLineSend.sendSystemText(input),
     provider: async (key) => resolveChatProvider(settings, (await settings.getConversationAgent(key))?.provider),
     workspacePath: async () => { const inspection = await workspace.inspect(); return inspection.status === 'available' ? inspection.path : null; },
@@ -3276,6 +3277,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         }
         if (!account.ownMid) return failure(request.requestId, 'ADMIN_NOT_SET', '尚未設定主要管理者。');
         if (request.type === 'adminDownloadBridgeStart') {
+          if (request.installExtension === true) {
+            if (!await downloadBridge.installExtensionFromStore({ accountId: account.accountId, adminMid: account.ownMid })) {
+              return failure(request.requestId, 'DOWNLOAD_BRIDGE_BUSY', '下載用 Chrome 正在使用中，請先清除下載登入。');
+            }
+            return accepted(request.requestId);
+          }
           await downloadBridge.start({ accountId: account.accountId, adminMid: account.ownMid });
           return accepted(request.requestId);
         }
@@ -3722,6 +3729,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         return accepted(request.requestId);
       }
       if (request.type === 'openAttachment') return { type: request.type, requestId: request.requestId, ok: true, opened: false };
+      if (request.type === 'openStoredAttachmentsFolder') return { type: request.type, requestId: request.requestId, ok: true, opened: false };
       if (request.type === 'revealAttachment') return { type: request.type, requestId: request.requestId, ok: true, revealed: false };
       if (request.type === 'subscribeEvents') return accepted(request.requestId);
       if (request.type === 'mcpGetStatus') {
@@ -3980,6 +3988,18 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     async openAttachment(attachmentId, senderId = -1) {
       if (closing) return false;
       return attachmentOpenService?.open(attachmentId, { senderId }) ?? false;
+    },
+    async openStoredAttachmentsFolder(key) {
+      if (closing) return false;
+      const open = options.openFolderPath ?? options.openAttachmentPath;
+      if (!open) return false;
+      // The folder comes from the database row of the newest saved file and the managed root. The renderer sends only the chat key.
+      const newest = (await attachmentStorage.listStoredAttachments(key, null, 1)).attachments[0];
+      if (!newest) return false;
+      const row = await messages.getAttachment(newest.attachmentId);
+      if (!row?.relativePath || row.accountId !== key.accountId || row.chatType !== key.chatType || row.chatId !== key.chatId) return false;
+      const folder = await resolveStoredAttachmentFolder(options.attachmentRoot, row.relativePath);
+      return folder ? (await open(folder)) === '' : false;
     },
     async downloadAttachment(key: import('@line-agent/contracts').WritableConversationKey, attachmentId: string) {
       if (closing) return false;
@@ -4338,6 +4358,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   }
   return { ...facade,
     openAttachment: (...args) => admitted(() => facade.openAttachment!(...args), { operation: 'attachment' }),
+    openStoredAttachmentsFolder: (...args) => admitted(() => facade.openStoredAttachmentsFolder!(...args), { operation: 'attachment', identity: { accountId: args[0].accountId } }),
     listMessages: (...args) => admitted(() => facade.listMessages(...args), { operation: 'ipc', identity: { accountId: args[0].accountId } }),
     listChatNotes: (...args) => admitted(() => chatResources.listNotes(...args), { operation: 'note_list', identity: { accountId: args[0].accountId } }),
     getChatNote: (...args) => admitted(() => chatResources.getNote(...args), { operation: 'note_detail', identity: { accountId: args[0].accountId } }),

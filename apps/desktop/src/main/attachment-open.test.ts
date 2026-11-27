@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AttachmentOpenService } from './attachment-open.js';
+import { AttachmentOpenService, resolveStoredAttachmentFolder } from './attachment-open.js';
 import type { PreviewRecord } from './attachment-preview.js';
 
 const ID = '2a653934-7064-4d90-a9f0-e6e24cf4f93d';
@@ -201,5 +201,14 @@ describe('Windows attachment open', () => {
     acquired.resolve(); await vi.waitFor(() => expect(service.inventory().active).toBe(0));
     expect(service.inventory().handles).toBe(0);
     const after = await lstat(f.target); expect(after.ino).toBe(before.ino);
+  });
+
+  it('resolves a stored chat folder only inside the managed root', async () => {
+    const f = await fixture();
+    const chatFolder = path.join(f.root, 'accounts', 'a', 'group', 'c');
+    await mkdir(path.join(chatFolder, 'sender', 'message', 'digest'), { recursive: true });
+    expect(await resolveStoredAttachmentFolder(f.root, 'accounts/a/group/c/sender/message/digest/file.pdf')).toBe(await realpath(chatFolder));
+    expect(await resolveStoredAttachmentFolder(f.root, '../outside/file.pdf')).toBeNull();
+    expect(await resolveStoredAttachmentFolder(f.root, 'accounts/a/group/missing/sender/message/digest/file.pdf')).toBeNull();
   });
 });

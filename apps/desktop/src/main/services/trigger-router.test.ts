@@ -263,6 +263,18 @@ describe('/model command', () => {
     const direct = envelope({ chatType: 'direct', text: '/model opus', mentionIds: [], mentionRanges: [] });
     expect(routeTrigger(direct, admin)).toEqual({ type: 'agent_model', command: { action: 'argument', value: 'opus' } });
   });
+  it('answers /權限 and /permissions in a group with the hint for a served sender only, never as an Agent prompt', () => {
+    const served = { ...context, agentEnabled: true };
+    const unserved = { ...context, agentEnabled: false };
+    for (const text of ['/權限', '/permissions', '@Agent /權限', '@Agent /Permissions']) {
+      const source = envelope({ text, ...(text.startsWith('@') ? {} : { mentionIds: [], mentionRanges: [] }) });
+      expect(routeTrigger(source, served)).toEqual({ type: 'permission_hint' });
+      expect(routeTrigger(source, { ...unserved, senderIsPrimaryAdmin: true })).toEqual({ type: 'permission_hint' });
+      expect(routeTrigger(source, unserved)).toEqual({ type: 'ignore' });
+    }
+    const direct = envelope({ chatType: 'direct', text: '/權限', mentionIds: [], mentionRanges: [] });
+    expect(routeTrigger(direct, { ...context, senderIsPrimaryAdmin: true }).type).not.toBe('permission_hint');
+  });
   it('a served non-administrator never changes the model: the text is ordinary, like /agent default', () => {
     expect(routeTrigger(envelope({ text: '@Agent /model opus', ...mention }), context)).toEqual({ type: 'prompt', provider: 'codex', prompt: '/model opus' });
     const direct = envelope({ chatType: 'direct', text: '/model opus', mentionIds: [], mentionRanges: [] });

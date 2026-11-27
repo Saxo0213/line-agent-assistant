@@ -92,6 +92,10 @@ export function downloadBridgeErrorTextFor(locale: Locale, code: string | undefi
     EXTENSION_VERSION_MISMATCH: 'downloadBridgeErrorExtensionVersion',
     QR_FLOW_ERROR: 'downloadBridgeErrorQrFlow', PIN_CODE_TIMEOUT: 'downloadBridgeErrorPinTimeout', BRIDGE_SESSION_EXPIRED: 'downloadBridgeErrorSessionExpired',
   };
+  const extraKeys: Record<string, keyof typeof EXTRA_DESKTOP_COPY> = {
+    EXTENSION_STORE_INSTALL_REQUIRED: 'downloadBridgeStoreRequired', EXTENSION_FEATURES_CHANGED: 'downloadBridgeFeaturesChanged',
+  };
+  if (code !== undefined && Object.hasOwn(extraKeys, code)) return extraTextFor(locale, extraKeys[code] as keyof typeof EXTRA_DESKTOP_COPY);
   const key = code !== undefined && Object.hasOwn(keys, code) ? keys[code] : undefined;
   return key ? desktopTextFor(locale, key) : desktopTextFor(locale, 'downloadBridgeErrorArg0', { arg0: code ?? '' });
 }

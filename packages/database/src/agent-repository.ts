@@ -748,13 +748,6 @@ export class AgentRepository {
             [origin.direct_friend_grant_id, peek.account_id, origin.source_sender_id, origin.direct_friend_grant_version, peek.chat_type, peek.chat_id]);
           if (!grant.rowCount) { await client.query('ROLLBACK'); return null; }
         }
-        if (origin.room_agent_grant_id) {
-          const grant = await client.query(
-            `SELECT 1 FROM room_agent_grants WHERE grant_id = $1 AND account_id = $2 AND chat_type = $3 AND chat_id = $4
-               AND version = $5 AND state = 'ACTIVE' FOR SHARE`,
-            [origin.room_agent_grant_id, peek.account_id, peek.chat_type, peek.chat_id, origin.room_agent_grant_version]);
-          if (!grant.rowCount) { await client.query('ROLLBACK'); return null; }
-        }
       }
       const taken = await client.query(
         'SELECT 1 FROM agent_jobs WHERE retry_of_job_id = $1 UNION ALL SELECT 1 FROM agent_outputs WHERE job_id = $1', [input.originJobId]);

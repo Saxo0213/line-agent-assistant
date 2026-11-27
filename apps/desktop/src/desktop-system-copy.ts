@@ -56,6 +56,10 @@ export const EXTRA_DESKTOP_COPY = {
   reactionButton: 'React', reactionNice: 'Nice', reactionLove: 'Love', reactionFun: 'Fun', reactionAmazing: 'Amazing', reactionSad: 'Sad', reactionOmg: 'OMG',
   reactionFailed: 'Unable to send the reaction.',
   mentionListLabel: 'Members to mention', mentionNoMatch: 'No matching members',
+  downloadBridgeStoreInstall: 'Install extension from the store',
+  downloadBridgeStoreRequired: 'The download Chrome needs the LINE extension installed from the Chrome Web Store.',
+  downloadBridgeStoreWindow: 'In the Chrome window that opened, click "Add to Chrome". Then close that window.',
+  downloadBridgeFeaturesChanged: 'The LINE extension was updated and its login or download method changed. This version of the app cannot use it for now.',
 } as const;
 
 export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
@@ -89,6 +93,10 @@ export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, str
   reactionButton: '表情', reactionNice: '讚', reactionLove: '愛心', reactionFun: '好笑', reactionAmazing: '驚訝', reactionSad: '難過', reactionOmg: 'OMG',
   reactionFailed: '無法送出反應',
   mentionListLabel: '可提及的成員', mentionNoMatch: '沒有符合的成員',
+  downloadBridgeStoreInstall: '從商店安裝擴充功能',
+  downloadBridgeStoreRequired: '下載用 Chrome 需要從商店安裝 LINE 擴充功能。',
+  downloadBridgeStoreWindow: '請在開啟的 Chrome 視窗按「加到 Chrome」，完成後關閉這個視窗。',
+  downloadBridgeFeaturesChanged: 'LINE 擴充功能已更新，登入或下載方式有變動，這個版本的 App 暫時無法使用。',
 };
 export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
   optionalLocalAnalysis: '任意のローカル分析', agents: 'Agent', operations: '操作', agentQueue: 'Agent キュー', bytes: 'バイト', lineAccounts: 'LINE アカウント',
@@ -121,6 +129,10 @@ export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string
   reactionButton: 'リアクション', reactionNice: 'いいね', reactionLove: 'ラブ', reactionFun: '面白い', reactionAmazing: 'びっくり', reactionSad: '悲しい', reactionOmg: 'OMG',
   reactionFailed: 'リアクションを送信できません',
   mentionListLabel: 'メンションするメンバー', mentionNoMatch: '一致するメンバーがいません',
+  downloadBridgeStoreInstall: 'ストアから拡張機能をインストール',
+  downloadBridgeStoreRequired: 'ダウンロード用 Chrome には、ストアからインストールした LINE 拡張機能が必要です。',
+  downloadBridgeStoreWindow: '開いた Chrome ウィンドウで「Chrome に追加」を押し、完了したらそのウィンドウを閉じてください。',
+  downloadBridgeFeaturesChanged: 'LINE 拡張機能が更新され、ログインまたはダウンロードの方式が変わりました。このバージョンのアプリでは当面使用できません。',
 };
 export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> = {
   optionalLocalAnalysis: '선택적 로컬 분석', agents: 'Agent', operations: '작업', agentQueue: 'Agent 대기열', bytes: '바이트', lineAccounts: 'LINE 계정',
@@ -153,6 +165,10 @@ export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> 
   reactionButton: '반응', reactionNice: '좋아요', reactionLove: '사랑', reactionFun: '웃겨요', reactionAmazing: '놀라워요', reactionSad: '슬퍼요', reactionOmg: 'OMG',
   reactionFailed: '반응을 보낼 수 없습니다',
   mentionListLabel: '멘션할 멤버', mentionNoMatch: '일치하는 멤버가 없습니다',
+  downloadBridgeStoreInstall: '스토어에서 확장 프로그램 설치',
+  downloadBridgeStoreRequired: '다운로드용 Chrome에는 스토어에서 설치한 LINE 확장 프로그램이 필요합니다.',
+  downloadBridgeStoreWindow: '열린 Chrome 창에서 「Chrome에 추가」를 누른 다음 그 창을 닫으세요.',
+  downloadBridgeFeaturesChanged: 'LINE 확장 프로그램이 업데이트되어 로그인 또는 다운로드 방식이 바뀌었습니다. 이 버전의 앱에서는 당분간 사용할 수 없습니다.',
 };
 
 const JAPANESE_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {

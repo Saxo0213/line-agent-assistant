@@ -136,7 +136,9 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('lineBeginAdminChange'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('lineCancelAdminChange'), accountId: IdSchema }),
   /** Primary Admin download bridge. `accountId` is the Primary Admin account. */
-  RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeStart'), accountId: IdSchema }),
+  RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeStart'), accountId: IdSchema,
+    /** True: open a visible Chrome on the download profile to install the extension from the Web Store (no login start). */
+    installExtension: z.boolean().optional() }),
   RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeRefreshQr'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('adminDownloadBridgeClear'), accountId: IdSchema }),
   /** Turns the automatic download of new External Monitor attachments on or off. */
@@ -204,6 +206,7 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('searchMessages'), query: z.strictObject({ key: ConversationKeySchema.optional(), accountId: IdSchema.optional(), scope: MessageSearchScopeSchema.optional(), senderId: IdSchema.optional(), text: z.string().optional(), from: TimestampSchema.optional(), to: TimestampSchema.optional(), hasAttachment: z.boolean().optional(), attachmentKind: z.enum(['image', 'video', 'audio', 'file']).optional(), limit: z.number().int().positive().max(500) }) }),
   RequestIdSchema.extend({ type: z.literal('openExternalUrl'), url: z.string().min(1).max(8192) }),
   RequestIdSchema.extend({ type: z.literal('openAttachment'), attachmentId: IdSchema }),
+  RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('openStoredAttachmentsFolder') }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('downloadAttachment'), attachmentId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('revealAttachment'), attachmentId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('resolveFileTypeIcon'), extension: z.string().regex(/^[a-z0-9]{1,12}$/) }),
@@ -577,6 +580,7 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('cancelChatResourceRequest'), requestId: IdSchema, ok: z.literal(true), cancelled: z.boolean() }),
     z.strictObject({ type: z.literal('getJobEvents'), requestId: IdSchema, ok: z.literal(true), events: z.array(AgentEventSchema) }),
     z.strictObject({ type: z.literal('openAttachment'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
+    z.strictObject({ type: z.literal('openStoredAttachmentsFolder'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
     z.strictObject({ type: z.literal('openExternalUrl'), requestId: IdSchema, ok: z.literal(true) }),
     z.strictObject({ type: z.literal('getChromeLoginAvailability'), requestId: IdSchema, ok: z.literal(true), status: ChromeLtsmStatusSchema }),
     z.strictObject({ type: z.literal('detectChromeLtsm'), requestId: IdSchema, ok: z.literal(true), result: ChromeLtsmInstallResultSchema }),

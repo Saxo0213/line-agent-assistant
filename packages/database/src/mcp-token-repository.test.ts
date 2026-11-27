@@ -7,7 +7,6 @@ import { AccountRepository } from './account-repository.js';
 import { AdminRepository } from './admin-repository.js';
 import { MessageRepository } from './message-repository.js';
 import { FriendWhitelistRepository } from './friend-whitelist-repository.js';
-import { RoomActivationRepository } from './room-activation-repository.js';
 import { McpDomainError, McpTokenRepository } from './mcp-token-repository.js';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -657,7 +656,7 @@ database('MCP token & audit repository and target/time message queries', () => {
   it('scopes LINE-origin Agent jobs by origin: chat-only for granted friends and group members, full for the Primary Admin and UI, deny when unclassifiable or stale', async () => {
     const seedJob = async (input: {
       chatType: 'direct' | 'group'; chatId: string; senderId: string;
-      direct?: { grantId: string; version: number }; room?: { grantId: string; version: number };
+      direct?: { grantId: string; version: number };
       status?: string; generation?: number; accountId?: string;
     }): Promise<string> => {
       const accountId = input.accountId ?? 'account-agent';
@@ -676,42 +675,17 @@ database('MCP token & audit repository and target/time message queries', () => {
       );
       await pool.query(
         `INSERT INTO agent_jobs (job_id, account_id, chat_type, chat_id, provider, source_type, source_message_id, prompt, workspace_path, generation, creation_epoch, status,
-           direct_friend_grant_id, direct_friend_grant_version, room_agent_grant_id, room_agent_grant_version)
-         VALUES ($1, $2, $3, $4, 'claude', 'line', $5, 'scope', 'C:\\workspace', $6, 1, $7, $8, $9, $10, $11)`,
+           direct_friend_grant_id, direct_friend_grant_version)
+         VALUES ($1, $2, $3, $4, 'claude', 'line', $5, 'scope', 'C:\\workspace', $6, 1, $7, $8, $9)`,
         [jobId, accountId, input.chatType, input.chatId, messageId, input.generation ?? 1, input.status ?? 'running',
-          input.direct?.grantId ?? null, input.direct?.version ?? null, input.room?.grantId ?? null, input.room?.version ?? null],
+          input.direct?.grantId ?? null, input.direct?.version ?? null],
       );
       return jobId;
     };
     const friends = new FriendWhitelistRepository(pool);
-    const rooms = new RoomActivationRepository(pool);
     const friendGrant = async (mid: string) => {
       const g = await friends.activate('account-agent', mid, 'test-admin');
       return { grantId: g.grantId, version: g.version };
-    };
-    // Real ENABLED room policy + ACTIVE room grant (authority_version == grant version, as admission requires).
-    const roomGrant = async (chatType: 'group', chatId: string) => {
-      await pool.query(
-        `UPDATE room_agent_grants SET state = 'REVOKED', revoked_at = clock_timestamp()
-         WHERE account_id = 'account-agent' AND chat_type = $1 AND chat_id = $2 AND state = 'ACTIVE'`, [chatType, chatId]);
-      const requestId = randomUUID();
-      await pool.query(
-        `INSERT INTO room_activation_requests(request_id, account_id, chat_type, chat_id, source_message_id, requester_id,
-           admin_chat_id, admin_user_id, admin_version, room_authority_version, state, wait_expires_at)
-         VALUES ($1,'account-agent',$2,$3,$4,'member','admin','mid-primary-admin',1,1,'CONSUMED',clock_timestamp())`,
-        [requestId, chatType, chatId, randomUUID()]);
-      const policy = await pool.query<{ authority_version: string }>(
-        `INSERT INTO room_agent_policies(account_id, chat_type, chat_id, state, authority_version)
-         VALUES ('account-agent',$1,$2,'ENABLED',1)
-         ON CONFLICT (account_id, chat_type, chat_id) DO UPDATE
-           SET state = 'ENABLED', authority_version = room_agent_policies.authority_version + 1
-         RETURNING authority_version`, [chatType, chatId]);
-      const version = Number(policy.rows[0]!.authority_version);
-      const grantId = randomUUID();
-      await pool.query(
-        `INSERT INTO room_agent_grants(grant_id, account_id, chat_type, chat_id, capability, version, state, request_id)
-         VALUES ($1,'account-agent',$2,$3,'AGENT_USE_ROOM',$4,'ACTIVE',$5)`, [grantId, chatType, chatId, version, requestId]);
-      return { grantId, version };
     };
     const run = (context: Parameters<McpTokenRepository['executeForInternalAgent']>[0]['context'], opts: {
       toolName?: 'list_targets' | 'query_target_messages' | 'query_target_messages_by_time';
@@ -761,11 +735,10 @@ database('MCP token & audit repository and target/time message queries', () => {
     // Explicitly asking for its own chat is fine.
     expect((await run(friendCtx, { requestedAccountId: 'account-agent', requestedChat: { chatType: 'direct', chatId: 'chat-friend-direct' } })).messages.length).toBeGreaterThan(0);
 
-    // Agent-enabled group member job: only that group on that account, even though account-admin has a same-named group.
-    // An ACCOUNT-scoped friend grant triggered inside a group: the job carries both a direct and a room grant; scope is that group only.
+    // Whitelisted group member job: only that group on that account, even though account-admin has a same-named group.
+    // An ACCOUNT-scoped friend grant triggered inside a group: the job carries the direct grant only; scope is that group only.
     const aliceGrant = await friendGrant('user-alice');
-    const groupRoom = await roomGrant('group', 'group-alpha');
-    const groupJob = await seedJob({ chatType: 'group', chatId: 'group-alpha', senderId: 'user-alice', direct: aliceGrant, room: groupRoom });
+    const groupJob = await seedJob({ chatType: 'group', chatId: 'group-alpha', senderId: 'user-alice', direct: aliceGrant });
     const groupCtx = { sourceType: 'line' as const, jobId: groupJob };
     const groupTargets = (await run(groupCtx, { toolName: 'list_targets' })).targets;
     expect(groupTargets.map((t) => `${t.accountId}/${t.chatType}/${t.chatId}`)).toEqual(['account-agent/group/group-alpha']);
@@ -784,7 +757,7 @@ database('MCP token & audit repository and target/time message queries', () => {
     const adminMsgs = (await run({ sourceType: 'line', jobId: adminGroupJob })).messages;
     expect(new Set(adminMsgs.map((m) => m.chatId)).size).toBeGreaterThan(1);
     // A granted job whose sender is the Primary Admin is still full.
-    const adminGrantJob = await seedJob({ chatType: 'group', chatId: 'group-alpha', senderId: 'mid-primary-admin', room: groupRoom });
+    const adminGrantJob = await seedJob({ chatType: 'group', chatId: 'group-alpha', senderId: 'mid-primary-admin', direct: aliceGrant });
     expect(new Set((await run({ sourceType: 'line', jobId: adminGrantJob })).messages.map((m) => m.accountId))).toEqual(new Set(['account-admin', 'account-agent']));
 
     // UI: full scope.
@@ -852,17 +825,10 @@ database('MCP token & audit repository and target/time message queries', () => {
     await expect(run({ sourceType: 'job', jobId: revokableJob, generation: 1, accountId: 'account-agent' }, { toolName: 'list_targets' })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
     expect((await tokens.listAuditRecords(1000)).filter((r) => r.action === 'AUTH_REJECTED').length).toBeGreaterThanOrEqual(rejectedBefore + 3);
 
-    // Group: still valid, then revokeRoom() denies the same job.
+    // Group: still valid, then revoking the sender's whitelist grant denies the same job (a group needs no activation).
     await run(groupCtx);
-    expect(await rooms.revokeRoom({ accountId: 'account-agent', chatType: 'group', chatId: 'group-alpha' }, 'test-admin')).toBe(true);
-    await expect(run(groupCtx)).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
-    // Revoking only the sender's friend grant also kills a group job even if the room is re-enabled.
-    const reRoom = await roomGrant('group', 'group-alpha');
-    const aliceNow = await friendGrant('user-alice');
-    const groupJob2 = await seedJob({ chatType: 'group', chatId: 'group-alpha', senderId: 'user-alice', direct: aliceNow, room: reRoom });
-    await run({ sourceType: 'line', jobId: groupJob2 });
     await friends.revoke('account-agent', 'user-alice', 'test-admin');
-    await expect(run({ sourceType: 'line', jobId: groupJob2 })).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
+    await expect(run(groupCtx)).rejects.toMatchObject({ code: 'SCOPE_DENIED' });
 
     // Audit: scope-denied rows exist and allowed rows record the chat scope in the principal.
     const audits = await tokens.listAuditRecords(200);
