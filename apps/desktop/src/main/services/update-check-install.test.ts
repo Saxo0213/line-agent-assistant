@@ -25,8 +25,10 @@ function fakeUpdater(overrides: Partial<AppUpdaterLike> = {}) {
   return { updater, calls };
 }
 
-async function build(options: { canAutoInstall?: boolean; updater?: AppUpdaterLike; calls?: string[]; prepare?: () => Promise<boolean>; beforePrepare?: (saved: Partial<UpdateCheckPersisted> | null) => void; initial?: Partial<UpdateCheckPersisted> | null; fetch?: (url: string) => Promise<Response> } = {}) {
-  const memory = memoryStore(options.initial ?? null);
+async function build(options: { canAutoInstall?: boolean; updater?: AppUpdaterLike; calls?: string[]; prepare?: () => Promise<boolean>; beforePrepare?: (saved: Partial<UpdateCheckPersisted> | null) => void; initial?: Partial<UpdateCheckPersisted> | null; fetch?: (url: string) => Promise<Response>;
+  autoInstall?: boolean; isIdle?: () => Promise<boolean> } = {}) {
+  // The manual tests run with the automatic install off.
+  const memory = memoryStore({ autoInstall: options.autoInstall ?? false, ...(options.initial ?? {}) });
   const states: any[] = [];
   const openExternal = vi.fn();
   const prepareInstall = vi.fn(async () => { options.calls?.push('shutdown'); options.beforePrepare?.(memory.saved); return options.prepare ? options.prepare() : true; });
@@ -34,6 +36,7 @@ async function build(options: { canAutoInstall?: boolean; updater?: AppUpdaterLi
     currentVersion: '1.0.279', fetch: async (url) => options.fetch ? options.fetch(url) : new Response(release(), { status: 200 }), store: memory.store, openExternal,
     onChange: (state) => states.push(state), canAutoInstall: options.canAutoInstall ?? true,
     ...(options.updater ? { getUpdater: () => options.updater! } : {}), prepareInstall,
+    ...(options.isIdle ? { isIdle: options.isIdle } : {}),
   });
   await service.start();
   await service.checkNow();
@@ -216,5 +219,88 @@ describe('update install', () => {
     await service.setEnabled(false);
     await service.install();
     expect(updater.checkForUpdates).not.toHaveBeenCalled();
+  });
+});
+
+describe('automatic install', () => {
+  it('starts the download after a check and keeps the install for the idle moment', async () => {
+    const { updater, calls } = fakeUpdater();
+    const { service } = await build({ updater, calls, autoInstall: true, isIdle: async () => false });
+    await vi.waitFor(() => expect(service.state().download.status).toBe('ready'));
+    expect(calls).toEqual(['check', 'download']);
+    expect(updater.autoInstallOnAppQuit).toBe(false);
+    expect(updater.quitAndInstall).not.toHaveBeenCalled();
+    service.stop();
+  });
+
+  it('does not install while the app is busy', async () => {
+    const { updater, calls } = fakeUpdater();
+    const { service, prepareInstall } = await build({ updater, calls, autoInstall: true, isIdle: async () => false });
+    await vi.waitFor(() => expect(service.state().download.status).toBe('ready'));
+    await vi.advanceTimersByTimeAsync(3 * 60_000);
+    expect(prepareInstall).not.toHaveBeenCalled();
+    expect(updater.quitAndInstall).not.toHaveBeenCalled();
+    service.stop();
+  });
+
+  it('gives up after one failed shutdown and keeps the error state', async () => {
+    const { updater, calls } = fakeUpdater();
+    const events: string[] = [];
+    const memory = memoryStore({ autoInstall: true });
+    const prepareInstall = vi.fn(async () => false);
+    const service = createUpdateCheckService({
+      currentVersion: '1.0.279', fetch: async () => new Response(release(), { status: 200 }), store: memory.store, openExternal: vi.fn(),
+      canAutoInstall: true, getUpdater: () => updater, prepareInstall, isIdle: async () => true, onAutoInstall: (event) => events.push(event.phase),
+    });
+    await service.start();
+    await service.checkNow();
+    await vi.waitFor(() => expect(service.state().download.status).toBe('ready'));
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(prepareInstall).toHaveBeenCalledTimes(1);
+    expect(updater.quitAndInstall).not.toHaveBeenCalled();
+    expect(service.state().download.status).toBe('error');
+    expect(events).toEqual(['download_started', 'download_ready', 'install_failed', 'install_given_up']);
+    expect(calls).toEqual(['check', 'download']);
+    service.stop();
+  });
+
+  it('installs the downloaded build on exit without the shutdown path', async () => {
+    const { updater } = fakeUpdater();
+    const { service, prepareInstall } = await build({ updater, autoInstall: true, isIdle: async () => false });
+    expect(service.installOnExit()).toBe(false);
+    await vi.waitFor(() => expect(service.state().download.status).toBe('ready'));
+    expect(service.state().autoInstallStage).toBe('waiting');
+    expect(service.installOnExit()).toBe(true);
+    expect(updater.quitAndInstall).toHaveBeenCalledWith(true, false);
+    expect(prepareInstall).not.toHaveBeenCalled();
+    expect(service.installOnExit()).toBe(false);
+    service.stop();
+  });
+
+  it('starts the download at startup when a stored update is available', async () => {
+    const { updater, calls } = fakeUpdater();
+    const memory = memoryStore({ autoInstall: true, available: true, latestVersion: '1.0.280', releaseUrl: RELEASE_URL, lastCheckedAt: new Date().toISOString() });
+    const service = createUpdateCheckService({
+      currentVersion: '1.0.279', fetch: async () => new Response(release(), { status: 200 }), store: memory.store, openExternal: vi.fn(),
+      canAutoInstall: true, getUpdater: () => updater, prepareInstall: async () => true, isIdle: async () => false,
+    });
+    await service.start();
+    await vi.waitFor(() => expect(service.state().download.status).toBe('ready'));
+    expect(calls).toEqual(['check', 'download']);
+    service.stop();
+  });
+
+  it('installs silently at the first idle check', async () => {
+    const { updater, calls } = fakeUpdater();
+    let idle = false;
+    const { service } = await build({ updater, calls, autoInstall: true, isIdle: async () => idle });
+    await vi.waitFor(() => expect(service.state().download.status).toBe('ready'));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(updater.quitAndInstall).not.toHaveBeenCalled();
+    idle = true;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toEqual(['check', 'download', 'shutdown', 'quitAndInstall']);
+    expect(updater.quitAndInstall).toHaveBeenCalledWith(true, true);
+    service.stop();
   });
 });

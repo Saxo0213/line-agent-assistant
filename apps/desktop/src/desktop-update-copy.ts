@@ -3,6 +3,10 @@ import type { Locale } from './locale.js';
 /** Copy of the update check (Settings → About and the 設定 nav badge). Slots use the `{argN}` convention of the main catalog. */
 export const ENGLISH_UPDATE_COPY = {
   autoCheck: 'Automatically check for updates',
+  autoInstall: 'Install updates automatically',
+  autoInstallHelp: 'Downloads a new version in the background, then installs it and reopens the app when the app is idle',
+  downloadedWaiting: 'Downloaded v{arg0}; installs automatically when the app is idle',
+  installingUpdate: 'Installing the update…',
   lastChecked: 'Last checked: {arg0}',
   neverChecked: 'Not checked yet',
   checkFailed: 'Check failed',
@@ -28,6 +32,10 @@ type UpdateCopy = Record<UpdateCopyKey, string>;
 
 export const TRADITIONAL_CHINESE_UPDATE_COPY: UpdateCopy = {
   autoCheck: '自動檢查更新',
+  autoInstall: '自動安裝更新',
+  autoInstallHelp: '有新版時在背景下載，App 閒置時自動安裝並重新開啟',
+  downloadedWaiting: '已下載 v{arg0}，App 閒置時自動安裝',
+  installingUpdate: '正在安裝更新…',
   lastChecked: '上次檢查：{arg0}',
   neverChecked: '尚未檢查',
   checkFailed: '檢查失敗',
@@ -51,6 +59,10 @@ export const TRADITIONAL_CHINESE_UPDATE_COPY: UpdateCopy = {
 
 export const JAPANESE_UPDATE_COPY: UpdateCopy = {
   autoCheck: '更新を自動的に確認',
+  autoInstall: '更新を自動的にインストール',
+  autoInstallHelp: '新しいバージョンをバックグラウンドでダウンロードし、アプリがアイドル状態のときに自動でインストールして再起動します',
+  downloadedWaiting: 'v{arg0} をダウンロードしました。アプリがアイドル状態になると自動でインストールします',
+  installingUpdate: '更新をインストールしています…',
   lastChecked: '前回の確認：{arg0}',
   neverChecked: '未確認',
   checkFailed: '確認に失敗しました',
@@ -74,6 +86,10 @@ export const JAPANESE_UPDATE_COPY: UpdateCopy = {
 
 export const KOREAN_UPDATE_COPY: UpdateCopy = {
   autoCheck: '업데이트 자동 확인',
+  autoInstall: '업데이트 자동 설치',
+  autoInstallHelp: '새 버전이 있으면 백그라운드에서 다운로드하고, 앱이 유휴 상태일 때 자동으로 설치한 뒤 다시 시작합니다',
+  downloadedWaiting: 'v{arg0} 다운로드 완료, 앱이 유휴 상태일 때 자동으로 설치합니다',
+  installingUpdate: '업데이트를 설치하는 중…',
   lastChecked: '마지막 확인: {arg0}',
   neverChecked: '아직 확인하지 않음',
   checkFailed: '확인 실패',

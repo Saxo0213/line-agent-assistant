@@ -37,8 +37,12 @@ export type UpdateCheckPersisted = {
   ignoredVersion: string | null;
   pendingInstallTarget: { version: string; releaseUrl: string } | null;
   installedNotice: { version: string; releaseUrl: string } | null;
+  /** Download in the background and install when idle. A stored file without this field means true. */
+  autoInstall: boolean;
+  /** Version that ran when an automatic download became ready; read once at the next start to record `installed`. */
+  autoInstallFrom: string | null;
 };
-export const DEFAULT_PERSISTED: UpdateCheckPersisted = { enabled: true, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, ignoredVersion: null, pendingInstallTarget: null, installedNotice: null };
+export const DEFAULT_PERSISTED: UpdateCheckPersisted = { enabled: true, autoInstall: true, autoInstallFrom: null, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, ignoredVersion: null, pendingInstallTarget: null, installedNotice: null };
 
 /** The slice of electron-updater's AppUpdater that the service drives; injected so tests never touch the real updater. */
 export type AppUpdaterLike = {
@@ -49,6 +53,19 @@ export type AppUpdaterLike = {
   quitAndInstall(isSilent?: boolean, isForceRunAfter?: boolean): void;
   on(event: string, listener: (...args: any[]) => void): unknown;
 };
+
+/** One step of the automatic install, for the system records. `error` keeps the real error object; the sink reads its code. */
+export type AutoInstallEvent = {
+  phase: 'download_started' | 'download_ready' | 'download_failed' | 'install_started' | 'install_failed' | 'install_given_up' | 'installed';
+  /** The target version; for `installed`, the version that now runs. */
+  version: string | null;
+  /** Only for `installed`: the version before the install. */
+  fromVersion?: string | null;
+  /** True when the step ran in the exit path. */
+  viaExit?: boolean;
+  error?: unknown;
+};
+export const AUTO_INSTALL_IDLE_INTERVAL_MS = 60 * 1000;
 
 export type UpdateCheckStore = { load(): Promise<Partial<UpdateCheckPersisted> | null>; save(value: UpdateCheckPersisted): Promise<void> };
 
@@ -84,6 +101,11 @@ type Options = {
   getUpdater?: () => AppUpdaterLike;
   /** Runs the normal service shutdown (PostgreSQL, workers, agents) and resolves true when it is safe to hand over to the installer. */
   prepareInstall?: () => Promise<boolean>;
+  /** True when no Agent job is queued or running and no LINE send is pending. The automatic install waits for true. */
+  isIdle?: () => Promise<boolean>;
+  /** Receives each step of the automatic download and install. */
+  onAutoInstall?: (event: AutoInstallEvent) => void;
+  idleIntervalMs?: number;
 };
 
 async function readCappedText(response: Response): Promise<string> {
@@ -118,10 +140,17 @@ export function createUpdateCheckService(options: Options) {
   let download: UpdateCheckState['download'] = { status: 'idle', percent: 0 };
   let installing = false;
   let updater: AppUpdaterLike | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleTarget: AppUpdaterLike | undefined;
+  let installStage: UpdateCheckState['autoInstallStage'] = 'none';
+  let installStarted = false;
+  let stopped = false;
   const canAutoInstall = options.canAutoInstall === true && options.getUpdater !== undefined;
 
   const state = (): UpdateCheckState => ({
     enabled: persisted.enabled,
+    autoInstall: persisted.autoInstall,
+    autoInstallStage: installStage,
     checking,
     lastCheckedAt: persisted.lastCheckedAt,
     lastCheckFailed: persisted.lastCheckFailed,
@@ -192,6 +221,128 @@ export function createUpdateCheckService(options: Options) {
     });
     updater = created;
     return created;
+  }
+
+  /** Asks electron-updater for the target build and validates it against the checked release. Throws when the build cannot be installed. */
+  async function resolveInstallTarget(): Promise<{ target: AppUpdaterLike; installerTarget: { readonly version: string; readonly releaseUrl: string } }> {
+    const target = ensureUpdater();
+    const result = await target.checkForUpdates();
+    // Releases without latest.yml reject here (404); an updater that sees no newer build resolves without an update.
+    if (!result || result.isUpdateAvailable === false) throw new Error('no updater metadata');
+    const updaterVersion = parseReleaseVersion(result.updateInfo?.version);
+    if (result.updateInfo?.version !== undefined && (!updaterVersion || !current || !isNewerVersion(updaterVersion, current))) throw new Error('invalid updater target');
+    const installerVersion = updaterVersion?.join('.') ?? persisted.latestVersion;
+    const installerParsed = parseReleaseVersion(installerVersion);
+    if (!installerVersion || !installerParsed || !current || !isNewerVersion(installerParsed, current)
+      || !isTrustedReleaseUrl(persisted.releaseUrl)) throw new Error('invalid installer target');
+    const releaseUrl = await resolveReleaseUrl(installerVersion);
+    if (!isTrustedReleaseUrl(releaseUrl)) throw new Error('invalid installer release URL');
+    return { target, installerTarget: Object.freeze({ version: installerVersion, releaseUrl }) };
+  }
+
+  const emitAuto = (event: AutoInstallEvent) => { try { options.onAutoInstall?.(event); } catch { /* A broken sink must not break the update. */ } };
+  const clearIdleTimer = () => { if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined; } };
+  const autoActive = () => persisted.enabled && persisted.autoInstall && canAutoInstall;
+  const scheduleIdleCheck = () => {
+    clearIdleTimer();
+    if (stopped) return;
+    idleTimer = setTimeout(() => { idleTimer = undefined; void idleTick(); }, options.idleIntervalMs ?? AUTO_INSTALL_IDLE_INTERVAL_MS);
+    (idleTimer as { unref?: () => void }).unref?.();
+  };
+  const giveUpAutoInstall = (target: AppUpdaterLike) => {
+    target.autoInstallOnAppQuit = false;
+    idleTarget = undefined;
+    installStage = 'none';
+    installing = false;
+    download = { status: 'error', percent: 0 };
+    publish();
+  };
+  const autoVersion = () => persisted.pendingInstallTarget?.version ?? persisted.latestVersion;
+
+  /** Runs every 60 s after an automatic download is ready: installs through the normal shutdown only when the app is idle. One failure ends the automatic path. */
+  async function idleTick(): Promise<void> {
+    const target = idleTarget;
+    if (!target || stopped) return;
+    if (!autoActive()) { target.autoInstallOnAppQuit = false; idleTarget = undefined; installStage = 'none'; installing = false; download = { status: 'idle', percent: 0 }; publish(); return; }
+    let idle = false;
+    try { idle = options.isIdle ? await options.isIdle() : false; } catch { idle = false; }
+    if (stopped) return;
+    if (!idle) { scheduleIdleCheck(); return; }
+    let prepared = false;
+    let failure: unknown;
+    try { prepared = options.prepareInstall ? await options.prepareInstall() : false; } catch (error) { failure = error; }
+    if (!prepared) {
+      emitAuto({ phase: 'install_failed', version: autoVersion(),
+        error: failure ?? Object.assign(new Error('shutdown failed'), { code: 'UPDATE_PREPARE_INSTALL_FAILED' }) });
+      emitAuto({ phase: 'install_given_up', version: autoVersion() });
+      giveUpAutoInstall(target);
+      return;
+    }
+    installStage = 'installing';
+    installStarted = true;
+    publish();
+    emitAuto({ phase: 'install_started', version: autoVersion() });
+    try { target.quitAndInstall(true, true); }
+    catch (error) {
+      emitAuto({ phase: 'install_failed', version: autoVersion(), error });
+      emitAuto({ phase: 'install_given_up', version: autoVersion() });
+      installStarted = false;
+      giveUpAutoInstall(target);
+    }
+  }
+
+  /** Starts the background download of a newer version with the same progress state as 「更新」. Never opens the release page; a failure waits for the next check. */
+  async function autoDownload(): Promise<void> {
+    installing = true;
+    installStarted = false;
+    download = { status: 'downloading', percent: 0 };
+    publish();
+    let target: AppUpdaterLike | undefined;
+    let installerTarget: { readonly version: string; readonly releaseUrl: string } | undefined;
+    try {
+      ({ target, installerTarget } = await resolveInstallTarget());
+      emitAuto({ phase: 'download_started', version: installerTarget.version });
+      await target.downloadUpdate();
+      persisted = { ...persisted, pendingInstallTarget: installerTarget, autoInstallFrom: current ? current.join('.') : null };
+      await persistNow();
+    } catch (error) {
+      if (target) target.autoInstallOnAppQuit = false;
+      installing = false;
+      download = { status: 'error', percent: 0 };
+      publish();
+      emitAuto({ phase: 'download_failed', version: installerTarget?.version ?? persisted.latestVersion, error });
+      return;
+    }
+    download = { status: 'ready', percent: 100 };
+    // autoInstallOnAppQuit stays false: the explicit installOnExit (called by Main at exit) is the only quit path, so the build never installs twice.
+    idleTarget = target;
+    installStage = 'waiting';
+    publish();
+    emitAuto({ phase: 'download_ready', version: installerTarget!.version });
+    scheduleIdleCheck();
+  }
+
+  /**
+   * Called by Main at exit, after the services have drained and before app.exit(0), which does not run the updater's own on-quit install.
+   * Installs the automatically downloaded build; returns false when there is nothing to install or the install did not start.
+   */
+  function installOnExit(): boolean {
+    const target = idleTarget;
+    if (!target || installStarted || !autoActive()) return false;
+    installStarted = true;
+    emitAuto({ phase: 'install_started', version: autoVersion(), viaExit: true });
+    try { target.quitAndInstall(true, false); return true; }
+    catch (error) {
+      installStarted = false;
+      emitAuto({ phase: 'install_failed', version: autoVersion(), viaExit: true, error });
+      return false;
+    }
+  }
+
+  function maybeAutoDownload(): void {
+    if (!autoActive() || stopped || installing || !persisted.available || download.status !== 'idle') return;
+    if (!persisted.latestVersion || persisted.ignoredVersion === persisted.latestVersion) return;
+    void autoDownload();
   }
 
   async function fetchLatest(): Promise<{ version: string; url: string; available: boolean }> {
@@ -267,6 +418,7 @@ export function createUpdateCheckService(options: Options) {
     await save();
     schedule(UPDATE_CHECK_INTERVAL_MS);
     publish();
+    maybeAutoDownload();
     return state();
   }
 
@@ -279,6 +431,7 @@ export function createUpdateCheckService(options: Options) {
       if (saved) {
         persisted = {
           enabled: typeof saved.enabled === 'boolean' ? saved.enabled : true,
+          autoInstall: typeof saved.autoInstall === 'boolean' ? saved.autoInstall : true,
           lastCheckedAt: typeof saved.lastCheckedAt === 'string' && Number.isFinite(Date.parse(saved.lastCheckedAt)) ? saved.lastCheckedAt : null,
           lastCheckFailed: saved.lastCheckFailed === true,
           latestVersion: typeof saved.latestVersion === 'string' && parseReleaseVersion(saved.latestVersion) ? saved.latestVersion : null,
@@ -291,15 +444,19 @@ export function createUpdateCheckService(options: Options) {
           installedNotice: saved.installedNotice && typeof saved.installedNotice === 'object'
             && parseReleaseVersion(saved.installedNotice.version) && isTrustedReleaseUrl(saved.installedNotice.releaseUrl)
             ? { version: parseReleaseVersion(saved.installedNotice.version)!.join('.'), releaseUrl: saved.installedNotice.releaseUrl } : null,
+          autoInstallFrom: typeof saved.autoInstallFrom === 'string' && parseReleaseVersion(saved.autoInstallFrom) ? saved.autoInstallFrom : null,
         };
         if (!persisted.latestVersion) persisted.available = false;
       }
       if (persisted.pendingInstallTarget) {
         if (current && parseReleaseVersion(persisted.pendingInstallTarget.version)?.join('.') === current.join('.')) {
           persisted.installedNotice = persisted.pendingInstallTarget;
+          // An automatic install is recorded once, at the first start of the new version.
+          if (persisted.autoInstallFrom) emitAuto({ phase: 'installed', version: current.join('.'), fromVersion: persisted.autoInstallFrom });
         }
         persisted.pendingInstallTarget = null;
       }
+      persisted.autoInstallFrom = null;
       if (!persisted.installedNotice && persisted.available && current && parseReleaseVersion(persisted.latestVersion)?.join('.') === current.join('.')
         && isTrustedReleaseUrl(persisted.releaseUrl)) {
         persisted.installedNotice = { version: current.join('.'), releaseUrl: persisted.releaseUrl! };
@@ -309,6 +466,8 @@ export function createUpdateCheckService(options: Options) {
       await save();
       scheduleFromLastCheck();
       publish();
+      // A stored update that waits for its download does not wait for the next check.
+      maybeAutoDownload();
       return state();
     },
     async setEnabled(enabled: boolean): Promise<UpdateCheckState> {
@@ -318,6 +477,14 @@ export function createUpdateCheckService(options: Options) {
       else { clearTimer(); persisted = { ...persisted, available: false, latestVersion: null, releaseUrl: null }; }
       await save();
       publish();
+      return state();
+    },
+    async setAutoInstall(autoInstall: boolean): Promise<UpdateCheckState> {
+      if (persisted.autoInstall === autoInstall) return state();
+      persisted = { ...persisted, autoInstall };
+      await save();
+      publish();
+      if (autoInstall) maybeAutoDownload();
       return state();
     },
     checkNow: check,
@@ -341,19 +508,7 @@ export function createUpdateCheckService(options: Options) {
       let target: AppUpdaterLike;
       let installerTarget: { readonly version: string; readonly releaseUrl: string };
       try {
-        target = ensureUpdater();
-        const result = await target.checkForUpdates();
-        // Releases without latest.yml reject here (404); an updater that sees no newer build resolves without an update.
-        if (!result || result.isUpdateAvailable === false) throw new Error('no updater metadata');
-        const updaterVersion = parseReleaseVersion(result.updateInfo?.version);
-        if (result.updateInfo?.version !== undefined && (!updaterVersion || !current || !isNewerVersion(updaterVersion, current))) throw new Error('invalid updater target');
-        const installerVersion = updaterVersion?.join('.') ?? persisted.latestVersion;
-        const installerParsed = parseReleaseVersion(installerVersion);
-        if (!installerVersion || !installerParsed || !current || !isNewerVersion(installerParsed, current)
-          || !isTrustedReleaseUrl(persisted.releaseUrl)) throw new Error('invalid installer target');
-        const releaseUrl = await resolveReleaseUrl(installerVersion);
-        if (!isTrustedReleaseUrl(releaseUrl)) throw new Error('invalid installer release URL');
-        installerTarget = Object.freeze({ version: installerVersion, releaseUrl });
+        ({ target, installerTarget } = await resolveInstallTarget());
       } catch {
         installing = false;
         download = { status: 'idle', percent: 0 };
@@ -382,7 +537,8 @@ export function createUpdateCheckService(options: Options) {
       }
       return state();
     },
-    stop() { clearTimer(); },
+    installOnExit,
+    stop() { stopped = true; clearTimer(); clearIdleTimer(); },
   };
 }
 export type UpdateCheckService = ReturnType<typeof createUpdateCheckService>;

@@ -74,6 +74,8 @@ const POLL_INTERVAL_MS = 1000;
 const RESUME_TIMEOUT_MS = 60_000;
 const INTERACTIVE_TIMEOUT_MS = 10 * 60_000;
 const MAX_POLL_FAILURES = 5;
+/** Chrome exits in a row during the start call after which the restart loop stops. */
+const MAX_START_CRASHES = 3;
 /** Delay before each next restart of an ended Chrome. The last value repeats. */
 const RESTART_DELAYS_MS = [5_000, 30_000, 120_000, 600_000] as const;
 /** Time in logged_in after which the restart delay starts again from the first value. */
@@ -254,6 +256,10 @@ interface Session {
   loggedInSince?: number | undefined;
   /** Number of restarts since the last reset of the delay. */
   restarts: number;
+  /** Number of Chrome exits in a row during the start call itself. Reset when a start succeeds. */
+  startCrashes: number;
+  /** Reason slug of the last Chrome exit at start. */
+  lastStartReason?: string | undefined;
   lastLink?: string | undefined;
   /** Last uncaught exception of the extension page (names only). */
   pageError?: string | undefined;
@@ -606,7 +612,7 @@ export class OfficialDownloadBridgeService {
 
   #begin(input: { accountId: string; adminMid: string }, mode: 'interactive' | 'resume'): void {
     const timeout = mode === 'resume' ? (this.#options.resumeTimeoutMs ?? RESUME_TIMEOUT_MS) : (this.#options.interactiveTimeoutMs ?? INTERACTIVE_TIMEOUT_MS);
-    const session: Session = { id: this.#nextSessionId++, accountId: input.accountId, adminMid: input.adminMid, mode, deadline: Date.now() + timeout, identity: 'pending', everLoggedIn: false, restarts: 0, netEvents: [], qrRequests: new Map() };
+    const session: Session = { id: this.#nextSessionId++, accountId: input.accountId, adminMid: input.adminMid, mode, deadline: Date.now() + timeout, identity: 'pending', everLoggedIn: false, restarts: 0, startCrashes: 0, netEvents: [], qrRequests: new Map() };
     this.#session = session;
     this.#setStatus({ accountId: input.accountId, state: 'starting', code: CHROME_STARTING_CODE });
     session.run = this.#run(session);
@@ -753,7 +759,9 @@ export class OfficialDownloadBridgeService {
       session.qrRequests.clear();
       session.qrExpiresAt = undefined;
       session.detail = undefined;
-      this.#setStatus({ accountId: session.accountId, state: 'starting', code: CHROME_STARTING_CODE });
+      const waitDetail = `restart:${session.restarts}${session.lastStartReason ? `|${session.lastStartReason}` : ''}`
+        .replace(/[^A-Za-z0-9_.:/|=,-]/g, '').slice(0, MAX_DETAIL);
+      this.#setStatus({ accountId: session.accountId, state: 'starting', code: CHROME_STARTING_CODE, detail: waitDetail });
       await this.#sleepWhileCurrent(session, delay);
     }
   }
@@ -773,11 +781,22 @@ export class OfficialDownloadBridgeService {
         return 'ended';
       }
       session.bridge = bridge;
+      session.startCrashes = 0;
+      session.lastStartReason = undefined;
       this.#watchPageErrors(session, bridge);
     } catch (error) {
       this.#options.onError?.(error);
-      if (error instanceof BridgeError && error.code === 'CDP_CLOSED' && this.#isCurrent(session)) return 'crashed';
       const reasonDetail = bridgeFailureDetail(error)?.replace(/^code:[A-Z0-9_]+:/, '');
+      if (error instanceof BridgeError && error.code === 'CDP_CLOSED' && this.#isCurrent(session)) {
+        // Chrome ended during the start call itself. After MAX_START_CRASHES in a row the restart loop stops.
+        session.startCrashes += 1;
+        session.lastStartReason = reasonDetail?.replace(/^reason:/, '');
+        if (session.startCrashes >= MAX_START_CRASHES) {
+          await this.#fail(session, 'CHROME_EXITED_AT_START', false, reasonDetail);
+          return 'ended';
+        }
+        return 'crashed';
+      }
       await this.#fail(session, errorCodeOf(error, 'BRIDGE_START_FAILED'), false, reasonDetail);
       return 'ended';
     }

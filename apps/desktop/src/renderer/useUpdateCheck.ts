@@ -17,6 +17,7 @@ export function useUpdateCheck(api: DesktopApi) {
   return {
     state,
     setEnabled: (enabled: boolean) => run(api.setUpdateCheckEnabled ? () => api.setUpdateCheckEnabled!(enabled) : undefined),
+    setAutoInstall: (autoInstall: boolean) => run(api.setUpdateAutoInstall ? () => api.setUpdateAutoInstall!(autoInstall) : undefined),
     checkNow: () => run(api.checkForUpdateNow),
     openReleasePage: () => run(api.openUpdateReleasePage),
     openInstalledDetails: () => run(api.openInstalledUpdateDetails),

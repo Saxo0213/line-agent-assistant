@@ -45,7 +45,7 @@ export class CdpPipe {
       child.once('exit', (code, signal) => {
         this.#closed = true;
         // The real exit code goes into the error text for diagnostics.
-        this.#failAll(new BridgeError('CDP_CLOSED', `Chrome process ended (exit code ${code ?? 'none'}, signal ${signal ?? 'none'})`));
+        this.#failAll(new BridgeError('CDP_CLOSED', `Chrome process ended (exit code ${code ?? 'none'}, signal ${signal ?? 'none'})`, { exposeReason: true }));
         resolve();
       });
     });

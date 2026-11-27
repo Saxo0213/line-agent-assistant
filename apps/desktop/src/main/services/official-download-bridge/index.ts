@@ -6,6 +6,7 @@ import { locateChrome } from './chrome-locator.js';
 import { getExtensionHandles, type ExtensionHandles } from './extension-handles.js';
 import { writeBridgePreferences } from './chrome-preferences.js';
 import { resolveExtensionSource } from './extension-source.js';
+import { closeStaleBridgeChrome } from './stale-chrome.js';
 
 export { BridgeError, type BridgeErrorCode } from './errors.js';
 export { readLoginState, type ExtensionHandles } from './extension-handles.js';
@@ -32,6 +33,7 @@ export interface OfficialDownloadBridge {
 export async function startOfficialDownloadBridge(options: OfficialDownloadBridgeOptions): Promise<OfficialDownloadBridge> {
   const source = await resolveExtensionSource({ root: options.root, profileDir: options.profileDir });
   const chromePath = await locateChrome();
+  await closeStaleBridgeChrome(options.profileDir, options.onError);
   await writeBridgePreferences(options.profileDir, options.onError);
   const chrome = await startBridgeChrome({
     chromePath,

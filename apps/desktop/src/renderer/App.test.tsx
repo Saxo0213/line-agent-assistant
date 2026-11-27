@@ -4318,7 +4318,7 @@ describe('conversation list view toggle and sorting', () => {
 describe('update check navigation badge', () => {
   const updateState = (patch: Record<string, unknown> = {}) => ({ enabled: true, checking: false, lastCheckedAt: '2026-10-28T02:00:00.000Z', lastCheckFailed: false,
     latestVersion: '1.0.280', releaseUrl: 'https://github.com/Saxo0213/line-agent-assistant/releases/tag/v1.0.280', available: true,
-    installedNotice: null, ignoredVersion: null, download: { status: 'idle' as const, percent: 0 }, canAutoInstall: true, ...patch });
+    installedNotice: null, ignoredVersion: null, download: { status: 'idle' as const, percent: 0 }, canAutoInstall: true, autoInstall: false, autoInstallStage: 'none' as const, ...patch });
 
   it('marks the settings nav item only while an update is available', async () => {
     const listeners: Array<(state: ReturnType<typeof updateState>) => void> = [];

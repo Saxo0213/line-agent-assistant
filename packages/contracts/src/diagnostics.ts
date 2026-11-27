@@ -21,7 +21,7 @@ export const DIAGNOSTIC_OPERATIONS = [
   'cancelAttachmentDownload', 'logout', 'revokeControl', 'stop', 'ipc', 'database', 'attachment', 'agent', 'mcp',
   'external_monitor', 'chat_resource', 'startup', 'shutdown', 'snapshot', 'audit_sink', 'line_ingest',
   'delivery', 'secret_store', 'provider_auth', 'native_reader', 'renderer', 'catalog_refresh', 'unknown',
-  'note_list', 'note_detail', 'album_list', 'album_photos', 'photo_download',
+  'note_list', 'note_detail', 'album_list', 'album_photos', 'photo_download', 'download_bridge',
 ] as const;
 export const DIAGNOSTIC_STAGES = ['admission', 'bootstrap', 'dispatch', 'execute', 'response', 'persist',
   'publish', 'read', 'write', 'spawn', 'parse', 'cancel', 'cleanup', 'shutdown', 'recover', 'authenticate',

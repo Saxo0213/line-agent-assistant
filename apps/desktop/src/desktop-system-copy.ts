@@ -16,7 +16,7 @@ export const SYSTEM_DISPLAY_COPY = {
   '新增使用者：加入 LINE 好友': 'Add user: add LINE friend', '新增使用者：重新確認好友': 'Add user: recheck friendship',
   '新增使用者：授權預檢': 'Add user: authorization preflight', '新增使用者：寫入白名單': 'Add user: save allowlist',
   '相簿照片下載': 'Album photo download',
-  '自由模式回覆判斷': 'Free mode reply decision', '自由模式中斷回覆': 'Free mode reply interrupted', '下載橋接訊息驗證': 'Download bridge message check',
+  '自由模式回覆判斷': 'Free mode reply decision', '自由模式中斷回覆': 'Free mode reply interrupted', '下載橋接訊息驗證': 'Download bridge message check', '自動更新': 'Automatic update',
   'LINE 訊息延遲（LINE 至本機）': 'LINE message delay (LINE to app)', 'LINE 訊息延遲（本機佇列／寫入）': 'LINE message delay (app queue / save)',
   '已提出': 'Requested', '已完成': 'Completed', '失敗': 'Failed', '已記錄': 'Recorded',
   '等待下載': 'Waiting to download', '下載中': 'Downloading', '已過期': 'Expired', '重試中': 'Retrying', '下載失敗': 'Download failed',
@@ -58,6 +58,7 @@ export const EXTRA_DESKTOP_COPY = {
   mentionListLabel: 'Members to mention', mentionNoMatch: 'No matching members',
   downloadBridgeStoreInstall: 'Install extension from the store',
   downloadBridgeStoreRequired: 'The download Chrome needs the LINE extension installed from the Chrome Web Store.',
+  downloadBridgeChromeExitedAtStart: 'The download Chrome ended right after it started. Retries have stopped. Close all download Chrome windows, then select log in for download again.',
   downloadBridgeStoreWindow: 'In the Chrome window that opened, click "Add to Chrome". Then close that window.',
   downloadBridgeFeaturesChanged: 'The LINE extension was updated and its login or download method changed. This version of the app cannot use it for now.',
 } as const;
@@ -95,6 +96,7 @@ export const EXTRA_TRADITIONAL_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, str
   mentionListLabel: '可提及的成員', mentionNoMatch: '沒有符合的成員',
   downloadBridgeStoreInstall: '從商店安裝擴充功能',
   downloadBridgeStoreRequired: '下載用 Chrome 需要從商店安裝 LINE 擴充功能。',
+  downloadBridgeChromeExitedAtStart: '下載用 Chrome 啟動後立即結束，已停止重試；請關閉所有下載用 Chrome 後再按登入下載。',
   downloadBridgeStoreWindow: '請在開啟的 Chrome 視窗按「加到 Chrome」，完成後關閉這個視窗。',
   downloadBridgeFeaturesChanged: 'LINE 擴充功能已更新，登入或下載方式有變動，這個版本的 App 暫時無法使用。',
 };
@@ -131,6 +133,7 @@ export const EXTRA_JAPANESE_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string
   mentionListLabel: 'メンションするメンバー', mentionNoMatch: '一致するメンバーがいません',
   downloadBridgeStoreInstall: 'ストアから拡張機能をインストール',
   downloadBridgeStoreRequired: 'ダウンロード用 Chrome には、ストアからインストールした LINE 拡張機能が必要です。',
+  downloadBridgeChromeExitedAtStart: 'ダウンロード用 Chrome が起動直後に終了したため、再試行を停止しました。ダウンロード用 Chrome をすべて閉じてから、もう一度ログインを押してください。',
   downloadBridgeStoreWindow: '開いた Chrome ウィンドウで「Chrome に追加」を押し、完了したらそのウィンドウを閉じてください。',
   downloadBridgeFeaturesChanged: 'LINE 拡張機能が更新され、ログインまたはダウンロードの方式が変わりました。このバージョンのアプリでは当面使用できません。',
 };
@@ -167,6 +170,7 @@ export const EXTRA_KOREAN_COPY: Record<keyof typeof EXTRA_DESKTOP_COPY, string> 
   mentionListLabel: '멘션할 멤버', mentionNoMatch: '일치하는 멤버가 없습니다',
   downloadBridgeStoreInstall: '스토어에서 확장 프로그램 설치',
   downloadBridgeStoreRequired: '다운로드용 Chrome에는 스토어에서 설치한 LINE 확장 프로그램이 필요합니다.',
+  downloadBridgeChromeExitedAtStart: '다운로드용 Chrome이 시작 직후 종료되어 재시도를 중지했습니다. 다운로드용 Chrome을 모두 닫은 뒤 다시 로그인을 누르세요.',
   downloadBridgeStoreWindow: '열린 Chrome 창에서 「Chrome에 추가」를 누른 다음 그 창을 닫으세요.',
   downloadBridgeFeaturesChanged: 'LINE 확장 프로그램이 업데이트되어 로그인 또는 다운로드 방식이 바뀌었습니다. 이 버전의 앱에서는 당분간 사용할 수 없습니다.',
 };
@@ -182,7 +186,7 @@ const JAPANESE_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> =
   'LINE 操作失敗': 'LINE 操作失敗', 'LINE 聯絡人／群組清單更新': 'LINE 連絡先／グループ一覧を更新', '新增使用者（好友授權）': 'ユーザー追加（友だち認証）', '新增使用者：確認 LINE 好友關係': 'ユーザー追加：LINE の友だち関係を確認',
   '新增使用者：加入 LINE 好友': 'ユーザー追加：LINE の友だちに追加', '新增使用者：重新確認好友': 'ユーザー追加：友だち関係を再確認', '新增使用者：授權預檢': 'ユーザー追加：認証を事前確認', '新增使用者：寫入白名單': 'ユーザー追加：許可リストに保存',
   '相簿照片下載': 'アルバム写真をダウンロード',
-  '自由模式回覆判斷': 'フリーモード返信の判定', '自由模式中斷回覆': 'フリーモード返信の中断', '下載橋接訊息驗證': 'ダウンロードブリッジのメッセージ検証',
+  '自由模式回覆判斷': 'フリーモード返信の判定', '自由模式中斷回覆': 'フリーモード返信の中断', '下載橋接訊息驗證': 'ダウンロードブリッジのメッセージ検証', '自動更新': '自動アップデート',
   'LINE 訊息延遲（LINE 至本機）': 'LINE メッセージ遅延（LINE からアプリ）', 'LINE 訊息延遲（本機佇列／寫入）': 'LINE メッセージ遅延（アプリのキュー／保存）',
   '已提出': 'リクエスト済み', '已完成': '完了', '失敗': '失敗', '已記錄': '記録済み', '等待下載': 'ダウンロード待ち', '下載中': 'ダウンロード中', '已過期': '期限切れ', '重試中': '再試行中', '下載失敗': 'ダウンロード失敗',
 };
@@ -197,7 +201,7 @@ const KOREAN_SYSTEM_LABELS: Record<keyof typeof SYSTEM_DISPLAY_COPY, string> = {
   'LINE 操作失敗': 'LINE 작업 실패', 'LINE 聯絡人／群組清單更新': 'LINE 연락처／그룹 목록 업데이트', '新增使用者（好友授權）': '사용자 추가(친구 인증)', '新增使用者：確認 LINE 好友關係': '사용자 추가: LINE 친구 관계 확인',
   '新增使用者：加入 LINE 好友': '사용자 추가: LINE 친구 추가', '新增使用者：重新確認好友': '사용자 추가: 친구 관계 재확인', '新增使用者：授權預檢': '사용자 추가: 인증 사전 확인', '新增使用者：寫入白名單': '사용자 추가: 허용 목록 저장',
   '相簿照片下載': '앨범 사진 다운로드',
-  '自由模式回覆判斷': '자유 모드 답장 판단', '自由模式中斷回覆': '자유 모드 답장 중단', '下載橋接訊息驗證': '다운로드 브리지 메시지 검증',
+  '自由模式回覆判斷': '자유 모드 답장 판단', '自由模式中斷回覆': '자유 모드 답장 중단', '下載橋接訊息驗證': '다운로드 브리지 메시지 검증', '自動更新': '자동 업데이트',
   'LINE 訊息延遲（LINE 至本機）': 'LINE 메시지 지연(LINE에서 앱)', 'LINE 訊息延遲（本機佇列／寫入）': 'LINE 메시지 지연(앱 대기열/저장)',
   '已提出': '요청됨', '已完成': '완료', '失敗': '실패', '已記錄': '기록됨', '等待下載': '다운로드 대기', '下載中': '다운로드 중', '已過期': '만료됨', '重試中': '재시도 중', '下載失敗': '다운로드 실패',
 };

@@ -14,7 +14,7 @@ export function formatCheckedAt(iso: string): string {
 export function UpdateCheckSettings({ api }: { api: DesktopApi }) {
   const locale = useDesktopLocale();
   const text = (key: UpdateCopyKey, values?: Record<string, unknown>) => updateTextFor(locale, key, values);
-  const { state, setEnabled, checkNow, openReleasePage, openInstalledDetails, install } = useUpdateCheck(api);
+  const { state, setEnabled, setAutoInstall, checkNow, openReleasePage, openInstalledDetails, install } = useUpdateCheck(api);
   if (!state) return null;
   const status = state.checking ? text('checking')
     : state.lastCheckFailed ? text('checkFailed')
@@ -24,6 +24,11 @@ export function UpdateCheckSettings({ api }: { api: DesktopApi }) {
     <div className="update-check-row">
       <span id="update-check-label">{text('autoCheck')}</span>
       <button type="button" role="switch" className="schedule-switch" aria-checked={state.enabled} aria-labelledby="update-check-label" onClick={() => setEnabled(!state.enabled)}><span className="schedule-switch-thumb" aria-hidden="true" /></button>
+    </div>
+    <div className="update-check-row">
+      <span><span id="update-auto-install-label">{text('autoInstall')}</span><br /><span id="update-auto-install-help" className="muted">{text('autoInstallHelp')}</span></span>
+      <button type="button" role="switch" className="schedule-switch" aria-checked={state.autoInstall && state.enabled && state.canAutoInstall} aria-labelledby="update-auto-install-label" aria-describedby="update-auto-install-help"
+        disabled={!state.enabled || !state.canAutoInstall} onClick={() => setAutoInstall(!state.autoInstall)}><span className="schedule-switch-thumb" aria-hidden="true" /></button>
     </div>
     <div className="update-check-row">
       <span className="muted update-check-status" role="status">{status}</span>
@@ -41,7 +46,9 @@ export function UpdateCheckSettings({ api }: { api: DesktopApi }) {
       <button type="button" onClick={openInstalledDetails}>{text('details')}</button>
     </div>}
     {state.available && state.download.status === 'downloading' && <span className="muted" role="status">{text('downloading')} {state.download.percent}%</span>}
-    {state.available && state.download.status === 'ready' && <span className="muted" role="status">{text('restarting')}</span>}
+    {state.available && state.download.status === 'ready' && <span className="muted" role="status">{
+      state.autoInstallStage === 'waiting' ? text('downloadedWaiting', { arg0: state.latestVersion ?? '' })
+        : state.autoInstallStage === 'installing' ? text('installingUpdate') : text('restarting')}</span>}
     {state.available && state.download.status === 'error' && <span className="update-prompt-error" role="status">{text('updateFailed')}</span>}
   </div>;
 }

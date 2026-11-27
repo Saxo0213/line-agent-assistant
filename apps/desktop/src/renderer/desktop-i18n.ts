@@ -94,6 +94,7 @@ export function downloadBridgeErrorTextFor(locale: Locale, code: string | undefi
   };
   const extraKeys: Record<string, keyof typeof EXTRA_DESKTOP_COPY> = {
     EXTENSION_STORE_INSTALL_REQUIRED: 'downloadBridgeStoreRequired', EXTENSION_FEATURES_CHANGED: 'downloadBridgeFeaturesChanged',
+    CHROME_EXITED_AT_START: 'downloadBridgeChromeExitedAtStart',
   };
   if (code !== undefined && Object.hasOwn(extraKeys, code)) return extraTextFor(locale, extraKeys[code] as keyof typeof EXTRA_DESKTOP_COPY);
   const key = code !== undefined && Object.hasOwn(keys, code) ? keys[code] : undefined;

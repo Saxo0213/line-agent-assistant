@@ -24,12 +24,17 @@ export const UpdateCheckStateSchema = z.strictObject({
   download: z.strictObject({ status: z.enum(['idle', 'downloading', 'ready', 'error']), percent: z.number().min(0).max(100) }),
   /** False when running unpackaged; 「更新」 then opens the release page. */
   canAutoInstall: z.boolean(),
+  /** Download a new version in the background and install it when the app is idle. */
+  autoInstall: z.boolean(),
+  /** Automatic install only: `waiting` = downloaded, waits for an idle app; `installing` = the installer is starting. */
+  autoInstallStage: z.enum(['none', 'waiting', 'installing']),
 });
 export type UpdateCheckState = z.infer<typeof UpdateCheckStateSchema>;
 
 export const UpdateCheckRequestSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('getState') }),
   z.strictObject({ type: z.literal('setEnabled'), enabled: z.boolean() }),
+  z.strictObject({ type: z.literal('setAutoInstall'), autoInstall: z.boolean() }),
   z.strictObject({ type: z.literal('checkNow') }),
   z.strictObject({ type: z.literal('openReleasePage') }),
   z.strictObject({ type: z.literal('openInstalledDetails') }),

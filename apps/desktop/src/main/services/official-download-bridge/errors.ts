@@ -1,5 +1,7 @@
 // Typed error for the official download bridge. The code is the real failure stage. Do not map it to a generic code.
 
+import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+
 export type BridgeErrorCode =
   | 'EXTENSION_NOT_FOUND'
   | 'EXTENSION_VERSION_MISMATCH'
@@ -8,6 +10,7 @@ export type BridgeErrorCode =
   | 'CHROME_START_FAILED'
   | 'CDP_TIMEOUT'
   | 'CDP_CLOSED'
+  | 'CHROME_EXITED_AT_START'
   | 'CDP_ERROR'
   | 'EXTENSION_LOAD_FAILED'
   | 'EXTENSION_STORE_INSTALL_REQUIRED'
@@ -58,6 +61,48 @@ export function bridgeFailureDetail(error: unknown): string | undefined {
   return slug ? `code:${error.code}:reason:${slug}`.slice(0, MAX_REASON_DETAIL) : undefined;
 }
 
+const SAFE_CODE_PATTERN = /^[A-Z0-9][A-Z0-9_]{1,63}$/;
+
+/**
+ * Audit detail of any error of the bridge path. Order: code plus reason slug (BridgeError with a reason),
+ * `code:<CODE>` (BridgeError, BridgeDownloadError or another error with a code), `class:<name>` (an error without a code).
+ * It matches `^[A-Za-z0-9_.:-]{1,160}$` and holds no path.
+ */
+export function bridgeErrorDetail(error: unknown): string | undefined {
+  const reason = bridgeFailureDetail(error);
+  if (reason) return reason;
+  let code: unknown;
+  let name: unknown;
+  try {
+    if (error && typeof error === 'object') {
+      code = (error as { code?: unknown }).code;
+      name = (error as { name?: unknown }).name;
+    }
+  } catch { /* A hostile getter is not evidence. */ }
+  if (typeof code === 'string' && SAFE_CODE_PATTERN.test(code)) return `code:${code}`;
+  if (typeof name === 'string') {
+    const slug = name.replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 60);
+    if (slug) return `class:${slug}`;
+  }
+  return undefined;
+}
+
+/**
+ * Safe diagnostic of a failure on the bridge path. It adds the real code to the detail and picks a matching category
+ * when the base category is `unknown`.
+ */
+export function bridgeDiagnosticFailure(operation: SafeDiagnostic['operation'], stage: SafeDiagnostic['stage'], error?: unknown): SafeDiagnostic {
+  const base = diagnosticFailure(operation, stage, error);
+  const detail = bridgeErrorDetail(error);
+  const code = error instanceof BridgeError ? error.code : (error as { code?: unknown } | null | undefined)?.code;
+  const category: SafeDiagnostic['category'] = base.category !== 'unknown' ? base.category
+    : code === 'BRIDGE_NOT_LOGGED_IN' || code === 'BRIDGE_NOT_READY' ? 'authentication_required'
+      : code === 'CDP_TIMEOUT' ? 'timeout' : code === 'CDP_CLOSED' || code === 'CHROME_EXITED_AT_START' || code === 'CHROME_NOT_FOUND' ? 'unavailable'
+        : code === 'CHROME_START_FAILED' ? 'process_start_failed' : code === 'CDP_ERROR' ? 'transport_failed' : 'unknown';
+  return { ...base, category, ...(detail ? { detail } : {}),
+    recovery: category === 'authentication_required' ? 'relogin' : category === base.category ? base.recovery : category === 'unavailable' ? 'check_configuration' : 'retry' };
+}
+
 export class BridgeError extends Error {
   readonly code: BridgeErrorCode;
   /** Names of variables that were missing (EXTENSION_HANDLES_NOT_FOUND only). */
@@ -65,11 +110,12 @@ export class BridgeError extends Error {
   /** Safe text of the external message (see `safeReasonText`). Only for codes whose message comes from Chrome or CDP. */
   readonly reason: string | undefined;
 
-  constructor(code: BridgeErrorCode, message: string, options: { cause?: unknown; missing?: readonly string[]; paths?: readonly string[] } = {}) {
+  constructor(code: BridgeErrorCode, message: string, options: { cause?: unknown; missing?: readonly string[]; paths?: readonly string[]; exposeReason?: boolean } = {}) {
     super(`${code}: ${message}`, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = 'BridgeError';
     this.code = code;
     this.missing = options.missing ?? [];
-    this.reason = EXTERNAL_MESSAGE_CODES.has(code) ? safeReasonText(message, options.paths) || undefined : undefined;
+    // `exposeReason`: the caller made the message from known values (for example the exit code of Chrome).
+    this.reason = EXTERNAL_MESSAGE_CODES.has(code) || options.exposeReason ? safeReasonText(message, options.paths) || undefined : undefined;
   }
 }

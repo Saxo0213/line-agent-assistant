@@ -12,7 +12,7 @@ export const AUDIT_ACTIONS = [
   'friend_authorization_precheck', 'friend_grant_commit',
   'worker_operation_error', 'line_catalog_refresh', 'runtime_error',
   'album_photo_download', 'line_ingest_slow_upstream', 'line_ingest_slow_main',
-  'free_mode_judge', 'free_mode_interrupt', 'bridge_message_verify',
+  'free_mode_judge', 'free_mode_interrupt', 'bridge_message_verify', 'app_auto_update',
 ] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
 export const AUDIT_INITIATORS = ['user', 'system', 'worker'] as const;

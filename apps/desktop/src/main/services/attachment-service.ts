@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { IMAGE_EXTENSION_BY_MIME, diagnosticFailure, type AttachmentBlockReason, type SafeDiagnostic } from '@line-agent/contracts';
+import { IMAGE_EXTENSION_BY_MIME, type AttachmentBlockReason, type SafeDiagnostic } from '@line-agent/contracts';
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { createReadStream } from 'node:fs';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
@@ -10,6 +10,7 @@ import {
   BRIDGE_VERIFY_WAIT_MS, BridgeDownloadError, buildMessageFromNativeRow, isBridgeGateOpen, nativeRowFromEnvelope,
   type BridgeAttempt, type BridgeAttemptStage, type BridgeDownloadRequest, type BridgeDownloadedFile, type BridgeIdentity, type BridgeKind, type BridgeVerification, type BridgeVerifyRequest,
 } from './official-download-bridge/index.js';
+import { bridgeDiagnosticFailure } from './official-download-bridge/errors.js';
 import type { BridgeAttachmentStore, BridgeStoredAttachment } from './official-download-bridge/bridge-attachment-store.js';
 
 /** Local recovery of an expired attachment from a Downloads folder. No network is used. */
@@ -196,7 +197,7 @@ export class AttachmentService {
   }
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown, identity?: import('@line-agent/contracts').DiagnosticIdentity): void {
-    try { this.onDispatcherError?.(diagnosticFailure('attachment', stage, error), identity); } catch { /* Diagnostics never change attachment state. */ }
+    try { this.onDispatcherError?.(bridgeDiagnosticFailure('attachment', stage, error), identity); } catch { /* Diagnostics never change attachment state. */ }
   }
 
   private notifyChanged(attachmentId: string): void {

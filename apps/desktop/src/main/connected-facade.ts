@@ -68,7 +68,7 @@ import { ContentReprojectionService } from './services/content-reprojection-serv
 import { HealthService, kindPreview } from './services/health-service.js';
 import { AdminChangeError, AdminPairingService, type AdminChangeOutcome } from './services/admin-pairing-service.js';
 import { OfficialDownloadBridgeService } from './services/official-download-bridge/official-download-bridge-service.js';
-import { bridgeFailureDetail } from './services/official-download-bridge/errors.js';
+import { bridgeDiagnosticFailure } from './services/official-download-bridge/errors.js';
 import { OfficialDownloadBridgeDownloader, randomIntervalMs } from './services/official-download-bridge/bridge-download.js';
 import { BRIDGE_VERIFY_RESULT_CODES, bridgeGateThreshold, isBridgeGateOpen, type BridgeKind, type BridgeVerifyResult } from './services/official-download-bridge/bridge-verification.js';
 import { createBridgeAttachmentStore } from './services/official-download-bridge/bridge-attachment-store.js';
@@ -1566,8 +1566,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         void publishSnapshot().catch(() => undefined);
       },
       onError: (error) => {
-        const reasonDetail = bridgeFailureDetail(error);
-        options.audit?.failure({ ...diagnosticFailure('ipc', 'execute', error), ...(reasonDetail ? { detail: reasonDetail } : {}) }, { background: true });
+        options.audit?.failure(bridgeDiagnosticFailure('download_bridge', 'execute', error), { background: true });
       },
     });
     stopDownloadBridge = onceCleanup(() => downloadBridge?.close());
@@ -2435,7 +2434,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       for (const row of rows.rows) {
         // The result shows in the bridge status detail (`proof=<result>`). Only an error needs a report here.
         void downloadBridge.proveIdentity(row.message_id).catch((error: unknown) => {
-          try { options.audit?.failure(diagnosticFailure('attachment', 'execute', error), { background: true }); } catch { /* Diagnostics never change monitoring. */ }
+          try { options.audit?.failure(bridgeDiagnosticFailure('attachment', 'execute', error), { background: true }); } catch { /* Diagnostics never change monitoring. */ }
         });
       }
     } catch (error) {
@@ -4260,6 +4259,12 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       const pending = await options.pool.query<{ count: string }>("SELECT count(*) FROM agent_deliveries WHERE status IN ('pending','sending')");
       return { activeAccountId: state.activeAccountId, epoch: state.controlEpoch, pendingOutbound: Number(pending.rows[0]?.count ?? 0) };
     },
+    async isIdle() {
+      if (agentLineSend.hasPending()) return false;
+      const busy = await options.pool.query<{ busy: boolean }>(
+        "SELECT (EXISTS (SELECT 1 FROM agent_jobs WHERE status IN ('queued','running')) OR EXISTS (SELECT 1 FROM agent_deliveries WHERE status IN ('pending','sending'))) AS busy");
+      return busy.rows[0]?.busy === false;
+    },
     shutdown() {
       closing = true;
       clearInterval(monitorDispatchTimer);
@@ -4379,5 +4384,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     listSystemActivity: (...args) => admitted(() => facade.listSystemActivity!(...args), { operation: 'ipc' }),
     listSystemErrors: (...args) => admitted(() => facade.listSystemErrors!(...args), { operation: 'ipc' }),
     controlState: (...args) => admitted(() => facade.controlState(...args), { operation: 'ipc' }),
+    isIdle: () => facade.isIdle!(),
   };
 }

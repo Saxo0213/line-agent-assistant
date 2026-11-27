@@ -10,7 +10,9 @@ export function UpdatePrompt({ api }: { api: DesktopApi }) {
   const text = (key: UpdateCopyKey, values?: Record<string, unknown>) => updateTextFor(locale, key, values);
   const { state, ignore, install, openReleasePage, openInstalledDetails } = useUpdateCheck(api);
   if (!state) return null;
-  const hasActionableUpdate = state.available && !!state.latestVersion && state.ignoredVersion !== state.latestVersion;
+  // The main process downloads and installs a new version by itself; the prompt returns only when that fails.
+  const handledAutomatically = state.enabled && state.autoInstall && state.canAutoInstall && state.download.status !== 'error';
+  const hasActionableUpdate = state.available && !!state.latestVersion && state.ignoredVersion !== state.latestVersion && !handledAutomatically;
   if (!hasActionableUpdate && state.installedNotice) return <div className="update-prompt" role="status" aria-live="polite">
     <strong className="update-prompt-title">{text('installedTitle', { arg0: state.installedNotice.version })}</strong>
     <div className="update-prompt-actions"><button type="button" className="primary" onClick={openInstalledDetails}>{text('details')}</button></div>

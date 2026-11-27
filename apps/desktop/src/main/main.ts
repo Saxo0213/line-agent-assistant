@@ -28,7 +28,7 @@ import { ChromeLtsmService } from './services/chrome-ltsm-service.js';
 import { createOperationalAuditRuntime } from './services/operational-audit-runtime.js';
 import { createOperationalAudit, type OperationalAudit } from './services/operational-audit.js';
 import { OperationalAuditFallback } from './services/operational-audit-fallback.js';
-import { diagnosticFailure, IpcEventSchema, type SafeDiagnostic } from '@line-agent/contracts';
+import { diagnosticFailure, IpcEventSchema, safeErrorCode, type SafeDiagnostic } from '@line-agent/contracts';
 import { externalMonitorBootstrapReason, type ExternalMonitorFailureDetail } from './services/external-monitor-diagnostics.js';
 import { DatabaseSetupService } from './services/database-setup.js';
 import { createAttachmentRootChange } from './services/attachment-root-change.js';
@@ -57,7 +57,7 @@ import { createLocaleSettings, getEffectiveLocale, setEffectiveLocaleReader } fr
 import { installEditContextMenu } from './edit-context-menu.js';
 import { nativeDesktopText } from '../desktop-system-copy.js';
 import { createLocaleIpcAdapter } from './locale-ipc.js';
-import { createFileUpdateCheckStore, createUpdateCheckService, type UpdateCheckService } from './services/update-check-service.js';
+import { createFileUpdateCheckStore, createUpdateCheckService, type AutoInstallEvent, type UpdateCheckService } from './services/update-check-service.js';
 import { loadAppUpdater } from './services/app-updater.js';
 import { createUpdateCheckIpcAdapter } from './update-check-ipc.js';
 import { UPDATE_CHECK_CHANNEL, UPDATE_CHECK_STATE_CHANNEL } from '../update-check-protocol.js';
@@ -101,14 +101,17 @@ let service: DesktopServiceFacade = createDisconnectedFacade();
 let connectedService: DesktopServiceFacade | undefined;
 let operationalAudit: OperationalAudit | undefined;
 let earlyAudit: OperationalAudit | undefined;
-function reportRuntimeFailure(diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity): void {
-  if (operationalAudit) { operationalAudit.failure(diagnostic, identity); return; }
+function auditSink(): OperationalAudit {
+  if (operationalAudit) return operationalAudit;
   if (!earlyAudit) {
     const fallback = new OperationalAuditFallback(path.join(new BootstrapSettings().root, 'logs', 'operational'));
     earlyAudit = createOperationalAudit({ append: (event) => fallback.append(event), appendFallback: (event) => fallback.append(event),
       logSinkState: (state, errorCode, droppedCount) => console.warn(JSON.stringify({ event: 'early_audit_sink', state, errorCode, droppedCount })) });
   }
-  earlyAudit.failure(diagnostic, identity);
+  return earlyAudit;
+}
+function reportRuntimeFailure(diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity): void {
+  auditSink().failure(diagnostic, identity);
 }
 async function persistLifecycleFailure(failure: DesktopLifecycleFailure): Promise<void> {
   const diagnostic: SafeDiagnostic = failure === 'shutdown_timeout'
@@ -116,6 +119,29 @@ async function persistLifecycleFailure(failure: DesktopLifecycleFailure): Promis
     : { operation: 'shutdown', stage: 'shutdown', category: 'unknown', recovery: 'retry' };
   reportRuntimeFailure(diagnostic);
   await (operationalAudit ?? earlyAudit)?.flush();
+}
+/**
+ * Automatic update steps go to the system records as `app_auto_update`. The diagnostic detail holds only
+ * phase, from version, to version and, for a failure, the real error code. A failed download keeps its runtime_error record.
+ * Every step also reaches the console, so a step at exit time stays visible when the audit sink is already closed.
+ */
+function reportAutoInstallEvent(event: AutoInstallEvent): void {
+  const safeVersion = (value: string | null | undefined) => value && /^[0-9.]{1,32}$/.test(value) ? value : 'unknown';
+  const toVersion = safeVersion(event.version);
+  const fromVersion = event.phase === 'installed' ? safeVersion(event.fromVersion) : safeVersion(app.getVersion());
+  console.info(`[auto-update] ${event.phase} from=${fromVersion} to=${toVersion}${event.viaExit ? ' via=exit' : ''}`);
+  if (event.phase === 'download_started') return;
+  const code = safeErrorCode(event.error);
+  try {
+    if (event.phase === 'download_failed') {
+      reportRuntimeFailure({ ...diagnosticFailure('unknown', 'download', event.error), detail: `auto_update_download_failed${code ? `:code:${code}` : ''}` });
+      return;
+    }
+    const failed = event.phase === 'install_failed' || event.phase === 'install_given_up';
+    const detail = `phase:${event.phase}:from:${fromVersion}:to:${toVersion}${failed && code ? `:code:${code}` : ''}${event.viaExit ? ':via:exit' : ''}`;
+    const diagnostic: SafeDiagnostic = { operation: 'unknown', stage: 'prepare', category: 'unknown', recovery: 'none', detail, ...(failed ? { outcome: 'failed' as const } : {}) };
+    auditSink().outcome('app_auto_update', failed ? 'failed' : 'succeeded', { initiator: 'system', diagnostic });
+  } catch (error) { console.warn(`[auto-update] audit unavailable ${safeErrorCode(error) ?? 'UNKNOWN'}`); }
 }
 let lineMediaProtocolRegistered = false;
 const setupCutover = createSetupCutover({
@@ -155,19 +181,21 @@ async function initializeLocaleSettings(): Promise<void> {
 }
 let windowGeometryPersistence: ReturnType<typeof createWindowGeometryPersistence> | undefined;
 let tray: Tray | null = null;
+let relaunchScheduled = false;
 const lifecycle = createDesktopLifecycle({ starting: true,
   hide: () => window?.hide(),
   closeServices: () => shutdownServices([
     () => (connectedService ?? service).shutdown(),
     stopEmbeddedServer,
   ]),
-  relaunch: () => app.relaunch({ execPath: process.execPath, args: process.argv.slice(1).filter((argument) => argument !== '--quit' && argument !== '--restart') }),
+  relaunch: () => { relaunchScheduled = true; app.relaunch({ execPath: process.execPath, args: process.argv.slice(1).filter((argument) => argument !== '--quit' && argument !== '--restart') }); },
   reportEvent: (event, command) => console.info(`[desktop-lifecycle] ${event.replaceAll('-', '_')} command=${command}`),
   reportFailure: persistLifecycleFailure,
   // Services have already drained. Do not route this through app.quit(): Electron's
   // window close/unload path can be vetoed or kept alive by a renderer. The
   // relauncher waits for this process to exit before starting the replacement.
-  exit: () => { windowGeometryPersistence?.flush(); tray?.destroy(); fileTypeIcons.disable(); app.exit(0); },
+  // A restart relaunches the old app, so the automatic install must not start then.
+  exit: () => { if (!relaunchScheduled) updateCheck?.installOnExit(); updateCheck?.stop(); windowGeometryPersistence?.flush(); tray?.destroy(); fileTypeIcons.disable(); app.exit(0); },
 });
 const fileTypeIcons = createFileTypeIconResolver({ platform: process.platform, tempDirectory: app.getPath('temp'),
   getFileIcon: (filePath, options) => app.getFileIcon(filePath, options) });
@@ -498,6 +526,9 @@ async function createWindow(setupOnly = false) {
   });
   updateCheck ??= createUpdateCheckService({ currentVersion: app.getVersion(), fetch: (url, init) => net.fetch(url, init),
     canAutoInstall: app.isPackaged, getUpdater: loadAppUpdater, prepareInstall: () => lifecycle.prepareExit(),
+    // No connected service means no Agent job and no LINE send exist, so the app counts as idle.
+    isIdle: async () => connectedService?.isIdle ? connectedService.isIdle() : true,
+    onAutoInstall: reportAutoInstallEvent,
     store: createFileUpdateCheckStore(path.join(app.getPath('userData'), 'update-check.json')),
     openExternal: (url) => shell.openExternal(url),
     onChange: (state) => { if (window && !window.isDestroyed()) window.webContents.send(UPDATE_CHECK_STATE_CHANNEL, state); } });

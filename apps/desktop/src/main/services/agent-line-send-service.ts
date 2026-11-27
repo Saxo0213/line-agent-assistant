@@ -204,6 +204,11 @@ export class AgentLineSendService implements AgentLineSendHandler {
     return this.queue.filter((entry) => entry.call.plan.jobId === jobId).length + (this.active?.call.plan.jobId === jobId ? 1 : 0);
   }
 
+  /** True while any item is queued or in flight; the automatic updater waits for false. */
+  hasPending(): boolean {
+    return this.queue.length > 0 || this.active !== undefined;
+  }
+
   async listTargets(client: Queryable, rawInput: unknown, accountScope?: readonly string[] | null): Promise<McpListSendTargetsOutput> {
     const parsed = McpListSendTargetsInputSchema.safeParse(rawInput);
     if (!parsed.success) throw new McpDomainError('INVALID_INPUT', parsed.error.issues[0]?.message ?? 'Invalid list_send_targets arguments.');

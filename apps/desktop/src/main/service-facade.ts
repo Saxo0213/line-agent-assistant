@@ -66,6 +66,8 @@ export type DesktopServiceFacade = {
   listSystemActivity?(): Promise<SystemActivityResult>;
   listSystemErrors?(): Promise<SystemErrorsResult>;
   controlState(): Promise<{ activeAccountId: string | null; epoch: number; pendingOutbound: number }>;
+  /** True when no Agent job is queued or running and no LINE send is queued or in flight; the automatic updater installs only then. */
+  isIdle?(): Promise<boolean>;
   shutdown(): Promise<void>;
 };
 

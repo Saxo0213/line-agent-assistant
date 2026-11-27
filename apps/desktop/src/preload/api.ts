@@ -93,6 +93,7 @@ export type DesktopApi = {
   /** Update check against the public repository (Settings → About). Optional so older test doubles stay valid. */
   getUpdateCheckState?(): Promise<UpdateCheckState>;
   setUpdateCheckEnabled?(enabled: boolean): Promise<UpdateCheckState>;
+  setUpdateAutoInstall?(autoInstall: boolean): Promise<UpdateCheckState>;
   checkForUpdateNow?(): Promise<UpdateCheckState>;
   openUpdateReleasePage?(): Promise<UpdateCheckState>;
   openInstalledUpdateDetails?(): Promise<UpdateCheckState>;
@@ -315,6 +316,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async setLocale(preference) { return LocaleSnapshotSchema.parse(await transport.invoke('line-agent:locale', { type: 'setLocale', preference })); },
     getUpdateCheckState: () => updateCheck({ type: 'getState' }),
     setUpdateCheckEnabled: (enabled) => updateCheck({ type: 'setEnabled', enabled }),
+    setUpdateAutoInstall: (autoInstall) => updateCheck({ type: 'setAutoInstall', autoInstall }),
     checkForUpdateNow: () => updateCheck({ type: 'checkNow' }),
     openUpdateReleasePage: () => updateCheck({ type: 'openReleasePage' }),
     openInstalledUpdateDetails: () => updateCheck({ type: 'openInstalledDetails' }),

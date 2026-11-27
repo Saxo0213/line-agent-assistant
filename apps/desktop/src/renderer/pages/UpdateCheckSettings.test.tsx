@@ -10,7 +10,7 @@ import { formatCheckedAt, UpdateCheckSettings } from './UpdateCheckSettings.js';
 
 afterEach(cleanup);
 
-const base: UpdateCheckState = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, installedNotice: null, ignoredVersion: null, download: { status: 'idle', percent: 0 }, canAutoInstall: true };
+const base: UpdateCheckState = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, installedNotice: null, ignoredVersion: null, download: { status: 'idle', percent: 0 }, canAutoInstall: true, autoInstall: true, autoInstallStage: 'none' };
 function setup(initial: Partial<UpdateCheckState> = {}, locale: 'zh-TW' | 'en' = 'zh-TW') {
   let state: UpdateCheckState = { ...base, ...initial };
   const api = {
@@ -66,7 +66,7 @@ describe('UpdateCheckSettings', () => {
 
   it('toggles the switch and checks on demand, also while the switch is off', async () => {
     const api = setup({ enabled: false });
-    const toggle = await screen.findByRole('switch');
+    const toggle = await screen.findByRole('switch', { name: '自動檢查更新' });
     expect(toggle.getAttribute('aria-checked')).toBe('false');
     fireEvent.click(screen.getByRole('button', { name: '立即檢查' }));
     expect(api.checkForUpdateNow).toHaveBeenCalledTimes(1);

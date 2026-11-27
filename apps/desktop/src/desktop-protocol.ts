@@ -64,7 +64,7 @@ const SystemActionLabel = z.enum(['系統操作失敗', '系統啟動', '系統�
   'Codex 登出', 'Claude 登出', '外部監控設定變更', '系統紀錄儲存失敗', '系統紀錄儲存恢復', '系統作業', '圖片下載', '影片下載',
   '語音下載', '檔案下載', '附件下載', 'LINE 操作失敗', 'LINE 聯絡人／群組清單更新', '新增使用者（好友授權）', '新增使用者：確認 LINE 好友關係',
   '新增使用者：加入 LINE 好友', '新增使用者：重新確認好友', '新增使用者：授權預檢', '新增使用者：寫入白名單', '相簿照片下載',
-  '自由模式回覆判斷', '自由模式中斷回覆', '下載橋接訊息驗證',
+  '自由模式回覆判斷', '自由模式中斷回覆', '下載橋接訊息驗證', '自動更新',
   'LINE 訊息延遲（LINE 至本機）', 'LINE 訊息延遲（本機佇列／寫入）']);
 const SystemPhaseLabel = z.enum(['已提出', '已完成', '失敗', '已記錄']);
 const AttachmentStatusLabel = z.enum(['等待下載', '下載中', '已完成', '已過期', '重試中', '下載失敗']);
@@ -79,7 +79,7 @@ const LocalSystemErrorCode = z.enum(['DATABASE_WRITE_FAILED', 'FALLBACK_WRITE_FA
   'HISTORY_READ_FAILED', 'CHAT_RESOURCE_READ_FAILED', 'PROFILE_REFRESH_FAILED', 'MESSAGE_SEND_FAILED',
   'MESSAGE_UNSEND_FAILED', 'MESSAGE_REACTION_FAILED', 'FRIEND_RELATION_CHECK_FAILED', 'FRIEND_ADD_FAILED', 'PRIMARY_ADMIN_NOT_FRIEND',
   'ATTACHMENT_DOWNLOAD_OPERATION_FAILED', 'CREDENTIAL_RESTORE_FAILED', 'LINE_SYNC_FAILED',
-  'LINE_CONNECTION_SUSPENDED', 'AGENT_JOB_FAILED', 'UNKNOWN_ERROR']);
+  'LINE_CONNECTION_SUSPENDED', 'LINE_SQUARE_SUSPENDED', 'AGENT_JOB_FAILED', 'UNKNOWN_ERROR']);
 const SystemErrorCode = z.union([LocalSystemErrorCode,
   z.custom<LineServerErrorCode>((value) => typeof value === 'string' && value.length <= 80 && isLineServerErrorCode(value))]);
 const SystemActivityAuditSchema = z.strictObject({ kind: z.literal('audit'), createdAt: z.iso.datetime({ offset: true }),
