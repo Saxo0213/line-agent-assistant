@@ -26,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.392 removes group activation, so a whitelisted member can use the Agent in any group. Codex now chats in read-only mode for members without the local workspace permission. The download login prefers the LINE extension installed from the Chrome Web Store and checks it by code features. The saved files dialog can open the chat folder. Install through the app's **Check for updates**. See the [v1.0.390 → v1.0.392 release notes](docs/releases/v1.0.392.md) for the complete changes.
+v1.0.392 removes group activation: a group checks only the whitelist (an account-wide member can use the Agent in every group, a member added for one group only in that group). Codex now chats in read-only mode for members without the local workspace permission. The download login prefers the LINE extension installed from the Chrome Web Store and checks it by code features. The saved files dialog can open the chat folder. Install through the app's **Check for updates**. See the [v1.0.390 → v1.0.392 release notes](docs/releases/v1.0.392.md) for the complete changes.
 
 ## Installation
 
