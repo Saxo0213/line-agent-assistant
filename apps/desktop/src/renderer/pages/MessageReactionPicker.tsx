@@ -3,7 +3,7 @@ import { Smile } from 'lucide-react';
 import type { WritableConversationKey } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import type { TimelineMessage } from '../../main/service-facade.js';
-import { LINE_REACTION_IMAGES } from '../AgentStatusMarker.js';
+import { LINE_REACTION_GLYPHS } from '../AgentStatusMarker.js';
 import { safeErrorTextFor, useDesktopLocale, useExtraText } from '../desktop-i18n.js';
 
 type ManualReaction = 'NICE' | 'LOVE' | 'FUN' | 'AMAZING' | 'SAD' | 'OMG';
@@ -58,7 +58,7 @@ export function MessageReactionPicker({ api, route, message }: {
     {open && <span role="menu" className="reaction-menu" aria-label={extra('reactionButton')}>
       {CHOICES.map(([kind, copyKey]) => <button type="button" role="menuitem" key={kind} className="reaction-choice" aria-pressed={own === kind}
         aria-label={extra(copyKey)} title={extra(copyKey)} onClick={() => void choose(kind)}>
-        <img src={LINE_REACTION_IMAGES[kind]} alt="" width={24} height={24} draggable={false} />
+        <span className="message-reaction-icon" aria-hidden="true">{LINE_REACTION_GLYPHS[kind]}</span>
       </button>)}
     </span>}
     {error && <span role="alert" className="message-reaction-error">{error}</span>}
