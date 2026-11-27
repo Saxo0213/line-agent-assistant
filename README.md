@@ -26,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.385 moves to a new LINE engine on linejs 3.6.9 and adds community message archiving, message reactions and @-mentions, one-to-one notes and albums, attachment self-repair, project folder management in **Settings → Folders**, and a photo-text schedule rule. Install through the app's **Check for updates**. See the [v1.0.359 → v1.0.385 release notes](docs/releases/v1.0.385.md) for the complete changes.
+v1.0.390 adds an **Environment check** (Chrome, LINE extension, desktop LINE, Node.js, Claude CLI, Codex CLI, with install buttons) and a **Login guide**, both opened from buttons next to the Settings title. It also accepts Node.js 24 or higher for the CLIs, shows the real reason when the external monitor fails, and disables community receive for accounts without a phone number. Install through the app's **Check for updates**. See the [v1.0.385 → v1.0.390 release notes](docs/releases/v1.0.390.md) for the complete changes.
 
 ## Installation
 

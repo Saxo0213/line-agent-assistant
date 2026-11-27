@@ -44,15 +44,6 @@ export type WorkerErrorCode = typeof WORKER_ERROR_CODES[number] | LineServerErro
 const WorkerErrorCodeSchema = z.union([z.enum(WORKER_ERROR_CODES),
   z.custom<LineServerErrorCode>((value) => lineServerErrorMessage(value) !== null)]);
 const UserMid = z.string().regex(/^u[0-9a-fA-F]{32}$/);
-export const CONTACT_LOOKUP_RELATIONS = ['friend', 'not_friend', 'blocked', 'self', 'unknown'] as const;
-export const ContactLookupSchema = z.strictObject({
-  mid: UserMid,
-  displayName: z.string().max(256).nullable(),
-  statusMessage: z.string().max(1024).nullable(),
-  picturePath: z.string().max(2048).nullable(),
-  relation: z.enum(CONTACT_LOOKUP_RELATIONS),
-});
-export type ContactLookupDto = z.infer<typeof ContactLookupSchema>;
 const SourceChatMid = z.string().regex(/^[ucr][0-9a-fA-F]{32}$/);
 const Conversation = Bound.merge(WritableConversationKeySchema);
 const LoginAttempt = Bound.extend({ loginAttemptId: Id });
@@ -222,8 +213,6 @@ export const LineWorkerCommandSchema = z.discriminatedUnion('type', [
   Conversation.extend({ type: z.literal('unsendMessage'), requestId: Id, messageId: Decimal }),
   Bound.extend({ type: z.literal('checkFriendRelation'), requestId: Id, targetMid: UserMid }),
   Bound.extend({ type: z.literal('addFriendByMid'), requestId: Id, targetMid: UserMid, sourceChatMid: SourceChatMid.optional() }),
-  /** One user-started contact read (getContactsV3). It never adds a friend and never sends a message. */
-  Bound.extend({ type: z.literal('lookupContact'), requestId: Id.max(128), targetMid: UserMid }),
   Conversation.extend({ type: z.literal('downloadAttachment'), requestId: Id, attemptToken: z.uuid(), messageId: Id, attachmentId: z.uuid(), externalAttachmentId: Id, kind: z.enum(['image', 'video', 'audio', 'file']), occurredAt: z.iso.datetime({ offset: true }), originalFileName: z.string(), senderId: Id.optional(), senderDisplayName: z.string().max(256).nullable().optional(), lineMessage: JsonValueSchema, maxBytes: z.number().int().positive(), timeoutMs: z.number().int().positive() }),
   Bound.extend({ type: z.literal('cancelAttachmentDownload'), attachmentId: z.uuid(), attemptToken: z.uuid() }),
   Bound.extend({ type: z.literal('revokeControl') }),
@@ -243,6 +232,8 @@ export const LineWorkerEventSchema = z.union([
   Bound.extend({ type: z.literal('authInvalidated'), code: z.custom<LineServerErrorCode>((value) => lineServerErrorMessage(value) !== null).optional(),
     upstreamCode: z.union([z.number().finite().min(-1_000_000_000).max(1_000_000_000), z.enum(['missing', 'non_numeric'])]).optional() }),
   Bound.extend({ type: z.literal('syncConfirmed') }),
+  /** One read of the account settings after a login. `phoneRegistered` is null when the read failed or LINE sent no boolean. */
+  Bound.extend({ type: z.literal('accountSettings'), phoneRegistered: z.boolean().nullable() }),
   Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('degraded'), code: z.literal('CATALOG_REFRESH_FAILED'),
     serverError: z.string().max(80).refine((value) => lineServerErrorMessage(value) !== null).optional() }),
   Bound.extend({ type: z.literal('catalogRefreshStatus'), state: z.literal('ready'), code: z.literal('CATALOG_REFRESH_RECOVERED') }),
@@ -287,11 +278,6 @@ export const LineWorkerEventSchema = z.union([
   }),
   Bound.extend({ type: z.literal('addFriendResult'), requestId: Id, targetMid: UserMid,
     status: z.enum(['added', 'failed', 'unknown']), error: z.string().nullable() }),
-  z.discriminatedUnion('status', [
-    Bound.extend({ type: z.literal('contactLookupResult'), requestId: Id.max(128), status: z.literal('ok'), error: z.null(),
-      contact: ContactLookupSchema }),
-    Bound.extend({ type: z.literal('contactLookupResult'), requestId: Id.max(128), status: z.literal('failed'), error: z.string().min(1).max(80) }),
-  ]),
   Bound.extend({ type: z.literal('error'), code: WorkerErrorCodeSchema, message: Id, retryable: z.boolean(),
     diagnostic: SafeDiagnosticSchema.optional(), requestId: Id.max(128).optional(),
     /** Status of the CHROMEOS ltsm store; present only with code CHROME_LTSM_UNAVAILABLE. */

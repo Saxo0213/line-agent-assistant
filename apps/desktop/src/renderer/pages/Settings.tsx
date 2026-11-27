@@ -1,4 +1,4 @@
-import { generatedMessageText, useDesktopText, useExtraText, useSafeErrorText } from '../desktop-i18n.js';
+import { generatedMessageText, useDesktopLocale, useDesktopText, useExtraText, useSafeErrorText } from '../desktop-i18n.js';
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { type AgentAccountSource, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MAX, AGENT_STATUS_ROTATION_INTERVAL_SECONDS_MIN, DEFAULT_AGENT_STATUS_ICONS, DEFAULT_AUTORESPONDER_FALLBACK, normalizeAutoresponderTrigger, validateAutoresponderConfig, type AgentStatusIcons, type AutoResponderRule, type AutoResponderSettings, type ComponentHealth, type ConversationKey, type LineAccountSummary, type McpLocalClientKind, type McpLocalClientStatus, type McpServerStatus, type ProviderStatus } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
@@ -14,6 +14,10 @@ import { AGENT_STATUS_MARKERS, AgentStatusMarker } from '../AgentStatusMarker.js
 import { translateSettings } from '../../locale.js';
 import { localeFromState, useLocale } from '../locale-context.js';
 import { UpdateCheckSettings } from './UpdateCheckSettings.js';
+import { EnvironmentCheckDialog, useEnvironmentCheck } from '../EnvironmentCheck.js';
+import { LoginGuideDialog, loginGuideState } from '../LoginGuide.js';
+import { AttentionDot } from '../HeaderDialog.js';
+import { environmentTextFor } from '../../desktop-environment-copy.js';
 import { AgentExtensionsSettings } from './AgentExtensionsSettings.js';
 import { AgentPersonaSettings } from './AgentPersonaSettings.js';
 
@@ -47,6 +51,11 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
   const setTab = (next: SettingsTabId) => { setTabState(next); storeSettingsTab(next); };
   // The app can redirect here after Settings has already mounted.
   useEffect(() => { setTabState(initialTab); }, [initialTab]);
+  const environmentCheck = useEnvironmentCheck(api);
+  const guideState = loginGuideState(accounts);
+  const [headerDialog, setHeaderDialog] = useState<'environment' | 'guide' | null>(null);
+  const environmentLocale = useDesktopLocale();
+  const environmentText = (key: Parameters<typeof environmentTextFor>[1]) => environmentTextFor(environmentLocale, key);
   const [attachmentAttemptLimit, setAttachmentAttemptLimit] = useState(3);
   const [agentStatusRotationIntervalSeconds, setAgentStatusRotationIntervalSeconds] = useState(10);
   const [agentStatusIcons, setAgentStatusIcons] = useState<AgentStatusIcons>({ ...DEFAULT_AGENT_STATUS_ICONS });
@@ -477,7 +486,11 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
   }
   const displayAttachmentPath = splitDisplayPath(attachmentRoot || desktopText('notConfigured'));
 
-  return <div className="page settings-page"><div ref={settingsContentRef} className="settings-content" aria-hidden={connectionInfo !== null || passwordDialog || localeState.restartChoice}><header className="page-header"><div><span className="eyebrow">{extraText('preferences')}</span><div className="page-title-row"><h1 tabIndex={-1} ref={headingRef}>{desktopText('settings')}</h1><p>{desktopText('manageTheDatabaseAttachmentsAndAgents')}</p></div></div></header>
+  return <div className="page settings-page"><div ref={settingsContentRef} className="settings-content" aria-hidden={connectionInfo !== null || passwordDialog || localeState.restartChoice || headerDialog !== null}><header className="page-header"><div><span className="eyebrow">{extraText('preferences')}</span><div className="page-title-row"><h1 tabIndex={-1} ref={headingRef}>{desktopText('settings')}</h1><p>{desktopText('manageTheDatabaseAttachmentsAndAgents')}</p></div></div>
+    <div className="page-header-actions">
+      {environmentCheck.available && <button type="button" className="header-dialog-button" onClick={() => setHeaderDialog('environment')}>{environmentText('title')}{environmentCheck.needsAttention && <AttentionDot label={environmentText('attention')} />}</button>}
+      <button type="button" className="header-dialog-button" onClick={() => setHeaderDialog('guide')}>{desktopText('loginGuideSummary')}{guideState.needsAttention && <AttentionDot label={environmentText('attention')} />}</button>
+    </div></header>
     <div className="settings-tabs" role="tablist" aria-label={desktopText('settingsCategories')}>
       <button role="tab" aria-selected={tab === 'system'} className={tab === 'system' ? 'active' : ''} onClick={() => setTab('system')}>{desktopText('system')}</button>
       <button role="tab" aria-selected={tab === 'folders'} className={tab === 'folders' ? 'active' : ''} onClick={() => setTab('folders')}>{desktopText('folders')}</button>
@@ -488,7 +501,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
       <button role="tab" aria-selected={tab === 'about'} className={tab === 'about' ? 'active' : ''} onClick={() => setTab('about')}>{desktopText('about')}</button>
     </div>
     <div className="settings-panel-scroll" ref={panelScrollRef}>
-    {tab === 'system' ? <div role="tabpanel" className="settings-card-stack system-settings-card-stack"><LineLogin api={api} accounts={accounts} live={live} embedded conversations={conversations} onOpenConversation={onOpenWorkConversation} {...(onNotice ? { onNotice } : {})} />
+    {tab === 'system' ? <div role="tabpanel" className="settings-card-stack system-settings-card-stack"><LineLogin api={api} accounts={accounts} live={live} embedded {...(onNotice ? { onNotice } : {})} />
       <section className="panel database-settings database-summary"><div className="panel-top"><div><h2>{desktopText('databaseAndAttachments')}</h2><p>{desktopText('viewCurrentDatabaseAndAttachmentStorageLocations')}</p></div></div>
       <div className="system-location-rows">
         <div className="system-location-row"><label>{desktopText('database')}</label><div className="system-location-field"><span className="system-location-value">{databaseStatusText}</span>{embedded && <div className="button-row"><button onClick={() => void showConnectionInfo()}>{desktopText('showPassword')}</button><button onClick={() => setPasswordDialog(true)}>{desktopText('changePassword')}</button></div>}</div></div>
@@ -665,6 +678,8 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
     </div>
     </div>
     {localeState.restartChoice && <div className="modal-scrim"><section ref={localeChoiceDialogRef} className="modal locale-restart-dialog" role="alertdialog" aria-modal="true" aria-label={localeText('restartChoice')}><p>{localeText('restartChoice')}</p><div className="modal-actions"><button type="button" disabled={localeState.busy} onClick={() => localeState.restartLater?.()}>{localeText('restartLater')}</button><button type="button" className="primary" disabled={localeState.busy} onClick={() => localeState.restartNow?.()}>{localeText('restartNow')}</button></div></section></div>}
+    {headerDialog === 'environment' && <EnvironmentCheckDialog check={environmentCheck} onClose={() => setHeaderDialog(null)} />}
+    {headerDialog === 'guide' && <LoginGuideDialog accounts={accounts} closeLabel={environmentText('close')} onClose={() => setHeaderDialog(null)} />}
     {!onNotice && localStatus && <div role="status" className="system-toast">{generatedMessageText(localStatus)}</div>}
     {connectionInfo && <div className="database-modal-scrim">
       <div className="panel database-settings database-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-info-title">

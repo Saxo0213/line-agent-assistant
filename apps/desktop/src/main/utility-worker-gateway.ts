@@ -47,7 +47,6 @@ type State = { binding: Bound; child: Child; poll: ReturnType<typeof setInterval
   relations: Map<string, Pending<Extract<LineWorkerEvent, { type: 'friendRelationResult' | 'addFriendResult' }>>>;
   chatResources: Map<string, Pending<Extract<LineWorkerEvent, { type: 'chatResourceResult' }>>>;
   ownProfiles: Map<string, Pending<Extract<LineWorkerEvent, { type: 'ownProfileResult' }>>>;
-  contactLookups: Map<string, Pending<Extract<LineWorkerEvent, { type: 'contactLookupResult' }>>>;
   usedRelationRequests: Map<string, { type: 'check' | 'add'; targetMid: string }>;
   modeWaiters: Map<string, Set<(value: boolean) => void>>;
   rawModeWaiters: Map<string, Set<(value: boolean) => void>>; exited: Promise<void>; resolveExited(): void };
@@ -177,7 +176,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     for (const pending of state.chatResources.values()) { pending.cleanup?.(); if (pending.timer) clearTimeout(pending.timer);
       pending.reject(chatResourceGatewayError(reason, 'pending_request', 'pending_stopped')); }
     for (const pending of state.ownProfiles.values()) { if (pending.timer) clearTimeout(pending.timer); pending.reject(new Error(reason)); }
-    for (const pending of state.contactLookups.values()) { if (pending.timer) clearTimeout(pending.timer); pending.reject(new Error(reason)); }
     for (const pending of state.relations.values()) {
       if (pending.timer) clearTimeout(pending.timer);
       const command = pending.command as Extract<LineWorkerCommand, { type: 'addFriendByMid' }> | undefined;
@@ -191,7 +189,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     }
     state.sends.clear(); state.sendQueue.length = 0; state.activeSendId = undefined;
     cancelPacing(state.binding.accountId);
-    state.uncertainSends.clear(); state.downloads.clear(); state.chatResources.clear(); state.ownProfiles.clear(); state.contactLookups.clear(); state.relations.clear();
+    state.uncertainSends.clear(); state.downloads.clear(); state.chatResources.clear(); state.ownProfiles.clear();state.relations.clear();
     for (const waiters of state.modeWaiters.values()) for (const resolve of waiters) resolve(false);
     state.modeWaiters.clear();
     for (const waiters of state.rawModeWaiters.values()) for (const resolve of waiters) resolve(false);
@@ -528,7 +526,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
       // Sends, unsends and Relation mutations keep their own outcome-unknown handling.
       const failure = new Error(`Worker rejected request: ${event.code}`);
       state.ownProfiles.get(event.requestId)?.reject(failure);
-      state.contactLookups.get(event.requestId)?.reject(failure);
       state.chatResources.get(event.requestId)?.reject(chatResourceGatewayError(failure.message, 'pending_request', 'unknown'));
       const relation = state.relations.get(event.requestId);
       if (relation && (relation.command as { type?: string } | undefined)?.type === 'checkFriendRelation') {
@@ -537,7 +534,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     }
     if (event.type !== 'sendResult' && event.type !== 'unsendResult' && event.type !== 'attachmentResult' && event.type !== 'attachmentCancelAck'
       && event.type !== 'friendRelationResult' && event.type !== 'addFriendResult'
-      && event.type !== 'chatResourceResult' && event.type !== 'ownProfileResult' && event.type !== 'contactLookupResult'
+      && event.type !== 'chatResourceResult' && event.type !== 'ownProfileResult'
       && event.type !== 'modeAck' && event.type !== 'workerProtocolAck') {
       if (event.type === 'batch' && trackBatch(state, event)) return;
       if (state.domainEvents.length + Number(state.processingDomainEvents) >= maxQueuedDomainEvents) {
@@ -589,12 +586,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
     else if (event.type === 'ownProfileResult') {
       const pending = state.ownProfiles.get(event.requestId);
       const command = pending?.command as Extract<LineWorkerCommand, { type: 'refreshOwnProfile' }> | undefined;
-      if (!pending || !command || !sameWorkerBinding(state.binding, command) || !sameWorkerBinding(state.binding, event)) return;
-      pending.resolve(event);
-    }
-    else if (event.type === 'contactLookupResult') {
-      const pending = state.contactLookups.get(event.requestId);
-      const command = pending?.command as Extract<LineWorkerCommand, { type: 'lookupContact' }> | undefined;
       if (!pending || !command || !sameWorkerBinding(state.binding, command) || !sameWorkerBinding(state.binding, event)) return;
       pending.resolve(event);
     }
@@ -827,7 +818,7 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
             if (state!.protocolVerified || state!.stopping || stateFor(effective.accountId) !== state) return;
             state!.stopping = true; lifecycle.phase = 'retiring'; child.kill();
           }, responseTimeoutMs),
-          sends: new Map(), unsends: new Map(), sendQueue: [], activeSendId: undefined, uncertainSends: new Map(), downloads: new Map(), relations: new Map(), chatResources: new Map(), ownProfiles: new Map(), contactLookups: new Map(), usedRelationRequests: new Map(), modeWaiters: new Map(), rawModeWaiters: new Map(), exited, resolveExited,
+          sends: new Map(), unsends: new Map(), sendQueue: [], activeSendId: undefined, uncertainSends: new Map(), downloads: new Map(), relations: new Map(), chatResources: new Map(), ownProfiles: new Map(), usedRelationRequests: new Map(), modeWaiters: new Map(), rawModeWaiters: new Map(), exited, resolveExited,
           poll: setInterval(() => { if (stateFor(effective.accountId) === state) child.postMessage({ type: 'poll', ...ownerFields(effective), accountId: effective.accountId,
             workerInstanceId: state!.binding.workerInstanceId, controlEpoch: state!.binding.controlEpoch }); }, options.pollIntervalMs ?? 1500) };
         lifecycle.child = state;
@@ -1285,29 +1276,6 @@ export function createUtilityWorkerGateway(options: { spawn(binding: Bound): Chi
             timeoutMs: command.timeoutMs, ...ownerFields(state.binding) });
         }
         catch (error) { pending.reject(error instanceof Error ? error : new Error('LINE profile read failed')); }
-      });
-    },
-    async lookupContact(command) {
-      const state = currentFor(command);
-      if (!state.protocolVerified || !state.bindingReady || state.stopping || state.acknowledgedMode === 'PAUSED') throw new Error('Worker protocol/mode not acknowledged for contact lookup');
-      if (!sameWorkerBinding(state.binding, command)) throw new Error('Incomplete or stale worker binding for contact lookup');
-      if (state.contactLookups.size >= 1) throw new Error('Worker contact lookup is already in progress (QUEUE_FULL)');
-      if (state.contactLookups.has(command.requestId)) throw new Error('Duplicate worker contact lookup request ID');
-      return await new Promise((resolve, reject) => {
-        const finish = (settle: () => void) => {
-          if (state.contactLookups.get(command.requestId) !== pending) return;
-          state.contactLookups.delete(command.requestId); if (pending.timer) clearTimeout(pending.timer); settle();
-        };
-        const pending: Pending<Extract<LineWorkerEvent, { type: 'contactLookupResult' }>> = {
-          command, resolve: (value) => finish(() => resolve(value)), reject: (error) => finish(() => reject(error)),
-        };
-        pending.timer = setTimeout(() => pending.reject(new Error('LINE contact lookup timed out')), 30_000);
-        state.contactLookups.set(command.requestId, pending);
-        try {
-          state.child.postMessage({ ...workerBindingFields(command), type: 'lookupContact', requestId: command.requestId,
-            targetMid: command.targetMid, ...ownerFields(state.binding) });
-        }
-        catch (error) { pending.reject(error instanceof Error ? error : new Error('LINE contact lookup failed')); }
       });
     },
     async waitModeAck(accountId, mode, waitMs) {

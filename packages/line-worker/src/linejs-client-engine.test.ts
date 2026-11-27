@@ -306,45 +306,6 @@ describe('linejs client engine', () => {
     instance.revoke();
   });
 
-  it('lookupContact reads one contact with getContactsV3 and maps friend, not_friend, blocked and self', async () => {
-    const { RelationService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/relation/mod.js', import.meta.url).href) as {
-      RelationService: { prototype: Record<string, (...args: any[]) => Promise<unknown>> };
-    };
-    const entry = (mid: string, extra: Record<string, unknown>) => ({ targetUserMid: mid,
-      targetProfileDetail: { profileName: 'Ann', picturePath: '/p/abc', statusMessage: { content: 'hello', meta: {} } }, ...extra });
-    const responses = [
-      entry(PEER, { friendDetail: { user: {} } }),
-      entry(PEER, { friendDetail: { notFriend: {} } }),
-      entry(PEER, { friendDetail: { notFriend: {} }, blockDetail: { user: {} } }),
-      entry(OWN, { friendDetail: { notFriend: {} } }),
-    ];
-    const getContactsV3 = vi.spyOn(RelationService.prototype, 'getContactsV3');
-    for (const response of responses) getContactsV3.mockResolvedValueOnce({ responses: [response] });
-    const { instance, calls } = engine(() => profileReply());
-    await instance.loginToken(TOKEN);
-    const relations: string[] = [];
-    for (const mid of [PEER, PEER, PEER, OWN]) relations.push((await instance.lookupContact(mid)).relation);
-    expect(relations).toEqual(['friend', 'not_friend', 'blocked', 'self']);
-    expect(getContactsV3).toHaveBeenCalledTimes(4);
-    expect(calls.map((call) => call.method)).toEqual(['getProfile']);
-    instance.revoke();
-  });
-
-  it('lookupContact returns name, status message and picture, and keeps null for missing fields', async () => {
-    const { RelationService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/relation/mod.js', import.meta.url).href) as {
-      RelationService: { prototype: Record<string, (...args: any[]) => Promise<unknown>> };
-    };
-    vi.spyOn(RelationService.prototype, 'getContactsV3')
-      .mockResolvedValueOnce({ responses: [{ targetUserMid: PEER, targetProfileDetail: { profileName: 'Ann', picturePath: '/p/abc',
-        statusMessage: { content: 'hello', meta: {} } }, friendDetail: { notFriend: {} } }] })
-      .mockResolvedValueOnce({ responses: [{ targetUserMid: PEER, targetProfileDetail: {} }] });
-    const { instance } = engine(() => profileReply());
-    expect(await instance.lookupContact(PEER)).toMatchObject({ mid: PEER, displayName: 'Ann', statusMessage: 'hello', relation: 'not_friend',
-      picturePath: expect.any(String) });
-    expect(await instance.lookupContact(PEER)).toEqual({ mid: PEER, displayName: null, statusMessage: null, picturePath: null, relation: 'unknown' });
-    instance.revoke();
-  });
-
   it('marks a friend member true and a blocked friend member false in the catalog', async () => {
     const { Client } = await import('@evex/linejs');
     vi.spyOn(Client.prototype, 'fetchJoinedChats').mockResolvedValue([]);
@@ -369,25 +330,6 @@ describe('linejs client engine', () => {
     expect(items.map((item) => [item.title, item.members[0]!.displayName, item.members[0]!.nickname, item.members[0]!.friend]))
       .toEqual([['Annie', 'Ann', 'Annie', true], ['Bob', 'Bob', undefined, false]]);
     expect(items[0]!.picturePath).toEqual(expect.any(String));
-    instance.revoke();
-  });
-
-  it('lookupContact falls back to getContactsV2 when getContactsV3 is not capable', async () => {
-    const { RelationService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/relation/mod.js', import.meta.url).href) as {
-      RelationService: { prototype: Record<string, (...args: any[]) => Promise<unknown>> };
-    };
-    const { TalkService } = await import(new URL('../../../node_modules/@evex/linejs/base/service/talk/mod.js', import.meta.url).href) as {
-      TalkService: { prototype: Record<string, (...args: any[]) => Promise<unknown>> };
-    };
-    vi.spyOn(RelationService.prototype, 'getContactsV3').mockRejectedValue(new Error('API method not capable'));
-    const getContactsV2 = vi.spyOn(TalkService.prototype, 'getContactsV2');
-    for (const status of [1, 2, 3]) getContactsV2.mockResolvedValueOnce({ contacts: { [PEER]: { contact: { displayName: 'Ann', statusMessage: 'hello', picturePath: '/p/abc', status } } } });
-    const { instance } = engine(() => profileReply());
-    await instance.loginToken(TOKEN);
-    const results = [await instance.lookupContact(PEER), await instance.lookupContact(PEER), await instance.lookupContact(PEER)];
-    expect(results.map((result) => result.relation)).toEqual(['friend', 'blocked', 'not_friend']);
-    expect(results[0]).toMatchObject({ displayName: 'Ann', statusMessage: 'hello', picturePath: expect.any(String) });
-    expect(getContactsV2).toHaveBeenCalledWith({ mids: [PEER] });
     instance.revoke();
   });
 

@@ -101,7 +101,7 @@ import { createSingleFlightRead } from './services/system-read-flight.js';
 import { runCleanupInOrder, StartupCleanup } from './startup-cleanup.js';
 import type { DirectMonitorPage, ImportCatalogPage, ImportCursor, ImportDirectoryPage, ImportProgress, ImportRow } from './services/js-external-reader/protocol.js';
 import { createFirstImportProgressLog } from './services/first-import-progress-log.js';
-import { classifyExternalMonitorFailure, clearExternalMonitorDiagnostic, ExternalMonitorDiagnosticFailure, externalMonitorDatabaseFailure, externalMonitorFailureDetail, recordExternalMonitorDiagnostic as persistExternalMonitorDiagnostic, type ExternalMonitorDiagnosticProducer, type ExternalMonitorFailurePhase } from './services/external-monitor-diagnostics.js';
+import { classifyExternalMonitorFailure, clearExternalMonitorDiagnostic, ExternalMonitorDiagnosticFailure, externalMonitorDatabaseFailure, externalMonitorBootstrapReason, externalMonitorFailureDetail, externalMonitorProgressMessage, recordExternalMonitorDiagnostic as persistExternalMonitorDiagnostic, type ExternalMonitorDiagnosticProducer, type ExternalMonitorFailureDetail, type ExternalMonitorFailurePhase } from './services/external-monitor-diagnostics.js';
 import { linePrompt } from './services/line-prompts.js';
 import { createOwnAvatarRefreshScheduler, runOwnAvatarRefreshes } from './services/own-avatar-refresh-scheduler.js';
 import { cleanupStaleManualMedia, ManualMediaError, stageManualMedia } from './services/manual-media-staging.js';
@@ -109,7 +109,6 @@ import { createManualMediaAdmission } from './services/manual-media-admission.js
 import { ManualSendNotStartedError } from './services/manual-send-errors.js';
 import { gatewayFault, recordSendFault, workerFault } from './services/send-failure.js';
 import { pickWorkerBinding } from './worker-binding-fields.js';
-import { parseLineContactLink } from './line-contact-link.js';
 
 const REPLY_SENDER_NAME_SQL = senderNameSql({ m: 'qm', la: 'qla', c: 'qc', cm: 'qcm',
   senderContact: 'quoted_sender_contact', peerContact: 'quoted_peer_contact' });
@@ -167,8 +166,6 @@ export interface IntegratedWorkerGateway {
   checkFriendRelation(command: Extract<LineWorkerCommand, { type: 'checkFriendRelation' }>): Promise<Extract<LineWorkerEvent, { type: 'friendRelationResult' }>>;
   refreshOwnProfile?(command: Extract<LineWorkerCommand, { type: 'refreshOwnProfile' }>): Promise<Extract<LineWorkerEvent, { type: 'ownProfileResult' }>>;
   addFriendByMid(command: Extract<LineWorkerCommand, { type: 'addFriendByMid' }>): Promise<Extract<LineWorkerEvent, { type: 'addFriendResult' }>>;
-  /** One user-started contact read. Only the lineLookupContact IPC calls it. */
-  lookupContact?(command: Extract<LineWorkerCommand, { type: 'lookupContact' }>): Promise<Extract<LineWorkerEvent, { type: 'contactLookupResult' }>>;
   download(command: Extract<LineWorkerCommand, { type: 'downloadAttachment' }>, signal?: AbortSignal): Promise<Extract<LineWorkerEvent, { type: 'attachmentResult' }>>;
   readChatResource?(command: ChatResourceRequest, signal?: AbortSignal): Promise<ChatResourceReadResult>;
   /** Effective per-operation bound of the gateway (child boot/protocol guard and in-flight sends). */
@@ -225,6 +222,8 @@ export interface ConnectedFacadeOptions {
   /** Opens the OS folder picker for Settings → 資料夾; resolves to the chosen path, or null when cancelled. */
   chooseProjectFolder?: () => Promise<string | null>;
   secretStore?: SecretStore;
+  /** Updates PATH of the Main process from the registry, so a CLI installed after the app started is found by the status checks. */
+  refreshProcessEnvironment?: () => Promise<void>;
   /** Support for CHROMEOS login: the ltsm asset service, the native folder picker and the Chrome Web Store opener. If absent, CHROMEOS is not available. */
   chromeLogin?: { ltsm: ChromeLtsmControl; chooseFolder(): Promise<string | null>; openStore(url: string): Promise<void> };
   audit?: OperationalAudit & { listEvents?: (limit?: number, onUpdate?: (result: AuditEventsReadResult) => void) => Promise<AuditEventsReadResult>; waitForReadDrain?: () => Promise<void> };
@@ -251,6 +250,10 @@ export interface ConnectedFacadeOptions {
   /** Packaged app-owned Skills directory (contains linejs-mcp/SKILL.md). */
   skillsDirectory?: string;
   officialSnapshotImporter?: OfficialSnapshotImporter;
+  /** Reason code of a failed reader bootstrap. Used only when `officialSnapshotImporter` is missing. */
+  officialSnapshotImporterFailure?: ExternalMonitorFailureDetail;
+  /** Creates the importer again when the bootstrap failed. The facade calls it at most once for each start. */
+  createOfficialSnapshotImporter?: () => Promise<OfficialSnapshotImporter>;
   externalImportProgressPath?: string;
   externalMonitorDiagnosticPath?: string;
   /** Persisted official LINE build trust; drives the Primary Admin build status and signer approval. */
@@ -531,6 +534,25 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const inFlight = new Set<Promise<unknown>>();
   const manualMediaAdmission = createManualMediaAdmission();
   const externalMonitor = new ExternalMonitorRepository(options.pool);
+  /**
+   * The official snapshot importer. A failed bootstrap does not stay for the whole app run: when it is missing at the time of a
+   * start, `ensureOfficialSnapshotImporter` calls the factory once for that start. A success is kept for later calls.
+   */
+  let officialImporter = options.officialSnapshotImporter;
+  let officialImporterFailure = options.officialSnapshotImporterFailure;
+  let officialImporterCreation: Promise<OfficialSnapshotImporter | undefined> | undefined;
+  function ensureOfficialSnapshotImporter(): Promise<OfficialSnapshotImporter | undefined> {
+    if (officialImporter || !options.createOfficialSnapshotImporter) return Promise.resolve(officialImporter);
+    const create = options.createOfficialSnapshotImporter;
+    officialImporterCreation ??= create().then((created) => { officialImporter = created; officialImporterFailure = undefined; return created; },
+      (error: unknown) => {
+        officialImporterFailure = externalMonitorBootstrapReason(error);
+        const failed = diagnosticFailure('native_reader', 'bootstrap', error);
+        options.audit?.failure(officialImporterFailure ? { ...failed, detail: `reader:${officialImporterFailure}` } : failed);
+        return undefined;
+      }).finally(() => { officialImporterCreation = undefined; });
+    return officialImporterCreation;
+  }
   type ExternalImportProgress = NonNullable<import('@line-agent/contracts').LineAccountSummary['externalImportProgress']>;
   const externalImportProgress = new Map<string, ExternalImportProgress>();
   let pendingMonitorRefresh: { accountId: string; sourceId: string; generation: number; pending: boolean } | null = null;
@@ -1051,6 +1073,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   // Counts of the latest bridge verification result of each attachment. They come from the audit rows and are cached for the snapshot.
   const bridgeVerificationCache = new Map<string, BridgeVerificationCounts>();
   const bridgeVerificationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // In memory only: LINE phone registration of each signed-in account, read once by the worker after login.
+  const phoneRegisteredByAccount = new Map<string, boolean | null>();
   startupCleanup.add(() => { for (const timer of bridgeVerificationTimers.values()) clearTimeout(timer); bridgeVerificationTimers.clear(); });
   // A failed count keeps the safe fallback (gate closed). The error goes to the audit failure path with a safe code.
   const reportBridgeCountError = (error: unknown): void => {
@@ -1105,8 +1129,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const agent = agentAccount.find((item) => item.productRole === 'AGENT');
         const verifiedBinding = !!stored?.ownMid && await externalAdminAuthorized(agent, stored.ownMid);
         const capability = await accounts.resolveCapabilities(account.accountId);
-        const canStartExternalImport = !!options.officialSnapshotImporter?.readOfficialSnapshot
-          && !!options.officialSnapshotImporter.readOfficialMonitor && account.productRole === 'PRIMARY_ADMIN'
+        // A missing importer with a factory counts as available: the start tries to create it again.
+        const canStartExternalImport = (officialImporter ? !!officialImporter.readOfficialSnapshot && !!officialImporter.readOfficialMonitor
+          : options.createOfficialSnapshotImporter !== undefined) && account.productRole === 'PRIMARY_ADMIN'
           && verifiedBinding && account.status === 'disconnected' && !externalImportOwner;
         return { ...account, canSendManually: false, canStartExternalImport, hasVerifiedLineIdentity: !!stored?.ownMid,
           externalImportProgress: externalImportProgress.get(account.accountId) ?? null, ...officialBuildFor(account) };
@@ -1124,7 +1149,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     // Every device other than the default DESKTOPWIN shows its device value; DESKTOPWIN leaves the field absent.
     const accountsWithTransport = await Promise.all(accountsWithManualSend.map(async (account) => {
       const kind = await transportOf(account.accountId);
-      return kind === 'DESKTOPWIN' ? account : { ...account, lineTransport: kind };
+      const phone = account.status === 'connected' ? phoneRegisteredByAccount.get(account.accountId) : undefined;
+      const withPhone = phone === undefined ? account : { ...account, phoneRegistered: phone };
+      return kind === 'DESKTOPWIN' ? withPhone : { ...withPhone, lineTransport: kind };
     }));
     const bridgeStatus = downloadBridge?.status();
     const accountsWithBridge = await Promise.all(accountsWithTransport.map(async (account) => account.productRole === 'PRIMARY_ADMIN' && downloadBridge
@@ -1797,7 +1824,13 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
 
   unsubscribeEvent = options.workers.onEvent((instance, event) => closing ? Promise.resolve() : track(async () => {
     if (!lineService.isCurrentWorkerEvent(instance, event)) return;
+    if (event.type === 'accountSettings') {
+      phoneRegisteredByAccount.set(event.accountId, event.phoneRegistered);
+      await publishSnapshot();
+      return;
+    }
     if (event.type === 'authInvalidated') {
+      phoneRegisteredByAccount.delete(event.accountId);
       try {
         options.audit?.observed('line_auth_invalidated', { initiator: 'worker', accountId: event.accountId,
           workerInstanceId: event.workerInstanceId, reasonCode: 'auth_invalidated',
@@ -1952,6 +1985,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     if (event.type === 'login') {
       if (!lineService.isCurrentWorkerEvent(instance, event)) return;
       completedLoginAttempts.set(event.accountId, event.loginAttemptId);
+      phoneRegisteredByAccount.delete(event.accountId);
       await updateChatResourceReadiness(instance, event);
       await noteOwnAvatarAccountConnected(event.accountId);
       options.publish?.({ type: 'lineLoginState', accountId: event.accountId, loginAttemptId: event.loginAttemptId, state: 'connected', message: null });
@@ -2414,7 +2448,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     sourceIdentityDigest: string; checkpoint: Record<string, unknown>; signal: AbortSignal;
     setProgress(progress: ExternalImportProgress): void;
   }): Promise<void> {
-    const importer = options.officialSnapshotImporter?.readOfficialMonitor;
+    const importer = (await ensureOfficialSnapshotImporter())?.readOfficialMonitor;
     let readerReady = false;
     let diagnosticPhase: ExternalMonitorFailurePhase = 'facade_checkpoint_fence';
     let readinessDiagnosticClear: Promise<void> | undefined;
@@ -2424,7 +2458,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         throw new ExternalMonitorDiagnosticFailure(failure.code, failure.stage, failure.detail, diagnosticPhase, failure.errorCode);
       }
     };
-    if (!importer) throw new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup');
+    if (!importer) throw new ExternalMonitorDiagnosticFailure('external_monitor_reader_startup_failed', 'startup',
+      officialImporterFailure, 'reader_resource_verification');
     const committer: Pick<ExternalMonitorRepository, 'commitDirectPoll'> = externalMonitor;
     let checkpoint = input.checkpoint;
     // The first complete native polling round establishes the monitor high-water mark.
@@ -2522,7 +2557,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
 
   async function beginExternalImport(requestId: string, accountId: string): Promise<IpcResult> {
     if (closing) return failure(requestId, 'SERVICE_CLOSING', 'Service is closing.');
-    if (!options.officialSnapshotImporter) return failure(requestId, 'EXTERNAL_IMPORT_UNAVAILABLE', 'LINE history import is not available in this build.');
+    if (!await ensureOfficialSnapshotImporter()) return failure(requestId, 'EXTERNAL_IMPORT_UNAVAILABLE', 'LINE history import is not available in this build.');
     return supervisor.runLifecycle(async () => {
       if (externalImportOwner) return failure(requestId, 'EXTERNAL_IMPORT_BUSY', 'An official LINE import is already running.', true);
       const account = await accounts.getAccount(accountId);
@@ -2585,7 +2620,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
               signal: abort.signal, setProgress });
             return;
           }
-          const completion = await options.officialSnapshotImporter!.readOfficialSnapshot({
+          const completion = await officialImporter!.readOfficialSnapshot({
             expectedMid: account.ownMid!, signal: abort.signal,
             onProgress(progress) {
               progressLogReady = true;
@@ -2747,7 +2782,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
               totalBytes: externalImportProgress.get(accountId)?.totalBytes ?? null,
               committedRows: externalImportProgress.get(accountId)?.committedRows ?? previousState?.committedCount ?? '0',
               eligibleRows: externalImportProgress.get(accountId)?.eligibleRows ?? previousState?.eligibleCount ?? null,
-              message: safeCode ?? externalMonitorFailureDetail(error) ?? 'LINE import failed.' });
+              message: monitorFailure ? externalMonitorProgressMessage(monitorFailure.code, monitorFailure.detail)
+                : externalMonitorFailureDetail(error) ?? 'LINE import failed.' });
           }
         } finally {
           if (progressLog) await progressLog.close({ remove: false });
@@ -2762,7 +2798,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   }
 
   async function resumeExternalMonitorOnStartup(producer: ExternalMonitorDiagnosticProducer = 'startup_resume'): Promise<void> {
-    if (!options.officialSnapshotImporter?.readOfficialMonitor) return;
+    if (!officialImporter?.readOfficialMonitor) return;
     await supervisor.runLifecycle(async () => {
     if (closing || externalImportOwner) return;
     const selected = await options.pool.query<{ account_id: string; source_id: string; generation: string;
@@ -2829,8 +2865,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         scheduleMonitorRetry(failureCode);
         setProgress({ stage: abort.signal.aborted ? 'complete' : 'failed', copiedBytes: null, totalBytes: null,
           committedRows: state.committedCount, eligibleRows: state.eligibleCount,
-          message: abort.signal.aborted ? 'External monitoring paused.'
-            : failureCode });
+          message: abort.signal.aborted || !failureCode ? 'External monitoring paused.'
+            : externalMonitorProgressMessage(failureCode, externalMonitorFailureDetail(error)) });
       } finally {
         if (externalImportOwner?.abort === abort) externalImportOwner = null;
         await publishSnapshot().catch(() => undefined);
@@ -2874,8 +2910,9 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       expectedAdminMid = adminRow.ownMid;
     }
     if (externalImportOwner || identityReadAbort) return failure(requestId, 'EXTERNAL_IMPORT_BUSY', 'LINE 讀取正在進行中，請稍後再試。', true);
-    const readIdentity = options.officialSnapshotImporter?.readOfficialIdentity?.bind(options.officialSnapshotImporter);
-    if (!readIdentity) return failure(requestId, 'OFFICIAL_IDENTITY_UNAVAILABLE', 'reader_missing');
+    const readerImporter = await ensureOfficialSnapshotImporter();
+    const readIdentity = readerImporter?.readOfficialIdentity?.bind(readerImporter);
+    if (!readIdentity) return failure(requestId, 'OFFICIAL_IDENTITY_UNAVAILABLE', officialImporterFailure ?? 'reader_missing');
     const abort = new AbortController();
     identityReadAbort = abort;
     try {
@@ -3074,25 +3111,6 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       }
       if (request.type === 'refreshLineAvatar') {
         return refreshOwnAvatar(request.accountId, request.requestId);
-      }
-      if (request.type === 'lineLookupContact') {
-        // User-started contact read. One worker call per IPC call. No Agent, MCP or schedule path reaches this branch.
-        const lookupFailure = (error: string): IpcResult => ({ type: request.type, requestId, ok: true, lookup: { ok: false, error } });
-        const targetMid = parseLineContactLink(request.link);
-        if (!targetMid) return lookupFailure('INVALID_LINE_LINK');
-        const agent = (await accounts.listAuthenticatedAccounts()).find((item) => item.productRole === 'AGENT');
-        const binding = agent ? await options.workers.binding(agent.accountId) : null;
-        if (!agent?.ownMid || !binding || binding.mode === 'PAUSED' || !options.workers.lookupContact) return lookupFailure('LINE_NOT_CONNECTED');
-        try {
-          const result = await options.workers.lookupContact({ ...pickWorkerBinding(binding), type: 'lookupContact',
-            requestId: `lookup-${randomUUID()}`, targetMid });
-          return result.status === 'ok'
-            ? { type: request.type, requestId, ok: true, lookup: { ok: true, contact: result.contact } }
-            : lookupFailure(result.error);
-        } catch (error) {
-          options.audit?.failure({ ...diagnosticFailure('ipc', 'execute', error), ipcAction: request.type }, { accountId: agent.accountId, requestId, initiator: 'user' });
-          return lookupFailure('CONTACT_LOOKUP_FAILED');
-        }
       }
       if (request.type === 'refreshLineCatalog') {
         // Friends tab opened by the user: one catalog read for the account, at most one in 60 seconds. No timer sends this request.
@@ -3519,6 +3537,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       if (request.type === 'setDefaultAgent') { await settings.setAppSetting('default_provider', request.provider); await publishSnapshot(); return accepted(request.requestId); }
       if (request.type === 'setWorkspace') { await workspace.configure(request.workspacePath); return accepted(request.requestId); }
       if (request.type === 'agentRefreshStatus') {
+        await options.refreshProcessEnvironment?.().catch(() => undefined);
         const auth = await options.agent.agentRefreshStatus(request.provider, await quotaAccount(request.provider));
         if (auth.status === 'error') options.audit?.failure({ ...diagnosticFailure('provider_auth', 'authenticate'), provider: request.provider });
         applyProviderAuthStatus(health, {provider:request.provider,...auth});
@@ -3560,6 +3579,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
             result = ok ? { type: request.type, requestId, ok: true, sources: done.sources }
               : failure(requestId, 'AGENT_AUTH_FAILED', done.result.detail ?? 'Agent 登入操作失敗。');
           } else if (request.type === 'agentSourceRefresh') {
+            await options.refreshProcessEnvironment?.().catch(() => undefined);
             await sourceService.refresh(request.id);
             result = { type: request.type, requestId, ok: true, sources: await sourceService.list() };
           } else {

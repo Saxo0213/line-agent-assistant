@@ -386,6 +386,15 @@ describe('inline account action status', () => {
     expect(notices.at(-1)).toBe(desktopTextFor('zh-TW', 'squareReceiveHint'));
   });
 
+  it('shows the community receive checkbox disabled and unchecked with a note when the account has no phone registration', async () => {
+    const api = { getLineSquareReceive: vi.fn(async () => true), setLineSquareReceive: vi.fn(async (enabled: boolean) => enabled) } as unknown as DesktopApi;
+    render(<LineLogin api={api} accounts={[{ ...buildAgent, phoneRegistered: false }]} headingRef={React.createRef()} onNotice={() => undefined} />);
+    const checkbox = await screen.findByLabelText(/接收社群訊息/) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    expect(checkbox.disabled).toBe(true);
+    expect(screen.getByText(desktopTextFor('zh-TW', 'squareReceiveNoPhone'))).toBeTruthy();
+  });
+
   it('disables automatic login while monitoring and leaves it enabled otherwise', () => {
     const { rerender } = render(<LineLogin api={{ lineSetAutoLogin: vi.fn() } as unknown as DesktopApi}
       accounts={[{ ...autoLoginAccount(), externalImportProgress: { stage: 'monitoring', copiedBytes: null, totalBytes: null,

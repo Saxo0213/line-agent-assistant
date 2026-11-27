@@ -212,14 +212,13 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
           : { code: 'INVALID_COMMAND' as const, message: 'Worker command rejected' };
         const serverRejection = isLineServerRejection(error) ? error : null;
         if (serverRejection) flushTrafficLogSync(); // The response of the rejected call must be on disk before Main reacts.
-        const base = diagnosticFailure(command?.type === 'lookupContact' ? 'unknown' : command?.type === 'refreshCatalog' ? 'catalog_refresh' : command?.type ?? rejectedOperation(input), commandExecutionStarted ? 'execute'
+        const base = diagnosticFailure(command?.type === 'refreshCatalog' ? 'catalog_refresh' : command?.type ?? rejectedOperation(input), commandExecutionStarted ? 'execute'
             : command?.type === 'init' && initializing ? 'bootstrap' : 'admission', error);
         // The event code is the fixed operation code. The real error class, method and code stay in the diagnostic detail and status.
         const fallbackDetail = base.detail === undefined && !serverRejection ? buildLoginFailureDetail(error) : undefined;
         const fallbackStatus = serverRejection ? undefined : loginHttpStatus(error);
         await emit({ type: 'error', ...identity, ...diagnostic,
           ...(serverRejection ? { code: serverRejection.code, message: serverRejection.message } : {}), retryable: false,
-          // lookupContact has no audit operation value (the audit trigger list stays as it is), so its rare unexpected failure reads as unknown.
           diagnostic: { ...base,
             ...(fallbackDetail === undefined ? {} : { detail: fallbackDetail }),
             ...(fallbackStatus === undefined ? {} : { upstreamStatus: fallbackStatus }),
@@ -322,9 +321,6 @@ export function runWorkerLoopOnPort(port: WorkerPort, factory: (init: Init) => P
       } else if (command.type === 'addFriendByMid') {
         void emit({ type: 'addFriendResult', ...requestBinding, requestId: command.requestId,
           targetMid: command.targetMid, status: 'failed', error: 'QUEUE_FULL' });
-      } else if (command.type === 'lookupContact') {
-        void emit({ type: 'contactLookupResult', ...requestBinding, requestId: command.requestId,
-          status: 'failed', error: 'QUEUE_FULL' });
       } else {
         void emit({ type: 'error', ...requestBinding,
           code: 'QUEUE_FULL', message: 'Worker capability is busy', retryable: true });

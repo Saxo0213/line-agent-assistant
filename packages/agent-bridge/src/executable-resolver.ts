@@ -48,6 +48,8 @@ export class WindowsExecutableResolver implements ExecutableResolver {
     }
     const directories=(this.options.searchPath ?? env.PATH ?? '').split(';').filter(isAbsolute);
     const nativeCandidates=[...(this.options.knownInstallations?.[provider] ?? []),...directories.map(d=>join(d,`${provider}.exe`))];
+    // The official Claude installer puts claude.exe here and does not always add the folder to PATH.
+    if(provider==='claude' && env.USERPROFILE) nativeCandidates.push(join(env.USERPROFILE,'.local','bin','claude.exe'));
     if(provider === 'codex') {
       for(const directory of directories) {
         nativeCandidates.push(join(directory,'node_modules','@openai','codex','node_modules','@openai','codex-win32-x64','vendor','x86_64-pc-windows-msvc','bin','codex.exe'));
@@ -83,7 +85,7 @@ export class WindowsExecutableResolver implements ExecutableResolver {
           const node=await trusted(candidate);
           if(!node || !await isPortableExecutable(node)) continue;
           const check=await captureProcess(this.options.runner,{file:node,args:['--version'],env});
-          if(check.code!==0 || !/^v24\.\d+\.\d+\s*$/.test(check.stdout)) continue;
+          if(check.code!==0 || !isSupportedNodeVersion(check.stdout)) continue;
           const version=await this.version(node,[entry],provider,env);
           if(version) return {file:node,prefixArgs:[entry],version,kind:'node'};
         }
@@ -100,6 +102,12 @@ export class WindowsExecutableResolver implements ExecutableResolver {
       return match?.[1] ?? null;
     } catch {return null;}
   }
+}
+
+/** `node --version` output of Node.js major version 24 or higher, for example `v24.1.0` or `v26.13.1`. */
+export function isSupportedNodeVersion(output:string):boolean {
+  const match=/^v(\d+)\.\d+\.\d+\s*$/.exec(output);
+  return match!==null && Number(match[1])>=24;
 }
 
 async function isPortableExecutable(file:string) {

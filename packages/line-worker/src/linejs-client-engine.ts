@@ -16,7 +16,7 @@ import { safeChatResourceFailureDetails } from './chat-resource-error.js';
 import { authInvalidationDetailOfName, decodeLinejsServerRejection, decodeSquareRejection, isTalkAuthInvalidation,
   talkAuthInvalidationDetail, type AuthInvalidationDetail } from './line-server-error.js';
 import { classifyLinejsFailure, hasLinejsMethodTag, tagLinejsFailure } from './login-failure-detail.js';
-import type { ContactLookup, FriendAddResult, FriendRelation, FriendRelationDiagnostic, LineTransport, RelationCancellation,
+import type { FriendAddResult, FriendRelation, FriendRelationDiagnostic, LineTransport, RelationCancellation,
   SquareSyncResult, SyncItem, SyncResult, TransportIdentity } from './worker-loop.js';
 import { ObservedMemoryStorage } from './linejs-client-engine-storage.js';
 import { OperationCollector, decimal } from './linejs-client-engine-ops.js';
@@ -406,6 +406,16 @@ export class LinejsClientEngine implements LineTransport {
       members: memberIds.map((memberId) => this.#member(memberId)), ...(path === undefined ? {} : { picturePath: path }) };
   }
 
+  /**
+   * `LinejsFullClient.getSettings` (linejs `base.talk.getSettings()`), one call, no retry. Only `phoneRegistration` is read.
+   * The other fields (for example the e-mail identifier) are dropped here and are never kept or logged.
+   */
+  async readPhoneRegistration(): Promise<boolean | null> {
+    if (this.#revoked || !this.#full.authToken) throw new Error('LINE settings read is unavailable');
+    const settings = await this.#linejs(() => this.#full.getSettings()) as { phoneRegistration?: unknown } | undefined;
+    return typeof settings?.phoneRegistration === 'boolean' ? settings.phoneRegistration : null;
+  }
+
   /** `client.fetchJoinedChats()` and `client.fetchUsers()` (client/client.ts). */
   async listConversations(): Promise<readonly ConversationCatalogItem[]> {
     const chats = await this.#linejs(() => this.#client.fetchJoinedChats());
@@ -705,49 +715,6 @@ export class LinejsClientEngine implements LineTransport {
       if (signal.aborted) return unknown('RELATION_CANCELLED');
       return { status: 'unknown', error: 'RELATION_LIST_RPC_FAILED', ...safeChatResourceFailureDetails(error) };
     }
-  }
-
-  /**
-   * One user-started contact read: `client.getUser(mid)` (client/client.ts, getContactsV3), one call, no retry.
-   * Relation: own MID is `self`; `friendDetail.user` is `friend`; `friendDetail.notFriend` is `not_friend`;
-   * `blockDetail.user` (the contact is on the block list) is `blocked`; anything else is `unknown`.
-   * Name, status message and picture come from `targetProfileDetail`. Nothing is added and nothing is sent.
-   */
-  async lookupContact(targetMid: string): Promise<ContactLookup> {
-    if (this.#revoked) throw new Error('LOOKUP_BINDING_REVOKED');
-    // `getUser` uses getContactsV3 only. When linejs reports API_NOT_CAPABLE (the same check as `isApiNotCapable`, client/client.js:20),
-    // read the contact with getContactsV2, the call of `fetchUsers` (client/client.js:242).
-    const user = await this.#linejs(async () => {
-      try { return await this.#client.getUser(targetMid); } catch (error) {
-        if (!/API method not capable/i.test(error instanceof Error ? error.message : String(error))) throw error;
-        const res = await this.#full.getContactsV2([targetMid]);
-        const entries = (res.contacts ?? {}) as Record<string, unknown>;
-        const entry = entries[targetMid] ?? entries[targetMid.toLowerCase()] ?? Object.values(entries)[0];
-        return { raw: typeof entry === 'object' && entry !== null ? { ...entry, targetUserMid: targetMid } : undefined };
-      }
-    });
-    const raw = user.raw as unknown as { targetUserMid?: unknown;
-      targetProfileDetail?: { profileName?: unknown; picturePath?: unknown; statusMessage?: unknown };
-      friendDetail?: { user?: unknown; notFriend?: unknown }; blockDetail?: { user?: unknown };
-      contact?: { displayName?: unknown; picturePath?: unknown; statusMessage?: unknown; status?: unknown } } | undefined;
-    const v2 = !raw?.targetProfileDetail && typeof raw?.contact === 'object' && raw.contact !== null ? raw.contact : undefined;
-    const detail = raw?.targetProfileDetail ?? (v2 ? { profileName: v2.displayName, statusMessage: v2.statusMessage,
-      ...(Object.hasOwn(v2, 'picturePath') ? { picturePath: v2.picturePath } : {}) } : undefined);
-    const own = this.#full.profile?.mid;
-    const v2Relation: ContactLookup['relation'] = v2?.status === 2 || v2?.status === 'FRIEND_BLOCKED' ? 'blocked'
-      : v2?.status === 1 || v2?.status === 'FRIEND' ? 'friend' : 'not_friend';
-    const relation: ContactLookup['relation'] = typeof own === 'string' && own.toLowerCase() === targetMid.toLowerCase() ? 'self'
-      : v2 ? v2Relation
-        : raw?.blockDetail?.user ? 'blocked'
-          : raw?.friendDetail?.user ? 'friend'
-            : raw?.friendDetail?.notFriend ? 'not_friend' : 'unknown';
-    const text = (value: unknown, max: number): string | null => {
-      const content = typeof value === 'string' ? value : (value as { content?: unknown } | undefined)?.content;
-      return typeof content === 'string' && content.length > 0 ? content.slice(0, max) : null;
-    };
-    const path = picturePath(detail?.picturePath, detail !== undefined && Object.hasOwn(detail, 'picturePath'));
-    return { mid: targetMid.toLowerCase(), displayName: text(detail?.profileName, 256), statusMessage: text(detail?.statusMessage, 1024),
-      picturePath: path ?? null, relation };
   }
 
   /**

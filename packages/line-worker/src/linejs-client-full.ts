@@ -92,6 +92,11 @@ export class LinejsFullClient {
   /** linejs `base.auth.logoutZ()` (base/service/auth/mod.ts:247). */
   logout() { return this.#base.auth.logoutZ(); }
 
+  // ---- account settings ----
+
+  /** linejs `base.talk.getSettings()` (base/service/talk/mod.ts:302). The request is the linejs default; no argument is given. */
+  getSettings() { return this.#base.talk.getSettings(); }
+
   // ---- sync cursors ----
 
   /** linejs `base.poll.sync.talk` (base/polling/mod.ts, SyncData). */
@@ -152,9 +157,6 @@ export class LinejsFullClient {
 
   /** linejs `base.relation.addFriendByMid(args)` (cli/src/commands/contacts.ts:147; the group member form: base/service/relation/mod.test.ts:47-52). */
   addFriendByMid(args: AddFriendArgs) { return this.#base.relation.addFriendByMid(args); }
-
-  /** linejs `base.talk.getContactsV2({ mids })` (client/client.js:242, the V2 step of `fetchUsers`). */
-  getContactsV2(mids: string[]) { return this.#base.talk.getContactsV2({ mids }); }
 
   // ---- notes ----
 

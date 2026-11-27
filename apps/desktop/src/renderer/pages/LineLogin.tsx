@@ -3,11 +3,11 @@ import { desktopTextFor, generatedMessageText, useDesktopLocale, useDesktopText,
 import React, { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { DEFAULT_DOWNLOAD_BRIDGE_INTERVALS, DOWNLOAD_BRIDGE_INTERVAL_SECONDS_MAX, isLinejsTransport } from '@line-agent/contracts';
-import { LineMediaImage } from '../LineMediaImage.js';
-import type { ChromeLtsmInstallResult, ChromeLtsmUnavailableStatus, ConversationKey, DownloadBridgeIntervalRange, DownloadBridgeIntervals, DownloadBridgeState, IpcResult, LineAccountSummary, LineTransportKind } from '@line-agent/contracts';
+import type { ChromeLtsmInstallResult, ChromeLtsmUnavailableStatus, DownloadBridgeIntervalRange, DownloadBridgeIntervals, DownloadBridgeState, IpcResult, LineAccountSummary, LineTransportKind } from '@line-agent/contracts';
 import type { DesktopApi } from '../../preload/api.js';
 import { InlineBusy } from '../components/InlineBusy.js';
 import { ProgressOverlay } from '../components/ProgressOverlay.js';
+import { EXPERIMENTAL_LINE_CONTROLS } from '../release-features.js';
 
 export type LineLoginView = { accountId: string; loginAttemptId: string | null; state: 'connecting' | 'connected' | 'disconnected' | 'degraded' | 'reauth_required'; message: string | null; imageDataUrl?: string; pin?: string };
 type PendingAction = 'add' | 'restart' | 'login';
@@ -47,10 +47,25 @@ const knownImportKeys = {
   reader_process_count_invalid: 'openLineAndLogInToThePrimaryAdministrator', candidate_ambiguous: 'multipleLineDatabasesAreUpdatingTryAgainShortly',
   line_window_ambiguous: 'multipleLineWindowsAreOpenCloseTheOtherWindows',
 } as const;
+/** Detail codes after `<failure code>:`. They give the real reason of a reader failure. */
+const importDetailKeys = {
+  unsupported_build: 'externalMonitorDetailUnsupportedBuild',
+  process_missing: 'externalMonitorDetailProcessMissing',
+  process_ambiguous: 'externalMonitorDetailProcessAmbiguous', line_window_ambiguous: 'externalMonitorDetailProcessAmbiguous',
+  key_unavailable: 'externalMonitorDetailKeyUnavailable', owner_invalid: 'externalMonitorDetailKeyUnavailable',
+  private_directory_path_validation: 'externalMonitorDetailPrivateDirectory', private_directory_acl_command_failed: 'externalMonitorDetailPrivateDirectory',
+  private_directory_acl_command_timeout: 'externalMonitorDetailPrivateDirectory', private_directory_acl_unexpected_output: 'externalMonitorDetailPrivateDirectory',
+  node_eacces: 'externalMonitorDetailAccessDenied', node_eperm: 'externalMonitorDetailAccessDenied',
+  official_account_not_active: 'theCurrentLineAccountIsNotThePrimaryAdministrator',
+  reader_resource_integrity_failed: 'externalMonitorDetailResourceIntegrity', reader_main_identity_invalid: 'externalMonitorDetailMainIdentity',
+  reader_main_identity_timeout: 'externalMonitorDetailMainIdentityTimeout',
+} as const;
 const knownImportText = (locale: Parameters<typeof desktopTextFor>[0], code: string): string | undefined => {
   const key = Object.hasOwn(knownImportKeys, code) ? knownImportKeys[code as keyof typeof knownImportKeys] : undefined;
   return key ? desktopTextFor(locale, key) : undefined;
 };
+const detailImportText = (locale: Parameters<typeof desktopTextFor>[0], code: string): string | undefined =>
+  Object.hasOwn(importDetailKeys, code) ? desktopTextFor(locale, importDetailKeys[code as keyof typeof importDetailKeys]) : undefined;
 const stageText = (locale: Parameters<typeof desktopTextFor>[0], stage: 'checking_source' | 'closing_line_window' | 'copying_snapshot' | 'counting_rows') =>
   desktopTextFor(locale, ({ checking_source: 'checkingLineSource', closing_line_window: 'minimizingLineToTheSystemTray', copying_snapshot: 'preparingImport', counting_rows: 'countingMessages' } as const)[stage]);
 const SAFE_ERROR_CODE =/^[a-z0-9_:.-]{1,120}$/;
@@ -62,8 +77,13 @@ const MACHINE_CODE =/^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)*$/;
 export function describeExternalImportMessage(message: string, locale: Parameters<typeof desktopTextFor>[0] = 'en'): { text: string; code: string | null } {
   const trimmed = message.trim();
   if (!MACHINE_CODE.test(trimmed) || !SAFE_ERROR_CODE.test(trimmed)) return { text: desktopTextFor(locale, 'externalMonitoringStoppedUnexpectedlyRestartExternalMonitoring'), code: null };
+  const separator = trimmed.indexOf(':');
   const code = trimmed.slice(trimmed.lastIndexOf(':') + 1);
-  return { text: knownImportText(locale, code) ?? knownImportText(locale, trimmed) ?? desktopTextFor(locale, 'externalMonitoringStoppedUnexpectedlyRestartExternalMonitoring'), code: trimmed };
+  // `external_monitor_*:<detail>` shows the text of the detail first, then the text of the failure code.
+  // Other codes (for example `reader_source_unsupported:key_unavailable`) keep the text of the last segment.
+  const text = !trimmed.startsWith('external_monitor_') || separator < 0 ? knownImportText(locale, code) ?? knownImportText(locale, trimmed)
+    : detailImportText(locale, code) ?? knownImportText(locale, code) ?? knownImportText(locale, trimmed.slice(0, separator));
+  return { text: text ?? desktopTextFor(locale, 'externalMonitoringStoppedUnexpectedlyRestartExternalMonitoring'), code: trimmed };
 }
 export function externalImportMessageText(message: string, locale: Parameters<typeof desktopTextFor>[0] = 'en'): string { return describeExternalImportMessage(message, locale).text; }
 const importKey = (account: LineAccountSummary) => `${account.externalImportProgress?.stage ?? ''}|${account.externalImportProgress?.message ?? ''}`;
@@ -99,12 +119,9 @@ function BridgeIntervalRow({ label, minLabel, maxLabel, unit, value, disabled, o
     <span>{unit}</span>
   </div>;
 }
-type Props = { api: DesktopApi; accounts: LineAccountSummary[]; headingRef?: React.RefObject<HTMLHeadingElement | null>; embedded?: boolean; live?: LineLoginView | null; onNotice?: (message: string) => void;
-  /** Stored conversations; the lookup card offers 開啟聊天 only for a friend that has a direct row here. */
-  conversations?: readonly ConversationKey[]; onOpenConversation?: (key: ConversationKey) => void };
-const NO_CONVERSATIONS: readonly ConversationKey[] = [];
+type Props = { api: DesktopApi; accounts: LineAccountSummary[]; headingRef?: React.RefObject<HTMLHeadingElement | null>; embedded?: boolean; live?: LineLoginView | null; onNotice?: (message: string) => void };
 
-export function LineLogin({ api, accounts, headingRef, embedded = false, live = null, onNotice, conversations = NO_CONVERSATIONS, onOpenConversation }: Props) {
+export function LineLogin({ api, accounts, headingRef, embedded = false, live = null, onNotice }: Props) {
   const desktopText = useDesktopText();
   const extraText = useExtraText();
   const safeErrorText = useSafeErrorText();
@@ -134,6 +151,14 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   // Key of the QR image or PIN whose dialog the user closed. A new QR image or PIN opens the dialog again.
   const [bridgeDialogHiddenKey, setBridgeDialogHiddenKey] = useState<string | null>(null);
   const [bridgeNow, setBridgeNow] = useState(() => Date.now());
+  const [bridgeStoreError, setBridgeStoreError] = useState<string | null>(null);
+  async function openBridgeExtensionStore(): Promise<void> {
+    setBridgeStoreError(null);
+    try {
+      const opened = await api.openChromeExtensionStore();
+      if (!opened.ok) setBridgeStoreError(safeErrorText(opened));
+    } catch (cause) { setBridgeStoreError(safeErrorText(cause)); }
+  }
   const bridgeErrorText = useDownloadBridgeErrorText();
   const [adminChangeNow, setAdminChangeNow] = useState(() => Date.now());
   const [loginMethod, setLoginMethod] = useState<LoginMethod>('DESKTOPWIN');
@@ -161,50 +186,6 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       notify(desktopText('legyEncryptedTransportHint'));
     } catch (cause) { notify(safeErrorText(cause, desktopText('unableToSave'))); }
   }
-  // LINE link lookup (test). The 查詢 button is the only trigger; typing or pasting never starts a query.
-  const [lookupText, setLookupText] = useState('');
-  const [lookupBusy, setLookupBusy] = useState(false);
-  const [lookupResult, setLookupResult] = useState<Awaited<ReturnType<DesktopApi['lineLookupContact']>> | null>(null);
-  async function runLookup(): Promise<void> {
-    if (lookupBusy || typeof api.lineLookupContact !== 'function') return;
-    setLookupBusy(true);
-    try { setLookupResult(await api.lineLookupContact(lookupText)); }
-    catch { setLookupResult({ ok: false, error: 'CONTACT_LOOKUP_FAILED' }); }
-    finally { setLookupBusy(false); }
-  }
-  const lookupRelationText = {
-    friend: desktopText('lineLookupRelationFriend'), not_friend: desktopText('lineLookupRelationNotFriend'),
-    blocked: desktopText('lineLookupRelationBlocked'), self: desktopText('lineLookupRelationSelf'), unknown: desktopText('lineLookupRelationUnknown'),
-  } as const;
-  const lookupSection = (account: LineAccountSummary) => {
-    const contact = lookupResult?.ok ? lookupResult.contact : null;
-    const hasChat = contact !== null && contact.relation === 'friend' && onOpenConversation !== undefined
-      && conversations.some((item) => item.accountId === account.accountId && item.chatType === 'direct' && item.chatId === contact.mid);
-    return <section className="line-lookup" aria-label={desktopText('lineLookupTitle')}>
-      <h3>{desktopText('lineLookupTitle')}</h3>
-      <div className="button-row">
-        <input type="text" value={lookupText} placeholder={desktopText('lineLookupPlaceholder')} aria-label={desktopText('lineLookupTitle')}
-          onChange={(event) => setLookupText(event.target.value)} />
-        <button disabled={lookupBusy || lookupText.trim() === ''} onClick={() => void runLookup()}>
-          {lookupBusy ? desktopText('lineLookupBusy') : desktopText('lineLookupButton')}</button>
-      </div>
-      {lookupResult && !lookupResult.ok && <p role="alert" className="line-lookup-error">
-        {lookupResult.error === 'INVALID_LINE_LINK' ? desktopText('lineLookupInvalid') : null}
-        <small className="error-code"> {desktopText('lineLookupErrorCode')}{lookupResult.error}</small></p>}
-      {contact && <div className="line-lookup-card" role="status">
-        <LineMediaImage api={api} enabled={contact.picturePath !== null} {...(contact.picturePath !== null ? { target: { type: 'profilePicture' as const, picturePath: contact.picturePath } } : {})}
-          fallbackKind="person" className="conversation-avatar" />
-        <div>
-          <strong>{contact.displayName ?? desktopText('lineLookupNoName')}</strong>
-          {contact.statusMessage !== null && <p>{contact.statusMessage}</p>}
-          <p>{lookupRelationText[contact.relation]} <small>{maskMid(contact.mid)}</small></p>
-          {hasChat
-            ? <button onClick={() => onOpenConversation?.({ accountId: account.accountId, chatType: 'direct', chatId: contact.mid })}>{desktopText('lineLookupOpenChat')}</button>
-            : <p>{desktopText('lineLookupNotFriendNotice')}</p>}
-        </div>
-      </div>}
-    </section>;
-  };
   // Community message receive setting of the Agent worker. Null until the main process answers. It applies at the next login.
   const [squareReceive, setSquareReceive] = useState<boolean | null>(null);
   useEffect(() => {
@@ -698,11 +679,12 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       {!isAdmin && <label className="auto-login-option"><input type="checkbox" checked={account.autoLoginOnStartup === true} disabled={monitoring}
         title={monitoring ? desktopText('unavailableDuringExternalMonitoring') : undefined} aria-describedby={monitoring ? `auto-login-disabled-${account.accountId}` : undefined}
         onChange={(event) => void setAutoLogin(account, event.target.checked)} /> {desktopText('logInAutomaticallyAtStartup')}</label>}
-      {!isAdmin && isLinejsTransport(accountMethod(account)) && accountMethod(account) !== 'IOSIPAD' && legyEncrypted !== null && <label className="auto-login-option"><input type="checkbox" checked={legyEncrypted}
+      {EXPERIMENTAL_LINE_CONTROLS && !isAdmin && isLinejsTransport(accountMethod(account)) && accountMethod(account) !== 'IOSIPAD' && legyEncrypted !== null && <label className="auto-login-option"><input type="checkbox" checked={legyEncrypted}
         onChange={(event) => void changeLegyEncrypted(event.target.checked)} /> {desktopText('legyEncryptedTransport')}<small> {desktopText('legyEncryptedTransportHint')}</small></label>}
-      {account.productRole === 'AGENT' && isLinejsTransport(accountMethod(account)) && lookupSection(account)}
-      {!isAdmin && isLinejsTransport(accountMethod(account)) && squareReceive !== null && <label className="auto-login-option"><input type="checkbox" checked={squareReceive}
-        onChange={(event) => void changeSquareReceive(event.target.checked)} /> {desktopText('squareReceive')}<small> {desktopText('squareReceiveHint')}</small></label>}
+      {!isAdmin && isLinejsTransport(accountMethod(account)) && squareReceive !== null && (account.phoneRegistered === false
+        ? <label className="auto-login-option"><input type="checkbox" checked={false} disabled /> {desktopText('squareReceive')}<small> {desktopText('squareReceiveNoPhone')}</small></label>
+        : <label className="auto-login-option"><input type="checkbox" checked={squareReceive}
+          onChange={(event) => void changeSquareReceive(event.target.checked)} /> {desktopText('squareReceive')}<small> {desktopText('squareReceiveHint')}</small></label>)}
       {!isAdmin && monitoring && <span id={`auto-login-disabled-${account.accountId}`} className="sr-only">{desktopText('unavailableDuringExternalMonitoring')}</span>}
       <div className="button-row account-actions">
         {account.status === 'connected' && !monitoring && <button disabled={refreshingAvatar !== null || busy}
@@ -762,7 +744,9 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
   const bridgeCountdownText = bridgeQrExpiresAt === undefined ? null : bridgeNow >= bridgeQrExpiresAt ? desktopText('downloadBridgeQrExpiredNow')
     : desktopText('downloadBridgeQrRemainingArg0', { arg0: `${Math.floor(Math.ceil((bridgeQrExpiresAt - bridgeNow) / 1000) / 60)}:${String(Math.ceil((bridgeQrExpiresAt - bridgeNow) / 1000) % 60).padStart(2, '0')}` });
   const downloadControls = admin && bridge ? <div className="admin-change download-bridge" role="group" aria-label={desktopText('downloadBridgeTitle')}>
-    <p role="status" className="download-bridge-state">{desktopText('downloadBridgeStatusLabel')}{bridgeStateText}{bridge.state === 'starting' && bridge.code && <small className="muted">（{bridge.code}）</small>}</p>
+    <p role="status" className="download-bridge-state">{desktopText('downloadBridgeStatusLabel')}{bridgeStateText}{bridge.state === 'starting' && bridge.code && <small className="muted">（{bridge.code}）</small>}
+      {bridge.state === 'error' && bridge.code === 'EXTENSION_NOT_FOUND' && <> <button onClick={() => void openBridgeExtensionStore()}>{desktopText('downloadBridgeInstallExtension')}</button></>}</p>
+    {bridge.state === 'error' && bridge.code === 'EXTENSION_NOT_FOUND' && bridgeStoreError && <p role="alert">{bridgeStoreError}</p>}
     {(bridge.state === 'starting' || bridge.state === 'error' || (bridge.state === 'logged_in' && bridge.identity !== 'verified')) && bridge.detail && <p><small className="muted" style={{ wordBreak: 'break-all' }}>{bridge.detail}</small></p>}
     {bridgeCountdownText && <p><small className="muted">{bridgeCountdownText}</small></p>}
     {bridge.state === 'logged_in' && bridge.identity !== 'verified' && <p><small className="muted">{desktopText('downloadBridgeIdentityPending')}</small></p>}
@@ -786,10 +770,13 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
         void runBridgeRequest(() => api.adminDownloadBridgeSetIntervals(admin.accountId, { ...current, [kind]: range }));
       }} />)}
   </div> : null;
-  const methodChoice = <div className="button-row login-method-choice" role="group" aria-label={extraText('loginMethodLabel')}>
-    {LOGIN_METHODS.map((method) => <button key={method} type="button" aria-pressed={loginMethod === method}
-      className={loginMethod === method ? 'primary' : undefined} disabled={loginActive || addPending}
-      onClick={() => chooseLoginMethod(method)}>{extraText(LOGIN_METHOD_TEXT_KEY[method])}</button>)}
+  const methodChoice = <div className="login-method-choice">
+    <span className="login-method-choice-label" aria-hidden="true">{extraText('loginMethodLabel')}</span>
+    <div className="login-method-segmented" role="group" aria-label={extraText('loginMethodLabel')}>
+      {LOGIN_METHODS.map((method) => <button key={method} type="button" aria-pressed={loginMethod === method}
+        className={`login-method-seg${loginMethod === method ? ' active' : ''}`} disabled={loginActive || addPending}
+        onClick={() => chooseLoginMethod(method)}>{extraText(LOGIN_METHOD_TEXT_KEY[method])}</button>)}
+    </div>
   </div>;
   const chromeStatus = chromeSetup?.status ?? null;
   const vacantPending = (slot: PendingTarget) => pending?.target === slot ? desktopText('startingLineLogin') : null;
@@ -828,35 +815,9 @@ export function LineLogin({ api, accounts, headingRef, embedded = false, live = 
       : current === null ? { get title() { return desktopText('logInToLineAccount'); }, accountId: live.accountId, step: live.pin ? desktopText('enterThePinOnYourPhone') : live.imageDataUrl ? desktopText('scanTheQrCodeWithLineOnYourPhone') : desktopText('loggingIn') } : current);
     else if ((live?.state === 'degraded' || live?.state === 'disconnected' || live?.state === 'reauth_required') && progress?.title === desktopText('logInToLineAccount')) setProgress({ get title() { return desktopText('logInToLineAccount'); }, step: '', error: desktopText('lineLoginFailed') });
   }, [live?.state, live?.imageDataUrl, live?.pin, live?.message]);
-  const guideAgentDone = agent?.status === 'connected';
-  const guideAdminDone = admin !== undefined || agent?.hasPrimaryAdmin === true;
-  const guideBridgeDone = bridge?.state === 'logged_in' && bridge.identity === 'verified';
-  const guideAllDone = guideAgentDone && guideAdminDone;
-  const [guideOpen, setGuideOpen] = useState(!guideAllDone);
-  const guideWasDone = useRef(guideAllDone);
-  useEffect(() => {
-    if (guideWasDone.current && !guideAllDone) setGuideOpen(true);
-    guideWasDone.current = guideAllDone;
-  }, [guideAllDone]);
-  const guideBadge = (done: boolean) => <span className={`badge login-guide-badge ${done ? 'done' : 'todo'}`}>{done ? desktopText('loginGuideDone') : desktopText('loginGuideNotDone')}</span>;
-  const loginGuide = <details className="panel login-guide" open={guideOpen} onToggle={(event) => setGuideOpen(event.currentTarget.open)}>
-    <summary>{desktopText('loginGuideSummary')}</summary>
-    <p className="muted">{desktopText('loginGuideIntro')}</p>
-    <ol>
-      <li><strong>{desktopText('loginGuideStep1Title')}</strong> {guideBadge(guideAgentDone)}
-        <p>{desktopText('loginGuideStep1Purpose')}</p><p>{desktopText('loginGuideStep1Login')}</p><p>{desktopText('loginGuideStep1Warning')}</p></li>
-      <li><strong>{desktopText('loginGuideStep2Title')}</strong> {guideBadge(guideAdminDone)}
-        <p>{desktopText('loginGuideStep2Purpose')}</p><p>{desktopText('loginGuideStep2Setup')}</p><p>{desktopText('loginGuideStep2Alternative')}</p></li>
-      <li><strong>{desktopText('loginGuideStep3Title')}</strong>
-        <p>{desktopText('loginGuideStep3Body')}</p></li>
-      <li><strong>{desktopText('loginGuideStep4Title')}</strong> <span className="badge login-guide-badge optional">{desktopText('loginGuideOptional')}</span>{guideBridgeDone && guideBadge(true)}
-        <p>{desktopText('loginGuideStep4Purpose')}</p><p>{desktopText('loginGuideStep4Setup')}</p></li>
-    </ol>
-  </details>;
   const windowPromptAccount = windowPrompt ? accounts.find((account) => account.accountId === windowPrompt) : undefined;
   return <div className={embedded ? 'account-settings' : 'page'}>
     {!embedded && <header className="page-header compact"><div><span className="eyebrow">{extraText('lineAccounts')}</span><div className="page-title-row"><h1 tabIndex={-1} ref={headingRef}>{desktopText('account')}</h1><p>{desktopText('agentAndAdministratorAccounts')}</p></div></div></header>}
-    {embedded && loginGuide}
     <section className={embedded ? 'panel combined-account-card' : undefined} aria-label={embedded ? desktopText('lineAccountSettings') : undefined}>
     {embedded && <h2 className="combined-account-title">{desktopText('account')}</h2>}
     <div className="account-role-slots">

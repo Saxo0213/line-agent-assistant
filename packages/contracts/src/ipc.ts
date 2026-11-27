@@ -12,7 +12,6 @@ import { DownloadBridgeIntervalsSchema } from './download-bridge-intervals.js';
 import { AutoResponderRuleSchema, AutoResponderSettingsSchema, validateAutoresponderConfig } from './autoresponder.js';
 import { AccountModeSchema, ChatTypeSchema, ConversationKeySchema, LineTransportKindSchema, WritableConversationKeySchema } from './account.js';
 import { ChromeLtsmInstallResultSchema, ChromeLtsmStatusSchema, ChromeLtsmUnavailableStatusSchema } from './chrome-login.js';
-import { ContactLookupSchema } from './worker-v2.js';
 import { MentionRangeSchema, MessageContentSchema, MessageKindSchema, OutgoingMentionSchema, OUTGOING_MENTIONS_MAX, outgoingMentionsIssue, SticonRangeSchema } from './line.js';
 import {
   AgentPermissionsViewSchema,
@@ -194,8 +193,6 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('setLineLegyEncrypted'), enabled: z.boolean() }),
   RequestIdSchema.extend({ type: z.literal('getLineSquareReceive') }),
   RequestIdSchema.extend({ type: z.literal('setLineSquareReceive'), enabled: z.boolean() }),
-  /** A user-started contact read from a pasted LINE profile link or MID. The renderer button is the only caller. */
-  RequestIdSchema.extend({ type: z.literal('lineLookupContact'), link: z.string().min(1).max(512) }),
   /** Friends tab opened: one conversation catalog refresh from LINE. Main allows one for each account in 60 seconds. */
   RequestIdSchema.extend({ type: z.literal('refreshLineCatalog'), accountId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('getAgentPersona') }),
@@ -325,6 +322,8 @@ export const LineAccountSummarySchema = z.strictObject({
   /** Login method of this account. If absent (older payloads), it means DESKTOPWIN. */
   lineTransport: LineTransportKindSchema.optional(),
   hasVerifiedLineIdentity: z.boolean().optional(),
+  /** LINE phone registration of the signed-in account (one read after login). False: no phone number. Absent or null: not known. */
+  phoneRegistered: z.boolean().nullable().optional(),
   avatarAvailable: z.boolean().optional(),
   canSendManually: z.boolean().optional(),
   canStartExternalImport: z.boolean().optional(),
@@ -541,10 +540,6 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('setLineLegyEncrypted'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
     z.strictObject({ type: z.literal('getLineSquareReceive'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
     z.strictObject({ type: z.literal('setLineSquareReceive'), requestId: IdSchema, ok: z.literal(true), enabled: z.boolean() }),
-    z.strictObject({ type: z.literal('lineLookupContact'), requestId: IdSchema, ok: z.literal(true), lookup: z.union([
-      z.strictObject({ ok: z.literal(true), contact: ContactLookupSchema }),
-      z.strictObject({ ok: z.literal(false), error: z.string().min(1).max(80) }),
-    ]) }),
     z.strictObject({ type: z.literal('getAgentPersona'), requestId: IdSchema, ok: z.literal(true), persona: AgentPersonaSchema }),
     z.strictObject({ type: z.literal('setAgentPersona'), requestId: IdSchema, ok: z.literal(true), persona: AgentPersonaSchema }),
     z.strictObject({ type: z.literal('setAutoResponderSettings'), requestId: IdSchema, ok: z.literal(true), version: z.number().int().positive() }),

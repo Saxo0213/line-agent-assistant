@@ -149,3 +149,40 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .nav-update-badge { background: #e5bc69; color: #2b1d00; }
 }
+.page-header-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.header-dialog-button { position: relative; white-space: nowrap; }
+.attention-dot { position: absolute; top: -3px; right: -3px; width: 9px; height: 9px; border-radius: 50%; background: #d93025; box-shadow: 0 0 0 2px var(--surface); }
+.header-dialog { max-height: calc(100vh - 48px); overflow-y: auto; }
+.header-dialog-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.header-dialog-top h2 { margin: 0; }
+.header-dialog-intro { margin: 6px 0 14px; font-size: 13px; }
+.environment-check-dialog { width: min(720px, calc(100vw - 48px)); }
+.environment-check-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.environment-check-table th { text-align: left; font-size: 12px; font-weight: 500; color: var(--secondary); padding: 6px 10px; border-bottom: 1px solid var(--subtle); }
+.environment-check-table td { padding: 10px; vertical-align: middle; border-bottom: 1px solid var(--subtle); }
+.environment-check-table th:nth-child(1), .environment-check-table td:nth-child(1) { min-width: 200px; }
+.environment-check-table th:nth-child(2), .environment-check-table td:nth-child(2) { width: 1%; white-space: nowrap; }
+.environment-check-table th:nth-child(3), .environment-check-table td:nth-child(3) { width: 1%; white-space: nowrap; }
+.environment-check-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.environment-check-name strong { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.environment-check-name .muted { font-size: 12px; line-height: 1.4; }
+.environment-check-status { display: inline-block; white-space: nowrap; max-width: none; }
+.environment-check-status.ok { color: #216e42; background: #e3f2e7; }
+.environment-check-status.missing { color: #805500; background: #fff4dc; }
+.environment-check-status.unknown { color: var(--secondary); background: var(--subtle); }
+.environment-check-action { display: flex; align-items: center; gap: 8px; }
+.login-guide-dialog { width: min(640px, calc(100vw - 48px)); }
+.login-guide-steps { margin: 0; padding-left: 20px; font-size: 13px; }
+.login-guide-steps li { margin-bottom: 14px; }
+.login-guide-steps li:last-child { margin-bottom: 0; }
+.login-guide-step-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.login-guide-step-head strong { font-weight: 600; }
+.login-guide-badges { display: flex; gap: 6px; flex: none; }
+.login-guide-steps li p { margin: 4px 0 0; color: var(--secondary); font-size: 12px; line-height: 1.5; }
+.login-guide-steps .login-guide-badge { margin-left: 0; white-space: nowrap; }
+:root[data-theme="dark"] .environment-check-status.ok, :root[data-theme="dark"] .login-guide-badge.done { color: #8bd3a4; background: #1f3a2a; }
+:root[data-theme="dark"] .environment-check-status.missing, :root[data-theme="dark"] .login-guide-badge.todo { color: #e5bc69; background: #3a2d12; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .environment-check-status.ok, :root:not([data-theme="light"]) .login-guide-badge.done { color: #8bd3a4; background: #1f3a2a; }
+  :root:not([data-theme="light"]) .environment-check-status.missing, :root:not([data-theme="light"]) .login-guide-badge.todo { color: #e5bc69; background: #3a2d12; }
+}

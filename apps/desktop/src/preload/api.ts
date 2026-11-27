@@ -5,7 +5,6 @@ import {
   PendingAgentApprovalSchema,
   type DownloadBridgeIntervals,
   type OutgoingMention,
-  type ContactLookupDto,
   type AgentApprovalDecision,
   type AgentExtensionTools,
   type AgentExtensionsState,
@@ -80,7 +79,14 @@ import type { FriendRow, MessagePage, MessageReader, WorkRecord } from '../main/
 import { LocaleSnapshotSchema, type LocalePreference, type LocaleSnapshot } from '../locale.js';
 import { UPDATE_CHECK_CHANNEL, UPDATE_CHECK_STATE_CHANNEL, UpdateCheckStateSchema, type UpdateCheckRequest, type UpdateCheckState } from '../update-check-protocol.js';
 
+import { ENVIRONMENT_CHECK_CHANGED_CHANNEL, ENVIRONMENT_CHECK_CHANNEL, EnvironmentCheckResultSchema, EnvironmentInstallResultSchema,
+  type EnvironmentCheckResult, type EnvironmentInstallResult, type EnvironmentItemId } from '../environment-check-protocol.js';
+
 export type DesktopApi = {
+  /** Environment check (Settings → 系統). Optional so older test doubles stay valid. */
+  getEnvironmentCheck?(): Promise<EnvironmentCheckResult>;
+  installEnvironmentItem?(id: EnvironmentItemId): Promise<EnvironmentInstallResult>;
+  onEnvironmentCheckChanged?(callback: () => void): () => void;
   reportRendererFailure?(): Promise<IpcResult>;
   getLocale(): Promise<LocaleSnapshot>;
   setLocale(preference: LocalePreference): Promise<LocaleSnapshot>;
@@ -128,8 +134,6 @@ export type DesktopApi = {
   setManualUnsendWindow(window: '1h' | '7d'): Promise<'1h' | '7d'>;
   getLineLegyEncrypted(): Promise<boolean>;
   setLineLegyEncrypted(enabled: boolean): Promise<boolean>;
-  /** User-started contact read from a pasted LINE profile link or MID. Only the settings button calls it. */
-  lineLookupContact(link: string): Promise<{ ok: true; contact: ContactLookupDto } | { ok: false; error: string }>;
   getLineSquareReceive(): Promise<boolean>;
   setLineSquareReceive(enabled: boolean): Promise<boolean>;
   /** The global Agent persona (Settings > Assistant). */
@@ -320,6 +324,13 @@ export function createDesktopApi(transport: Transport): DesktopApi {
       transport.on(UPDATE_CHECK_STATE_CHANNEL, listener);
       return () => transport.removeListener(UPDATE_CHECK_STATE_CHANNEL, listener);
     },
+    getEnvironmentCheck: async () => EnvironmentCheckResultSchema.parse(await transport.invoke(ENVIRONMENT_CHECK_CHANNEL, { type: 'getEnvironmentCheck' })),
+    installEnvironmentItem: async (id) => EnvironmentInstallResultSchema.parse(await transport.invoke(ENVIRONMENT_CHECK_CHANNEL, { type: 'installEnvironmentItem', id })),
+    onEnvironmentCheckChanged(callback) {
+      const listener = () => callback();
+      transport.on(ENVIRONMENT_CHECK_CHANGED_CHANNEL, listener);
+      return () => transport.removeListener(ENVIRONMENT_CHECK_CHANGED_CHANNEL, listener);
+    },
     reportRendererFailure: () => request({ type: 'reportRendererFailure' }),
     async getSnapshot() { const result = await request({ type: 'getSnapshot' }); if (result.type !== 'getSnapshot') throw new Error(result.type === 'error' ? result.message : 'Unexpected snapshot response'); return AppSnapshotSchema.parse(result.snapshot); },
     async listMessages(key, cursor, limit = 75, messageId) { const result = await read({ type: 'listMessages', key, cursor, limit, ...(messageId ? { messageId } : {}) }); return MessagePageSchema.parse(result.page); },
@@ -354,7 +365,6 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async getManualUnsendWindow() { const result = await request({ type: 'getManualUnsendWindow' }); if (result.type !== 'getManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },
     async getLineLegyEncrypted() { const result = await request({ type: 'getLineLegyEncrypted' }); if (result.type !== 'getLineLegyEncrypted') throwIpcErrorOrUnexpected(result, 'Unexpected transport setting response'); return result.enabled; },
     async setLineLegyEncrypted(enabled) { const result = await request({ type: 'setLineLegyEncrypted', enabled }); if (result.type !== 'setLineLegyEncrypted') throwIpcErrorOrUnexpected(result, 'Unexpected transport setting response'); return result.enabled; },
-    async lineLookupContact(link) { const result = await request({ type: 'lineLookupContact', link }); if (result.type !== 'lineLookupContact') throwIpcErrorOrUnexpected(result, 'Unexpected contact lookup response'); return result.lookup; },
     async getLineSquareReceive() { const result = await request({ type: 'getLineSquareReceive' }); if (result.type !== 'getLineSquareReceive') throwIpcErrorOrUnexpected(result, 'Unexpected community receive setting response'); return result.enabled; },
     async setLineSquareReceive(enabled) { const result = await request({ type: 'setLineSquareReceive', enabled }); if (result.type !== 'setLineSquareReceive') throwIpcErrorOrUnexpected(result, 'Unexpected community receive setting response'); return result.enabled; },
     async setManualUnsendWindow(window) { const result = await request({ type: 'setManualUnsendWindow', window }); if (result.type !== 'setManualUnsendWindow') throwIpcErrorOrUnexpected(result, 'Unexpected unsend setting response'); return result.window; },

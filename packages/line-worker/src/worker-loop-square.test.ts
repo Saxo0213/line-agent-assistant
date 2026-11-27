@@ -23,6 +23,7 @@ class SquareFakeTransport extends FakeLineTransport {
   readonly queue: Array<SquareSyncResult | Error> = [];
   httpStatus: number | null = null;
   titleError?: Error;
+  readPhoneRegistration?: () => Promise<boolean | null>;
   async syncSquare(request: { syncToken?: string; continuationToken?: string }): Promise<SquareSyncResult> {
     this.squareCalls.push(request);
     const next = this.queue.shift() ?? page([], request.syncToken ?? null);
@@ -37,8 +38,9 @@ class SquareFakeTransport extends FakeLineTransport {
   lastSquareHttpStatus(): number | null { return this.httpStatus; }
 }
 
-async function setup(init: Record<string, unknown> = { squareReceive: true }) {
+async function setup(init: Record<string, unknown> = { squareReceive: true }, phoneRegistered?: boolean) {
   const transport = new SquareFakeTransport({ ownMid: 'u-self', displayName: 'Agent' });
+  if (phoneRegistered !== undefined) transport.readPhoneRegistration = async () => phoneRegistered;
   const events: any[] = [];
   const worker = new LineWorkerLoop({ transport, emit: (event) => { events.push(event); }, validateLease: async () => true });
   await worker.handle({ type: 'init', ...binding, protocolVersion: 5, mode: 'ACTIVE_CONTROL', durableCursor: cursor, ...init });
@@ -57,6 +59,15 @@ describe('community receive step', () => {
     const { transport, advance } = await setup({});
     await advance(60_000);
     expect(transport.squareCalls).toHaveLength(0);
+  });
+
+  it('skips the community step and reports it when the account has no phone registration', async () => {
+    vi.useFakeTimers();
+    const { transport, events, advance } = await setup({ squareReceive: true }, false);
+    await advance(60_000);
+    expect(transport.squareCalls).toHaveLength(0);
+    expect(events.find((event) => event.type === 'accountSettings')).toMatchObject({ phoneRegistered: false });
+    expect(events.filter((event) => event.type === 'error' && event.diagnostic?.detail === 'square_receive_skipped:phone_not_registered')).toHaveLength(1);
   });
 
   it('fetches without a token on the first run, emits one batch with titles and waits for the ack', async () => {

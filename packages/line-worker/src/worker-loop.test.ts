@@ -1261,14 +1261,6 @@ describe('one-account worker loop', () => {
     expect(events.at(-1)).toMatchObject({ requestId: 'check-2', targetMid: `u${'b'.repeat(32)}`, status: 'not_friend' });
   });
 
-  it('answers lookupContact with LOOKUP_UNSUPPORTED when the transport has no lookup method', async () => {
-    const { worker, events, init } = setup('MONITOR_ONLY');
-    await init;
-    await authenticate(worker);
-    await worker.handle({ type: 'lookupContact', ...binding, requestId: 'lookup-1', targetMid: `u${'a'.repeat(32)}` });
-    expect(events.at(-1)).toMatchObject({ type: 'contactLookupResult', ...binding, requestId: 'lookup-1', status: 'failed', error: 'LOOKUP_UNSUPPORTED' });
-  });
-
   it('forwards safe friend-detail failure fields while keeping the relation unknown', async () => {
     const { worker, transport, events, init } = setup('ACTIVE_CONTROL');
     await init;

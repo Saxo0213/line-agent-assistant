@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   isLineServerErrorCode, isLocalAgentRoom, talkServerError, MEDIA_FILE_MAX_BYTES, MEDIA_IMAGE_MAX_BYTES, LineWorkerCommandSchema, LineWorkerEventSchema,
   WORKER_PROTOCOL_VERSION, type ConversationCatalogItem, type JsonValue as ContractJsonValue, type LineWorkerCommand, type LineWorkerEvent, type TalkCursorV1Dto,
-  type ChatResourceReadCommand, type ContactLookupDto, type LineServerErrorCode, type OutgoingMention, type ChatResourcePhotoPageShape,
+  type ChatResourceReadCommand, type LineServerErrorCode, type OutgoingMention, type ChatResourcePhotoPageShape,
 } from '@line-agent/contracts';
 import { DurableCursorSession, cursorsEqual, decodeHistoryCursor, encodeHistoryCursor,
   type HistoryCursorV1, type JsonValue } from './cursor.js';
@@ -15,7 +15,7 @@ import { SafeAttachmentError } from './attachment-error.js';
 import { validateAttachmentMessage, type AttachmentDownloadIdentity } from './attachment-download.js';
 import { isChatResourceFailure, isChatResourceUnsupported, safeChatResourceFailureDetails, type ChatResourceFailureKind, type ChatResourceResponseCode } from './chat-resource-error.js';
 import { isLineServerRejection, isLineSquareRejection } from './line-server-error.js';
-import { tagLoginStage } from './login-failure-detail.js';
+import { buildLoginFailureDetail, tagLoginStage } from './login-failure-detail.js';
 import { flushTrafficLogSync } from './traffic-log.js';
 import { normalizeSquareEvents } from './square-normalizer.js';
 
@@ -35,8 +35,6 @@ export type FriendRelation = 'friend' | 'not_friend' | 'unknown';
 export type FriendRelationDiagnostic = Readonly<{ status: FriendRelation; error: string | null; failureKind?: ChatResourceFailureKind;
   upstreamStatus?: number; upstreamCode?: ChatResourceResponseCode }>;
 export type FriendAddResult = Readonly<{ status: 'added' | 'failed' | 'unknown'; error: string | null }>;
-/** One contact read by the user (`lookupContact`). It carries no add-friend or send right. */
-export type ContactLookup = ContactLookupDto;
 
 const FRIEND_ADD_LOCAL_FAILURES = new Set(['SIDE_EFFECT_DENIED', 'NOT_STARTED', 'NOT_READY', 'REQUEST_ID_CONFLICT', 'QUEUE_FULL']);
 const CHAT_DETAIL_BATCH_LIMIT = 100;
@@ -108,7 +106,11 @@ export interface LineTransport {
   addFriendByMid(targetMid: string, lease: ControlLease, onPhysicalStart: () => void, signal?: RelationCancellation,
     sourceChatMid?: string): Promise<FriendAddResult>;
   /** Optional: one contact read. Only the linejs Client engine has it; the loop answers LOOKUP_UNSUPPORTED when it is absent. */
-  lookupContact?(targetMid: string): Promise<ContactLookup>;
+  /**
+   * Optional: one read of the account settings after a login. It gives only `phoneRegistration`
+   * (true, false, or null when LINE sent no boolean). Only the linejs Client engine has it.
+   */
+  readPhoneRegistration?(): Promise<boolean | null>;
   revoke?(): void;
 }
 
@@ -386,7 +388,7 @@ export class LineWorkerLoop {
       if (command.type === 'poll') return;
       throw new Error('LINE authentication is invalidated');
     }
-    if (binding.mode === 'PAUSED' && ['loginQr', 'loginToken', 'poll', 'history', 'downloadAttachment', 'refreshOwnProfile', 'lookupContact', 'refreshCatalog'].includes(command.type)) {
+    if (binding.mode === 'PAUSED' && ['loginQr', 'loginToken', 'poll', 'history', 'downloadAttachment', 'refreshOwnProfile', 'refreshCatalog'].includes(command.type)) {
       throw new Error('paused worker cannot access LINE');
     }
     switch (command.type) {
@@ -433,7 +435,9 @@ export class LineWorkerLoop {
               ownMid: result.ownMid, displayName: result.displayName, ...(result.picturePath === undefined ? {} : { picturePath: result.picturePath }) });
             await this.#emit({ type: 'status', ...this.#identity(), state: 'ready', message: null });
             this.#startCatalogRefresh();
-            this.#startSquare();
+            // The settings read runs after the login is complete. It never blocks or fails the login.
+            if (this.#transport.readPhoneRegistration) void this.#readAccountSettings();
+            else this.#startSquare();
           } catch (error) {
             // A diagnostic tag only; the first tag (from the transport) stays.
             tagLoginStage(error, loginStage);
@@ -612,23 +616,6 @@ export class LineWorkerLoop {
         }
         await this.#checkFriendRelation(command);
         return;
-      case 'lookupContact': {
-        const identity = this.#identity();
-        const failedResult = (error: string) => this.#emit({ type: 'contactLookupResult', ...identity, requestId: command.requestId,
-          status: 'failed', error });
-        if (this.#connectionSuspended) { await failedResult(SUSPENDED); return; }
-        if (!this.#transport.lookupContact) { await failedResult('LOOKUP_UNSUPPORTED'); return; }
-        if (!this.#ownMid) { await failedResult('LOOKUP_NOT_READY'); return; }
-        try {
-          // One call, no retry. The transport call reads the contact and changes nothing at LINE.
-          const contact = await this.#withTransportCall(() => this.#transport.lookupContact!(command.targetMid));
-          if (this.#stopped || this.#revoked) { await failedResult('LOOKUP_BINDING_REVOKED'); return; }
-          await this.#emit({ type: 'contactLookupResult', ...identity, requestId: command.requestId, status: 'ok', error: null, contact });
-        } catch (error) {
-          await failedResult(isLineServerRejection(error) ? error.code : 'CONTACT_LOOKUP_FAILED');
-        }
-        return;
-      }
       case 'refreshCatalog':
         this.#userCatalogRefresh();
         return;
@@ -919,6 +906,37 @@ export class LineWorkerLoop {
   }
   #squareRunning(): boolean {
     return this.#squareStarted && !this.#squareSuspended && !this.#stopped && !this.#revoked && !this.#authInvalidated;
+  }
+  /**
+   * One read of the account settings after each successful login (not on a poll, not on a token refresh).
+   * It sends the phone registration to Main and then starts the community step. On an error the value stays null
+   * and one diagnostic gives the real error code and stage. The community step is skipped when the phone is not registered.
+   */
+  async #readAccountSettings(): Promise<void> {
+    let phoneRegistered: boolean | null = null;
+    try {
+      phoneRegistered = await this.#transport.readPhoneRegistration!();
+    } catch (error) {
+      tagLoginStage(error, 'get_settings');
+      phoneRegistered = null;
+      if (!this.#stopped && !this.#revoked && this.#binding) {
+        const detail = buildLoginFailureDetail(error);
+        await this.#emit({ type: 'error', ...this.#identity(), code: 'WORKER_OPERATION_FAILED',
+          message: 'LINE account settings read failed', retryable: false,
+          diagnostic: { operation: 'startup', stage: 'read', category: 'transport_failed', recovery: 'none', outcome: 'failed',
+            ...(detail === undefined ? {} : { detail }) } }).catch(() => undefined);
+      }
+    }
+    if (this.#stopped || this.#revoked || !this.#binding) return;
+    await this.#emit({ type: 'accountSettings', ...this.#identity(), phoneRegistered }).catch(() => undefined);
+    if (phoneRegistered === false && this.#binding.squareReceive === true) {
+      await this.#emit({ type: 'error', ...this.#identity(), code: 'WORKER_OPERATION_FAILED',
+        message: 'LINE community receive skipped', retryable: false,
+        diagnostic: { operation: 'startup', stage: 'prepare', category: 'unsupported', recovery: 'none', outcome: 'not_started',
+          detail: 'square_receive_skipped:phone_not_registered' } }).catch(() => undefined);
+      return;
+    }
+    this.#startSquare();
   }
   /** Starts the community step once, only when the init command turned it on and the transport can read Square events. */
   #startSquare(): void {

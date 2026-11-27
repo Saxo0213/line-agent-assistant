@@ -7,7 +7,7 @@ export const IPC_ACTION_CODES = [
   'lineSyncHistory', 'submitAgentRoomPrompt', 'stopAgentRoomJob', 'retryAgentRoomJob', 'getAgentRoomJobEvents',
   'listMessages', 'listAttachments', 'listChatNotes', 'getChatNote', 'listChatAlbums', 'listChatAlbumPhotos',
   'downloadChatAlbumPhoto', 'openChatAlbum', 'openReadableChatAlbumFolder', 'cancelChatResourceRequest',
-  'sendText', 'replyText', 'sendManualMedia', 'unsendMessage', 'reactMessage', 'getManualUnsendWindow', 'setManualUnsendWindow', 'getLineLegyEncrypted', 'setLineLegyEncrypted', 'getLineSquareReceive', 'setLineSquareReceive', 'lineLookupContact', 'refreshLineCatalog', 'getAgentPersona', 'setAgentPersona',
+  'sendText', 'replyText', 'sendManualMedia', 'unsendMessage', 'reactMessage', 'getManualUnsendWindow', 'setManualUnsendWindow', 'getLineLegyEncrypted', 'setLineLegyEncrypted', 'getLineSquareReceive', 'setLineSquareReceive','refreshLineCatalog', 'getAgentPersona', 'setAgentPersona',
   'stopJob', 'retryJob', 'newSession', 'getJobEvents', 'searchMessages', 'openExternalUrl', 'openAttachment',
   'downloadAttachment', 'revealAttachment', 'resolveFileTypeIcon', 'subscribeEvents', 'setConversationAgent',
   'switchControl', 'setDefaultAgent', 'setWorkspace', 'getConversationSettings', 'setConversationSettings',

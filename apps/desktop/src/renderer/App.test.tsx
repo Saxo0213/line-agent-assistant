@@ -217,7 +217,6 @@ function fakeApi(): DesktopApi {
     setManualUnsendWindow: vi.fn(async (window) => window),
     getLineLegyEncrypted: vi.fn(async () => false),
     setLineLegyEncrypted: vi.fn(async (enabled) => enabled),
-    lineLookupContact: vi.fn(async () => ({ ok: false as const, error: 'LINE_NOT_CONNECTED' })),
     getLineSquareReceive: vi.fn(async () => false),
     setLineSquareReceive: vi.fn(async (enabled) => enabled),
     getAgentPersona: vi.fn(async () => ({ description: '', liveliness: 'normal' as const })),

@@ -57,7 +57,7 @@ const nativeFailureCodes = new Set([
   'reader_catalog_page_invalid', 'reader_child_unavailable', 'reader_cleanup_uncertain', 'reader_child_closed_before_ready',
   'reader_child_identity_invalid', 'reader_child_identity_changed', 'reader_closed_early', 'reader_closed',
   'reader_completion_invalid', 'reader_fixture_bridge_invalid', 'reader_fixture_root_invalid', 'reader_frame_invalid',
-  'reader_frame_queue_full', 'reader_inventory_result_invalid', 'reader_main_identity_invalid', 'reader_process_image_invalid',
+  'reader_frame_queue_full', 'reader_inventory_result_invalid', 'reader_main_identity_invalid', 'reader_main_identity_timeout','reader_process_image_invalid',
   'reader_owner_cleanup_uncertain', 'reader_owner_identity_unavailable', 'reader_queue_limit_invalid', 'reader_trailing_bytes',
   'reader_trailing_frame', 'reader_waiter_limit', 'reader_progress_timeout', 'reader_request_root_changed',
   'reader_request_root_invalid', 'reader_stale_entry_changed', 'reader_stale_entry_unknown', 'reader_stale_inventory_limit',
@@ -117,6 +117,27 @@ export function externalMonitorFailureDetail(error: unknown): ExternalMonitorFai
   if (message === 'reader_source_identity_changed') return 'reader_source_identity_changed';
   if (message === 'source_changed' || message === 'reader_source_unsupported:source_changed') return 'reader_source_changed';
   return undefined;
+}
+
+/**
+ * Builds the progress message that goes to the renderer: `<code>` or `<code>:<detail>`.
+ * Only a whitelisted detail is added. A path, a MID or free text never enters the message.
+ */
+export function externalMonitorProgressMessage(code: ExternalMonitorFailureCode, detail?: string): string {
+  const known = detail !== undefined && errorCodePattern.test(detail)
+    && (externalMonitorFailureDetails.includes(detail as ExternalMonitorFailureDetail) || nativeFailureCodes.has(detail));
+  return known ? `${code}:${detail}` : code;
+}
+
+/**
+ * Reason of a failed reader bootstrap: a known reader code or a `node_*` code of the error, else undefined.
+ * Only a whitelisted value is returned. The error text never leaves this function.
+ */
+export function externalMonitorBootstrapReason(error: unknown): ExternalMonitorFailureDetail | undefined {
+  let reason: ExternalMonitorFailureDetail | undefined;
+  try { reason = externalMonitorFailureDetail(error); } catch { return undefined; }
+  return reason !== undefined && errorCodePattern.test(reason)
+    && (externalMonitorFailureDetails.includes(reason) || nativeFailureCodes.has(reason)) ? reason : undefined;
 }
 
 /** Discards repository exception text and any attached database details immediately. */

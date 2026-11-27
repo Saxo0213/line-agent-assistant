@@ -595,7 +595,7 @@ export type {AutoSlimOptions} from './transcript.js';
 export {fnv1a64,spillClaudeArguments} from './spill.js';
 export {INTERNAL_MCP_TOKEN_ENV,LINEJS_MCP_TOOLS,LINEJS_MCP_SERVER,claudeMcpToolNames,claudePermissionPromptToolName} from './mcp.js';
 export type {AuthStatus} from './auth.js';
-export {WindowsExecutableResolver} from './executable-resolver.js';
+export {WindowsExecutableResolver,isSupportedNodeVersion} from './executable-resolver.js';
 export type {ExecutableResolver,ResolvedExecutable} from './executable-resolver.js';
 export {NodeProcessRunner} from './process-runner.js';
 export type {ProcessRunner,ProcessSpec,RunningProcess} from './process-runner.js';

@@ -16,6 +16,7 @@ import { ExternalMonitorDiagnosticFailure } from '../external-monitor-diagnostic
 
 const execFileAsync = promisify(execFile);
 const PROCESS_IDENTITY_TIMEOUT_MS = 5_000;
+const MAIN_PROCESS_IDENTITY_TIMEOUT_MS = 20_000;
 const REQUEST_STARTUP_TIMEOUT_MS = 45_000;
 
 export function mapOfficialIdentityRead(identity: Readonly<{ mid: string; displayName: string | null; picturePath?: string | null }>, candidateCount: number) {
@@ -41,7 +42,10 @@ export async function createJsOfficialSnapshotImporter(input: Readonly<{
   const resources = await verifyJsExternalReaderResources(resourceRoot);
   const controller = new JsExternalReaderController(input.admission);
   const requestRoot = path.join(input.localAppData, 'LINEJS', 'js-external-imports');
-  const mainIdentity = await inspectProcess(process.pid);
+  // The identity check of the main process runs during app start (cold PowerShell), so it gets a longer limit.
+  let mainIdentityTimedOut = false;
+  const mainIdentity = await inspectProcess(process.pid, { timeoutMs: MAIN_PROCESS_IDENTITY_TIMEOUT_MS, onTimeout: () => { mainIdentityTimedOut = true; } });
+  if (!mainIdentity && mainIdentityTimedOut) throw new Error('reader_main_identity_timeout');
   if (!mainIdentity || path.resolve(mainIdentity.imagePath).toLowerCase() !== path.resolve(process.execPath).toLowerCase()) {
     throw new Error('reader_main_identity_invalid');
   }
@@ -171,7 +175,7 @@ async function queryProcessLiveness(pid: number): Promise<ProcessLiveness> {
   } catch { return { kind: 'unknown' }; }
 }
 
-async function inspectProcess(pid: number): Promise<OwnerProcessIdentity | null> {
+async function inspectProcess(pid: number, limits: Readonly<{ timeoutMs?: number; onTimeout?: () => void }> = {}): Promise<OwnerProcessIdentity | null> {
   if (!Number.isSafeInteger(pid) || pid < 1 || pid > 0xffffffff) return null;
   const script = `$ErrorActionPreference='Stop'; $p=Get-Process -Id ${pid} -ErrorAction Stop; ` +
     `$c=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'; ` +
@@ -180,7 +184,7 @@ async function inspectProcess(pid: number): Promise<OwnerProcessIdentity | null>
     `[Console]::Out.WriteLine($c.ExecutablePath)`;
   try {
     const result = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      windowsHide: true, timeout: PROCESS_IDENTITY_TIMEOUT_MS, maxBuffer: 4096,
+      windowsHide: true, timeout: limits.timeoutMs ?? PROCESS_IDENTITY_TIMEOUT_MS, maxBuffer: 4096,
     });
     const [startedAt, imagePath] = result.stdout.trimEnd().split(/\r?\n/);
     if (!startedAt || !/^\d{15,20}$/.test(startedAt) || !imagePath || !path.isAbsolute(imagePath) || imagePath.includes('\0')) return null;
@@ -202,7 +206,11 @@ async function inspectProcess(pid: number): Promise<OwnerProcessIdentity | null>
     });
     if (bytes !== info.size) return null;
     return { pid, startedAt, imagePath, imageSha256: hash.digest('hex') };
-  } catch { return null; }
+  } catch (error) {
+    // execFile sets `killed` when its timeout stopped the child process.
+    if ((error as { killed?: unknown } | null)?.killed === true) limits.onTimeout?.();
+    return null;
+  }
 }
 
 async function ensurePrivateDirectory(directory: string): Promise<void> {

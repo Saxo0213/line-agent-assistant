@@ -29,6 +29,7 @@ import { createOperationalAuditRuntime } from './services/operational-audit-runt
 import { createOperationalAudit, type OperationalAudit } from './services/operational-audit.js';
 import { OperationalAuditFallback } from './services/operational-audit-fallback.js';
 import { diagnosticFailure, IpcEventSchema, type SafeDiagnostic } from '@line-agent/contracts';
+import { externalMonitorBootstrapReason, type ExternalMonitorFailureDetail } from './services/external-monitor-diagnostics.js';
 import { DatabaseSetupService } from './services/database-setup.js';
 import { createAttachmentRootChange } from './services/attachment-root-change.js';
 import { WorkspaceAuthority } from './services/workspace-authority.js';
@@ -60,6 +61,13 @@ import { createFileUpdateCheckStore, createUpdateCheckService, type UpdateCheckS
 import { loadAppUpdater } from './services/app-updater.js';
 import { createUpdateCheckIpcAdapter } from './update-check-ipc.js';
 import { UPDATE_CHECK_CHANNEL, UPDATE_CHECK_STATE_CHANNEL } from '../update-check-protocol.js';
+import { ENVIRONMENT_CHECK_CHANGED_CHANNEL, ENVIRONMENT_CHECK_CHANNEL } from '../environment-check-protocol.js';
+import { createEnvironmentCheckIpcAdapter } from './environment-check-ipc.js';
+import { EnvironmentCheckService, probeDesktopLine } from './services/environment-check.js';
+import { refreshProcessPath } from './services/fresh-path.js';
+import { locateChrome } from './services/official-download-bridge/chrome-locator.js';
+import { BridgeError } from './services/official-download-bridge/errors.js';
+import { discoverLtsmAssets } from '@line-agent/line-chrome';
 
 if (process.platform === 'win32') app.setAppUserModelId(APP_USER_MODEL_ID);
 
@@ -136,6 +144,10 @@ function stopEmbeddedServerForSessionEnd(): void {
 let window: BrowserWindow | null = null;
 let localeSettings: ReturnType<typeof createLocaleSettings> | undefined;
 let updateCheck: UpdateCheckService | undefined;
+let environmentCheck: EnvironmentCheckService | undefined;
+// Set by initializeServices. The environment check reports `unknown` for these items until they exist.
+let environmentBridge: AgentCliBridge | undefined;
+let environmentLtsm: ChromeLtsmService | undefined;
 async function initializeLocaleSettings(): Promise<void> {
   localeSettings = createLocaleSettings({ filePath: path.join(app.getPath('userData'), 'app-settings.json'), preferredLanguages: app.getPreferredSystemLanguages() });
   setEffectiveLocaleReader(() => localeSettings?.snapshot().effectiveLocale ?? 'en');
@@ -222,7 +234,9 @@ async function initializeServices(): Promise<void> {
   const secretStore = new SecretStore(bootstrapSettings.root);
   // CHROMEOS ltsm assets. The verified copies are in userData. A CHROMEOS worker gets only this store root.
   const chromeLtsm = new ChromeLtsmService({ userDataDir: app.getPath('userData') });
+  environmentLtsm = chromeLtsm;
   let officialSnapshotImporter: OfficialSnapshotImporter | undefined;
+  let officialSnapshotImporterFailure: ExternalMonitorFailureDetail | undefined;
   // One persisted trust document (app_settings.official_line_build_trust); no timer or watcher.
   const officialBuildTrust = new OfficialBuildTrustService({
     read: async () => {
@@ -234,18 +248,24 @@ async function initializeServices(): Promise<void> {
       catch (error) { audit.failure(diagnosticFailure('native_reader', 'persist', error)); throw error; }
     },
   });
+  const createOfficialSnapshotImporter = () => createJsOfficialSnapshotImporter({ packaged: app.isPackaged,
+    appPath: app.getAppPath(), resourcesPath: process.resourcesPath, localAppData: process.env.LOCALAPPDATA,
+    admission: mainExternalSourceProbeAdmission, buildTrust: officialBuildTrust });
   try {
-    officialSnapshotImporter = await createJsOfficialSnapshotImporter({ packaged: app.isPackaged,
-      appPath: app.getAppPath(), resourcesPath: process.resourcesPath, localAppData: process.env.LOCALAPPDATA,
-      admission: mainExternalSourceProbeAdmission, buildTrust: officialBuildTrust });
+    officialSnapshotImporter = await createOfficialSnapshotImporter();
   } catch (error) {
-    reportRuntimeFailure(diagnosticFailure('native_reader', 'bootstrap', error));
+    // The audit detail keeps the real reader or Node code. Without a known code it keeps the Node/SQL code of the error.
+    officialSnapshotImporterFailure = externalMonitorBootstrapReason(error);
+    const failure = diagnosticFailure('native_reader', 'bootstrap', error);
+    reportRuntimeFailure(officialSnapshotImporterFailure ? { ...failure, detail: `reader:${officialSnapshotImporterFailure}` } : failure);
   }
+  await refreshProcessPath().catch(() => undefined);
   const bridge = new AgentCliBridge({ enabled: agentBridgeEnabled(process.env), resolveWorkspaceRoots: async () => [await workspaceAuthority.current()], runner: new NodeProcessRunner({ hostFile: jobHostFile }),
     validateResumeSession: (request) => agents.validateResumeSession(request),
     spillDirectory: path.join(app.getPath('userData'), 'agent', 'spawn-args'),
     accountsDirectory: path.join(app.getPath('userData'), 'llm-accounts'),
     maxResidents: MAX_INTERNAL_MCP_CAPABILITIES - 3 });
+  environmentBridge = bridge;
   startupCleanup.add(() => bridge.shutdown());
   // Local log of the HTTP requests to LINE hosts. It only observes; a failure inside it never reaches a request.
   const trafficLogDir = path.join(app.getPath('userData'), 'logs', 'line-traffic');
@@ -317,6 +337,8 @@ async function initializeServices(): Promise<void> {
       return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]!;
     },
     secretStore, audit, previewPresenter,
+    // A tool that the user installs after the app starts is on the registry PATH only. Status checks of the Agent CLIs refresh PATH first.
+    refreshProcessEnvironment: async () => { await refreshProcessPath(); },
     chromeLogin: {
       ltsm: chromeLtsm,
       chooseFolder: async () => {
@@ -331,8 +353,9 @@ async function initializeServices(): Promise<void> {
     ...(officialSnapshotImporter ? { officialSnapshotImporter } : {}),
     ...(officialSnapshotImporter && process.env.LOCALAPPDATA
       ? { externalImportProgressPath: path.join(process.env.LOCALAPPDATA, 'LINEJS', 'js-external-imports', 'first-import-progress.json') } : {}),
-    ...(officialSnapshotImporter
-      ? { externalMonitorDiagnosticPath: path.join(app.getPath('userData'), 'external-monitor-failure.json') } : {}),
+    ...(officialSnapshotImporterFailure ? { officialSnapshotImporterFailure } : {}),
+    createOfficialSnapshotImporter,
+    externalMonitorDiagnosticPath: path.join(app.getPath('userData'), 'external-monitor-failure.json'),
     publish,
     beforeMcpListen: async () => {
       if (!lineMediaProtocolRegistered) {
@@ -482,6 +505,31 @@ async function createWindow(setupOnly = false) {
   ipcMain.removeHandler(UPDATE_CHECK_CHANNEL);
   ipcMain.handle(UPDATE_CHECK_CHANNEL, (event, payload: unknown) => updateCheckRequest({ senderId: event.sender.id, url: event.senderFrame?.url ?? '' }, payload));
   if (!setupOnly) void updateCheck.start().catch(() => undefined);
+  environmentCheck ??= new EnvironmentCheckService({
+    chrome: async () => {
+      try { await locateChrome(); return { status: 'ok' }; }
+      catch (error) { return { status: error instanceof BridgeError && error.code === 'CHROME_NOT_FOUND' ? 'missing' : 'unknown' }; }
+    },
+    // Same detection as the Chrome login setup status and the download bridge: the verified store copy, then the discovery of the installed extension.
+    lineExtension: async () => {
+      if (!environmentLtsm) return { status: 'unknown' };
+      const stored = await environmentLtsm.status();
+      if (stored.kind === 'available') return { status: 'ok', version: stored.version };
+      const found = await discoverLtsmAssets();
+      if (found.kind === 'found') return { status: 'ok', version: found.match.extensionVersion };
+      return { status: 'missing', version: found.kind === 'wrong-version' ? found.detected[0]?.extensionVersion ?? null : null };
+    },
+    lineDesktop: () => probeDesktopLine(),
+    providerStatus: async (provider) => {
+      if (!environmentBridge) throw new Error('Agent bridge is not ready');
+      return environmentBridge.getAuthStatus(provider);
+    },
+    openExternal: (url) => shell.openExternal(url),
+    onChange: () => { if (window && !window.isDestroyed()) window.webContents.send(ENVIRONMENT_CHECK_CHANGED_CHANNEL); },
+  });
+  const environmentCheckRequest = createEnvironmentCheckIpcAdapter({ webContentsId: view.id, rendererUrl, service: environmentCheck });
+  ipcMain.removeHandler(ENVIRONMENT_CHECK_CHANNEL);
+  ipcMain.handle(ENVIRONMENT_CHECK_CHANNEL, (event, payload: unknown) => environmentCheckRequest({ senderId: event.sender.id, url: event.senderFrame?.url ?? '' }, payload));
   ipcMain.removeHandler('line-agent:request'); ipcMain.removeHandler('line-agent:read'); ipcMain.removeHandler('line-agent:setup');
   ipcMain.handle('line-agent:request', (event, payload: unknown) => request({ senderId: event.sender.id, url: event.senderFrame?.url ?? '' }, payload));
   ipcMain.handle('line-agent:read', (event, payload: unknown) => read({ senderId: event.sender.id, url: event.senderFrame?.url ?? '' }, payload));

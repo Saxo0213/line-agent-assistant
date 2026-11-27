@@ -197,21 +197,6 @@ it('binds relation commands and results to the exact LINE user MID and current w
     targetMid: 'u-peer', status: 'friend', error: null }).success).toBe(false);
 });
 
-it('accepts the lookupContact command only with a user MID and checks the lookup result shape', () => {
-  const lookup = { type: 'lookupContact', ...binding, requestId: 'lookup-1', targetMid: `u${'a'.repeat(32)}` };
-  expect(LineWorkerCommandSchema.safeParse(lookup).success).toBe(true);
-  for (const targetMid of ['u-peer', `c${'a'.repeat(32)}`, `u${'a'.repeat(31)}`]) {
-    expect(LineWorkerCommandSchema.safeParse({ ...lookup, targetMid }).success).toBe(false);
-  }
-  const contact = { mid: lookup.targetMid, displayName: 'Ann', statusMessage: null, picturePath: null, relation: 'not_friend' };
-  expect(LineWorkerEventSchema.safeParse({ type: 'contactLookupResult', ...binding, requestId: 'lookup-1',
-    status: 'ok', error: null, contact }).success).toBe(true);
-  expect(LineWorkerEventSchema.safeParse({ type: 'contactLookupResult', ...binding, requestId: 'lookup-1',
-    status: 'failed', error: 'LINE_TALK_NOT_AUTHORIZED_DEVICE' }).success).toBe(true);
-  expect(LineWorkerEventSchema.safeParse({ type: 'contactLookupResult', ...binding, requestId: 'lookup-1',
-    status: 'ok', error: null, contact: { ...contact, relation: 'stranger' } }).success).toBe(false);
-});
-
 it('requires batch and cursor-after identities on durable acknowledgement', () => {
   expect(LineWorkerCommandSchema.safeParse({ type: 'ackBatch', ...binding, batchId: 'batch-1', cursorAfter: cursor }).success).toBe(true);
   expect(LineWorkerCommandSchema.safeParse({ type: 'ackBatch', ...binding, cursorAfter: cursor }).success).toBe(false);
