@@ -6,6 +6,7 @@ import {
   mkdir,
   open,
   realpath,
+  rename,
   rm,
 } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -186,14 +187,26 @@ export function sanitizeAttachmentFilename(value: string): string {
   return sanitized;
 }
 
-function validateRoot(root: string): string {
+/**
+ * True for a network root of the form `\\server\share` or `\\server\share\folder`. Device paths (`\\?\`, `\\.\`)
+ * and a root without a share name are not network roots.
+ */
+export function isUncRoot(root: string): boolean {
+  const normalized = root.replaceAll("/", "\\");
+  if (!normalized.startsWith("\\\\") || WINDOWS_DEVICE_PREFIX.test(normalized)) return false;
+  const [server, share] = normalized.slice(2).split("\\");
+  return !!server && !!share && server !== "." && server !== "?" && !/[\0:*?"<>|]/.test(`${server}${share}`);
+}
+
+function validateRoot(root: string, allowUnc = false): string {
   const windowsNormalized = root.replaceAll("/", "\\");
+  const unc = allowUnc && isUncRoot(root);
   if (
     root.length === 0
     || !isWellFormedUnicode(root)
     || root.includes("\0")
     || !isAbsolute(root)
-    || windowsNormalized.startsWith("\\\\")
+    || (windowsNormalized.startsWith("\\\\") && !unc)
     || WINDOWS_DEVICE_PREFIX.test(windowsNormalized)
     || /:(?![\\/])/.test(root.slice(2))
   ) {
@@ -274,7 +287,7 @@ export function buildAttachmentLocation(input: {
   readonly sender?: { readonly id: string; readonly displayName: string | null };
   readonly layout?: 'primary' | 'secondary';
 }): AttachmentLocation {
-  const root = validateRoot(input.root);
+  const root = validateRoot(input.root, input.layout === 'secondary');
   const { year, month } = dateParts(input.occurredAt);
   const account = encodeStableId(input.identity.accountId);
   const chat = encodeStableId(input.identity.chatId);
@@ -423,12 +436,15 @@ export async function storeAttachment(
     throw new AttachmentStoreError("INVALID_LIMIT", "Attachment byte and timeout limits must be positive finite values");
   }
   const location = buildAttachmentLocation({ ...input, ...(input.sender ? { sender: input.sender } : {}), ...(input.layout ? { layout: input.layout } : {}) });
-  const root = validateRoot(input.root);
+  const root = validateRoot(input.root, input.layout === 'secondary');
   const directorySegments = relative(root, location.directoryAbsolutePath).split(sep);
   const portableWindowsTestAllowed = runtime.unsafeAllowPortableFilesystemOnWindowsForTests === true
     && process.env.VITEST === "true"
     && process.env.NODE_ENV !== "production";
-  if (process.platform === "win32" && !portableWindowsTestAllowed) {
+  // A network share (secondary layout only) cannot use the native broker: it needs a local drive volume and a hard-link
+  // publish that many network file servers do not support. A network root uses the Node path with a rename publish.
+  const networkRoot = input.layout === 'secondary' && isUncRoot(root);
+  if (process.platform === "win32" && !portableWindowsTestAllowed && !networkRoot) {
     const broker = runtime.windowsSafetyBroker;
     if (!broker
       || broker.guarantees.rootHandleAnchored !== true
@@ -494,12 +510,26 @@ export async function storeAttachment(
       throw new AttachmentStoreError("SYMLINK_ESCAPE", "Attachment directory changed before finalization");
     }
     assertContained(rootReal, directoryAgain);
+    if (networkRoot) {
+      // Read the bytes back from the share. A short or damaged write is found before the final name exists.
+      const written = await hashFile(temporary);
+      if (written.sha256 !== sha256 || written.size !== size) {
+        throw new AttachmentStoreError("CONTENT_CONFLICT", "The network copy does not match the source bytes");
+      }
+    }
     let published = false;
     try {
-      // Hard-link publication is atomic and no-replace on both NTFS and POSIX.
-      // The already-fsynced temporary inode becomes the final name only if no
-      // concurrent writer has won.
-      await link(temporary, target);
+      if (networkRoot) {
+        // Many network file servers have no hard links, and rename replaces an existing file. Check first, then rename.
+        // The name is stable per attachment, so a concurrent writer would write the same bytes.
+        if (await optionalLstat(target)) throw Object.assign(new Error("Target exists"), { code: "EEXIST" });
+        await rename(temporary, target);
+      } else {
+        // Hard-link publication is atomic and no-replace on both NTFS and POSIX.
+        // The already-fsynced temporary inode becomes the final name only if no
+        // concurrent writer has won.
+        await link(temporary, target);
+      }
       published = true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -513,10 +543,14 @@ export async function storeAttachment(
       await rm(temporary, { force: true });
       return { ...location, absolutePath: target, directoryAbsolutePath: directoryReal, sha256, size, idempotent: true };
     }
-    await rm(temporary);
+    if (!networkRoot) await rm(temporary);
     const finalized = await validateExistingTarget(target);
     if (finalized !== "file") {
       throw new AttachmentStoreError("CONTENT_CONFLICT", "Attachment finalization did not create a regular file");
+    }
+    if (networkRoot && (await lstat(target)).size !== size) {
+      await rm(target, { force: true }).catch(() => undefined);
+      throw new AttachmentStoreError("CONTENT_CONFLICT", "The published network file has a different size");
     }
     try {
       const directoryHandle = await open(directoryReal, constants.O_RDONLY);

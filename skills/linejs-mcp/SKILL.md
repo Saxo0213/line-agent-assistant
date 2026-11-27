@@ -59,6 +59,16 @@ description: 使用 LINEJS 內建 MCP 工具查詢已封存的 LINE 對話
 - `update_schedule`：修改任何欄位，或用 `enabled` 暫停／恢復。
 - `delete_schedule`：刪除排程與它的觸發紀錄。刪除前先向使用者確認。
 
+### 下載資料夾（只有主要管理者與 Agent 室可用）
+
+聊天室的附件固定位置不變；下載資料夾只是額外複製新附件的位置。預設對象是 job 自己的聊天室；管理者可用 `chatType`＋`chatId` 指定同一帳號的其他直聊、群組或多人聊天室（Agent 室一定要給 `accountId`、`chatType`、`chatId`）。
+- `list_chat_download_folders`：列出固定位置、預設資料夾、分類資料夾（`folderId`、路徑、描述）與各自複製數量。
+- `add_chat_download_folder`：新增分類資料夾。必填 `path`（絕對路徑或 `\\server\share`）與 `description`（1 到 200 字，給分類用）。
+- `set_chat_download_folder_description`：修改分類資料夾描述（`folderId`、`description`）。
+- `set_chat_default_download_folder`：用 `path` 設定或取代預設資料夾。
+- `remove_chat_download_folder`：用 `folderId` 移除分類資料夾，或 `clearDefault: true` 清除預設資料夾。移除前先向管理者確認。
+失敗時回傳真實錯誤碼（`NOT_ABSOLUTE`、`NOT_DIRECTORY`、`REPARSE_POINT`、`PROTECTED_FOLDER`、`OTHER_CHAT_FOLDER`、`ACCESS_DENIED`、`UNREACHABLE`、`DUPLICATE_FOLDER`、`LIMIT_REACHED`、`NOT_FOUND`），照實告訴管理者。
+
 ### 建立：直接建立，套用預設值
 
 不要請使用者確認他沒提到的欄位，也不要逐項追問；套用預設值後立刻建立：

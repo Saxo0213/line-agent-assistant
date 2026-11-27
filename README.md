@@ -26,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.397 adds a gear button in each chat to set an extra folder that also receives that chat's downloaded attachments, and fixes the download Chrome that stayed at "Starting" because a background Chrome held its profile. Since v1.0.395 the app updates itself: a new version downloads in the background and installs when the app is idle, then the app reopens. Older versions update once with the app's **Check for updates**. See the [v1.0.395 → v1.0.397 release notes](docs/releases/v1.0.397.md) for the changes, and the [v1.0.395 release notes](docs/releases/v1.0.395.md) for the previous version.
+v1.0.405 adds a default folder and up to 10 classification folders per chat (the Agent picks the folder for each downloaded attachment, network shares supported), a chat settings window with download, Agent access and permission tabs, sender tabs for saved files, and LINE commands to set permissions (`/權限`) and add several users at once (`/adduser`). Since v1.0.395 the app updates itself: a new version downloads in the background and installs when the app is idle, then the app reopens. Older versions update once with the app's **Check for updates**. See the [v1.0.397 → v1.0.405 release notes](docs/releases/v1.0.405.md) for the changes, and the [v1.0.397 release notes](docs/releases/v1.0.397.md) for the previous version.
 
 ## Installation
 

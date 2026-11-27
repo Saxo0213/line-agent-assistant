@@ -78,6 +78,8 @@ describe('connected facade permission policy publisher', () => {
         policy = { ...policy, level: input.level, approvalTimeoutSeconds: input.approvalTimeoutSeconds, timeoutAction: input.timeoutAction, version: policy.version + 1 };
         return policy.version;
       },
+      async getState() { return { subjects: [], rules: [], defaults: [], links: [], folders: [], eligibleChats: [] }; },
+      async setPermission(): Promise<never> { throw new Error('not used'); },
     };
     const binding = { accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1 };
     const transport: PermissionCommandTransport = {
@@ -102,6 +104,7 @@ describe('connected facade permission policy publisher', () => {
     };
 
     await enqueue('permission-list', '/\u6b0a\u9650');
+    await enqueue('permission-levels', '1');
     await enqueue('permission-select', '1');
     expect(policy.level).toBe('read_only');
     expect(published).toEqual([{ type: 'agentExecutionPolicyChanged' }]);

@@ -19,7 +19,14 @@ export interface JudgeRequest {
   timeoutMs?:number;
   /** Account source. Absent = the system source. A managed source without its login file makes the judge fail. */
   account?:AccountRef;
+  /**
+   * Absolute paths of image files inside `workspacePath`. Only Codex reads them (`--image`).
+   * The Claude judge input is plain text, so Claude ignores this field.
+   */
+  imagePaths?:string[];
 }
+/** The most images that one judge turn can carry. */
+export const JUDGE_MAX_IMAGES=4;
 export interface JudgeResult {text:string; sessionId:string}
 
 /** No tools, no MCP servers, no skills, no settings files: the judge only reads the prompt and answers. */
@@ -32,7 +39,10 @@ export function claudeJudgeArguments(request:JudgeRequest):string[] {
 /** Read-only sandbox, user config (and with it every MCP server) ignored, low reasoning effort on the default model. */
 export function codexJudgeArguments(request:JudgeRequest,workspace:string):string[] {
   return ['exec','--ignore-user-config','--ignore-rules','-c',CODEX_JUDGE_REASONING_OVERRIDE,'--json','--sandbox','read-only',
-    '--skip-git-repo-check','-C',workspace,...(request.resumeSessionId?['resume',request.resumeSessionId]:[]),'-'];
+    '--skip-git-repo-check','-C',workspace,
+    // One `--image=<path>` per image. A comma splits the value in Codex, so such a path is not passed.
+    ...(request.imagePaths ?? []).filter(file=>!file.includes(',')).map(file=>`--image=${file}`),
+    ...(request.resumeSessionId?['resume',request.resumeSessionId]:[]),'-'];
 }
 /** Codex has no system prompt flag, so the standing instructions lead the prompt. */
 export function judgeInput(request:JudgeRequest):string {

@@ -91,6 +91,14 @@ describe('LINE operation normalization', () => {
     expect(envelope.raw).toMatchObject({ nul: '�', message: { text: 'hello�world' } });
   });
 
+  it.each(['undefined', ' Null ', '', '  '])('treats the FILE_NAME %j as no name', (fileName) => {
+    const envelope = normalizeOperation({ revision: 5, type: 26, message: {
+      id: '5', from: 'u-peer', to: 'c-group', contentType: 'IMAGE', createdTime: 1760522400000,
+      contentMetadata: { FILE_NAME: fileName, FILE_SIZE: '12' },
+    } }, context);
+    expect(envelope.attachments[0]?.name).toBeNull();
+  });
+
   it('marks denied decrypt without mentions or Agent trigger markers and keeps raw', () => {
     const envelope = normalizeOperation({ revision: 9n, type: 26,
       encryptedPayload: { chunks: [new Uint8Array([0, 255])] }, message: {

@@ -10,7 +10,7 @@ import { formatCheckedAt, UpdateCheckSettings } from './UpdateCheckSettings.js';
 
 afterEach(cleanup);
 
-const base: UpdateCheckState = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, installedNotice: null, ignoredVersion: null, download: { status: 'idle', percent: 0 }, canAutoInstall: true, autoInstall: true, autoInstallStage: 'none' };
+const base: UpdateCheckState = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, installedNotice: null, ignoredVersion: null, download: { status: 'idle', percent: 0 }, canAutoInstall: true, autoInstall: true, autoInstallStage: 'none', autoInstallBlockedBy: null };
 function setup(initial: Partial<UpdateCheckState> = {}, locale: 'zh-TW' | 'en' = 'zh-TW') {
   let state: UpdateCheckState = { ...base, ...initial };
   const api = {

@@ -28,29 +28,83 @@ function renderFiles(key = group, api = { listStoredAttachments: vi.fn(async () 
 }
 
 describe('ChatStoredFiles', () => {
-  it('shows a local saved-file list with speaker in group chats and opens by attachment ID while disconnected', async () => {
+  it('shows a local saved-file list with an Open button that keeps the name in its label and opens by attachment ID while disconnected', async () => {
     const client = { listStoredAttachments: vi.fn(async () => ({ attachments: [item], nextCursor: null })), openAttachment: vi.fn(async () => true) } as unknown as DesktopApi;
     renderFiles(group, client);
     fireEvent.click(screen.getByRole('button', { name: 'Open saved files' }));
     expect(await screen.findByRole('dialog', { name: 'Saved files' })).toBeTruthy();
+    const open = await screen.findByRole('button', { name: 'Open report.pdf' });
+    expect(open.textContent).toBe('Open');
+    expect(open.getAttribute('title')).toBe('report.pdf');
     expect(screen.getByText('report.pdf')).toBeTruthy();
-    expect(screen.getByText('Kai')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Open report.pdf' }));
+    expect([...document.querySelectorAll('th')].map((cell) => cell.textContent)).toEqual(['Message date', 'Type', 'Size', 'Name', '']);
+    fireEvent.click(open);
     await waitFor(() => expect(client.openAttachment).toHaveBeenCalledWith('attachment-1'));
-    expect(client.listStoredAttachments).toHaveBeenCalledWith(group, null, 50);
+    expect(client.listStoredAttachments).toHaveBeenCalledWith(group, null, 50, null);
   });
 
-  it('omits the speaker column for direct chats and paginates records without duplicate attachment rows', async () => {
+  it('uses the short Open text in every language', async () => {
+    renderFiles(group, undefined, 'zh-TW');
+    fireEvent.click(screen.getByRole('button', { name: '開啟已儲存檔案' }));
+    expect((await screen.findByRole('button', { name: '開啟 report.pdf' })).textContent).toBe('開啟');
+  });
+
+  it('shows speaker tabs in group chats and reloads the table from the first page for the chosen sender', async () => {
+    const second = { ...item, attachmentId: 'attachment-2', name: 'second.png', senderId: 'member-2', senderDisplayName: 'Mia' };
+    const client = { listStoredAttachments: vi.fn(async (_key: ConversationKey, _cursor: string | null, _limit?: number, sender?: string | null) =>
+      sender === 'member-2' ? { attachments: [second], nextCursor: null } : { attachments: [item, second], nextCursor: null }),
+    listStoredAttachmentSenders: vi.fn(async () => ({ senders: [{ senderId: 'member-1', senderDisplayName: 'Kai', count: 3 }, { senderId: 'member-2', senderDisplayName: 'Mia', count: 1 }] })),
+    openAttachment: vi.fn() } as unknown as DesktopApi;
+    renderFiles(group, client);
+    fireEvent.click(screen.getByRole('button', { name: 'Open saved files' }));
+    expect(await screen.findByRole('tablist')).toBeTruthy();
+    expect(screen.getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['All', 'Kai (3)', 'Mia (1)']);
+    expect(screen.getByRole('tab', { name: 'All' }).getAttribute('aria-selected')).toBe('true');
+    expect(await screen.findByRole('button', { name: 'Open report.pdf' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: 'Mia (1)' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open report.pdf' })).toBeNull());
+    expect(await screen.findByRole('button', { name: 'Open second.png' })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: 'Mia (1)' }).getAttribute('aria-selected')).toBe('true');
+    expect(client.listStoredAttachments).toHaveBeenLastCalledWith(group, null, 50, 'member-2');
+  });
+
+  it('ignores a late response of an earlier tab and resets to All when the dialog opens again', async () => {
+    const second = { ...item, attachmentId: 'attachment-2', name: 'second.png', senderId: 'member-2', senderDisplayName: 'Mia' };
+    const slow = deferred<{ attachments: typeof item[]; nextCursor: null }>();
+    const client = { listStoredAttachments: vi.fn()
+      .mockResolvedValueOnce({ attachments: [item, second], nextCursor: null })
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValueOnce({ attachments: [second], nextCursor: null })
+      .mockResolvedValueOnce({ attachments: [item, second], nextCursor: null }),
+    listStoredAttachmentSenders: vi.fn(async () => ({ senders: [{ senderId: 'member-1', senderDisplayName: 'Kai', count: 1 }, { senderId: 'member-2', senderDisplayName: 'Mia', count: 1 }] })),
+    openAttachment: vi.fn() } as unknown as DesktopApi;
+    renderFiles(group, client);
+    fireEvent.click(screen.getByRole('button', { name: 'Open saved files' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Kai (1)' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Mia (1)' }));
+    expect(await screen.findByRole('button', { name: 'Open second.png' })).toBeTruthy();
+    slow.resolve({ attachments: [item], nextCursor: null });
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open report.pdf' })).toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open saved files' }));
+    expect((await screen.findByRole('tab', { name: 'All' })).getAttribute('aria-selected')).toBe('true');
+    expect(client.listStoredAttachments).toHaveBeenLastCalledWith(group, null, 50, null);
+  });
+
+  it('shows no tabs for direct chats and paginates records without duplicate attachment rows', async () => {
     const client = { listStoredAttachments: vi.fn().mockResolvedValueOnce({ attachments: [item], nextCursor: 'next' })
-      .mockResolvedValueOnce({ attachments: [item, { ...item, attachmentId: 'attachment-2', name: 'second.png' }], nextCursor: null }), openAttachment: vi.fn() } as unknown as DesktopApi;
+      .mockResolvedValueOnce({ attachments: [item, { ...item, attachmentId: 'attachment-2', name: 'second.png' }], nextCursor: null }),
+    listStoredAttachmentSenders: vi.fn(async () => ({ senders: [{ senderId: 'member-1', senderDisplayName: 'Kai', count: 1 }] })),
+    openAttachment: vi.fn() } as unknown as DesktopApi;
     renderFiles(direct, client);
     fireEvent.click(screen.getByRole('button', { name: 'Open saved files' }));
     expect(await screen.findByRole('dialog', { name: 'Saved files' })).toBeTruthy();
-    expect(screen.queryByText('Kai')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
-    expect(await screen.findByText('second.png')).toBeTruthy();
-    expect(screen.getAllByText('report.pdf')).toHaveLength(1);
-    expect(client.listStoredAttachments).toHaveBeenNthCalledWith(2, direct, 'next', 50);
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(client.listStoredAttachmentSenders).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole('button', { name: 'Load more' }));
+    expect(await screen.findByRole('button', { name: 'Open second.png' })).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'Open report.pdf' })).toHaveLength(1);
+    expect(client.listStoredAttachments).toHaveBeenNthCalledWith(2, direct, 'next', 50, null);
   });
 
   it('ignores a response from a previous chat after switching routes', async () => {
@@ -63,9 +117,9 @@ describe('ChatStoredFiles', () => {
       <ChatStoredFiles api={client} route={direct} />
     </LocaleProvider>);
     fireEvent.click(screen.getByRole('button', { name: 'Open saved files' }));
-    expect(await screen.findByText('new-chat.txt')).toBeTruthy();
+    expect(await screen.findByRole('button', { name: 'Open new-chat.txt' })).toBeTruthy();
     resolveOld({ attachments: [item], nextCursor: null });
-    await waitFor(() => expect(screen.queryByText('report.pdf')).toBeNull());
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open report.pdf' })).toBeNull());
   });
 
   it('ignores an earlier request after the modal is closed and reopened', async () => {
@@ -76,9 +130,9 @@ describe('ChatStoredFiles', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Open saved files' }));
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     fireEvent.click(screen.getByRole('button', { name: 'Open saved files' }));
-    expect(await screen.findByText('fresh.txt')).toBeTruthy();
+    expect(await screen.findByRole('button', { name: 'Open fresh.txt' })).toBeTruthy();
     resolveOld({ attachments: [item], nextCursor: null });
-    await waitFor(() => expect(screen.queryByText('report.pdf')).toBeNull());
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open report.pdf' })).toBeNull());
   });
 
   it('focuses the modal, contains Tab, closes on Escape and restores focus to its trigger', async () => {

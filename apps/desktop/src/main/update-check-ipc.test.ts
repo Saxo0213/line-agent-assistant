@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createUpdateCheckIpcAdapter } from './update-check-ipc.js';
 
-const state = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, installedNotice: null, ignoredVersion: null, download: { status: 'idle' as const, percent: 0 }, canAutoInstall: true, autoInstall: true, autoInstallStage: 'none' as const };
+const state = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: null, releaseUrl: null, available: false, installedNotice: null, ignoredVersion: null, download: { status: 'idle' as const, percent: 0 }, canAutoInstall: true, autoInstall: true, autoInstallStage: 'none' as const, autoInstallBlockedBy: null };
 function setup() {
   const service = { state: vi.fn(() => state), setEnabled: vi.fn(async (enabled: boolean) => ({ ...state, enabled })), setAutoInstall: vi.fn(async (autoInstall: boolean) => ({ ...state, autoInstall })), checkNow: vi.fn(async () => state), openReleasePage: vi.fn(async () => true), openInstalledDetails: vi.fn(async () => state), ignore: vi.fn(async () => state), install: vi.fn(async () => state) };
   const adapter = createUpdateCheckIpcAdapter({ webContentsId: 7, rendererUrl: 'file:///app/index.html', service });

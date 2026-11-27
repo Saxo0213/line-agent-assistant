@@ -7,6 +7,21 @@ import {
   LIST_SEND_TARGETS_TOOL_NAME,
   SEND_TO_TARGET_TOOL_NAME,
   READ_MESSAGE_ATTACHMENT_TOOL_NAME,
+  CHAT_EXTRA_FOLDER_DESCRIPTION_MAX,
+  CHAT_EXTRA_FOLDER_LIMIT,
+  LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_NAME,
+  ADD_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
+  SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_NAME,
+  SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME,
+  REMOVE_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
+  ListChatDownloadFoldersToolInputSchema,
+  AddChatDownloadFolderToolInputSchema,
+  SetChatDownloadFolderDescriptionToolInputSchema,
+  SetChatDefaultDownloadFolderToolInputSchema,
+  RemoveChatDownloadFolderToolInputSchema,
+  isChatDownloadFolderToolName,
+  type ChatDownloadFolderToolName,
+  type WritableConversationKey,
   McpReadMessageAttachmentInputSchema,
   LIST_SCHEDULES_TOOL_NAME,
   CREATE_SCHEDULE_TOOL_NAME,
@@ -47,6 +62,8 @@ import {
 } from '@line-agent/contracts';
 import {
   AgentScheduleError,
+  CHAT_FOLDER_ADMIN_ONLY_MESSAGE,
+  type ChatFolderScope,
   findSharedAdminChat,
   McpDomainError,
   type InternalAgentExecutionContext,
@@ -63,6 +80,7 @@ import {
   type InternalMcpObservation,
 } from './internal-mcp-capabilities.js';
 import type { AgentApprovalBroker } from './agent-approval-broker.js';
+import type { AttachmentStorageService } from './attachment-storage-service.js';
 import type { AgentLineSendHandler, AuthorizeOutcome } from './agent-line-send-service.js';
 import { isScheduledRunRequestId, type AgentScheduleService } from './agent-schedule-service.js';
 import { formatTaipei } from './agent-schedule-prompt.js';
@@ -499,6 +517,74 @@ export const DELETE_SCHEDULE_TOOL_DEFINITION = {
   inputSchema: { type: 'object', additionalProperties: false, required: ['scheduleId'], properties: { scheduleId: { type: 'string' } } },
 } as const;
 const SCHEDULE_TOOLS = [LIST_SCHEDULES_TOOL_DEFINITION, CREATE_SCHEDULE_TOOL_DEFINITION, UPDATE_SCHEDULE_TOOL_DEFINITION, DELETE_SCHEDULE_TOOL_DEFINITION] as const;
+/**
+ * Internal-only download folder tools (never in MCP_TOOL_DEFINITIONS). Offered only to the Primary Admin and the Agent room;
+ * tools/call checks the principal again. They do what Settings and the gear dialog do for the extra attachment folders of a chat.
+ */
+const CHAT_FOLDER_TARGET_JSON_PROPERTIES = {
+  accountId: { type: 'string', description: 'LINE account of the chat. Allowed only together with chatType and chatId. Required in the Agent room when you name a chat; a job from LINE uses its own account.' },
+  chatType: { type: 'string', enum: ['direct', 'group', 'room'], description: 'Chat type. Give it together with chatId. Omit both to use the chat of this job (not possible in the Agent room).' },
+  chatId: { type: 'string', minLength: 1, maxLength: 256, description: 'Chat id from list_targets. Give it together with chatType.' },
+} as const;
+const CHAT_FOLDER_TARGET_GUIDANCE = ' The chat is the chat of this job by default. An admin job may name another chat of the same account with chatType and chatId (accountId too in the Agent room). Only direct, group and room chats. The fixed attachment location never changes; a download folder only adds a place that new attachments are copied to.';
+const CHAT_FOLDER_ERROR_GUIDANCE = ' On failure the result has error.code: NOT_ABSOLUTE, NOT_DIRECTORY, REPARSE_POINT, PROTECTED_FOLDER, OTHER_CHAT_FOLDER, ACCESS_DENIED, UNREACHABLE, DUPLICATE_FOLDER, LIMIT_REACHED, NOT_FOUND, FAILED, TARGET_REQUIRED, CHAT_NOT_FOUND, ACCOUNT_MISMATCH or INVALID_INPUT. Tell the admin the real code.';
+export const LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_DEFINITION = {
+  name: LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_NAME,
+  description: 'List the download folders of one chat: the fixed attachment location, the default folder and the classification folders (folderId, path, description) with the copy counts (queued, claimed, completed, failed) of each.' + CHAT_FOLDER_TARGET_GUIDANCE,
+  inputSchema: { type: 'object', additionalProperties: false, properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES } },
+} as const;
+export const ADD_CHAT_DOWNLOAD_FOLDER_TOOL_DEFINITION = {
+  name: ADD_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
+  description: `Add a classification folder to one chat. path must be an absolute local path or a \\\\server\\share path of an existing real directory (no link, no system folder, not the workspace folder of another chat). description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) tells the classifier which attachments belong there. At most ${CHAT_EXTRA_FOLDER_LIMIT} classification folders per chat; the same path cannot be added twice.` + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
+  inputSchema: { type: 'object', additionalProperties: false, required: ['path', 'description'], properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES,
+    path: { type: 'string', minLength: 1, maxLength: 1024 }, description: { type: 'string', minLength: 1, maxLength: CHAT_EXTRA_FOLDER_DESCRIPTION_MAX } } },
+} as const;
+export const SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_DEFINITION = {
+  name: SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_NAME,
+  description: `Change the description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) of one classification folder of a chat. Get folderId from list_chat_download_folders. The default folder has no description.` + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
+  inputSchema: { type: 'object', additionalProperties: false, required: ['folderId', 'description'], properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES,
+    folderId: { type: 'string', format: 'uuid' }, description: { type: 'string', minLength: 1, maxLength: CHAT_EXTRA_FOLDER_DESCRIPTION_MAX } } },
+} as const;
+export const SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_DEFINITION = {
+  name: SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME,
+  description: 'Set or replace the default folder of one chat by path (the same checks as add_chat_download_folder). The default folder receives the attachments that the classifier cannot place. A replaced default folder stops receiving copies; its files stay.' + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
+  inputSchema: { type: 'object', additionalProperties: false, required: ['path'], properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES, path: { type: 'string', minLength: 1, maxLength: 1024 } } },
+} as const;
+export const REMOVE_CHAT_DOWNLOAD_FOLDER_TOOL_DEFINITION = {
+  name: REMOVE_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
+  description: 'Remove one classification folder of a chat (folderId from list_chat_download_folders), or clear the default folder (clearDefault: true). Give exactly one of them. Waiting copies stop; the files on disk stay. Confirm with the admin first.' + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
+  inputSchema: { type: 'object', additionalProperties: false, properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES,
+    folderId: { type: 'string', format: 'uuid' }, clearDefault: { const: true } } },
+} as const;
+const CHAT_FOLDER_TOOLS = [LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_DEFINITION, ADD_CHAT_DOWNLOAD_FOLDER_TOOL_DEFINITION, SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_DEFINITION,
+  SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_DEFINITION, REMOVE_CHAT_DOWNLOAD_FOLDER_TOOL_DEFINITION] as const;
+/**
+ * The same tools as a whitelisted user's job sees them (own-chat authority): no chat target, no default folder tool, and `path` is a
+ * subfolder of the default folder. tools/call applies the limits again; these definitions are only a hint.
+ */
+const OWN_CHAT_FOLDER_GUIDANCE = ' This tool acts only on the chat of this job. The default folder of the chat is fixed; only the admin can change it.';
+const OWN_CHAT_FOLDER_ERROR_GUIDANCE = ' On failure the result has error.code: NO_DEFAULT_FOLDER, INVALID_SUBFOLDER, OUTSIDE_DEFAULT_FOLDER, NOT_DIRECTORY, PROTECTED_FOLDER, ACCESS_DENIED, UNREACHABLE, DUPLICATE_FOLDER, LIMIT_REACHED, NOT_FOUND, FAILED, TARGET_NOT_ALLOWED, ADMIN_ONLY, CHAT_NOT_FOUND or INVALID_INPUT. Tell the user the real code.';
+const OWN_CHAT_FOLDER_TOOLS = [
+  { name: LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_NAME,
+    description: 'List the download folders of this chat: the default folder and the classification folders (folderId, path, description) with the copy counts (queued, claimed, completed, failed) of each.' + OWN_CHAT_FOLDER_GUIDANCE,
+    inputSchema: { type: 'object', additionalProperties: false, properties: {} } },
+  { name: ADD_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
+    description: `Add a classification folder to this chat. path is a subfolder name or a relative path with "/" under the default folder of the chat, for example "invoices" or "2026/invoices". It is created when it does not exist. It cannot contain "..", a drive letter, a network path, a reserved Windows name or the characters < > : " | ? * \\. description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) tells the classifier which attachments belong there. At most ${CHAT_EXTRA_FOLDER_LIMIT} classification folders per chat; the same folder cannot be added twice. The chat must have a default folder.` + OWN_CHAT_FOLDER_GUIDANCE + OWN_CHAT_FOLDER_ERROR_GUIDANCE,
+    inputSchema: { type: 'object', additionalProperties: false, required: ['path', 'description'], properties: {
+      path: { type: 'string', minLength: 1, maxLength: 1024, description: 'Subfolder name or relative path under the default folder.' },
+      description: { type: 'string', minLength: 1, maxLength: CHAT_EXTRA_FOLDER_DESCRIPTION_MAX } } } },
+  { name: SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_NAME,
+    description: `Change the description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) of one classification folder of this chat. Get folderId from list_chat_download_folders.` + OWN_CHAT_FOLDER_GUIDANCE + OWN_CHAT_FOLDER_ERROR_GUIDANCE,
+    inputSchema: { type: 'object', additionalProperties: false, required: ['folderId', 'description'], properties: {
+      folderId: { type: 'string', format: 'uuid' }, description: { type: 'string', minLength: 1, maxLength: CHAT_EXTRA_FOLDER_DESCRIPTION_MAX } } } },
+  { name: REMOVE_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
+    description: 'Remove one classification folder setting of this chat (folderId from list_chat_download_folders). Only the setting is removed; the folder and its files stay on disk. Waiting copies stop.' + OWN_CHAT_FOLDER_GUIDANCE + OWN_CHAT_FOLDER_ERROR_GUIDANCE,
+    inputSchema: { type: 'object', additionalProperties: false, required: ['folderId'], properties: { folderId: { type: 'string', format: 'uuid' } } } },
+] as const;
+/** The download folder operations McpService needs; AttachmentStorageService provides them. */
+export type AgentChatFolderHandler = Pick<AttachmentStorageService, 'getStatus' | 'addFolder' | 'addSubfolder' | 'setDefaultFolder' | 'removeFolder' | 'setFolderDescription'>
+  & { readonly fixedLocation: string };
+
 /** The schedule operations McpService needs; AgentScheduleService provides them. */
 export type AgentScheduleToolHandler = Pick<AgentScheduleService, 'list' | 'create' | 'update' | 'delete' | 'primaryAdminChat'>
   & Partial<Pick<AgentScheduleService, 'listExternal' | 'createExternal' | 'updateExternal' | 'deleteExternal'>>;
@@ -540,6 +626,8 @@ export interface McpServiceOptions {
   lineSend?: AgentLineSendHandler;
   /** Scheduled Agent triggers behind list/create/update/delete_schedule; absent means the tools are never offered. */
   schedules?: AgentScheduleToolHandler;
+  /** Download folders behind list/add/set/remove_chat_download_folder(s); absent means the tools are never offered. */
+  chatFolders?: AgentChatFolderHandler;
   /** Clock for schedule conveniences such as once.inMinutes (tests). */
   now?: () => Date;
   chatResources?: McpChatResourceReader;
@@ -1071,6 +1159,118 @@ export class McpService {
     }
   }
 
+  /**
+   * Download folder tools. The principal (Primary Admin or Agent room) is re-resolved and audited inside the short authorization
+   * transaction, which also parses the input and resolves the target chat from the job row; the folder work runs after it commits,
+   * through the same service calls and path checks as the Settings and gear dialog actions. Result codes are the real folder codes.
+   */
+  private async callChatFolderTool(
+    toolName: ChatDownloadFolderToolName,
+    rawArguments: Record<string, unknown>,
+    context: Extract<InternalAgentExecutionContext, { sourceType: 'job' }>,
+    signal: AbortSignal,
+  ): Promise<{ data: unknown } | { error: { code: string; message?: string } }> {
+    const storage = this.options.chatFolders;
+    const notPermitted = { error: { code: 'chat_folder_not_permitted' } } as const;
+    if (!storage) return notPermitted;
+    type Staged =
+      | { kind: 'invalid'; message: string }
+      | { kind: 'error'; code: string; message: string }
+      | { kind: 'target'; key: WritableConversationKey; args: Record<string, unknown>; scope: ChatFolderScope };
+    try {
+      const requestedAccountId = typeof rawArguments.accountId === 'string' && rawArguments.accountId.trim() ? rawArguments.accountId.trim() : undefined;
+      const staged = await this.track(() => this.options.tokens.executeForInternalAgent<Staged>({
+        context, toolName, signal, ...(requestedAccountId ? { requestedAccountId } : {}),
+        execute: async ({ client, authorizedAccountIds, chatFolderScope }) => {
+          // The authority is derived by the repository from the durable job row in this transaction; never from the arguments.
+          // Absent means the narrower authority (fail closed).
+          const authority: ChatFolderScope = chatFolderScope ?? 'own_chat';
+          const schema = toolName === LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_NAME ? ListChatDownloadFoldersToolInputSchema
+            : toolName === ADD_CHAT_DOWNLOAD_FOLDER_TOOL_NAME ? AddChatDownloadFolderToolInputSchema
+              : toolName === SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_NAME ? SetChatDownloadFolderDescriptionToolInputSchema
+                : toolName === SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME ? SetChatDefaultDownloadFolderToolInputSchema
+                  : RemoveChatDownloadFolderToolInputSchema;
+          const parsed = schema.safeParse(rawArguments);
+          if (!parsed.success) return { data: { kind: 'invalid', message: formatValidationIssues(parsed.error) }, resultCount: 0 };
+          const { accountId, chatType, chatId, ...args } = parsed.data as { accountId?: string; chatType?: WritableConversationKey['chatType']; chatId?: string } & Record<string, unknown>;
+          // The own chat of the job comes from the durable job row; an Agent room job has no account and no chat.
+          const job = (await client.query<{ account_id: string | null; chat_type: string | null; chat_id: string | null }>(
+            'SELECT account_id, chat_type, chat_id FROM agent_jobs WHERE job_id = $1', [context.jobId])).rows[0];
+          let key: WritableConversationKey;
+          if (authority === 'own_chat') {
+            // Whitelisted user: only the chat of the job. Any explicit target that is not that chat is refused and audited.
+            const ownType = job?.chat_type;
+            const own: WritableConversationKey | null = job?.account_id && job.chat_id && (ownType === 'direct' || ownType === 'group' || ownType === 'room')
+              ? { accountId: job.account_id, chatType: ownType, chatId: job.chat_id } : null;
+            if (!own) return { data: { kind: 'error', code: 'TARGET_NOT_ALLOWED', message: 'This job has no chat of its own.' }, resultCount: 0, refused: 'SCOPE_DENIED' as const };
+            const explicit = chatType !== undefined || chatId !== undefined || accountId !== undefined;
+            if (explicit && (chatType !== own.chatType || chatId !== own.chatId || (accountId !== undefined && accountId !== own.accountId))) {
+              return { data: { kind: 'error', code: 'TARGET_NOT_ALLOWED', message: 'You may manage the download folders of this chat only.' }, resultCount: 0, refused: 'SCOPE_DENIED' as const };
+            }
+            if (toolName === SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME || (toolName === REMOVE_CHAT_DOWNLOAD_FOLDER_TOOL_NAME && args.clearDefault === true)) {
+              return { data: { kind: 'error', code: 'ADMIN_ONLY', message: 'Only the admin can set or clear the default folder.' }, resultCount: 0, refused: 'PERMISSION_DENIED' as const };
+            }
+            key = own;
+          } else if (chatType !== undefined && chatId !== undefined) {
+            const account = accountId ?? job?.account_id ?? undefined;
+            if (!account) return { data: { kind: 'error', code: 'TARGET_REQUIRED', message: 'Give accountId, chatType and chatId in the Agent room.' }, resultCount: 0 };
+            if ((job?.account_id && account !== job.account_id) || !authorizedAccountIds.includes(account)) {
+              return { data: { kind: 'error', code: 'ACCOUNT_MISMATCH', message: 'The chat must belong to the LINE account of this job.' }, resultCount: 0 };
+            }
+            key = { accountId: account, chatType, chatId };
+          } else {
+            const ownType = job?.chat_type;
+            const own: WritableConversationKey | null = job?.account_id && job.chat_id && (ownType === 'direct' || ownType === 'group' || ownType === 'room')
+              ? { accountId: job.account_id, chatType: ownType, chatId: job.chat_id } : null;
+            if (!own) return { data: { kind: 'error', code: 'TARGET_REQUIRED', message: 'This job has no chat of its own. Give accountId, chatType and chatId.' }, resultCount: 0 };
+            key = own;
+          }
+          const exists = await client.query('SELECT 1 FROM conversations WHERE account_id=$1 AND chat_type=$2 AND chat_id=$3 LIMIT 1', [key.accountId, key.chatType, key.chatId]);
+          if (exists.rowCount !== 1) return { data: { kind: 'error', code: 'CHAT_NOT_FOUND', message: 'No such chat.' }, resultCount: 0 };
+          return { data: { kind: 'target', key, args, scope: authority }, resultCount: 1 };
+        },
+      }), signal);
+      if (staged.kind === 'invalid') return { error: { code: 'INVALID_INPUT', message: staged.message } };
+      if (staged.kind === 'error') return { error: { code: staged.code, message: staged.message } };
+      const { key, args, scope } = staged;
+      const ownChatOnly = scope === 'own_chat';
+      const chat = { accountId: key.accountId, chatType: key.chatType, chatId: key.chatId };
+      const failed = (result: { ok: false; code: string }) => ({ error: { code: result.code } });
+      // A whitelisted user changes only classification folders of its own chat, never the default folder.
+      const isClassified = async (folderId: string) => (await storage.getStatus(key)).folders.some((folder) => folder.folderId === folderId);
+      if (toolName === LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_NAME) {
+        const status = await storage.getStatus(key);
+        // The fixed attachment location is an app-internal path; a whitelisted user does not get it.
+        return { data: { toolName, ...chat, ...(ownChatOnly ? {} : { fixedLocation: storage.fixedLocation }), defaultFolder: status.defaultFolder, folders: status.folders,
+          waitingClassification: status.waitingClassification, folderLimit: CHAT_EXTRA_FOLDER_LIMIT } };
+      }
+      if (toolName === ADD_CHAT_DOWNLOAD_FOLDER_TOOL_NAME) {
+        const result = ownChatOnly ? await storage.addSubfolder(key, args.path as string, args.description as string)
+          : await storage.addFolder(key, args.path as string, args.description as string);
+        return result.ok ? { data: { toolName, ok: true, ...chat, folderId: result.folderId ?? null, root: result.root ?? null, folderCount: result.count, historyCopyStarted: result.backfill ?? false } } : failed(result);
+      }
+      if (toolName === SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_NAME) {
+        if (ownChatOnly && !await isClassified(args.folderId as string)) return { error: { code: 'NOT_FOUND' } };
+        const result = await storage.setFolderDescription(key, args.folderId as string, args.description as string);
+        return result.ok ? { data: { toolName, ok: true, ...chat, folderId: args.folderId } } : failed(result);
+      }
+      if (toolName === SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME) {
+        if (ownChatOnly) return { error: { code: 'ADMIN_ONLY' } };
+        const result = await storage.setDefaultFolder(key, args.path as string);
+        return result.ok ? { data: { toolName, ok: true, ...chat, folderId: result.folderId ?? null, root: result.root ?? null, historyCopyStarted: result.backfill ?? false } } : failed(result);
+      }
+      if (ownChatOnly && (args.clearDefault === true || !await isClassified(args.folderId as string))) return { error: { code: args.clearDefault === true ? 'ADMIN_ONLY' : 'NOT_FOUND' } };
+      const folderId = args.clearDefault === true ? (await storage.getStatus(key)).defaultFolder?.folderId : (args.folderId as string | undefined);
+      if (!folderId) return { error: { code: 'NOT_FOUND' } };
+      const result = await storage.removeFolder(key, folderId);
+      return result.ok ? { data: { toolName, ok: true, ...chat, folderId, folderCount: result.count } } : failed(result);
+    } catch (error) {
+      if (error instanceof McpDomainError && error.code === 'PERMISSION_DENIED' && error.message === CHAT_FOLDER_ADMIN_ONLY_MESSAGE) return { error: { code: 'ADMIN_ONLY' } };
+      if (error instanceof McpDomainError && (error.code === 'PERMISSION_DENIED' || error.code === 'SCOPE_DENIED')) return notPermitted;
+      throw error;
+    }
+  }
+
   /** External local-client schedule mutation happens after the short audited MCP transaction commits. */
   private async callExternalScheduleTool(toolName: ScheduleToolName, rawArguments: Record<string, unknown>, authorizedAccountIds: readonly string[], signal: AbortSignal): Promise<unknown> {
     const handler = this.options.schedules;
@@ -1593,15 +1793,16 @@ export class McpService {
         return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {} } };
       }
       if (rpc.method === 'tools/list') {
-        const { permissions, roomHistory, lineSend } = await verify();
+        const { permissions, roomHistory, lineSend, chatFolders, chatFolderScope } = await verify();
         await finalCheck(null);
         this.internalCapabilities.observe(capability, 'tools_listed');
         // Listing is only a hint of the current permissions; tools/call re-resolves them and is the authority.
         const tools: Array<McpToolDefinition | typeof AGENT_ROOM_HISTORY_TOOL_DEFINITION | typeof REQUEST_PERMISSION_TOOL_DEFINITION
-          | (typeof SEND_TOOLS)[number] | (typeof SCHEDULE_TOOLS)[number] | typeof READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION> = allowedTools(permissions);
+          | (typeof SEND_TOOLS)[number] | (typeof SCHEDULE_TOOLS)[number] | (typeof CHAT_FOLDER_TOOLS)[number] | (typeof OWN_CHAT_FOLDER_TOOLS)[number] | typeof READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION> = allowedTools(permissions);
         if (roomHistory) tools.push(AGENT_ROOM_HISTORY_TOOL_DEFINITION);
         if (lineSend && this.options.lineSend) tools.push(...SEND_TOOLS);
         if (lineSend && this.options.schedules) tools.push(...SCHEDULE_TOOLS);
+        if (chatFolders && this.options.chatFolders) tools.push(...(chatFolderScope === 'own_chat' ? OWN_CHAT_FOLDER_TOOLS : CHAT_FOLDER_TOOLS));
         if (this.options.attachments && MCP_TOOL_PERMISSIONS.query_target_messages.some((permission) => permissions[permission] === 'ALLOW')) tools.push(READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION);
         if (capability.approval && this.options.approvalBroker) tools.push(REQUEST_PERMISSION_TOOL_DEFINITION);
         this.internalCapabilities.recordToolList(capability, tools);
@@ -1675,6 +1876,16 @@ export class McpService {
           }
           return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
             content: [{ type: 'text', text: JSON.stringify(scheduled.data) }], structuredContent: scheduled.data, isError: false } } };
+        }
+        if (isChatDownloadFolderToolName(params.name)) {
+          const folders = await this.callChatFolderTool(params.name, rawCallArgs, context, signal);
+          if (params.name === LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_NAME) await finalCheck(params.name);
+          if ('error' in folders) {
+            return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
+              content: [{ type: 'text', text: JSON.stringify({ error: folders.error }) }], isError: true } } };
+          }
+          return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
+            content: [{ type: 'text', text: JSON.stringify(folders.data) }], structuredContent: folders.data, isError: false } } };
         }
         const toolNameCheck = McpToolNameSchema.safeParse(params.name);
         if (!toolNameCheck.success) {

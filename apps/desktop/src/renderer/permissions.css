@@ -12,9 +12,11 @@
 .perm-scope-selectors { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 0 0 12px; }
 .perm-scope-mode { display: inline-flex; gap: 6px; }
 .perm-scope-field { display: inline-flex; align-items: center; gap: 8px; margin: 0; white-space: nowrap; }
-.perm-whitelist-card label.perm-scope-field { flex-direction: row; align-items: center; margin: 0; }
+.perm-whitelist-card label.perm-scope-field, .perm-whitelist-embedded label.perm-scope-field { flex-direction: row; align-items: center; margin: 0; }
 .perm-scope-field select { min-width: 180px; max-width: min(360px, 55vw); }
 .perm-revoke-button { margin-left: auto; }
+.perm-whitelist-embedded .perm-list { margin-bottom: 0; }
+.perm-whitelist-embedded .perm-row { flex-wrap: wrap; }
 @media (max-width: 640px) {
   .perm-whitelist-header { align-items: flex-start; flex-wrap: wrap; }
   .perm-whitelist-header .perm-scope-mode { margin-left: auto; }

@@ -783,6 +783,42 @@ database('MCP token & audit repository and target/time message queries', () => {
     expect((await tokens.verifyInternalAgentAccess({ context: { sourceType: 'ui' } })).lineSend).toBe(true);
     expect((await tokens.verifyInternalAgentAccess({ context: friendCtx })).lineSend).toBe(false);
     expect((await tokens.verifyInternalAgentAccess({ context: groupCtx })).lineSend).toBe(false);
+
+    // Download folder tools: full for the Primary Admin and the UI, own chat only for a whitelisted user (direct or group), none for a
+    // room member (free mode). Re-derived on every call; the default folder tool is refused for the whitelisted user and audited.
+    const freeMessageId = `msg-free-${randomUUID()}`;
+    const freeJobId = randomUUID();
+    await pool.query(`INSERT INTO conversations (account_id, chat_type, chat_id, title) VALUES ('account-agent', 'group', 'group-free', 'Free') ON CONFLICT DO NOTHING`);
+    await pool.query(
+      `INSERT INTO room_free_mode (account_id, chat_type, chat_id, enabled_by, expires_at) VALUES ('account-agent', 'group', 'group-free', 'mid-primary-admin', clock_timestamp() + interval '1 hour')`);
+    await pool.query(
+      `INSERT INTO messages (account_id, message_id, event_id, chat_id, chat_type, sender_id, kind, text_content, ingestion_source, occurred_at, raw)
+       VALUES ('account-agent', $1, $2, 'group-free', 'group', 'user-member', 'text', 'free', 'live', now(), '{}'::jsonb)`, [freeMessageId, `ev-${freeMessageId}`]);
+    await pool.query(
+      `INSERT INTO agent_jobs (job_id, account_id, chat_type, chat_id, provider, source_type, source_message_id, prompt, workspace_path, generation, creation_epoch, status, free_mode)
+       VALUES ($1, 'account-agent', 'group', 'group-free', 'claude', 'line', $2, 'free', 'C:\\workspace', 1, 1, 'running', true)`, [freeJobId, freeMessageId]);
+    const memberCtx = { sourceType: 'line' as const, jobId: freeJobId };
+    const folderCall = (context: Parameters<McpTokenRepository['executeForInternalAgent']>[0]['context'], toolName: 'add_chat_download_folder' | 'set_chat_default_download_folder') =>
+      tokens.executeForInternalAgent({ context, toolName, execute: async ({ chatFolderScope }) => ({ data: chatFolderScope ?? 'none', resultCount: 1 }) });
+    expect(await folderCall(adminDirectCtx, 'add_chat_download_folder')).toBe('full');
+    expect(await folderCall({ sourceType: 'ui' }, 'set_chat_default_download_folder')).toBe('full');
+    expect(await folderCall(friendCtx, 'add_chat_download_folder')).toBe('own_chat');
+    expect(await folderCall(groupCtx, 'add_chat_download_folder')).toBe('own_chat');
+    await expect(folderCall(friendCtx, 'set_chat_default_download_folder')).rejects.toMatchObject({ code: 'PERMISSION_DENIED', message: 'ADMIN_ONLY' });
+    await expect(folderCall(memberCtx, 'add_chat_download_folder')).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+    expect((await tokens.verifyInternalAgentAccess({ context: adminDirectCtx })).chatFolderScope).toBe('full');
+    expect((await tokens.verifyInternalAgentAccess({ context: { sourceType: 'ui' } })).chatFolderScope).toBe('full');
+    expect((await tokens.verifyInternalAgentAccess({ context: friendCtx })).chatFolderScope).toBe('own_chat');
+    expect((await tokens.verifyInternalAgentAccess({ context: groupCtx })).chatFolderScope).toBe('own_chat');
+    expect((await tokens.verifyInternalAgentAccess({ context: memberCtx })).chatFolders).toBe(false);
+    const folderAudits = (await tokens.listAuditRecords(500)).filter((row) => row.toolName === 'set_chat_default_download_folder' || row.toolName === 'add_chat_download_folder');
+    expect(folderAudits.filter((row) => row.action === 'AUTH_REJECTED' && row.disposition === 'PERMISSION_DENIED')).toHaveLength(2);
+    // A tool body that refuses is audited as a rejection, not as an allowed call.
+    expect(await tokens.executeForInternalAgent({ context: friendCtx, toolName: 'add_chat_download_folder',
+      execute: async () => ({ data: 'refused', refused: 'SCOPE_DENIED' as const }) })).toBe('refused');
+    expect((await tokens.listAuditRecords(10)).some((row) => row.toolName === 'add_chat_download_folder' && row.action === 'AUTH_REJECTED'
+      && row.disposition === 'SCOPE_DENIED' && row.principalId === 'internal:chat_scoped:direct:chat-friend-direct')).toBe(true);
+
     const sendAudits = (await tokens.listAuditRecords(500)).filter((row) => row.toolName === 'send_to_target');
     expect(sendAudits.filter((row) => row.action === 'TOOL_CALLED' && row.disposition === 'ALLOWED' && row.resultCount === 2)).toHaveLength(4);
     expect(sendAudits.filter((row) => row.action === 'AUTH_REJECTED' && row.disposition === 'PERMISSION_DENIED'

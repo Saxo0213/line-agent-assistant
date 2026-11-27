@@ -11,7 +11,7 @@ afterEach(cleanup);
 
 const base: UpdateCheckState = { enabled: true, checking: false, lastCheckedAt: null, lastCheckFailed: false, latestVersion: '1.0.280',
   releaseUrl: 'https://github.com/Saxo0213/line-agent-assistant/releases/tag/v1.0.280', available: true, installedNotice: null, ignoredVersion: null,
-  download: { status: 'idle', percent: 0 }, canAutoInstall: true, autoInstall: false, autoInstallStage: 'none' };
+  download: { status: 'idle', percent: 0 }, canAutoInstall: true, autoInstall: false, autoInstallStage: 'none', autoInstallBlockedBy: null };
 
 function setup(initial: Partial<UpdateCheckState> = {}) {
   let state: UpdateCheckState = { ...base, ...initial };

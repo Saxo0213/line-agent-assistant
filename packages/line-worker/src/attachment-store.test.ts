@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { AttachmentResultSchema } from "@line-agent/contracts";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -457,5 +458,43 @@ describe("storeAttachment", () => {
     });
     expect(request?.directorySegments.at(-1)).toBe(createHash("sha256").update(baseIdentity.externalAttachmentId).digest("hex"));
     await expect(readdir(root)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+describe.skipIf(process.platform !== "win32")("network (UNC) root of the secondary layout", () => {
+  const location = (root: string, layout: "primary" | "secondary") => () => buildAttachmentLocation({
+    root, identity: baseIdentity, occurredAt: "2026-10-15T01:02:03.000Z", originalFileName: "a.pdf", layout });
+
+  it("accepts a UNC root for the secondary layout only and still rejects device paths", () => {
+    expect(location("\\\\nas\\share\\Folder", "secondary")().absolutePath.startsWith("\\\\nas\\share\\Folder\\")).toBe(true);
+    expect(location("//nas/share", "secondary")).not.toThrow();
+    expect(location("\\\\nas\\share\\Folder", "primary")).toThrow(expect.objectContaining({ code: "INVALID_ROOT" }));
+    for (const root of ["\\\\?\\C:\\Data", "\\\\.\\C:\\Data", "\\\\?\\UNC\\nas\\share\\x", "\\\\nas", "\\\\nas\\"]) {
+      expect(location(root, "secondary")).toThrow(expect.objectContaining({ code: "INVALID_ROOT" }));
+    }
+  });
+
+  // A real UNC path to this computer through the administrative share of the temp drive. It is skipped when that share is not reachable.
+  const localUnc = (path: string) => `\\\\localhost\\${path[0]}$${path.slice(2)}`;
+  const reachable = process.platform === "win32" && existsSync(localUnc(tmpdir()));
+
+  it.skipIf(!reachable)("writes through the Node path, verifies, keeps a different file and leaves no temporary file", async () => {
+    const local = await temporaryRoot();
+    const root = localUnc(local);
+    const input = { root, identity: baseIdentity, occurredAt: "2026-10-15T01:02:03.000Z", originalFileName: "document.pdf", layout: "secondary" as const, maxBytes: 100, timeoutMs: 2_000 };
+    // No broker is given: a UNC root must not need one.
+    const first = await storeAttachment({ ...input, source: chunks("same") });
+    expect(first.idempotent).toBe(false);
+    expect(await readFile(join(local, first.managedRelativePath), "utf8")).toBe("same");
+    expect((await storeAttachment({ ...input, source: chunks("same") })).idempotent).toBe(true);
+    await expect(storeAttachment({ ...input, source: chunks("different") })).rejects.toMatchObject({ code: "CONTENT_CONFLICT" });
+    expect(await readFile(join(local, first.managedRelativePath), "utf8")).toBe("same");
+    await expect(storeAttachment({ ...input, identity: { ...baseIdentity, externalAttachmentId: "attachment-B" }, maxBytes: 2, source: chunks("too long") }))
+      .rejects.toMatchObject({ code: "MAX_BYTES_EXCEEDED" });
+    const leftovers = async (directory: string): Promise<string[]> => (await readdir(directory, { withFileTypes: true }))
+      .flatMap((entry) => entry.isDirectory() ? [] : [entry.name]);
+    for (const directory of (await readdir(local, { recursive: true, withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => join(entry.parentPath, entry.name))) {
+      expect((await leftovers(directory)).filter((name) => name.endsWith(".part"))).toEqual([]);
+    }
   });
 });

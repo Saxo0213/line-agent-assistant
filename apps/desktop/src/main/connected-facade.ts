@@ -59,7 +59,8 @@ import { createMcpChatResourceArchiveReader } from './services/mcp-chat-resource
 import { trackOperation, type TrackedOperationContext } from './tracked-operation.js';
 import { WorkspaceAuthority, InvalidWorkspaceError } from './services/workspace-authority.js';
 import { AttachmentService, EXTERNAL_BRIDGE_AUTO_MAX_AGE_MS, EXTERNAL_BRIDGE_RECOVERED_MAX_AGE_MS } from './services/attachment-service.js';
-import { AttachmentStorageService } from './services/attachment-storage-service.js';
+import { AttachmentStorageService, type FolderActionResult } from './services/attachment-storage-service.js';
+import { buildClassifierPrompt, classifierFailure, CLASSIFIER_SYSTEM_PROMPT, CLASSIFIER_TIMEOUT_MS } from './services/attachment-classifier.js';
 import { createWindowsAttachmentBroker, resolveWindowsAttachmentBrokerPath } from '@line-agent/line-worker/attachment-storage';
 import { DeliveryService } from './services/delivery-service.js';
 import { AgentLineSendService } from './services/agent-line-send-service.js';
@@ -191,7 +192,7 @@ export interface IntegratedAgent extends AgentRunner {
   logout(provider: AgentProvider, account?: { id: string; kind: 'system' | 'managed' }): Promise<{ ok: boolean; detail?: string }>;
   /** One tool-less, read-only fast-model turn (group free-mode judge). */
   judge?(request: { provider: AgentProvider; prompt: string; systemPrompt: string; workspacePath: string; resumeSessionId?: string;
-    timeoutMs?: number }): Promise<{ text: string; sessionId: string }>;
+    timeoutMs?: number; account?: { id: string; kind: 'system' | 'managed' }; imagePaths?: string[] }): Promise<{ text: string; sessionId: string }>;
   shutdown(): Promise<void>;
 }
 
@@ -210,6 +211,8 @@ export interface ConnectedFacadeOptions {
   attachmentBrokerHelperPath?: string;
   /** App-managed empty directory used as the working directory of the free-mode judge. */
   freeModeJudgeDirectory?: string;
+  /** App-managed directory (a sibling of the free-mode judge directory) for the image copies of the attachment classifier. */
+  attachmentClassifierDirectory?: string;
   previewCacheRoot?: string;
   mediaCacheRoot?: string;
   /** Handle-anchored Main archive store; absent adapters fail closed. */
@@ -473,13 +476,15 @@ export function recordAttachmentServerResult(options: ConnectedFacadeOptions,
 
 /** Production composition root. Every external process and OS effect is supplied explicitly. */
 export function createPermissionCommandService(
-  repository: Pick<AgentPermissionRepository, 'getExecutionPolicy' | 'setExecutionPolicy'>,
+  repository: Pick<AgentPermissionRepository, 'getExecutionPolicy' | 'setExecutionPolicy' | 'getState' | 'setPermission'>,
   transport: PermissionCommandTransport,
   onPolicyChanged: () => void,
   locale: Locale | string = 'en',
   onDiagnostic?: (diagnostic: import('@line-agent/contracts').SafeDiagnostic) => void,
+  onPermissionsChanged?: () => void,
 ): PermissionCommandService {
-  return new PermissionCommandService(repository, transport, { onPolicyChanged, locale, ...(onDiagnostic ? { onDiagnostic } : {}) });
+  return new PermissionCommandService(repository, transport, { onPolicyChanged, locale, ...(onDiagnostic ? { onDiagnostic } : {}),
+    ...(onPermissionsChanged ? { onPermissionsChanged } : {}) });
 }
 
 export async function createConnectedFacade(options: ConnectedFacadeOptions): Promise<DesktopServiceFacade> {
@@ -775,7 +780,30 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     protectedPaths: options.projectFolderProtectedPaths ?? [],
     workspaceRoot: async () => { const inspection = await workspace.inspect(); return inspection.status === 'available' ? inspection.path : inspection.configuredPath; },
     ownChatWorkspaceFolder: async (key) => (await chatFolders.resolveExisting(key.accountId,key.chatType,key.chatId))?.path ?? null,
-    onError: (error) => options.audit?.failure(diagnosticFailure('attachment','persist',error)) });
+    onError: (error) => options.audit?.failure(diagnosticFailure('attachment','persist',error)),
+    // A chat with 2 or more extra folders: a tool-less judge turn picks the folder of each new attachment.
+    // The provider is the one of the chat, the account is the effective default source of that provider, and no session is resumed.
+    ...(options.attachmentClassifierDirectory ? { classifierDirectory: options.attachmentClassifierDirectory } : {}),
+    classifier: {
+      run: async (request) => {
+        const judge = options.agent.judge;
+        const directory = options.attachmentClassifierDirectory;
+        if (!judge || !directory) throw classifierFailure(new Error('Agent support is disabled'));
+        let image: Awaited<ReturnType<typeof attachmentStorageService.prepareClassifierImage>> = null;
+        try {
+          const provider = await resolveChatProvider(settings, (await settings.getConversationAgent(request.key))?.provider);
+          const account = await quotaAccount(provider);
+          await mkdir(directory, { recursive: true });
+          // Only Codex reads an image in the tool-less judge turn. Claude gets the file name and the text only.
+          if (provider === 'codex' && request.imageRelativePath) image = await attachmentStorageService.prepareClassifierImage(request.imageRelativePath).catch(() => null);
+          const result = await judge({ provider, prompt: buildClassifierPrompt(request.input, image !== null), systemPrompt: CLASSIFIER_SYSTEM_PROMPT,
+            workspacePath: directory, timeoutMs: CLASSIFIER_TIMEOUT_MS, account, ...(image ? { imagePaths: [image.path] } : {}) });
+          return result.text;
+        } catch (error) { throw classifierFailure(error); }
+        finally { await image?.cleanup(); }
+      },
+      onFailure: (error) => options.audit?.failure(diagnosticFailure('attachment', 'execute', error)),
+    } });
   const diagnostics = options.chatResourceDiagnosticsDirectory
     ? createChatResourceDiagnostics({ appDataDirectory: options.chatResourceDiagnosticsDirectory,
       onSinkFailure: (stage) => options.audit?.failure({ operation: 'chat_resource', stage,
@@ -993,7 +1021,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     publish:()=>options.publish?.({type:'agentSchedulesChanged'}),onError:(error)=>options.audit?.failure(diagnosticFailure('agent','execute',error))});
   stopAgentSchedules = onceCleanup(async () => { await photoText.stop(); await scheduleForward.stop(); await agentSchedules.stop(); });
   startupCleanup.add(stopAgentSchedules);
-  mcpService = new McpService({ pool: options.pool, tokens: mcpTokens, messages, approvalBroker, lineSend: agentLineSend, schedules: agentSchedules,
+  mcpService = new McpService({ pool: options.pool, tokens: mcpTokens, messages, approvalBroker, lineSend: agentLineSend, schedules: agentSchedules, chatFolders: attachmentStorageService,
     // attachmentService is created below; read_message_attachment reads it only when an Agent job calls the tool.
     jobFileAccess: (jobId) => agentService.runFileAccess(jobId),
     attachments: { recoverFromLocalDownloads: (attachmentId) => attachmentService.recoverFromLocalDownloads(attachmentId), resolveReadyPath: (attachmentId) => attachmentService.resolveReadyPath(attachmentId) },
@@ -1637,7 +1665,17 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     binding: (accountId) => options.workers.binding(accountId),
     isCurrentActiveControlBinding: (binding) => options.workers.isCurrentActiveControlBinding(binding),
     async send(command) { await assertLineWriteAllowed(command.accountId); return options.workers.send(command); },
-  }, audit: options.audit, locale: options.locale ?? 'en' });
+  }, audit: options.audit, locale: options.locale ?? 'en',
+  async displayName(accountId, chatType, chatId, mid) {
+    // Same name rule as the chat list: nickname, then profile name, then the member name stored for the chat.
+    const result = await options.pool.query<{ name: string }>(
+      `SELECT COALESCE(NULLIF(lc.nickname, ''), NULLIF(lc.display_name, ''), NULLIF(cm.display_name, ''), '') AS name
+       FROM (SELECT $4::text AS mid) t
+       LEFT JOIN line_contacts lc ON lc.account_id = $1 AND lc.mid = t.mid
+       LEFT JOIN conversation_members cm ON cm.account_id = $1 AND cm.chat_type = $2 AND cm.chat_id = $3 AND cm.member_id = t.mid
+       LIMIT 1`, [accountId, chatType, chatId, mid]);
+    return result.rows[0]?.name || null;
+  } });
   const roomIsCurrentControl = async (binding: WorkerBinding): Promise<boolean> => {
     const [control, current] = await Promise.all([accounts.getControlState(), options.workers.binding(binding.accountId)]);
     return control.activeAccountId === binding.accountId && control.controlEpoch === binding.controlEpoch
@@ -1659,7 +1697,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   };
   const roomAutomation = new RoomAutomationService(autoresponders, lineReplyTransport);
   const permissionCommands = createPermissionCommandService(permissionRepository, lineReplyTransport,
-    publishExecutionPolicyChanged, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic));
+    publishExecutionPolicyChanged, options.locale ?? 'en', (diagnostic) => options.audit?.failure(diagnostic),
+    () => options.publish?.({ type: 'agentPermissionsChanged' }));
   // Group free mode: durable window per chat, debounced member messages, one room-member Agent job per batch.
   freeMode = new FreeModeService({ store: freeModeStore,
     roomAvailable: async (key) => (await accounts.getAccount(key.accountId))?.productRole === 'AGENT'
@@ -3836,20 +3875,28 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
         const open = options.openFolderPath ?? options.openAttachmentPath;
         return { type: request.type, requestId, ok: true, opened: open ? (await open(path)) === '' : false };
       }
-      if (request.type === 'getChatExtraFolder' || request.type === 'chooseChatExtraFolder' || request.type === 'clearChatExtraFolder'
-        || request.type === 'retryChatExtraFolder' || request.type === 'openChatExtraFolder') {
-        // The extra folder of one chat. The fixed attachment location never changes; a change here only adds a copy target.
+      if (request.type === 'listChatExtraFolders' || request.type === 'addChatExtraFolder' || request.type === 'removeChatExtraFolder'
+        || request.type === 'setDefaultChatExtraFolder' || request.type === 'setChatExtraFolderDescription' || request.type === 'retryChatExtraFolders'
+        || request.type === 'openChatExtraFolder') {
+        // The extra folders of one chat. The fixed attachment location never changes; a change here only adds or removes a copy target.
         const key = { accountId: request.accountId, chatType: request.chatType, chatId: request.chatId };
-        if (request.type === 'getChatExtraFolder') return { type: request.type, requestId, ok: true, status: await attachmentStorageService.getSecondaryStatus(key) };
-        if (request.type === 'retryChatExtraFolder') return { type: request.type, requestId, ok: true, count: await attachmentStorageService.retrySecondaryFailed(key) };
-        if (request.type === 'clearChatExtraFolder') return { type: request.type, requestId, ok: true, result: await attachmentStorageService.setSecondaryRoot(key, null) };
-        if (request.type === 'chooseChatExtraFolder') {
+        const folderResult = (result: FolderActionResult) => result.ok ? { ok: true as const } : { ok: false as const, code: result.code };
+        if (request.type === 'listChatExtraFolders') return { type: request.type, requestId, ok: true, status: await attachmentStorageService.getStatus(key) };
+        if (request.type === 'retryChatExtraFolders') return { type: request.type, requestId, ok: true, count: await attachmentStorageService.retryFailed(key) };
+        if (request.type === 'removeChatExtraFolder') return { type: request.type, requestId, ok: true, result: folderResult(await attachmentStorageService.removeFolder(key, request.folderId)) };
+        if (request.type === 'setDefaultChatExtraFolder') {
           if (!options.chooseChatExtraFolder) return failure(requestId, 'CHAT_EXTRA_FOLDER_PICKER_UNAVAILABLE', '此環境無法開啟資料夾選擇視窗。');
           const chosen = await options.chooseChatExtraFolder();
-          return { type: request.type, requestId, ok: true, result: chosen === null ? null : await attachmentStorageService.setSecondaryRoot(key, chosen) };
+          return { type: request.type, requestId, ok: true, result: chosen === null ? null : folderResult(await attachmentStorageService.setDefaultFolder(key, chosen)) };
+        }
+        if (request.type === 'setChatExtraFolderDescription') return { type: request.type, requestId, ok: true, result: folderResult(await attachmentStorageService.setFolderDescription(key, request.folderId, request.description)) };
+        if (request.type === 'addChatExtraFolder') {
+          if (!options.chooseChatExtraFolder) return failure(requestId, 'CHAT_EXTRA_FOLDER_PICKER_UNAVAILABLE', '此環境無法開啟資料夾選擇視窗。');
+          const chosen = await options.chooseChatExtraFolder();
+          return { type: request.type, requestId, ok: true, result: chosen === null ? null : folderResult(await attachmentStorageService.addFolder(key, chosen)) };
         }
         const open = options.openFolderPath ?? options.openAttachmentPath;
-        const root = (await attachmentStorageService.getSecondaryStatus(key)).root;
+        const root = await attachmentStorageService.getFolderRoot(key, request.folderId);
         return { type: request.type, requestId, ok: true, opened: open && root ? (await open(root)) === '' : false };
       }
       if (request.type === 'listProjectFolders' || request.type === 'chooseProjectFolder' || request.type === 'bindProjectFolder' || request.type === 'unbindProjectFolder') {
@@ -4231,8 +4278,11 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     async listAttachmentStates(key, attachmentIds) {
       return messages.listAttachmentStates(key, attachmentIds, conversationSettings.attachmentAutoAttemptLimit);
     },
-    async listStoredAttachments(key, cursor, limit) {
-      return attachmentStorage.listStoredAttachments(key, cursor, limit);
+    async listStoredAttachments(key, cursor, limit, senderId) {
+      return attachmentStorage.listStoredAttachments(key, cursor, limit, senderId ?? null);
+    },
+    async listStoredAttachmentSenders(key) {
+      return { senders: await attachmentStorage.listStoredAttachmentSenders(key) };
     },
     async listAgentStatuses(key, messageIds) {
       if (!isWritableChatType(key.chatType)) return [];
@@ -4278,10 +4328,15 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
       return { activeAccountId: state.activeAccountId, epoch: state.controlEpoch, pendingOutbound: Number(pending.rows[0]?.count ?? 0) };
     },
     async isIdle() {
-      if (agentLineSend.hasPending()) return false;
-      const busy = await options.pool.query<{ busy: boolean }>(
-        "SELECT (EXISTS (SELECT 1 FROM agent_jobs WHERE status IN ('queued','running')) OR EXISTS (SELECT 1 FROM agent_deliveries WHERE status IN ('pending','sending'))) AS busy");
-      return busy.rows[0]?.busy === false;
+      const busy = await options.pool.query<{ jobs: boolean; deliveries: boolean }>(
+        "SELECT EXISTS (SELECT 1 FROM agent_jobs WHERE status IN ('queued','running')) AS jobs, EXISTS (SELECT 1 FROM agent_deliveries WHERE status IN ('pending','sending')) AS deliveries");
+      const row = busy.rows[0];
+      // A missing row is not proof of idle: report the unknown state as busy without a reason.
+      if (!row) return { idle: false, reason: null };
+      if (row.jobs) return { idle: false, reason: 'agent_jobs' };
+      if (row.deliveries) return { idle: false, reason: 'deliveries' };
+      if (agentLineSend.hasPending()) return { idle: false, reason: 'line_send' };
+      return { idle: true, reason: null };
     },
     shutdown() {
       closing = true;
@@ -4394,6 +4449,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     openReadableChatAlbumFolder: (...args) => admitted(() => chatResources.openReadableAlbumFolder(...args), { operation: 'chat_resource', identity: { accountId: args[0].accountId } }),
     listAttachmentStates: (...args) => admitted(() => facade.listAttachmentStates(...args), { operation: 'attachment', identity: { accountId: args[0].accountId } }),
     listStoredAttachments: (...args) => admitted(() => facade.listStoredAttachments!(...args), { operation: 'ipc', identity: { accountId: args[0].accountId } }),
+    listStoredAttachmentSenders: (...args) => admitted(() => facade.listStoredAttachmentSenders!(...args), { operation: 'ipc', identity: { accountId: args[0].accountId } }),
     listAgentStatuses: (...args) => admitted(() => facade.listAgentStatuses(...args), { operation: 'agent', identity: { accountId: args[0].accountId } }),
     listWorkRecords: (...args) => admitted(() => facade.listWorkRecords(...args), { operation: 'agent' }),
     listFriends: (...args) => admitted(() => facade.listFriends!(...args), { operation: 'ipc', identity: { accountId: args[0] } }),

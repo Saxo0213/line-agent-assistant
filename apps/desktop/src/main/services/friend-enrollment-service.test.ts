@@ -515,15 +515,94 @@ describe('FriendEnrollmentService', () => {
     }
   });
 
-  it('rejects malformed inline group commands, fake mentions, extra text and multiple targets', async () => {
+  it('rejects malformed inline group commands, fake mentions and extra text', async () => {
     const ctx = setup();
     await ctx.service.handle(inlineGroupCommand('/adduser', { mentionIds: [targetMid],
       mentionRanges: [{ start: 0, end: 6, userId: targetMid }, { start: 15, end: 22, userId: targetMid }] }), null, ownMid);
     await ctx.service.handle(inlineGroupCommand('/adduser extra'), null, ownMid);
-    await ctx.service.handle(inlineGroupCommand('/adduser', { text: '@Agent /adduser @Target @Other', mentionIds: [ownMid, targetMid, 'u' + 'c'.repeat(32)],
-      mentionRanges: [{ start: 0, end: 6, userId: ownMid }, { start: 15, end: 22, userId: targetMid },
-        { start: 23, end: 29, userId: 'u' + 'c'.repeat(32) }] }), null, ownMid);
     expect(ctx.workers.send).not.toHaveBeenCalled();
+  });
+
+  const otherMid = 'u' + 'c'.repeat(32);
+  const thirdMid = 'u' + 'd'.repeat(32);
+  const multiCommand = (mids: string[], overrides: Partial<InboundEnvelope> = {}) => {
+    let text = '@Agent /adduser';
+    const ranges = [{ start: 0, end: 6, userId: ownMid }];
+    for (const [index, mid] of mids.entries()) {
+      const label = `@T${index}`;
+      ranges.push({ start: text.length + 1, end: text.length + 1 + label.length, userId: mid });
+      text += ` ${label}`;
+    }
+    return codeMessage('', { chatType: 'group', chatId: 'origin-room', text, mentionIds: [ownMid, ...new Set(mids)],
+      mentionRanges: ranges, ...overrides });
+  };
+  const manyMids = (count: number) => Array.from({ length: count }, (_, index) => 'u' + index.toString(16).padStart(32, '0'));
+
+  it('starts one challenge for a command with several target mentions and activates each target after one code', async () => {
+    const ctx = setup();
+    await ctx.service.handle(multiCommand([targetMid, otherMid, thirdMid]), null, ownMid);
+    const challenges = ctx.workers.send.mock.calls.filter(([c]) => c.type === 'sendText' && c.text.includes('LW-ABCDEFG2'));
+    expect(challenges).toHaveLength(1);
+    expect(challenges[0]![0]).toMatchObject({ chatType: 'direct', chatId: 'admin-chat', text: expect.stringContaining('3 位') });
+    expect(ctx.whitelist.activateForEnrollment).not.toHaveBeenCalled();
+    await ctx.service.handle(groupCodeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true }, ownMid);
+    expect(ctx.whitelist.activateForEnrollment.mock.calls.map(([input]) => input.targetMid)).toEqual([targetMid, otherMid, thirdMid]);
+    expect(ctx.workers.send.mock.calls.filter(([c]) => c.type === 'sendText' && c.chatType === 'group')).toHaveLength(1);
+  });
+
+  it('accepts several targets in the selection reply', async () => {
+    const ctx = setup();
+    await ctx.service.handle(groupCommand(), null, ownMid);
+    await ctx.service.handle(groupSelection({ text: '@Agent @Target @Other', mentionIds: [ownMid, targetMid, otherMid],
+      mentionRanges: [{ start: 0, end: 6, userId: ownMid }, { start: 7, end: 14, userId: targetMid },
+        { start: 15, end: 21, userId: otherMid }] }), null, ownMid);
+    expect(ctx.workers.send.mock.calls.at(-1)?.[0]).toMatchObject({ chatType: 'direct', text: expect.stringContaining('2 位') });
+    await ctx.service.handle(groupCodeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true }, ownMid);
+    expect(ctx.whitelist.activateForEnrollment.mock.calls.map(([input]) => input.targetMid)).toEqual([targetMid, otherMid]);
+  });
+
+  it('counts a duplicate mention of the same user once', async () => {
+    const ctx = setup();
+    await ctx.service.handle(multiCommand([targetMid, targetMid]), null, ownMid);
+    await ctx.service.handle(groupCodeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true }, ownMid);
+    expect(ctx.whitelist.activateForEnrollment).toHaveBeenCalledTimes(1);
+    expect(ctx.workers.send.mock.calls.at(-1)?.[0]).toMatchObject({ chatType: 'group', text: linePrompt('zh-TW', 'enrollmentGrantedGroup') });
+  });
+
+  it('rejects more than ten targets with an error text and starts no challenge', async () => {
+    const ctx = setup();
+    await ctx.service.handle(multiCommand(manyMids(11)), null, ownMid);
+    expect(ctx.workers.send).toHaveBeenCalledTimes(1);
+    expect(ctx.workers.send.mock.calls[0]?.[0]).toMatchObject({ chatType: 'group', chatId: 'origin-room', text: expect.stringContaining('最多標記 10 位') });
+    await ctx.service.handle(groupCodeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true }, ownMid);
+    expect(ctx.whitelist.activateForEnrollment).not.toHaveBeenCalled();
+    const accepted = setup();
+    await accepted.service.handle(multiCommand(manyMids(10)), null, ownMid);
+    expect(accepted.workers.send.mock.calls[0]?.[0]).toMatchObject({ chatType: 'direct', text: expect.stringContaining('10 位') });
+  });
+
+  it('reports added, already authorized and failed targets in one group reply and keeps real audit codes', async () => {
+    const ctx = setup();
+    ctx.whitelist.getActiveAuthorization.mockImplementation((async (_account: string, mid: string) => mid === otherMid
+      ? { scopeKind: 'CHAT', chatType: 'group', chatId: 'origin-room' } : null) as never);
+    const activate = ctx.whitelist.activateForEnrollment.getMockImplementation()!;
+    ctx.whitelist.activateForEnrollment.mockImplementation(async (input: any) => {
+      if (input.targetMid === thirdMid) throw new Error('private grant detail');
+      return activate(input);
+    });
+    await ctx.service.handle(multiCommand([targetMid, otherMid, thirdMid]), null, ownMid);
+    await ctx.service.handle(groupCodeMessage('LW-ABCDEFG2'), { code: 'LW-ABCDEFG2', exact: true }, ownMid);
+    const groupReplies = ctx.workers.send.mock.calls.filter(([c]) => c.type === 'sendText' && c.chatType === 'group');
+    expect(groupReplies).toHaveLength(1);
+    const text = (groupReplies[0]![0] as Extract<LineWorkerCommand, { type: 'sendText' }>).text;
+    expect(text).toContain('已新增 1 位');
+    expect(text).toContain('原本已授權 1 位');
+    expect(text).toContain('失敗 1 位');
+    expect(text).not.toContain(targetMid);
+    expect(ctx.auditEvents.filter((item) => item.phase === 'failed')).toEqual([
+      expect.objectContaining({ errorCode: 'ENROLLMENT_GRANT_FAILED' })]);
+    expect(ctx.auditEvents.filter((item) => item.phase === 'succeeded')).toHaveLength(2);
+    expect(ctx.audit.request).toHaveBeenCalledTimes(3);
   });
 
   it('handles but does not start from group contacts, fake mentions, or non-primary group commands', async () => {
@@ -550,14 +629,14 @@ describe('FriendEnrollmentService', () => {
     expect(ctx.workers.addFriendByMid).not.toHaveBeenCalled();
   });
 
-  it('requires exactly one structured target mention in the original group', async () => {
+  it('requires structured target mentions only in the original group', async () => {
     const ctx = setup();
     await ctx.service.handle(groupCommand(), null, ownMid);
     await ctx.service.handle(groupSelection({ text: '@Agent @Target extra' }), null, ownMid);
     expect(ctx.workers.send).toHaveBeenCalledTimes(2);
-    await ctx.service.handle(groupSelection({ text: '@Agent @Target @Other', mentionIds: [ownMid, targetMid, 'u' + 'c'.repeat(32)],
+    await ctx.service.handle(groupSelection({ text: '@Agent @Target @Other', mentionIds: [ownMid, targetMid, 'x'],
       mentionRanges: [{ start: 0, end: 6, userId: ownMid }, { start: 7, end: 14, userId: targetMid },
-        { start: 15, end: 21, userId: 'u' + 'c'.repeat(32) }] }), null, ownMid);
+        { start: 15, end: 21, userId: 'x' }] }), null, ownMid);
     expect(ctx.workers.send).toHaveBeenCalledTimes(3);
   });
 

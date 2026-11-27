@@ -63,6 +63,8 @@ export type AutoInstallEvent = {
   fromVersion?: string | null;
   /** True when the step ran in the exit path. */
   viaExit?: boolean;
+  /** True when the user started the install with 「立即更新」 and skipped the idle check. */
+  manual?: boolean;
   error?: unknown;
 };
 export const AUTO_INSTALL_IDLE_INTERVAL_MS = 60 * 1000;
@@ -101,8 +103,8 @@ type Options = {
   getUpdater?: () => AppUpdaterLike;
   /** Runs the normal service shutdown (PostgreSQL, workers, agents) and resolves true when it is safe to hand over to the installer. */
   prepareInstall?: () => Promise<boolean>;
-  /** True when no Agent job is queued or running and no LINE send is pending. The automatic install waits for true. */
-  isIdle?: () => Promise<boolean>;
+  /** `idle` is true when no Agent job is queued or running and no LINE send is pending. The automatic install waits for true. `reason` names the first busy cause when `idle` is false. */
+  isIdle?: () => Promise<{ idle: boolean; reason: UpdateCheckState['autoInstallBlockedBy'] }>;
   /** Receives each step of the automatic download and install. */
   onAutoInstall?: (event: AutoInstallEvent) => void;
   idleIntervalMs?: number;
@@ -144,6 +146,9 @@ export function createUpdateCheckService(options: Options) {
   let idleTarget: AppUpdaterLike | undefined;
   let installStage: UpdateCheckState['autoInstallStage'] = 'none';
   let installStarted = false;
+  /** True from the start of `runInstall` until it ends; blocks a second install path (idle tick or click). */
+  let installBusy = false;
+  let blockedBy: UpdateCheckState['autoInstallBlockedBy'] = null;
   let stopped = false;
   const canAutoInstall = options.canAutoInstall === true && options.getUpdater !== undefined;
 
@@ -151,6 +156,7 @@ export function createUpdateCheckService(options: Options) {
     enabled: persisted.enabled,
     autoInstall: persisted.autoInstall,
     autoInstallStage: installStage,
+    autoInstallBlockedBy: installStage === 'waiting' ? blockedBy : null,
     checking,
     lastCheckedAt: persisted.lastCheckedAt,
     lastCheckFailed: persisted.lastCheckFailed,
@@ -253,42 +259,68 @@ export function createUpdateCheckService(options: Options) {
     target.autoInstallOnAppQuit = false;
     idleTarget = undefined;
     installStage = 'none';
+    blockedBy = null;
     installing = false;
     download = { status: 'error', percent: 0 };
     publish();
   };
   const autoVersion = () => persisted.pendingInstallTarget?.version ?? persisted.latestVersion;
 
-  /** Runs every 60 s after an automatic download is ready: installs through the normal shutdown only when the app is idle. One failure ends the automatic path. */
+  /**
+   * The install steps of the automatic path: normal shutdown, then the silent installer. One failure ends the automatic path.
+   * The idle tick and 「立即更新」 both call this; `manual` only marks the system records.
+   */
+  async function runInstall(target: AppUpdaterLike, manual: boolean): Promise<void> {
+    if (installBusy || installStarted) return;
+    installBusy = true;
+    clearIdleTimer();
+    const via = manual ? { manual: true } : {};
+    try {
+      let prepared = false;
+      let failure: unknown;
+      try { prepared = options.prepareInstall ? await options.prepareInstall() : false; } catch (error) { failure = error; }
+      if (!prepared) {
+        emitAuto({ phase: 'install_failed', version: autoVersion(), ...via,
+          error: failure ?? Object.assign(new Error('shutdown failed'), { code: 'UPDATE_PREPARE_INSTALL_FAILED' }) });
+        emitAuto({ phase: 'install_given_up', version: autoVersion(), ...via });
+        giveUpAutoInstall(target);
+        return;
+      }
+      installStage = 'installing';
+      installStarted = true;
+      blockedBy = null;
+      publish();
+      emitAuto({ phase: 'install_started', version: autoVersion(), ...via });
+      try { target.quitAndInstall(true, true); }
+      catch (error) {
+        emitAuto({ phase: 'install_failed', version: autoVersion(), ...via, error });
+        emitAuto({ phase: 'install_given_up', version: autoVersion(), ...via });
+        installStarted = false;
+        giveUpAutoInstall(target);
+      }
+    } finally { installBusy = false; }
+  }
+
+  /** Runs every 60 s after an automatic download is ready: installs through the normal shutdown only when the app is idle. */
   async function idleTick(): Promise<void> {
     const target = idleTarget;
-    if (!target || stopped) return;
-    if (!autoActive()) { target.autoInstallOnAppQuit = false; idleTarget = undefined; installStage = 'none'; installing = false; download = { status: 'idle', percent: 0 }; publish(); return; }
-    let idle = false;
-    try { idle = options.isIdle ? await options.isIdle() : false; } catch { idle = false; }
-    if (stopped) return;
-    if (!idle) { scheduleIdleCheck(); return; }
-    let prepared = false;
-    let failure: unknown;
-    try { prepared = options.prepareInstall ? await options.prepareInstall() : false; } catch (error) { failure = error; }
-    if (!prepared) {
-      emitAuto({ phase: 'install_failed', version: autoVersion(),
-        error: failure ?? Object.assign(new Error('shutdown failed'), { code: 'UPDATE_PREPARE_INSTALL_FAILED' }) });
-      emitAuto({ phase: 'install_given_up', version: autoVersion() });
-      giveUpAutoInstall(target);
-      return;
-    }
-    installStage = 'installing';
-    installStarted = true;
-    publish();
-    emitAuto({ phase: 'install_started', version: autoVersion() });
-    try { target.quitAndInstall(true, true); }
-    catch (error) {
-      emitAuto({ phase: 'install_failed', version: autoVersion(), error });
-      emitAuto({ phase: 'install_given_up', version: autoVersion() });
-      installStarted = false;
-      giveUpAutoInstall(target);
-    }
+    if (!target || stopped || installBusy) return;
+    if (!autoActive()) { target.autoInstallOnAppQuit = false; idleTarget = undefined; installStage = 'none'; blockedBy = null; installing = false; download = { status: 'idle', percent: 0 }; publish(); return; }
+    let result: { idle: boolean; reason: UpdateCheckState['autoInstallBlockedBy'] } = { idle: false, reason: null };
+    try { if (options.isIdle) result = await options.isIdle(); } catch { result = { idle: false, reason: null }; }
+    // A click on 「立即更新」 can start the install while the idle check runs.
+    if (stopped || installBusy || installStarted || idleTarget !== target) return;
+    const reason = result.idle ? null : result.reason;
+    if (reason !== blockedBy) { blockedBy = reason; publish(); }
+    if (!result.idle) { scheduleIdleCheck(); return; }
+    await runInstall(target, false);
+  }
+
+  /** 「立即更新」 while the downloaded build waits for idle: installs at once and skips the idle check. */
+  async function installNow(): Promise<UpdateCheckState> {
+    const target = idleTarget;
+    if (target && !stopped && installStage === 'waiting') await runInstall(target, true);
+    return state();
   }
 
   /** Starts the background download of a newer version with the same progress state as 「更新」. Never opens the release page; a failure waits for the next check. */
@@ -317,6 +349,7 @@ export function createUpdateCheckService(options: Options) {
     // autoInstallOnAppQuit stays false: the explicit installOnExit (called by Main at exit) is the only quit path, so the build never installs twice.
     idleTarget = target;
     installStage = 'waiting';
+    blockedBy = null;
     publish();
     emitAuto({ phase: 'download_ready', version: installerTarget!.version });
     scheduleIdleCheck();
@@ -500,6 +533,8 @@ export function createUpdateCheckService(options: Options) {
     },
     /** 「更新」: download with electron-updater, run the normal shutdown, then hand over to the silent installer. Falls back to the release page. */
     async install(): Promise<UpdateCheckState> {
+      // The automatic download is ready and waits for idle: install it now.
+      if (installing && installStage === 'waiting') return installNow();
       if (installing || !state().available) return state();
       if (!canAutoInstall) { await openReleasePage(); return state(); }
       installing = true;

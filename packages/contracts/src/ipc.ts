@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ChatExtraFolderResultSchema, ChatExtraFolderStatusSchema } from './attachment-storage.js';
+import { CHAT_EXTRA_FOLDER_DESCRIPTION_MAX, ChatExtraFolderResultSchema, ChatExtraFolderStatusSchema } from './attachment-storage.js';
 import { isLineServerErrorCode } from './line-server-error.js';
 import { ATTACHMENT_BLOCK_REASONS } from './attachment-block.js';
 import { AgentAttachmentSummarySchema, AgentAttachmentUploadsSchema, AgentEventSchema, AgentProviderSchema } from './agent.js';
@@ -208,11 +208,14 @@ export const IpcRequestSchema = z.discriminatedUnion('type', [
   RequestIdSchema.extend({ type: z.literal('openExternalUrl'), url: z.string().min(1).max(8192) }),
   RequestIdSchema.extend({ type: z.literal('openAttachment'), attachmentId: IdSchema }),
   RequestIdSchema.merge(ConversationKeySchema).extend({ type: z.literal('openStoredAttachmentsFolder') }),
-  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('getChatExtraFolder') }),
-  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('chooseChatExtraFolder') }),
-  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('clearChatExtraFolder') }),
-  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('retryChatExtraFolder') }),
-  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('openChatExtraFolder') }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('listChatExtraFolders') }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('addChatExtraFolder') }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('removeChatExtraFolder'), folderId: z.uuid() }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('setDefaultChatExtraFolder') }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('setChatExtraFolderDescription'), folderId: z.uuid(),
+    description: z.string().max(CHAT_EXTRA_FOLDER_DESCRIPTION_MAX) }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('retryChatExtraFolders') }),
+  RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('openChatExtraFolder'), folderId: z.uuid() }),
   RequestIdSchema.merge(WritableConversationKeySchema).extend({ type: z.literal('downloadAttachment'), attachmentId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('revealAttachment'), attachmentId: IdSchema }),
   RequestIdSchema.extend({ type: z.literal('resolveFileTypeIcon'), extension: z.string().regex(/^[a-z0-9]{1,12}$/) }),
@@ -482,6 +485,8 @@ export const IpcEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('agentApprovalResolved'), approvalId: IdSchema, jobId: IdSchema, outcome: AgentApprovalOutcomeSchema }),
   /** The execution policy changed (operator UI or LINE /權限); subscribers re-read it. Carries no policy data. */
   z.strictObject({ type: z.literal('agentExecutionPolicyChanged') }),
+  /** The allowlist capability rules changed from LINE /權限; subscribers re-read them. Carries no rule data. */
+  z.strictObject({ type: z.literal('agentPermissionsChanged') }),
   /** A schedule or a schedule run changed (UI, Agent tool or the trigger tick); subscribers re-read. Carries no schedule data. */
   z.strictObject({ type: z.literal('agentSchedulesChanged') }),
   /** The user clicked a desktop notification: the renderer opens this chat when it is in its list. */
@@ -587,11 +592,13 @@ export const IpcResultSchema = z.union([
     z.strictObject({ type: z.literal('getJobEvents'), requestId: IdSchema, ok: z.literal(true), events: z.array(AgentEventSchema) }),
     z.strictObject({ type: z.literal('openAttachment'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
     z.strictObject({ type: z.literal('openStoredAttachmentsFolder'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
-    z.strictObject({ type: z.literal('getChatExtraFolder'), requestId: IdSchema, ok: z.literal(true), status: ChatExtraFolderStatusSchema }),
+    z.strictObject({ type: z.literal('listChatExtraFolders'), requestId: IdSchema, ok: z.literal(true), status: ChatExtraFolderStatusSchema }),
     // result is null when the user cancels the folder picker.
-    z.strictObject({ type: z.literal('chooseChatExtraFolder'), requestId: IdSchema, ok: z.literal(true), result: ChatExtraFolderResultSchema.nullable() }),
-    z.strictObject({ type: z.literal('clearChatExtraFolder'), requestId: IdSchema, ok: z.literal(true), result: ChatExtraFolderResultSchema }),
-    z.strictObject({ type: z.literal('retryChatExtraFolder'), requestId: IdSchema, ok: z.literal(true), count: z.number().int().nonnegative() }),
+    z.strictObject({ type: z.literal('addChatExtraFolder'), requestId: IdSchema, ok: z.literal(true), result: ChatExtraFolderResultSchema.nullable() }),
+    z.strictObject({ type: z.literal('removeChatExtraFolder'), requestId: IdSchema, ok: z.literal(true), result: ChatExtraFolderResultSchema }),
+    z.strictObject({ type: z.literal('setDefaultChatExtraFolder'), requestId: IdSchema, ok: z.literal(true), result: ChatExtraFolderResultSchema.nullable() }),
+    z.strictObject({ type: z.literal('setChatExtraFolderDescription'), requestId: IdSchema, ok: z.literal(true), result: ChatExtraFolderResultSchema }),
+    z.strictObject({ type: z.literal('retryChatExtraFolders'), requestId: IdSchema, ok: z.literal(true), count: z.number().int().nonnegative() }),
     z.strictObject({ type: z.literal('openChatExtraFolder'), requestId: IdSchema, ok: z.literal(true), opened: z.boolean() }),
     z.strictObject({ type: z.literal('openExternalUrl'), requestId: IdSchema, ok: z.literal(true) }),
     z.strictObject({ type: z.literal('getChromeLoginAvailability'), requestId: IdSchema, ok: z.literal(true), status: ChromeLtsmStatusSchema }),

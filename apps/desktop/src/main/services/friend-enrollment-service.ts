@@ -20,7 +20,7 @@ type Flow =
       originChatId: string; adminSenderId: string }
   | { phase: 'selection'; context: FlowContext }
   | { phase: 'selecting'; context: FlowContext }
-  | { phase: 'challenge'; context: FlowContext; challengeId: string; targetMid: string; digest: Buffer; attempts: number }
+  | { phase: 'challenge'; context: FlowContext; challengeId: string; targetMids: string[]; digest: Buffer; attempts: number }
   | { phase: 'processing'; context: FlowContext };
 
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -28,6 +28,7 @@ const CODE_PATTERN = /^LW-[A-HJ-NP-Z2-9]{8}$/;
 const LINE_MID = /^u[0-9a-fA-F]{32}$/;
 const MAX_ATTEMPTS = 5;
 const MAX_FLOWS = 512;
+const MAX_TARGETS = 10;
 const TTL_MS = 10 * 60_000;
 function keyFor(accountId: string, chatType: string, chatId: string, senderId: string): string {
   return JSON.stringify([accountId, chatType, chatId, senderId]);
@@ -67,7 +68,31 @@ function withoutRanges(text: string, ranges: readonly { start: number; end: numb
   return result.normalize('NFC').trim().replace(/\s+/gu, ' ');
 }
 
-type EnrollmentCommand = { kind: 'direct' | 'group'; targetMid?: string };
+type EnrollmentCommand = { kind: 'direct' | 'group'; targetMids?: string[]; tooMany?: true };
+type TargetOutcome = { targetMid: string; status: 'added' | 'already' | 'failed'; silent: boolean;
+  errorCode?: AuditErrorCode; finishReply?: (reply: 'sent' | 'failed' | 'unknown') => void };
+type TargetParse ={ mids: string[] } | { tooMany: true } | null;
+
+// Reads the target mentions that follow the leading Agent mention. The rest of the text must pass `restOk`.
+function parseTargets(envelope: InboundEnvelope, ownMid: string, own: { start: number; end: number },
+  restOk: (rest: string) => boolean): TargetParse {
+  const text = envelope.text;
+  if (text === null) return null;
+  const ranges = [...envelope.mentionRanges].sort((left, right) => left.start - right.start);
+  const targets = ranges.filter((range) => range.userId !== ownMid);
+  if (targets.length === 0 || targets.length + 1 !== ranges.length) return null;
+  for (const [index, range] of ranges.entries()) {
+    if (range.start < 0 || range.end > text.length || range.start >= range.end
+      || (index > 0 && range.start < ranges[index - 1]!.end)) return null;
+  }
+  if (targets.some((range) => range.start <= own.end || !LINE_MID.test(range.userId))) return null;
+  const rangeIds = new Set(ranges.map((range) => range.userId));
+  const mentionIds = new Set(envelope.mentionIds);
+  if (rangeIds.size !== mentionIds.size || [...rangeIds].some((id) => !mentionIds.has(id))) return null;
+  if (!restOk(withoutRanges(text, ranges))) return null;
+  const mids = [...new Set(targets.map((range) => range.userId))];
+  return mids.length > MAX_TARGETS ? { tooMany: true } : { mids };
+}
 
 function exactCommand(envelope: InboundEnvelope, ownMid: string | null): EnrollmentCommand | null {
   if (envelope.kind !== 'text' || envelope.text === null || envelope.ingestion.source !== 'live'
@@ -82,22 +107,15 @@ function exactCommand(envelope: InboundEnvelope, ownMid: string | null): Enrollm
     return envelope.mentionRanges.length === 1 && envelope.mentionIds.length === 1
       && accepted(withoutRanges(envelope.text, [mention])) ? { kind: 'group' } : null;
   }
-  if (targets.length !== 1 || envelope.mentionRanges.length !== 2 || envelope.mentionIds.length !== 2) return null;
-  const target = targets[0]!;
-  if (target.start <= mention.end || !LINE_MID.test(target.userId) || target.userId === ownMid
-    || envelope.mentionIds.filter((id) => id === target.userId).length !== 1
-    || !accepted(withoutRanges(envelope.text, [mention, target]))) return null;
-  return { kind: 'group', targetMid: target.userId };
+  const parsed = parseTargets(envelope, ownMid, mention, accepted);
+  if (!parsed) return null;
+  return 'tooMany' in parsed ? { kind: 'group', tooMany: true } : { kind: 'group', targetMids: parsed.mids };
 }
 
-function targetMention(envelope: InboundEnvelope, ownMid: string): string | null {
-  if (envelope.text === null || envelope.mentionRanges.length !== 2 || envelope.mentionIds.length !== 2) return null;
+// Selection reply: the Agent mention first, then only target mentions.
+function targetMentions(envelope: InboundEnvelope, ownMid: string): TargetParse {
   const own = leadingOwnMention(envelope, ownMid);
-  const target = envelope.mentionRanges.find((range) => range.userId !== ownMid);
-  if (!own || !target || target.start <= own.start || !envelope.mentionIds.includes(target.userId)
-    || !LINE_MID.test(target.userId) || target.userId === ownMid
-    || withoutRanges(envelope.text, [own, target]) !== '') return null;
-  return target.userId;
+  return own ? parseTargets(envelope, ownMid, own, (rest) => rest === '') : null;
 }
 
 export class FriendEnrollmentService {
@@ -114,6 +132,8 @@ export class FriendEnrollmentService {
     digestKey?: Buffer;
     makeCode?: () => string;
     locale?: Locale | string;
+    /** Known display name of a LINE user in the chat, or null. Used only in texts for several targets. */
+    displayName?: (accountId: string, chatType: 'group' | 'room', chatId: string, mid: string) => Promise<string | null>;
   }) {
     this.now = deps.now ?? Date.now;
     this.digestKey = deps.digestKey ?? randomBytes(32);
@@ -135,7 +155,7 @@ export class FriendEnrollmentService {
       : await this.deps.admins.isPrimaryUser(envelope.accountId, envelope.senderId);
     if (!primary) return false;
     if (exactCommand(envelope, ownMid) || (envelope.kind === 'contact' && envelope.chatType === 'direct')) return true;
-    if (ownMid && targetMention(envelope, ownMid)) return true;
+    if (ownMid && targetMentions(envelope, ownMid)) return true;
     const flow = this.liveFlow(keyFor(envelope.accountId, envelope.chatType, envelope.chatId, envelope.senderId));
     return flow?.phase === 'selection' && envelope.chatType !== 'direct' && !!ownMid && !!leadingOwnMention(envelope, ownMid);
   }
@@ -237,7 +257,7 @@ export class FriendEnrollmentService {
     }
     const account = await this.deps.accounts.getAccount(envelope.accountId);
     if (!isStarting()) return;
-    if (!account?.ownMid || account.ownMid !== ownMid || account.ownMid === command.targetMid) {
+    if (!account?.ownMid || account.ownMid !== ownMid || command.targetMids?.includes(account.ownMid)) {
       this.deleteIfCurrent(key, flowId); return;
     }
     const binding = capturedBinding === undefined ? await this.currentControlBinding(envelope.accountId)
@@ -250,10 +270,17 @@ export class FriendEnrollmentService {
     const context: FlowContext = { flowId, accountId: envelope.accountId, originChatType,
       originChatId: envelope.chatId, adminSenderId: envelope.senderId, primaryChatId, binding, expiresAt: this.now() + TTL_MS,
       adminVersion, selectedSourceId: capabilities.selectedSourceId, selectedSourceGeneration: capabilities.selectedSourceGeneration };
-    if (command.targetMid) {
+    if (command.tooMany) {
+      this.putFlow(key, { phase: 'processing', context });
+      await this.sendText(context, originChatType, envelope.chatId, linePrompt(this.deps.locale ?? 'en', 'enrollmentTooMany'),
+        () => this.current(key, flowId, 'processing') !== null);
+      this.deleteIfCurrent(key, flowId);
+      return;
+    }
+    if (command.targetMids) {
       this.putFlow(key, { phase: 'selecting', context });
       if (!this.selectionIsCurrent(key, context)) return;
-      await this.createChallenge(key, context, command.targetMid);
+      await this.createChallenge(key, context, command.targetMids);
       return;
     }
     this.putFlow(key, { phase: 'selection', context });
@@ -318,7 +345,7 @@ export class FriendEnrollmentService {
       return;
     }
     if (!this.selectionIsCurrent(key, context)) return;
-    await this.createChallenge(key, context, targetMid);
+    await this.createChallenge(key, context, [targetMid]);
   }
 
   private async selectGroupTarget(key: string, flow: Extract<Flow, { phase: 'selection' }>, envelope: InboundEnvelope,
@@ -326,11 +353,11 @@ export class FriendEnrollmentService {
     const { context } = flow;
     this.putFlow(key, { phase: 'selecting', context });
     if (!this.selectionIsCurrent(key, context)) return;
-    const targetMid = targetMention(envelope, ownMid);
-    if (!targetMid) {
+    const parsed = targetMentions(envelope, ownMid);
+    if (!parsed || 'tooMany' in parsed) {
       this.putFlow(key, { phase: 'selection', context });
       await this.sendText(context, context.originChatType, context.originChatId,
-        linePrompt(this.deps.locale ?? 'en', 'enrollmentBadMention'),
+        linePrompt(this.deps.locale ?? 'en', parsed ? 'enrollmentTooMany' : 'enrollmentBadMention'),
         () => this.current(key, context.flowId, 'selection') !== null);
       return;
     }
@@ -345,7 +372,7 @@ export class FriendEnrollmentService {
     }
     const account = await this.deps.accounts.getAccount(context.accountId);
     if (!this.selectionIsCurrent(key, context)) return;
-    if (!account?.ownMid || account.ownMid !== ownMid || account.ownMid === targetMid) {
+    if (!account?.ownMid || account.ownMid !== ownMid || parsed.mids.includes(account.ownMid)) {
       this.putFlow(key, { phase: 'selection', context });
       return;
     }
@@ -356,18 +383,39 @@ export class FriendEnrollmentService {
       return;
     }
     if (!this.selectionIsCurrent(key, context)) return;
-    await this.createChallenge(key, context, targetMid);
+    await this.createChallenge(key, context, parsed.mids);
   }
 
-  private async createChallenge(key: string, context: FlowContext, targetMid: string): Promise<void> {
+  private async shortName(context: FlowContext, mid: string): Promise<string> {
+    let name: string | null = null;
+    try {
+      if (context.originChatType !== 'direct') {
+        name = await this.deps.displayName?.(context.accountId, context.originChatType, context.originChatId, mid) ?? null;
+      }
+    } catch { name = null; }
+    // eslint-disable-next-line no-control-regex
+    const clean = name?.replace(/[\u0000-\u001f\u007f-\u009f]/gu, '').trim().slice(0, 32) ?? '';
+    return clean || `${mid.slice(0, 5)}…${mid.slice(-4)}`;
+  }
+
+  private async createChallenge(key: string, context: FlowContext, targetMids: string[]): Promise<void> {
     const code = this.makeCode();
     if (!CODE_PATTERN.test(code)) { this.deleteIfCurrent(key, context.flowId); return; }
+    const locale = this.deps.locale ?? 'en';
+    let instruction: string;
+    if (context.originChatType !== 'direct' && targetMids.length > 1) {
+      const names = await Promise.all(targetMids.map((mid) => this.shortName(context, mid)));
+      if (this.current(key, context.flowId) === null) return;
+      instruction = linePrompt(locale, 'enrollmentGroupChallengeMulti',
+        { code, name: String(targetMids.length), text: names.join(', ') });
+    } else {
+      instruction = linePrompt(locale, context.originChatType === 'direct'
+        ? 'enrollmentDirectChallenge' : 'enrollmentGroupChallenge', { code });
+    }
     const challengeId = randomUUID();
     const challengeContext = { ...context, expiresAt: this.now() + TTL_MS };
-    this.putFlow(key, { phase: 'challenge', context: challengeContext, challengeId, targetMid,
+    this.putFlow(key, { phase: 'challenge', context: challengeContext, challengeId, targetMids,
       digest: this.digest(code), attempts: 0 });
-    const instruction = linePrompt(this.deps.locale ?? 'en', context.originChatType === 'direct'
-      ? 'enrollmentDirectChallenge' : 'enrollmentGroupChallenge', { code });
     if (await this.sendText(challengeContext, 'direct', challengeContext.primaryChatId,
       instruction,
       () => {
@@ -377,13 +425,14 @@ export class FriendEnrollmentService {
   }
 
   private exactConfirmation(envelope: InboundEnvelope, candidate: Exclude<SecretCandidate, null | undefined>,
-    context: FlowContext, targetMid: string, ownMid: string | null): boolean {
+    context: FlowContext, targetMids: string[], ownMid: string | null): boolean {
     if (!candidate.exact || !CODE_PATTERN.test(candidate.code) || envelope.kind !== 'text'
       || envelope.ingestion.source !== 'live') return false;
     if (context.originChatType === 'direct') {
       // Direct challenges are initiated in the administrator's chat, but proof
       // must arrive from the selected target in that target's own 1:1 chat.
-      return envelope.chatType === 'direct' && envelope.senderId === targetMid && envelope.chatId === targetMid;
+      const targetMid = targetMids[0];
+      return targetMids.length === 1 && envelope.chatType === 'direct' && envelope.senderId === targetMid && envelope.chatId === targetMid;
     }
     if (envelope.chatType !== context.originChatType || envelope.chatId !== context.originChatId
       || envelope.senderId !== context.adminSenderId) return false;
@@ -398,14 +447,14 @@ export class FriendEnrollmentService {
     if (envelope.chatType === 'direct') {
       const targetFlow = [...this.flows.entries()].find(([, flow]) => flow.phase === 'challenge'
         && flow.context.accountId === envelope.accountId && flow.context.originChatType === 'direct'
-        && flow.targetMid === envelope.senderId);
+        && flow.targetMids[0] === envelope.senderId);
       if (!targetFlow) return;
       [key, captured] = targetFlow;
     }
     if (captured?.phase !== 'challenge') return;
     const challengeId = captured.challengeId;
     const flowId = captured.context.flowId;
-    if (!this.exactConfirmation(envelope, candidate, captured.context, captured.targetMid, ownMid)) return;
+    if (!this.exactConfirmation(envelope, candidate, captured.context, captured.targetMids, ownMid)) return;
     if (!await this.isPrimary(captured.context)) {
       this.deleteIfCurrent(key, challengeId);
       return;
@@ -436,11 +485,41 @@ export class FriendEnrollmentService {
       return;
     }
     this.flows.set(key, { phase: 'processing', context: captured.context });
-    try { await this.verifyAndActivate(key, captured.context, current.targetMid); }
+    try { await this.verifyAndActivate(key, captured.context, current.targetMids); }
     finally { this.deleteIfCurrent(key, flowId); }
   }
 
-  private async verifyAndActivate(key: string, context: FlowContext, targetMid: string): Promise<void> {
+  private async verifyAndActivate(key: string, context: FlowContext, targetMids: string[]): Promise<void> {
+    const outcomes: TargetOutcome[] = [];
+    for (const targetMid of targetMids) outcomes.push(await this.activateOne(key, context, targetMid));
+    if (outcomes.every((outcome) => outcome.silent)) return;
+    const active = () => this.current(key, context.flowId, 'processing') !== null;
+    const locale = this.deps.locale ?? 'en';
+    const direct = context.originChatType === 'direct';
+    let replyText: string;
+    if (outcomes.length === 1) {
+      const only = outcomes[0]!;
+      replyText = linePrompt(locale, only.status === 'failed'
+        ? direct ? 'enrollmentDirectFailed' : 'enrollmentGroupFailed'
+        : only.status === 'already'
+          ? direct ? 'enrollmentAlreadyDirect' : 'enrollmentAlreadyGroup'
+          : direct ? 'enrollmentGrantedDirect' : 'enrollmentGrantedGroup');
+    } else {
+      const lines: string[] = [];
+      for (const [status, promptKey] of [['added', 'enrollmentSummaryAdded'], ['already', 'enrollmentSummaryAlready'],
+        ['failed', 'enrollmentSummaryFailed']] as const) {
+        const group = outcomes.filter((outcome) => outcome.status === status);
+        if (group.length === 0) continue;
+        const names = await Promise.all(group.map((outcome) => this.shortName(context, outcome.targetMid)));
+        lines.push(linePrompt(locale, promptKey, { name: String(group.length), text: names.join(', ') }));
+      }
+      replyText = `${linePrompt(locale, 'enrollmentSummaryHeader')}\n${lines.join('\n')}`;
+    }
+    const reply = await this.sendText(context, context.originChatType, context.originChatId, replyText, active);
+    for (const outcome of outcomes) outcome.finishReply?.(reply);
+  }
+
+  private async activateOne(key: string, context: FlowContext, targetMid: string): Promise<TargetOutcome> {
     const active = () => this.current(key, context.flowId, 'processing') !== null;
     const admitted = async () => active() && await this.canWriteLine(context.accountId)
       && await this.isPrimary(context) && await this.bindingCurrent(context.binding);
@@ -455,16 +534,18 @@ export class FriendEnrollmentService {
       try { if (auditCorrelation) this.deps.audit?.complete(auditCorrelation, phase,
         { resultCode, ...(errorCode ? { errorCode } : {}) }); } catch { /* Audit is diagnostic only. */ }
     };
-    const reportFailure = async () => {
-      if (active()) await this.sendText(context, context.originChatType, context.originChatId,
-        linePrompt(this.deps.locale ?? 'en', context.originChatType === 'direct' ? 'enrollmentDirectFailed' : 'enrollmentGroupFailed'), active);
-      finishAudit('failed', 'authorization_denied', failureCode);
-    };
+    // A failed target keeps its real error code in the audit; the group reply only names the user.
+    const failed = (errorCode: AuditErrorCode | undefined, silent = false): TargetOutcome =>
+      ({ targetMid, status: 'failed', silent, ...(errorCode ? { errorCode } : {}) });
     try {
-      if (!await admitted()) return;
+      if (!await admitted()) return failed('ENROLLMENT_BINDING_CHANGED', true);
       try { auditCorrelation = this.deps.audit?.request('friend_enrollment', auditFields) ?? randomUUID(); }
       catch { auditCorrelation = randomUUID(); }
-    } catch { failureCode = 'ENROLLMENT_PRECHECK_FAILED'; await reportFailure(); return; }
+    } catch {
+      failureCode = 'ENROLLMENT_PRECHECK_FAILED';
+      finishAudit('failed', 'authorization_denied', failureCode);
+      return failed(failureCode);
+    }
     let authorizationStage: 'precheck' | 'grant' = 'precheck';
     let committed = false;
     let existingAuthorization: Awaited<ReturnType<typeof this.deps.whitelist.getActiveAuthorization>> = null;
@@ -472,7 +553,7 @@ export class FriendEnrollmentService {
       if (!await admitted() || !await this.isPrimary(context) || !await admitted()
         || !await this.bindingCurrent(context.binding) || !active()) {
         observed('friend_authorization_precheck', undefined, 'ENROLLMENT_BINDING_CHANGED');
-        finishAudit('failed', 'authorization_denied', 'ENROLLMENT_BINDING_CHANGED'); return;
+        finishAudit('failed', 'authorization_denied', 'ENROLLMENT_BINDING_CHANGED'); return failed('ENROLLMENT_BINDING_CHANGED', true);
       }
       const scope = context.originChatType === 'direct'
         ? { kind: 'ACCOUNT' as const }
@@ -485,13 +566,13 @@ export class FriendEnrollmentService {
       observed('friend_authorization_precheck', existingAuthorization ? 'authorization_active' : 'precheck_ready');
       if (!await admitted() || !await this.isPrimary(context) || !await admitted()) {
         observed('friend_authorization_precheck', undefined, 'ENROLLMENT_BINDING_CHANGED');
-        finishAudit('failed', 'authorization_denied', 'ENROLLMENT_BINDING_CHANGED'); return;
+        finishAudit('failed', 'authorization_denied', 'ENROLLMENT_BINDING_CHANGED'); return failed('ENROLLMENT_BINDING_CHANGED', true);
       }
       const control = await this.deps.accounts.getControlState();
       if (!await admitted() || control.activeAccountId !== context.binding.accountId || control.controlEpoch !== context.binding.controlEpoch
         || !this.deps.workers.isCurrentActiveControlBinding(context.binding)) {
         observed('friend_authorization_precheck', undefined, 'ENROLLMENT_BINDING_CHANGED');
-        finishAudit('failed', 'authorization_denied', 'ENROLLMENT_BINDING_CHANGED'); return;
+        finishAudit('failed', 'authorization_denied', 'ENROLLMENT_BINDING_CHANGED'); return failed('ENROLLMENT_BINDING_CHANGED', true);
       }
       authorizationStage = 'grant';
       await this.deps.whitelist.activateForEnrollment({ ...workerFields(context.binding), targetMid, scope,
@@ -503,18 +584,18 @@ export class FriendEnrollmentService {
       failureCode = authorizationStage === 'grant' ? 'ENROLLMENT_GRANT_FAILED' : 'ENROLLMENT_PRECHECK_FAILED';
       if (authorizationStage === 'grant') observed('friend_grant_commit', undefined, failureCode);
       else observed('friend_authorization_precheck', undefined, failureCode);
-      await reportFailure();
+      finishAudit('failed', 'authorization_denied', failureCode);
+      return failed(failureCode);
     }
-    if (!committed) return;
-    const replyText = linePrompt(this.deps.locale ?? 'en', existingAuthorization
-      ? context.originChatType === 'direct' ? 'enrollmentAlreadyDirect' : 'enrollmentAlreadyGroup'
-      : context.originChatType === 'direct' ? 'enrollmentGrantedDirect' : 'enrollmentGrantedGroup');
-    const reply = await this.sendText(context, context.originChatType, context.originChatId, replyText, active);
-    const replyResultCode: AuditResultCode = reply === 'sent' ? 'authorization_active_reply_sent'
-      : reply === 'unknown' ? 'authorization_active_reply_unknown' : 'authorization_active_reply_failed';
-    const replyErrorCode: AuditErrorCode | undefined = reply === 'sent' ? undefined
-      : reply === 'unknown' ? 'ENROLLMENT_REPLY_UNKNOWN' : 'ENROLLMENT_REPLY_FAILED';
-    finishAudit('succeeded', replyResultCode, replyErrorCode);
+    if (!committed) return failed(failureCode);
+    return { targetMid, status: existingAuthorization ? 'already' : 'added', silent: false,
+      finishReply: (reply) => {
+        const replyResultCode: AuditResultCode = reply === 'sent' ? 'authorization_active_reply_sent'
+          : reply === 'unknown' ? 'authorization_active_reply_unknown' : 'authorization_active_reply_failed';
+        const replyErrorCode: AuditErrorCode | undefined = reply === 'sent' ? undefined
+          : reply === 'unknown' ? 'ENROLLMENT_REPLY_UNKNOWN' : 'ENROLLMENT_REPLY_FAILED';
+        finishAudit('succeeded', replyResultCode, replyErrorCode);
+      } };
   }
 
   private async sendText(context: FlowContext, chatType: 'direct' | 'group' | 'room', chatId: string, text: string,

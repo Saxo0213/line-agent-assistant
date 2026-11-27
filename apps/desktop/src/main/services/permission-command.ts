@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
+import { AGENT_PERMISSIONS, diagnosticFailure, type AgentPermissionId, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AgentExecutionLevel, LineWorkerCommand, LineWorkerEvent } from '@line-agent/contracts';
 import { AgentPermissionError, type AgentPermissionRepository } from '@line-agent/database';
 import type { RoomAutomationTransport } from './room-automation.js';
 import type { Locale } from '../../locale.js';
-import { linePrompt } from './line-prompts.js';
+import { linePrompt, type LinePromptKey } from './line-prompts.js';
 import { PERMISSION_COMMAND_PATTERN } from './trigger-router.js';
 
 type Envelope = Extract<LineWorkerEvent, { type: 'batch' }>['envelopes'][number];
 type SendTextCommand = Extract<LineWorkerCommand, { type: 'sendText' }>;
+type PermissionState = Awaited<ReturnType<AgentPermissionRepository['getState']>>;
 /** The same transport object the facade gives RoomAutomationService. */
 export type PermissionCommandTransport = RoomAutomationTransport;
 /**
@@ -16,9 +17,22 @@ export type PermissionCommandTransport = RoomAutomationTransport;
  * sent, so a message classified before the user could have seen the question is never claimed.
  * A choose entry's policyVersion stays null until its list read succeeded; it is armed only after that.
  */
-type ChoosePending = { id: number; stage: 'choose'; armed: boolean; expiresAt: number; policyVersion: number | null };
-type ConfirmPending = { id: number; stage: 'confirm'; armed: boolean; expiresAt: number; policyVersion: number; level: AgentExecutionLevel };
-type Pending = ChoosePending | ConfirmPending;
+type Base = { id: number; armed: boolean; expiresAt: number };
+type ChoosePending = Base & { stage: 'choose'; policyVersion: number | null };
+type ConfirmPending = Base & { stage: 'confirm'; policyVersion: number; level: AgentExecutionLevel };
+type GroupRef = { chatType: 'group' | 'room'; chatId: string; title: string };
+type PersonRef = { mid: string; name: string };
+type TargetEntry = ({ kind: 'group' } & GroupRef) | ({ kind: 'person' } & PersonRef);
+/** Step 1: the numbered target list. `targets` holds only the rows that were really sent (item 1 is the level dialogue). */
+type TargetPending = Base & { stage: 'target'; targets: TargetEntry[] };
+/** Step 2: the whitelisted persons of one group. */
+type PersonPending = Base & { stage: 'person'; group: GroupRef; people: PersonRef[] };
+type CapSubject = PersonRef & { chatType: 'group' | 'room' | 'direct'; chatId: string; scope: string };
+/** Step 3: the capability list. `values` and `versions` are the snapshot that the user saw (versions guard each write). */
+type CapsPending = Base & { stage: 'caps'; subject: CapSubject; values: boolean[]; versions: number[]; changed: number };
+type Toggle = { permission: AgentPermissionId; effect: 'ALLOW' | 'DENY'; expectedVersion: number; label: string };
+type CapConfirmPending = Base & { stage: 'capConfirm'; subject: CapSubject; toggles: Toggle[]; riskyLabels: string[]; changed: number };
+type Pending = ChoosePending | ConfirmPending | TargetPending | PersonPending | CapsPending | CapConfirmPending;
 type Queued = { envelope: Envelope; ticket: PermissionTicket };
 export type PermissionTicket =
   | { kind: 'list' }
@@ -28,9 +42,15 @@ export type PermissionCommandOptions = {
   onDiagnostic?: (diagnostic: SafeDiagnostic) => void;
   now?: () => number;
   onPolicyChanged?: () => void;
+  /** Called after at least one allowlist capability rule was written, so an open Settings page can reload. */
+  onPermissionsChanged?: () => void;
   locale?: Locale | string;
 };
 
+/** LINE accepts 5000 characters per text; the lists stay below this and say how many rows were left out. */
+const LIST_TEXT_LIMIT = 4500;
+const NAME_LIMIT = 80;
+const NOTE_RESERVE = 120;
 const PENDING_TTL_MS = 120_000;
 const PENDING_LIMIT = 64;
 const CHAT_QUEUE_LIMIT = 4;
@@ -43,9 +63,78 @@ const choices = new Map<string, AgentExecutionLevel>([
   ['1', 'read_only'], ['2', 'workspace_write'], ['3', 'trust'], ['4', 'full'],
   ['１', 'read_only'], ['２', 'workspace_write'], ['３', 'trust'], ['４', 'full'],
 ]);
+/** The local workspace permission (files and commands on this computer) is a major permission: Settings only, never this dialogue. */
+const SETTINGS_ONLY_CAPABILITY: AgentPermissionId = 'agent.local_tools';
+type DialogueCapability = Exclude<AgentPermissionId, typeof SETTINGS_ONLY_CAPABILITY>;
+const capabilityKeys: Record<DialogueCapability, LinePromptKey> = {
+  'records.query_current_chat': 'permissionCapCurrentChat',
+  'records.query_all_chats': 'permissionCapAllChats',
+  'chat_folder.read': 'permissionCapFolderRead',
+  'chat_folder.write': 'permissionCapFolderWrite',
+  'project_folder.read': 'permissionCapProjectFolderRead',
+  'project_folder.write': 'permissionCapProjectFolderWrite',
+};
+/** The catalog entries that the dialogue lists, in catalog order. */
+const dialogueCapabilities = AGENT_PERMISSIONS.filter((entry) => entry.id !== SETTINGS_ONLY_CAPABILITY);
+/** Turning this ON widens what the Agent can write, so it needs a confirmation. */
+const riskyCapabilities: ReadonlySet<AgentPermissionId> = new Set<AgentPermissionId>(['project_folder.write']);
+const doneWords: ReadonlySet<string> = new Set(['0', '完成', 'done', '結束', '完了', '완료']);
 const keyOf = (envelope: Envelope) => `${envelope.accountId}\0${envelope.chatId}`;
 const isCommand = (text: string) => PERMISSION_COMMAND_PATTERN.test(text);
-const isConfirmation = (text: string) => text === '確認' || text === '是' || /^yes$/i.test(text);
+const isConfirmation = (text: string) => text === '確認' || text === '是' || /^(?:yes|[yｙＹ])$/i.test(text);
+const asciiDigits = (text: string) => text.replace(/[０-９]/g, (digit) => String.fromCharCode(digit.charCodeAt(0) - 0xFEE0));
+/** One whole number reply, or null. */
+const parseIndex = (text: string): number | null => {
+  const value = asciiDigits(text.trim());
+  return /^\d{1,4}$/.test(value) ? Number(value) : null;
+};
+const isDone = (text: string) => doneWords.has(asciiDigits(text.trim()).toLowerCase());
+/** Capability numbers separated by space, comma or 、; null when any token is not a valid number. Zero-based, ascending, unique. */
+const parseToggles = (text: string, count: number): number[] | null => {
+  const tokens = asciiDigits(text.trim()).split(/[\s,，、]+/).filter(Boolean);
+  if (!tokens.length) return null;
+  const picked = new Set<number>();
+  for (const token of tokens) {
+    if (!/^\d{1,2}$/.test(token)) return null;
+    const value = Number(token);
+    if (value < 1 || value > count) return null;
+    picked.add(value - 1);
+  }
+  return [...picked].sort((a, b) => a - b);
+};
+const cleanName = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, NAME_LIMIT);
+
+/** The whitelisted persons of one group, as the Settings account selector shows them for that group. */
+const peopleOfGroup = (state: PermissionState, group: Pick<GroupRef, 'chatType' | 'chatId'>): PersonRef[] => state.subjects
+  .filter((user) => user.grantScope === 'ACCOUNT' || user.chatScopes.some((scope) => scope.chatType === group.chatType && scope.chatId === group.chatId))
+  .map((user) => ({ mid: user.mid, name: cleanName(user.displayName || user.mid) || user.mid }));
+/** The groups of the Settings group selector that have at least one eligible whitelisted person. */
+const groupsOf = (state: PermissionState): GroupRef[] => {
+  const groups: GroupRef[] = [];
+  for (const chat of state.eligibleChats) {
+    if (chat.chatType !== 'group' && chat.chatType !== 'room') continue;
+    const group = { chatType: chat.chatType, chatId: chat.chatId, title: cleanName(chat.title || chat.chatId) || chat.chatId };
+    if (peopleOfGroup(state, group).length) groups.push(group);
+  }
+  return groups;
+};
+/** The same list as the Settings personal view: whitelisted persons whose grant covers the whole account. */
+const personalOf = (state: PermissionState): PersonRef[] => state.subjects.filter((user) => user.grantScope === 'ACCOUNT')
+  .map((user) => ({ mid: user.mid, name: cleanName(user.displayName || user.mid) || user.mid }));
+
+/**
+ * Effective value of every capability for one subject, in catalog order. Same order of precedence as
+ * resolveUserPermissions and the Settings page: this chat's rule, the person's account-wide rule, the everyone rule,
+ * the global default, then the catalog default. `version` is the version of this chat's own rule (0 when none).
+ */
+const capabilityStates = (state: PermissionState, subject: CapSubject) => dialogueCapabilities.map((entry) => {
+  const scoped = state.rules.find((rule) => rule.permission === entry.id && rule.subject.kind === 'USER' && rule.subject.mid === subject.mid
+    && rule.chatType === subject.chatType && rule.chatId === subject.chatId);
+  const user = state.rules.find((rule) => rule.permission === entry.id && rule.subject.kind === 'USER' && rule.subject.mid === subject.mid && rule.chatType === null);
+  const everyone = state.rules.find((rule) => rule.permission === entry.id && rule.subject.kind === 'EVERYONE' && rule.chatType === null);
+  const effect = scoped?.effect ?? user?.effect ?? everyone?.effect ?? state.defaults.find((item) => item.permission === entry.id)?.effect ?? entry.defaultEffect;
+  return { id: entry.id as DialogueCapability, allowed: effect === 'ALLOW', version: scoped?.version ?? 0 };
+});
 
 /** True when the message belongs to the permission dialogue and must not reach an Agent. */
 export const claimed = (ticket: PermissionTicket | null): boolean => ticket?.kind === 'list' || ticket?.kind === 'reply';
@@ -68,15 +157,17 @@ export class PermissionCommandService {
   private readonly abort = new AbortController();
   private readonly now: () => number;
   private readonly onPolicyChanged: (() => void) | undefined;
+  private readonly onPermissionsChanged: (() => void) | undefined;
   private readonly locale: Locale | string;
   private readonly onDiagnostic: PermissionCommandOptions['onDiagnostic'];
   private queued = 0;
   private nextId = 1;
 
-  constructor(private readonly repository: Pick<AgentPermissionRepository, 'getExecutionPolicy' | 'setExecutionPolicy'>,
+  constructor(private readonly repository: Pick<AgentPermissionRepository, 'getExecutionPolicy' | 'setExecutionPolicy' | 'getState' | 'setPermission'>,
     private readonly transport: PermissionCommandTransport, options: PermissionCommandOptions = {}) {
     this.now = options.now ?? Date.now;
     this.onPolicyChanged = options.onPolicyChanged;
+    this.onPermissionsChanged = options.onPermissionsChanged;
     this.locale = options.locale ?? 'en';
     this.onDiagnostic = options.onDiagnostic;
   }
@@ -97,8 +188,13 @@ export class PermissionCommandService {
     if (isCommand(text)) return { kind: 'list' };
     const pending = this.pending.get(keyOf(envelope));
     if (!pending || !pending.armed || pending.expiresAt <= this.now()) return null;
-    if (pending.stage === 'confirm' || choices.has(text)) return { kind: 'reply', pendingId: pending.id };
-    return { kind: 'clear', pendingId: pending.id };
+    // Confirmation and capability replies are always claimed: any other text cancels the dialogue with a reply.
+    if (pending.stage === 'confirm' || pending.stage === 'capConfirm' || pending.stage === 'caps') return { kind: 'reply', pendingId: pending.id };
+    const index = parseIndex(text);
+    const valid = pending.stage === 'choose' ? choices.has(text)
+      : pending.stage === 'target' ? index !== null && index >= 1 && index <= pending.targets.length + 1
+        : index !== null && index >= 1 && index <= pending.people.length;
+    return valid ? { kind: 'reply', pendingId: pending.id } : { kind: 'clear', pendingId: pending.id };
   }
 
   /**
@@ -204,23 +300,35 @@ export class PermissionCommandService {
     }
     try {
       if (ticket.kind === 'list') {
-        const pending = this.create<ChoosePending>(key, { stage: 'choose', policyVersion: null });
-        let policy;
-        try { policy = await this.read(); } catch (error) {
+        const pending = this.create<TargetPending>(key, { stage: 'target', targets: [] });
+        let state;
+        try { state = await this.readState(envelope.accountId); } catch (error) {
           if (this.pending.get(key) === pending) this.pending.delete(key);
           throw error;
         }
         if (!this.current(key, pending)) return;
-        pending.policyVersion = policy.version;
-        await this.prompt(key, pending, envelope, `${linePrompt(this.locale, 'permissionList', { level: this.label(policy.level) })}`
-          + `${linePrompt(this.locale, 'permissionReplyInstruction')}\n${levels.map((level, index) =>
-            `${index + 1}. ${this.label(level)}${level === policy.level ? linePrompt(this.locale, 'permissionCurrentMarker') : ''}`).join('\n')}`);
+        const groups = groupsOf(state).map((group): TargetEntry => ({ kind: 'group', ...group }));
+        const persons = personalOf(state).map((person): TargetEntry => ({ kind: 'person', ...person }));
+        const rows = [...groups, ...persons];
+        const list = this.numberedList(linePrompt(this.locale, 'permissionTargetHeader'), [`1. ${linePrompt(this.locale, 'permissionTargetLevel')}`],
+          rows.map((row) => row.kind === 'group' ? `${linePrompt(this.locale, 'permissionTargetGroup')} ${row.title}`
+            : `${linePrompt(this.locale, 'permissionTargetPerson')} ${row.name}`), 2);
+        pending.targets = rows.slice(0, list.shown);
+        await this.prompt(key, pending, envelope, list.text);
         return;
       }
       const pending = this.pending.get(key);
       if (!pending || pending.id !== ticket.pendingId) { await this.reply(envelope, linePrompt(this.locale, 'permissionStale')); return; }
       this.pending.delete(key);
       const text = (envelope.text ?? '').trim();
+      if (pending.stage === 'target') { await this.pickTarget(key, envelope, pending, text); return; }
+      if (pending.stage === 'person') { await this.pickPerson(key, envelope, pending, text); return; }
+      if (pending.stage === 'caps') { await this.pickCapabilities(key, envelope, pending, text); return; }
+      if (pending.stage === 'capConfirm') {
+        if (!isConfirmation(text)) { await this.reply(envelope, linePrompt(this.locale, 'permissionCancelled')); return; }
+        await this.applyToggles(key, envelope, pending.subject, pending.toggles, pending.changed);
+        return;
+      }
       if (pending.stage === 'confirm') {
         if (!isConfirmation(text)) { await this.reply(envelope, linePrompt(this.locale, 'permissionCancelled')); return; }
         const policy = await this.read();
@@ -247,6 +355,141 @@ export class PermissionCommandService {
       await this.reply(envelope, linePrompt(this.locale, error instanceof AgentPermissionError && error.code === 'PERMISSION_VERSION_CONFLICT'
         ? 'permissionConflict' : 'permissionFailure'));
     }
+  }
+
+  private async readState(accountId: string): Promise<PermissionState> {
+    if (this.closed) throw new Error('Permission command service closed.');
+    return this.repository.getState(accountId);
+  }
+
+  /**
+   * One message with a header, fixed leading lines and numbered rows. Rows that would pass the safe text length
+   * are left out with a note; `shown` is how many rows were really listed, so only listed numbers can be chosen.
+   */
+  private numberedList(header: string, leading: string[], rows: string[], firstNumber: number): { text: string; shown: number } {
+    const lines = [...leading];
+    let length = header.length + leading.reduce((sum, line) => sum + line.length + 1, 0) + 1;
+    let shown = 0;
+    for (const row of rows) {
+      const line = `${firstNumber + shown}. ${row}`;
+      if (length + line.length + 1 > LIST_TEXT_LIMIT - NOTE_RESERVE) break;
+      lines.push(line);
+      length += line.length + 1;
+      shown += 1;
+    }
+    const hidden = rows.length - shown;
+    const note = hidden > 0 ? `\n${linePrompt(this.locale, 'permissionTargetTruncated', { name: String(hidden) })}` : '';
+    return { text: `${header}\n${lines.join('\n')}${note}`, shown };
+  }
+
+  /** The Agent execution level dialogue (target item 1), unchanged. */
+  private async startLevels(key: string, envelope: Envelope): Promise<void> {
+    const pending = this.create<ChoosePending>(key, { stage: 'choose', policyVersion: null });
+    let policy;
+    try { policy = await this.read(); } catch (error) {
+      if (this.pending.get(key) === pending) this.pending.delete(key);
+      throw error;
+    }
+    if (!this.current(key, pending)) return;
+    pending.policyVersion = policy.version;
+    await this.prompt(key, pending, envelope, `${linePrompt(this.locale, 'permissionList', { level: this.label(policy.level) })}`
+      + `${linePrompt(this.locale, 'permissionReplyInstruction')}\n${levels.map((level, index) =>
+        `${index + 1}. ${this.label(level)}${level === policy.level ? linePrompt(this.locale, 'permissionCurrentMarker') : ''}`).join('\n')}`);
+  }
+
+  private async pickTarget(key: string, envelope: Envelope, pending: TargetPending, text: string): Promise<void> {
+    const index = parseIndex(text);
+    if (index === 1) { await this.startLevels(key, envelope); return; }
+    const entry = index === null ? undefined : pending.targets[index - 2];
+    if (!entry) { await this.reply(envelope, linePrompt(this.locale, 'permissionStale')); return; }
+    const state = await this.readState(envelope.accountId);
+    if (entry.kind === 'group') {
+      const group = groupsOf(state).find((item) => item.chatType === entry.chatType && item.chatId === entry.chatId);
+      const people = group ? peopleOfGroup(state, group) : [];
+      if (!group || !people.length) { await this.reply(envelope, linePrompt(this.locale, 'permissionStale')); return; }
+      if (this.closed) return;
+      const next = this.create<PersonPending>(key, { stage: 'person', group, people });
+      const list = this.numberedList(linePrompt(this.locale, 'permissionPersonHeader', { name: group.title }), [], people.map((person) => person.name), 1);
+      next.people = people.slice(0, list.shown);
+      await this.prompt(key, next, envelope, list.text);
+      return;
+    }
+    const person = personalOf(state).find((item) => item.mid === entry.mid);
+    if (!person) { await this.reply(envelope, linePrompt(this.locale, 'permissionStale')); return; }
+    await this.showCapabilities(key, envelope, state, { ...person, chatType: 'direct', chatId: person.mid,
+      scope: linePrompt(this.locale, 'permissionCapScopeDirect') }, 0, '');
+  }
+
+  private async pickPerson(key: string, envelope: Envelope, pending: PersonPending, text: string): Promise<void> {
+    const index = parseIndex(text);
+    const chosen = index === null ? undefined : pending.people[index - 1];
+    if (!chosen) { await this.reply(envelope, linePrompt(this.locale, 'permissionStale')); return; }
+    const state = await this.readState(envelope.accountId);
+    const group = groupsOf(state).find((item) => item.chatType === pending.group.chatType && item.chatId === pending.group.chatId);
+    const person = group ? peopleOfGroup(state, group).find((item) => item.mid === chosen.mid) : undefined;
+    if (!group || !person) { await this.reply(envelope, linePrompt(this.locale, 'permissionStale')); return; }
+    await this.showCapabilities(key, envelope, state, { ...person, chatType: group.chatType, chatId: group.chatId, scope: group.title }, 0, '');
+  }
+
+  /** Sends the capability list of one subject and waits for the next number reply. */
+  private async showCapabilities(key: string, envelope: Envelope, state: PermissionState, subject: CapSubject, changed: number, prefix: string): Promise<void> {
+    if (this.closed) return;
+    const states = capabilityStates(state, subject);
+    const pending = this.create<CapsPending>(key, { stage: 'caps', subject, values: states.map((item) => item.allowed),
+      versions: states.map((item) => item.version), changed });
+    const items = states.map((item, index) =>
+      `${index + 1}. ${linePrompt(this.locale, capabilityKeys[item.id])} [${this.yesNo(item.allowed)}]`);
+    await this.prompt(key, pending, envelope, `${prefix}${linePrompt(this.locale, 'permissionCapHeader', { name: subject.name, scope: subject.scope })}\n`
+      + `${items.join('\n')}\n${linePrompt(this.locale, 'permissionCapReply')}\n${linePrompt(this.locale, 'permissionCapLocalOnly')}`);
+  }
+
+  private yesNo(value: boolean): string { return linePrompt(this.locale, value ? 'permissionCapYes' : 'permissionCapNo'); }
+
+  private async pickCapabilities(key: string, envelope: Envelope, pending: CapsPending, text: string): Promise<void> {
+    if (isDone(text)) { await this.reply(envelope, linePrompt(this.locale, 'permissionCapDone', { name: String(pending.changed) })); return; }
+    const picked = parseToggles(text, pending.values.length);
+    if (!picked) { await this.reply(envelope, linePrompt(this.locale, 'permissionCancelled')); return; }
+    const toggles = picked.map((index): Toggle => {
+      const permission = dialogueCapabilities[index]!.id as DialogueCapability;
+      return { permission, effect: pending.values[index] ? 'DENY' : 'ALLOW', expectedVersion: pending.versions[index]!,
+        label: linePrompt(this.locale, capabilityKeys[permission]) };
+    });
+    const risky = toggles.filter((toggle) => toggle.effect === 'ALLOW' && riskyCapabilities.has(toggle.permission));
+    if (!risky.length) { await this.applyToggles(key, envelope, pending.subject, toggles, pending.changed); return; }
+    // Turning on a risky item needs a confirmation; the whole selection is applied together or not at all.
+    if (this.closed) return;
+    const riskyLabels = risky.map((toggle) => toggle.label);
+    const confirm = this.create<CapConfirmPending>(key, { stage: 'capConfirm', subject: pending.subject, toggles, riskyLabels, changed: pending.changed });
+    await this.prompt(key, confirm, envelope, linePrompt(this.locale, 'permissionCapConfirm', { text: riskyLabels.join(' / ') }));
+  }
+
+  /** Writes each toggle through the same repository method as the Settings page, then sends the updated list. */
+  private async applyToggles(key: string, envelope: Envelope, subject: CapSubject, toggles: Toggle[], changedBefore: number): Promise<void> {
+    let written = 0;
+    try {
+      for (const toggle of toggles) {
+        if (this.closed) throw new Error('Permission command service closed.');
+        // Defense in depth: no reply can reach the Settings-only capability.
+        if (toggle.permission === SETTINGS_ONLY_CAPABILITY) throw new AgentPermissionError('UNKNOWN_PERMISSION', 'This permission can be changed only in Settings.');
+        await this.repository.setPermission({ accountId: envelope.accountId, subject: { kind: 'USER', mid: subject.mid },
+          chatType: subject.chatType, chatId: subject.chatId, permission: toggle.permission, effect: toggle.effect,
+          expectedVersion: toggle.expectedVersion }, 'line_primary_admin');
+        written += 1;
+      }
+    } finally {
+      if (written) try { this.onPermissionsChanged?.(); } catch { /* A listener failure does not undo the committed write. */ }
+    }
+    const summary = linePrompt(this.locale, 'permissionCapChanged',
+      { text: toggles.map((toggle) => `${toggle.label} → ${this.yesNo(toggle.effect === 'ALLOW')}`).join(' / ') });
+    let state;
+    try { state = await this.readState(envelope.accountId); } catch (error) {
+      // The writes are committed; report them even though the new list cannot be read.
+      if (this.closed) return;
+      try { this.onDiagnostic?.(diagnosticFailure('database', 'persist', error)); } catch { /* Reply behavior remains authoritative. */ }
+      await this.reply(envelope, summary);
+      return;
+    }
+    await this.showCapabilities(key, envelope, state, subject, changedBefore + toggles.length, `${summary}\n\n`);
   }
 
   /** Awaits the repository until it commits or rolls back; a write that commits during close() stays committed. */

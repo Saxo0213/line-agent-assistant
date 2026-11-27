@@ -4,7 +4,7 @@ import { isWritableChatType, diagnosticFailure, InboundEnvelopeSchema, normalize
 import type { AccountRepository, AdminRepository, AgentJobStatusProjection, FriendWhitelistRepository, MessageRepository, RoutingDecision, SettingsRepository } from '@line-agent/database';
 import type { ExternalMonitorAgentReceipt } from '@line-agent/database';
 import { bridgeNativeEnvelope, normalizedFallbackOrder, routeKeyFor, type AccountSource } from '@line-agent/database';
-import { hasOwnMention, isAgentSwitchText, isFolderCommandText, isFreeCommandText, isPermissionCommandText, isPersonaCommandText, routeTrigger, type FolderCommand, type FreeCommand, type PersonaCommand, type TriggerDecision } from './trigger-router.js';
+import { hasOwnMention, isAgentSwitchText, isFolderCommandText, isFreeCommandText, isPermissionCommandText, isPersonaCommandText, routeTrigger, composeMentionOnlyPrompt, MENTION_CONTEXT_MAX_MESSAGES, type MentionContextMessage, type FolderCommand, type FreeCommand, type PersonaCommand, type TriggerDecision } from './trigger-router.js';
 import { executePersonaCommand } from './agent-persona.js';
 import { modelReply, normalizeModelForProvider, type ModelCommand } from './model-command.js';
 import { classifyRoomControl, ownMentionBody, sanitizeRoomControlEnvelope } from './room-control.js';
@@ -206,6 +206,21 @@ export class LineService {
     await repository.suppressPendingRouteActions?.(input);
     if (signal?.aborted || this.bindings.get(binding.workerInstanceId) !== binding) return;
     await repository.suppressUnroutedLiveSourceMessages?.(input);
+  }
+
+  /** Messages of the mention message's chat in the 10 minutes before it: stored rows plus earlier messages of the same batch. */
+  private async loadMentionContext(envelope: InboundEnvelope, earlierInBatch: ReadonlyArray<{ envelope: InboundEnvelope }>): Promise<MentionContextMessage[]> {
+    const at = Date.parse(envelope.occurredAt);
+    const stored = await this.messages.listRecentChatMessages({ accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId,
+      beforeOccurredAt: envelope.occurredAt, excludeMessageId: envelope.messageId, windowMinutes: 10, limit: MENTION_CONTEXT_MAX_MESSAGES });
+    const batch = earlierInBatch.map((item) => item.envelope).filter((item) => item.accountId === envelope.accountId
+      && item.chatType === envelope.chatType && item.chatId === envelope.chatId && item.messageId !== envelope.messageId
+      && item.kind !== 'event' && Date.parse(item.occurredAt) <= at && Date.parse(item.occurredAt) >= at - 10 * 60_000);
+    const names = await this.messages.getContactDisplayNames(envelope.accountId, [...new Set(batch.map((item) => item.senderId))]);
+    return [
+      ...stored.map((row) => ({ messageId: row.messageId, senderName: row.senderDisplayName, kind: row.kind, text: row.text, occurredAt: row.occurredAt })),
+      ...batch.map((item) => ({ messageId: item.messageId, senderName: names.get(item.senderId) ?? '', kind: item.kind, text: item.text, occurredAt: item.occurredAt })),
+    ];
   }
 
   private async reconcileUnroutedLiveMessages(binding: BoundWorker, signal?: AbortSignal): Promise<void> {
@@ -926,7 +941,7 @@ export class LineService {
     const personaDispatches = new Map<string, PersonaCommand>();
     const primaryAdminLookupFailedIds = new Set<string>();
     let monitorLiveFallback = false;
-    for (const { envelope, ownMid, control, sensitive } of prepared) {
+    for (const [preparedIndex, { envelope, ownMid, control, sensitive }] of prepared.entries()) {
       const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
       const conversation = await this.settings.getConversationAgent(key);
       const directAdmin = envelope.chatType === 'direct'
@@ -958,9 +973,15 @@ export class LineService {
       const senderIsPrimaryAdmin = envelope.chatType === 'direct'
         ? primaryAdmin || friendAuthorization !== null
         : primaryAdmin;
-      const routed = permissionClaimed || primaryAdminLookupFailed ? { type: 'ignore' as const } : routeTrigger(envelope, { ownMid,
+      const routedBase = permissionClaimed || primaryAdminLookupFailed ? { type: 'ignore' as const } : routeTrigger(envelope, { ownMid,
         agentEnabled: roomAgentEnabled, defaultProvider: await resolveChatProvider(this.settings, conversation?.provider),
         senderIsPrimaryAdmin, primaryAdmin: primaryAdmin === true, senderIsFolderAdmin: primaryAdmin, workspaceConfigured: true, freeModeActive: this.freeMode?.isActive(key) ?? false });
+      // A lone Agent mention calls the Agent with the recent messages of the chat; the batch messages before it are not stored yet.
+      const routed: TriggerDecision = routedBase.type === 'prompt' && routedBase.mentionOnly
+        && !existingRoutes.has(envelope.messageId) && control.type === 'none' && !administrative.has(envelope.messageId) && !sensitive
+        ? { ...routedBase, prompt: await composeMentionOnlyPrompt(() => this.loadMentionContext(envelope,
+          prepared.slice(0, preparedIndex).filter((item) => item.control.type === 'none' && !item.sensitive && !administrative.has(item.envelope.messageId)))) }
+        : routedBase;
       if (!['prompt','ignore','stop','new','status'].includes(routed.type)) monitorLiveFallback=true;
       // Free-mode decisions are applied after ingestion; for storage and admission they are plain ignored messages.
       const freeDispatch: FreeDispatch | null = !this.freeMode ? null : routed.type === 'free' || routed.type === 'free_range' ? { command: routed }

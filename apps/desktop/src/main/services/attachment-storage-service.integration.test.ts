@@ -112,8 +112,8 @@ database('attachment storage service with isolated PostgreSQL and native broker'
       VALUES ($1,'external-direct',$2,'direct',$3,$4,'file','direct source.txt','text/plain',$5,'ready',$6,$7)`,
       [directAttachmentId,accountId,directChatId,directMessageId,directBytes.byteLength,directRelative,createHash('sha256').update(directBytes).digest('hex')]);
     const directKey={accountId,chatType:'direct' as const,chatId:directChatId};
-    const directSetting=await repository.setSecondaryRoot(directKey,tempRoot);
-    expect(await repository.admitReadyAttachment(directKey,directAttachmentId,directSetting.generation)).toBe(true);
+    const directFolder=(await repository.addFolder(directKey,tempRoot)).folder;
+    expect(await repository.admitReadyAttachment(directKey,directAttachmentId,directFolder.folderId)).toBe(true);
     await waitForStatus('secondary','completed',directAttachmentId);
     const directTarget=(await pool.query<{target_relative_path:string}>(`SELECT target_relative_path FROM attachment_storage_jobs WHERE attachment_id=$1 AND target_kind='secondary'`,[directAttachmentId])).rows[0]!.target_relative_path;
     expect(directTarget).toBe(buildAttachmentLocation({root:tempRoot,identity:{accountId,chatType:'direct',chatId:directChatId,
@@ -142,8 +142,8 @@ database('attachment storage service with isolated PostgreSQL and native broker'
     await pool.query(`INSERT INTO attachments(attachment_id,external_attachment_id,account_id,chat_type,chat_id,message_id,kind,name,mime_type,size_bytes,status,relative_path,sha256)
       VALUES ($1,'external-pending-1',$2,'group',$3,$4,'file','pending copy.pdf','application/pdf',$5,'ready',$6,$7)`,
       [pendingAttachmentId,accountId,chatId,messageId,bytes.byteLength,row.relative_path,sha256]);
-    const currentSetting=await repository.getSetting({accountId,chatType:'group',chatId});
-    expect(await repository.admitReadyAttachment({accountId,chatType:'group',chatId},pendingAttachmentId,currentSetting.generation)).toBe(true);
+    const currentFolder=(await repository.listFolders({accountId,chatType:'group',chatId}))[0]!;
+    expect(await repository.admitReadyAttachment({accountId,chatType:'group',chatId},pendingAttachmentId,currentFolder.folderId)).toBe(true);
     const nativeBroker=createWindowsAttachmentBroker({helperPath});
     let brokerEntered!:()=>void;
     const entered=new Promise<void>((resolve)=>{brokerEntered=resolve;});

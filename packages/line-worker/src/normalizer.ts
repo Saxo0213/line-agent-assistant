@@ -35,6 +35,12 @@ function databaseText(value: string): string {
   // roll back the complete incoming-message batch.
   return value.replaceAll('\0', '\uFFFD');
 }
+/** FILE_NAME of LINE metadata. Empty text, or the text "undefined" or "null" of a sender client, is no name. */
+function attachmentName(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed === '' || /^(?:undefined|null)$/i.test(trimmed) ? null : databaseText(value);
+}
 function serializeNativeChunks(chunks: unknown[], ancestors: WeakSet<object>): unknown[] {
   if (chunks.length > MAX_NATIVE_MESSAGE_CHUNKS) return INVALID_NATIVE_CHUNKS;
   let totalBytes = 0;
@@ -147,7 +153,7 @@ export function messageContent(message: RecordValue, messageId: string, decrypti
   const size = Number(metadata.FILE_SIZE);
   const attachments = !decryptionFailure && attachmentKinds.has(kind)
     ? [{ id: messageId, kind: kind as 'image' | 'video' | 'audio' | 'file',
-      name: typeof metadata.FILE_NAME === 'string' ? databaseText(metadata.FILE_NAME) : null,
+      name: attachmentName(metadata.FILE_NAME),
       mimeType: typeof metadata.MIME_TYPE === 'string' ? databaseText(metadata.MIME_TYPE) : null,
       sizeBytes: Number.isSafeInteger(size) && size >= 0 ? size : null }]
     : [];

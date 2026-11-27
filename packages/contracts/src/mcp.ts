@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { ChatTypeSchema } from './account.js';
 import { SCHEDULE_TOOL_NAMES } from './agent-schedule.js';
+import { CHAT_DOWNLOAD_FOLDER_TOOL_NAMES } from './attachment-storage.js';
 import { SendDetailSchema } from './diagnostics.js';
 
 export const McpToolNameSchema = z.enum([
@@ -390,7 +391,7 @@ export const SEND_TO_TARGET_TOOL_NAME = 'send_to_target' as const;
 /** Internal-only tool: gives an Agent job a local copy of one message attachment. Never part of McpToolNameSchema. */
 export const READ_MESSAGE_ATTACHMENT_TOOL_NAME = 'read_message_attachment' as const;
 export const McpInternalToolNameSchema = z.enum([
-  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, ...SCHEDULE_TOOL_NAMES,
+  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, ...SCHEDULE_TOOL_NAMES, ...CHAT_DOWNLOAD_FOLDER_TOOL_NAMES,
 ]);
 export type McpInternalToolName = z.infer<typeof McpInternalToolNameSchema>;
 /** The principal of an Agent room job or the local console UI; an admin-direct LINE job is also allowed while the room shares that chat. */

@@ -8,6 +8,7 @@ import {AgentProviderAuthControl} from './AgentProviderAuthControl.js';
 import { AgentAccountSources, AgentAutoFailoverSwitch } from './AgentAccountSources.js';
 import { AgentPermissions } from './AgentPermissions.js';
 import { ProjectFolders, type ProjectFolderChat } from './ProjectFolders.js';
+import { DownloadFolders } from './DownloadFolders.js';
 import { LineLogin, type LineLoginView } from './LineLogin.js';
 import { WorkRecords } from './WorkRecords.js';
 import { AGENT_STATUS_MARKERS, AgentStatusMarker } from '../AgentStatusMarker.js';
@@ -531,7 +532,7 @@ export function Settings({ api, headingRef, defaultProvider = 'claude', provider
         </fieldset>
       </div></div>
     </div></section></div>
-      : tab === 'folders' ? <div role="tabpanel" className="settings-card-stack"><ProjectFolders api={api} accounts={accounts} conversations={conversations} /></div>
+      : tab === 'folders' ? <div role="tabpanel" className="settings-card-stack"><ProjectFolders api={api} accounts={accounts} conversations={conversations} /><div className="settings-card-stack folder-sections-gap"><DownloadFolders api={api} accounts={accounts} conversations={conversations} /></div></div>
       : tab === 'conversation' ? <div role="tabpanel" className="settings-card-stack"><section className="panel conversation-settings">
       <div className="panel-top"><div><h2>{desktopText('conversations')}</h2></div><button className="primary"
         disabled={conversationSettingsBusy || !Number.isInteger(attachmentAttemptLimit) || attachmentAttemptLimit < 3 || attachmentAttemptLimit > 10

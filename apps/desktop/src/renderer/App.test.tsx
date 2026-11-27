@@ -197,6 +197,7 @@ function fakeApi(): DesktopApi {
     cancelChatResourceRequest: vi.fn(async () => true),
     listAttachmentStates: vi.fn(async () => []),
     listStoredAttachments: vi.fn(async () => ({ attachments: [], nextCursor: null })),
+    listStoredAttachmentSenders: vi.fn(async () => ({ senders: [] })),
     listAgentStatuses: vi.fn(async () => []),
     listWorkRecords: vi.fn(async () => []),
     listFriends: vi.fn(async () => []),
@@ -224,10 +225,12 @@ function fakeApi(): DesktopApi {
     submitAgentRoomPrompt: vi.fn(async () => ({ type: 'submitAgentRoomPrompt', requestId: 'x', ok: true, jobId: 'job-1' } as const)),
     openAttachment: vi.fn(async () => false),
     openStoredAttachmentsFolder: vi.fn(async () => false),
-    getChatExtraFolder: vi.fn(async () => ({ root: null, queued: 0, claimed: 0, completed: 0, failed: 0 })),
-    chooseChatExtraFolder: vi.fn(async () => null),
-    clearChatExtraFolder: vi.fn(async () => ({ ok: true as const, root: null })),
-    retryChatExtraFolder: vi.fn(async () => 0),
+    listChatExtraFolders: vi.fn(async () => ({ defaultFolder: null, folders: [], waitingClassification: 0, decisions: [] })),
+    addChatExtraFolder: vi.fn(async () => null),
+    removeChatExtraFolder: vi.fn(async () => ({ ok: true as const })),
+    setDefaultChatExtraFolder: vi.fn(async () => null),
+    setChatExtraFolderDescription: vi.fn(async () => ({ ok: true as const })),
+    retryChatExtraFolders: vi.fn(async () => 0),
     openChatExtraFolder: vi.fn(async () => false),
     openExternalUrl: vi.fn(async () => ({ type: 'openExternalUrl', requestId: 'x', ok: true } as const)),
     downloadAttachment: vi.fn(async () => accepted),
@@ -1560,15 +1563,12 @@ describe('operator console', () => {
     ));
   });
 
-  it('shows only the selected conversation Agent trigger state beside chat resources', async () => {
+  it('does not show the Agent trigger state in the chat header', async () => {
     await renderLineApp(fakeApi());
     await screen.findAllByRole('button', { name: /同名群組.*群組/ });
-    expect(screen.getByText('Agent 觸發：未啟用')).toBeTruthy();
-    expect(screen.queryByText('Agent 觸發：未啟用 · Claude')).toBeNull();
-    expect(screen.queryByText('收訊監控與 Agent 觸發分開設定')).toBeNull();
+    expect(screen.queryByText(/Agent 觸發/)).toBeNull();
     const statusArea = document.querySelector('.chat-header-meta');
-    expect(statusArea?.firstElementChild?.classList.contains('agent-trigger-status')).toBe(true);
-    expect(statusArea?.firstElementChild?.nextElementSibling?.classList.contains('chat-resources-actions')).toBe(true);
+    expect(statusArea?.firstElementChild?.classList.contains('chat-resources-actions')).toBe(true);
     expect(screen.queryByText('已連線')).toBeNull();
   });
 
@@ -1580,15 +1580,6 @@ describe('operator console', () => {
     expect(accountHeaderStatusFor(monitored, 'ko')).toBe('모니터링 중');
     expect(accountHeaderStatusFor(snapshot.accounts[0]!, 'zh-TW')).toBe('已連線');
     expect(accountHeaderStatusFor({ ...snapshot.accounts[0]!, mode: 'PAUSED' }, 'zh-TW')).toBe('已暫停');
-  });
-
-  it('shows the enabled state for the selected conversation Agent trigger', async () => {
-    const api = fakeApi();
-    api.getSnapshot = vi.fn(async () => ({ ...snapshot, conversations: [{
-      ...snapshot.conversations[0]!, agentEnabled: true, defaultProvider: 'codex' as const,
-    }] }));
-    await renderLineApp(api);
-    await screen.findByText('Agent 觸發：已啟用');
   });
 
   it('renders committed job state delivered by the coalesced domain snapshot publisher', async () => {
@@ -3307,13 +3298,26 @@ describe('operator console', () => {
     expect(row.querySelector('.list-preview')?.getAttribute('data-preview')).toBe('群組摘要');
   });
 
+  it('keeps one stored-files button and one download-location button after the chat changes twice', async () => {
+    const api = fakeApi();
+    api.getSnapshot = vi.fn(async () => snapshotWithRooms(3));
+    await renderLineApp(api);
+    const header = screen.getByTestId('address-plate');
+    await within(header).findByRole('button', { name: '聊天室設定' });
+    for (const title of ['聊天室 1 群組', '聊天室 2 群組']) {
+      fireEvent.click(await screen.findByRole('button', { name: title }));
+      await waitFor(() => expect(api.listMessages).toHaveBeenCalled());
+    }
+    expect(within(screen.getByTestId('address-plate')).getAllByRole('button', { name: '開啟已儲存檔案' })).toHaveLength(1);
+    expect(within(screen.getByTestId('address-plate')).getAllByRole('button', { name: '聊天室設定' })).toHaveLength(1);
+  });
+
   it('keeps same-named chats scoped internally without exposing route identifiers', async () => {
     const api = fakeApi();
     await renderLineApp(api);
     expect(await screen.findAllByRole('button', { name: /同名群組.*群組/ })).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: '查看觀察' }));
     expect(screen.getByTestId('address-plate').textContent).toContain('群組');
-    expect(screen.getByTestId('address-plate').textContent).toContain('Agent 觸發：未啟用');
     expect(screen.getByTestId('address-plate').textContent).not.toContain('觀察');
     expect(screen.getByTestId('address-plate').textContent).not.toContain('account-B');
     expect(screen.getByTestId('address-plate').textContent).not.toContain('same-chat');
@@ -3348,7 +3352,6 @@ describe('operator console', () => {
     await screen.findByText('monitor-message');
 
     expect(await screen.findByText('僅監控，無法傳送')).toBeTruthy();
-    expect(within(screen.getByTestId('address-plate')).getByText('Agent 觸發：未啟用')).toBeTruthy();
     expect(screen.queryByRole('textbox', { name: 'LINE 訊息' })).toBeNull();
     expect(screen.queryByRole('button', { name: '傳送' })).toBeNull();
     expect(screen.queryByRole('button', { name: '回覆' })).toBeNull();
@@ -4323,7 +4326,7 @@ describe('conversation list view toggle and sorting', () => {
 describe('update check navigation badge', () => {
   const updateState = (patch: Record<string, unknown> = {}) => ({ enabled: true, checking: false, lastCheckedAt: '2026-10-28T02:00:00.000Z', lastCheckFailed: false,
     latestVersion: '1.0.280', releaseUrl: 'https://github.com/Saxo0213/line-agent-assistant/releases/tag/v1.0.280', available: true,
-    installedNotice: null, ignoredVersion: null, download: { status: 'idle' as const, percent: 0 }, canAutoInstall: true, autoInstall: false, autoInstallStage: 'none' as const, ...patch });
+    installedNotice: null, ignoredVersion: null, download: { status: 'idle' as const, percent: 0 }, canAutoInstall: true, autoInstall: false, autoInstallStage: 'none' as const, autoInstallBlockedBy: null, ...patch });
 
   it('marks the settings nav item only while an update is available', async () => {
     const listeners: Array<(state: ReturnType<typeof updateState>) => void> = [];

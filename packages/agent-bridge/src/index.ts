@@ -9,7 +9,7 @@ import {accountEnvironment,buildChildEnvironment,CLAUDE_GIT_BASH_PATH_ENV,gitBas
 import {claudeArguments,ClaudeEvents,claudeResidentArguments} from './claude.js';
 import {codexArguments,codexResumeNotFound,CodexEvents,isValidCodexModel} from './codex.js';
 import {extensionEnvironment} from './extensions.js';
-import {claudeJudgeArguments,codexJudgeArguments,judgeInput,JUDGE_DEFAULT_TIMEOUT_MS,type JudgeRequest,type JudgeResult} from './judge.js';
+import {claudeJudgeArguments,codexJudgeArguments,judgeInput,JUDGE_DEFAULT_TIMEOUT_MS,JUDGE_MAX_IMAGES,type JudgeRequest,type JudgeResult} from './judge.js';
 import {isAuthenticationDiagnostic} from './failure.js';
 export {providerFailureResetAt} from './failure.js';
 export {isValidCodexModel} from './codex.js';
@@ -259,14 +259,25 @@ export class AgentCliBridge {
     if(input.resumeSessionId!==undefined && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,199}$/.test(input.resumeSessionId)) throw new Error('Invalid judge session');
     const workspace=await realpath(input.workspacePath);
     if(!(await stat(workspace)).isDirectory()) throw new Error('Judge workspace is not a directory');
+    // An image must be an existing regular file inside the judge workspace. Only Codex receives it.
+    const imagePaths:string[]=[];
+    if(input.provider==='codex' && input.imagePaths?.length) {
+      if(input.imagePaths.length>JUDGE_MAX_IMAGES) throw new Error('Too many judge images');
+      for(const candidate of input.imagePaths) {
+        const image=await realpath(candidate);
+        if(!isWithin(workspace,image) || !(await stat(image)).isFile()) throw new Error('Judge image is outside the workspace');
+        imagePaths.push(image);
+      }
+    }
+    const request:JudgeRequest={...input,imagePaths};
     const executable=await this.resolver.resolve(input.provider);
     if(!executable) throw new Error('The official CLI is unavailable');
     const launch=await this.accountLaunch(input.provider,input.account);
     if(!launch.signedIn) throw new Error('The CLI account is not signed in');
     const {env}=buildChildEnvironment(this.options.environment ?? process.env);
     const child=this.runner.start({file:executable.file,
-      args:[...executable.prefixArgs,...(input.provider==='codex'?codexJudgeArguments(input,workspace):claudeJudgeArguments(input))],
-      cwd:workspace,input:judgeInput(input),env,...(Object.keys(launch.accountEnv).length?{accountEnv:launch.accountEnv}:{})});
+      args:[...executable.prefixArgs,...(input.provider==='codex'?codexJudgeArguments(request,workspace):claudeJudgeArguments(request))],
+      cwd:workspace,input:judgeInput(request),env,...(Object.keys(launch.accountEnv).length?{accountEnv:launch.accountEnv}:{})});
     let timedOut=false;
     const timer=setTimeout(()=>{timedOut=true;void child.cancel().catch(()=>{});},input.timeoutMs ?? JUDGE_DEFAULT_TIMEOUT_MS);
     const stderr=(async()=>{let length=0;for await(const chunk of child.stderr) length+=chunk.byteLength;})().catch(()=>undefined);

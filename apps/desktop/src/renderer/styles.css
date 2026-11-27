@@ -57,7 +57,7 @@
 .monitor-note{margin:0;flex:none}
 .chat-header h2{margin-bottom:3px;font-size:17px}
 .line-chat-header{display:flex;align-items:center;justify-content:space-between;gap:18px}.line-chat-header h2{margin:0}
-.chat-header-meta{display:flex;align-items:center;gap:16px}.agent-trigger-status{flex:none;font-size:12px;color:var(--secondary);text-align:left;white-space:nowrap}.agent-trigger-status.enabled{color:var(--primary)}
+.chat-header-meta{display:flex;align-items:center;gap:6px}
 .message-by{justify-content:space-between;font-size:11px}
 .message-text{margin-top:3px}.message-text a,.reply-quote a{color:var(--primary);font-weight:600;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}.message-text a:focus-visible,.reply-quote a:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:2px}.message-mention{color:#0866c6;font-weight:600}
 .message-row{display:flex;align-items:flex-end;gap:6px;width:100%;min-width:0;flex:none}.message-row.inbound{justify-content:flex-start}.message-row.outbound{justify-content:flex-end}.message-row .message{max-width:min(68ch,calc(72% - 88px));min-width:0;align-self:auto}.message-actions{display:flex;flex-direction:column;align-items:flex-start;gap:0;flex:none}.reply-action{position:relative;flex:none;align-self:flex-end;border:0;background:transparent;color:var(--primary);padding:3px 0;min-height:24px;white-space:nowrap}

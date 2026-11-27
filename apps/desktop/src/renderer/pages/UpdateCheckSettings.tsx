@@ -37,7 +37,7 @@ export function UpdateCheckSettings({ api }: { api: DesktopApi }) {
     {state.available && state.latestVersion && <div className="update-check-row">
       <strong>{text('latestVersion', { arg0: state.latestVersion })}</strong>
       <span className="button-row">
-        <button type="button" className="primary" disabled={state.download.status === 'downloading' || state.download.status === 'ready'} onClick={install}>{text('updateNow')}</button>
+        <button type="button" className="primary" disabled={state.download.status === 'downloading' || (state.download.status === 'ready' && state.autoInstallStage !== 'waiting')} onClick={install}>{text('updateNow')}</button>
         <button type="button" onClick={openReleasePage}>{text('goDownload')}</button>
       </span>
     </div>}
@@ -49,6 +49,9 @@ export function UpdateCheckSettings({ api }: { api: DesktopApi }) {
     {state.available && state.download.status === 'ready' && <span className="muted" role="status">{
       state.autoInstallStage === 'waiting' ? text('downloadedWaiting', { arg0: state.latestVersion ?? '' })
         : state.autoInstallStage === 'installing' ? text('installingUpdate') : text('restarting')}</span>}
+    {state.available && state.download.status === 'ready' && state.autoInstallStage === 'waiting' && state.autoInstallBlockedBy && <span className="muted" role="status">{
+      text(state.autoInstallBlockedBy === 'agent_jobs' ? 'blockedAgentJobs' : state.autoInstallBlockedBy === 'deliveries' ? 'blockedDeliveries' : 'blockedLineSend')}
+      <br />{text('updateNowHint')}</span>}
     {state.available && state.download.status === 'error' && <span className="update-prompt-error" role="status">{text('updateFailed')}</span>}
   </div>;
 }

@@ -28,6 +28,8 @@ export const UpdateCheckStateSchema = z.strictObject({
   autoInstall: z.boolean(),
   /** Automatic install only: `waiting` = downloaded, waits for an idle app; `installing` = the installer is starting. */
   autoInstallStage: z.enum(['none', 'waiting', 'installing']),
+  /** Only while `autoInstallStage` is `waiting`: why the last idle check failed; null when idle or not waiting. */
+  autoInstallBlockedBy: z.enum(['agent_jobs', 'deliveries', 'line_send']).nullable(),
 });
 export type UpdateCheckState = z.infer<typeof UpdateCheckStateSchema>;
 

@@ -35,7 +35,7 @@ describe('launch-scoped MCP adapter configuration',()=>{
     expect(args[args.indexOf('--disallowedTools')+1]).toContain('Bash');
     const config=JSON.parse(args[args.indexOf('--mcp-config')+1]!);
     expect(config).toEqual({mcpServers:{linejs:{type:'http',url:mcp.endpoint,headers:{Authorization:'Bearer ${LINEJS_INTERNAL_MCP_TOKEN}'}}}});
-    expect(args[args.indexOf('--allowedTools')+1]).toBe('mcp__linejs__list_targets,mcp__linejs__query_target_messages,mcp__linejs__query_target_messages_by_time,mcp__linejs__list_active_chats,mcp__linejs__list_chat_albums,mcp__linejs__get_chat_album,mcp__linejs__read_message_attachment,mcp__linejs__query_agent_room_history,mcp__linejs__list_send_targets,mcp__linejs__send_to_target,mcp__linejs__list_schedules,mcp__linejs__create_schedule,mcp__linejs__update_schedule,mcp__linejs__delete_schedule,Write,Edit');
+    expect(args[args.indexOf('--allowedTools')+1]).toBe('mcp__linejs__list_targets,mcp__linejs__query_target_messages,mcp__linejs__query_target_messages_by_time,mcp__linejs__list_active_chats,mcp__linejs__list_chat_albums,mcp__linejs__get_chat_album,mcp__linejs__read_message_attachment,mcp__linejs__query_agent_room_history,mcp__linejs__list_send_targets,mcp__linejs__send_to_target,mcp__linejs__list_schedules,mcp__linejs__create_schedule,mcp__linejs__update_schedule,mcp__linejs__delete_schedule,mcp__linejs__list_chat_download_folders,mcp__linejs__add_chat_download_folder,mcp__linejs__set_chat_download_folder_description,mcp__linejs__set_chat_default_download_folder,mcp__linejs__remove_chat_download_folder,Write,Edit');
     expect(args[args.indexOf('--tools')+1]).not.toContain('Bash');
     expect(args[args.indexOf('--allowedTools')+1]).not.toContain('Bash');
     expect(args.join('\n')).not.toContain(TOKEN);
@@ -47,7 +47,7 @@ describe('launch-scoped MCP adapter configuration',()=>{
     expect(overrides).toEqual([
       'mcp_servers.linejs.url="http://127.0.0.1:38471/mcp"',
       'mcp_servers.linejs.bearer_token_env_var="LINEJS_INTERNAL_MCP_TOKEN"',
-      'mcp_servers.linejs.enabled_tools=["list_targets","query_target_messages","query_target_messages_by_time","list_active_chats","list_chat_albums","get_chat_album","read_message_attachment","query_agent_room_history","list_send_targets","send_to_target","list_schedules","create_schedule","update_schedule","delete_schedule"]',
+      'mcp_servers.linejs.enabled_tools=["list_targets","query_target_messages","query_target_messages_by_time","list_active_chats","list_chat_albums","get_chat_album","read_message_attachment","query_agent_room_history","list_send_targets","send_to_target","list_schedules","create_schedule","update_schedule","delete_schedule","list_chat_download_folders","add_chat_download_folder","set_chat_download_folder_description","set_chat_default_download_folder","remove_chat_download_folder"]',
       'mcp_servers.linejs.tool_timeout_sec=600',
       'mcp_servers.linejs.tools.list_targets.approval_mode="approve"',
       'mcp_servers.linejs.tools.query_target_messages.approval_mode="approve"',
@@ -63,6 +63,11 @@ describe('launch-scoped MCP adapter configuration',()=>{
       'mcp_servers.linejs.tools.create_schedule.approval_mode="approve"',
       'mcp_servers.linejs.tools.update_schedule.approval_mode="approve"',
       'mcp_servers.linejs.tools.delete_schedule.approval_mode="approve"',
+      'mcp_servers.linejs.tools.list_chat_download_folders.approval_mode="approve"',
+      'mcp_servers.linejs.tools.add_chat_download_folder.approval_mode="approve"',
+      'mcp_servers.linejs.tools.set_chat_download_folder_description.approval_mode="approve"',
+      'mcp_servers.linejs.tools.set_chat_default_download_folder.approval_mode="approve"',
+      'mcp_servers.linejs.tools.remove_chat_download_folder.approval_mode="approve"',
     ]);
     expect(args.join('\n')).not.toContain(TOKEN);
     expect(args.at(-1)).toBe('-');

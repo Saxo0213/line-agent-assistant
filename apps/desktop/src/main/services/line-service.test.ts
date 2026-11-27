@@ -2140,7 +2140,7 @@ database('LineService transaction and worker identity', () => {
         await settle();
         await deliverMany('permission-replay-confirm-yes-batch', '1714', [{ id: 'permission-replay-confirm-yes', text: '確認' }]);
         await settle();
-        expect(texts()).toEqual([listOf('工作區可寫'), '確定要放寬為 全部放行？回覆「確認」套用，回覆其他內容取消（2 分鐘內有效）', '已放寬為 全部放行']);
+        expect(texts()).toEqual([listOf('工作區可寫'), '確定要放寬為 全部放行？\n回覆 y 確認／n 取消（2 分鐘內有效）', '已放寬為 全部放行']);
         expect(await policy.current()).toMatchObject({ level: 'full', version: policy.start.version + 1 });
         expect(await routeOf('permission-replay-confirm-choice')).toEqual({ action: 'ignore', jobs: 0 });
         expect(await routeOf('permission-replay-confirm-yes')).toEqual({ action: 'ignore', jobs: 0 });
@@ -2218,7 +2218,7 @@ database('LineService transaction and worker identity', () => {
         await vi.waitFor(() => expect(texts()).toHaveLength(6));
         await settle();
         expect(texts().slice(2)).toEqual(['已取消', listOf('工作區可寫'),
-          '確定要放寬為 信任？回覆「確認」套用，回覆其他內容取消（2 分鐘內有效）', '已放寬為 信任']);
+          '確定要放寬為 信任？\n回覆 y 確認／n 取消（2 分鐘內有效）', '已放寬為 信任']);
         for (const id of ['permission-confirm-route-list', 'permission-confirm-route-choice', 'permission-confirm-route-cancel',
           'permission-confirm-route-list2', 'permission-confirm-route-choice2', 'permission-confirm-route-yes']) {
           expect(await routeOf(id)).toEqual({ action: 'ignore', jobs: 0 });
@@ -2263,7 +2263,7 @@ database('LineService transaction and worker identity', () => {
           await deliverMany(`${prefix}-yes-batch`, revision(4), [{ id: `${prefix}-yes`, text: '確認' }]);
           await settle();
           expect(texts()).toEqual([listOf('工作區可寫'), listOf('工作區可寫'),
-            '確定要放寬為 全部放行？回覆「確認」套用，回覆其他內容取消（2 分鐘內有效）']);
+            '確定要放寬為 全部放行？\n回覆 y 確認／n 取消（2 分鐘內有效）']);
           expect(await routeOf(`${prefix}-choice`)).toEqual({ action: 'ignore', jobs: 0 });
           expect(await routeOf(`${prefix}-yes`)).toEqual({ action: 'prompt', jobs: 1 });
           expect(await policy.current()).toMatchObject({ level: 'workspace_write', version: policy.start.version });

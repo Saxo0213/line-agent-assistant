@@ -55,6 +55,7 @@ import {
   type AutoResponderSettings,
   type ConversationKey,
   type StoredAttachmentPage,
+  type StoredAttachmentSenders,
   type ChatExtraFolderStatus,
   type ChatExtraFolderResult,
   type WritableConversationKey,
@@ -74,7 +75,7 @@ import {
   type ChatResourcePhoto,
 } from '@line-agent/contracts';
 import { ConversationMembersSchema, FriendListSchema, MessageReadersSchema, AttachmentStateListSchema, ControlStateSchema, DesktopReadResultSchema, MessagePageSchema, SystemActivityResultSchema, SystemErrorsResultSchema, WorkRecordSchema } from '../desktop-protocol.js';
-import { StoredAttachmentPageSchema } from '@line-agent/contracts';
+import { StoredAttachmentPageSchema, StoredAttachmentSendersSchema } from '@line-agent/contracts';
 import { DatabaseSetupResultSchema, SETUP_PROGRESS_CHANNEL, SetupProgressEventSchema, type DatabaseConnectionInput, type DatabaseSetupStatus,
   type EmbeddedConnectionInfo, type SetupProgressEvent } from '../setup-protocol.js';
 import type { FriendRow, MessagePage, MessageReader, WorkRecord } from '../main/service-facade.js';
@@ -114,7 +115,8 @@ export type DesktopApi = {
   openReadableChatAlbumFolder(key: ConversationKey, albumId: string, requestId?: string): Promise<{ albumId: string; exportedCount: number; failedCount: number; totalCount: number; complete: boolean; failureCodes: string[]; folderName: string; opened: boolean }>;
   cancelChatResourceRequest(targetRequestId: string): Promise<boolean>;
   listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[]): Promise<ReturnType<typeof AttachmentStateListSchema.parse>>;
-  listStoredAttachments(key: ConversationKey, cursor: string | null, limit?: number): Promise<StoredAttachmentPage>;
+  listStoredAttachments(key: ConversationKey, cursor: string | null, limit?: number, senderId?: string | null): Promise<StoredAttachmentPage>;
+  listStoredAttachmentSenders(key: ConversationKey): Promise<StoredAttachmentSenders>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'; revision: string }>>;
   listWorkRecords(): Promise<WorkRecord[]>;
   listFriends(accountId: string): Promise<FriendRow[]>;
@@ -149,13 +151,16 @@ export type DesktopApi = {
   retryAgentRoomJob(jobId: string): Promise<IpcResult>;
   openAttachment(attachmentId: string): Promise<boolean>;
   openStoredAttachmentsFolder(route: ConversationKey): Promise<boolean>;
-  /** Extra attachment folder of one chat. The fixed location never changes. */
-  getChatExtraFolder(key: WritableConversationKey): Promise<ChatExtraFolderStatus>;
-  /** Opens the folder picker in Main. Resolves to null when the user cancels. */
-  chooseChatExtraFolder(key: WritableConversationKey): Promise<ChatExtraFolderResult | null>;
-  clearChatExtraFolder(key: WritableConversationKey): Promise<ChatExtraFolderResult>;
-  retryChatExtraFolder(key: WritableConversationKey): Promise<number>;
-  openChatExtraFolder(key: WritableConversationKey): Promise<boolean>;
+  /** The extra attachment folders of one chat, their progress, the classifier queue and the last decisions. The fixed location never changes. */
+  listChatExtraFolders(key: WritableConversationKey): Promise<ChatExtraFolderStatus>;
+  /** Opens the folder picker in Main and adds the folder. Resolves to null when the user cancels. */
+  addChatExtraFolder(key: WritableConversationKey): Promise<ChatExtraFolderResult | null>;
+  removeChatExtraFolder(key: WritableConversationKey, folderId: string): Promise<ChatExtraFolderResult>;
+  /** Opens the folder picker in Main and sets (or replaces) the default folder. Resolves to null when the user cancels. */
+  setDefaultChatExtraFolder(key: WritableConversationKey): Promise<ChatExtraFolderResult | null>;
+  setChatExtraFolderDescription(key: WritableConversationKey, folderId: string, description: string): Promise<ChatExtraFolderResult>;
+  retryChatExtraFolders(key: WritableConversationKey): Promise<number>;
+  openChatExtraFolder(key: WritableConversationKey, folderId: string): Promise<boolean>;
   openExternalUrl(url: string): Promise<IpcResult>;
   downloadAttachment(key: WritableConversationKey, attachmentId: string): Promise<IpcResult>;
   resolveFileTypeIcon(extension: string): Promise<string | null>;
@@ -307,7 +312,7 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     if (result.requestId !== requestId) throw new Error('IPC correlation mismatch');
     return result;
   };
-  const read = async <T extends 'listMessages' | 'listAttachmentStates' | 'listStoredAttachments' | 'listAgentStatuses' | 'listWorkRecords' | 'listFriends' | 'listMessageReaders' | 'listConversationMembers' | 'listSystemActivity' | 'listSystemErrors' | 'getControlState'>(body: { type: T; [key: string]: unknown }): Promise<Extract<ReturnType<typeof DesktopReadResultSchema.parse>, { type: T }>> => {
+  const read = async <T extends 'listMessages' | 'listAttachmentStates' | 'listStoredAttachments' | 'listStoredAttachmentSenders' | 'listAgentStatuses' | 'listWorkRecords' | 'listFriends' | 'listMessageReaders' | 'listConversationMembers' | 'listSystemActivity' | 'listSystemErrors' | 'getControlState'>(body: { type: T; [key: string]: unknown }): Promise<Extract<ReturnType<typeof DesktopReadResultSchema.parse>, { type: T }>> => {
     const result = DesktopReadResultSchema.parse(await transport.invoke('line-agent:read', body));
     if (result.type !== body.type) throw new Error('IPC read response mismatch');
     return result as Extract<ReturnType<typeof DesktopReadResultSchema.parse>, { type: T }>;
@@ -357,7 +362,8 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async openReadableChatAlbumFolder(key, albumId, requestId) { const result = await request({ type: 'openReadableChatAlbumFolder', ...key, albumId }, requestId); if (result.type !== 'openReadableChatAlbumFolder') throwIpcErrorOrUnexpected(result, 'Unexpected readable album folder response'); return { albumId: result.albumId, exportedCount: result.exportedCount, failedCount: result.failedCount, totalCount: result.totalCount, complete: result.complete, failureCodes: result.failureCodes, folderName: result.folderName, opened: result.opened }; },
     async cancelChatResourceRequest(targetRequestId) { const result = await request({ type: 'cancelChatResourceRequest', targetRequestId }); return result.type === 'cancelChatResourceRequest' && result.cancelled; },
     async listAttachmentStates(key, attachmentIds) { if (attachmentIds.length > 225) throw new Error('Attachment state lookup exceeds 225 IDs'); if (attachmentIds.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) throw new Error('Invalid attachment ID'); const result = await read({ type: 'listAttachmentStates', key, attachmentIds: [...new Set(attachmentIds)] }); return AttachmentStateListSchema.parse(result.attachments); },
-    async listStoredAttachments(key, cursor, limit = 50) { const result = await read({ type: 'listStoredAttachments', key, cursor, limit }); return StoredAttachmentPageSchema.parse(result.page); },
+    async listStoredAttachments(key, cursor, limit = 50, senderId = null) { const result = await read({ type: 'listStoredAttachments', key, cursor, limit, senderId }); return StoredAttachmentPageSchema.parse(result.page); },
+    async listStoredAttachmentSenders(key) { const result = await read({ type: 'listStoredAttachmentSenders', key }); return StoredAttachmentSendersSchema.parse({ senders: result.senders }); },
     async listAgentStatuses(key, messageIds) { if (messageIds.length > 225) throw new Error('Agent status lookup exceeds 225 IDs'); const result = await read({ type: 'listAgentStatuses', key, messageIds: [...new Set(messageIds)] }); return result.statuses; },
     async listWorkRecords() { const result = await read({ type: 'listWorkRecords' }); return WorkRecordSchema.array().parse(result.records); },
     async listFriends(accountId) { const result = await read({ type: 'listFriends', accountId }); return FriendListSchema.parse(result.friends); },
@@ -390,11 +396,13 @@ export function createDesktopApi(transport: Transport): DesktopApi {
     async openAttachment(attachmentId) { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)) throw new Error('Invalid attachment ID'); const result = await request({ type: 'openAttachment', attachmentId }); return result.type === 'openAttachment' && result.opened; },
     openExternalUrl: (url) => request({ type: 'openExternalUrl', url }),
     async openStoredAttachmentsFolder(route) { const result = await request({ type: 'openStoredAttachmentsFolder', accountId: route.accountId, chatType: route.chatType, chatId: route.chatId }); return result.type === 'openStoredAttachmentsFolder' && result.opened; },
-    async getChatExtraFolder(key) { const result = await request({ type: 'getChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'getChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.status; },
-    async chooseChatExtraFolder(key) { const result = await request({ type: 'chooseChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'chooseChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.result; },
-    async clearChatExtraFolder(key) { const result = await request({ type: 'clearChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'clearChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.result; },
-    async retryChatExtraFolder(key) { const result = await request({ type: 'retryChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'retryChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.count; },
-    async openChatExtraFolder(key) { const result = await request({ type: 'openChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); return result.type === 'openChatExtraFolder' && result.opened; },
+    async listChatExtraFolders(key) { const result = await request({ type: 'listChatExtraFolders', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'listChatExtraFolders') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.status; },
+    async addChatExtraFolder(key) { const result = await request({ type: 'addChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'addChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.result; },
+    async removeChatExtraFolder(key, folderId) { const result = await request({ type: 'removeChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId, folderId }); if (result.type !== 'removeChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.result; },
+    async setDefaultChatExtraFolder(key) { const result = await request({ type: 'setDefaultChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'setDefaultChatExtraFolder') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.result; },
+    async setChatExtraFolderDescription(key, folderId, description) { const result = await request({ type: 'setChatExtraFolderDescription', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId, folderId, description }); if (result.type !== 'setChatExtraFolderDescription') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.result; },
+    async retryChatExtraFolders(key) { const result = await request({ type: 'retryChatExtraFolders', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId }); if (result.type !== 'retryChatExtraFolders') throwIpcErrorOrUnexpected(result, 'Unexpected extra folder response'); return result.count; },
+    async openChatExtraFolder(key, folderId) { const result = await request({ type: 'openChatExtraFolder', accountId: key.accountId, chatType: key.chatType, chatId: key.chatId, folderId }); return result.type === 'openChatExtraFolder' && result.opened; },
     async downloadAttachment(key, attachmentId) { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)) throw new Error('Invalid attachment ID'); return await request({ type: 'downloadAttachment', ...key, attachmentId }); },
     async resolveFileTypeIcon(extension) { if (!/^[a-z0-9]{1,12}$/.test(extension)) return null; const result = await request({ type: 'resolveFileTypeIcon', extension }); return result.type === 'resolveFileTypeIcon' ? result.dataUrl : null; },
     lineAddAccountQr: (lineTransport) => request({ type: 'lineAddAccountQr', ...(lineTransport ? { lineTransport } : {}) }),

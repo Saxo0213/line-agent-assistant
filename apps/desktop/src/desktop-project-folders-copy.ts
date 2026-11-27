@@ -2,8 +2,8 @@ import type { Locale } from './locale.js';
 
 /** Copy of Settings → 資料夾. Slots use the `{argN}` convention of the main catalog. */
 export const ENGLISH_PROJECT_FOLDERS_COPY = {
-  heading: 'Project folders',
-  note: 'The Agent can read these folders when it works in the selected chat. A change here only changes the binding; it does not send a LINE message and never changes files on disk.',
+  heading: 'Agent access folders',
+  note: 'The Agent can read or write these folders when it works in the selected chat. A change here only changes the binding; it does not send a LINE message and never changes files on disk.',
   chatLabel: 'Chat',
   chatPlaceholder: 'Choose a chat',
   chatFoldersTitle: 'Folders of {arg0}',
@@ -49,8 +49,8 @@ export type ProjectFoldersCopyKey = keyof typeof ENGLISH_PROJECT_FOLDERS_COPY;
 type ProjectFoldersCopy = Record<ProjectFoldersCopyKey, string>;
 
 export const TRADITIONAL_CHINESE_PROJECT_FOLDERS_COPY: ProjectFoldersCopy = {
-  heading: '專案資料夾',
-  note: 'Agent 在所選聊天室工作時可以讀取這些資料夾。在這裡的變更只會改變綁定，不會傳送 LINE 訊息，也不會更動磁碟上的檔案。',
+  heading: 'Agent 權限資料夾',
+  note: 'Agent 在所選聊天室工作時可以讀取或寫入這些資料夾。在這裡的變更只會改變綁定，不會傳送 LINE 訊息，也不會更動磁碟上的檔案。',
   chatLabel: '聊天室',
   chatPlaceholder: '選擇聊天室',
   chatFoldersTitle: '{arg0}的資料夾',
@@ -94,8 +94,8 @@ export const TRADITIONAL_CHINESE_PROJECT_FOLDERS_COPY: ProjectFoldersCopy = {
 };
 
 export const JAPANESE_PROJECT_FOLDERS_COPY: ProjectFoldersCopy = {
-  heading: 'プロジェクトフォルダー',
-  note: 'Agent は選択したチャットで作業するとき、これらのフォルダーを読み取れます。ここでの変更は紐付けだけを変更し、LINE メッセージは送信せず、ディスク上のファイルも変更しません。',
+  heading: 'Agent アクセスフォルダー',
+  note: 'Agent は選択したチャットで作業するとき、これらのフォルダーを読み取りまたは書き込みできます。ここでの変更は紐付けだけを変更し、LINE メッセージは送信せず、ディスク上のファイルも変更しません。',
   chatLabel: 'チャット',
   chatPlaceholder: 'チャットを選択',
   chatFoldersTitle: '{arg0} のフォルダー',
@@ -139,8 +139,8 @@ export const JAPANESE_PROJECT_FOLDERS_COPY: ProjectFoldersCopy = {
 };
 
 export const KOREAN_PROJECT_FOLDERS_COPY: ProjectFoldersCopy = {
-  heading: '프로젝트 폴더',
-  note: 'Agent는 선택한 채팅에서 작업할 때 이 폴더를 읽을 수 있습니다. 여기서의 변경은 연결만 바꾸며 LINE 메시지를 보내지 않고 디스크의 파일도 변경하지 않습니다.',
+  heading: 'Agent 접근 폴더',
+  note: 'Agent는 선택한 채팅에서 작업할 때 이 폴더를 읽거나 쓸 수 있습니다. 여기서의 변경은 연결만 바꾸며 LINE 메시지를 보내지 않고 디스크의 파일도 변경하지 않습니다.',
   chatLabel: '채팅',
   chatPlaceholder: '채팅 선택',
   chatFoldersTitle: '{arg0}의 폴더',

@@ -335,6 +335,10 @@ export type SendChatType = (typeof SEND_CHAT_TYPES)[number];
 /** Attachment status that means the file is stored on disk (what markAttachmentReady writes). */
 export const ATTACHMENT_STORED_STATUS = 'ready' as const;
 
+export type RecentChatMessage = Readonly<{
+  messageId: string; senderId: string; senderDisplayName: string; kind: string; text: string | null; occurredAt: string;
+}>;
+
 export type SendTargetRecord = Readonly<{
   no: number; chatType: SendChatType; chatId: string; title: string | null; members: string[]; memberCount: number;
 }>;
@@ -2432,6 +2436,34 @@ export class MessageRepository {
     const check = await queryable.query(
       "SELECT 1 FROM conversations WHERE account_id = $1 AND chat_type = 'direct' AND chat_id = $2", [accountId, chatId]);
     if (check.rows.length === 0) throw new Error('direct conversation row missing after insert');
+  }
+
+  /**
+   * The newest messages of one chat that are at or before `beforeOccurredAt` and at most `windowMinutes` older, oldest first.
+   * Recalled, source-deleted and event rows are left out. The message `excludeMessageId` is left out.
+   */
+  async listRecentChatMessages(input: { accountId: string; chatType: string; chatId: string; beforeOccurredAt: string;
+    excludeMessageId: string; windowMinutes?: number; limit?: number }): Promise<RecentChatMessage[]> {
+    const result = await this.pool.query<{ message_id: string; sender_id: string; sender: string; kind: string; text_content: string | null; occurred_at: Date }>(
+      `SELECT m.message_id,m.sender_id,COALESCE(NULLIF(c.nickname,''),NULLIF(c.display_name,''),'') AS sender,m.kind,m.text_content,m.occurred_at
+       FROM messages m LEFT JOIN line_contacts c ON c.account_id=m.account_id AND c.mid=m.sender_id
+       WHERE m.account_id=$1 AND m.chat_type=$2 AND m.chat_id=$3 AND m.message_id<>$4 AND m.kind<>'event'
+         AND m.recalled_at IS NULL AND COALESCE(${AGENT_MASKED_SQL}, false) = false
+         AND m.occurred_at <= $5::timestamptz AND m.occurred_at >= $5::timestamptz - make_interval(mins => $6::int)
+       ORDER BY m.occurred_at DESC,m.message_id DESC LIMIT $7`,
+      [input.accountId, input.chatType, input.chatId, input.excludeMessageId, input.beforeOccurredAt,
+        Math.max(1, Math.min(60, Math.trunc(input.windowMinutes ?? 10))), Math.max(1, Math.min(50, Math.trunc(input.limit ?? 8)))]);
+    return result.rows.reverse().map((row) => ({ messageId: row.message_id, senderId: row.sender_id, senderDisplayName: row.sender.trim(),
+      kind: row.kind, text: row.text_content, occurredAt: row.occurred_at.toISOString() }));
+  }
+
+  /** Display name (nickname, then display name) of each given contact MID; an unknown or unnamed MID is absent from the map. */
+  async getContactDisplayNames(accountId: string, mids: readonly string[]): Promise<Map<string, string>> {
+    if (mids.length === 0) return new Map();
+    const result = await this.pool.query<{ mid: string; name: string }>(
+      `SELECT mid,COALESCE(NULLIF(nickname,''),NULLIF(display_name,''),'') AS name FROM line_contacts WHERE account_id=$1 AND mid=ANY($2::text[])`,
+      [accountId, [...mids]]);
+    return new Map(result.rows.filter((row) => row.name.trim()).map((row) => [row.mid, row.name.trim()]));
   }
 
   /** The archived message to forward. `masked` is true for recalled and source-deleted messages (text is then null). */

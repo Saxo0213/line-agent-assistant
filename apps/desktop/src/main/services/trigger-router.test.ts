@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { InboundEnvelope } from '@line-agent/contracts';
 import { modelReply, normalizeModelArgument, normalizeModelForProvider, parseModelCommand } from './model-command.js';
-import { hasOwnMention, isFolderCommandText, parseAgentSwitch, parseFolderCommand, routeTrigger } from './trigger-router.js';
+import { composeMentionOnlyPrompt, hasOwnMention, isFolderCommandText, MENTION_ONLY_INSTRUCTION, parseAgentSwitch, parseFolderCommand, routeTrigger } from './trigger-router.js';
 
 const envelope = (overrides: Partial<InboundEnvelope> = {}): InboundEnvelope => ({
   eventId: 'e1', accountId: 'a', chatType: 'group', chatId: 'g', senderId: 'user', messageId: 'm1',
@@ -63,6 +63,26 @@ describe('routeTrigger', () => {
     expect(routeTrigger({ ...direct, text: '/status' }, context)).toEqual({ type: 'ignore' });
     expect(routeTrigger({ ...direct, text: '--workspace C:\\evil --danger' }, authorized)).toEqual({ type: 'prompt', provider: 'codex', prompt: '--workspace C:\\evil --danger' });
     expect(routeTrigger({ ...direct, text: '  ' }, authorized)).toEqual({ type: 'ignore' });
+  });
+  it('turns a lone group mention into a call, but keeps free mode and direct chats unchanged', () => {
+    const lone = envelope({ text: '@Agent', mentionRanges: [{ start: 0, end: 6, userId: 'agent-mid' }] });
+    expect(routeTrigger(lone, context)).toEqual({ type: 'prompt', provider: 'codex', prompt: MENTION_ONLY_INSTRUCTION, mentionOnly: true });
+    expect(routeTrigger(lone, { ...context, freeModeActive: true })).toEqual({ type: 'free_message' });
+    expect(routeTrigger(lone, { ...context, agentEnabled: false })).toEqual({ type: 'ignore' });
+  });
+  it('adds the newest 8 context messages oldest first, and still calls when the read fails', async () => {
+    const rows = Array.from({ length: 10 }, (_, index) => ({ messageId: `c${index}`, senderName: index === 9 ? '' : `U${index}`,
+      kind: index === 8 ? 'image' : 'text', text: index === 7 ? 'x'.repeat(600) : `t${index}`,
+      occurredAt: `2026-10-15T00:0${index}:00.000Z` }));
+    const prompt = await composeMentionOnlyPrompt(async () => [...rows].reverse().concat(rows[0]!));
+    const lines = prompt.split('\n').slice(-8);
+    expect(prompt.startsWith(MENTION_ONLY_INSTRUCTION)).toBe(true);
+    expect(lines[0]).toBe('U2 08:02 t2');
+    expect(lines[5]).toBe(`U7 08:07 ${'x'.repeat(500)}…`);
+    expect(lines[6]).toBe('U8 08:08 [圖片]');
+    expect(lines[7]).toBe('未知發言人 08:09 t9');
+    expect(prompt).not.toContain('t1\n');
+    await expect(composeMentionOnlyPrompt(async () => { throw new Error('db down'); })).resolves.toBe(MENTION_ONLY_INSTRUCTION);
   });
   it('does not treat @all as the account own MID', () => {
     expect(routeTrigger(envelope({ text: '@all hello', mentionIds: ['@all'],

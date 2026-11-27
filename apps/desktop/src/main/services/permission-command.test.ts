@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentExecutionLevel, AgentExecutionPolicy, InboundEnvelope, LineWorkerCommand, LineWorkerEvent,
-  SetAgentExecutionPolicyInput, WorkerBinding } from '@line-agent/contracts';
-import { AgentPermissionError } from '@line-agent/database';
+  SetAgentExecutionPolicyInput, SetAgentPermissionInput, WorkerBinding } from '@line-agent/contracts';
+import { AgentPermissionError, type PermissionState } from '@line-agent/database';
 import { AccountRepository } from '@line-agent/database';
 import type { PoolClient } from 'pg';
 import { claimed, PermissionCommandService, type PermissionCommandTransport, type PermissionTicket } from './permission-command.js';
@@ -18,10 +18,18 @@ const listText = (current: AgentExecutionLevel) => {
     .map(([level, name], index) => `${index + 1}. ${name}${level === current ? '（目前）' : ''}`).join('\n')}`;
 };
 const LIST_WORKSPACE_WRITE = '目前 Agent 執行權限：工作區可寫\n回覆數字變更（2 分鐘內有效）：\n1. 唯讀\n2. 工作區可寫（目前）\n3. 信任\n4. 全部放行';
+const TARGET_LIST = '選擇要設定的對象，回覆數字（2 分鐘內有效）：\n1. Agent 執行層級\n2. [群組] HA\n3. [群組] Room\n4. [個人] 劉禹玹';
+const PERSON_LIST = '「HA」的白名單成員，回覆數字（2 分鐘內有效）：\n1. 劉禹玹\n2. Bob';
+const CAP_FOOTER = '回覆編號切換 是／否，可一次多選（如 1 3 或 1、3）；回覆 0 或「完成」結束（2 分鐘內有效）\n「使用本機工作區（讀檔／執行指令）」只能在桌面版設定中變更。';
+/** The capability list of 劉禹玹 in HA; `values` are the six 是/否 marks in order. */
+const capList = (values: string[], scope = 'HA', prefix = '') => `${prefix}劉禹玹（${scope}）目前的權限：\n${[
+  '查詢本聊天室紀錄', '查詢所有聊天室紀錄', '讀取本聊天室資料夾', '寫入本聊天室資料夾', '讀取專案資料夾', '寫入專案資料夾']
+  .map((name, index) => `${index + 1}. ${name} [${values[index]}]`).join('\n')}\n${CAP_FOOTER}`;
+const CAP_DEFAULT = ['是', '否', '是', '是', '是', '否'];
 const CONFLICT = '權限已在其他地方變更，請重新輸入 /權限';
 const FAILURE = '權限變更失敗，請稍後再試';
 const STALE = '這個選項已失效，請重新輸入 /權限';
-const LOOSEN_FULL = '確定要放寬為 全部放行？回覆「確認」套用，回覆其他內容取消（2 分鐘內有效）';
+const LOOSEN_FULL = '確定要放寬為 全部放行？\n回覆 y 確認／n 取消（2 分鐘內有效）';
 
 const deferred = () => {
   let resolve!: () => void;
@@ -58,7 +66,45 @@ class FakeRepository {
   writeGate: Promise<void> | null = null;
   /** Awaited at the start of every read when set. */
   readHook: (() => Promise<void>) | null = null;
+  /** Allowlist state read by the target and capability lists, like AgentPermissionRepository.getState. */
+  state: PermissionState = {
+    subjects: [
+      { kind: 'USER', mid: 'u-alice', displayName: '劉禹玹', grantScope: 'ACCOUNT', chatScopes: [] },
+      { kind: 'USER', mid: 'u-bob', displayName: 'Bob', grantScope: 'CHAT', chatScopes: [{ chatType: 'group', chatId: 'g1' }] },
+    ],
+    rules: [], defaults: [], links: [], folders: [],
+    eligibleChats: [{ chatType: 'group', chatId: 'g1', title: 'HA' }, { chatType: 'room', chatId: 'r1', title: 'Room' }],
+  };
+  stateReads = 0;
+  stateError: Error | null = null;
+  /** Every attempted capability write, committed or not. */
+  permissionWrites: Array<{ input: SetAgentPermissionInput; actor: string | undefined }> = [];
+  permissionError: Error | null = null;
   constructor(readonly outstanding = new Outstanding()) {}
+  getState(): Promise<PermissionState> {
+    return this.outstanding.track(async () => {
+      this.stateReads += 1;
+      if (this.readHook) await this.readHook();
+      const gate = this.gates.shift();
+      if (gate) await gate;
+      if (this.stateError) throw this.stateError;
+      return { ...this.state, rules: this.state.rules.map((rule) => ({ ...rule })) };
+    });
+  }
+  setPermission(input: SetAgentPermissionInput, actor?: string): Promise<number> {
+    return this.outstanding.track(async () => {
+      this.permissionWrites.push({ input, actor });
+      if (this.permissionError) throw this.permissionError;
+      const rule = this.state.rules.find((item) => item.subject.kind === 'USER' && item.subject.mid === input.subject.mid
+        && item.chatType === input.chatType && item.chatId === input.chatId && item.permission === input.permission);
+      if ((rule?.version ?? 0) !== input.expectedVersion) throw new AgentPermissionError('PERMISSION_VERSION_CONFLICT', 'changed');
+      const effect = input.effect as 'ALLOW' | 'DENY';
+      if (rule) { rule.effect = effect; rule.version += 1; return rule.version; }
+      this.state.rules.push({ subject: { kind: 'USER', mid: input.subject.mid }, chatType: input.chatType, chatId: input.chatId,
+        permission: input.permission, effect, version: 1 });
+      return 1;
+    });
+  }
   getExecutionPolicy(): Promise<AgentExecutionPolicy> {
     return this.outstanding.track(async () => {
       this.reads += 1;
@@ -126,7 +172,9 @@ function setup(level: AgentExecutionLevel = 'workspace_write', locale: Locale | 
   const transport = new FakeTransport(outstanding);
   const clock = { now: 0 };
   let changed = 0;
-  const service = new PermissionCommandService(repository, transport, { now: () => clock.now, onPolicyChanged: () => { changed += 1; }, locale });
+  let permissionsChanged = 0;
+  const service = new PermissionCommandService(repository, transport, { now: () => clock.now, onPolicyChanged: () => { changed += 1; },
+    onPermissionsChanged: () => { permissionsChanged += 1; }, locale });
   /** Texts of every attempted reply. */
   const replies = () => transport.commands.map((command) => command.text);
   const idle = async () => { for (let index = 0; index < 1000 && service.sizes().runners; index += 1) await Promise.resolve(); };
@@ -139,7 +187,9 @@ function setup(level: AgentExecutionLevel = 'workspace_write', locale: Locale | 
     return claimed(ticket);
   };
   const run = async (source: InboundEnvelope, ticket: PermissionTicket) => { service.enqueue(source, ticket); await idle(); };
-  return { repository, transport, outstanding, clock, service, replies, say, run, idle, changed: () => changed };
+  /** Opens the Agent execution level dialogue: `/權限`, then target 1. */
+  const levels = async () => { await say('/權限'); await say('1'); };
+  return { repository, transport, outstanding, clock, service, replies, say, run, idle, levels, changed: () => changed, permissionsChanged: () => permissionsChanged };
 }
 
 
@@ -155,7 +205,8 @@ describe('PermissionCommandService', () => {
     for (const [locale, prefix] of cases) {
       const flow = setup('workspace_write', locale);
       expect(await flow.say('/permissions')).toBe(true);
-      expect(flow.replies()[0]).toContain(prefix);
+      expect(await flow.say('1')).toBe(true);
+      expect(flow.replies()[1]).toContain(prefix);
     }
     expect(linePrompt('unsupported', 'permissionFailure')).toBe('Unable to change permissions. Please try again later.');
   });
@@ -189,7 +240,7 @@ describe('PermissionCommandService', () => {
       expect(Date.now() - startedAt).toBeLessThanOrEqual(3_500);
       expect(gatewaySends).toBe(0);
       expect(service.sizes()).toEqual({ queued: 0, runners: 0, pending: 0 });
-      expect(repository.reads).toBe(1);
+      expect(repository.stateReads).toBe(1);
     } finally {
       await service.close();
       await blocker.query('ROLLBACK');
@@ -198,23 +249,146 @@ describe('PermissionCommandService', () => {
     }
   });
 
-  it('lists the levels verbatim with the current level marked', async () => {
+  it('lists the targets in order: level item, groups with whitelisted users, then whitelisted persons', async () => {
     const { say, replies, transport } = setup();
     expect(await say('/權限')).toBe(true);
-    expect(replies()).toEqual([LIST_WORKSPACE_WRITE]);
+    expect(replies()).toEqual([TARGET_LIST]);
     expect(transport.commands[0]).toMatchObject({ type: 'sendText', accountId: 'a', workerInstanceId: 'w1', controlEpoch: 1,
       chatType: 'direct', chatId: 'c' });
     expect(transport.commands[0]!.replyToMessageId).toMatch(/^m\d+$/);
+    // A group without an eligible whitelisted person is not listed.
+    const only = setup();
+    only.repository.state.subjects = [only.repository.state.subjects[1]!];
+    await only.say('/權限');
+    expect(only.replies()).toEqual(['選擇要設定的對象，回覆數字（2 分鐘內有效）：\n1. Agent 執行層級\n2. [群組] HA']);
+  });
+
+  it('keeps the level dialogue unchanged behind target 1', async () => {
+    const { say, replies } = setup();
+    await say('/權限');
+    expect(await say('1')).toBe(true);
+    expect(replies()).toEqual([TARGET_LIST, LIST_WORKSPACE_WRITE]);
     const full = setup('full');
-    await full.say('/權限');
-    expect(full.replies()).toEqual(['目前 Agent 執行權限：全部放行\n回覆數字變更（2 分鐘內有效）：\n1. 唯讀\n2. 工作區可寫\n3. 信任\n4. 全部放行（目前）']);
+    await full.levels();
+    expect(full.replies().slice(1)).toEqual(['目前 Agent 執行權限：全部放行\n回覆數字變更（2 分鐘內有效）：\n1. 唯讀\n2. 工作區可寫\n3. 信任\n4. 全部放行（目前）']);
+  });
+
+  it('walks group, person and capabilities and shows the effective 是/否 without the local workspace item', async () => {
+    const { say, replies, repository } = setup();
+    await say('/權限');
+    expect(await say('2')).toBe(true);
+    expect(replies().at(-1)).toBe(PERSON_LIST);
+    expect(await say('1')).toBe(true);
+    expect(replies().at(-1)).toBe(capList(CAP_DEFAULT));
+    // System default DENY becomes 是 only through an explicit ALLOW rule; an explicit DENY rule overrides a default ALLOW.
+    expect(repository.permissionWrites).toEqual([]);
+    const personal = setup();
+    personal.repository.state.rules.push({ subject: { kind: 'USER', mid: 'u-alice' }, chatType: 'direct', chatId: 'u-alice', permission: 'chat_folder.read', effect: 'DENY', version: 3 });
+    await personal.say('/權限');
+    expect(await personal.say('4')).toBe(true);
+    expect(personal.replies().at(-1)).toBe(capList(['是', '否', '否', '是', '是', '否'], '個人'));
+  });
+
+  it('toggles 否 to ALLOW and 是 to DENY for the chosen subject, then sends the updated list', async () => {
+    const { say, replies, repository, permissionsChanged } = setup();
+    await say('/權限'); await say('2'); await say('1');
+    expect(await say('2')).toBe(true);
+    expect(repository.permissionWrites).toEqual([{ input: { accountId: 'a', subject: { kind: 'USER', mid: 'u-alice' }, chatType: 'group', chatId: 'g1',
+      permission: 'records.query_all_chats', effect: 'ALLOW', expectedVersion: 0 }, actor: 'line_primary_admin' }]);
+    expect(replies().at(-1)).toBe(capList(['是', '是', '是', '是', '是', '否'], 'HA', '已變更：查詢所有聊天室紀錄 → 是\n\n'));
+    expect(permissionsChanged()).toBe(1);
+    expect(await say('1')).toBe(true);
+    expect(repository.permissionWrites.at(-1)!.input).toMatchObject({ permission: 'records.query_current_chat', effect: 'DENY', expectedVersion: 0 });
+    expect(replies().at(-1)).toBe(capList(['否', '是', '是', '是', '是', '否'], 'HA', '已變更：查詢本聊天室紀錄 → 否\n\n'));
+    // The personal view writes to the direct chat of the person.
+    const personal = setup();
+    await personal.say('/權限'); await personal.say('4');
+    await personal.say('2');
+    expect(personal.repository.permissionWrites[0]!.input).toMatchObject({ subject: { kind: 'USER', mid: 'u-alice' }, chatType: 'direct', chatId: 'u-alice',
+      permission: 'records.query_all_chats', effect: 'ALLOW', expectedVersion: 0 });
+  });
+
+  it('toggles several numbers separated by space, comma or 、 in one reply', async () => {
+    for (const reply of ['1 3 4', '1,3,4', '1、3、4', '１，３、４', '4 3 1 1']) {
+      const { say, replies, repository } = setup();
+      await say('/權限'); await say('2'); await say('1');
+      expect(await say(reply)).toBe(true);
+      expect(repository.permissionWrites.map((write) => [write.input.permission, write.input.effect])).toEqual([
+        ['records.query_current_chat', 'DENY'], ['chat_folder.read', 'DENY'], ['chat_folder.write', 'DENY']]);
+      expect(replies().at(-1)).toBe(capList(['否', '否', '否', '否', '是', '否'], 'HA',
+        '已變更：查詢本聊天室紀錄 → 否 / 讀取本聊天室資料夾 → 否 / 寫入本聊天室資料夾 → 否\n\n'));
+    }
+  });
+
+  it('asks for confirmation before turning on 寫入專案資料夾 and applies the whole selection only on 確認', async () => {
+    const { say, replies, repository, permissionsChanged } = setup();
+    await say('/權限'); await say('2'); await say('1');
+    expect(await say('2 6')).toBe(true);
+    expect(replies().at(-1)).toBe('要開啟「寫入專案資料夾」嗎？這會放寬 Agent 權限（同一次選擇的其他項目會一併套用）。\n回覆 y 確認／n 取消（2 分鐘內有效）');
+    expect(repository.permissionWrites).toEqual([]);
+    expect(await say('確認')).toBe(true);
+    expect(repository.permissionWrites.map((write) => [write.input.permission, write.input.effect])).toEqual([
+      ['records.query_all_chats', 'ALLOW'], ['project_folder.write', 'ALLOW']]);
+    expect(replies().at(-1)).toBe(capList(['是', '是', '是', '是', '是', '是'], 'HA', '已變更：查詢所有聊天室紀錄 → 是 / 寫入專案資料夾 → 是\n\n'));
+    expect(permissionsChanged()).toBe(1);
+    // Any other text cancels and writes nothing; turning the risky item OFF needs no confirmation.
+    const cancel = setup();
+    await cancel.say('/權限'); await cancel.say('2'); await cancel.say('1'); await cancel.say('6');
+    expect(await cancel.say('不要')).toBe(true);
+    expect(cancel.replies().at(-1)).toBe('已取消');
+    expect(cancel.repository.permissionWrites).toEqual([]);
+    const off = setup();
+    off.repository.state.rules.push({ subject: { kind: 'USER', mid: 'u-alice' }, chatType: 'group', chatId: 'g1', permission: 'project_folder.write', effect: 'ALLOW', version: 1 });
+    await off.say('/權限'); await off.say('2'); await off.say('1'); await off.say('6');
+    expect(off.repository.permissionWrites).toMatchObject([{ input: { permission: 'project_folder.write', effect: 'DENY', expectedVersion: 1 } }]);
+  });
+
+  it('y confirms and n cancels the 寫入專案資料夾 confirmation', async () => {
+    const yes = setup();
+    await yes.say('/權限'); await yes.say('2'); await yes.say('1'); await yes.say('6');
+    expect(await yes.say('y')).toBe(true);
+    expect(yes.repository.permissionWrites.map((write) => write.input.permission)).toEqual(['project_folder.write']);
+    const no = setup();
+    await no.say('/權限'); await no.say('2'); await no.say('1'); await no.say('6');
+    expect(await no.say('n')).toBe(true);
+    expect(no.replies().at(-1)).toBe('已取消');
+    expect(no.repository.permissionWrites).toEqual([]);
+  });
+
+  it('never writes the local workspace capability: it is not listed and a crafted number cancels', async () => {
+    for (const crafted of ['7', '0 7', 'agent.local_tools']) {
+      const { say, replies, repository } = setup();
+      await say('/權限'); await say('2'); await say('1');
+      expect(replies().at(-1)!.split('\n').slice(1, 7).join('\n')).not.toContain('本機工作區');
+      expect(await say(crafted)).toBe(true);
+      expect(replies().at(-1)).toBe('已取消');
+      expect(repository.permissionWrites).toEqual([]);
+    }
+  });
+
+  it('ends with 0, 完成, done or 結束 and a short summary, and cancels on anything that is not a valid reply', async () => {
+    for (const word of ['0', '完成', 'done', 'DONE', '結束']) {
+      const { say, replies, service } = setup();
+      await say('/權限'); await say('2'); await say('1'); await say('2');
+      expect(await say(word)).toBe(true);
+      expect(replies().at(-1)).toBe('已結束權限設定，本次共變更 1 項。');
+      expect(service.sizes().pending).toBe(0);
+      expect(await say('1')).toBe(false);
+    }
+    for (const bad of ['hello', '8', '1 x']) {
+      const { say, replies, repository } = setup();
+      await say('/權限'); await say('2'); await say('1');
+      expect(await say(bad)).toBe(true);
+      expect(replies().at(-1)).toBe('已取消');
+      expect(repository.permissionWrites).toEqual([]);
+    }
   });
 
   it('accepts /permissions in any case and surrounding whitespace', async () => {
     for (const text of ['/permissions', '/PERMISSIONS', '/Permissions', '  /權限  ', '\n/permissions\t']) {
       const { say, replies } = setup();
       expect(await say(text)).toBe(true);
-      expect(replies()).toEqual([LIST_WORKSPACE_WRITE]);
+      expect(replies()).toEqual([TARGET_LIST]);
     }
     const { say } = setup();
     expect(await say('/權限 1')).toBe(false);
@@ -229,8 +403,8 @@ describe('PermissionCommandService', () => {
   });
 
   it('replies without writing when the same level is chosen and clears pending', async () => {
-    const { say, replies, repository, changed } = setup();
-    await say('/權限');
+    const { say, replies, repository, changed, levels } = setup();
+    await levels();
     expect(await say('2')).toBe(true);
     expect(replies().at(-1)).toBe('已經是 工作區可寫，未變更');
     expect(repository.writes).toEqual([]);
@@ -239,8 +413,8 @@ describe('PermissionCommandService', () => {
   });
 
   it('applies a tighter level immediately with the list-time version and the LINE admin actor', async () => {
-    const { say, replies, repository, changed } = setup('trust');
-    await say('/權限');
+    const { say, replies, repository, changed, levels } = setup('trust');
+    await levels();
     expect(await say('1')).toBe(true);
     expect(repository.writes).toEqual([{ input: { level: 'read_only', approvalTimeoutSeconds: 60, timeoutAction: 'DENY', expectedVersion: 5 }, actor: 'line_primary_admin' }]);
     expect(replies().at(-1)).toBe('已改為 唯讀');
@@ -250,8 +424,8 @@ describe('PermissionCommandService', () => {
 
   it('asks before loosening and applies only on 確認, 是, yes or YES', async () => {
     for (const answer of ['確認', '是', 'yes', 'YES', ' yes ']) {
-      const { say, replies, repository, changed } = setup();
-      await say('/權限');
+      const { say, replies, repository, changed, levels } = setup();
+      await levels();
       expect(await say('4')).toBe(true);
       expect(replies().at(-1)).toBe(LOOSEN_FULL);
       expect(repository.writes).toEqual([]);
@@ -265,8 +439,8 @@ describe('PermissionCommandService', () => {
 
   it('cancels a loosening confirmation on any other text and keeps it from the Agent', async () => {
     for (const answer of ['不要', 'no', '4', '確認一下']) {
-      const { say, replies, repository } = setup();
-      await say('/權限');
+      const { say, replies, repository, levels } = setup();
+      await levels();
       await say('3');
       expect(await say(answer)).toBe(true);
       expect(replies().at(-1)).toBe('已取消');
@@ -276,34 +450,36 @@ describe('PermissionCommandService', () => {
   });
 
   it('releases a non-number at the choose stage to the Agent and clears pending', async () => {
-    const { say, replies, service } = setup();
-    await say('/權限');
+    const { say, replies, service, levels } = setup();
+    await levels();
     expect(service.classify(envelope('hello'), true)).toEqual({ kind: 'clear', pendingId: expect.any(Number) });
     expect(await say('hello')).toBe(false);
     expect(await say('5')).toBe(false);
     expect(await say('1')).toBe(false);
-    expect(replies()).toEqual([LIST_WORKSPACE_WRITE]);
+    expect(replies()).toEqual([TARGET_LIST, LIST_WORKSPACE_WRITE]);
   });
 
   it('accepts full-width digits', async () => {
     const { say, replies, repository } = setup('full');
     await say('/權限');
     expect(await say('１')).toBe(true);
+    expect(await say('１')).toBe(true);
     expect(replies().at(-1)).toBe('已改為 唯讀');
     expect(repository.writes).toHaveLength(1);
     const loosen = setup();
     await loosen.say('/權限');
+    await loosen.say('１');
     expect(await loosen.say('３')).toBe(true);
-    expect(loosen.replies().at(-1)).toBe('確定要放寬為 信任？回覆「確認」套用，回覆其他內容取消（2 分鐘內有效）');
+    expect(loosen.replies().at(-1)).toBe('確定要放寬為 信任？\n回覆 y 確認／n 取消（2 分鐘內有效）');
   });
 
   it('expires the choose stage at 120 seconds', async () => {
     const early = setup('full');
-    await early.say('/權限');
+    await early.levels();
     early.clock.now = 119_999;
     expect(await early.say('1')).toBe(true);
     const late = setup('full');
-    await late.say('/權限');
+    await late.levels();
     late.clock.now = 120_000;
     expect(await late.say('1')).toBe(false);
     expect(late.repository.writes).toEqual([]);
@@ -312,14 +488,14 @@ describe('PermissionCommandService', () => {
 
   it('expires the confirm stage at 120 seconds', async () => {
     const early = setup();
-    await early.say('/權限');
+    await early.levels();
     early.clock.now = 10_000;
     await early.say('4');
     early.clock.now = 129_999;
     expect(await early.say('確認')).toBe(true);
     expect(early.repository.writes).toHaveLength(1);
     const late = setup();
-    await late.say('/權限');
+    await late.levels();
     late.clock.now = 10_000;
     await late.say('4');
     late.clock.now = 130_000;
@@ -329,16 +505,17 @@ describe('PermissionCommandService', () => {
 
   it('(f) measures expiry from arming, not from classification or creation', async () => {
     const { service, repository, clock, say, replies, idle } = setup('full');
+    await say('/權限');
     const read = deferred();
     repository.gates.push(read.promise);
-    const list = envelope('/權限');
+    const list = envelope('1');
     service.enqueue(list, service.classify(list, true)!);
     clock.now = 50_000;
     await flush();
     expect(service.classify(envelope('1'), true)).toBeNull();
     read.resolve();
     await idle();
-    expect(replies()).toEqual([listText('full')]);
+    expect(replies()).toEqual([TARGET_LIST, listText('full')]);
     clock.now = 169_999;
     expect(service.classify(envelope('1'), true)).toEqual({ kind: 'reply', pendingId: expect.any(Number) });
     clock.now = 170_000;
@@ -348,7 +525,7 @@ describe('PermissionCommandService', () => {
 
     // The confirm question is likewise armed when its send resolves as sent.
     const confirm = setup();
-    await confirm.say('/權限');
+    await confirm.levels();
     const sendGate = deferred();
     confirm.transport.respond = async (command) => { await sendGate.promise; return sentResult(command); };
     const choice = envelope('4');
@@ -366,14 +543,14 @@ describe('PermissionCommandService', () => {
 
   it('replies with the conflict text only for a version conflict', async () => {
     const tighten = setup('trust');
-    await tighten.say('/權限');
+    await tighten.levels();
     tighten.repository.policy.version = 6;
     await tighten.say('1');
     expect(tighten.replies().at(-1)).toBe(CONFLICT);
     expect(tighten.changed()).toBe(0);
 
     const loosen = setup();
-    await loosen.say('/權限');
+    await loosen.levels();
     await loosen.say('4');
     loosen.repository.policy.version = 6;
     await loosen.say('確認');
@@ -383,7 +560,7 @@ describe('PermissionCommandService', () => {
 
   it.each(['en', 'zh-TW', 'ja', 'ko'] as const)('localizes conflict and failure outcomes in %s without changing authorization', async (locale) => {
     const conflict = setup('trust', locale);
-    await conflict.say('/permissions');
+    await conflict.say('/permissions'); await conflict.say('1');
     conflict.repository.policy.version += 1;
     await conflict.say('1');
     expect(conflict.replies().at(-1)).toBe(linePrompt(locale, 'permissionConflict'));
@@ -391,7 +568,7 @@ describe('PermissionCommandService', () => {
     expect(conflict.repository.audit).toEqual([]);
 
     const failure = setup('trust', locale);
-    await failure.say('/permissions');
+    await failure.say('/permissions'); await failure.say('1');
     failure.repository.setError = new Error('write failed');
     await failure.say('1');
     expect(failure.replies().at(-1)).toBe(linePrompt(locale, 'permissionFailure'));
@@ -401,22 +578,22 @@ describe('PermissionCommandService', () => {
 
   it('replies with the generic failure text for any other error', async () => {
     const write = setup('trust');
-    await write.say('/權限');
+    await write.levels();
     write.repository.setError = new AgentPermissionError('INVALID_POLICY', 'bad');
     await write.say('1');
     expect(write.replies().at(-1)).toBe(FAILURE);
 
     const plain = setup('trust');
-    await plain.say('/權限');
+    await plain.levels();
     plain.repository.setError = new Error('PERMISSION_VERSION_CONFLICT');
     await plain.say('1');
     expect(plain.replies().at(-1)).toBe(FAILURE);
 
     const list = setup();
-    list.repository.getError = new Error('database down');
+    list.repository.stateError = new Error('database down');
     expect(await list.say('/權限')).toBe(true);
     expect(list.replies()).toEqual([FAILURE]);
-    list.repository.getError = null;
+    list.repository.stateError = null;
     // The list was never shown, so the choice is not armed and goes to the Agent.
     expect(await list.say('1')).toBe(false);
     expect(list.replies()).toEqual([FAILURE]);
@@ -439,13 +616,14 @@ describe('PermissionCommandService', () => {
     expect(service.classify(envelope('1'), true)).toBeNull();
     firstRead.resolve();
     await flush();
-    expect(replies()).toEqual([listText('trust')]);
+    expect(replies()).toEqual([TARGET_LIST]);
     // The second list replaced the first with a new, still unarmed entry before its read resolved.
     expect(service.classify(envelope('1'), true)).toBeNull();
     secondRead.resolve();
     await idle();
-    expect(replies()).toEqual([listText('trust'), listText('trust')]);
+    expect(replies()).toEqual([TARGET_LIST, TARGET_LIST]);
     expect(service.classify(envelope('1'), true)).toEqual({ kind: 'reply', pendingId: expect.any(Number) });
+    expect(await say('1')).toBe(true);
     expect(await say('1')).toBe(true);
     expect(repository.writes).toEqual([{ input: { level: 'read_only', approvalTimeoutSeconds: 60, timeoutAction: 'DENY', expectedVersion: 5 }, actor: 'line_primary_admin' }]);
     expect(replies().at(-1)).toBe('已改為 唯讀');
@@ -458,13 +636,13 @@ describe('PermissionCommandService', () => {
     expect(tickets).toEqual([{ kind: 'list' }, null, null]);
     for (const [index, ticket] of tickets.entries()) if (ticket) await run(batch[index]!, ticket);
     expect(repository.writes).toEqual([]);
-    expect(replies()).toEqual([LIST_WORKSPACE_WRITE]);
+    expect(replies()).toEqual([TARGET_LIST]);
     expect(service.classify(envelope('4'), true)).toEqual({ kind: 'reply', pendingId: expect.any(Number) });
   });
 
   it('(c) answers a stale reply ticket with the expired text and writes nothing', async () => {
-    const { service, repository, replies, say, run } = setup('full');
-    await say('/權限');
+    const { service, repository, replies, say, run, levels } = setup('full');
+    await levels();
     const choice = envelope('3');
     const stale = service.classify(choice, true)!;
     expect(stale.kind).toBe('reply');
@@ -480,17 +658,18 @@ describe('PermissionCommandService', () => {
     expect(replies().at(-1)).toBe(STALE);
     expect(repository.writes).toEqual([]);
     expect(await say('1')).toBe(true);
+    expect(await say('1')).toBe(true);
     expect(replies().at(-1)).toBe('已改為 唯讀');
 
     // Applying the same reply ticket twice writes once; the second is stale.
     const twice = setup('trust');
-    await twice.say('/權限');
+    await twice.levels();
     const one = envelope('1');
     const ticket = twice.service.classify(one, true)!;
     await twice.run(one, ticket);
     await twice.run(one, ticket);
     expect(twice.repository.writes).toHaveLength(1);
-    expect(twice.replies().slice(1)).toEqual(['已改為 唯讀', STALE]);
+    expect(twice.replies().slice(2)).toEqual(['已改為 唯讀', STALE]);
   });
 
   it('(d) leaves an entry unarmed when its prompt send throws', async () => {
@@ -503,13 +682,13 @@ describe('PermissionCommandService', () => {
 
     // A failed confirm prompt consumes the choice and leaves the confirmation unarmed.
     const loosen = setup();
-    await loosen.say('/權限');
+    await loosen.levels();
     loosen.transport.respond = async () => { throw new Error('LINE send failed'); };
     expect(await loosen.say('4')).toBe(true);
     loosen.transport.respond = async (command) => sentResult(command);
     expect(await loosen.say('確認')).toBe(false);
     expect(loosen.repository.writes).toEqual([]);
-    expect(await loosen.say('/權限')).toBe(true);
+    await loosen.levels();
     expect(await loosen.say('4')).toBe(true);
     expect(loosen.replies().at(-1)).toBe(LOOSEN_FULL);
   });
@@ -519,7 +698,7 @@ describe('PermissionCommandService', () => {
       const list = setup('trust');
       list.transport.respond = async (command) => sentResult(command, { status, messageId: null, error: 'not sent' });
       expect(await list.say('/權限')).toBe(true);
-      expect(list.replies()).toEqual([listText('trust')]);
+      expect(list.replies()).toEqual([TARGET_LIST]);
       expect(list.service.classify(envelope('1'), true)).toBeNull();
       expect(await list.say('1')).toBe(false);
       expect(await list.say('確認')).toBe(false);
@@ -527,7 +706,7 @@ describe('PermissionCommandService', () => {
       expect(list.replies()).toHaveLength(1);
 
       const confirm = setup();
-      await confirm.say('/權限');
+      await confirm.levels();
       confirm.transport.respond = async (command) => sentResult(command, { status, messageId: null, error: 'not sent' });
       expect(await confirm.say('4')).toBe(true);
       expect(confirm.replies().at(-1)).toBe(LOOSEN_FULL);
@@ -573,23 +752,23 @@ describe('PermissionCommandService', () => {
   });
 
   it('(e) classify has no side effects when repeated or out of order', async () => {
-    const { service, repository, replies, say } = setup();
+    const { service, repository, replies, say, levels } = setup();
     for (let index = 0; index < 3; index += 1) {
       expect(service.classify(envelope('/權限'), true)).toEqual({ kind: 'list' });
       expect(service.classify(envelope('1'), true)).toBeNull();
     }
-    expect(repository.reads).toBe(0);
+    expect(repository.reads + repository.stateReads).toBe(0);
     expect(replies()).toEqual([]);
     expect(service.sizes()).toEqual({ queued: 0, runners: 0, pending: 0 });
-    await say('/權限');
+    await levels();
     const tickets = ['hello', '3', '/權限', '確認', '3', 'hello'].map((text) => service.classify(envelope(text), true));
     const id = (tickets[1] as Extract<PermissionTicket, { kind: 'reply' }>).pendingId;
     expect(tickets).toEqual([{ kind: 'clear', pendingId: id }, { kind: 'reply', pendingId: id }, { kind: 'list' },
       { kind: 'clear', pendingId: id }, { kind: 'reply', pendingId: id }, { kind: 'clear', pendingId: id }]);
     expect(repository.reads).toBe(1);
-    expect(replies()).toEqual([LIST_WORKSPACE_WRITE]);
+    expect(replies()).toEqual([TARGET_LIST, LIST_WORKSPACE_WRITE]);
     expect(await say('3')).toBe(true);
-    expect(replies().at(-1)).toBe('確定要放寬為 信任？回覆「確認」套用，回覆其他內容取消（2 分鐘內有效）');
+    expect(replies().at(-1)).toBe('確定要放寬為 信任？\n回覆 y 確認／n 取消（2 分鐘內有效）');
   });
 
   it('does not classify non-admin, group, non-live or non-text messages', () => {
@@ -646,18 +825,18 @@ describe('PermissionCommandService', () => {
     }
     expect(service.sizes()).toMatchObject({ queued: 64, runners: 61 });
     await until(() => service.sizes().runners === 1);
-    expect(replies()).toEqual(Array(60).fill(listText('trust')));
+    expect(replies()).toEqual(Array(60).fill(TARGET_LIST));
     expect(service.sizes()).toMatchObject({ queued: 4, runners: 1 });
     read.resolve();
     await idle();
     expect(replies()).toHaveLength(64);
-    expect(repository.reads).toBe(64);
+    expect(repository.stateReads).toBe(64);
     expect(repository.writes).toEqual([]);
     expect(service.sizes()).toEqual({ queued: 0, runners: 0, pending: 61 });
 
     // A held send keeps the backlog bounded too; overflow choices are neither answered nor written.
     const held = setup('full');
-    await held.say('/權限');
+    await held.levels();
     const sendGate = deferred();
     held.transport.respond = async (command) => { await sendGate.promise; return sentResult(command); };
     const first = envelope('1');
@@ -667,12 +846,12 @@ describe('PermissionCommandService', () => {
     sendGate.resolve();
     await held.idle();
     expect(held.repository.writes).toHaveLength(1);
-    expect(held.replies().slice(1)).toEqual(['已改為 唯讀', STALE, STALE, STALE]);
+    expect(held.replies().slice(2)).toEqual(['已改為 唯讀', STALE, STALE, STALE]);
   });
 
   it('removes a runner once its queue is empty and starts a fresh one later', async () => {
-    const { service, say } = setup('trust');
-    await say('/權限');
+    const { service, say, levels } = setup('trust');
+    await levels();
     expect(service.sizes()).toEqual({ queued: 0, runners: 0, pending: 1 });
     await say('4');
     expect(service.sizes()).toEqual({ queued: 0, runners: 0, pending: 1 });
@@ -681,26 +860,26 @@ describe('PermissionCommandService', () => {
   });
 
   it('notifies a policy change only after a successful write', async () => {
-    const { say, repository, changed } = setup('trust');
-    await say('/權限'); await say('3');
-    await say('/權限'); await say('4'); await say('不要');
-    await say('/權限'); repository.setError = new Error('boom'); await say('1');
+    const { say, repository, changed, levels } = setup('trust');
+    await levels(); await say('3');
+    await levels(); await say('4'); await say('不要');
+    await levels(); repository.setError = new Error('boom'); await say('1');
     expect(changed()).toBe(0);
     repository.setError = null;
-    await say('/權限'); await say('1');
+    await levels(); await say('1');
     expect(changed()).toBe(1);
   });
 
   it('holds the slot through a stalled write without a failure reply, then reports the committed result', async () => {
-    const { service, repository, replies, say, idle, outstanding, changed } = setup('trust');
-    await say('/權限');
+    const { service, repository, replies, say, idle, outstanding, changed, levels } = setup('trust');
+    await levels();
     const gate = deferred();
     repository.writeGate = gate.promise;
     const choice = envelope('1');
     service.enqueue(choice, service.classify(choice, true)!);
     await until(() => repository.writes.length === 1);
     await flush();
-    expect(replies()).toEqual([listText('trust')]);
+    expect(replies()).toEqual([TARGET_LIST, listText('trust')]);
     expect(service.sizes()).toMatchObject({ queued: 1, runners: 1 });
     expect(outstanding.current).toBe(1);
     // The in-flight write keeps its slot, so only 3 more tickets fit in this chat.
@@ -710,7 +889,7 @@ describe('PermissionCommandService', () => {
     expect(repository.audit).toEqual([]);
     gate.resolve();
     await idle();
-    expect(replies()).toEqual([listText('trust'), '已改為 唯讀', listText('read_only'), listText('read_only'), listText('read_only')]);
+    expect(replies()).toEqual([TARGET_LIST, listText('trust'), '已改為 唯讀', TARGET_LIST, TARGET_LIST, TARGET_LIST]);
     expect(repository.policy).toMatchObject({ level: 'read_only', approvalTimeoutSeconds: 60, version: 6 });
     expect(repository.audit).toEqual([{ version: 6, level: 'read_only', actor: 'line_primary_admin' }]);
     expect(changed()).toBe(1);
@@ -719,8 +898,8 @@ describe('PermissionCommandService', () => {
   });
 
   it('close() waits for a stalled write, keeps its committed result and sends nothing afterwards', async () => {
-    const { service, repository, transport, replies, say, outstanding } = setup('trust');
-    await say('/權限');
+    const { service, repository, transport, replies, outstanding, levels } = setup('trust');
+    await levels();
     const gate = deferred();
     repository.writeGate = gate.promise;
     const choice = envelope('1');
@@ -736,21 +915,21 @@ describe('PermissionCommandService', () => {
     await closing;
     expect(repository.policy).toMatchObject({ level: 'read_only', version: 6 });
     expect(repository.audit).toEqual([{ version: 6, level: 'read_only', actor: 'line_primary_admin' }]);
-    expect(replies()).toEqual([listText('trust')]);
+    expect(replies()).toEqual([TARGET_LIST, listText('trust')]);
     expect(repository.reads).toBe(2);
     expect(service.sizes()).toEqual({ queued: 0, runners: 0, pending: 0 });
     expect(outstanding.current).toBe(0);
     // After close resolves no repository or transport call happens.
-    const calls = { reads: repository.reads, writes: repository.writes.length, sends: transport.commands.length };
+    const calls = { reads: repository.reads, stateReads: repository.stateReads, writes: repository.writes.length, sends: transport.commands.length };
     service.enqueue(envelope('/權限'), { kind: 'list' });
     expect(service.classify(envelope('/權限'), true)).toBeNull();
     await flush();
-    expect({ reads: repository.reads, writes: repository.writes.length, sends: transport.commands.length }).toEqual(calls);
+    expect({ reads: repository.reads, stateReads: repository.stateReads, writes: repository.writes.length, sends: transport.commands.length }).toEqual(calls);
     expect(service.sizes()).toEqual({ queued: 0, runners: 0, pending: 0 });
 
     // A stalled write that fails during close is not answered either.
     const conflict = setup('trust');
-    await conflict.say('/權限');
+    await conflict.levels();
     const conflictGate = deferred();
     conflict.repository.writeGate = conflictGate.promise;
     const late = envelope('1');
@@ -762,7 +941,7 @@ describe('PermissionCommandService', () => {
     await conflictClosing;
     expect(conflict.repository.policy).toMatchObject({ level: 'trust', version: 9 });
     expect(conflict.repository.audit).toEqual([]);
-    expect(conflict.replies()).toEqual([listText('trust')]);
+    expect(conflict.replies()).toEqual([TARGET_LIST, listText('trust')]);
   });
 
   it('close() aborts a stalled send through its signal and leaves the entry unarmed', async () => {
@@ -802,7 +981,7 @@ describe('PermissionCommandService', () => {
     gate.resolve();
     await closing;
     expect(replies()).toEqual([]);
-    expect(repository.reads).toBe(1);
+    expect(repository.stateReads).toBe(1);
     expect(service.sizes()).toEqual({ queued: 0, runners: 0, pending: 0 });
     expect(outstanding.current).toBe(0);
   });
@@ -837,7 +1016,7 @@ describe('PermissionCommandService', () => {
     expect(outstanding.max).toBeGreaterThan(4);
     expect(outstanding.current).toBe(0);
     expect(replies()).toHaveLength(accepted);
-    expect(repository.reads).toBe(accepted);
+    expect(repository.stateReads).toBe(accepted);
     expect(repository.writes).toEqual([]);
   });
 });

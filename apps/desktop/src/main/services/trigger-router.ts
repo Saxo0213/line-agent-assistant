@@ -45,6 +45,49 @@ export function parseFreeCommand(text: string): FreeCommand | null {
     ? { type: 'free', action: 'on', minutes } : { type: 'free_range' };
 }
 
+/** Fixed prompt for a group message that is only the Agent mention. */
+export const MENTION_ONLY_INSTRUCTION = '使用者在聊天室中只標註了你，沒有附上其他文字。請查看此聊天室最近的訊息，找出該使用者想請你處理的事，然後回答。若找不到明確的請求，請用一句簡短的話問該使用者需要什麼。';
+export const MENTION_CONTEXT_MAX_MESSAGES = 8;
+export const MENTION_CONTEXT_MAX_TEXT = 500;
+
+export interface MentionContextMessage {
+  messageId: string;
+  senderName: string;
+  kind: string;
+  text: string | null;
+  occurredAt: string;
+}
+
+const KIND_PLACEHOLDERS: Record<string, string> = {
+  image: '[圖片]', video: '[影片]', audio: '[語音]', file: '[檔案]', sticker: '[貼圖]', contact: '[聯絡人]', location: '[位置]', rich: '[圖文訊息]',
+};
+const taipeiClock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit', hour12: false });
+
+function mentionContextLine(message: MentionContextMessage): string {
+  const flat = (message.text ?? '').replace(/\s*[\r\n]+\s*/g, ' ').trim();
+  const body = message.kind === 'text' && flat
+    ? (flat.length > MENTION_CONTEXT_MAX_TEXT ? `${flat.slice(0, MENTION_CONTEXT_MAX_TEXT)}…` : flat)
+    : KIND_PLACEHOLDERS[message.kind] ?? '[其他訊息]';
+  const date = new Date(message.occurredAt);
+  const clock = Number.isNaN(date.getTime()) ? '--:--' : taipeiClock.format(date);
+  return `${message.senderName.trim() || '未知發言人'} ${clock} ${body}`;
+}
+
+/**
+ * The prompt for a mention-only message: the fixed instruction plus the newest messages (oldest first, no duplicate ids).
+ * A failed read gives the instruction without context.
+ */
+export async function composeMentionOnlyPrompt(load: () => Promise<MentionContextMessage[]>): Promise<string> {
+  let messages: MentionContextMessage[];
+  try { messages = await load(); } catch { return MENTION_ONLY_INSTRUCTION; }
+  const unique = new Map<string, MentionContextMessage>();
+  for (const message of messages) if (!unique.has(message.messageId)) unique.set(message.messageId, message);
+  const recent = [...unique.values()]
+    .sort((a, b) => Date.parse(a.occurredAt) - Date.parse(b.occurredAt) ||a.messageId.localeCompare(b.messageId))
+    .slice(-MENTION_CONTEXT_MAX_MESSAGES);
+  return recent.length ? `${MENTION_ONLY_INSTRUCTION}\n\n最近的聊天訊息（由舊到新）：\n${recent.map(mentionContextLine).join('\n')}` : MENTION_ONLY_INSTRUCTION;
+}
+
 /** The message text with this account's structured mention removed (the whole text when it carries none), trimmed. */
 function textWithoutOwnMention(envelope: InboundEnvelope, ownMid: string | null): string {
   const text = envelope.text ?? '';
@@ -163,7 +206,8 @@ export interface TriggerContext {
 
 export type TriggerDecision =
   | { type: 'ignore' }
-  | { type: 'prompt'; provider: AgentProvider; prompt: string }
+  /** `mentionOnly`: a group message that is only the Agent mention. The prompt is the fixed instruction; the caller adds the chat context. */
+  | { type: 'prompt'; provider: AgentProvider; prompt: string; mentionOnly?: true }
   | { type: 'stop' | 'new' | 'status' }
   /** Primary Administrator's bare `/agent claude|codex|default`: set or clear this chat's Agent override. */
   | { type: 'agent_provider'; provider: AgentProvider | 'default' }
@@ -247,7 +291,12 @@ function routeNormalTrigger(envelope: InboundEnvelope, context: TriggerContext):
     text = text.slice(0, mention.start) + text.slice(mention.end);
   } else if (!context.senderIsPrimaryAdmin) return { type: 'ignore' };
   text = text.trim();
-  if (!text) return { type: 'ignore' };
+  if (!text) {
+    // A lone mention in a group or room calls the Agent. In free mode the old free-mode path keeps this message.
+    return envelope.chatType !== 'direct' && !context.freeModeActive
+      ? { type: 'prompt', provider: context.defaultProvider, prompt: MENTION_ONLY_INSTRUCTION, mentionOnly: true }
+      : { type: 'ignore' };
+  }
   if (text === '/stop') return { type: 'stop' };
   if (text === '/new') return { type: 'new' };
   if (text === '/status') return { type: 'status' };

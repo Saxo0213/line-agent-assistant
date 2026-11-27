@@ -1,4 +1,4 @@
-import type { IpcRequest, IpcResult, ConversationKey, WritableConversationKey, AppSnapshot, MessageContent, LineMediaTarget, StoredAttachmentPage,
+import type { IpcRequest, IpcResult, ConversationKey, WritableConversationKey, AppSnapshot, MessageContent, LineMediaTarget, StoredAttachmentPage, StoredAttachmentSenders,
   ChatResourceNote, ChatResourceAlbum, ChatResourcePhoto } from '@line-agent/contracts';
 import type { SystemActivityResult, SystemErrorsResult } from '../desktop-protocol.js';
 import type { AttachmentBlockReason, SticonRange } from '@line-agent/contracts';
@@ -55,7 +55,8 @@ export type DesktopServiceFacade = {
   openChatAlbum(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<AlbumOpenResult>;
   openReadableChatAlbumFolder(key: ConversationKey, albumId: string, signal?: AbortSignal): Promise<import('./services/chat-resources.js').ReadableAlbumFolderResult>;
   listAttachmentStates(key: ConversationKey, attachmentIds: readonly string[]): Promise<AttachmentState[]>;
-  listStoredAttachments?(key: ConversationKey, cursor: string | null, limit?: number): Promise<StoredAttachmentPage>;
+  listStoredAttachments?(key: ConversationKey, cursor: string | null, limit?: number, senderId?: string | null): Promise<StoredAttachmentPage>;
+  listStoredAttachmentSenders?(key: ConversationKey): Promise<StoredAttachmentSenders>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: NonNullable<TimelineMessage['agentJobStatus']>; revision: string }>>;
   listAgentStatuses(key: ConversationKey, messageIds: readonly string[]): Promise<Array<{ messageId: string; jobId: string; status: NonNullable<TimelineMessage['agentJobStatus']>; revision: string }>>;
   listWorkRecords(): Promise<WorkRecord[]>;
@@ -66,8 +67,8 @@ export type DesktopServiceFacade = {
   listSystemActivity?(): Promise<SystemActivityResult>;
   listSystemErrors?(): Promise<SystemErrorsResult>;
   controlState(): Promise<{ activeAccountId: string | null; epoch: number; pendingOutbound: number }>;
-  /** True when no Agent job is queued or running and no LINE send is queued or in flight; the automatic updater installs only then. */
-  isIdle?(): Promise<boolean>;
+  /** `idle` is true when no Agent job is queued or running and no LINE send is queued or in flight; the automatic updater installs only then. `reason` names the first busy cause when `idle` is false. */
+  isIdle?(): Promise<{ idle: boolean; reason: 'agent_jobs' | 'deliveries' | 'line_send' | null }>;
   shutdown(): Promise<void>;
 };
 
@@ -99,6 +100,7 @@ export function createDisconnectedFacade(reason = '服務尚未接入；請完�
     async openReadableChatAlbumFolder() { throw new Error(reason); },
     async listAttachmentStates() { return []; },
     async listStoredAttachments() { return { attachments: [], nextCursor: null }; },
+    async listStoredAttachmentSenders() { return { senders: [] }; },
     async listAgentStatuses() { return []; },
     async openAttachment() { return false; },
     async downloadAttachment() { return false; },

@@ -1,4 +1,4 @@
-import { AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
+import { AGENT_ROOM_HISTORY_TOOL_NAME, isChatDownloadFolderToolName, SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME,LIST_SEND_TARGETS_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
 import { lockAndCheckAgentAuthorization, lockAndCheckFreeMode } from './agent-authorization.js';
 import { findSharedAdminChat, type SharedAdminChat } from './agent-repository.js';
@@ -37,6 +37,24 @@ export class McpDomainError extends Error {
  */
 export const mayLineSend = (principalId: string): boolean =>
   principalId === 'internal:ui' || principalId === SCHEDULE_PRINCIPAL_ID || principalId.startsWith('internal:primary_admin:');
+
+/**
+ * Full authority over the download folders of any chat of the account: only the Primary Admin's LINE jobs and the desktop
+ * operator's Agent room jobs. A scheduled run, a room member and an external token have none.
+ * A whitelisted user has the narrower `own_chat` authority (see `ChatFolderScope`).
+ */
+export const mayManageChatDownloadFolders = (principalId: string): boolean =>
+  principalId === 'internal:ui' || principalId.startsWith('internal:primary_admin:');
+
+/**
+ * Authority of an internal principal over download folders.
+ * - `full`: Primary Admin and the Agent room; any chat, absolute paths, the default folder.
+ * - `own_chat`: a whitelisted user's job (direct friend grant); only the chat of the job, classification folders as subfolders of the
+ *   default folder, no change of the default folder. A group free-mode (room member) job has none (null).
+ */
+export type ChatFolderScope = 'full' | 'own_chat';
+/** Message of the PERMISSION_DENIED error for an own-chat principal that asks for the default folder tool; the caller maps it to code ADMIN_ONLY. */
+export const CHAT_FOLDER_ADMIN_ONLY_MESSAGE = 'ADMIN_ONLY';
 
 /**
  * Principal of a scheduled Agent run. Same data scope and permissions as the room operator (internal:ui), but a distinct audit
@@ -315,7 +333,8 @@ export class McpTokenRepository {
     initial: InternalAgentExecutionContext,
     toolName: McpInternalToolName | null,
     includeHistory = toolName === AGENT_ROOM_HISTORY_TOOL_NAME,
-  ): Promise<{ principalId: string; scope: InternalDataScope; permissions: EffectivePermissions; history: { allowed: boolean; shared: SharedAdminChat | null } }> {
+  ): Promise<{ principalId: string; scope: InternalDataScope; permissions: EffectivePermissions; history: { allowed: boolean; shared: SharedAdminChat | null };
+    chatFolderScope: ChatFolderScope | null }> {
     let context: { sourceType: 'ui' } | { sourceType: 'schedule'; accountScope: string[] | null } | { sourceType: 'line'; jobId: string };
     if (initial.sourceType === 'job') {
       const row = (await client.query<{ account_id: string | null; generation: string | number; status: string; source_type: string; mcp_account_scope: string[] | null }>(
@@ -334,11 +353,11 @@ export class McpTokenRepository {
       // NULL is legacy/internal full operator scope; externally created schedules carry their fixed account scope.
       return { principalId: SCHEDULE_PRINCIPAL_ID,
         scope: context.accountScope === null ? { kind: 'full' } : { kind: 'accounts', accountIds: context.accountScope },
-        permissions: allPermissions('ALLOW'), history: { allowed: false, shared: null } };
+        permissions: allPermissions('ALLOW'), history: { allowed: false, shared: null }, chatFolderScope: null };
     }
     if (context.sourceType === 'ui') {
       return { principalId: 'internal:ui', scope: { kind: 'full' }, permissions: allPermissions('ALLOW'),
-        history: { allowed: true, shared: includeHistory ? await findSharedAdminChat(client) : null } };
+        history: { allowed: true, shared: includeHistory ? await findSharedAdminChat(client) : null }, chatFolderScope: 'full' };
     }
     const jobResult = await client.query<{
       job_id: string;
@@ -376,6 +395,8 @@ export class McpTokenRepository {
           : { kind: 'chat', accountId: job.account_id, chatType: job.chat_type, chatId: job.chat_id, linkedChats: [] },
         permissions: memberPermissions,
         history: { allowed: false, shared: null },
+        // A room member (free mode) is not a whitelisted user: no download folder authority.
+        chatFolderScope: null,
       };
     }
     const adminUserId = await findPrimaryAdminUser(client, job.account_id, job.source_message_id);
@@ -384,7 +405,7 @@ export class McpTokenRepository {
       const shared = includeHistory && job.chat_type === 'direct' ? await findSharedAdminChat(client) : null;
       const sharedHere = shared !== null && shared.accountId === job.account_id && shared.adminMid === job.chat_id;
       return { principalId: `internal:primary_admin:${adminUserId}`, scope: { kind: 'full' }, permissions: allPermissions('ALLOW'),
-        history: { allowed: sharedHere, shared: sharedHere ? shared : null } };
+        history: { allowed: sharedHere, shared: sharedHere ? shared : null }, chatFolderScope: 'full' };
     }
     // Whitelisted friend (1:1) or whitelisted group member: only while the stored grant still passes the same
     // predicate message admission uses; the effective permissions then decide the scope (current chat by default).
@@ -413,6 +434,8 @@ export class McpTokenRepository {
               linkedChats: await resolveLinkedChats(client, job.account_id, sender!.sender_id) },
         permissions,
         history: { allowed: false, shared: null },
+        // Whitelisted user: the grant was rechecked above in this transaction.
+        chatFolderScope: 'own_chat',
       };
     }
     return this.rejectInternal(client, toolName, [job.account_id], 'Only the verified Primary Administrator or a granted chat participant may invoke internal MCP archive queries from LINE.');
@@ -427,10 +450,11 @@ export class McpTokenRepository {
    * Like verifyInternalAgent, plus whether the Agent room history and LINE send tools may be listed (hints; tools/call
    * re-checks). `lineSend` is true only for the Primary Admin and the desktop operator (internal:ui).
    */
-  async verifyInternalAgentAccess(input: { context: InternalAgentExecutionContext; signal?: AbortSignal }): Promise<{ permissions: EffectivePermissions; roomHistory: boolean; lineSend: boolean }> {
+  async verifyInternalAgentAccess(input: { context: InternalAgentExecutionContext; signal?: AbortSignal }): Promise<{ permissions: EffectivePermissions; roomHistory: boolean; lineSend: boolean; chatFolders: boolean; chatFolderScope: ChatFolderScope | null }> {
     return this.withMcpTransaction(input.signal, async (client) => {
       const resolved = await this.resolveInternalPrincipal(client, input.context, null, true);
-      return { permissions: resolved.permissions, roomHistory: resolved.history.allowed, lineSend: mayLineSend(resolved.principalId) };
+      return { permissions: resolved.permissions, roomHistory: resolved.history.allowed, lineSend: mayLineSend(resolved.principalId),
+        chatFolders: resolved.chatFolderScope !== null, chatFolderScope: resolved.chatFolderScope };
     });
   }
 
@@ -455,11 +479,15 @@ export class McpTokenRepository {
       accountScope?: readonly string[] | null;
       /** Agent room history only: the admin-direct chat shared at this call, or null; pass to queryAgentRoomHistory. */
       sharedAdminChat?: SharedAdminChat | null;
-    }) => Promise<{ data: T; resultCount?: number }>;
+      /** Download folder tools only: the authority of the principal, re-derived in this transaction. */
+      chatFolderScope?: ChatFolderScope;
+    }) => Promise<{ data: T; resultCount?: number;
+      /** Download folder tools only: the call was refused by the tool body; it is audited as AUTH_REJECTED with this disposition. */
+      refused?: 'SCOPE_DENIED' | 'PERMISSION_DENIED' }>;
   }): Promise<T> {
     return this.withMcpTransaction(input.signal, async (client) => {
 
-      const { principalId, scope, permissions, history } = await this.resolveInternalPrincipal(client, input.context, input.toolName);
+      const { principalId, scope, permissions, history, chatFolderScope } = await this.resolveInternalPrincipal(client, input.context, input.toolName);
 
       // Agent room history: the Agent room (internal:ui) or the admin-direct LINE job while the room shares that chat.
       // Re-derived from durable state on every call; tools/list is only a hint.
@@ -479,6 +507,40 @@ export class McpTokenRepository {
           tokenId: null, principalId, initiator: 'internal_agent', action: 'TOOL_CALLED', toolName: input.toolName,
           accountScopes: scope.kind === 'accounts' ? [...scope.accountIds] : [], grantVersion: null, disposition: 'ALLOWED', resultCount: resultCount ?? null,
         });
+        return data;
+      }
+
+      // Download folder tools: the Primary Admin and the Agent room (full), or a whitelisted user (own chat only), re-derived on every
+      // call. The tool body resolves the target chat inside this transaction and applies the own-chat limits; the folder change runs
+      // after it commits.
+      if (isChatDownloadFolderToolName(input.toolName)) {
+        // A whitelisted user may not set or clear the default folder; refused here, before the tool body runs.
+        if (chatFolderScope === 'own_chat' && input.toolName === SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME) {
+          await this.insertAudit(client, {
+            tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
+            accountScopes: [], grantVersion: null, disposition: 'PERMISSION_DENIED', resultCount: null,
+          });
+          await client.query('COMMIT');
+          throw new McpDomainError('PERMISSION_DENIED', CHAT_FOLDER_ADMIN_ONLY_MESSAGE);
+        }
+        if (chatFolderScope === null) {
+          await this.insertAudit(client, {
+            tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
+            accountScopes: [], grantVersion: null, disposition: 'PERMISSION_DENIED', resultCount: null,
+          });
+          await client.query('COMMIT');
+          throw new McpDomainError('PERMISSION_DENIED', 'This Agent job does not have permission to use this tool.');
+        }
+        const live = (await client.query<{ account_id: string }>("SELECT account_id FROM line_accounts WHERE mode <> 'PAUSED' ORDER BY account_id ASC")).rows.map((row) => row.account_id);
+        const requested = input.requestedAccountId?.trim();
+        if (requested && !live.includes(requested)) return this.rejectInternal(client, input.toolName, [requested], `Requested LINE account "${requested}" is unavailable or paused.`);
+        const authorizedAccountIds = requested ? [requested] : live;
+        const { data, resultCount, refused } = await input.execute({ client, principalId, authorizedAccountIds, ownLineNamesOnly: false, chatFolderScope });
+        await this.insertAudit(client, refused
+          ? { tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
+            accountScopes: authorizedAccountIds, grantVersion: null, disposition: refused, resultCount: null }
+          : { tokenId: null, principalId, initiator: 'internal_agent', action: 'TOOL_CALLED', toolName: input.toolName,
+            accountScopes: authorizedAccountIds, grantVersion: null, disposition: 'ALLOWED', resultCount: resultCount ?? null });
         return data;
       }
 

@@ -129,7 +129,7 @@ function reportAutoInstallEvent(event: AutoInstallEvent): void {
   const safeVersion = (value: string | null | undefined) => value && /^[0-9.]{1,32}$/.test(value) ? value : 'unknown';
   const toVersion = safeVersion(event.version);
   const fromVersion = event.phase === 'installed' ? safeVersion(event.fromVersion) : safeVersion(app.getVersion());
-  console.info(`[auto-update] ${event.phase} from=${fromVersion} to=${toVersion}${event.viaExit ? ' via=exit' : ''}`);
+  console.info(`[auto-update] ${event.phase} from=${fromVersion} to=${toVersion}${event.viaExit ? ' via=exit' : ''}${event.manual ? ' via=manual' : ''}`);
   if (event.phase === 'download_started') return;
   const code = safeErrorCode(event.error);
   try {
@@ -138,7 +138,7 @@ function reportAutoInstallEvent(event: AutoInstallEvent): void {
       return;
     }
     const failed = event.phase === 'install_failed' || event.phase === 'install_given_up';
-    const detail = `phase:${event.phase}:from:${fromVersion}:to:${toVersion}${failed && code ? `:code:${code}` : ''}${event.viaExit ? ':via:exit' : ''}`;
+    const detail = `phase:${event.phase}:from:${fromVersion}:to:${toVersion}${failed && code ? `:code:${code}` : ''}${event.viaExit ? ':via:exit' : ''}${event.manual ? ':via:manual' : ''}`;
     const diagnostic: SafeDiagnostic = { operation: 'unknown', stage: 'prepare', category: 'unknown', recovery: 'none', detail, ...(failed ? { outcome: 'failed' as const } : {}) };
     auditSink().outcome('app_auto_update', failed ? 'failed' : 'succeeded', { initiator: 'system', diagnostic });
   } catch (error) { console.warn(`[auto-update] audit unavailable ${safeErrorCode(error) ?? 'UNKNOWN'}`); }
@@ -350,6 +350,7 @@ async function initializeServices(): Promise<void> {
       } }),
     attachmentBrokerHelperPath: path.join(path.dirname(workerEntry), 'native', 'AttachmentBroker.exe'),
     freeModeJudgeDirectory: path.join(app.getPath('userData'), 'free-mode-judge'),
+    attachmentClassifierDirectory: path.join(app.getPath('userData'), 'attachment-classifier'),
     chatResourceDiagnosticsDirectory: app.getPath('userData'),
     projectFolderProtectedPaths: [app.getPath('userData'), app.getAppPath(), path.dirname(process.execPath), process.resourcesPath,
       ...(process.env.LOCALAPPDATA ? [path.join(process.env.LOCALAPPDATA, 'LineAgentAssistant'), path.join(process.env.LOCALAPPDATA, 'LINEJS')] : [])]
@@ -531,7 +532,7 @@ async function createWindow(setupOnly = false) {
   updateCheck ??= createUpdateCheckService({ currentVersion: app.getVersion(), fetch: (url, init) => net.fetch(url, init),
     canAutoInstall: app.isPackaged, getUpdater: loadAppUpdater, prepareInstall: () => lifecycle.prepareExit(),
     // No connected service means no Agent job and no LINE send exist, so the app counts as idle.
-    isIdle: async () => connectedService?.isIdle ? connectedService.isIdle() : true,
+    isIdle: async () => connectedService?.isIdle ? connectedService.isIdle() : { idle: true, reason: null },
     onAutoInstall: reportAutoInstallEvent,
     store: createFileUpdateCheckStore(path.join(app.getPath('userData'), 'update-check.json')),
     openExternal: (url) => shell.openExternal(url),
