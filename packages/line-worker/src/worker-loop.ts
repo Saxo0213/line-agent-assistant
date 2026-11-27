@@ -278,6 +278,12 @@ export class LineWorkerLoop {
   // Chats that arrived after the full catalog are read once per session (official talkChat/fetchTalkChats: getChats for unknown mids).
   readonly #knownChatIds = new Set<string>();
   readonly #pendingDetailIds = new Set<string>();
+  /** Member ids of all group and room items of the emitted catalogs of this session. */
+  readonly #catalogMemberIds = new Set<string>();
+  /** Sender ids that already caused one detail refresh in this session. */
+  readonly #refreshedSenderIds = new Set<string>();
+  /** Known chats that wait for a detail refresh because of a sender who is not in the catalog: chat id to sender ids. */
+  readonly #memberRefreshSenders = new Map<string, Set<string>>();
   #detailFlight: Promise<void> | undefined;
   #detailRetryAttempt = 0;
   #detailRetryAtTick = 0;
@@ -720,16 +726,40 @@ export class LineWorkerLoop {
     this.#catalogRefreshComplete = false;
     this.#knownChatIds.clear();
     this.#pendingDetailIds.clear();
+    this.#catalogMemberIds.clear();
+    this.#refreshedSenderIds.clear();
+    this.#memberRefreshSenders.clear();
     this.#detailRetryAttempt = 0;
     this.#detailRetryAtTick = this.#catalogPollTicks;
   }
 
-  #noteUnknownChats(envelopes: readonly Readonly<{ chatType: string; chatId: string }>[]): void {
-    for (const { chatType, chatId } of envelopes) {
+  #noteCatalogMembers(conversations: readonly ConversationCatalogItem[]): void {
+    for (const item of conversations) {
+      if (item.chatType !== 'group' && item.chatType !== 'room') continue;
+      for (const member of item.members) this.#catalogMemberIds.add(member.memberId);
+    }
+  }
+
+  #noteUnknownChats(envelopes: readonly Readonly<{ chatType: string; chatId: string; senderId?: string }>[]): void {
+    for (const { chatType, chatId, senderId } of envelopes) {
       if (chatType !== 'group' && chatType !== 'room') continue;
-      if (this.#knownChatIds.has(chatId) || this.#pendingDetailIds.has(chatId)) continue;
+      if (this.#knownChatIds.has(chatId)) {
+        // A known chat: a sender who is not in the catalog (a member who joined later) causes one refresh of that chat.
+        if (!this.#catalogRefreshComplete || senderId === undefined || senderId === this.#ownMid
+          || this.#catalogMemberIds.has(senderId) || this.#refreshedSenderIds.has(senderId)) continue;
+        if (!this.#pendingDetailIds.has(chatId) && this.#pendingDetailIds.size >= CHAT_DETAIL_BATCH_LIMIT) continue;
+        this.#refreshedSenderIds.add(senderId);
+        this.#pendingDetailIds.add(chatId);
+        const senders = this.#memberRefreshSenders.get(chatId) ?? new Set<string>();
+        senders.add(senderId);
+        this.#memberRefreshSenders.set(chatId, senders);
+        continue;
+      }
+      if (this.#pendingDetailIds.has(chatId)) continue;
       if (this.#pendingDetailIds.size >= CHAT_DETAIL_BATCH_LIMIT) return;
       this.#pendingDetailIds.add(chatId);
+      // The read of an unknown chat already includes the profile of this sender.
+      if (senderId !== undefined) this.#refreshedSenderIds.add(senderId);
     }
   }
 
@@ -737,7 +767,13 @@ export class LineWorkerLoop {
     if (!this.#catalogRefreshComplete || this.#catalogRefreshFlight || this.#detailFlight || !this.#ownMid
       || this.#revoked || this.#authInvalidated || this.#connectionSuspended || !this.#transport.listConversationDetails) return;
     if (this.#catalogPollTicks < this.#detailRetryAtTick) return;
-    for (const chatId of this.#pendingDetailIds) if (this.#knownChatIds.has(chatId)) this.#pendingDetailIds.delete(chatId);
+    for (const [chatId, senders] of this.#memberRefreshSenders) {
+      for (const senderId of senders) if (this.#catalogMemberIds.has(senderId)) senders.delete(senderId);
+      if (senders.size === 0) this.#memberRefreshSenders.delete(chatId);
+    }
+    for (const chatId of this.#pendingDetailIds) {
+      if (this.#knownChatIds.has(chatId) && !this.#memberRefreshSenders.has(chatId)) this.#pendingDetailIds.delete(chatId);
+    }
     const chatIds = [...this.#pendingDetailIds].slice(0, CHAT_DETAIL_BATCH_LIMIT);
     if (chatIds.length === 0) return;
     const generation = this.#catalogRefreshGeneration;
@@ -751,8 +787,9 @@ export class LineWorkerLoop {
         if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
         if (conversations.length > 0) await this.#emit({ type: 'conversationCatalog', ...this.#identity(), conversations });
         if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
+        this.#noteCatalogMembers(conversations);
         // Ids that LINE did not return count as known too, so this session does not ask again.
-        for (const chatId of chatIds) { this.#knownChatIds.add(chatId); this.#pendingDetailIds.delete(chatId); }
+        for (const chatId of chatIds) { this.#knownChatIds.add(chatId); this.#pendingDetailIds.delete(chatId); this.#memberRefreshSenders.delete(chatId); }
         for (const item of conversations) this.#knownChatIds.add(item.chatId);
         this.#detailRetryAttempt = 0;
       } catch {
@@ -801,6 +838,7 @@ export class LineWorkerLoop {
         await this.#emit({ type: 'conversationCatalog', ...this.#identity(), conversations });
         this.#catalogRefreshComplete = true;
         this.#catalogRetryAttempt = 0;
+        this.#noteCatalogMembers(conversations);
         for (const item of conversations) this.#knownChatIds.add(item.chatId);
       } catch (error) {
         if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
@@ -843,6 +881,7 @@ export class LineWorkerLoop {
         }
         if (!this.#ownsCatalogRefresh(generation, receiveGeneration, transportGeneration)) return;
         await this.#emit({ type: 'conversationCatalog', ...this.#identity(), conversations });
+        this.#noteCatalogMembers(conversations);
         for (const item of conversations) this.#knownChatIds.add(item.chatId);
       } catch (error) {
         // No retry. The failure is reported as the startup read reports it, with the real LINE server code when there is one.

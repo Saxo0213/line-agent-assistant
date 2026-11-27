@@ -90,6 +90,24 @@ function aborted(signal: AbortSignal): Promise<never> {
 
 type UserInfo = { displayName: string | null; nickname?: string; picturePath?: string | null; friend?: boolean };
 
+/**
+ * One contact answer of linejs. V3 shape (getContactsV3): `targetProfileDetail`, `friendDetail`, `blockDetail.user` marks a blocked friend.
+ * V2 shape (client/client.ts, when V3 is API_NOT_CAPABLE): `{ ...ContactEntry, targetUserMid }`, the data is in `contact`.
+ */
+function parseContact(rawValue: unknown): UserInfo & { friend: boolean } {
+  const raw = rawValue as { targetProfileDetail?: { profileName?: unknown; picturePath?: unknown };
+    friendDetail?: { user?: { overriddenName?: unknown } }; blockDetail?: { user?: unknown };
+    contact?: { displayName?: unknown; displayNameOverridden?: unknown; picturePath?: unknown; status?: unknown } };
+  const v2 = typeof raw.contact === 'object' && raw.contact !== null ? raw.contact : undefined;
+  const detail = raw.targetProfileDetail ?? (v2 ? { profileName: v2.displayName, ...(Object.hasOwn(v2, 'picturePath') ? { picturePath: v2.picturePath } : {}) } : undefined);
+  const friend = v2 ? !(v2.status === 2 || v2.status === 'FRIEND_BLOCKED') : !raw.blockDetail?.user;
+  const displayName = typeof detail?.profileName === 'string' ? detail.profileName : null;
+  const overridden = v2 ? v2.displayNameOverridden : raw.friendDetail?.user?.overriddenName;
+  const nickname = typeof overridden === 'string' && overridden.length > 0 ? overridden.slice(0, 256) : undefined;
+  const path = picturePath(detail?.picturePath, detail !== undefined && Object.hasOwn(detail, 'picturePath'));
+  return { displayName, ...(nickname === undefined ? {} : { nickname }), ...(path === undefined ? {} : { picturePath: path }), friend };
+}
+
 export class LinejsClientEngine implements LineTransport {
   readonly #options: LinejsClientEngineOptions;
   readonly #full: LinejsFullClient;
@@ -100,6 +118,8 @@ export class LinejsClientEngine implements LineTransport {
   readonly #waiters = new Set<() => void>();
   readonly #collector = new OperationCollector(() => this.#full.profile?.mid);
   readonly #users = new Map<string, UserInfo>();
+  /** Profiles of group members who are not in the friend list. Never marked as friends. */
+  readonly #profiles = new Map<string, UserInfo>();
   #talkQueue: TalkEntry[] = [];
   #squareQueue: unknown[] = [];
   #talkStarted = false;
@@ -389,7 +409,7 @@ export class LinejsClientEngine implements LineTransport {
   }
 
   #member(memberId: string) {
-    const info = this.#users.get(memberId);
+    const info = this.#users.get(memberId) ?? this.#profiles.get(memberId);
     return { memberId, displayName: info?.displayName ?? null,
       ...(info?.nickname === undefined ? {} : { nickname: info.nickname }),
       ...(info?.picturePath === undefined ? {} : { picturePath: info.picturePath }),
@@ -423,24 +443,14 @@ export class LinejsClientEngine implements LineTransport {
     this.#users.clear();
     const items: ConversationCatalogItem[] = [];
     for (const user of users) {
-      const raw = user.raw as unknown as { targetProfileDetail?: { profileName?: unknown; picturePath?: unknown };
-        friendDetail?: { user?: { overriddenName?: unknown } }; blockDetail?: { user?: unknown };
-        contact?: { displayName?: unknown; displayNameOverridden?: unknown; picturePath?: unknown; status?: unknown } };
       // `fetchUsers()` is the linejs friend list (`getUserFriendIds`, client/client.ts:314).
-      // V3 shape (getContactsV3): `blockDetail.user` marks a blocked friend.
-      // V2 shape (client/client.js:242-255, when V3 is API_NOT_CAPABLE): `{ ...ContactEntry, targetUserMid }`, the data is in `contact`.
-      const v2 = typeof raw.contact === 'object' && raw.contact !== null ? raw.contact : undefined;
-      const detail = raw.targetProfileDetail ?? (v2 ? { profileName: v2.displayName, ...(Object.hasOwn(v2, 'picturePath') ? { picturePath: v2.picturePath } : {}) } : undefined);
-      const friend = v2 ? !(v2.status === 2 || v2.status === 'FRIEND_BLOCKED') : !raw.blockDetail?.user;
-      const displayName = typeof detail?.profileName === 'string' ? detail.profileName : null;
-      const overridden = v2 ? v2.displayNameOverridden : raw.friendDetail?.user?.overriddenName;
-      const nickname = typeof overridden === 'string' && overridden.length > 0 ? overridden.slice(0, 256) : undefined;
-      const path = picturePath(detail?.picturePath, detail !== undefined && Object.hasOwn(detail, 'picturePath'));
-      const info: UserInfo = { displayName, ...(nickname === undefined ? {} : { nickname }), ...(path === undefined ? {} : { picturePath: path }), friend };
+      const info = parseContact(user.raw);
       this.#users.set(user.mid, info);
-      items.push({ chatType: 'direct', chatId: user.mid, title: nickname ?? displayName, members: [this.#member(user.mid)],
-        ...(path === undefined ? {} : { picturePath: path }) });
+      items.push({ chatType: 'direct', chatId: user.mid, title: info.nickname ?? info.displayName, members: [this.#member(user.mid)],
+        ...(info.picturePath === undefined ? {} : { picturePath: info.picturePath }) });
     }
+    this.#profiles.clear();
+    await this.#readMemberProfiles(chats);
     for (const chat of chats) {
       const item = this.#chatItem(chat);
       if (item) items.push(item);
@@ -448,17 +458,70 @@ export class LinejsClientEngine implements LineTransport {
     return items;
   }
 
+  /**
+   * Reads the profile of each group or room member who is not a friend and not yet read, in batches of 100, once, no retry.
+   * Same calls as `client.fetchUsers()` (client/client.ts): `base.relation.getContactsV3({ mids })`, and
+   * `base.talk.getContactsV2({ mids })` when V3 reports "API method not capable". A failure keeps `displayName: null`.
+   */
+  async #readMemberProfiles(chats: readonly Chat[]): Promise<void> {
+    const own = this.#full.profile?.mid;
+    const wanted = new Set<string>();
+    for (const chat of chats) {
+      const type = chatKind(chat.mid);
+      if (type !== 'group' && type !== 'room') continue;
+      const raw = chat.raw as unknown as { extra?: { groupExtra?: { memberMids?: unknown } } };
+      for (const memberId of stringIds(raw.extra?.groupExtra?.memberMids)) {
+        if (memberId !== own && !this.#users.has(memberId) && !this.#profiles.has(memberId)) wanted.add(memberId);
+      }
+    }
+    if (wanted.size === 0) return;
+    const mids = [...wanted];
+    try {
+      const contacts = await this.#linejs(async () => {
+        const base = this.#client.base;
+        const out: { mid: string; raw: unknown }[] = [];
+        const batches: string[][] = [];
+        for (let i = 0; i < mids.length; i += 100) batches.push(mids.slice(i, i + 100));
+        try {
+          for (const batch of batches) {
+            const res = await base.relation.getContactsV3({ mids: batch });
+            for (const raw of res.responses) out.push({ mid: (raw as { targetUserMid?: string }).targetUserMid ?? '', raw });
+          }
+          return out;
+        } catch (error) {
+          if (!/API method not capable/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        }
+        out.length = 0;
+        for (const batch of batches) {
+          const res = await base.talk.getContactsV2({ mids: batch });
+          for (const [mid, entry] of Object.entries(res.contacts ?? {})) out.push({ mid, raw: { ...(entry as object), targetUserMid: mid } });
+        }
+        return out;
+      });
+      for (const { mid, raw } of contacts) {
+        if (!wanted.has(mid)) continue;
+        const { friend: _friend, ...info } = parseContact(raw);
+        this.#profiles.set(mid, info);
+      }
+    } catch {
+      // The catalog stays valid: these members keep `displayName: null`.
+    }
+  }
+
   /** `client.getChat(mid)` (client/client.ts) for each group or room id. */
   async listConversationDetails(chatIds: readonly string[]): Promise<readonly ConversationCatalogItem[]> {
-    const items: ConversationCatalogItem[] = [];
+    const chats: Chat[] = [];
     for (const chatId of new Set(chatIds)) {
       const type = chatKind(chatId);
       if (type !== 'group' && type !== 'room') continue;
-      let chat: Chat;
-      try { chat = await this.#linejs(() => this.#client.getChat(chatId)); } catch (error) {
+      try { chats.push(await this.#linejs(() => this.#client.getChat(chatId))); } catch (error) {
         if (error instanceof TypeError) continue; // linejs builds a Chat from an empty answer: the chat is unknown to LINE.
         throw error;
       }
+    }
+    await this.#readMemberProfiles(chats);
+    const items: ConversationCatalogItem[] = [];
+    for (const chat of chats) {
       const item = this.#chatItem(chat);
       if (item) items.push(item);
     }
