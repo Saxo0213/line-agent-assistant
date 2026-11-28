@@ -102,13 +102,7 @@ describe('hidden schedule run context', () => {
       分頁規則：訊息查詢工具每頁最多 200 則，結果含 hasMore 與 nextCursor；hasMore 為 true 時，用相同條件加上 cursor=nextCursor 再查下一頁，直到 hasMore 為 false，逐頁整理後再合併。不要自行指定超過 200 的 limit，也不要因為單頁筆數上限而放棄或重試；只有最後一頁（hasMore=false）仍無訊息，才能寫該時段無訊息。
       來源（用 query_target_messages_by_time 逐一查到 hasMore=false，只查上述時間）：
       • AI & Vibe 社群（accountId=acc-2，chatType=community，chatId=cm-open）
-      任務：總結。每個來源一個區塊（純文字）：
-      【<聊天室名稱>】<M/D HH:mm–HH:mm> · <N> 則
-      重點：• …（最多 5 點）
-      決議／待辦：• [名稱]－事項－期限（沒有就省略）
-      未解問題：• …（沒有就省略）
-      每區塊最多 15 行；沒有訊息時只寫一行「<名稱>：此時段無訊息」。
-      人名規則：結果中每個人的顯示名稱一律寫成 [名稱]（半形方括號），例如「• 01:31 [小藍點] 分享因搬出國與規則限制而停卡」；不明發言者寫 [未知]；非人名的詞不加括號；聊天室標題維持【】，人名不用【】。
+      任務：總結。Call \`get_summary_guide\` before you write the summary.
       輸出：用 send_to_target 傳給管理員（accountId=acc-1，chatType=direct，chatId=uadmin）。只傳結果本身（純文字、不要 Markdown、不加說明）；你的回覆貼同一份文字。傳送失敗或結果不明時不要重試，在回覆說明原因（此規則只適用於傳送與真正的錯誤，分頁不算錯誤，必須繼續查下一頁）。"
     `);
     expect(context.length).toBeLessThanOrEqual(1200);

@@ -1,62 +1,61 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { formatIdentityBlock, GROUP_MENTION_LINE, loadLinejsMcpSkill, MCP_SKILL_MAX_BYTES, withMcpSkill, withOutputChannel } from './mcp-skill.js';
+import { formatIdentityBlock, GROUP_MENTION_LINE, loadLinejsMcpSkill, loadLinejsSummarySkill, resetLinejsSummarySkill, saveLinejsSummarySkill, withMcpSkill, withOutputChannel } from './mcp-skill.js';
 import { resolveSkillsDirectory } from '../resources.js';
-import { CREATE_SCHEDULE_TOOL_DEFINITION, UPDATE_SCHEDULE_TOOL_DEFINITION } from './mcp-service.js';
+import { CREATE_SCHEDULE_TOOL_DEFINITION, LIST_SCHEDULES_TOOL_DEFINITION, LIST_SEND_TARGETS_TOOL_DEFINITION, MCP_TOOL_DEFINITIONS, READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION, UPDATE_SCHEDULE_TOOL_DEFINITION } from './mcp-service.js';
 
 describe('app-owned LINEJS MCP Skill', () => {
   it('ships a secret-free English Skill naming the read-only tools and the reply language', async () => {
     const text = await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), ''));
     expect(text).toContain('list_targets');
-    expect(text).toContain('query_target_messages_by_time');
-    for (const needle of ['Reply in the language of the user', 'Traditional Chinese (Taiwan usage)', 'query_agent_room_history', 'Use `query_agent_room_history` when you need the content of an earlier conversation', 'Use a keyword first to narrow the range', 'Stop when you find the answer']) expect(text).toContain(needle);
+    expect(text).toContain('list_send_targets');
+    for (const needle of ['Reply in the language of the user', 'Traditional Chinese (Taiwan usage)', 'call a tool', 'give the user the real `error.code`']) expect(text).toContain(needle);
     expect(text).toMatch(/[\u4e00-\u9fff]/);
     expect(text).not.toMatch(/li_job_|la_mcp_|Bearer|LINEJS_INTERNAL_MCP_TOKEN/);
   });
-  it('tells the Agent to take schedule chats only from the current request', async () => {
-    const text = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
-    for (const needle of ['If the user names a chat in this request', 'Take the chat only from this request', 'If the user names no chat, create a `custom` task', 'Leave `targets` empty']) expect(text).toContain(needle);
+  it('keeps the field guidance of the moved rules in the tool descriptions', () => {
+    const byTime = MCP_TOOL_DEFINITIONS.find((tool) => tool.name === 'query_target_messages_by_time')!.description;
+    expect(byTime).toContain('With a time condition, use the smallest time range.');
+    for (const needle of ['find the message with a message query to get the `attachmentId`', 'When `available` is false: ask the user to send the file again.']) expect(READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION.description).toContain(needle);
+    for (const needle of ['[聯絡人卡片]', '`chatId` equal to that mid', 'When no row matches: tell the user']) expect(LIST_SEND_TARGETS_TOOL_DEFINITION.description).toContain(needle);
+    for (const needle of ['`nextFireAtTaipei`', '`deliveryLabel`', '`SCHEDULE_LIMIT`']) expect(CREATE_SCHEDULE_TOOL_DEFINITION.description).toContain(needle);
+    expect(LIST_SCHEDULES_TOOL_DEFINITION.description).toContain('The system skips a missed fire time');
   });
-  it('tells the Agent to read all chats in one call without a target', async () => {
-    const text = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
-    for (const needle of ['omit all target fields', 'One call returns the messages of all readable chats', 'Each message has `chatId` and `conversationTitle`']) expect(text).toContain(needle);
-    expect(Buffer.byteLength(text, 'utf8')).toBeLessThan(MCP_SKILL_MAX_BYTES);
+  it('ships the Summary rules as their own Skill', async () => {
+    const text = await loadLinejsSummarySkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), ''));
+    for (const needle of ['name: linejs-summary', 'notes\\YYYY-MM-DD-<主題>.md', '【範圍】', '【概覽】', '【需要你處理】', '【待解決】', '【檔案與連結】', 'Taiwan time']) expect(text).toContain(needle);
+    const main = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
+    expect(main).not.toContain('## Summary');
   });
-  it('tells the Agent to see active chats first and to use the by-time filters', async () => {
-    const text = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
-    for (const needle of ['`list_active_chats`', 'call it first', 'Then call `query_target_messages_by_time` with `chatId`', '`messageCount`', '`senderCount`', '`lastMessageAt`', '`truncated`',
-      '`excludeChatIds`', '`direction`', '`kinds`', '`excludeKinds`', 'Use only one of them', 'send the same filters with `cursor`']) expect(text).toContain(needle);
-    expect(Buffer.byteLength(text, 'utf8')).toBeLessThan(MCP_SKILL_MAX_BYTES);
+  it('keeps one editable copy of the Summary Skill that falls back to the default', async () => {
+    const skills = resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '');
+    const user = await mkdtemp(path.join(tmpdir(), 'summary-skill-'));
+    try {
+      const first = await loadLinejsSummarySkill(skills, user);
+      expect(first).toContain('name: linejs-summary');
+      expect(await saveLinejsSummarySkill(user, '# changed')).toBe('saved');
+      expect(await loadLinejsSummarySkill(skills, user)).toBe('# changed');
+      expect(await saveLinejsSummarySkill(user, '  ')).toBe('invalid');
+      expect(await resetLinejsSummarySkill(skills, user)).toBe(true);
+      expect(await loadLinejsSummarySkill(skills, user)).toBe(first);
+    } finally { await rm(user, { recursive: true, force: true }); }
   });
-  it('tells the Agent to use a contact card mid as the send target', async () => {
+  it('names chat types with the app words', async () => {
     const text = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
-    for (const needle of ['[聯絡人卡片]', '`chatId` equal to that mid', 'Do not send to another chat']) expect(text).toContain(needle);
-  });
-  it('ships the Summary rules within the size limit', async () => {
-    const text = await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), ''));
-    expect(text).toContain('## Summary (總結)');
-    for (const needle of ['Scope and target', 'Decisions and to-do items', 'Open questions', 'notes\\YYYY-MM-DD-<主題>.md', '輸出位置', '【標題】', 'Taiwan time']) expect(text).toContain(needle);
-  });
-  it('names chat types with the app words and states the Agent room is account-independent', async () => {
-    const text = (await loadLinejsMcpSkill(resolveSkillsDirectory(false, path.resolve(import.meta.dirname, '../..'), '')))!;
-    for (const needle of ['個人 (direct)', '群組 (group)', '聊天室 (room)', '社群 (community)', '討論串 (thread)', '一對一', 'belongs to no LINE account']) expect(text).toContain(needle);
-    expect(Buffer.byteLength(text, 'utf8')).toBeLessThan(MCP_SKILL_MAX_BYTES);
+    for (const needle of ['個人 (direct)', '群組 (group)', '聊天室 (room)', '社群 (community)', '討論串 (thread)', 'Chat type words:']) expect(text).toContain(needle);
   });
   it('adds one channel line per source type', () => {
     expect(withOutputChannel('p', 'ui')).toBe('輸出位置：Agent 聊天室（可使用 Markdown）\n\np');
     expect(withOutputChannel('p', 'line')).toBe('輸出位置：LINE（只能用純文字，不要使用 Markdown）\n不要對 LINE 使用者顯示 App 或工作資料夾的本機絕對路徑；用資料夾的用途或專案資料夾名稱稱呼。\n\np');
     expect(withOutputChannel('p', 'line').match(/輸出位置/g)).toHaveLength(1);
   });
-  it('prepends exactly once and tolerates a missing or oversized Skill', async () => {
+  it('prepends exactly once and tolerates a missing Skill', async () => {
     expect(withMcpSkill('SKILL', 'prompt')).toBe('SKILL\n\n---\n\nprompt');
     expect(withMcpSkill(null, 'prompt')).toBe('prompt');
     const dir = await mkdtemp(path.join(tmpdir(), 'skill-'));
     try {
-      expect(await loadLinejsMcpSkill(dir)).toBeNull();
-      await mkdir(path.join(dir, 'linejs-mcp'));
-      await writeFile(path.join(dir, 'linejs-mcp', 'SKILL.md'), 'x'.repeat(MCP_SKILL_MAX_BYTES + 1));
       expect(await loadLinejsMcpSkill(dir)).toBeNull();
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
@@ -69,9 +68,9 @@ describe('app-owned LINEJS MCP Skill', () => {
 describe('schedule tool guidance', () => {
   it('create and update descriptions limit chats to the current request and send unnamed requests to a custom task', () => {
     const create = CREATE_SCHEDULE_TOOL_DEFINITION.description;
-    for (const needle of ['only for chats that the user names in the current request', 'Take chats from the current request only', 'custom task whose prompt restates the request', 'Leave targets empty']) expect(create).toContain(needle);
+    for (const needle of ['Use `targets` only for chats that the user names in the current request', 'else `custom` with the request as `prompt` and empty `targets`', 'At each run the Agent chooses the chats to read']) expect(create).toContain(needle);
     expect(UPDATE_SCHEDULE_TOOL_DEFINITION.description).toContain('names in the current request');
-    expect(UPDATE_SCHEDULE_TOOL_DEFINITION.description).toContain('custom task with the request as prompt and empty targets');
+    expect(UPDATE_SCHEDULE_TOOL_DEFINITION.description).toContain('a `custom` task with the request as `prompt` and empty `targets`');
     expect(CREATE_SCHEDULE_TOOL_DEFINITION.inputSchema.properties.targets.description).toContain('Take chats from the current request only');
   });
 });

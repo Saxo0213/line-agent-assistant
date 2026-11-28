@@ -991,13 +991,12 @@ describe('database settings', () => {
     expect(table.textContent).toContain('6 位數配對碼');
     expect(table.textContent).toContain('LW-XXXXXXXX');
     expect(table.textContent).not.toContain('一般文字提示');
-    expect(table.textContent).toContain('使用者授權');
+    expect(table.textContent).toContain('加入白名單');
     expect(table.textContent).not.toContain('LINE 使用者授權');
-    expect(table.textContent).toContain('主要管理者專用。在 1:1 或群組中，將使用者加入 Agent 白名單。');
-    expect(table.textContent).toContain('取消此聊天室執行中與排隊中的 Agent 工作');
-    expect(table.textContent).toContain('開始新的 Agent 對話');
-    expect(table.textContent).toContain('Agent 會回覆確認');
-    expect(table.textContent).toContain('查看 Agent 執行狀態');
+    expect(table.textContent).toContain('個人：輸入指令，再分享對方的聯絡人卡片。');
+    expect(table.textContent).toContain('取消執行中與排隊中的工作');
+    expect(table.textContent).toContain('取消工作，開始新對話');
+    expect(table.textContent).toContain('顯示執行狀態與自由模式剩餘分鐘');
   });
 
   it('separates database and Agent settings into tabs and includes provider login controls', async () => {

@@ -68,6 +68,8 @@ export interface AgentScheduleServiceOptions {
   agentLineage?: () => Promise<AgentLineage>;
   /** Resolves the Primary Admin direct chat at fire time; null when none. A failure counts as none. */
   primaryAdminChat?: () => Promise<AgentSchedulePrimaryAdminChat | null>;
+  /** The summary rules (linejs-summary) with the chat rule of each given chat; null when unavailable. Used by summary runs. */
+  summaryGuide?: (chats: readonly AgentScheduleTarget[]) => Promise<string | null>;
   /** Tells subscribers that a schedule or a run changed. */
   publish?: () => void;
   now?: () => Date;
@@ -292,9 +294,15 @@ export class AgentScheduleService {
         : { sourceType: 'schedule', accountScope: null })).evaluation.chats.filter((chat) => chat.action === 'llm')
         .map((chat) => ({ accountId: chat.accountId, chatType: chat.chatType, chatId: chat.chatId, title: chat.title }))
       : undefined;
+    const summaryChats = schedule.task.type === 'summary' ? mapped.targets : schedule.task.type === 'new_messages' ? llmChats ?? [] : null;
+    let summaryGuide: string | null = null;
+    if (summaryChats && this.options.summaryGuide) {
+      try { summaryGuide = await this.options.summaryGuide(summaryChats); } catch (error) { this.options.onError?.(error); }
+    }
     return composeScheduleRunContext({
       title: schedule.title, prompt: schedule.prompt, task: schedule.task, targets: mapped.targets, delivery: mapped.delivery, adminChat, window,
       ...(llmChats ? { llmChats } : {}),
+      ...(summaryGuide ? { summaryGuide } : {}),
     });
   }
 

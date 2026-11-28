@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeAutoresponderTrigger, selectAutoresponderReply, validateAutoresponderConfig } from './autoresponder.js';
+import { normalizeAutoresponderTrigger, selectAutoresponderReply, splitAutoresponderReplies, validateAutoresponderConfig } from './autoresponder.js';
 
 describe('deterministic autoresponder rules', () => {
   it('matches complete normalized strings while preserving case and punctuation', () => {
@@ -24,5 +24,21 @@ describe('deterministic autoresponder rules', () => {
       { trigger: '\u76E3\u63A7', reply: 'custom' },
     ] })).toContain('reserved');
     expect(validateAutoresponderConfig({ displayName: 'Agent', fallback: ' ', rules: [] })).toContain('fallback');
+  });
+
+  it('splits replies on both semicolons, drops empty parts and picks one with the random parameter', () => {
+    expect(splitAutoresponderReplies('甲；乙; 丙 ；；  ;')).toEqual(['甲', '乙', '丙']);
+    expect(splitAutoresponderReplies('single')).toEqual(['single']);
+    const rules = [{ trigger: 'hi', reply: 'A；B;C' }];
+    expect(selectAutoresponderReply('hi', rules, 'x', () => 0)).toBe('A');
+    expect(selectAutoresponderReply('hi', rules, 'x', () => 0.5)).toBe('B');
+    expect(selectAutoresponderReply('hi', rules, 'x', () => 0.99)).toBe('C');
+    expect(selectAutoresponderReply('other', rules, 'F1；F2', () => 0.6)).toBe('F2');
+  });
+
+  it('rejects a reply or fallback that has no non-empty part', () => {
+    expect(validateAutoresponderConfig({ displayName: 'Agent', fallback: '；', rules: [] })).toContain('fallback');
+    expect(validateAutoresponderConfig({ displayName: 'Agent', fallback: 'ok', rules: [{ trigger: 'a', reply: ' ; ； ' }] })).toContain('reply');
+    expect(validateAutoresponderConfig({ displayName: 'Agent', fallback: 'ok；', rules: [{ trigger: 'a', reply: 'b；' }] })).toBeNull();
   });
 });

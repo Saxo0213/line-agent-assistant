@@ -1,15 +1,88 @@
-import { readFile } from 'node:fs/promises';
+import { access, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-
-export const MCP_SKILL_MAX_BYTES = 24 * 1024;
+import { loadRulesState } from './chat-rules-files.js';
 
 /** Reads the packaged app-owned Skill text; returns null when unavailable (MCP still works, without guidance). */
 export async function loadLinejsMcpSkill(skillsDirectory: string): Promise<string | null> {
   try {
     const text = await readFile(path.join(skillsDirectory, 'linejs-mcp', 'SKILL.md'), 'utf8');
-    if (Buffer.byteLength(text, 'utf8') > MCP_SKILL_MAX_BYTES) return null;
     return text.trim() || null;
   } catch { return null; }
+}
+
+const SUMMARY_SKILL_DIRECTORY = 'linejs-summary';
+const SUMMARY_SKILL_FILE = 'SKILL.md';
+/** The name of the chat rule file (`rules/摘要.md` in the chat folder) that adds a summary rule to one chat. */
+export const CHAT_SUMMARY_RULE_NAME = '摘要';
+export const CHAT_SUMMARY_RULE_HEADING = 'Chat rule for this chat (this rule wins over the rules above):';
+export const SUMMARY_GUIDE_FALLBACK_LINE = 'Call `get_summary_guide` before you write the summary.';
+
+async function readSkillFile(file: string): Promise<string | null> {
+  try {
+    return (await readFile(file, 'utf8')).trim() || null;
+  } catch { return null; }
+}
+
+async function fileExists(file: string): Promise<boolean> {
+  try { await access(file); return true; } catch { return false; }
+}
+
+async function copyPackagedSummarySkill(skillsDirectory: string, userSkillsDirectory: string): Promise<boolean> {
+  try {
+    const packaged = await readSkillFile(path.join(skillsDirectory, SUMMARY_SKILL_DIRECTORY, SUMMARY_SKILL_FILE));
+    if (!packaged) return false;
+    await writeSummarySkillFile(userSkillsDirectory, `${packaged}\n`);
+    return true;
+  } catch { return false; }
+}
+
+async function writeSummarySkillFile(userSkillsDirectory: string, text: string): Promise<void> {
+  const directory = path.join(userSkillsDirectory, SUMMARY_SKILL_DIRECTORY);
+  await mkdir(directory, { recursive: true });
+  const target = path.join(directory, SUMMARY_SKILL_FILE);
+  const temporary = `${target}.${process.pid}.tmp`;
+  try {
+    await writeFile(temporary, text, 'utf8');
+    await rename(temporary, target);
+  } finally { await rm(temporary, { force: true }).catch(() => undefined); }
+}
+
+/**
+ * The summary rules (linejs-summary). The packaged file is the default. The editable copy is `<userSkillsDirectory>/linejs-summary/SKILL.md`;
+ * it is made from the default at first use and read at every call. A missing, unreadable or empty copy gives the default.
+ */
+export async function loadLinejsSummarySkill(skillsDirectory: string, userSkillsDirectory?: string): Promise<string | null> {
+  const packagedFile = path.join(skillsDirectory, SUMMARY_SKILL_DIRECTORY, SUMMARY_SKILL_FILE);
+  if (!userSkillsDirectory) return readSkillFile(packagedFile);
+  const editableFile = path.join(userSkillsDirectory, SUMMARY_SKILL_DIRECTORY, SUMMARY_SKILL_FILE);
+  const edited = await readSkillFile(editableFile);
+  if (edited) return edited;
+  if (!(await fileExists(editableFile))) await copyPackagedSummarySkill(skillsDirectory, userSkillsDirectory);
+  return readSkillFile(packagedFile);
+}
+
+/** Replaces the editable copy. `invalid` is an empty text. */
+export async function saveLinejsSummarySkill(userSkillsDirectory: string, text: string): Promise<'saved' | 'invalid' | 'io'> {
+  const body = `${text.trim()}\n`;
+  if (body.trim() === '') return 'invalid';
+  try { await writeSummarySkillFile(userSkillsDirectory, body); return 'saved'; } catch { return 'io'; }
+}
+
+/** Copies the packaged default over the editable copy. */
+export async function resetLinejsSummarySkill(skillsDirectory: string, userSkillsDirectory: string): Promise<boolean> {
+  return copyPackagedSummarySkill(skillsDirectory, userSkillsDirectory);
+}
+
+/** The text of `rules/摘要.md` in a chat folder, or null when the file is missing or unreadable. */
+export async function readChatSummaryRule(chatFolderPath: string): Promise<string | null> {
+  const loaded = await loadRulesState(chatFolderPath);
+  if (!loaded.ok) return null;
+  return loaded.state.rules.find((rule) => rule.name === CHAT_SUMMARY_RULE_NAME)?.text.trim() || null;
+}
+
+/** The summary rules followed by one section for each chat rule. */
+export function composeSummaryGuide(base: string, chatRules: ReadonlyArray<{ title?: string | null; text: string }>): string {
+  return [base, ...chatRules.map((rule) => `${CHAT_SUMMARY_RULE_HEADING}\n${rule.title ? `Chat: ${rule.title}\n` : ''}${rule.text}`)].join('\n\n');
 }
 
 const NO_LOCAL_PATH_RULE = '不要對 LINE 使用者顯示 App 或工作資料夾的本機絕對路徑；用資料夾的用途或專案資料夾名稱稱呼。';

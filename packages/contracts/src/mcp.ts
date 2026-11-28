@@ -391,8 +391,13 @@ export const LIST_SEND_TARGETS_TOOL_NAME = 'list_send_targets' as const;
 export const SEND_TO_TARGET_TOOL_NAME = 'send_to_target' as const;
 /** Internal-only tool: gives an Agent job a local copy of one message attachment. Never part of McpToolNameSchema. */
 export const READ_MESSAGE_ATTACHMENT_TOOL_NAME = 'read_message_attachment' as const;
+/** Internal-only tool: returns the rules for a LINE chat summary (linejs-summary), with the chat rule of one chat when given. */
+export const GET_SUMMARY_GUIDE_TOOL_NAME = 'get_summary_guide' as const;
+/** Internal-only tool: replaces the editable summary rules or restores the default. Only a job of the Primary Admin (1:1 chat or Agent room). */
+export const SET_SUMMARY_GUIDE_TOOL_NAME = 'set_summary_guide' as const;
 export const McpInternalToolNameSchema = z.enum([
-  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, ...SCHEDULE_TOOL_NAMES, ...CHAT_DOWNLOAD_FOLDER_TOOL_NAMES, ...EXTERNAL_SESSION_TOOL_NAMES, FORWARD_TO_SESSION_TOOL_NAME,
+  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME,
+  GET_SUMMARY_GUIDE_TOOL_NAME, SET_SUMMARY_GUIDE_TOOL_NAME, ...SCHEDULE_TOOL_NAMES, ...CHAT_DOWNLOAD_FOLDER_TOOL_NAMES, ...EXTERNAL_SESSION_TOOL_NAMES, FORWARD_TO_SESSION_TOOL_NAME,
 ]);
 export type McpInternalToolName = z.infer<typeof McpInternalToolNameSchema>;
 /** The principal of an Agent room job or the local console UI; an admin-direct LINE job is also allowed while the room shares that chat. */

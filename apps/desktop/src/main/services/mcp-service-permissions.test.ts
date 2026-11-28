@@ -143,8 +143,8 @@ describe('Agent room history tool visibility', () => {
 describe('query_target_messages_by_time tool definition', () => {
   it('tells the Agent to read all chats in one call without a target', () => {
     const definition = MCP_TOOL_DEFINITIONS.find((tool) => tool.name === 'query_target_messages_by_time')!;
-    for (const needle of ['omit every target field and give from', 'accountId, chatType, chatId and conversationTitle', 'Use one call for all chats',
-      'from is required when no target field is given', 'The oldest message is first', 'Report that a time window is empty or complete only when the last page has hasMore=false']) expect(definition.description).toContain(needle);
+    for (const needle of ['omit every target field and give `from`', '`accountId`, `chatType`, `chatId` and `conversationTitle`', 'One call returns the messages of all readable chats',
+      '`from` is required when no target field is given', 'The oldest message is first', 'Say that a time window is empty or complete only when the last page has `hasMore=false`']) expect(definition.description).toContain(needle);
     expect((definition.inputSchema.properties as Record<string, { description?: string }>).target?.description).toContain('Omit to read all chats.');
     const plain = MCP_TOOL_DEFINITIONS.find((tool) => tool.name === 'query_target_messages')!;
     expect((plain.inputSchema.properties as Record<string, { description?: string }>).target?.description).not.toContain('Omit to read all chats.');

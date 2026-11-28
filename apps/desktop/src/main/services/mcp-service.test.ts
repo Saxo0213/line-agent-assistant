@@ -173,8 +173,8 @@ database('McpService, McpHttpServer loopback transport, ConnectedFacade IPC, and
       expect(McpQueryTargetMessagesInputSchema.safeParse(communityKey).success).toBe(true);
       expect(McpQueryTargetMessagesByTimeInputSchema.safeParse({ ...communityKey, from: '2026-10-16' }).success).toBe(true);
       const listDescription = MCP_TOOL_DEFINITIONS.find((tool) => tool.name === 'list_targets')!.description;
-      expect(listDescription).toContain('numbered list that uses no');
-      expect(listDescription).toContain('most recent list_targets result');
+      expect(listDescription).toContain('Number the list with `no`');
+      expect(listDescription).toContain('most recent `list_targets` result');
       const filteredListResp = await fetch(endpoint, {
         method: 'POST', headers,
         body: JSON.stringify({ jsonrpc: '2.0', id: 32, method: 'tools/call', params: { name: 'list_targets', arguments: { query: 'Engineering', limit: 1 } } }),

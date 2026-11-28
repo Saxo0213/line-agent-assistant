@@ -44,7 +44,7 @@ import { ProjectFolderService, ProjectFolderUiError } from './services/project-f
 import { createScheduleMessageReader } from './services/agent-schedule-reader.js';
 import { createAgentScheduleTargetResolver } from './services/agent-schedule-targets.js';
 import { AgentAttachmentError } from './services/agent-attachments.js';
-import { loadLinejsMcpSkill } from './services/mcp-skill.js';
+import { composeSummaryGuide, loadLinejsMcpSkill, loadLinejsSummarySkill, readChatSummaryRule, resetLinejsSummarySkill, saveLinejsSummarySkill } from './services/mcp-skill.js';
 import { AgentJobEnvironmentService } from './services/agent-job-environment.js';
 import { AgentExtensionsService, AgentExtensionsServiceError, BackendSecretCodec } from './services/agent-extensions-service.js';
 import { defaultImportLocations, type AgentExtensionImportLocations } from './services/agent-extension-import.js';
@@ -264,6 +264,8 @@ export interface ConnectedFacadeOptions {
   mcpLocalClientPackaged?: boolean;
   /** Packaged app-owned Skills directory (contains linejs-mcp/SKILL.md). */
   skillsDirectory?: string;
+  /** Editable Skills directory under userData; holds the editable copy of linejs-summary. */
+  userSkillsDirectory?: string;
   officialSnapshotImporter?: OfficialSnapshotImporter;
   /** Reason code of a failed reader bootstrap. Used only when `officialSnapshotImporter` is missing. */
   officialSnapshotImporterFailure?: ExternalMonitorFailureDetail;
@@ -783,6 +785,34 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const admins = new AdminRepository(options.pool);
   const permissionRepository = new AgentPermissionRepository(options.pool);
   const chatFolders = new ChatFolderService(permissionRepository, workspace);
+  // The summary rules: the packaged default, the editable global copy under userData, and the chat rule `rules/摘要.md` of a chat.
+  const summaryGuideChatRule = async (chat: { accountId: string; chatType: string; chatId: string }): Promise<string | null> => {
+    try {
+      const folder = await chatFolders.resolveExisting(chat.accountId, chat.chatType, chat.chatId);
+      return folder ? await readChatSummaryRule(folder.path) : null;
+    } catch { return null; }
+  };
+  const summaryGuide = options.skillsDirectory ? {
+    read: async (chat: { accountId: string; chatType: string; chatId: string } | null): Promise<string | null> => {
+      const base = await loadLinejsSummarySkill(options.skillsDirectory!, options.userSkillsDirectory);
+      if (!base) return null;
+      const rule = chat ? await summaryGuideChatRule(chat) : null;
+      return rule ? composeSummaryGuide(base, [{ text: rule }]) : base;
+    },
+    /** The text of a scheduled summary run: the global text and the chat rule of each target chat. */
+    forChats: async (chats: ReadonlyArray<{ accountId: string; chatType: string; chatId: string; title: string }>): Promise<string | null> => {
+      const base = await loadLinejsSummarySkill(options.skillsDirectory!, options.userSkillsDirectory);
+      if (!base) return null;
+      const rules: Array<{ title: string; text: string }> = [];
+      for (const chat of chats) {
+        const text = await summaryGuideChatRule(chat);
+        if (text) rules.push({ title: chat.title.trim() || chat.chatId, text });
+      }
+      return composeSummaryGuide(base, rules);
+    },
+    write: async (text: string) => options.userSkillsDirectory ? saveLinejsSummarySkill(options.userSkillsDirectory, text) : 'io' as const,
+    reset: async () => options.userSkillsDirectory ? resetLinejsSummarySkill(options.skillsDirectory!, options.userSkillsDirectory) : false,
+  } : undefined;
   const attachmentBroker = createWindowsAttachmentBroker({ helperPath: options.attachmentBrokerHelperPath ?? resolveWindowsAttachmentBrokerPath() });
   const attachmentStorageService = new AttachmentStorageService({ repository: attachmentStorage, messages, attachmentRoot: options.attachmentRoot,
     windowsSafetyBroker: attachmentBroker,
@@ -1027,7 +1057,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   // Scheduled Agent triggers (list/create/update/delete_schedule and the schedules IPC). The Agent room job is submitted through
   // agentService, which is built later; the service only calls it from its tick, which starts after both exist.
   const forwardStore = new ScheduleForwardRepository(options.pool);
-  const agentSchedules = new AgentScheduleService({ store: new AgentScheduleRepository(options.pool), targets: scheduleTargets, forwards: forwardStore, agentLineage: () => resolveAgentLineage(options.pool),
+  const agentSchedules = new AgentScheduleService({ store: new AgentScheduleRepository(options.pool), targets: scheduleTargets,
+    ...(summaryGuide ? { summaryGuide: summaryGuide.forChats } : {}), forwards: forwardStore, agentLineage: () => resolveAgentLineage(options.pool),
     primaryAdminChat: async () => {
       const identity = await agents.describeJobIdentity({ sourceType: 'ui', accountId: null, chatType: null, chatId: null });
       return identity.admin ? { accountId: identity.admin.accountId, chatId: identity.admin.chatId, title: identity.admin.name ?? '' } : null;
@@ -1054,6 +1085,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     // attachmentService is created below; read_message_attachment reads it only when an Agent job calls the tool.
     jobFileAccess: (jobId) => agentService.runFileAccess(jobId),
     attachments: { recoverFromLocalDownloads: (attachmentId) => attachmentService.recoverFromLocalDownloads(attachmentId), resolveReadyPath: (attachmentId) => attachmentService.resolveReadyPath(attachmentId) },
+    ...(summaryGuide ? { summaryGuide: { read: summaryGuide.read, write: summaryGuide.write, reset: summaryGuide.reset } } : {}),
     onDiagnostic: (diagnostic, identity) => options.audit?.failure(diagnostic, identity),
     ...(chatResourceStore ? { chatResources: createMcpChatResourceArchiveReader(chatResources, diagnostics ? (record) => diagnostics.record(record) : undefined) } : {}),
     getLiveLoginBinding: getMcpLiveLoginBinding,

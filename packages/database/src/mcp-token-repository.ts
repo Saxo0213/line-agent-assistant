@@ -1,4 +1,4 @@
-import { EXTERNAL_SESSION_TOOL_NAMES, FORWARD_TO_SESSION_TOOL_NAME, isExternalSessionToolName, AGENT_ROOM_HISTORY_TOOL_NAME, isChatDownloadFolderToolName, SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME,LIST_SEND_TARGETS_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
+import { EXTERNAL_SESSION_TOOL_NAMES, FORWARD_TO_SESSION_TOOL_NAME, GET_SUMMARY_GUIDE_TOOL_NAME, SET_SUMMARY_GUIDE_TOOL_NAME, isExternalSessionToolName, AGENT_ROOM_HISTORY_TOOL_NAME, isChatDownloadFolderToolName, SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME,LIST_SEND_TARGETS_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
 import { lockAndCheckAgentAuthorization, lockAndCheckFreeMode } from './agent-authorization.js';
 import { findSharedAdminChat, type SharedAdminChat } from './agent-repository.js';
@@ -453,12 +453,15 @@ export class McpTokenRepository {
    */
   async verifyInternalAgentAccess(input: { context: InternalAgentExecutionContext; signal?: AbortSignal }): Promise<{ permissions: EffectivePermissions; roomHistory: boolean; lineSend: boolean; chatFolders: boolean; chatFolderScope: ChatFolderScope | null;
     /** True only for a job of the Primary Admin in the direct chat of the Agent account (forward_to_session). */
-    forwardToSession: boolean }> {
+    forwardToSession: boolean;
+    /** True only for a job of the Primary Admin in the 1:1 chat, or an Agent room job (set_summary_guide). */
+    summaryGuideWrite: boolean }> {
     return this.withMcpTransaction(input.signal, async (client) => {
       const resolved = await this.resolveInternalPrincipal(client, input.context, null, true);
+      const adminDirect = (await this.primaryAdminDirectJobAccount(client, input.context, resolved.principalId)) !== null;
       return { permissions: resolved.permissions, roomHistory: resolved.history.allowed, lineSend: mayLineSend(resolved.principalId),
         chatFolders: resolved.chatFolderScope !== null, chatFolderScope: resolved.chatFolderScope,
-        forwardToSession: (await this.primaryAdminDirectJobAccount(client, input.context, resolved.principalId)) !== null };
+        forwardToSession: adminDirect, summaryGuideWrite: adminDirect || resolved.principalId === 'internal:ui' };
     });
   }
 
@@ -625,9 +628,40 @@ export class McpTokenRepository {
         return data;
       }
 
+      // set_summary_guide: only a job of the Primary Admin in the 1:1 chat, or an Agent room job, re-derived on every call.
+      if (input.toolName === SET_SUMMARY_GUIDE_TOOL_NAME) {
+        const allowed = principalId === 'internal:ui' || (await this.primaryAdminDirectJobAccount(client, input.context, principalId)) !== null;
+        if (!allowed) {
+          await this.insertAudit(client, {
+            tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
+            accountScopes: [], grantVersion: null, disposition: 'PERMISSION_DENIED', resultCount: null,
+          });
+          await client.query('COMMIT');
+          throw new McpDomainError('PERMISSION_DENIED', 'This Agent job does not have permission to use this tool.');
+        }
+        let executed: { data: T; resultCount?: number };
+        try { executed = await input.execute({ client, principalId, authorizedAccountIds: [], ownLineNamesOnly: false }); }
+        catch (error) {
+          if (error instanceof McpDomainError && error.code === 'INVALID_INPUT') {
+            await this.insertAudit(client, {
+              tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
+              accountScopes: [], grantVersion: null, disposition: 'INVALID_INPUT', resultCount: null,
+            });
+            await client.query('COMMIT');
+          }
+          throw error;
+        }
+        await this.insertAudit(client, {
+          tokenId: null, principalId, initiator: 'internal_agent', action: 'TOOL_CALLED', toolName: input.toolName,
+          accountScopes: [], grantVersion: null, disposition: 'ALLOWED', resultCount: executed.resultCount ?? null,
+        });
+        return executed.data;
+      }
+
       // The tool's permission is re-resolved on every call and is the authority; tools/list is only a hint.
       // read_message_attachment reads a message attachment, so it needs the same permission as query_target_messages.
-      const permissionTool = (input.toolName === READ_MESSAGE_ATTACHMENT_TOOL_NAME ? 'query_target_messages' : input.toolName) as McpToolName;
+      // get_summary_guide has the same gate, so every job that can read messages can read the summary rules.
+      const permissionTool = (input.toolName === READ_MESSAGE_ATTACHMENT_TOOL_NAME || input.toolName === GET_SUMMARY_GUIDE_TOOL_NAME ? 'query_target_messages' : input.toolName) as McpToolName;
       if (!MCP_TOOL_PERMISSIONS[permissionTool].some((permission) => permissions[permission] === 'ALLOW')) {
         await this.insertAudit(client, {
           tokenId: null,

@@ -384,6 +384,7 @@ async function initializeServices(): Promise<void> {
     },
     closePoolOnShutdown: true, runMigrations: false, contentReprojection: true, officialBuildTrust,
     skillsDirectory: resolveSkillsDirectory(app.isPackaged, appDir, process.resourcesPath),
+    userSkillsDirectory: path.join(app.getPath('userData'), 'skills'),
     ...(officialSnapshotImporter ? { officialSnapshotImporter } : {}),
     ...(officialSnapshotImporter && process.env.LOCALAPPDATA
       ? { externalImportProgressPath: path.join(process.env.LOCALAPPDATA, 'LINEJS', 'js-external-imports', 'first-import-progress.json') } : {}),

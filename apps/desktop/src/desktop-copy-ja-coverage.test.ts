@@ -23,13 +23,11 @@ const parts = [
 ];
 
 describe('Japanese desktop copy coverage', () => {
-  it('covers all 766 English keys exactly once across parts 1–9', () => {
+  it('covers every English key exactly once across parts 1–9', () => {
     const coveredKeys = parts.flatMap((part) => Object.keys(part));
     const englishKeys = Object.keys(ENGLISH_DESKTOP_COPY);
 
-    expect(englishKeys).toHaveLength(766);
-    expect(coveredKeys).toHaveLength(766);
-    expect(new Set(coveredKeys).size).toBe(766);
+    expect(new Set(coveredKeys).size).toBe(coveredKeys.length);
     expect(coveredKeys.sort()).toEqual(englishKeys.sort());
   });
 });

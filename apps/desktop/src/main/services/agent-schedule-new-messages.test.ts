@@ -321,7 +321,7 @@ describe('runContext of a new_messages schedule', () => {
     expect(context).toContain('• 群組big（accountId=agent，chatType=group，chatId=big）');
     expect(context).not.toContain('群組small');
     expect(context).not.toContain('群組noise');
-    expect(context).toContain('任務：總結。每個來源一個區塊（純文字）');
+    expect(context).toContain('任務：總結。Call `get_summary_guide` before you write the summary.');
     expect(context).toContain('人名規則');
     expect(context).toContain('用 send_to_target 傳給管理員（accountId=agent，chatType=direct，chatId=u-admin）');
     expect(context).toContain('補充：看重點');

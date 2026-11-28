@@ -202,6 +202,7 @@ export async function stageResources({ repositoryRoot = thisRepositoryRoot, outp
   if (process.platform === 'win32') await copyRequired(path.join(repositoryRoot, 'apps', 'desktop', 'dist', 'native', 'ChatResourceArchiveHost.exe'), path.join(outputRoot, 'native', 'ChatResourceArchiveHost.exe'));
   await copyRequired(path.join(repositoryRoot, 'packages', 'database', 'migrations'), path.join(outputRoot, 'database', 'migrations'));
   await copyRequired(path.join(repositoryRoot, 'skills', 'linejs-mcp'), path.join(outputRoot, 'skills', 'linejs-mcp'));
+  await copyRequired(path.join(repositoryRoot, 'skills', 'linejs-summary'), path.join(outputRoot, 'skills', 'linejs-summary'));
 
   const files = await hashFiles(outputRoot);
   const lineJsFiles = Object.entries(files).filter(([name]) => name.startsWith('line-worker/node_modules/@evex/linejs/'));

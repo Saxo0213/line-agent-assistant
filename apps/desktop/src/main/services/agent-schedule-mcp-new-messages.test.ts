@@ -9,7 +9,6 @@ import { AgentScheduleService } from './agent-schedule-service.js';
 import {
   CREATE_SCHEDULE_TOOL_DEFINITION, LIST_SCHEDULES_TOOL_DEFINITION, McpService, UPDATE_SCHEDULE_TOOL_DEFINITION, type AgentScheduleToolHandler,
 } from './mcp-service.js';
-import { MCP_SKILL_MAX_BYTES } from './mcp-skill.js';
 
 type Rpc = (method: string, params?: unknown) => Promise<{ httpStatus: number; body: Record<string, unknown> | null }>;
 const resultOf = (response: Awaited<ReturnType<Rpc>>) =>
@@ -114,14 +113,14 @@ describe('new_messages through the schedule tools', () => {
 
   it('describes the two kinds, the new_messages rules and the llm rule in the tool definitions', () => {
     const description = CREATE_SCHEDULE_TOOL_DEFINITION.description;
-    for (const needle of ['two kinds', 'Program: message', 'new_messages', 'uses no LLM', 'then="llm"', 'Agent: custom, summary, keyword_digest', 'use new_messages', 'too many messages means summarize']) {
+    for (const needle of ['two kinds', 'Program (`message`, `new_messages`)', 'new_messages', 'uses no LLM', 'then: "llm"', 'Agent (`custom`, `summary`, `keyword_digest`)', 'use `new_messages`', 'too many messages means summarize']) {
       expect(description).toContain(needle);
     }
     expect(LIST_SCHEDULES_TOOL_DEFINITION.description).toContain('execution');
     expect(LIST_SCHEDULES_TOOL_DEFINITION.description).toContain('mayUseLlm');
     for (const definition of [CREATE_SCHEDULE_TOOL_DEFINITION, UPDATE_SCHEDULE_TOOL_DEFINITION]) {
       const task = (definition.inputSchema.properties as unknown as { task: { description: string; oneOf: Array<{ properties: Record<string, unknown> }> } }).task;
-      for (const needle of ['new_messages', 'chat.messageCount', 'run.listedChars', 'chat.keywordHits', 'message.textContains', 'chat.id', 'chat.type', 'at most 20', 'at most 50 leaves', 'then is list', 'Example:']) {
+      for (const needle of ['new_messages', 'chat.messageCount', 'run.listedChars', 'chat.keywordHits', 'message.textContains', 'chat.id', 'chat.type', 'at most 20', 'at most 50 leaves', '`then` is `list`', 'Example:']) {
         expect(task.description).toContain(needle);
       }
       const variant = task.oneOf.find((option) => 'type' in option.properties && JSON.stringify(option.properties.type) === '{"const":"new_messages"}')!;
@@ -137,10 +136,9 @@ describe('new_messages through the schedule tools', () => {
     expect(AgentScheduleCreateInputSchema.safeParse({ title: 't', provider: 'claude', recurrence, task: example }).success).toBe(true);
   });
 
-  it('puts the same guidance in English into the MCP skill and keeps it under the size limit', async () => {
+  it('keeps the schedule rules in the MCP skill and leaves the field guidance to the tool definitions', async () => {
     const skill = await readFile(fileURLToPath(new URL('../../../../../skills/linejs-mcp/SKILL.md', import.meta.url)), 'utf8');
-    expect(Buffer.byteLength(skill, 'utf8')).toBeLessThan(MCP_SKILL_MAX_BYTES);
-    for (const needle of ['Two types of schedule: program and Agent', '`execution`', '`mayUseLlm`', '`new_messages`', 'use `new_messages`', '`then: "llm"`', '`messageFilter`', '`chat.keywordHits`', '`run.listedChars`']) {
+    for (const needle of ['## 4. Schedules', '`list_targets`', '`list_send_targets`', '`create_schedule`', '`list_schedules`', '`update_schedule`', '`delete_schedule`', '2. Call `create_schedule`.']) {
       expect(skill).toContain(needle);
     }
   });

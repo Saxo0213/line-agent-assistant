@@ -68,15 +68,12 @@ describe('schedule tools (mocked repository)', () => {
     const listed = (await h.rpc('tools/list')).body as { result: { tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> } };
     const create = listed.result.tools.find((tool) => tool.name === 'create_schedule')!;
     const update = listed.result.tools.find((tool) => tool.name === 'update_schedule')!;
-    expect(create.description).toContain('match:{mode:"sender"}');
-    expect(create.description).toContain('sender:{accountId:"<source-accountId>",mid:"<sender-MID>"}');
-    expect(create.description).toContain('accountId:"<list_send_targets.accountId>"');
-    expect(create.description).toContain('chatType:"direct"');
-    expect(update.description).toContain('match:{mode:"sender"}');
-    expect(update.description).toContain('sender:{accountId:"<source-accountId>",mid:"<sender-MID>"}');
+    for (const tool of [create, update]) expect(tool.description).toContain('Message forwarding: use `task.type: "message_forward"` and `recurrence: {kind: "message"}`. The `task` field gives the rules.');
 
     const task = create.inputSchema.properties as { task: { oneOf: Array<{ properties?: { match?: { oneOf: Array<{ required: string[] }> }; sender?: { required: string[] } } }> } };
     const forward = task.task.oneOf[0]!;
+    const forwardDescription = (forward as unknown as { description: string }).description;
+    for (const needle of ['match:{mode:"sender"}', 'sender:{accountId:"<source-accountId>",mid:"<sender-MID>"}', 'accountId:"<list_send_targets.accountId>"', 'chatType:"direct"']) expect(forwardDescription).toContain(needle);
     expect(forward.properties?.match?.oneOf.map((variant) => variant.required)).toEqual([
       ['mode', 'keywords'], ['mode', 'text'], ['mode', 'keywords'], ['mode'], ['mode'],
     ]);
@@ -106,16 +103,10 @@ describe('schedule tools (mocked repository)', () => {
     const listed = (await h.rpc('tools/list')).body as { result: { tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> } };
     const create = listed.result.tools.find((tool) => tool.name === 'create_schedule')!;
     const update = listed.result.tools.find((tool) => tool.name === 'update_schedule')!;
-    for (const tool of [create, update]) {
-      expect(tool.description).toContain('match:{mode:"mention"');
-      expect(tool.description).toContain('task.actions');
-      expect(tool.description).toContain('empty targets array means every readable chat');
-      expect(tool.description).toContain('{mode:"record_only"}');
-    }
     expect(create.description).not.toContain('explicit selected source chats');
-    expect(update.description).toContain('task.actions');
-    const properties = create.inputSchema.properties as { task: { oneOf: Array<{ properties?: { match?: { oneOf: Array<{ properties: { mode: { const: string } } }> }; actions?: { properties: Record<string, unknown> } } }> } };
+    const properties = create.inputSchema.properties as { task: { oneOf: Array<{ description: string; properties?: { match?: { oneOf: Array<{ properties: { mode: { const: string } } }> }; actions?: { properties: Record<string, unknown> } } }> } };
     const forward = properties.task.oneOf[0]!;
+    for (const needle of ['match:{mode:"mention"', 'task.actions', 'An empty `targets` array means every readable chat', '{mode:"record_only"}']) expect(forward.description).toContain(needle);
     expect(forward.properties?.match?.oneOf.map((variant) => variant.properties.mode.const)).toEqual(['contains', 'exact', 'image_text', 'sender', 'mention']);
     expect(Object.keys(forward.properties?.actions?.properties ?? {})).toEqual(['forward', 'notify', 'agent']);
     await h.service.shutdown();

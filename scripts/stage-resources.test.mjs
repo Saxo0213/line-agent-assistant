@@ -31,6 +31,7 @@ test('stages and verifies the complete packaged runtime resource contract', asyn
     'database/migrations/001_initial.sql',
     'database/migrations/005_pending_route_recovery.sql',
     'skills/linejs-mcp/SKILL.md',
+    'skills/linejs-summary/SKILL.md',
   ];
   for (const relativePath of required) {
     assert.ok(manifest.files[relativePath], `manifest is missing ${relativePath}`);

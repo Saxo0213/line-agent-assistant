@@ -10,6 +10,8 @@ import {
   type AgentScheduleWindow,
 } from '@line-agent/contracts';
 
+import { SUMMARY_GUIDE_FALLBACK_LINE } from './mcp-skill.js';
+
 export interface ScheduleTimeWindow { from: Date; to: Date }
 
 /** Lookback used by since_last_run when the schedule has no earlier submitted run. */
@@ -61,6 +63,8 @@ export interface ScheduledPromptInput {
   llmChats?: readonly AgentScheduleTarget[];
   /** message_forward only: the source chat title and the Agent output chat of the rule. */
   forward?: { sourceTitle: string; agentTarget: AgentScheduleSendTarget; mention: boolean };
+  /** summary and new_messages only: the linejs-summary text with the chat rules of the chats. Null or absent: the run is told to call get_summary_guide. */
+  summaryGuide?: string | null;
 }
 
 const targetLabel = (target: AgentScheduleTarget): string => target.title.trim() || target.chatId;
@@ -122,7 +126,9 @@ export function composeScheduledPrompt(input: ScheduledPromptInput): string {
 
 const PAGING_RULE = '分頁規則：訊息查詢工具每頁最多 200 則，結果含 hasMore 與 nextCursor；hasMore 為 true 時，用相同條件加上 cursor=nextCursor 再查下一頁，直到 hasMore 為 false，逐頁整理後再合併。不要自行指定超過 200 的 limit，也不要因為單頁筆數上限而放棄或重試；只有最後一頁（hasMore=false）仍無訊息，才能寫該時段無訊息。';
 const NAME_RULE = '人名規則：結果中每個人的顯示名稱一律寫成 [名稱]（半形方括號），例如「• 01:31 [小藍點] 分享因搬出國與規則限制而停卡」；不明發言者寫 [未知]；非人名的詞不加括號；聊天室標題維持【】，人名不用【】。';
-const SUMMARY_FORMAT = '每個來源一個區塊（純文字）：\n【<聊天室名稱>】<M/D HH:mm–HH:mm> · <N> 則\n重點：• …（最多 5 點）\n決議／待辦：• [名稱]－事項－期限（沒有就省略）\n未解問題：• …（沒有就省略）\n每區塊最多 15 行；沒有訊息時只寫一行「<名稱>：此時段無訊息」。';
+/** The summary line of a run: the linejs-summary text (global rules and chat rules) or, when it is unavailable, one line that names the tool. */
+const summaryTaskLine = (input: Pick<ScheduledPromptInput, 'summaryGuide'>): string =>
+  `任務：總結。${input.summaryGuide ? `\n${input.summaryGuide}` : SUMMARY_GUIDE_FALLBACK_LINE}`;
 
 /** The hidden run-time instructions of one scheduled run (injected by Main when the job starts; never stored in the job prompt). */
 export function composeScheduleRunContext(input: ScheduledPromptInput): string {
@@ -140,7 +146,7 @@ for (const chat of chats) lines.push(`• ${targetLabel(chat)}（accountId=${cha
 if (input.task.type === 'new_messages' && input.task.messageFilter && chats.length > 0) {
   lines.push(`訊息過濾：只使用符合下列條件的訊息，其他訊息視為不存在。message.direction 的 inbound 是別人傳入、outbound 是自己傳出；message.kind 是訊息類型；message.textContains 比對文字且不分大小寫。條件：${JSON.stringify(input.task.messageFilter)}`);
 }
-lines.push(`任務：總結。${SUMMARY_FORMAT}`);
+lines.push(summaryTaskLine(input));
   }
   if (reads) {
 lines.push(`時間：${formatTaipeiRange(input.window)}（台灣時間）；查詢用 UTC from=${input.window.from.toISOString()} to=${input.window.to.toISOString()}`);
@@ -156,12 +162,12 @@ lines.push('來源：未固定聊天室。依指示自行決定要讀取哪些�
 lines.push(PAGING_RULE);
   }
   if (input.task.type === 'summary') {
-lines.push(`任務：總結。${SUMMARY_FORMAT}`);
+lines.push(summaryTaskLine(input));
 if (input.task.focus) lines.push(`特別關注：${input.task.focus}`);
   } else if (input.task.type === 'keyword_digest') {
 lines.push(`任務：關鍵字彙整（不分大小寫）：${input.task.keywords.map((keyword) => `「${keyword}」`).join('、')}。每個來源一個區塊，標題「【<名稱>】」，其下每則一行「• HH:mm [發言者]：內容」（台灣時間），最多 20 則，超過寫「另有 N 則」；沒有符合時寫「<名稱>：此時段無符合訊息」。純文字。`);
   }
-  if (input.task.type !== 'custom') lines.push(NAME_RULE);
+  if (input.task.type !== 'custom' && input.task.type !== 'summary') lines.push(NAME_RULE);
   const sendRules = '只傳結果本身（純文字、不要 Markdown、不加說明）；你的回覆貼同一份文字。傳送失敗或結果不明時不要重試，在回覆說明原因（此規則只適用於傳送與真正的錯誤，分頁不算錯誤，必須繼續查下一頁）。';
   if (input.delivery.mode === 'primary_admin') {
 const admin = input.adminChat;

@@ -26,7 +26,7 @@
 </tr>
 </table>
 
-v1.0.415 fixes the Agent Skill that did not load since v1.0.404, checks Agent replies to members before they go out (system information is for the Primary Admin only), adds per-chat Agent rules (`/rules`), lets external MCP clients such as Claude Code and Codex wait for the admin's quoted LINE reply, and adds `/help` for the Primary Admin. Since v1.0.395 the app updates itself: a new version downloads in the background and installs when the app is idle, then the app reopens. Older versions update once with the app's **Check for updates**. See the [v1.0.405 → v1.0.415 release notes](docs/releases/v1.0.415.md) for the changes, and the [v1.0.405 release notes](docs/releases/v1.0.405.md) for the previous version.
+v1.0.419 makes the summary rules a separate Skill that the Primary Admin and each chat can adjust, rewrites all Agent tool descriptions, shortens the command help, and lets an auto-reply pick one of several replies separated by `；` at random. Since v1.0.395 the app updates itself: a new version downloads in the background and installs when the app is idle, then the app reopens. Older versions update once with the app's **Check for updates**. See the [v1.0.415 → v1.0.419 release notes](docs/releases/v1.0.419.md) for the changes, and the [v1.0.415 release notes](docs/releases/v1.0.415.md) for the previous version.
 
 ## Installation
 
