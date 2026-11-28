@@ -59,13 +59,17 @@ export interface ResidentPromptInput {
   personaSection: string;
   replySection: string;
   attachmentSection: string;
+  /** The waiting external sessions of the Primary Admin's direct chat (one turn); empty adds nothing. */
+  waitingSessionsSection?: string;
+  /** The 發問者 line of a LINE job (Primary Admin or member). Null or absent: none. */
+  requesterLine?: string | null;
 }
 
 /**
  * Splits the prompt of a resident Claude job.
  * systemPrompt (fixed for the process): skill, output-channel line, history hint, identity block without the asker line,
  * project-folder section, persona section.
- * message (one turn): asker line (group and room chats only), job prompt, reply-context section, attachment section.
+ * message (one turn): requester line (LINE jobs), asker line (group and room chats only), job prompt, reply-context section, attachment section, waiting-session section.
  */
 export function buildResidentPrompt(input: ResidentPromptInput): { systemPrompt: string; message: string } {
   const head: string[] = [];
@@ -80,6 +84,7 @@ export function buildResidentPrompt(input: ResidentPromptInput): { systemPrompt:
   const tail = `${input.projectFolderSection}${input.personaSection}`;
   const systemPrompt = withSkill ? `${withSkill}${tail}` : tail.replace(/^\n+/, '');
   const askerLine = input.identity ? formatAskerLine(input.identity) : null;
-  const visible = askerLine ? withIdentityBlock(input.visiblePrompt, askerLine) : input.visiblePrompt;
-  return { systemPrompt, message: `${visible}${input.replySection}${input.attachmentSection}` };
+  const turnLines = [input.requesterLine, askerLine].filter((line): line is string => !!line).join('\n');
+  const visible = turnLines ? withIdentityBlock(input.visiblePrompt, turnLines) : input.visiblePrompt;
+  return { systemPrompt, message: `${visible}${input.replySection}${input.attachmentSection}${input.waitingSessionsSection ?? ''}` };
 }

@@ -12,7 +12,8 @@ export const AUDIT_ACTIONS = [
   'friend_authorization_precheck', 'friend_grant_commit',
   'worker_operation_error', 'line_catalog_refresh', 'runtime_error',
   'album_photo_download', 'line_ingest_slow_upstream', 'line_ingest_slow_main',
-  'free_mode_judge', 'free_mode_interrupt', 'bridge_message_verify', 'app_auto_update',
+  'free_mode_judge', 'free_mode_interrupt', 'bridge_message_verify', 'app_auto_update', 'chat_rules_restored',
+  'agent_reply_audit',
 ] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
 export const AUDIT_INITIATORS = ['user', 'system', 'worker'] as const;
@@ -46,7 +47,7 @@ export const AUDIT_RESULT_CODES = ['worker_stopped', 'secret_removed', 'agent_au
   'catalog_refresh_recovered', 'free_mode_judge_reply', 'free_mode_judge_no_reply', 'free_mode_interrupted',
   'free_mode_interrupt_refused_urgency', 'free_mode_interrupt_refused_limit', 'free_mode_interrupt_refused_not_running',
   'BRIDGE_VERIFY_MATCH', 'BRIDGE_VERIFY_MISMATCH', 'BRIDGE_VERIFY_NOT_IN_STORE', 'BRIDGE_VERIFY_NATIVE_INCOMPLETE',
-  'BRIDGE_VERIFY_STORE_INCOMPLETE', 'BRIDGE_VERIFY_IDENTITY_MATCH'] as const;
+  'BRIDGE_VERIFY_STORE_INCOMPLETE', 'BRIDGE_VERIFY_IDENTITY_MATCH', 'allowed', 'blocked', 'judge_unavailable'] as const;
 export type AuditResultCode = typeof AUDIT_RESULT_CODES[number];
 
 export interface AuditEvent {

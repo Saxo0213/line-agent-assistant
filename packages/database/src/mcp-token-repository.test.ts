@@ -306,7 +306,8 @@ database('MCP token & audit repository and target/time message queries', () => {
     const seen = await tokens.executeLocalClientRead({ toolName: 'list_targets',
       execute: async ({ principalId, authorizedAccountIds, toolScopes }) => ({ data: { principalId, authorizedAccountIds, toolScopes }, resultCount: 2 }) });
     expect(seen).toEqual({ principalId: 'local-client', authorizedAccountIds: ['account-admin', 'account-agent'],
-      toolScopes: [...MCP_TOOL_NAMES, 'list_send_targets', 'send_to_target', 'list_schedules', 'create_schedule', 'update_schedule', 'delete_schedule'] });
+      toolScopes: [...MCP_TOOL_NAMES, 'list_send_targets', 'send_to_target', 'read_message_attachment', 'list_schedules', 'create_schedule', 'update_schedule', 'delete_schedule',
+        'wait_for_admin_reply', 'list_admin_replies', 'close_session'] });
     const row = (await tokens.listAuditRecords(10)).find((entry) => entry.principalId === 'local-client' && entry.action === 'TOOL_CALLED');
     expect(row).toMatchObject({ tokenId: null, initiator: 'external_agent', toolName: 'list_targets',
       accountScopes: ['account-admin', 'account-agent'], grantVersion: null, disposition: 'ALLOWED', resultCount: 2 });

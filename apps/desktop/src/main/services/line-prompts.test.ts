@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LINE_PROMPT_CATALOG, linePrompt } from './line-prompts.js';
+import { LINE_PROMPT_CATALOG, lineHelpText, linePrompt } from './line-prompts.js';
 
 describe('LINE prompt translations', () => {
   it('has the same typed prompt keys in every supported locale', () => {
@@ -27,6 +27,16 @@ describe('LINE prompt translations', () => {
       expect(direct).toMatch(relayWording[locale]);
       expect(linePrompt(locale, 'enrollmentGroupChallenge', { code })).toContain(code);
       expect(linePrompt(locale, 'adminWelcome')).toBe(welcome[locale]);
+    }
+  });
+
+  it('lists every command in the /help reply in every locale, short enough for one LINE message', () => {
+    for (const locale of ['en', 'zh-TW', 'ja', 'ko'] as const) {
+      const text = lineHelpText(locale);
+      for (const command of ['/new', '/stop', '/status', '/quota', '/agent codex|claude|default', '/model', '/free', '/persona', '/folder', '/adduser', '/permissions', '/help']) {
+        expect(text).toContain(command);
+      }
+      expect(text.length).toBeLessThan(1500);
     }
   });
 

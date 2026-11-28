@@ -3,15 +3,20 @@ import type { AgentRunExtensions, AgentToolPolicy } from '@line-agent/contracts'
 import { deriveToolPolicy, type JobPolicy } from '@line-agent/database';
 import type { AgentExecutionLevel } from '@line-agent/contracts';
 import type { ChatFolderService } from './chat-folders.js';
+import type { ChatRulesService } from './chat-rules-service.js';
 
 export type AgentJobPlan =
-  | { ok: true; workspacePath: string; tools: AgentToolPolicy; extensions?: AgentRunExtensions }
+  | { ok: true; workspacePath: string; tools: AgentToolPolicy; extensions?: AgentRunExtensions;
+    /** Who asked, from the durable job policy: the Primary Admin (and the operator) or a member. */
+    requester?: 'admin' | 'member' }
   | { ok: false; code: string; message: string };
 
 /** Main-owned decision of where a job runs and which provider tools it gets; consumed by agent-service. */
 export interface AgentJobEnvironment {
   /** `topLayer` is the workspace stored on the job row; the bridge validates it exactly as before. */
   prepare(jobId: string, topLayer?: string): Promise<AgentJobPlan>;
+  /** End of the job (any outcome): undoes changes a protected job made to its chat folder's rule files. */
+  finish?(jobId: string): Promise<void>;
 }
 
 export interface AgentJobEnvironmentDependencies {
@@ -23,6 +28,8 @@ export interface AgentJobEnvironmentDependencies {
   /** The chat's /folder bindings, re-validated now (missing or relocated folders already left out and audited). */
   resolveProjectFolders?(key: { accountId: string; chatType: string; chatId: string }): Promise<Array<{ path: string; mode: 'READ' | 'READ_WRITE' }>>;
   workspace: { current(): Promise<string> };
+  /** Per-chat Agent rules: synced at the start of a chat-folder job, protected until its end. */
+  chatRules?: Pick<ChatRulesService, 'begin' | 'end'>;
 }
 
 /**
@@ -52,9 +59,14 @@ const fail = (code: string, message: string): AgentJobPlan => ({ ok: false, code
 export class AgentJobEnvironmentService implements AgentJobEnvironment {
   constructor(private readonly dependencies: AgentJobEnvironmentDependencies) {}
 
+  async finish(jobId: string): Promise<void> {
+    try { await this.dependencies.chatRules?.end(jobId); } catch { /* best effort */ }
+  }
+
   async prepare(jobId: string, topLayer?: string): Promise<AgentJobPlan> {
     const resolved: { policy: JobPolicy | null } = { policy: null };
-    const plan = await this.prepareWorkspace(jobId, topLayer, resolved);
+    const prepared = await this.prepareWorkspace(jobId, topLayer, resolved);
+    const plan: AgentJobPlan = prepared.ok ? { ...prepared, requester: extensionsEligible(resolved.policy) ? 'admin' : 'member' } : prepared;
     if (!plan.ok || !this.dependencies.resolveExtensions || !extensionsEligible(resolved.policy)) return plan;
     // Extras are an addition: if they cannot be read the job still runs with exactly the tools it had before.
     let extensions: AgentRunExtensions | null = null;
@@ -75,6 +87,19 @@ export class AgentJobEnvironmentService implements AgentJobEnvironment {
     try { mounts = await this.dependencies.resolveProjectFolders({ accountId, chatType, chatId }); } catch { return []; }
     const mayWrite = policy.permissions['project_folder.write'] === 'ALLOW' && level !== 'read_only';
     return mounts.map((mount) => ({ path: mount.path, writable: mount.mode === 'READ_WRITE' && mayWrite }));
+  }
+
+  /**
+   * The project folders of a job's chat that the job may read, with the same rule `prepare` uses to mount them (the principal, the
+   * project_folder.read permission and the re-validated binding). Empty when nothing is mounted or the job cannot be resolved.
+   */
+  async readableProjectFolders(jobId: string): Promise<string[]> {
+    try {
+      const policy = await this.dependencies.resolvePolicy(jobId);
+      if (!policy || policy.principal.kind === 'unresolved') return [];
+      const level = await this.dependencies.getExecutionLevel?.() ?? 'workspace_write';
+      return (await this.projectDirs(policy, level)).map((dir) => dir.path);
+    } catch { return []; }
   }
 
   private async prepareWorkspace(jobId: string, topLayer: string | undefined, resolved: { policy: JobPolicy | null }): Promise<AgentJobPlan> {
@@ -99,10 +124,13 @@ export class AgentJobEnvironmentService implements AgentJobEnvironment {
         return fail('JOB_POLICY_UNRESOLVED', 'The Agent job permissions could not be resolved.');
       }
       const own = await this.dependencies.folders.resolve(policy.accountId, policy.chatType, policy.chatId, 'system:agent-job');
+      // Per-chat rules: sync the rule files, keep their bytes. Only the Primary Admin's direct job (above) may change them.
+      await this.dependencies.chatRules?.begin(jobId, own.path, { protect: true, ...(policy.accountId ? { accountId: policy.accountId } : {}) });
+      const protectedTools: AgentToolPolicy = { ...tools, chatRulesProtected: true };
       // The admin/operator layer is the whole system: below the top layer it still mounts the workspace root.
       // Whitelisted users never get it.
       if (policy.principal.kind === 'admin') {
-        return { ok: true, workspacePath: own.path, tools: withProjectDirs({ ...tools, workspaceRootDir: await realpath(await this.dependencies.workspace.current()) },
+        return { ok: true, workspacePath: own.path, tools: withProjectDirs({ ...protectedTools, workspaceRootDir: await realpath(await this.dependencies.workspace.current()) },
           await this.projectDirs(policy, level)) };
       }
       const linkedReadDirs: string[] = [];
@@ -111,7 +139,7 @@ export class AgentJobEnvironmentService implements AgentJobEnvironment {
       }
       const projectDirs = await this.projectDirs(policy, level);
       return { ok: true, workspacePath: own.path,
-        tools: withProjectDirs(linkedReadDirs.length > 0 ? { ...tools, fileRead: true, linkedReadDirs } : tools, projectDirs) };
+        tools: withProjectDirs(linkedReadDirs.length > 0 ? { ...protectedTools, fileRead: true, linkedReadDirs } : protectedTools, projectDirs) };
     } catch (error) {
       const code = (error as { code?: unknown }).code === 'CHAT_FOLDER_UNAVAILABLE' ? 'CHAT_FOLDER_UNAVAILABLE' : 'WORKSPACE_UNAVAILABLE';
       return fail(code, code === 'CHAT_FOLDER_UNAVAILABLE'

@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-export const MCP_SKILL_MAX_BYTES = 16 * 1024;
+export const MCP_SKILL_MAX_BYTES = 24 * 1024;
 
 /** Reads the packaged app-owned Skill text; returns null when unavailable (MCP still works, without guidance). */
 export async function loadLinejsMcpSkill(skillsDirectory: string): Promise<string | null> {
@@ -12,10 +12,12 @@ export async function loadLinejsMcpSkill(skillsDirectory: string): Promise<strin
   } catch { return null; }
 }
 
+const NO_LOCAL_PATH_RULE = '不要對 LINE 使用者顯示 App 或工作資料夾的本機絕對路徑；用資料夾的用途或專案資料夾名稱稱呼。';
+
 const OUTPUT_CHANNEL_LINES = {
   ui: '輸出位置：Agent 聊天室（可使用 Markdown）',
-  line: '輸出位置：LINE（只能用純文字，不要使用 Markdown）',
-  schedule: '輸出位置：排程紀錄與 LINE（只能用純文字，不要使用 Markdown）',
+  line: `輸出位置：LINE（只能用純文字，不要使用 Markdown）\n${NO_LOCAL_PATH_RULE}`,
+  schedule: `輸出位置：排程紀錄與 LINE（只能用純文字，不要使用 Markdown）\n${NO_LOCAL_PATH_RULE}`,
 } as const;
 
 /** Adds the single 「輸出位置」 line that the Skill's output-format rule refers to. */

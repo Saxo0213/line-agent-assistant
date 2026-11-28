@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { AGENT_PERMISSIONS, AGENT_ROOM_KEY, AGENT_SCHEDULE_QUEUE_KEY, DEFAULT_AGENT_STATUS_ICONS, DEFAULT_DOWNLOAD_BRIDGE_INTERVALS, NativeAttachmentDescriptorSchema, NativeStickerMetadataSchema, isLocalAgentRoom, isWritableChatType, isLineServerErrorCode, lineResultErrorMessage, relationAddServerError, talkServerError } from '@line-agent/contracts';
 import {
-  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AGENT_RUNTIME_DEFAULTS, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, AttachmentStorageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomFreeModeRepository, SettingsRepository, ProviderQuotaRepository, AccountSourceRepository, PendingTurnRepository, effectiveDefaultId, normalizedFallbackOrder, migrate, parseLineStickerDescriptor,
+  AccountRepository, AdminRepository, AgentPermissionError, AgentExtensionsRepository, AgentPermissionRepository, AGENT_RUNTIME_DEFAULTS, AgentRepository, AgentScheduleError, AgentScheduleRepository, resolveAgentLineage, resolveJobPolicy, resolveUserPermissions, deriveToolPolicy, FREE_MODE_MEMBER_ID, AlbumNotificationTaskRepository, ChatAlbumCatalogRepository, type AlbumNotificationTaskChat, type AlbumNotificationTaskErrorCode, walkAlbumTaskMessagePages, AutoResponderRepository, ExternalMonitorRepository, FriendWhitelistRepository, McpDomainError, McpTokenRepository, MessageRepository, AttachmentStorageRepository, bridgeNativeEnvelope, nativeMessageText, ProjectFolderRepository, RoomFreeModeRepository, ExternalSessionRepository, SettingsRepository, ProviderQuotaRepository, AccountSourceRepository, PendingTurnRepository, effectiveDefaultId, normalizedFallbackOrder, migrate, parseLineStickerDescriptor,
   CONVERSATION_PICTURE_SQL, NAME_RESOLUTION_GROUP_COLUMNS, nativeReactions, ownMessageSql, PEER_CONTACT_JOIN, SENDER_CONTACT_JOIN, SENDER_NAME_SQL, SENDER_PICTURE_SQL, conversationPictureSql, senderNameSql, senderPictureSql,
 } from '@line-agent/database';
 import type { Attachment, BridgeVerificationCounts, ExternalDirectPollInput, ExternalDirectPollResult, ExternalObservation } from '@line-agent/database';
@@ -49,6 +49,8 @@ import { AgentJobEnvironmentService } from './services/agent-job-environment.js'
 import { AgentExtensionsService, AgentExtensionsServiceError, BackendSecretCodec } from './services/agent-extensions-service.js';
 import { defaultImportLocations, type AgentExtensionImportLocations } from './services/agent-extension-import.js';
 import { ChatFolderError, ChatFolderService } from './services/chat-folders.js';
+import { ChatRulesService } from './services/chat-rules-service.js';
+import { findGitExecutable } from './services/chat-rules-git.js';
 import { AlbumArchiveFailure, albumFailureContextFrom, albumTaskFailureStage, ChatResourceArchiveService, nativePostNotificationSubtype,
   ChatResourceUnsupportedError, ChatResourceNoHomeChatError, type ChatResourceBinding, type ChatResourceRequest, type ChatResourceReadResult, type ChatResourceStore } from './services/chat-resources.js';
 import { AlbumNotificationDispatcher, archiveAlbumContinuations } from './services/album-notification-dispatcher.js';
@@ -64,6 +66,8 @@ import { buildClassifierPrompt, classifierFailure, CLASSIFIER_SYSTEM_PROMPT, CLA
 import { createWindowsAttachmentBroker, resolveWindowsAttachmentBrokerPath } from '@line-agent/line-worker/attachment-storage';
 import { DeliveryService } from './services/delivery-service.js';
 import { AgentLineSendService } from './services/agent-line-send-service.js';
+import { ExternalSessionService } from './services/external-session-service.js';
+import { redactAppPaths } from './services/line-reply-path-redaction.js';
 import { PermissionCommandService, type PermissionCommandTransport } from './services/permission-command.js';
 import { ContentReprojectionService } from './services/content-reprojection-service.js';
 import { HealthService, kindPreview } from './services/health-service.js';
@@ -105,6 +109,7 @@ import type { DirectMonitorPage, ImportCatalogPage, ImportCursor, ImportDirector
 import { createFirstImportProgressLog } from './services/first-import-progress-log.js';
 import { classifyExternalMonitorFailure, clearExternalMonitorDiagnostic, ExternalMonitorDiagnosticFailure, externalMonitorDatabaseFailure, externalMonitorBootstrapReason, externalMonitorFailureDetail, externalMonitorProgressMessage, recordExternalMonitorDiagnostic as persistExternalMonitorDiagnostic, type ExternalMonitorDiagnosticProducer, type ExternalMonitorFailureDetail, type ExternalMonitorFailurePhase } from './services/external-monitor-diagnostics.js';
 import { linePrompt } from './services/line-prompts.js';
+import { createReplyAuditService } from './services/reply-audit-runtime.js';
 import { createOwnAvatarRefreshScheduler, runOwnAvatarRefreshes } from './services/own-avatar-refresh-scheduler.js';
 import { cleanupStaleManualMedia, ManualMediaError, stageManualMedia } from './services/manual-media-staging.js';
 import { createManualMediaAdmission } from './services/manual-media-admission.js';
@@ -213,6 +218,10 @@ export interface ConnectedFacadeOptions {
   freeModeJudgeDirectory?: string;
   /** App-managed directory (a sibling of the free-mode judge directory) for the image copies of the attachment classifier. */
   attachmentClassifierDirectory?: string;
+  /** App-managed empty directory that is the working directory of the reply audit session. Absent: no reply audit runs. */
+  replyAuditDirectory?: string;
+  /** The packaged app version (app.getVersion()); the reply audit scan looks for it in a reply. */
+  appVersion?: string;
   previewCacheRoot?: string;
   mediaCacheRoot?: string;
   /** Handle-anchored Main archive store; absent adapters fail closed. */
@@ -962,7 +971,15 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   const agentExtensions = new AgentExtensionsService(
     new AgentExtensionsRepository(options.pool, new BackendSecretCodec(options.agentExtensionSecretBackend ?? new DpapiUserSecretBackend())),
     () => ({ ...defaultImportLocations(), ...options.agentExtensionImport }));
+  // Per-chat Agent rules (AGENTS.md, CLAUDE.md, rules/): /rules, the start-of-job sync and the end-of-job protection.
+  // A restore is recorded as chat_rules_restored; the bounded diagnostic detail holds the counts.
+  const chatRules = new ChatRulesService({ folders: chatFolders, gitExecutable: () => findGitExecutable(),
+    onRestored: (info) => { options.audit?.observed('chat_rules_restored', { initiator: 'system',
+      ...(info.accountId ? { accountId: info.accountId } : {}), jobId: info.jobId,
+      diagnostic: { operation: 'agent', stage: 'cleanup', category: 'unknown', recovery: 'none', outcome: 'recovered',
+        detail: `changed:${info.changed}:added:${info.added}:removed:${info.removed}` } }); } });
   const agentJobEnvironment = new AgentJobEnvironmentService({
+    chatRules,
     resolvePolicy: (jobId) => resolveJobPolicy(options.pool, jobId),
     resolveExtensions: () => agentExtensions.resolveForRun(),
     getExecutionLevel: async () => (await permissionRepository.getExecutionPolicy()).level,
@@ -983,8 +1000,19 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     } });
   // Agent LINE send queue (list_send_targets / send_to_target). Built before the MCP service that hands it work; it sends
   // through the same worker gateway and write gate as DeliveryService, and drops its pending items on shutdown.
+  // Text that goes to LINE never shows the app data folder or the chat workspace path (the workspace root counts as an app folder).
+  const redactLineText = async (text: string, chatWorkspace: string | null): Promise<string> => {
+    const root = await workspace.current().catch(() => null);
+    return redactAppPaths(text, { chatWorkspace, appRoots: root ? [root] : [] });
+  };
+  // External MCP sessions and the replies of the Primary Admin (docs/design/external-session-reply.md).
+  const externalSessionRepository = new ExternalSessionRepository(options.pool);
+  const externalSessionService = new ExternalSessionService({ sessions: externalSessionRepository, messages });
   const agentLineSend = new AgentLineSendService({ messages, canWriteLine, attachmentRoot: options.attachmentRoot,
+    sessions: externalSessionRepository,
+    redactText: redactLineText,
     workspacePath: async () => workspace.current().catch(() => null),
+    projectFolders: (jobId) => agentJobEnvironment.readableProjectFolders(jobId),
     worker: {
       binding: (accountId) => options.workers.binding(accountId),
       waitModeAck: (accountId, mode, timeoutMs) => options.workers.waitModeAck(accountId, mode, timeoutMs),
@@ -1022,6 +1050,7 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
   stopAgentSchedules = onceCleanup(async () => { await photoText.stop(); await scheduleForward.stop(); await agentSchedules.stop(); });
   startupCleanup.add(stopAgentSchedules);
   mcpService = new McpService({ pool: options.pool, tokens: mcpTokens, messages, approvalBroker, lineSend: agentLineSend, schedules: agentSchedules, chatFolders: attachmentStorageService,
+    externalSessions: externalSessionService, externalAttachmentWorkspace: async () => workspace.current().catch(() => null),
     // attachmentService is created below; read_message_attachment reads it only when an Agent job calls the tool.
     jobFileAccess: (jobId) => agentService.runFileAccess(jobId),
     attachments: { recoverFromLocalDownloads: (attachmentId) => attachmentService.recoverFromLocalDownloads(attachmentId), resolveReadyPath: (attachmentId) => attachmentService.resolveReadyPath(attachmentId) },
@@ -1380,6 +1409,8 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     { accountSources, failover, ...(options.agentUpgradeNotice ? { upgradeNotice: options.agentUpgradeNotice } : {}), residentTurnTimeoutMs: agentRuntime.turnTimeoutSeconds * 1000, residentStallMs: agentRuntime.turnStallSeconds * 1000,
       // Decision D1: a job with a committed LINE send is never replayed by the self-heal.
       committedLineSends: (jobId) => messages.countJobLineSends(jobId),
+      // The waiting external sessions in the prompt of the Primary Admin's direct-chat job (forward_to_session).
+      waitingSessionsSection: (accountId) => externalSessionService.waitingSessionsSection(accountId),
       // /model: a LINE job uses its chat's model. A room job uses the model of the admin-direct chat while the claim fixed that
       // session for it (the room shares the chat); a room job on its own session has no model and follows the bridge default.
       resolveClaudeModel: async (job) => {
@@ -1789,13 +1820,28 @@ async function createConnectedFacadeInternal(options: ConnectedFacadeOptions, st
     async (snapshot) => providerQuota.saveSnapshot({ sourceId: snapshot.sourceId ?? snapshot.provider, requestedAt: snapshot.requestedAt,
       fetchedAt: snapshot.fetchedAt, stale: snapshot.stale, snapshot }), providerQuotaService,
     (sourceId) => providerQuota.get(sourceId), () => accountSources.list(),
-    async (routeKey) => await settings.getAgentAutoFailoverEnabled() ? agents.getRoute(routeKey) : null);
+    async (routeKey) => await settings.getAgentAutoFailoverEnabled() ? agents.getRoute(routeKey) : null,
+    externalSessionService, chatRules);
   lineServiceReady = true;
+  // The reply to a non-admin chat is audited after the path redaction and before the LINE send (docs/design/non-admin-reply-audit.md).
+  const replyAudit = createReplyAuditService({
+    judge: options.agent.judge, directory: options.replyAuditDirectory,
+    resolvePolicy: (jobId) => resolveJobPolicy(options.pool, jobId),
+    provider: () => resolveDefaultProvider(settings), account: (provider) => quotaAccount(provider),
+    appendEvent: (jobId, event) => agents.appendEvent(jobId, event),
+    record: (entry) => options.audit?.observed('agent_reply_audit', { initiator: 'system',
+      ...(entry.accountId ? { accountId: entry.accountId } : {}), jobId: entry.jobId, resultCode: entry.resultCode,
+      diagnostic: { operation: 'agent', stage: 'execute', category: entry.resultCode === 'blocked' ? 'denied' : entry.resultCode === 'allowed' ? 'unknown' : 'unavailable',
+        recovery: 'none', outcome: 'recovered', detail: entry.detail } }),
+    blockedText: linePrompt(options.locale ?? 'en', 'replyAuditBlocked'),
+    ...(options.appVersion ? { appVersion: options.appVersion } : {}),
+    onError: (error) => options.audit?.failure(diagnosticFailure('agent', 'execute', error)) });
   delivery = new DeliveryService(agents, {
     binding: (accountId) => options.workers.binding(accountId),
     waitModeAck: (accountId, mode, timeoutMs) => options.workers.waitModeAck(accountId, mode, timeoutMs),
     send: sendLineCommand,
-  }, canWriteLine, (diagnostic, identity) => options.audit?.failure(diagnostic, identity));
+  }, canWriteLine, (diagnostic, identity) => options.audit?.failure(diagnostic, identity), redactLineText,
+  replyAudit ? (job, texts) => replyAudit.review(job, texts) : undefined);
   stopDelivery = onceCleanup(() => delivery.shutdown());
   startupCleanup.add(stopDelivery);
   // Queued jobs are reclaimed only after the MCP listener is bound (see below) so their capability can be minted.

@@ -108,6 +108,8 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     hadToolActivity: z.boolean().optional(), hadEffectiveOutput: z.boolean().optional() }),
   z.strictObject({ type: z.literal('cancelled') }),
   z.strictObject({ type: z.literal('mcp_status'), status: z.enum(['configured', 'available', 'not_loaded']), message: z.string().min(1) }),
+  /** The reply audit of a non-admin chat held back this reply; `draft` is the original text, kept only in the job event log. */
+  z.strictObject({ type: z.literal('reply_audit_blocked'), draft: z.string() }),
 ]);
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
 

@@ -104,7 +104,6 @@ database('list_active_chats and the by-time filters through McpService with a re
     expect(MCP_TOOL_EFFECTS.list_active_chats).toBe('read');
     const definition = MCP_TOOL_DEFINITIONS.find((tool) => tool.name === 'list_active_chats')!;
     expect(definition.description).toContain('Use this tool first to see which chats have new messages and how many, and then read only the chats that you need');
-    expect(definition.description).toContain('returns no message text');
     expect(definition.description).toContain('limit defaults to 200');
     expect(definition.inputSchema).toMatchObject({ type: 'object', additionalProperties: false, required: ['from'] });
     const properties = Object.keys((definition.inputSchema as { properties: Record<string, unknown> }).properties).sort();
@@ -114,7 +113,7 @@ database('list_active_chats and the by-time filters through McpService with a re
 
   it('documents the new by-time filters and points the Agent to list_active_chats', () => {
     const definition = MCP_TOOL_DEFINITIONS.find((tool) => tool.name === 'query_target_messages_by_time')!;
-    for (const needle of ['list_active_chats', 'excludeChatIds', 'excludeKinds', 'direction', 'not both', 'pass the same values together with cursor']) {
+    for (const needle of ['list_active_chats', 'excludeChatIds', 'excludeKinds', 'direction', 'use only one of them', 'Pass the same values together with cursor']) {
       expect(definition.description).toContain(needle);
     }
     const properties = (definition.inputSchema as { properties: Record<string, unknown> }).properties;

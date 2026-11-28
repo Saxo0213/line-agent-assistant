@@ -9,6 +9,7 @@ import {accountEnvironment,buildChildEnvironment,CLAUDE_GIT_BASH_PATH_ENV,gitBas
 import {claudeArguments,ClaudeEvents,claudeResidentArguments} from './claude.js';
 import {codexArguments,codexResumeNotFound,CodexEvents,isValidCodexModel} from './codex.js';
 import {extensionEnvironment} from './extensions.js';
+import {projectInstructionDigest} from './project-instructions.js';
 import {claudeJudgeArguments,codexJudgeArguments,judgeInput,JUDGE_DEFAULT_TIMEOUT_MS,JUDGE_MAX_IMAGES,type JudgeRequest,type JudgeResult} from './judge.js';
 import {isAuthenticationDiagnostic} from './failure.js';
 export {providerFailureResetAt} from './failure.js';
@@ -63,12 +64,13 @@ type Prepared=
   |{ok:true;job:Job;request:AgentRunRequest;workspace:string;executionRequest:AgentRunRequest;executable:ResolvedExecutable;accountEnv:AccountEnv};
 
 /** SHA-256 of the arguments without the resume pair, the workspace, the Git Bash path, a digest of the extension environment values and the account environment (a source change replaces the process). No executable path, no MCP token. */
-function residentArgsHash(args:readonly string[],resumeSessionId:string|undefined,workspace:string,gitBash:string,extensionEnv:Record<string,string>,accountEnv:AccountEnv={}):string {
+export function residentArgsHash(args:readonly string[],resumeSessionId:string|undefined,workspace:string,gitBash:string,extensionEnv:Record<string,string>,accountEnv:AccountEnv={}):string {
   const finalArgs=[...args];
   const at=resumeSessionId===undefined?-1:finalArgs.findIndex((value,index)=>value==='--resume'&&finalArgs[index+1]===resumeSessionId);
   if(at>=0) finalArgs.splice(at,2);
   const extensionDigest=createHash('sha256').update(JSON.stringify(Object.entries(extensionEnv).sort(([a],[b])=>a<b?-1:a>b?1:0))).digest('hex');
-  return createHash('sha256').update(JSON.stringify([finalArgs,workspace,gitBash,extensionDigest,accountEnv])).digest('hex');
+  // CLAUDE.md and AGENTS.md of the workspace are read once at process start: a changed file replaces the process.
+  return createHash('sha256').update(JSON.stringify([finalArgs,workspace,gitBash,extensionDigest,accountEnv,projectInstructionDigest(workspace)])).digest('hex');
 }
 interface Job {residentKey?:string; cancelled:boolean; cancellationFailed?:boolean; child?:RunningProcess; launchSettled:Promise<void>; finishLaunch():void}
 const failed=(code:string,message:string):AgentEvent=>({type:'failed',code,message,retryable:false});
@@ -600,6 +602,7 @@ export {classifyAutonomous,planRelay,shouldRelay} from './relay.js';
 export {EXTENSION_ENV_PREFIX,claudeExtensionPlan,codexExtensionPlan,extensionEnvironment} from './extensions.js';
 export {claudeArguments,claudeIsTaskNotification,claudeIsTurnActivity,claudeResidentArguments,claudeResultOf,claudeToolArguments,claudeUserTurnLine} from './claude.js';
 export {gitBashPath} from './child-environment.js';
+export {projectInstructionDigest} from './project-instructions.js';
 export {homeDirectoryFrom,slimReason,transcriptBytes} from './transcript.js';
 export type {AutoSlimOptions} from './transcript.js';
 export {fnv1a64,spillClaudeArguments} from './spill.js';

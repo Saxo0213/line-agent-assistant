@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomUUID } from 'node:crypto';
 import type { Socket } from 'node:net';
 import { INTERNAL_MCP_TOKEN_PREFIX } from './internal-mcp-capabilities.js';
-import { SEND_TO_TARGET_TOOL_NAME } from '@line-agent/contracts';
+import { SEND_TO_TARGET_TOOL_NAME, WAIT_FOR_ADMIN_REPLY_TOOL_NAME } from '@line-agent/contracts';
 import { REQUEST_PERMISSION_TOOL_NAME, type McpService } from './mcp-service.js';
 
 export const MCP_HTTP_HOST = '127.0.0.1' as const;
@@ -34,7 +34,11 @@ function isInternalToolCall(body: unknown, toolName: string): boolean {
     && (rpc.params as { name?: unknown }).name === toolName;
 }
 const isPermissionPromptCall = (body: unknown): boolean => isInternalToolCall(body, REQUEST_PERMISSION_TOOL_NAME);
-const isSendToTargetCall = (body: unknown): boolean => isInternalToolCall(body, SEND_TO_TARGET_TOOL_NAME);
+/**
+ * send_to_target waits for the paced queue; wait_for_admin_reply waits up to 600 s for a reply. Both get the long backstop
+ * (605 s, above the 600 s limit of both calls).
+ */
+const isSendToTargetCall = (body: unknown): boolean => isInternalToolCall(body, SEND_TO_TARGET_TOOL_NAME) || isInternalToolCall(body, WAIT_FOR_ADMIN_REPLY_TOOL_NAME);
 
 export class McpHttpServer {
   private server: Server | null = null;

@@ -45,10 +45,10 @@ describe('job workspace and provider tools are selected from the job row', () =>
     const full = { localTools: true, fileRead: true, fileWrite: true, linkedReadDirs: [], projectDirs: [], workspaceRootDir: null, level: 'workspace_write' as const, webTools: true, interactiveApproval:true };
     const operator = await environment({ principal: { kind: 'operator' }, accountId: 'acc', chatType: 'direct', chatId: '__local_agent_room__',
       permissions: allPermissions('ALLOW'), linkedChats: [] }).prepare('j');
-    expect(operator).toEqual({ ok: true, workspacePath: workspace, tools: full });
+    expect(operator).toEqual({ ok: true, workspacePath: workspace, tools: full, requester: 'admin' });
     const admin = await environment({ principal: { kind: 'admin', userId: 'A' }, accountId: 'acc', chatType: 'direct', chatId: 'A',
       permissions: allPermissions('ALLOW'), linkedChats: [] }).prepare('j');
-    expect(admin).toEqual({ ok: true, workspacePath: workspace, tools: { ...full, interactiveApproval:false } });
+    expect(admin).toEqual({ ok: true, workspacePath: workspace, tools: { ...full, interactiveApproval:false }, requester: 'admin' });
   });
 
   it('keeps the workspace stored on the job row for top-layer jobs', async () => {
@@ -80,11 +80,27 @@ describe('job workspace and provider tools are selected from the job row', () =>
     if (!plan.ok) throw new Error('expected plan');
     expect(plan.workspacePath.startsWith(join(workspace, 'groups'))).toBe(true);
     // A whitelisted user never gets the workspace root, and without links nothing is mounted.
-    expect(plan.tools).toEqual({ localTools: false, fileRead: true, fileWrite: false, linkedReadDirs: [], projectDirs: [], workspaceRootDir: null, level: 'workspace_write', webTools: true, interactiveApproval:false });
+    expect(plan.tools).toEqual({ localTools: false, fileRead: true, fileWrite: false, linkedReadDirs: [], projectDirs: [], workspaceRootDir: null, level: 'workspace_write', webTools: true, interactiveApproval:false, chatRulesProtected: true });
     const writable = await environment(user('group', 'g-three', { permissions: userPermissions({ 'chat_folder.write': 'ALLOW' }) })).prepare('j');
     expect(writable).toMatchObject({ ok: true, workspacePath: plan.workspacePath, tools: { fileWrite: true, localTools: false } });
     const none = await environment(user('group', 'g-three', { permissions: userPermissions({ 'chat_folder.read': 'DENY' }) })).prepare('j');
     expect(none).toMatchObject({ ok: true, tools: { fileRead: false, fileWrite: false, localTools: false } });
+  });
+
+  it('chat rules: a chat-folder job syncs and is protected; the operator and the admin 1:1 jobs are neither', async () => {
+    const calls: Array<[string, string, boolean]> = [];
+    const chatRules = { async begin(jobId: string, directory: string, options: { protect: boolean }) { calls.push(['begin', jobId, options.protect]); void directory; }, async end(jobId: string) { calls.push(['end', jobId, true]); } };
+    const withRules = (policy: JobPolicy) => new AgentJobEnvironmentService({ resolvePolicy: async () => policy, chatRules,
+      folders: new ChatFolderService(store, { current: async () => workspace }), workspace: { current: async () => workspace } });
+    const grouped = withRules(user('group', 'g-rules'));
+    const plan = await grouped.prepare('job-g');
+    expect(plan).toMatchObject({ ok: true, tools: { chatRulesProtected: true } });
+    await grouped.finish('job-g');
+    const admin = await withRules({ principal: { kind: 'admin', userId: 'A' }, accountId: 'acc', chatType: 'direct', chatId: 'A',
+      permissions: allPermissions('ALLOW'), linkedChats: [] }).prepare('job-a');
+    expect(admin).toMatchObject({ ok: true });
+    if (admin.ok) expect(admin.tools.chatRulesProtected).toBeUndefined();
+    expect(calls).toEqual([['begin', 'job-g', true], ['end', 'job-g', true]]);
   });
 
   it('row 4d: a whitelisted friend 1:1 runs in chats\\<folder_id>, never the top layer', async () => {

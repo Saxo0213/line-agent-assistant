@@ -109,6 +109,8 @@ export const AgentToolPolicySchema = z.strictObject({
   projectDirs: z.array(z.strictObject({ path: z.string().min(1), writable: z.boolean() })).max(8).default([]),
   /** True when file writes are enabled only for writable project folders: the job's own chat folder must stay read-only. */
   ownFolderReadOnly: z.boolean().optional(),
+  /** True when the job runs in a chat folder and may not change that folder's AGENTS.md, CLAUDE.md or rules/**. */
+  chatRulesProtected: z.boolean().optional(),
   /** Canonical workspace root mounted (one `--add-dir`) for admin/operator jobs whose cwd is below it; null otherwise. */
   workspaceRootDir: z.string().min(1).nullable(),
   /** Snapshotted global ceiling used by provider adapters. */

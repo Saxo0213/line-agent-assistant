@@ -7,6 +7,16 @@ import {
   LIST_SEND_TARGETS_TOOL_NAME,
   SEND_TO_TARGET_TOOL_NAME,
   READ_MESSAGE_ATTACHMENT_TOOL_NAME,
+  WAIT_FOR_ADMIN_REPLY_TOOL_NAME,
+  LIST_ADMIN_REPLIES_TOOL_NAME,
+  CLOSE_SESSION_TOOL_NAME,
+  FORWARD_TO_SESSION_NOTE_MAX_CHARS,
+  FORWARD_TO_SESSION_TOOL_NAME,
+  EXTERNAL_SESSION_KEY_PATTERN,
+  EXTERNAL_SESSION_LABEL_MAX_CHARS,
+  EXTERNAL_SESSION_WAIT_DEFAULT_SECONDS,
+  EXTERNAL_SESSION_WAIT_MAX_SECONDS,
+  isExternalSessionToolName,
   CHAT_EXTRA_FOLDER_DESCRIPTION_MAX,
   CHAT_EXTRA_FOLDER_LIMIT,
   LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_NAME,
@@ -59,6 +69,7 @@ import {
   McpInternalToolNameSchema,
   type McpAgentRoomHistoryOutput,
   type McpReadMessageAttachmentOutput,
+  type ForwardToSessionOutput,
 } from '@line-agent/contracts';
 import {
   AgentScheduleError,
@@ -82,6 +93,7 @@ import {
 import type { AgentApprovalBroker } from './agent-approval-broker.js';
 import type { AttachmentStorageService } from './attachment-storage-service.js';
 import type { AgentLineSendHandler, AuthorizeOutcome } from './agent-line-send-service.js';
+import type { ExternalSessionPlan, ExternalSessionService } from './external-session-service.js';
 import { isScheduledRunRequestId, type AgentScheduleService } from './agent-schedule-service.js';
 import { formatTaipei } from './agent-schedule-prompt.js';
 import type { McpChatResourceReader } from './mcp-chat-resource-reader.js';
@@ -184,20 +196,20 @@ export interface McpToolDefinition {
 }
 
 /** Added to the descriptions of the two message query tools. */
-const EVENT_ROW_GUIDANCE = ' An event row (kind: event) has the system line in text, for example a join or a removal by an admin. The sender of a removal event is the admin who did it; the sender and target filters also return events that name the member as joiner, actor or target. recalled: true also covers a message that the official LINE client removed (for example after an admin removed the member); check event rows near that time before you say the sender recalled it.';
+const EVENT_ROW_GUIDANCE = ' An event row (kind: event) has the system line in text, for example a join or a removal by an admin. The sender of a removal event is the admin who did it. The sender and target filters also return events that name the member as joiner, actor or target. recalled: true also covers a message that the official LINE client removed (for example after an admin removed the member). Before you say that the sender recalled a message, check the event rows near that time.';
 
 const MESSAGE_FILTER_JSON_PROPERTIES = {
-  excludeChatIds: { type: 'array', maxItems: 100, items: { type: 'string', minLength: 1, maxLength: 256 }, description: 'Skip messages of these chats (chatId values, exact match).' },
-  direction: { type: 'string', enum: ['inbound', 'outbound'], description: 'inbound = received messages only; outbound = messages sent by the account only.' },
-  kinds: { type: 'array', minItems: 1, items: { type: 'string', enum: McpMessageKindSchema.options }, description: 'Keep only these message kinds. Cannot be combined with excludeKinds.' },
-  excludeKinds: { type: 'array', minItems: 1, items: { type: 'string', enum: McpMessageKindSchema.options }, description: 'Drop these message kinds. Cannot be combined with kinds.' },
+  excludeChatIds: { type: 'array', maxItems: 100, items: { type: 'string', minLength: 1, maxLength: 256 }, description: 'Skips messages of these chats (chatId values, exact match).' },
+  direction: { type: 'string', enum: ['inbound', 'outbound'], description: 'inbound = received messages only; outbound = messages that the account sent only.' },
+  kinds: { type: 'array', minItems: 1, items: { type: 'string', enum: McpMessageKindSchema.options }, description: 'Keeps only these message kinds. Use only one of kinds and excludeKinds.' },
+  excludeKinds: { type: 'array', minItems: 1, items: { type: 'string', enum: McpMessageKindSchema.options }, description: 'Drops these message kinds. Use only one of kinds and excludeKinds.' },
 } as const;
 
 export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: 'list_targets',
     description:
-      'List authorized LINE conversations and participants grouped by (accountId, chatType, chatId). Rows with role primary_admin are the administrator\'s (Primary Admin) direct chat with the Agent account. Present results as a numbered list using no. If the user later answers with a number, use that no from the most recent list_targets result and pass its exact accountId, chatType, and chatId to the query tool.',
+      'Lists authorized LINE conversations and participants, grouped by (accountId, chatType, chatId). A row with role primary_admin is the direct chat of the Primary Admin with the Agent account. Show the result as a numbered list that uses no. If the user answers with a number, take that no from the most recent list_targets result. Pass its exact accountId, chatType and chatId to the query tool.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -212,7 +224,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: 'query_target_messages',
     description:
-      'Query archived LINE messages for a specified target (conversation title, chatId, sender displayName, or senderId) within authorized account scopes. A number refers to the no in the most recent list_targets result. Messages are returned newest first. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.' + EVENT_ROW_GUIDANCE,
+      'Searches archived LINE messages of one target (conversation title, chatId, sender displayName or senderId) in the authorized account scopes. A number is the no in the most recent list_targets result. The newest message is first. A page has 200 messages at most (a larger limit becomes 200). If hasMore is true, call again with the same filters and cursor set to nextCursor. Do this until hasMore is false. Process the messages page by page. Report that a time window is empty or complete only when the last page has hasMore=false.' + EVENT_ROW_GUIDANCE,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -225,7 +237,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         senderId: { type: 'string' },
         senderName: { type: 'string' },
         text: { type: 'string' },
-        limit: { type: 'integer', minimum: 1, default: 50, description: 'Page size; values above 200 are clamped to 200.' },
+        limit: { type: 'integer', minimum: 1, default: 50, description: 'Page size. A value above 200 becomes 200.' },
         cursor: { type: 'string', maxLength: 512, description: 'nextCursor from the previous page of the same query.' },
       },
     },
@@ -233,7 +245,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: 'query_target_messages_by_time',
     description:
-      'Query archived LINE messages within an explicit [from, to] time window (ISO-8601 datetime with offset or YYYY-MM-DD). A YYYY-MM-DD value is a full day in Taiwan time (Asia/Taipei, UTC+08:00): from starts at 00:00:00.000 and to ends at 23:59:59.999 of that day. To read new messages from all chats, omit every target field and give from. One call returns the messages of all readable chats, and each message has its accountId, chatType, chatId and conversationTitle. Do not call this tool once per chat. Do not call list_targets first for this purpose. To see which chats have new messages and how many, call list_active_chats first, then read only the chats you need with chatId. To skip chats you do not want, pass excludeChatIds. To keep or drop message kinds, pass kinds or excludeKinds (not both); direction keeps only inbound (received) or only outbound (sent by the account) messages. These four filters apply to every page, so pass the same values together with cursor. To read one chat, give a target field (a number refers to the no in the most recent list_targets result). from is required when no target field is given. Messages are returned oldest first (chronological) within the window. Results come in pages of up to 200 (limit above 200 is clamped to 200). When hasMore is true, call again with the same filters and cursor set to nextCursor until hasMore is false; process the messages page by page. Never report a time window as empty or complete unless the last page returned hasMore=false.' + EVENT_ROW_GUIDANCE,
+      'Searches archived LINE messages in an explicit [from, to] time window (ISO-8601 datetime with offset, or YYYY-MM-DD). A YYYY-MM-DD value is a full day in Taiwan time (Asia/Taipei, UTC+08:00). from starts at 00:00:00.000 of that day. to ends at 23:59:59.999 of that day. To read new messages of all chats, omit every target field and give from. Use one call for all chats: it returns the messages of all readable chats. Each message has accountId, chatType, chatId and conversationTitle. To see which chats have new messages and how many, call list_active_chats first. Then read only the chats that you need with chatId. To skip chats, pass excludeChatIds. To keep or drop message kinds, pass kinds or excludeKinds (use only one of them). direction keeps only inbound (received) or only outbound (sent by the account) messages. These four filters apply to every page. Pass the same values together with cursor. To read one chat, give a target field (a number is the no in the most recent list_targets result). from is required when no target field is given. The oldest message is first (chronological) in the window. A page has 200 messages at most (a larger limit becomes 200). If hasMore is true, call again with the same filters and cursor set to nextCursor. Do this until hasMore is false. Process the messages page by page. Report that a time window is empty or complete only when the last page has hasMore=false.' + EVENT_ROW_GUIDANCE,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -249,7 +261,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         from: { type: 'string', description: 'Start timestamp (ISO-8601 with offset or YYYY-MM-DD). YYYY-MM-DD starts at 00:00:00.000 Taiwan time (Asia/Taipei).' },
         to: { type: 'string', description: 'End timestamp (ISO-8601 with offset or YYYY-MM-DD). YYYY-MM-DD ends at 23:59:59.999 Taiwan time (Asia/Taipei).' },
         ...MESSAGE_FILTER_JSON_PROPERTIES,
-        limit: { type: 'integer', minimum: 1, default: 50, description: 'Page size; values above 200 are clamped to 200.' },
+        limit: { type: 'integer', minimum: 1, default: 50, description: 'Page size. A value above 200 becomes 200.' },
         cursor: { type: 'string', maxLength: 512, description: 'nextCursor from the previous page of the same query.' },
       },
     },
@@ -257,7 +269,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: 'list_active_chats',
     description:
-      'List the chats that have messages in a [from, to] time window, with the message count, the number of different senders and the time of the newest message of each chat. It returns no message text. Use this tool first to see which chats have new messages and how many, and then read only the chats that you need with query_target_messages_by_time (give chatId, and accountId when needed). from is required; to is optional (ISO-8601 datetime with offset or YYYY-MM-DD; YYYY-MM-DD is a full day in Taiwan time, Asia/Taipei, UTC+08:00). The counts are the messages that query_target_messages_by_time returns for the same window and the same filters, so excludeChatIds, direction, kinds and excludeKinds work the same way. Chats are sorted by the newest message first. limit defaults to 200 and values above 500 are clamped to 500; when truncated is true, more chats exist than were returned, so narrow the window or the filters.',
+      'Lists the chats that have messages in a [from, to] time window. Each chat has the message count, the number of different senders and the time of the newest message. Use this tool first to see which chats have new messages and how many, and then read only the chats that you need with query_target_messages_by_time (give chatId, and accountId when needed). from is required. to is optional (ISO-8601 datetime with offset, or YYYY-MM-DD; YYYY-MM-DD is a full day in Taiwan time, Asia/Taipei, UTC+08:00). The counts are the messages that query_target_messages_by_time returns for the same window and the same filters. excludeChatIds, direction, kinds and excludeKinds work the same way. The newest chat is first. limit defaults to 200 and a value above 500 becomes 500. If truncated is true, more chats exist than were returned. Narrow the window or the filters.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -267,25 +279,25 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         accountId: { type: 'string' },
         chatType: { type: 'string', enum: ChatTypeSchema.options },
         ...MESSAGE_FILTER_JSON_PROPERTIES,
-        limit: { type: 'integer', minimum: 1, default: MCP_ACTIVE_CHATS_DEFAULT_LIMIT, description: 'Maximum chats returned; values above 500 are clamped to 500.' },
+        limit: { type: 'integer', minimum: 1, default: MCP_ACTIVE_CHATS_DEFAULT_LIMIT, description: 'Maximum chats returned. A value above 500 becomes 500.' },
       },
       required: ['from'],
     },
   },
   {
-    name: 'list_chat_notes', description: 'List saved Note archives for an explicitly selected conversation.',
+    name: 'list_chat_notes', description: 'Lists saved Note archives for an explicitly selected conversation.',
     inputSchema: { type: 'object', additionalProperties: false, properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, cursor: { type: 'string', maxLength: 512 } }, required: ['accountId', 'chatType', 'chatId'] },
   },
   {
-    name: 'get_chat_note', description: 'Read one saved Note archive by its stable post ID.',
+    name: 'get_chat_note', description: 'Reads one saved Note archive by its stable post ID.',
     inputSchema: { type: 'object', additionalProperties: false, properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, noteId: { type: 'string' } }, required: ['accountId', 'chatType', 'chatId', 'noteId'] },
   },
   {
-    name: 'list_chat_albums', description: 'List saved Album archives for an explicitly selected conversation.',
+    name: 'list_chat_albums', description: 'Lists saved Album archives for an explicitly selected conversation.',
     inputSchema: { type: 'object', additionalProperties: false, properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, cursor: { type: 'string', maxLength: 512 } }, required: ['accountId', 'chatType', 'chatId'] },
   },
   {
-    name: 'get_chat_album', description: 'Read one saved Album archive by its stable album ID, with bounded photo metadata and image availability. Image bytes are not returned.',
+    name: 'get_chat_album', description: 'Reads one saved Album archive by its stable album ID. The result has bounded photo metadata and image availability.',
     inputSchema: { type: 'object', additionalProperties: false, properties: { accountId: { type: 'string' }, chatType: { type: 'string', enum: ['direct', 'group', 'room'] }, chatId: { type: 'string' }, albumId: { type: 'string' } }, required: ['accountId', 'chatType', 'chatId', 'albumId'] },
   },
 ];
@@ -297,7 +309,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
 export const AGENT_ROOM_HISTORY_TOOL_DEFINITION = {
   name: AGENT_ROOM_HISTORY_TOOL_NAME,
   description:
-    "Read the local Agent room conversation history (the operator's prompts and the Agent's final replies), newest first. Page through results with nextCursor; narrow by keyword (query), provider, or time window (from, to). Each item has an origin: agent_room, or line_admin_direct for the operator's shared 1:1 LINE chat with the Agent. Text is truncated and flagged by promptTruncated / replyTruncated. Query only when earlier context is needed, and prefer a keyword over reading every page.",
+    "Reads the local Agent room conversation history (the prompts of the operator and the final replies of the Agent). The newest item is first. Use nextCursor to get the next page. Narrow the result with a keyword (query), provider, or time window (from, to). Each item has an origin: agent_room, or line_admin_direct for the shared 1:1 LINE chat of the operator with the Agent. If the text is cut, promptTruncated or replyTruncated is true. Query only when you need earlier context. Prefer a keyword to reading every page.",
   inputSchema: {
     type: 'object',
     additionalProperties: false,
@@ -318,8 +330,8 @@ export const AGENT_ROOM_HISTORY_TOOL_DEFINITION = {
 export const LIST_SEND_TARGETS_TOOL_DEFINITION = {
   name: LIST_SEND_TARGETS_TOOL_NAME,
   description:
-    'The result includes a top-level accountId for use as the accountId in a schedule delivery target. ' +
-    'Rows with role primary_admin are the administrator (Primary Admin); a query such as 管理員, 主要管理者, admin or me returns that row first. List the LINE chats the Agent account can send to (direct chats, groups and rooms; communities are never included) whose title, member name or nickname contains the query. Call this first with the name the admin gave. If exactly one target matches, send to it. If more than one matches, reply to the admin with the numbered list (use no), wait for the admin\'s choice in the next message, then send to the chosen target. If none matches, tell the admin. Pass the chosen chatType and chatId to send_to_target.',
+    'The result has a top-level accountId. Use it as the accountId in a schedule delivery target. ' +
+    'A row with role primary_admin is the Primary Admin. A query such as 管理員, 主要管理者, admin or me returns that row first. Lists the LINE chats that the Agent account can send to (direct chats, groups and rooms only) whose title, member name or nickname contains the query. Call this first with the name that the admin gave. If one target matches, send to it. If more than one target matches, reply to the admin with the numbered list (use no). Wait for the choice of the admin in the next message. Then send to the chosen target. If no target matches, tell the admin. Pass the chosen chatType and chatId to send_to_target.',
   inputSchema: {
     type: 'object',
     additionalProperties: false,
@@ -330,13 +342,13 @@ export const LIST_SEND_TARGETS_TOOL_DEFINITION = {
 export const SEND_TO_TARGET_TOOL_DEFINITION = {
   name: SEND_TO_TARGET_TOOL_NAME,
   description:
-    'Send messages to one LINE chat of the Agent account (chatType direct, group or room; never a community). For a direct chat, chatId can be the user MID (u followed by 32 hex characters) of a friend of the Agent account or of a member of a group or room of the Agent account, also when there is no earlier chat with that user; strangers, blocked users and the Agent account itself are refused. Each item becomes one LINE message, sent in order: {type:"text", text} (up to 5000 characters), {type:"message", accountId, chatType, chatId, messageId} to forward an archived message (use the ids from the query_target_messages results; text, images and files are forwarded), {type:"attachment", attachmentId} to send a stored attachment, or {type:"file", path} to send a file in the authorized workspace (the job workspace for internal calls, the configured Agent workspace for external local calls; jpg, jpeg, png and gif are sent as images, anything else as a file). Images up to 20 MiB, files up to 100 MiB; media cannot be sent to a room chat. At most 10 items per call and 30 per job. Results are returned per item as sent, failed, unknown or skipped; the first failed or unknown item stops the call and later items are skipped. Never repeat an item whose status is unknown: tell the admin instead, because it may have been delivered.',
+    'Sends messages to one LINE chat of the Agent account (chatType direct, group or room). For a direct chat, chatId can be the user MID (u followed by 32 hex characters) of a friend of the Agent account, or of a member of a group or room of the Agent account. A chat with that user need not exist. The tool refuses strangers, blocked users and the Agent account itself. Each item becomes one LINE message. The tool sends the items in order: {type:"text", text} (up to 5000 characters); {type:"message", accountId, chatType, chatId, messageId} to forward an archived message (use the ids from the query_target_messages results; text, images and files are forwarded); {type:"attachment", attachmentId} to send a stored attachment; {type:"file", path} to send a file in the authorized workspace (the job workspace for internal calls, the configured Agent workspace for external local calls) or in a project folder that is bound to this chat and that the job may read. Give a project folder file by its own path. jpg, jpeg, png and gif files are sent as images. Other files are sent as files. Images can be up to 20 MiB. Files can be up to 100 MiB. Media can go to direct and group chats only. A call has 10 items at most. A job has 30 items at most. The result has a status for each item: sent, failed, unknown or skipped. The first failed or unknown item stops the call. The later items are skipped. If an item has status unknown, tell the admin. Send the item once only, because it may be delivered.',
   inputSchema: {
     type: 'object',
     additionalProperties: false,
     properties: {
       chatType: { type: 'string', enum: ['direct', 'group', 'room'] },
-      chatId: { type: 'string', minLength: 1, description: 'Chat id from list_send_targets. For a direct chat it can also be the user MID (u + 32 hex characters) of a friend or of a member of a group or room of the Agent account, also without an earlier chat; strangers, blocked users and the Agent account itself are refused.' },
+      chatId: { type: 'string', minLength: 1, description: 'Chat id from list_send_targets. For a direct chat it can also be the user MID (u + 32 hex characters) of a friend or of a member of a group or room of the Agent account. A chat with that user need not exist. The tool refuses strangers, blocked users and the Agent account itself.' },
       items: {
         type: 'array', minItems: 1, maxItems: 10,
         items: {
@@ -349,7 +361,7 @@ export const SEND_TO_TARGET_TOOL_DEFINITION = {
             { type: 'object', additionalProperties: false, required: ['type', 'attachmentId'],
               properties: { type: { const: 'attachment' }, attachmentId: { type: 'string', minLength: 1 } } },
             { type: 'object', additionalProperties: false, required: ['type', 'path'],
-              properties: { type: { const: 'file' }, path: { type: 'string', minLength: 1, maxLength: 1024, description: 'Path inside the authorized Agent workspace.' } } },
+              properties: { type: { const: 'file' }, path: { type: 'string', minLength: 1, maxLength: 1024, description: 'Path inside the authorized Agent workspace (a relative path is relative to it), or the full path of a file inside a project folder bound to this chat.' } } },
           ],
         },
       },
@@ -364,7 +376,7 @@ export const SEND_TO_TARGET_TOOL_DEFINITION = {
 export const READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION = {
   name: READ_MESSAGE_ATTACHMENT_TOOL_NAME,
   description:
-    'Gives the Agent a local copy of one message attachment (image, video, audio or file). Use an attachmentId from the query_target_messages or query_target_messages_by_time results. The result has available, absolutePath, relativePath and reason. When available is true, open absolutePath with your file reading tools. When available is false, reason says why the file is not on this computer. This tool never downloads from LINE. It copies a file that is already stored on this computer, or the same file from the local Downloads folder.',
+    'Gives the Agent a local copy of one message attachment (image, video, audio or file). Use an attachmentId from the query_target_messages or query_target_messages_by_time results. The result has available, absolutePath, relativePath and reason. If available is true, open absolutePath with your file reading tools. If available is false, reason says why the file is not on this computer. The tool copies a file that is already stored on this computer, or the same file from the local Downloads folder.',
   inputSchema: {
     type: 'object',
     additionalProperties: false,
@@ -375,12 +387,106 @@ export const READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION = {
 const SEND_TOOLS = [LIST_SEND_TARGETS_TOOL_DEFINITION, SEND_TO_TARGET_TOOL_DEFINITION] as const;
 
 /**
+ * External endpoint only (docs/design/external-session-reply.md). send_to_target there has the optional `session`; the built-in
+ * Agent never sees it.
+ */
+export const EXTERNAL_SEND_TO_TARGET_TOOL_DEFINITION = {
+  ...SEND_TO_TARGET_TOOL_DEFINITION,
+  description: `${SEND_TO_TARGET_TOOL_DEFINITION.description} ` +
+    'Add session when you want the Primary Admin to answer you. Use it only when the target is the direct chat of the Primary Admin (role primary_admin in list_send_targets). ' +
+    'session.key is a stable string that you create once and use again in every call of the same task. session.label is a short name of the task. ' +
+    'The tool puts 【label #n】 in front of the first text item. If no item is text, the tool sends the tag as a text message first. ' +
+    'When the admin quotes (replies to) one of these messages in LINE, call wait_for_admin_reply with the same key to get the answer.',
+  inputSchema: {
+    ...SEND_TO_TARGET_TOOL_DEFINITION.inputSchema,
+    properties: {
+      ...SEND_TO_TARGET_TOOL_DEFINITION.inputSchema.properties,
+      session: {
+        type: 'object', additionalProperties: false, required: ['key', 'label'],
+        properties: {
+          key: { type: 'string', pattern: EXTERNAL_SESSION_KEY_PATTERN.source, minLength: 8, maxLength: 128, description: 'Stable session key, 8 to 128 characters of A-Z, a-z, 0-9, _ and -.' },
+          label: { type: 'string', minLength: 1, maxLength: EXTERNAL_SESSION_LABEL_MAX_CHARS, description: 'Short display name of the session, 1 to 24 characters.' },
+        },
+      },
+    },
+  },
+} as const;
+const EXTERNAL_SEND_TOOLS = [LIST_SEND_TARGETS_TOOL_DEFINITION, EXTERNAL_SEND_TO_TARGET_TOOL_DEFINITION] as const;
+
+const SESSION_KEY_SCHEMA = { type: 'string', pattern: EXTERNAL_SESSION_KEY_PATTERN.source, minLength: 8, maxLength: 128,
+  description: 'The session.key that you gave to send_to_target.' } as const;
+export const WAIT_FOR_ADMIN_REPLY_TOOL_DEFINITION = {
+  name: WAIT_FOR_ADMIN_REPLY_TOOL_NAME,
+  description:
+    'Waits for a reply of the Primary Admin to a session that send_to_target started. The admin replies when the admin quotes one of your messages in LINE, or when the Agent of LINEJS forwards a message to the session. ' +
+    'If undelivered replies exist, the tool returns all of them at once and marks them delivered. If none exist, the tool waits for a new reply for timeoutSeconds at most. ' +
+    'When the time ends, the result is {replies: []}. Call the tool again to keep waiting. ' +
+    'Each reply has replyId, source (quote or agent), text, attachments (attachmentId, kind, name), note (the explanation of the Agent, or null) and receivedAt. ' +
+    'Give an attachmentId to read_message_attachment to get the file. sessionClosed true means that the session is closed.',
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['sessionKey'],
+    properties: {
+      sessionKey: SESSION_KEY_SCHEMA,
+      timeoutSeconds: { type: 'integer', minimum: 1, maximum: EXTERNAL_SESSION_WAIT_MAX_SECONDS, default: EXTERNAL_SESSION_WAIT_DEFAULT_SECONDS,
+        description: 'How long to wait for a new reply, in seconds.' },
+    },
+  },
+} as const;
+export const LIST_ADMIN_REPLIES_TOOL_DEFINITION = {
+  name: LIST_ADMIN_REPLIES_TOOL_NAME,
+  description:
+    'Lists the replies of the Primary Admin to one session, delivered and not delivered, oldest first (50 at most). The tool does not mark a reply as delivered. ' +
+    'Use since (an ISO-8601 datetime with offset) to get the replies after that time. The reply fields are the same as in wait_for_admin_reply.',
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['sessionKey'],
+    properties: { sessionKey: SESSION_KEY_SCHEMA, since: { type: 'string', description: 'Only replies after this ISO-8601 datetime (with offset).' } },
+  },
+} as const;
+export const CLOSE_SESSION_TOOL_DEFINITION = {
+  name: CLOSE_SESSION_TOOL_NAME,
+  description:
+    'Closes one session. After that, a quoted reply of the admin to a message of this session goes to the Agent of LINEJS, and the admin gets a notice. ' +
+    'Call this tool when the task is finished. A session without activity for 7 days closes by itself. A new send_to_target call with the same key opens the session again.',
+  inputSchema: { type: 'object', additionalProperties: false, required: ['sessionKey'], properties: { sessionKey: SESSION_KEY_SCHEMA } },
+} as const;
+/** read_message_attachment on the external endpoint: only an attachment that a reply of a session lists. */
+export const EXTERNAL_READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION = {
+  name: READ_MESSAGE_ATTACHMENT_TOOL_NAME,
+  description:
+    'Gives you a local copy of one attachment of a reply of the Primary Admin (image, video, audio or file). Use an attachmentId from the wait_for_admin_reply or list_admin_replies results. ' +
+    'The result has available, absolutePath, relativePath and reason. If available is true, open absolutePath with your file reading tools. If available is false, reason says why the file is not on this computer.',
+  inputSchema: READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION.inputSchema,
+} as const;
+const EXTERNAL_SESSION_TOOLS = [WAIT_FOR_ADMIN_REPLY_TOOL_DEFINITION, LIST_ADMIN_REPLIES_TOOL_DEFINITION, CLOSE_SESSION_TOOL_DEFINITION, EXTERNAL_READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION] as const;
+/**
+ * Internal-only (never in MCP_TOOL_DEFINITIONS, never on the external endpoint, never in a token scope). Offered only to a job of the
+ * Primary Admin in the direct chat of the Agent account; tools/call re-checks the principal and the chat every time.
+ */
+export const FORWARD_TO_SESSION_TOOL_DEFINITION = {
+  name: FORWARD_TO_SESSION_TOOL_NAME,
+  description:
+    'Gives the current message of the Primary Admin to one waiting external session. Use it when the message answers a session in the list "Waiting external sessions" of the prompt. ' +
+    'Give seq (the number after # in the list) and, if useful, a note (500 characters at most) that tells the session why you forwarded the message. ' +
+    'The result has forwarded, replyId and session. After the call, tell the admin in one short sentence that you forwarded the message. ' +
+    'The tool accepts an open session only. A repeated call for the same message returns the first replyId.',
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['seq'],
+    properties: {
+      seq: { type: 'integer', minimum: 1, description: 'The number of the session (the number after # in the list).' },
+      note: { type: 'string', maxLength: FORWARD_TO_SESSION_NOTE_MAX_CHARS, description: 'Short explanation for the session, 500 characters at most.' },
+    },
+  },
+} as const;
+/** The jobId of the copy folder of an external read_message_attachment (a fixed folder, so a file is reused). */
+const EXTERNAL_ATTACHMENT_FOLDER_ID = 'e57e0000-0000-4000-8000-000000000001';
+
+/**
  * Local MCP schedule tools. A job started by a schedule cannot mutate schedules.
  */
 const RECURRENCE_JSON_SCHEMA = {
   description: 'When to fire. once {at} or once {inMinutes: 1..10080} (a one-time run that many minutes from now; use it for "in 5 minutes" / 5 分鐘後); daily {time}; weekly {days (0=Sunday..6=Saturday), time}; interval {everyMinutes (5..10080), anchorAt}; cron {expression: 5 fields minute hour day-of-month month day-of-week}. time is HH:mm in the schedule timezone; at and anchorAt are ISO-8601 datetimes with offset.',
   oneOf: [
-    {type:'object',additionalProperties:false,required:['kind'],properties:{kind:{const:'message'}},description:'Fresh matching-message event; only message_forward. No time or recurrence polling.'},
+    {type:'object',additionalProperties:false,required:['kind'],properties:{kind:{const:'message'}},description:'A new matching message fires the schedule (message_forward only). It needs no time.'},
     { type: 'object', additionalProperties: false, required: ['kind', 'at'], properties: { kind: { const: 'once' }, at: { type: 'string' } } },
     { type: 'object', additionalProperties: false, required: ['kind', 'inMinutes'], properties: { kind: { const: 'once' }, inMinutes: { type: 'integer', minimum: 1, maximum: 10080 } } },
     { type: 'object', additionalProperties: false, required: ['kind', 'time'], properties: { kind: { const: 'daily' }, time: { type: 'string', pattern: '^([01]\\d|2[0-3]):[0-5]\\d$' } } },
@@ -393,7 +499,7 @@ const RECURRENCE_JSON_SCHEMA = {
 } as const;
 export const LIST_SCHEDULES_TOOL_DEFINITION = {
   name: LIST_SCHEDULES_TOOL_NAME,
-  description: 'List scheduled triggers with their next fire time and last outcome. Each schedule has execution (program = Main does all the work, agent = an Agent job does the work) and mayUseLlm (true when a run can start an LLM). By default it returns only active (enabled) schedules. Pass status "all" (or "disabled") when the user asks about disabled or all schedules. Before updating, deleting or re-enabling a schedule that may be disabled, call it with status "all" to get its scheduleId.',
+  description: 'Lists scheduled triggers with the next fire time and the last outcome of each. Each schedule has execution (program = Main does all the work, agent = an Agent job does the work) and mayUseLlm (true when a run can start an LLM). By default it returns the active (enabled) schedules. When the user asks about disabled or all schedules, pass status "disabled" or "all". Before you update, delete or re-enable a schedule that can be disabled, call it with status "all" to get its scheduleId.',
   inputSchema: {
     type: 'object', additionalProperties: false,
     properties: { status: { type: 'string', enum: ['active', 'disabled', 'all'], default: 'active', description: 'active = enabled schedules only (default); disabled = disabled schedules only; all = both.' } },
@@ -438,14 +544,14 @@ const conditionJson = <L extends object>(leaf: L) => {
   ] });
   return { oneOf: [leaf, group({ oneOf: [leaf, group(leaf)] })] };
 };
-const MESSAGE_FORWARD_TOOL_GUIDANCE = 'Immediate message forwarding is event-triggered and needs no time: use recurrence {kind:"message"}, task {type:"message_forward",match:{mode:"sender"},sender:{accountId:"<source-accountId>",mid:"<sender-MID>"}} for a sender; use task {type:"message_forward",match:{mode:"contains",keywords:["<literal>"]}} for contains; or task {type:"message_forward",match:{mode:"exact",text:"<literal>"}} for exact text. For text inside photos (照片裡的字 / 照片文字包含 / 照片有寫…) use task {type:"message_forward",match:{mode:"image_text",keywords:["<literal>"],verifyUnclear:true},actions:{forward:true,notify:false,agent:{target:<same as delivery.target>}}} with a line_target delivery: actions.forward must be true, and actions.agent is required when verifyUnclear is true (set verifyUnclear:false only when the user says unclear photos can be skipped). Only photos are checked; text messages never match this mode. Use match.mode (never kind/type) and sender.mid (never senderId). Get sender.mid from senderId in query_target_messages results; pair it with the accountId of the selected source target. The sender label is optional display text. Resolve source targets with list_targets. Delivery must be {mode:"line_target",target:{accountId:"<list_send_targets.accountId>",chatType:"direct",chatId:"<selected target.chatId>"}}; group is also valid. Use accountId from the top-level list_send_targets output and chatType/chatId from the selected target row; title is optional. For a rule that reacts to @mentions use task {type:"message_forward",match:{mode:"mention",admin?:boolean,members?:[{accountId,mid,label?}],all?:boolean}} (admin = mentions of the Primary Admin; members = up to 20 account+MID pairs; all = @All; at least one is required). Optional task.actions = {forward:boolean (default true: forward the original message to delivery), notify:boolean (default false: show one desktop notification), agent:null|{prompt?:string,target:{accountId,chatType,chatId}} (start one Agent job per matching message that may send its result to target)}; at least one action must be on. Targets may be empty: an empty targets array means every readable chat of the Agent and Primary Admin accounts. When actions.forward is false, delivery must be {mode:"record_only"}; when it is true, delivery must be a line_target. These task/target keys override the general summary/custom defaults and the general request-for-time wording.';
+const MESSAGE_FORWARD_TOOL_GUIDANCE = 'Immediate message forwarding is event-triggered and needs no time. Use recurrence {kind:"message"}. For a sender, use task {type:"message_forward",match:{mode:"sender"},sender:{accountId:"<source-accountId>",mid:"<sender-MID>"}}. For contains, use task {type:"message_forward",match:{mode:"contains",keywords:["<literal>"]}}. For exact text, use task {type:"message_forward",match:{mode:"exact",text:"<literal>"}}. For text inside photos (照片裡的字 / 照片文字包含 / 照片有寫…), use task {type:"message_forward",match:{mode:"image_text",keywords:["<literal>"],verifyUnclear:true},actions:{forward:true,notify:false,agent:{target:<same as delivery.target>}}} with a line_target delivery. actions.forward must be true. When verifyUnclear is true, actions.agent is required. Set verifyUnclear:false when the user says that unclear photos can be skipped. The image_text mode checks photos only. Use match.mode and sender.mid. Get sender.mid from senderId in the query_target_messages results. Pair it with the accountId of the selected source target. The sender label is optional display text. Resolve source targets with list_targets. Delivery must be {mode:"line_target",target:{accountId:"<list_send_targets.accountId>",chatType:"direct",chatId:"<selected target.chatId>"}}; group is also valid. Use the accountId from the top-level list_send_targets output and the chatType and chatId from the selected target row. title is optional. For a rule that reacts to @mentions, use task {type:"message_forward",match:{mode:"mention",admin?:boolean,members?:[{accountId,mid,label?}],all?:boolean}} (admin = mentions of the Primary Admin; members = up to 20 account+MID pairs; all = @All). At least one of them is required. Optional task.actions = {forward:boolean (default true: forward the original message to delivery), notify:boolean (default false: show one desktop notification), agent:null|{prompt?:string,target:{accountId,chatType,chatId}} (start one Agent job per matching message; the job may send its result to target)}. At least one action must be on. targets can be empty: an empty targets array means every readable chat of the Agent and Primary Admin accounts. When actions.forward is false, delivery must be {mode:"record_only"}. When actions.forward is true, delivery must be a line_target. These task and target keys replace the general summary/custom defaults and the general request-for-time wording.';
 const SCHEDULE_TASK_PROPERTIES = {
-  jitterMinutes: { type: 'integer', minimum: 0, maximum: 5, description: 'Random start delay: each run starts a random 0..N minutes (whole seconds) after its scheduled time, never before it, and never past the next occurrence. 0 (default when omitted on create) means no delay. Set it only when the user asks for a random or irregular start time.' },
+  jitterMinutes: { type: 'integer', minimum: 0, maximum: 5, description: 'Random start delay: each run starts a random 0..N minutes (whole seconds) after its scheduled time and before the next occurrence. 0 (default when omitted on create) means no delay. Set it when the user asks for a random or irregular start time.' },
   targets: { type: 'array', maxItems: 20, items: READ_TARGET_JSON_SCHEMA,
-    description: 'Chats the run reads (groups, rooms, direct chats and communities), up to 20 and without duplicates. For message_forward, empty means every readable chat. Only chats the user names in the current request; never one carried over from earlier conversation; leave empty when none is named. Resolve each with list_targets (use its exact accountId, chatType and chatId) and refer to it by title when talking to the user. The local Agent room is not allowed.' },
-  task: { description: 'What the run does. custom (default): run the prompt as written. summary {focus?}: per-target summary of the window (topics, decisions, action items, mentions of the admin, unanswered questions); needs targets. keyword_digest {keywords: 1..20}: list messages that match any keyword; needs targets. For summary and keyword_digest the prompt is optional extra instructions. new_messages {messageFilter?, rules?, maxMessagesPerChat?, maxTextChars?, sendWhenEmpty?}: a PROGRAM task; Main reads the new messages of the window itself and lists them (targets empty = every readable chat), and runs an LLM only for chats whose rule says then="llm". Use it to list or filter messages in a scheduled time window. Immediate original forwarding uses message_forward and message event recurrence. messageFilter keeps only the messages that match (metrics message.direction, message.kind with ops == != in not_in; message.textContains with any_of or none_of). rules (at most 20; for each chat the first rule whose when is true decides, none = list): when is a condition on chat.messageCount, chat.senderCount, chat.textChars, run.messageCount, run.chatCount, run.listedChars (ops > >= < <= == !=; integer value), chat.keywordHits (same ops, plus keywords 1..20), chat.id or chat.type (ops == != in not_in); then is list (send the messages), skip (drop the chat) or llm (an Agent summarizes the chat). A condition is a leaf {metric, op, value} or a group {all:[…]} / {any:[…]} that nests at most 2 levels; a task has at most 50 leaves in messageFilter and rules together. maxMessagesPerChat 1..200 (default 20), maxTextChars 20..2000 (default 200), sendWhenEmpty (default false: nothing is sent when there is nothing to list). Delivery is never record_only. Example: {type:"new_messages", messageFilter:{metric:"message.direction",op:"==",value:"inbound"}, rules:[{when:{metric:"chat.id",op:"==",value:"<chatId>"},then:"skip"},{when:{any:[{metric:"chat.messageCount",op:">",value:20},{metric:"run.listedChars",op:">",value:2000}]},then:"llm"}]}. message {text}: a fixed system message (alarm / reminder / fixed notice) that Main sends by itself at fire time, with NO Agent run; use it for every 提醒我… / 鬧鐘 / 定時通知 request; text is the user\'s wording as-is (1..5000 chars) and may contain {{date}} (YYYY-MM-DD), {{time}} (HH:mm) and {{weekday}} (星期一…星期日), filled in Asia/Taipei; targets, window and prompt are not used and delivery must not be record_only.',
+    description: 'Chats that the run reads (groups, rooms, direct chats and communities), up to 20, each one unique. For message_forward, empty means every readable chat. Use only chats that the user names in the current request. Take chats from the current request only. Leave it empty when the user names no chat. Resolve each chat with list_targets (use its exact accountId, chatType and chatId). Use the title when you talk to the user. The local Agent room is not allowed.' },
+  task: { description: 'What the run does. custom (default): runs the prompt as written. summary {focus?}: a summary of the window for each target (topics, decisions, action items, mentions of the admin, unanswered questions); needs targets. keyword_digest {keywords: 1..20}: lists the messages that match any keyword; needs targets. For summary and keyword_digest, the prompt is optional extra instructions. new_messages {messageFilter?, rules?, maxMessagesPerChat?, maxTextChars?, sendWhenEmpty?}: a PROGRAM task. Main reads the new messages of the window itself and lists them (targets empty = every readable chat). Main runs an LLM only for chats whose rule says then="llm". Use it to list or filter messages in a scheduled time window. Immediate original forwarding uses message_forward and a message event recurrence. messageFilter keeps only the messages that match (metrics message.direction, message.kind with ops == != in not_in; message.textContains with any_of or none_of). rules (at most 20; for each chat the first rule whose when is true decides; if no rule is true, the result is list): when is a condition on chat.messageCount, chat.senderCount, chat.textChars, run.messageCount, run.chatCount, run.listedChars (ops > >= < <= == !=; integer value), chat.keywordHits (same ops, plus keywords 1..20), chat.id or chat.type (ops == != in not_in); then is list (send the messages), skip (drop the chat) or llm (an Agent summarizes the chat). A condition is a leaf {metric, op, value} or a group {all:[…]} / {any:[…]} that nests at most 2 levels. A task has at most 50 leaves in messageFilter and rules together. maxMessagesPerChat 1..200 (default 20), maxTextChars 20..2000 (default 200), sendWhenEmpty (default false; if true, Main sends one line of notice when there is nothing to list). Delivery is primary_admin or line_target. Example: {type:"new_messages", messageFilter:{metric:"message.direction",op:"==",value:"inbound"}, rules:[{when:{metric:"chat.id",op:"==",value:"<chatId>"},then:"skip"},{when:{any:[{metric:"chat.messageCount",op:">",value:20},{metric:"run.listedChars",op:">",value:2000}]},then:"llm"}]}. message {text}: a fixed system message (alarm / reminder / fixed notice). Main sends it by itself at fire time, with NO Agent run. Use it for every 提醒我… / 鬧鐘 / 定時通知 request. text is the wording of the user as written (1..5000 chars). It can contain {{date}} (YYYY-MM-DD), {{time}} (HH:mm) and {{weekday}} (星期一…星期日), filled in Asia/Taipei. Leave out targets, window and prompt. Delivery is primary_admin or line_target.',
     oneOf: [
-      {type:'object',additionalProperties:false,required:['type','match'],description:'Immediate message rule. ' + MESSAGE_FORWARD_TOOL_GUIDANCE + ' Forwarding itself uses no AI. Case-sensitive literal text; sender-only forwards attachment-only receipts. Images/files original; video/audio as files. Never forwards backlog or uncertain sends.',
+      {type:'object',additionalProperties:false,required:['type','match'],description:'Immediate message rule. ' + MESSAGE_FORWARD_TOOL_GUIDANCE + ' Forwarding itself uses no AI. Literal text is case-sensitive. A sender-only rule also forwards attachment-only receipts. Images and files go as the original; video and audio go as files. The rule forwards new messages only, and only when the send is certain.',
         properties:{type:{const:'message_forward'},match:{oneOf:[
           {type:'object',additionalProperties:false,required:['mode','keywords'],description:'Use mode:"contains" with 1..20 literal keywords.',properties:{mode:{const:'contains'},keywords:{type:'array',minItems:1,maxItems:20,items:{type:'string',minLength:1,maxLength:200}}}},
           {type:'object',additionalProperties:false,required:['mode','text'],description:'Use mode:"exact" with the exact message text.',properties:{mode:{const:'exact'},text:{type:'string',minLength:1,maxLength:20000}}},
@@ -453,7 +559,7 @@ const SCHEDULE_TASK_PROPERTIES = {
           {type:'object',additionalProperties:false,required:['mode'],description:'Use mode:"sender" with the separate sender object.',properties:{mode:{const:'sender'}}},
           {type:'object',additionalProperties:false,required:['mode'],description:'Use mode:"mention" for a new message that mentions the Primary Admin (admin), one of the listed members (account + MID), or everyone (all). At least one target is required.',properties:{mode:{const:'mention'},admin:{type:'boolean',default:false},members:{type:'array',maxItems:20,items:{type:'object',additionalProperties:false,required:['accountId','mid'],properties:{accountId:{type:'string'},mid:{type:'string',description:'LINE member MID; the key is mid.'},label:{type:'string',maxLength:200}}}},all:{type:'boolean',default:false}}}]},
           actions:{type:'object',additionalProperties:false,description:'What a matching message does. Missing = forward only. At least one action must be on. forward needs a line_target delivery; without forward, delivery is record_only.',properties:{forward:{type:'boolean',default:true},notify:{type:'boolean',default:false},agent:{description:'null = no Agent job. Otherwise one Agent job per matching message; it may send its result once to target (a direct, group or room chat of the Agent account).',oneOf:[{type:'null'},{type:'object',additionalProperties:false,required:['target'],properties:{prompt:{type:'string',maxLength:4000,description:'Instruction for the Agent. Empty = the Agent decides how to handle the message.'},target:{...SEND_TARGET_JSON_SCHEMA,description:'Use top-level list_send_targets.accountId plus the selected row chatType/chatId.'}}}]}}},
-          sender:{type:'object',additionalProperties:false,required:['accountId','mid'],description:'Required only when match.mode is sender; use accountId of a selected source and LINE sender MID as mid (not senderId). label is optional.',properties:{accountId:{type:'string',description:'Exact accountId of one selected source target.'},mid:{type:'string',description:'LINE sender MID; the key is mid, not senderId.'},label:{type:'string',maxLength:200}}}}},
+          sender:{type:'object',additionalProperties:false,required:['accountId','mid'],description:'Use it when match.mode is sender. Use the accountId of a selected source and the LINE sender MID as mid. label is optional.',properties:{accountId:{type:'string',description:'Exact accountId of one selected source target.'},mid:{type:'string',description:'LINE sender MID. The key is mid.'},label:{type:'string',maxLength:200}}}}},
       { type: 'object', additionalProperties: false, required: ['type'], properties: { type: { const: 'custom' } } },
       { type: 'object', additionalProperties: false, required: ['type', 'text'], properties: { type: { const: 'message' }, text: { type: 'string', minLength: 1, maxLength: 5000 } } },
       { type: 'object', additionalProperties: false, required: ['type'], properties: { type: { const: 'summary' }, focus: { type: 'string', maxLength: 500 } } },
@@ -466,26 +572,26 @@ const SCHEDULE_TASK_PROPERTIES = {
           maxMessagesPerChat: { type: 'integer', minimum: 1, maximum: 200, default: 20 }, maxTextChars: { type: 'integer', minimum: 20, maximum: 2000, default: 200 },
           sendWhenEmpty: { type: 'boolean', default: false } } },
     ] },
-  window: { description: 'Which messages the run covers, ending at the fire time. since_last_run (default): from the last submitted run (or one recurrence period). lookback {minutes: 5..10080}. Never longer than 7 days.',
+  window: { description: 'Which messages the run covers, ending at the fire time. since_last_run (default): from the last submitted run (or one recurrence period). lookback {minutes: 5..10080}. The window is 7 days at most.',
     oneOf: [
       { type: 'object', additionalProperties: false, required: ['mode'], properties: { mode: { const: 'since_last_run' } } },
       { type: 'object', additionalProperties: false, required: ['mode', 'minutes'], properties: { mode: { const: 'lookback' }, minutes: { type: 'integer', minimum: 5, maximum: 10080 } } },
     ] },
-  delivery: { description: 'Where the result goes. For message_forward: line_target when actions.forward is on (default), record_only when it is off. primary_admin (default; omit delivery): the job sends the final result to the administrator (Primary Admin) by LINE; 我 / 給我 / 傳給我 means the administrator. record_only: nothing is sent, the job reply stays in the schedule run history (Agent tasks only; never for message). line_target {target}: use only when the user names another chat; resolve target with list_send_targets (direct, group or room of the Agent account; never a community). For message_forward, use {mode:"line_target",target:{accountId:"<list_send_targets.accountId>",chatType:"direct",chatId:"<selected target.chatId>"}}; group is also valid. Use the returned top-level accountId and selected target row chatType/chatId. The target title is optional.',
+  delivery: { description: 'Where the result goes. For message_forward: line_target when actions.forward is on (default), record_only when it is off. primary_admin (default; omit delivery): the job sends the final result to the Primary Admin by LINE; 我 / 給我 / 傳給我 means the Primary Admin. record_only: the job reply stays in the schedule run history and nothing is sent (Agent tasks only; not for message). line_target {target}: use it when the user names another chat; resolve target with list_send_targets (a direct chat, group or room of the Agent account). For message_forward, use {mode:"line_target",target:{accountId:"<list_send_targets.accountId>",chatType:"direct",chatId:"<selected target.chatId>"}}; group is also valid. Use the returned top-level accountId and the chatType and chatId of the selected target row. The target title is optional.',
     oneOf: [
       { type: 'object', additionalProperties: false, required: ['mode'], properties: { mode: { const: 'primary_admin' } } },
       { type: 'object', additionalProperties: false, required: ['mode'], properties: { mode: { const: 'record_only' } } },
-      { type: 'object', additionalProperties: false, required: ['mode', 'target'], properties: { mode: { const: 'line_target' }, target: { ...SEND_TARGET_JSON_SCHEMA, description: 'Use top-level list_send_targets.accountId plus the selected row chatType/chatId; title is optional and must be a string when supplied (omit null).' } } },
+      { type: 'object', additionalProperties: false, required: ['mode', 'target'], properties: { mode: { const: 'line_target' }, target: { ...SEND_TARGET_JSON_SCHEMA, description: 'Use top-level list_send_targets.accountId plus the selected row chatType/chatId; title is optional; when you give it, use a string.' } } },
     ] },
 } as const;
 export const CREATE_SCHEDULE_TOOL_DEFINITION = {
   name: CREATE_SCHEDULE_TOOL_NAME,
-  description: MESSAGE_FORWARD_TOOL_GUIDANCE + ' Create a scheduled trigger now, without asking the user to confirm fields they did not mention. There are two kinds of schedule. Program: message (a fixed text) and new_messages (list the new messages by rules); Main does all the work and a program schedule uses no LLM, except for chats where a rule selects then="llm". Agent: custom, summary, keyword_digest, for work that needs judgment; every run starts an Agent. Immediate message rules use message_forward with recurrence {kind:message}; source chats are optional (empty targets = every readable chat). They support literal case-sensitive contains keywords, exact text, text inside new photos (mode image_text, local OCR),account+MID sender conditions (including sender-only attachment messages) and @mention conditions (mode mention). Each rule runs the actions in task.actions: forward original images/files (video/audio as files) to a direct/group line_target, show a desktop notification, and/or start one Agent job per message. Forwarding and notification use no AI job. A request to list messages from a time window must use new_messages, not custom. A condition such as "too many messages means summarize" is a rule with then="llm". Defaults: results go to the administrator (Primary Admin) by LINE (我 / 給我 means the administrator, so omit delivery); task summary when the user names chats (targets), else custom with the request as prompt and empty targets (except message_forward, whose task is mandatory); window since the last run (pass window {mode: "lookback", minutes} when the user states a range, e.g. 過去 6 小時 = 360); timezone Asia/Taipei; provider of the current job; enabled. For "in 5 minutes" / 5 分鐘後 use recurrence {kind: "once", inMinutes: 5}. Resolve chats yourself with list_targets (communities included) and refer to them by title. Ask a question only when a chat name matches several conversations or the user gave no time at all, except message_forward is event-triggered and needs no time. After creating, reply with a short summary (target, next run time, range, task, delivery) using nextFireAtTaipei and deliveryLabel from the result, and say the user can ask to change it. For summary and keyword_digest leave prompt empty unless the user gave extra requirements, and never restate source, time, range, output or rules in prompt (the system adds them); a custom prompt is one or two sentences of what to do. At each fire time an unattended job runs in its own new session (never the Agent room). A reminder, alarm or fixed notice (提醒我…) is a message task: pass task {type: "message", text} with the user\'s reminder text as written and no prompt; Main sends it directly with no Agent run. Up to 50 schedules can be enabled. Use targets (and summary or keyword_digest) only for chats the user names in the current request; never carry a chat over from earlier conversation. When the request names no chat, create a custom task whose prompt restates the request and leave targets empty: at each run the Agent chooses the chats to read.',
+  description: MESSAGE_FORWARD_TOOL_GUIDANCE + ' Creates a scheduled trigger now. Use the default values for fields that the user did not give. There are two kinds of schedule. Program: message (a fixed text) and new_messages (list the new messages by rules). Main does all the work and a program schedule uses no LLM, except for chats where a rule selects then="llm". Agent: custom, summary, keyword_digest, for work that needs judgment; every run starts an Agent. Immediate message rules use message_forward with recurrence {kind:message}. Source chats are optional (empty targets = every readable chat). The rules support literal case-sensitive contains keywords, exact text, text inside new photos (mode image_text, local OCR), account+MID sender conditions (including sender-only attachment messages) and @mention conditions (mode mention). Each rule runs the actions in task.actions: forward original images/files (video/audio as files) to a direct/group line_target, show a desktop notification, and/or start one Agent job per message. Forwarding and notification use no AI job. For a request to list messages from a time window, use new_messages. A condition such as "too many messages means summarize" is a rule with then="llm". Defaults: results go to the Primary Admin by LINE (我 / 給我 means the Primary Admin, so omit delivery); task summary when the user names chats (targets), else custom with the request as prompt and empty targets (message_forward needs its own task); window since the last run (pass window {mode: "lookback", minutes} when the user states a range, e.g. 過去 6 小時 = 360); timezone Asia/Taipei; provider of the current job; enabled. For "in 5 minutes" / 5 分鐘後 use recurrence {kind: "once", inMinutes: 5}. Resolve chats yourself with list_targets (communities included) and use the titles when you talk to the user. Ask a question only when a chat name matches several conversations or the user gave no time at all (message_forward is event-triggered and needs no time). After you create the schedule, reply with a short summary (target, next run time, range, task, delivery). Use nextFireAtTaipei and deliveryLabel from the result. Tell the user that they can ask for a change. For summary and keyword_digest, leave prompt empty unless the user gave extra requirements. The system adds the source, time, range, output and rules. A custom prompt is one or two sentences of what to do. At each fire time an unattended job runs in its own new session (not the Agent room). A reminder, alarm or fixed notice (提醒我…) is a message task: pass task {type: "message", text} with the reminder text of the user as written. Main sends it directly with no Agent run. Up to 50 schedules can be enabled. Use targets (and summary or keyword_digest) only for chats that the user names in the current request. Take chats from the current request only. If the request names no chat, create a custom task whose prompt restates the request. Leave targets empty. At each run the Agent chooses the chats to read.',
   inputSchema: {
     type: 'object', additionalProperties: false, required: ['title', 'recurrence'],
     properties: {
       title: { type: 'string', minLength: 1, maxLength: 80 },
-      prompt: { type: 'string', maxLength: 4000, description: 'Required for the custom task: one or two sentences of what to do. For summary and keyword_digest leave it empty unless the user gave extra requirements. Never restate source, time, range, output or rules.' },
+      prompt: { type: 'string', maxLength: 4000, description: 'Required for the custom task: one or two sentences of what to do. For summary and keyword_digest leave it empty unless the user gave extra requirements. The system adds the source, time, range, output and rules.' },
       ...SCHEDULE_TASK_PROPERTIES,
       recurrence: RECURRENCE_JSON_SCHEMA,
       timezone: { type: 'string', maxLength: 64, description: 'IANA timezone. Default Asia/Taipei.' },
@@ -496,7 +602,7 @@ export const CREATE_SCHEDULE_TOOL_DEFINITION = {
 } as const;
 export const UPDATE_SCHEDULE_TOOL_DEFINITION = {
   name: UPDATE_SCHEDULE_TOOL_NAME,
-  description: 'Change a scheduled Agent trigger: any of title, prompt, recurrence, timezone, provider, targets, task, window, delivery, jitterMinutes, or enabled (false pauses it, true resumes it). Returns the updated schedule with nextFireAt. Only include fields the user asks to change; omitted fields retain their current values. ' + MESSAGE_FORWARD_TOOL_GUIDANCE + ' When updating a forwarding rule, preserve its current task (including task.actions), recurrence, targets and delivery unless the user asks to change them.',
+  description: 'Changes a scheduled Agent trigger: any of title, prompt, recurrence, timezone, provider, targets, task, window, delivery, jitterMinutes, or enabled (false pauses it, true resumes it). Returns the updated schedule with nextFireAt. Include only the fields that the user asks to change. Omitted fields keep their current values. ' + MESSAGE_FORWARD_TOOL_GUIDANCE + ' When you update a forwarding rule, keep its current task (including task.actions), recurrence, targets and delivery unless the user asks to change them. Use targets only for chats that the user names in the current request. If the request names no chat, use a custom task with the request as prompt and empty targets.',
   inputSchema: {
     type: 'object', additionalProperties: false, required: ['scheduleId'],
     properties: {
@@ -513,7 +619,7 @@ export const UPDATE_SCHEDULE_TOOL_DEFINITION = {
 } as const;
 export const DELETE_SCHEDULE_TOOL_DEFINITION = {
   name: DELETE_SCHEDULE_TOOL_NAME,
-  description: 'Permanently delete a scheduled Agent trigger and its run history. Confirm with the user first.',
+  description: 'Permanently deletes a scheduled Agent trigger and its run history. Confirm with the user first.',
   inputSchema: { type: 'object', additionalProperties: false, required: ['scheduleId'], properties: { scheduleId: { type: 'string' } } },
 } as const;
 const SCHEDULE_TOOLS = [LIST_SCHEDULES_TOOL_DEFINITION, CREATE_SCHEDULE_TOOL_DEFINITION, UPDATE_SCHEDULE_TOOL_DEFINITION, DELETE_SCHEDULE_TOOL_DEFINITION] as const;
@@ -522,37 +628,37 @@ const SCHEDULE_TOOLS = [LIST_SCHEDULES_TOOL_DEFINITION, CREATE_SCHEDULE_TOOL_DEF
  * tools/call checks the principal again. They do what Settings and the gear dialog do for the extra attachment folders of a chat.
  */
 const CHAT_FOLDER_TARGET_JSON_PROPERTIES = {
-  accountId: { type: 'string', description: 'LINE account of the chat. Allowed only together with chatType and chatId. Required in the Agent room when you name a chat; a job from LINE uses its own account.' },
+  accountId: { type: 'string', description: 'LINE account of the chat. Give it together with chatType and chatId. It is required in the Agent room when you name a chat. A job from LINE uses its own account.' },
   chatType: { type: 'string', enum: ['direct', 'group', 'room'], description: 'Chat type. Give it together with chatId. Omit both to use the chat of this job (not possible in the Agent room).' },
   chatId: { type: 'string', minLength: 1, maxLength: 256, description: 'Chat id from list_targets. Give it together with chatType.' },
 } as const;
-const CHAT_FOLDER_TARGET_GUIDANCE = ' The chat is the chat of this job by default. An admin job may name another chat of the same account with chatType and chatId (accountId too in the Agent room). Only direct, group and room chats. The fixed attachment location never changes; a download folder only adds a place that new attachments are copied to.';
-const CHAT_FOLDER_ERROR_GUIDANCE = ' On failure the result has error.code: NOT_ABSOLUTE, NOT_DIRECTORY, REPARSE_POINT, PROTECTED_FOLDER, OTHER_CHAT_FOLDER, ACCESS_DENIED, UNREACHABLE, DUPLICATE_FOLDER, LIMIT_REACHED, NOT_FOUND, FAILED, TARGET_REQUIRED, CHAT_NOT_FOUND, ACCOUNT_MISMATCH or INVALID_INPUT. Tell the admin the real code.';
+const CHAT_FOLDER_TARGET_GUIDANCE = ' The chat is the chat of this job by default. An admin job can name another chat of the same account with chatType and chatId (and accountId in the Agent room). The valid chats are direct, group and room chats. The fixed attachment location stays the same. A download folder is an extra place that receives copies of new attachments.';
+const CHAT_FOLDER_ERROR_GUIDANCE = ' On failure, error.code is one of: NOT_ABSOLUTE, NOT_DIRECTORY, REPARSE_POINT, PROTECTED_FOLDER, OTHER_CHAT_FOLDER, ACCESS_DENIED, UNREACHABLE, DUPLICATE_FOLDER, LIMIT_REACHED, NOT_FOUND, FAILED, TARGET_REQUIRED, CHAT_NOT_FOUND, ACCOUNT_MISMATCH, INVALID_INPUT. Tell the admin the real code.';
 export const LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_DEFINITION = {
   name: LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_NAME,
-  description: 'List the download folders of one chat: the fixed attachment location, the default folder and the classification folders (folderId, path, description) with the copy counts (queued, claimed, completed, failed) of each.' + CHAT_FOLDER_TARGET_GUIDANCE,
+  description: 'Lists the download folders of one chat: the fixed attachment location, the default folder and the classification folders (folderId, path, description) with the copy counts (queued, claimed, completed, failed) of each.' + CHAT_FOLDER_TARGET_GUIDANCE,
   inputSchema: { type: 'object', additionalProperties: false, properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES } },
 } as const;
 export const ADD_CHAT_DOWNLOAD_FOLDER_TOOL_DEFINITION = {
   name: ADD_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
-  description: `Add a classification folder to one chat. path must be an absolute local path or a \\\\server\\share path of an existing real directory (no link, no system folder, not the workspace folder of another chat). description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) tells the classifier which attachments belong there. At most ${CHAT_EXTRA_FOLDER_LIMIT} classification folders per chat; the same path cannot be added twice.` + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
+  description: `Adds a classification folder to one chat. path is an absolute local path or a \\\\server\\share path of an existing real directory. The tool refuses a link, a system folder and the workspace folder of another chat. description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) tells the classifier which attachments belong there. A chat has ${CHAT_EXTRA_FOLDER_LIMIT} classification folders at most. Add each path once.` + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
   inputSchema: { type: 'object', additionalProperties: false, required: ['path', 'description'], properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES,
     path: { type: 'string', minLength: 1, maxLength: 1024 }, description: { type: 'string', minLength: 1, maxLength: CHAT_EXTRA_FOLDER_DESCRIPTION_MAX } } },
 } as const;
 export const SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_DEFINITION = {
   name: SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_NAME,
-  description: `Change the description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) of one classification folder of a chat. Get folderId from list_chat_download_folders. The default folder has no description.` + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
+  description: `Changes the description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) of one classification folder of a chat. Get folderId from list_chat_download_folders.` + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
   inputSchema: { type: 'object', additionalProperties: false, required: ['folderId', 'description'], properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES,
     folderId: { type: 'string', format: 'uuid' }, description: { type: 'string', minLength: 1, maxLength: CHAT_EXTRA_FOLDER_DESCRIPTION_MAX } } },
 } as const;
 export const SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_DEFINITION = {
   name: SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME,
-  description: 'Set or replace the default folder of one chat by path (the same checks as add_chat_download_folder). The default folder receives the attachments that the classifier cannot place. A replaced default folder stops receiving copies; its files stay.' + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
+  description: 'Sets or replaces the default folder of one chat by path (the same checks as add_chat_download_folder). The default folder receives the attachments that the classifier cannot place. A replaced default folder stops receiving copies.' + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
   inputSchema: { type: 'object', additionalProperties: false, required: ['path'], properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES, path: { type: 'string', minLength: 1, maxLength: 1024 } } },
 } as const;
 export const REMOVE_CHAT_DOWNLOAD_FOLDER_TOOL_DEFINITION = {
   name: REMOVE_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
-  description: 'Remove one classification folder of a chat (folderId from list_chat_download_folders), or clear the default folder (clearDefault: true). Give exactly one of them. Waiting copies stop; the files on disk stay. Confirm with the admin first.' + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
+  description: 'Removes one classification folder of a chat (folderId from list_chat_download_folders), or clears the default folder (clearDefault: true). Give exactly one of them. Waiting copies stop. The files on disk stay. Confirm with the admin first.' + CHAT_FOLDER_TARGET_GUIDANCE + CHAT_FOLDER_ERROR_GUIDANCE,
   inputSchema: { type: 'object', additionalProperties: false, properties: { ...CHAT_FOLDER_TARGET_JSON_PROPERTIES,
     folderId: { type: 'string', format: 'uuid' }, clearDefault: { const: true } } },
 } as const;
@@ -562,23 +668,23 @@ const CHAT_FOLDER_TOOLS = [LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_DEFINITION, ADD_CHAT_
  * The same tools as a whitelisted user's job sees them (own-chat authority): no chat target, no default folder tool, and `path` is a
  * subfolder of the default folder. tools/call applies the limits again; these definitions are only a hint.
  */
-const OWN_CHAT_FOLDER_GUIDANCE = ' This tool acts only on the chat of this job. The default folder of the chat is fixed; only the admin can change it.';
-const OWN_CHAT_FOLDER_ERROR_GUIDANCE = ' On failure the result has error.code: NO_DEFAULT_FOLDER, INVALID_SUBFOLDER, OUTSIDE_DEFAULT_FOLDER, NOT_DIRECTORY, PROTECTED_FOLDER, ACCESS_DENIED, UNREACHABLE, DUPLICATE_FOLDER, LIMIT_REACHED, NOT_FOUND, FAILED, TARGET_NOT_ALLOWED, ADMIN_ONLY, CHAT_NOT_FOUND or INVALID_INPUT. Tell the user the real code.';
+const OWN_CHAT_FOLDER_GUIDANCE = ' This tool acts on the chat of this job. The default folder of the chat is fixed. Only the admin can change it.';
+const OWN_CHAT_FOLDER_ERROR_GUIDANCE = ' On failure, error.code is one of: NO_DEFAULT_FOLDER, INVALID_SUBFOLDER, OUTSIDE_DEFAULT_FOLDER, NOT_DIRECTORY, PROTECTED_FOLDER, ACCESS_DENIED, UNREACHABLE, DUPLICATE_FOLDER, LIMIT_REACHED, NOT_FOUND, FAILED, TARGET_NOT_ALLOWED, ADMIN_ONLY, CHAT_NOT_FOUND, INVALID_INPUT. Tell the user the real code.';
 const OWN_CHAT_FOLDER_TOOLS = [
   { name: LIST_CHAT_DOWNLOAD_FOLDERS_TOOL_NAME,
-    description: 'List the download folders of this chat: the default folder and the classification folders (folderId, path, description) with the copy counts (queued, claimed, completed, failed) of each.' + OWN_CHAT_FOLDER_GUIDANCE,
+    description: 'Lists the download folders of this chat: the default folder and the classification folders (folderId, path, description) with the copy counts (queued, claimed, completed, failed) of each.' + OWN_CHAT_FOLDER_GUIDANCE,
     inputSchema: { type: 'object', additionalProperties: false, properties: {} } },
   { name: ADD_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
-    description: `Add a classification folder to this chat. path is a subfolder name or a relative path with "/" under the default folder of the chat, for example "invoices" or "2026/invoices". It is created when it does not exist. It cannot contain "..", a drive letter, a network path, a reserved Windows name or the characters < > : " | ? * \\. description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) tells the classifier which attachments belong there. At most ${CHAT_EXTRA_FOLDER_LIMIT} classification folders per chat; the same folder cannot be added twice. The chat must have a default folder.` + OWN_CHAT_FOLDER_GUIDANCE + OWN_CHAT_FOLDER_ERROR_GUIDANCE,
+    description: `Adds a classification folder to this chat. path is a subfolder name or a relative path with "/" under the default folder of the chat, for example "invoices" or "2026/invoices". The tool creates it when it does not exist. The tool refuses "..", a drive letter, a network path, a reserved Windows name and the characters < > : " | ? * \\. description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) tells the classifier which attachments belong there. A chat has ${CHAT_EXTRA_FOLDER_LIMIT} classification folders at most. Add each folder once. The chat needs a default folder.` + OWN_CHAT_FOLDER_GUIDANCE + OWN_CHAT_FOLDER_ERROR_GUIDANCE,
     inputSchema: { type: 'object', additionalProperties: false, required: ['path', 'description'], properties: {
       path: { type: 'string', minLength: 1, maxLength: 1024, description: 'Subfolder name or relative path under the default folder.' },
       description: { type: 'string', minLength: 1, maxLength: CHAT_EXTRA_FOLDER_DESCRIPTION_MAX } } } },
   { name: SET_CHAT_DOWNLOAD_FOLDER_DESCRIPTION_TOOL_NAME,
-    description: `Change the description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) of one classification folder of this chat. Get folderId from list_chat_download_folders.` + OWN_CHAT_FOLDER_GUIDANCE + OWN_CHAT_FOLDER_ERROR_GUIDANCE,
+    description: `Changes the description (1 to ${CHAT_EXTRA_FOLDER_DESCRIPTION_MAX} characters) of one classification folder of this chat. Get folderId from list_chat_download_folders.` + OWN_CHAT_FOLDER_GUIDANCE + OWN_CHAT_FOLDER_ERROR_GUIDANCE,
     inputSchema: { type: 'object', additionalProperties: false, required: ['folderId', 'description'], properties: {
       folderId: { type: 'string', format: 'uuid' }, description: { type: 'string', minLength: 1, maxLength: CHAT_EXTRA_FOLDER_DESCRIPTION_MAX } } } },
   { name: REMOVE_CHAT_DOWNLOAD_FOLDER_TOOL_NAME,
-    description: 'Remove one classification folder setting of this chat (folderId from list_chat_download_folders). Only the setting is removed; the folder and its files stay on disk. Waiting copies stop.' + OWN_CHAT_FOLDER_GUIDANCE + OWN_CHAT_FOLDER_ERROR_GUIDANCE,
+    description: 'Removes one classification folder setting of this chat (folderId from list_chat_download_folders). The folder and its files stay on disk. Waiting copies stop.' + OWN_CHAT_FOLDER_GUIDANCE + OWN_CHAT_FOLDER_ERROR_GUIDANCE,
     inputSchema: { type: 'object', additionalProperties: false, required: ['folderId'], properties: { folderId: { type: 'string', format: 'uuid' } } } },
 ] as const;
 /** The download folder operations McpService needs; AttachmentStorageService provides them. */
@@ -624,6 +730,10 @@ export interface McpServiceOptions {
   approvalBroker?: Pick<AgentApprovalBroker, 'request'>;
   /** Agent LINE send behind list_send_targets / send_to_target; absent means the tools are never offered. */
   lineSend?: AgentLineSendHandler;
+  /** Sessions and Primary Admin replies behind wait_for_admin_reply, list_admin_replies, close_session and the external read_message_attachment. */
+  externalSessions?: Pick<ExternalSessionService, 'authorize' | 'run' | 'authorizeAttachment' | 'forward' | 'notifyReply'>;
+  /** Folder where an external read_message_attachment makes its copy (the configured Agent workspace). */
+  externalAttachmentWorkspace?: () => Promise<string | null>;
   /** Scheduled Agent triggers behind list/create/update/delete_schedule; absent means the tools are never offered. */
   schedules?: AgentScheduleToolHandler;
   /** Download folders behind list/add/set/remove_chat_download_folder(s); absent means the tools are never offered. */
@@ -646,7 +756,7 @@ export interface McpServiceOptions {
 export const REQUEST_PERMISSION_TOOL_NAME = 'request_permission';
 export const REQUEST_PERMISSION_TOOL_DEFINITION = {
   name: REQUEST_PERMISSION_TOOL_NAME,
-  description: 'Internal LINEJS permission prompt for the built-in Agent. Not a user-facing tool.',
+  description: 'Internal LINEJS permission prompt for the built-in Agent.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1081,6 +1191,25 @@ export class McpService {
     }
   }
 
+  /**
+   * forward_to_session. The principal (Primary Admin, direct chat) is re-resolved and audited inside the short transaction, which also
+   * writes the reply. The waiting client wakes after the commit. A refusal is a McpDomainError (INVALID_INPUT, PERMISSION_DENIED).
+   */
+  private async callForwardToSession(
+    rawArguments: Record<string, unknown>,
+    context: Extract<InternalAgentExecutionContext, { sourceType: 'job' }>,
+    signal: AbortSignal,
+  ): Promise<ForwardToSessionOutput> {
+    const sessions = this.options.externalSessions;
+    if (!sessions) throw new McpDomainError('SCOPE_DENIED', 'Session tools are unavailable.');
+    const forwarded = await this.track(() => this.options.tokens.executeForInternalAgent({
+      context, toolName: FORWARD_TO_SESSION_TOOL_NAME, signal,
+      execute: async ({ client }) => ({ data: await sessions.forward(client, { jobId: context.jobId, rawInput: rawArguments }), resultCount: 1 }),
+    }), signal);
+    sessions.notifyReply(forwarded.sessionKey);
+    return forwarded.output;
+  }
+
   /** Converts the tool-only { kind: 'once', inMinutes } into the stored { kind: 'once', at }. */
   private scheduleRecurrence(recurrence: ScheduleToolRecurrence): AgentScheduleRecurrence {
     if ('inMinutes' in recurrence) return { kind: 'once', at: new Date((this.options.now?.() ?? new Date()).getTime() + recurrence.inMinutes * 60_000).toISOString() };
@@ -1502,7 +1631,8 @@ export class McpService {
             signal,
             rateLimiter: () => this.checkExternalRateLimit(),
             execute: async ({ toolScopes }) => ({
-              data: [...MCP_TOOL_DEFINITIONS, ...(this.options.lineSend ? SEND_TOOLS : []), ...(this.options.schedules ? SCHEDULE_TOOLS : [])].filter((def) => !DISABLED_NOTE_TOOLS.has(def.name as McpToolName) && toolScopes.includes(def.name)
+              data: [...MCP_TOOL_DEFINITIONS, ...(this.options.lineSend ? (this.options.externalSessions ? EXTERNAL_SEND_TOOLS : SEND_TOOLS) : []),
+                ...(this.options.schedules ? SCHEDULE_TOOLS : []), ...(this.options.externalSessions ? EXTERNAL_SESSION_TOOLS : [])].filter((def) => !DISABLED_NOTE_TOOLS.has(def.name as McpToolName) && toolScopes.includes(def.name)
                 && (this.options.chatResources || !def.name.startsWith('list_chat_') && !def.name.startsWith('get_chat_'))),
             }),
           });
@@ -1572,6 +1702,53 @@ export class McpService {
             }
             else data = staged.output;
             return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data, isError: false } } };
+          }
+
+          // Session tools (docs/design/external-session-reply.md). The short part runs in the audited transaction; a long wait runs after it.
+          if (isExternalSessionToolName(toolName)) {
+            const sessions = this.options.externalSessions;
+            if (!sessions) throw new McpDomainError('SCOPE_DENIED', 'Session tools are unavailable.');
+            const requestId = randomUUID();
+            const staged = await this.options.tokens.executeLocalClientRead<ExternalSessionPlan>({
+              toolName, principalId: `local-client:${requestId}`, signal,
+              rateLimiter: () => this.checkExternalRateLimit(),
+              execute: async ({ client, authorizedAccountIds }) => {
+                const plan = await sessions.authorize(client, { toolName, rawInput: rawArgs, accountScope: authorizedAccountIds });
+                return { data: plan, resultCount: plan.kind === 'done' ? plan.resultCount : 0 };
+              },
+            });
+            let data: unknown;
+            if (staged.kind === 'wait') {
+              // The wait holds no request slot and no database connection.
+              releaseRequestSlot();
+              data = await sessions.run(staged, { signal });
+            } else data = staged.output;
+            const isError = !!data && typeof data === 'object' && 'error' in data;
+            return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data, isError } } };
+          }
+
+          // read_message_attachment on the external endpoint: only an attachment that a reply of a session lists.
+          if (toolName === READ_MESSAGE_ATTACHMENT_TOOL_NAME) {
+            const sessions = this.options.externalSessions;
+            const access = this.options.attachments;
+            const workspaceOf = this.options.externalAttachmentWorkspace;
+            if (!sessions || !access || !workspaceOf) throw new McpDomainError('SCOPE_DENIED', 'Attachment reading is unavailable.');
+            const messages = this.options.messages;
+            const requestId = randomUUID();
+            const authorized = await this.options.tokens.executeLocalClientRead({
+              toolName, principalId: `local-client:${requestId}`, signal,
+              rateLimiter: () => this.checkExternalRateLimit(),
+              execute: async ({ client, authorizedAccountIds }) => ({
+                data: await sessions.authorizeAttachment(client, { rawInput: rawArgs, accountScope: authorizedAccountIds }), resultCount: 1 }),
+            });
+            releaseRequestSlot();
+            const workspacePath = await workspaceOf().catch(() => null);
+            const output = await readMessageAttachmentForJob(
+              { getAttachment: (attachmentId) => messages.getAttachment(attachmentId), recoverFromLocalDownloads: (attachmentId) => access.recoverFromLocalDownloads(attachmentId),
+                resolveReadyPath: (attachmentId) => access.resolveReadyPath(attachmentId) },
+              { attachmentId: authorized.attachmentId, displayName: authorized.displayName, jobId: EXTERNAL_ATTACHMENT_FOLDER_ID,
+                fileAccess: workspacePath ? { workspacePath, fileRead: true } : null }, signal);
+            return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output, isError: false } } };
           }
 
           if (isScheduleToolName(toolName)) {
@@ -1793,12 +1970,14 @@ export class McpService {
         return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {} } };
       }
       if (rpc.method === 'tools/list') {
-        const { permissions, roomHistory, lineSend, chatFolders, chatFolderScope } = await verify();
+        const { permissions, roomHistory, lineSend, chatFolders, chatFolderScope, forwardToSession } = await verify();
         await finalCheck(null);
         this.internalCapabilities.observe(capability, 'tools_listed');
         // Listing is only a hint of the current permissions; tools/call re-resolves them and is the authority.
         const tools: Array<McpToolDefinition | typeof AGENT_ROOM_HISTORY_TOOL_DEFINITION | typeof REQUEST_PERMISSION_TOOL_DEFINITION
-          | (typeof SEND_TOOLS)[number] | (typeof SCHEDULE_TOOLS)[number] | (typeof CHAT_FOLDER_TOOLS)[number] | (typeof OWN_CHAT_FOLDER_TOOLS)[number] | typeof READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION> = allowedTools(permissions);
+          | (typeof SEND_TOOLS)[number] | (typeof SCHEDULE_TOOLS)[number] | (typeof CHAT_FOLDER_TOOLS)[number] | (typeof OWN_CHAT_FOLDER_TOOLS)[number] | typeof READ_MESSAGE_ATTACHMENT_TOOL_DEFINITION
+          | typeof FORWARD_TO_SESSION_TOOL_DEFINITION> = allowedTools(permissions);
+        if (forwardToSession === true && this.options.externalSessions) tools.push(FORWARD_TO_SESSION_TOOL_DEFINITION);
         if (roomHistory) tools.push(AGENT_ROOM_HISTORY_TOOL_DEFINITION);
         if (lineSend && this.options.lineSend) tools.push(...SEND_TOOLS);
         if (lineSend && this.options.schedules) tools.push(...SCHEDULE_TOOLS);
@@ -1856,6 +2035,15 @@ export class McpService {
           }
           return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
             content: [{ type: 'text', text: JSON.stringify(sent.data) }], structuredContent: sent.data, isError: false } } };
+        }
+        if (params.name === FORWARD_TO_SESSION_TOOL_NAME) {
+          // Like send_to_target, a reply that already committed is reported, not turned into an error by a late release.
+          const forwarded = await this.callForwardToSession(rawCallArgs, context, signal);
+          return { httpStatus: 200, body: { jsonrpc: '2.0', id, result: {
+            content: [{ type: 'text', text: JSON.stringify(forwarded) }],
+            structuredContent: forwarded,
+            isError: false,
+          } } };
         }
         if (params.name === READ_MESSAGE_ATTACHMENT_TOOL_NAME) {
           const attachment = await this.callReadMessageAttachment(rawCallArgs, context, signal);

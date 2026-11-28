@@ -301,4 +301,17 @@ describe('/model command', () => {
     expect(routeTrigger(direct, { ...context, senderIsPrimaryAdmin: true, primaryAdmin: false })).toEqual({ type: 'prompt', provider: 'codex', prompt: '/model opus' });
     expect(routeTrigger(direct, { ...context, senderIsPrimaryAdmin: false })).toEqual({ type: 'ignore' });
   });
+  it('routes /help, /說明 and /指令 to help only for the Primary Administrator in the one-to-one chat', () => {
+    const adminContext = { ...context, senderIsPrimaryAdmin: true, primaryAdmin: true };
+    for (const word of ['/help', '/HELP', '/說明', '/指令']) {
+      const direct = envelope({ chatType: 'direct', text: word, mentionIds: [], mentionRanges: [] });
+      expect(routeTrigger(direct, adminContext)).toEqual({ type: 'help' });
+      // A whitelisted friend in a 1:1 chat is served but is not the Primary Administrator: ordinary text.
+      expect(routeTrigger(direct, { ...context, senderIsPrimaryAdmin: true, primaryAdmin: false }).type).toBe('prompt');
+      expect(routeTrigger(direct, context)).toEqual({ type: 'ignore' });
+      // A group or room, even for the Primary Administrator with the mention, is not a help command.
+      expect(routeTrigger(envelope({ text: `@Agent ${word}`, ...mention }), adminContext).type).not.toBe('help');
+      expect(routeTrigger(envelope({ text: `@Agent ${word}`, ...mention }), context).type).not.toBe('help');
+    }
+  });
 });

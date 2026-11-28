@@ -38,6 +38,11 @@ export function claudePermissionPath(path:string):string {
 export function claudeProjectDenyRules(projectDirs:AgentRunRequest['tools']['projectDirs']):string[] {
   return (projectDirs??[]).filter(dir=>!dir.writable).flatMap(dir=>{const rule=`${claudePermissionPath(dir.path)}/**`;return [`Edit(${rule})`];});
 }
+/** `Edit` deny rules for the per-chat rule files of a protected job: AGENTS.md, CLAUDE.md and everything under rules/. */
+export function claudeChatRulesDenyRules(workspacePath:string):string[] {
+  const base=claudePermissionPath(workspacePath);
+  return [`Edit(${base}/AGENTS.md)`,`Edit(${base}/CLAUDE.md)`,`Edit(${base}/rules/**)`];
+}
 /** Same deny rules for plain directory paths. */
 export function claudeReadOnlyDenyRules(paths:readonly string[]):string[] {
   return claudeProjectDenyRules(paths.map(path=>({path,writable:false})));
@@ -91,7 +96,7 @@ export function claudeToolArguments(request:AgentRunRequest,mcpEndpoint:string|u
   allowed.push(...added,...(fullUnattended?['Bash']:[]),...webAllowed,...extension.allowedTools);
   const projectDirs=request.tools.projectDirs??[];
   // Linked folders are always read-only; a job whose writes exist only for project folders must not write its own chat folder either.
-  const deny=[...claudeProjectDenyRules(projectDirs),...claudeReadOnlyDenyRules([...(request.tools.fileWrite?request.tools.linkedReadDirs:[]),...(request.tools.ownFolderReadOnly?[request.workspacePath]:[])])];
+  const deny=[...claudeProjectDenyRules(projectDirs),...claudeReadOnlyDenyRules([...(request.tools.fileWrite?request.tools.linkedReadDirs:[]),...(request.tools.ownFolderReadOnly?[request.workspacePath]:[])]),...(request.tools.chatRulesProtected?claudeChatRulesDenyRules(request.workspacePath):[])];
   const settings=askBashEffective||deny.length?['--settings',JSON.stringify({permissions:{...(askBashEffective?{ask:['Bash']}:{}),...(deny.length?{deny}:{})}})]:[];
   return [...(fullAccess?[]:['--restricted']),'--permission-mode',interactive?'default':'dontAsk',...(interactive?['--permission-prompt-tool',claudePermissionPromptToolName]:[]),'--strict-mcp-config',...[...(request.tools.workspaceRootDir?[request.tools.workspaceRootDir]:[]),...request.tools.linkedReadDirs,...projectDirs.map(dir=>dir.path)].flatMap(directory=>['--add-dir',directory]),...(fullAccess?[]:['--tools',tools.join(',')]),...settings,...(disallowBash?['--disallowedTools','Bash']:[]),...(mcpEndpoint||Object.keys(extension.servers).length?['--mcp-config',claudeMcpConfig(mcpEndpoint?{endpoint:mcpEndpoint}:undefined,extension.servers)]:[]),...(allowed.length?['--allowedTools',[...new Set(allowed)].join(',')]:[])];
 }

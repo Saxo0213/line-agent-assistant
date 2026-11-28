@@ -239,13 +239,26 @@ describe('authoritative attachment preview', () => {
     await expect(readdir(cacheRoot)).resolves.toContain(`${digest(PNG)}.preview`);
   });
 
-  it('rejects an image with dimensions above the preview limit', async () => {
-    const oversized = Buffer.from(PNG); oversized.writeUInt32BE(9000, 16);
+  it.each([
+    ['a side above 32767', 32768, 1],
+    ['more than 32,000,000 pixels', 6000, 6000],
+  ])('rejects an image with %s', async (_label, width, height) => {
+    const oversized = Buffer.from(PNG); oversized.writeUInt32BE(width, 16); oversized.writeUInt32BE(height, 20);
     const item = await fixture(oversized, { kind: 'image', name: 'photo.png', mimeType: null,
       accountId: 'account-A', chatType: 'group', chatId: 'chat-A' });
     const service = new AttachmentPreviewService({ root: item.root,
       authority: { lookup: async () => item.metadata }, presenter: { async present() { return false; }, closeAll() {} } });
     await expect(service.readImage(ATTACHMENT_ID, { accountId: 'account-A', chatType: 'group', chatId: 'chat-A' }, { senderId: 7 })).resolves.toBeNull();
+  });
+
+  it('accepts a long JPEG screenshot of 1363 x 10815 pixels', async () => {
+    const tall = Buffer.from(JPEG); tall.writeUInt16BE(10815, 7); tall.writeUInt16BE(1363, 9);
+    const item = await fixture(tall, { kind: 'image', name: 'screenshot.jpg', mimeType: null,
+      accountId: 'account-A', chatType: 'group', chatId: 'chat-A' });
+    const service = new AttachmentPreviewService({ root: item.root,
+      authority: { lookup: async () => item.metadata }, presenter: { async present() { return false; }, closeAll() {} } });
+    await expect(service.readImage(ATTACHMENT_ID, { accountId: 'account-A', chatType: 'group', chatId: 'chat-A' }, { senderId: 7 }))
+      .resolves.toMatchObject({ bytes: tall, mimeType: 'image/jpeg' });
   });
 
   it('removes a same-size cache file with the wrong digest and rebuilds it from the authorized source', async () => {

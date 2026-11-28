@@ -24,6 +24,7 @@ import {
   ATTACHMENT_STORED_STATUS,
   McpDomainError,
   findSharedAdminChat,
+  type ExternalSessionRepository,
   type LineSendAuditRow,
   type MessageRepository,
   type SendChatType,
@@ -34,6 +35,7 @@ import { resolveManagedAttachment } from '../security.js';
 import { splitDeliveryText } from './delivery-service.js';
 import { openManagedBlob, readHeldBytes } from '../attachment-preview.js';
 import type { OperationalAudit } from './operational-audit.js';
+import { sessionTag } from './external-session-service.js';
 import { gatewayFault, recordSendFault, sendFaultDbCode, sendFaultDetail, workerFault, type SendFault } from './send-failure.js';
 
 /** list_send_targets queries that mean the administrator (compared lower-cased). */
@@ -71,11 +73,20 @@ export interface AgentLineSendOptions {
   attachmentRoot: string;
   /** Configured Agent workspace for local MCP calls that have no Agent job row. */
   workspacePath?: () => Promise<string | null>;
+  /** Project folders (docs/architecture/project-folders.md) of the job's chat that the job may read; a file `path` inside one may be sent. */
+  projectFolders?: (jobId: string) => Promise<readonly string[]>;
+  /** Applied to the text of every `text` item and of a system text before it goes to LINE (the app paths are replaced by labels). */
+  redactText?: (text: string, workspacePath: string | null) => Promise<string> | string;
   /** Operational audit: one row for each failed or unknown item, with the real cause as bounded enums and numbers. */
   audit?: Pick<OperationalAudit, 'observed'>;
+  /** Sessions of external MCP clients (docs/design/external-session-reply.md). Without it, `session` is refused. */
+  sessions?: Pick<ExternalSessionRepository, 'upsertSession' | 'recordMessage'>;
   /** Test hook: per-call budget. */
   callBudgetMs?: number;
 }
+
+/** The principal prefix of an external MCP call; only these calls may carry `session`. */
+const EXTERNAL_PRINCIPAL_PREFIX = 'local-client:';
 
 /** Audit principal of a message sent by Main itself for a system message schedule (no Agent job, no provider). */
 export const SYSTEM_SCHEDULE_PRINCIPAL = 'system:schedule';
@@ -85,6 +96,8 @@ export const FREE_MODE_PRINCIPAL = 'system:free_mode';
 /** Audit principal of a /folder reply (docs/architecture/project-folders.md). */
 export const PROJECT_FOLDER_PRINCIPAL = 'system:project_folder';
 export const PROVIDER_QUOTA_PRINCIPAL = 'system:provider_quota';
+/** Audit principal of the notice that follows a quoted reply of the Primary Admin to an external session. */
+export const EXTERNAL_SESSION_PRINCIPAL = 'system:external_session';
 
 export interface SystemTextInput {
   /** Audit `job_id`: the schedule run id (a system message has no Agent job). */
@@ -94,7 +107,7 @@ export interface SystemTextInput {
   /** System forwarding persists one physical part; no markdown splitting is permitted. */
   physicalPart?: boolean;
   /** Audit principal; defaults to the schedule principal. */
-  principalId?: typeof SYSTEM_SCHEDULE_PRINCIPAL | typeof SYSTEM_FORWARD_PRINCIPAL | typeof FREE_MODE_PRINCIPAL | typeof PROJECT_FOLDER_PRINCIPAL | typeof PROVIDER_QUOTA_PRINCIPAL;
+  principalId?: typeof SYSTEM_SCHEDULE_PRINCIPAL | typeof SYSTEM_FORWARD_PRINCIPAL | typeof FREE_MODE_PRINCIPAL | typeof PROJECT_FOLDER_PRINCIPAL | typeof PROVIDER_QUOTA_PRINCIPAL | typeof EXTERNAL_SESSION_PRINCIPAL;
   signal?: AbortSignal;
   /** Rechecked after FIFO wait and immediately before LINE send; false means a safely skipped write. */
   validateBeforeSend?: (binding: WorkerBinding) => Promise<boolean>;
@@ -121,10 +134,17 @@ export interface SendPlan {
   chatType: SendChatType;
   chatId: string;
   workspacePath: string | null;
+  /** Readable project folders of the job's chat at authorization time; only used to check `workspace` file items. */
+  projectFolders?: readonly string[];
   items: PlannedItem[];
   /** The direct chat has no conversation row yet; the first sent item creates it. */
   createDirectConversation?: boolean;
   managedForward?: { attachmentId: string; source: { accountId: string; chatType: string; chatId: string; messageId: string } };
+  /**
+   * External session of the call. Each sent message is stored with its LINE message id for this session.
+   * `tagOnlyText` is set when no text item carries the tag: the tag goes out first as one extra text message that is not an item.
+   */
+  session?: { key: string; seq: number; label: string; tagOnlyText?: true };
 }
 export type AuthorizeOutcome = { kind: 'rejected'; output: McpSendToTargetOutput } | { kind: 'plan'; plan: SendPlan };
 
@@ -256,26 +276,56 @@ export class AgentLineSendService implements AgentLineSendHandler {
     if (!accountId || !await this.options.canWriteLine(accountId)) return reject(0, 'send_line_unavailable');
     const target = await messages.getAgentSendTarget(accountId, chatType, chatId, client);
     if (!target) return reject(0, 'send_target_invalid');
+    // `session` is valid for an external MCP call to the direct chat of the Primary Admin only.
+    const sessionInput = parsed.data.session;
+    if (sessionInput) {
+      if (!input.principalId.startsWith(EXTERNAL_PRINCIPAL_PREFIX) || !this.options.sessions) {
+        throw new McpDomainError('INVALID_INPUT', 'session is available to external MCP clients only.');
+      }
+      const admin = await findSharedAdminChat(client).catch(() => null);
+      if (!admin || admin.accountId !== accountId || target.chatType !== 'direct' || target.chatId !== admin.adminMid) {
+        throw new McpDomainError('INVALID_INPUT', 'session is valid only when the target is the direct chat of the Primary Admin (role primary_admin in list_send_targets).');
+      }
+    }
     const sentSoFar = await messages.countJobLineSends(input.jobId, client);
     if (sentSoFar + this.pendingForJob(input.jobId) + items.length > SEND_ITEMS_PER_JOB_MAX) return reject(0, 'send_limit_exceeded');
 
     let workspacePath: string | null = null;
-    if (items.some((item) => item.type === 'file')) {
+    let projectFolders: readonly string[] = [];
+    const hasFile = items.some((item) => item.type === 'file');
+    if (hasFile || (this.options.redactText && items.some((item) => item.type === 'text'))) {
       const job = await client.query<{ workspace_path: string }>('SELECT workspace_path FROM agent_jobs WHERE job_id = $1', [input.jobId]);
       workspacePath = job.rows[0]?.workspace_path ?? await this.options.workspacePath?.() ?? null;
+      if (hasFile && workspacePath !== null && this.options.projectFolders) projectFolders = await this.options.projectFolders(input.jobId).catch(() => []);
     }
+    const redactText = async (text: string): Promise<string> => this.options.redactText ? await this.options.redactText(text, workspacePath) : text;
     const planned: PlannedItem[] = [];
     for (const [index, item] of items.entries()) {
       if (input.accountScope !== undefined && input.accountScope !== null && item.type === 'message' && !input.accountScope.includes(item.accountId)) {
         return reject(index, 'send_source_unavailable');
       }
-      const outcome = await this.planItem(client, item, index, workspacePath, input.accountScope);
+      const outcome = await this.planItem(client, item, index, workspacePath, input.accountScope, redactText);
       if ('code' in outcome) return reject(index, outcome.code);
       if (outcome.kind === 'media' && target.chatType === 'room') return reject(index, 'send_media_unsupported_chat');
       planned.push(outcome);
     }
+    // All checks passed: create or renew the session. The tag goes in front of the first text item (or one tag-only text).
+    let session: SendPlan['session'];
+    if (sessionInput) {
+      const record = await this.options.sessions!.upsertSession(client, { accountId, sessionKey: sessionInput.key, label: sessionInput.label });
+      const tag = sessionTag(record.label, record.seq);
+      const firstText = items.findIndex((item) => item.type === 'text');
+      if (firstText >= 0) {
+        const original = items[firstText] as Extract<McpSendItem, { type: 'text' }>;
+        const tagged = await this.planItem(client, { type: 'text', text: `${tag}\n${original.text}` }, firstText, workspacePath, input.accountScope, redactText);
+        if ('code' in tagged) return reject(firstText, tagged.code);
+        planned[firstText] = tagged;
+      }
+      session = { key: record.sessionKey, seq: record.seq, label: record.label, ...(firstText < 0 ? { tagOnlyText: true as const } : {}) };
+    }
     return { kind: 'plan', plan: { jobId: input.jobId, principalId: input.principalId, accountId, chatType: target.chatType,
-      chatId: target.chatId, workspacePath, items: planned, ...(target.newDirect ? { createDirectConversation: true } : {}) } };
+      chatId: target.chatId, workspacePath, ...(projectFolders.length > 0 ? { projectFolders } : {}), items: planned, ...(target.newDirect ? { createDirectConversation: true } : {}),
+      ...(session ? { session } : {}) } };
   }
 
   /** After a sent item of a direct chat without a row: creates the row (idempotent). A failure never changes the send result. */
@@ -288,11 +338,13 @@ export class AgentLineSendService implements AgentLineSendHandler {
     }
   }
 
-  private async planItem(client: Queryable, item: McpSendItem, index: number, workspacePath: string | null, accountScope?: readonly string[] | null):
+  private async planItem(client: Queryable, item: McpSendItem, index: number, workspacePath: string | null, accountScope?: readonly string[] | null,
+    redactText: (text: string) => Promise<string> = async (text) => text):
   Promise<PlannedItem | { code: SendErrorCode }> {
     const messages = this.options.messages;
     if (item.type === 'text') {
-      return { index, auditKind: 'text', kind: 'text', parts: splitDeliveryText(item.text), byteSize: utf8Length(item.text) };
+      const text = await redactText(item.text);
+      return { index, auditKind: 'text', kind: 'text', parts: splitDeliveryText(text), byteSize: utf8Length(text) };
     }
     if (item.type === 'file') {
       if (workspacePath === null) return { code: 'send_file_invalid' };
@@ -329,6 +381,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
   private async prepare(plan: SendPlan): Promise<{ ok: true; items: ReadyItem[] } | { ok: false; index: number; code: SendErrorCode }> {
     const ready: ReadyItem[] = [];
     let workspaceReal: string | null = null;
+    let projectReals: string[] | null = null;
     for (const item of plan.items) {
       if (item.kind === 'text') { ready.push(item); continue; }
       const unavailable: SendErrorCode = item.source.type === 'stored' ? 'send_attachment_unavailable' : 'send_file_invalid';
@@ -343,7 +396,14 @@ export class AgentLineSendService implements AgentLineSendHandler {
         } else {
           workspaceReal ??= await realpath(plan.workspacePath!);
           const real = await realpath(path.resolve(workspaceReal, item.source.path));
-          if (!isInside(workspaceReal, real)) return { ok: false, index: item.index, code: unavailable };
+          if (!isInside(workspaceReal, real)) {
+            // A bound project folder is allowed too; a folder that cannot be resolved now is left out. Both sides are canonical.
+            if (projectReals === null) {
+              projectReals = [];
+              for (const folder of plan.projectFolders ?? []) { try { projectReals.push(await realpath(folder)); } catch { /* left out */ } }
+            }
+            if (!projectReals.some((folder) => isInside(folder, real))) return { ok: false, index: item.index, code: unavailable };
+          }
           absolutePath = real;
           name = path.basename(real);
           mediaKind = IMAGE_EXTENSIONS.has(path.extname(real).toLowerCase()) ? 'image' : 'file';
@@ -374,11 +434,14 @@ export class AgentLineSendService implements AgentLineSendHandler {
   async sendSystemText(input: SystemTextInput): Promise<SystemTextResult> {
     const principalId = input.principalId ?? SYSTEM_SCHEDULE_PRINCIPAL;
     const unavailable: SystemTextResult = { status: 'failed', code: 'send_line_unavailable' };
+    // A forwarded message is the user's own text and stays exact; every other system text hides the app paths.
+    const text = this.options.redactText && principalId !== SYSTEM_FORWARD_PRINCIPAL
+      ? await Promise.resolve(this.options.redactText(input.text, null)).catch(() => input.text) : input.text;
     const parts = input.physicalPart && principalId === SYSTEM_FORWARD_PRINCIPAL
-      ? (input.text.length <= 4900 ? [input.text] : []) : splitDeliveryText(input.text);
+      ? (text.length <= 4900 ? [text] : []) : splitDeliveryText(text);
     if (this.stopping || parts.length === 0) return unavailable;
     const messages = this.options.messages;
-    const byteSize = utf8Length(input.text);
+    const byteSize = utf8Length(text);
     let accountId: string | null;
     try { accountId = await messages.findAgentSendAccount(); } catch { return unavailable; }
     if (!accountId) return unavailable;
@@ -445,21 +508,31 @@ export class AgentLineSendService implements AgentLineSendHandler {
     if (!prepared.ok) return refuse(prepared.index, prepared.code);
     const binding = await this.currentBinding(plan.accountId);
     if (!binding) return refuse(0, 'send_line_unavailable');
-    if (this.queue.length + count > SEND_PENDING_MAX) return refuse(0, 'send_limit_exceeded');
+    // A call with a session and no text item sends the tag first as one extra text message. It has index -1 and is not an item.
+    const tagItems: ReadyItem[] = plan.session?.tagOnlyText
+      ? (() => { const tag = sessionTag(plan.session.label, plan.session.seq);
+        return [{ index: -1, auditKind: 'text', kind: 'text', parts: [tag], byteSize: utf8Length(tag) } satisfies ReadyItem]; })()
+      : [];
+    if (this.queue.length + count + tagItems.length > SEND_PENDING_MAX) return refuse(0, 'send_limit_exceeded');
     if (this.stopping || context.signal.aborted || !context.isLive()) return failedAt(count, 0, 'send_line_unavailable');
 
     const call: CallState = { plan, isLive: context.isLive, halted: false,
       baseline: { controlEpoch: binding.controlEpoch, workerInstanceId: binding.workerInstanceId },
       ...(context.validateBeforeSend ? { validateBeforeSend: context.validateBeforeSend } : {}) };
     const release = () => this.haltQueued(call);
-    const results = prepared.items.map((item) => new Promise<McpSendResult>((resolve) => {
+    const results = [...tagItems, ...prepared.items].map((item) => new Promise<McpSendResult>((resolve) => {
       this.queue.push({ call, item, resolve });
     }));
     context.signal.addEventListener('abort', release, { once: true });
     const timer = setTimeout(release, this.callBudgetMs);
     this.pump();
     try {
-      return { results: await Promise.all(results) };
+      const all = await Promise.all(results);
+      const tagResult = all.find((result) => result.index < 0);
+      const itemResults = all.filter((result) => result.index >= 0);
+      // A tag that did not go out stops the call. The failure is reported on the first item.
+      if (tagResult && tagResult.status !== 'sent' && tagResult.status !== 'skipped' && itemResults[0]) itemResults[0] = { ...tagResult, index: 0 };
+      return { results: itemResults };
     } finally {
       clearTimeout(timer);
       context.signal.removeEventListener('abort', release);
@@ -515,7 +588,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
     const byteSize = item.kind === 'text' ? item.byteSize : item.sizeBytes;
     const record = (status: LineSendAuditRow['status'], code: string | null) => this.audit({
       jobId: plan.jobId, accountId: plan.accountId, principalId: plan.principalId, chatType: plan.chatType, chatId: plan.chatId,
-      itemIndex: index, itemKind: item.auditKind, byteSize, status, errorCode: code });
+      itemIndex: Math.max(0, index), itemKind: item.auditKind, byteSize, status, errorCode: code });
     const unavailable = async (sent: boolean): Promise<McpSendResult> => {
       // A capability released (or a shutdown) between two steps is a stop, not a failure, when nothing went out.
       if (!sent && (this.stopping || !call.isLive())) return skipped(index);
@@ -530,12 +603,26 @@ export class AgentLineSendService implements AgentLineSendHandler {
         && binding.workerInstanceId === call.baseline.workerInstanceId ? binding : null;
     };
     /** The worker result is the truth only when it matches this request and binding; the worker error code and detail are kept. */
+    let sentMessageId: string | null = null;
     const finish = (result: SendResult, requestId: string, binding: ActiveBinding): 'sent' | SendFault => {
       const matches = result.requestId === requestId && result.accountId === plan.accountId
         && result.workerInstanceId === binding.workerInstanceId && result.controlEpoch === binding.controlEpoch;
       if (!matches) return { source: 'local', outcome: 'unknown', code: 'result_mismatch' };
-      if (result.status === 'sent') return result.messageId ? 'sent' : { source: 'local', outcome: 'unknown', code: 'no_message_id' };
+      if (result.status === 'sent') {
+        sentMessageId = result.messageId ?? null;
+        return result.messageId ? 'sent' : { source: 'local', outcome: 'unknown', code: 'no_message_id' };
+      }
       return workerFault(result, result.status === 'failed' ? 'failed' : 'unknown');
+    };
+    /** Stores the LINE message id of the message that was just sent for the session of the call. A failure never changes the result. */
+    const rememberSessionMessage = async (): Promise<void> => {
+      if (!plan.session || !this.options.sessions || sentMessageId === null) return;
+      try {
+        await this.options.sessions.recordMessage({ accountId: plan.accountId, lineMessageId: sentMessageId, sessionKey: plan.session.key });
+      } catch {
+        recordSendFault(this.options.audit, { accountId: plan.accountId, jobId: plan.jobId, requestId: randomUUID(), operation: 'sendText' },
+          { source: 'local', outcome: 'failed', code: 'session_write_failed' });
+      }
     };
     const operation = item.kind === 'text' ? 'sendText' as const : 'sendMedia' as const;
     const outcomeResult = async (fault: SendFault, requestId: string): Promise<McpSendResult> => {
@@ -564,6 +651,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
           outcome = finish(result, requestId, binding);
         } catch (error) { outcome = gatewayFault(error); }
         if (outcome !== 'sent') return outcomeResult(outcome, requestId);
+        await rememberSessionMessage();
         sentParts += 1;
       }
       await record('sent', null);
@@ -609,6 +697,7 @@ export class AgentLineSendService implements AgentLineSendHandler {
       outcome = finish(result, requestId, binding);
     } catch (error) { outcome = gatewayFault(error); }
     if (outcome !== 'sent') return outcomeResult(outcome, requestId);
+    await rememberSessionMessage();
     await record('sent', null);
     await this.ensureConversation(plan);
     return { index, status: 'sent' };

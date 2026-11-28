@@ -11,6 +11,7 @@ import type { ReplyContextResolver } from './agent-reply-context.js';
 import type { ResidentReaped, ResidentTurnOptions } from '@line-agent/agent-bridge';
 import { decideSelfHeal, emptyReplyFailure, isBlankCompletion, markAfterSelfHeal, needsLineSendCheck, type FailedAgentEvent, type SelfHealContext } from './agent-self-heal.js';
 import { formatIdentityBlock, withAgentRoomHistoryHint, withIdentityBlock, withMcpSkill, withOutputChannel, type JobIdentityView } from './mcp-skill.js';
+import { REQUESTER_LINES } from './reply-audit-service.js';
 import { buildTranscript, withTranscriptPreamble } from './agent-transcript.js';
 import { agentUpgradeNoticeText, type AgentUpgradeNotice } from './agent-upgrade-notice.js';
 import { buildResidentPrompt, parseResidentKey, residentIdentity, residentKey, type ResidentIdentity } from './agent-resident.js';
@@ -148,6 +149,11 @@ export interface AgentServiceResidentOptions {
    * notice at the start of its run message (never in the stored job prompt). A schedule run has no session and never takes it.
    */
   upgradeNotice?: AgentUpgradeNotice;
+  /**
+   * The list of waiting external sessions (docs/design/external-session-reply.md) for a job of the Primary Admin in the direct chat of
+   * the Agent account: text to add after the job prompt in the run request, or an empty string when no session waits. A throw adds nothing.
+   */
+  waitingSessionsSection?: (accountId: string) => Promise<string>;
 }
 export const RESIDENT_TURN_TIMEOUT_MS = 900_000;
 export const RESIDENT_STALL_MS = 120_000;
@@ -963,12 +969,16 @@ export class AgentService {
         const resident = job.provider === 'claude' && job.sourceType !== 'schedule' && sessionKey !== undefined
           && typeof this.bridge.runResident === 'function';
         let runRequest = request;
+        // The 發問者 line of a LINE job (docs/design/non-admin-reply-audit.md): run request only.
+        const requesterLine = job.sourceType === 'line' && plan.requester ? REQUESTER_LINES[plan.requester] : null;
         // A Codex one-shot job of a chat or the room (not a schedule): the resident turn timeout, the chat's model, and a retry without resume.
         const codexOneShot = job.provider === 'codex' && job.sourceType !== 'schedule';
         const codexTimeoutMs = codexOneShot ? this.residentOptions.residentTurnTimeoutMs ?? RESIDENT_TURN_TIMEOUT_MS : undefined;
         let residentTurn: ResidentTurnOptions | undefined;
         const residentParts: { skill: string | null; mcp: boolean; historyEligible: boolean; identity: JobIdentityView | null; visiblePrompt: string } =
           { skill: null, mcp: false, historyEligible: false, identity: null, visiblePrompt: request.prompt };
+        // True when the identity lookup says that the chat of this job is the direct chat of the Primary Admin with the Agent account.
+        let adminDirectIdentity = false;
         if (resident && sessionKey) {
           const mcpEndpoint = this.mcpLauncher?.endpoint?.() ?? null;
           const launcher = this.mcpLauncher;
@@ -980,6 +990,7 @@ export class AgentService {
                 || await (async () => this.agents.sharesAgentRoomHistory({ sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId }))().catch(() => false);
               residentParts.identity = await (async () => await this.agents.describeJobIdentity({
                 sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, jobId: job.jobId }))().catch(() => null);
+              adminDirectIdentity = residentParts.identity?.current?.isAdmin === true;
             } catch (error) { this.reportFailure('prepare', error, job.jobId); residentParts.skill = null; }
           }
           const scheduleContext = isScheduledRunRequestId(job.sourceRequestId)
@@ -1028,15 +1039,18 @@ ${scheduleContext}` : request.prompt;
               const historyEligible = job.sourceType === 'ui'
                 || job.sourceType !== 'schedule' && await (async () => this.agents.sharesAgentRoomHistory({ sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId }))().catch(() => false);
               // 「身分」 block: who the Agent, the administrator and the current chat are. A failed lookup omits it; it never fails the job.
-              const identityBlock = await (async () => formatIdentityBlock(await this.agents.describeJobIdentity({
-                sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, jobId: job.jobId })))().catch(() => null);
+              const identityView = await (async () => await this.agents.describeJobIdentity({
+                sourceType: job.sourceType, accountId: job.accountId, chatType: job.chatType, chatId: job.chatId, jobId: job.jobId }))().catch(() => null);
+              const identityBlock = identityView ? formatIdentityBlock(identityView) : null;
+              adminDirectIdentity = identityView?.current?.isAdmin === true;
               // Schedule-sourced jobs get their machine instructions here, in the run request only (the stored prompt stays the short card).
               const scheduleContext = job.sourceType === 'schedule' || isScheduledRunRequestId(job.sourceRequestId)
                 ? await (async () => await this.mcpLauncher?.scheduleContext?.(job.sourceRequestId!, job.jobId))().catch(() => null) ?? SCHEDULE_CONTEXT_UNAVAILABLE : null;
               const visible = scheduleContext ? `${request.prompt}
 
 ${scheduleContext}` : request.prompt;
-              const userText = withIdentityBlock(historyEligible ? withAgentRoomHistoryHint(visible) : visible, identityBlock);
+              const userText = withIdentityBlock(historyEligible ? withAgentRoomHistoryHint(visible) : visible,
+                [identityBlock, requesterLine].filter((line): line is string => !!line).join('\n') || null);
               runRequest = { ...request, prompt: withMcpSkill(skill, withOutputChannel(userText, job.sourceType)), mcp: launch };
             }
           } catch (error) { this.reportFailure('prepare', error, job.jobId); launch = null; }
@@ -1081,9 +1095,22 @@ ${scheduleContext}` : request.prompt;
           else runRequest = { ...runRequest, prompt: `${runRequest.prompt}${attachmentPromptSection(job.provider, attachmentFiles)}`,
             ...(imagePaths.length > 0 ? { imagePaths } : {}) };
         }
+        // The waiting external sessions: a normal prompt job of the Primary Admin in the direct chat that has the MCP tools (the tool
+        // forward_to_session is offered to exactly this job). Run request only, after every other section. A failure adds nothing.
+        let residentWaitingSessionsSection = '';
+        const waitingSessionsSection = this.residentOptions.waitingSessionsSection;
+        if (waitingSessionsSection && job.sourceType === 'line' && job.accountId && adminDirectIdentity && !isScheduledRunRequestId(job.sourceRequestId)
+          && (residentTurn ? residentParts.mcp : runRequest.mcp !== undefined)) {
+          const section = await waitingSessionsSection(job.accountId).catch((error: unknown) => { this.reportFailure('prepare', error, job.jobId); return ''; });
+          if (section) {
+            if (residentTurn) residentWaitingSessionsSection = section;
+            else runRequest = { ...runRequest, prompt: `${runRequest.prompt}${section}` };
+          }
+        }
         if (residentTurn) {
-          const built = buildResidentPrompt({ sourceType: job.sourceType === 'ui' ? 'ui' : 'line', ...residentParts,
-            projectFolderSection, personaSection: residentPersonaSection, replySection: residentReplySection, attachmentSection: residentAttachmentSection });
+          const built = buildResidentPrompt({ sourceType: job.sourceType === 'ui' ? 'ui' : 'line', ...residentParts, requesterLine,
+            projectFolderSection, personaSection: residentPersonaSection, replySection: residentReplySection, attachmentSection: residentAttachmentSection,
+            waitingSessionsSection: residentWaitingSessionsSection });
           // CliTalkAgent prompt_user_with_session_context: a new process without a session to resume gets the recent turns in front of the message.
           // It is computed once here, so the second attempt of a self-heal sends the same message.
           let message = built.message;
@@ -1264,6 +1291,8 @@ ${scheduleContext}` : request.prompt;
       } finally {
         // Best effort: quoted files of a LINE job are deleted at the end of the job and never change its result.
         if (replyFilesWorkspace) await removeJobAttachments(replyFilesWorkspace, job.jobId).catch(() => undefined);
+        // A protected job must leave the chat's rule files as it found them (restores and audits otherwise).
+        await this.environment.finish?.(job.jobId).catch(() => undefined);
         const current = await this.agents.getJob(job.jobId).catch(() => null);
         if (current && !execution.terminal) {
           if (current.status === 'cancelled') {

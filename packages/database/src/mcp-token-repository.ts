@@ -1,4 +1,4 @@
-import { AGENT_ROOM_HISTORY_TOOL_NAME, isChatDownloadFolderToolName, SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME,LIST_SEND_TARGETS_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
+import { EXTERNAL_SESSION_TOOL_NAMES, FORWARD_TO_SESSION_TOOL_NAME, isExternalSessionToolName, AGENT_ROOM_HISTORY_TOOL_NAME, isChatDownloadFolderToolName, SET_CHAT_DEFAULT_DOWNLOAD_FOLDER_TOOL_NAME,LIST_SEND_TARGETS_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, SCHEDULE_TOOL_NAMES, isScheduleToolName, MCP_TOOL_EFFECTS, MCP_TOOL_PERMISSIONS, MCP_TOOL_NAMES, McpToolNameSchema, type McpInternalToolName, type EffectivePermissions, type ConversationKey, type McpToolName } from '@line-agent/contracts';
 import type { Pool, PoolClient } from 'pg';
 import { lockAndCheckAgentAuthorization, lockAndCheckFreeMode } from './agent-authorization.js';
 import { findSharedAdminChat, type SharedAdminChat } from './agent-repository.js';
@@ -221,7 +221,8 @@ export class McpTokenRepository {
       // The local loopback client can use the explicitly supported LINE send and schedule tools.
       // Agent-room history remains internal-only.
       const externalTool = input.toolName === null ? null : McpToolNameSchema.safeParse(input.toolName);
-      const localEffectTool = input.toolName === LIST_SEND_TARGETS_TOOL_NAME || input.toolName === SEND_TO_TARGET_TOOL_NAME || isScheduleToolName(input.toolName);
+      const localEffectTool = input.toolName === LIST_SEND_TARGETS_TOOL_NAME || input.toolName === SEND_TO_TARGET_TOOL_NAME || isScheduleToolName(input.toolName)
+        || isExternalSessionToolName(input.toolName) || input.toolName === READ_MESSAGE_ATTACHMENT_TOOL_NAME;
       if (input.toolName !== null && !externalTool?.success && !localEffectTool) {
         await reject([], 'SCOPE_DENIED');
         throw new McpDomainError('SCOPE_DENIED', `The external MCP endpoint does not offer tool "${input.toolName}".`);
@@ -267,7 +268,7 @@ export class McpTokenRepository {
           client,
           principalId,
           authorizedAccountIds,
-          toolScopes: [...MCP_TOOL_NAMES, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, ...SCHEDULE_TOOL_NAMES],
+          toolScopes: [...MCP_TOOL_NAMES, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, ...SCHEDULE_TOOL_NAMES, ...EXTERNAL_SESSION_TOOL_NAMES],
         }));
       } catch (stepError) {
         if (stepError instanceof McpDomainError && stepError.code === 'INVALID_INPUT') {
@@ -450,12 +451,25 @@ export class McpTokenRepository {
    * Like verifyInternalAgent, plus whether the Agent room history and LINE send tools may be listed (hints; tools/call
    * re-checks). `lineSend` is true only for the Primary Admin and the desktop operator (internal:ui).
    */
-  async verifyInternalAgentAccess(input: { context: InternalAgentExecutionContext; signal?: AbortSignal }): Promise<{ permissions: EffectivePermissions; roomHistory: boolean; lineSend: boolean; chatFolders: boolean; chatFolderScope: ChatFolderScope | null }> {
+  async verifyInternalAgentAccess(input: { context: InternalAgentExecutionContext; signal?: AbortSignal }): Promise<{ permissions: EffectivePermissions; roomHistory: boolean; lineSend: boolean; chatFolders: boolean; chatFolderScope: ChatFolderScope | null;
+    /** True only for a job of the Primary Admin in the direct chat of the Agent account (forward_to_session). */
+    forwardToSession: boolean }> {
     return this.withMcpTransaction(input.signal, async (client) => {
       const resolved = await this.resolveInternalPrincipal(client, input.context, null, true);
       return { permissions: resolved.permissions, roomHistory: resolved.history.allowed, lineSend: mayLineSend(resolved.principalId),
-        chatFolders: resolved.chatFolderScope !== null, chatFolderScope: resolved.chatFolderScope };
+        chatFolders: resolved.chatFolderScope !== null, chatFolderScope: resolved.chatFolderScope,
+        forwardToSession: (await this.primaryAdminDirectJobAccount(client, input.context, resolved.principalId)) !== null };
     });
+  }
+
+  /**
+   * The account of a job of the Primary Admin in a direct chat (the only job that may call forward_to_session), or null. The job row
+   * was already checked by resolveInternalPrincipal; this adds the principal and the chat type.
+   */
+  private async primaryAdminDirectJobAccount(client: PoolClient, context: InternalAgentExecutionContext, principalId: string): Promise<string | null> {
+    if (context.sourceType !== 'job' || !principalId.startsWith('internal:primary_admin:')) return null;
+    const row = (await client.query<{ account_id: string; chat_type: string }>('SELECT account_id, chat_type FROM agent_jobs WHERE job_id = $1', [context.jobId])).rows[0];
+    return row && row.chat_type === 'direct' ? row.account_id : null;
   }
 
   async executeForInternalAgent<T>(input: {
@@ -508,6 +522,37 @@ export class McpTokenRepository {
           accountScopes: scope.kind === 'accounts' ? [...scope.accountIds] : [], grantVersion: null, disposition: 'ALLOWED', resultCount: resultCount ?? null,
         });
         return data;
+      }
+
+      // forward_to_session: only a job of the Primary Admin in the direct chat, re-derived on every call. The tool body writes the
+      // reply inside this transaction; the caller wakes the waiting client after the commit.
+      if (input.toolName === FORWARD_TO_SESSION_TOOL_NAME) {
+        const accountId = await this.primaryAdminDirectJobAccount(client, input.context, principalId);
+        if (accountId === null) {
+          await this.insertAudit(client, {
+            tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
+            accountScopes: [], grantVersion: null, disposition: 'PERMISSION_DENIED', resultCount: null,
+          });
+          await client.query('COMMIT');
+          throw new McpDomainError('PERMISSION_DENIED', 'This Agent job does not have permission to use this tool.');
+        }
+        let executed: { data: T; resultCount?: number };
+        try { executed = await input.execute({ client, principalId, authorizedAccountIds: [accountId], ownLineNamesOnly: false }); }
+        catch (error) {
+          if (error instanceof McpDomainError && error.code === 'INVALID_INPUT') {
+            await this.insertAudit(client, {
+              tokenId: null, principalId, initiator: 'internal_agent', action: 'AUTH_REJECTED', toolName: input.toolName,
+              accountScopes: [accountId], grantVersion: null, disposition: 'INVALID_INPUT', resultCount: null,
+            });
+            await client.query('COMMIT');
+          }
+          throw error;
+        }
+        await this.insertAudit(client, {
+          tokenId: null, principalId, initiator: 'internal_agent', action: 'TOOL_CALLED', toolName: input.toolName,
+          accountScopes: [accountId], grantVersion: null, disposition: 'ALLOWED', resultCount: executed.resultCount ?? null,
+        });
+        return executed.data;
       }
 
       // Download folder tools: the Primary Admin and the Agent room (full), or a whitelisted user (own chat only), re-derived on every

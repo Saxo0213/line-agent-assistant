@@ -18,6 +18,7 @@ export * from './line.js';
 export * from './attachment-storage.js';
 export * from './line-server-error.js';
 export * from './local-route.js';
+export * from './external-session.js';
 export * from './mcp.js';
 export * from './native-source.js';
 export * from './content-type.js';

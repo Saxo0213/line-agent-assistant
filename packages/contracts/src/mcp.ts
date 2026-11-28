@@ -3,6 +3,7 @@ import { ChatTypeSchema } from './account.js';
 import { SCHEDULE_TOOL_NAMES } from './agent-schedule.js';
 import { CHAT_DOWNLOAD_FOLDER_TOOL_NAMES } from './attachment-storage.js';
 import { SendDetailSchema } from './diagnostics.js';
+import { EXTERNAL_SESSION_TOOL_NAMES, ExternalSessionInputSchema, FORWARD_TO_SESSION_TOOL_NAME } from './external-session.js';
 
 export const McpToolNameSchema = z.enum([
   'list_targets',
@@ -391,7 +392,7 @@ export const SEND_TO_TARGET_TOOL_NAME = 'send_to_target' as const;
 /** Internal-only tool: gives an Agent job a local copy of one message attachment. Never part of McpToolNameSchema. */
 export const READ_MESSAGE_ATTACHMENT_TOOL_NAME = 'read_message_attachment' as const;
 export const McpInternalToolNameSchema = z.enum([
-  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, ...SCHEDULE_TOOL_NAMES, ...CHAT_DOWNLOAD_FOLDER_TOOL_NAMES,
+  ...McpToolNameSchema.options, AGENT_ROOM_HISTORY_TOOL_NAME, LIST_SEND_TARGETS_TOOL_NAME, SEND_TO_TARGET_TOOL_NAME, READ_MESSAGE_ATTACHMENT_TOOL_NAME, ...SCHEDULE_TOOL_NAMES, ...CHAT_DOWNLOAD_FOLDER_TOOL_NAMES, ...EXTERNAL_SESSION_TOOL_NAMES, FORWARD_TO_SESSION_TOOL_NAME,
 ]);
 export type McpInternalToolName = z.infer<typeof McpInternalToolNameSchema>;
 /** The principal of an Agent room job or the local console UI; an admin-direct LINE job is also allowed while the room shares that chat. */
@@ -545,6 +546,8 @@ export const McpSendToTargetInputSchema = z.strictObject({
   chatType: SendChatTypeSchema,
   chatId: z.string().min(1),
   items: z.array(McpSendItemSchema).min(1).max(SEND_ITEMS_MAX),
+  /** External MCP clients only; valid only for the direct chat of the Primary Admin (docs/design/external-session-reply.md). */
+  session: ExternalSessionInputSchema.optional(),
 });
 export type McpSendToTargetInput = z.infer<typeof McpSendToTargetInputSchema>;
 

@@ -14,7 +14,7 @@ type SendResult = Extract<LineWorkerEvent, { type: 'sendResult' }>;
 export type GatewayFaultCode =
   | 'queue_full' | 'media_queue_full' | 'mode_not_acknowledged' | 'stale_binding' | 'cancelled'
   | 'duplicate_request' | 'worker_stopping' | 'gateway_error';
-export type LocalFaultCode = 'result_mismatch' | 'no_message_id' | 'process_error' | 'conversation_write_failed';
+export type LocalFaultCode = 'result_mismatch' | 'no_message_id' | 'process_error' | 'conversation_write_failed' | 'session_write_failed';
 export type SendOutcome = 'failed' | 'unknown';
 
 export type SendFault =

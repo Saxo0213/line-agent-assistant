@@ -20,13 +20,13 @@ const listText = (current: AgentExecutionLevel) => {
 const LIST_WORKSPACE_WRITE = '目前 Agent 執行權限：工作區可寫\n回覆數字變更（2 分鐘內有效）：\n1. 唯讀\n2. 工作區可寫（目前）\n3. 信任\n4. 全部放行';
 const TARGET_LIST = '選擇要設定的對象，回覆數字（2 分鐘內有效）：\n1. Agent 執行層級\n2. [群組] HA\n3. [群組] Room\n4. [個人] 劉禹玹';
 const PERSON_LIST = '「HA」的白名單成員，回覆數字（2 分鐘內有效）：\n1. 劉禹玹\n2. Bob';
-const CAP_FOOTER = '回覆編號切換 是／否，可一次多選（如 1 3 或 1、3）；回覆 0 或「完成」結束（2 分鐘內有效）\n「使用本機工作區（讀檔／執行指令）」只能在桌面版設定中變更。';
+const CAP_FOOTER = '回覆編號切換 是／否，可一次多選（如 1 3 或 1、3）；回覆 0 或「完成」結束（2 分鐘內有效）\n請在桌面版設定中變更「使用本機工作區（讀檔／執行指令）」。';
 /** The capability list of 劉禹玹 in HA; `values` are the six 是/否 marks in order. */
 const capList = (values: string[], scope = 'HA', prefix = '') => `${prefix}劉禹玹（${scope}）目前的權限：\n${[
   '查詢本聊天室紀錄', '查詢所有聊天室紀錄', '讀取本聊天室資料夾', '寫入本聊天室資料夾', '讀取專案資料夾', '寫入專案資料夾']
   .map((name, index) => `${index + 1}. ${name} [${values[index]}]`).join('\n')}\n${CAP_FOOTER}`;
 const CAP_DEFAULT = ['是', '否', '是', '是', '是', '否'];
-const CONFLICT = '權限已在其他地方變更，請重新輸入 /權限';
+const CONFLICT = '權限已變更，請重新輸入 /權限';
 const FAILURE = '權限變更失敗，請稍後再試';
 const STALE = '這個選項已失效，請重新輸入 /權限';
 const LOOSEN_FULL = '確定要放寬為 全部放行？\n回覆 y 確認／n 取消（2 分鐘內有效）';
@@ -406,7 +406,7 @@ describe('PermissionCommandService', () => {
     const { say, replies, repository, changed, levels } = setup();
     await levels();
     expect(await say('2')).toBe(true);
-    expect(replies().at(-1)).toBe('已經是 工作區可寫，未變更');
+    expect(replies().at(-1)).toBe('目前已是 工作區可寫');
     expect(repository.writes).toEqual([]);
     expect(changed()).toBe(0);
     expect(await say('1')).toBe(false);

@@ -391,6 +391,41 @@ describe('items', () => {
     expect(worker.sent).toHaveLength(0);
   });
 
+  describe('files in a bound project folder', () => {
+    let project: string;
+    const withProjectFolders = async (folders: string[]) => {
+      await service.shutdown();
+      service = new AgentLineSendService({ messages: repo as unknown as AgentLineSendRepository, worker, canWriteLine: async () => canWrite,
+        attachmentRoot, projectFolders: async () => folders });
+    };
+    beforeEach(async () => {
+      project = path.join(root, 'nas-project');
+      await mkdir(path.join(project, 'dwg'), { recursive: true });
+      await writeFile(path.join(project, 'dwg', 'plan.dwg'), 'dwg bytes');
+    });
+
+    it('plans and sends a file that is inside a bound project folder by its own path', async () => {
+      await withProjectFolders([project]);
+      const results = await submit([{ type: 'file', path: path.join(project, 'dwg', 'plan.dwg') }]);
+      expect(statuses(results)).toEqual(['sent']);
+      expect(worker.sent).toEqual([expect.objectContaining({ kind: 'media', fileName: 'plan.dwg', mediaKind: 'file' })]);
+    });
+
+    it('refuses a file of an unbound folder and a junction in the project folder that leaves it', async () => {
+      await writeFile(path.join(outside, 'secret.txt'), 'secret');
+      await symlink(outside, path.join(project, 'link'), 'junction');
+      await withProjectFolders([project]);
+      for (const candidate of [path.join(outside, 'secret.txt'), path.join(project, 'link', 'secret.txt'), path.join(project, '..', 'outside', 'secret.txt')]) {
+        const results = await submit([{ type: 'file', path: candidate }]);
+        expect(statuses(results)).toEqual(['failed']);
+        expect(results[0]!.code).toBe('send_file_invalid');
+      }
+      await withProjectFolders([]);
+      expect(codes(await submit([{ type: 'file', path: path.join(project, 'dwg', 'plan.dwg') }]))).toEqual(['send_file_invalid']);
+      expect(worker.sent).toHaveLength(0);
+    });
+  });
+
   it('enforces the size limits and refuses room media', async () => {
     const image = await open(path.join(workspace, 'big.png'), 'w');
     await image.truncate(20 * 1024 * 1024 + 1);

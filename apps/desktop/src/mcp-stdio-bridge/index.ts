@@ -9,15 +9,16 @@ const REQUEST_TIMEOUT_MS = 10_000;
  * bridge waits a little longer and the server's own answer arrives first. Every other request keeps the short timeout.
  */
 export const SEND_REQUEST_TIMEOUT_MS = 610_000;
-const SEND_TOOL_NAME = 'send_to_target';
+/** wait_for_admin_reply waits up to 600 s for a reply of the Primary Admin; it gets the same long timeout and does not block other requests. */
+const LONG_TOOL_NAMES: readonly string[] = ['send_to_target', 'wait_for_admin_reply'];
 type JsonRpcId = string | number | null;
 type JsonRpcRequest = { jsonrpc?: unknown; id?: JsonRpcId; method?: unknown; params?: unknown };
 
-/** The timeout of one request: long only for a tools/call of send_to_target. */
+/** The timeout of one request: long only for a tools/call of send_to_target or wait_for_admin_reply. */
 export function requestTimeoutMs(request: JsonRpcRequest): number {
   const params = request.params;
   const isSend = request.method === 'tools/call' && !!params && typeof params === 'object' && !Array.isArray(params)
-    && (params as { name?: unknown }).name === SEND_TOOL_NAME;
+    && LONG_TOOL_NAMES.includes((params as { name?: unknown }).name as string);
   return isSend ? SEND_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
 }
 

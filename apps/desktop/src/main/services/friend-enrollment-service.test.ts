@@ -646,7 +646,7 @@ describe('FriendEnrollmentService', () => {
     await ctx.service.handle(groupSelection({ text: '@Agent @Target extra' }), null, ownMid);
     expect(ctx.workers.send).toHaveBeenCalledTimes(2);
     expect(ctx.workers.send.mock.calls.at(-1)?.[0]).toMatchObject({ type: 'sendText', chatType: 'group', chatId: 'origin-room',
-      text: expect.stringContaining('標記格式不正確') });
+      text: expect.stringContaining('的格式標記') });
   });
 
   it('does not issue a token when a delayed direct selection admin lookup completes after expiry', async () => {

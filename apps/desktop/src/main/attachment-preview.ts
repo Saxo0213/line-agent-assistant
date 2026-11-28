@@ -194,6 +194,10 @@ function imageFormat(bytes: Buffer): Format | null {
   return FORMATS.find((candidate) => candidate.renderer === 'image' && candidate.signature(bytes)) ?? null;
 }
 
+/** Longest side that Chromium decodes (a long phone screenshot is about 11000 pixels high). */
+const MAX_IMAGE_SIDE = 32767;
+const MAX_IMAGE_PIXELS = 32_000_000;
+
 function imageDimensionsAreSafe(bytes: Buffer, format: Format): boolean {
   let width = 0, height = 0;
   if (format.mimeType === 'image/png' && bytes.length >= 24) { width = bytes.readUInt32BE(16); height = bytes.readUInt32BE(20); }
@@ -215,7 +219,7 @@ function imageDimensionsAreSafe(bytes: Buffer, format: Format): boolean {
       offset += 2 + length;
     }
   }
-  return width > 0 && height > 0 && width <= 8192 && height <= 8192 && width * height <= 32_000_000;
+  return width > 0 && height > 0 && width <= MAX_IMAGE_SIDE && height <= MAX_IMAGE_SIDE && width * height <= MAX_IMAGE_PIXELS;
 }
 
 async function closeQuietly(handle: FileHandle): Promise<void> {

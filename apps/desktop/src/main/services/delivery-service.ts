@@ -3,6 +3,7 @@ import type { LineWorkerCommand, LineWorkerEvent, OutgoingMention, WorkerBinding
 import { diagnosticFailure, type SafeDiagnostic } from '@line-agent/contracts';
 import type { AgentJob, ChatMentionCandidates, ClaimedLineDelivery, DeliverySegment } from '@line-agent/database';
 import { resolveAgentMentions } from './agent-mentions.js';
+import type { ReplyAuditDecision } from './reply-audit-service.js';
 
 const DEFAULT_LIMIT = 4900;
 const RECOVERY_PAGE_SIZE = 32;
@@ -81,7 +82,38 @@ export class DeliveryService {
   private stopping = false;
   constructor(private readonly repository: DeliveryRepository, private readonly worker: DeliveryWorker,
     private readonly canWriteLine: (accountId: string) => Promise<boolean> = async () => true,
-    private readonly onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void) {}
+    private readonly onDiagnostic?: (diagnostic: SafeDiagnostic, identity?: import('@line-agent/contracts').DiagnosticIdentity) => void,
+    /** Applied to the text of each segment just before it is sent to LINE (the app paths are replaced by labels). */
+    private readonly redactText?: (text: string, workspacePath: string | null) => Promise<string> | string,
+    /** Audit of the whole pending reply of a job (redacted texts) before the first part goes out; it never throws. */
+    private readonly auditReply?: (job: AgentJob, texts: string[]) => Promise<ReplyAuditDecision>) {}
+
+  /** Audit decisions by job id. A pending or finished decision is reused by a later call for the same job; it is dropped when the job delivery ends. */
+  private readonly verdicts = new Map<string, Promise<ReplyAuditDecision>>();
+
+  private verdictFor(job: AgentJob): Promise<ReplyAuditDecision> {
+    if (!this.auditReply) return Promise.resolve({ kind: 'pass' });
+    let pending = this.verdicts.get(job.jobId);
+    if (!pending) {
+      pending = this.repository.listDeliveries(job.jobId).then((segments) => this.auditPending(job, segments));
+      pending.catch(() => { this.verdicts.delete(job.jobId); });
+      this.verdicts.set(job.jobId, pending);
+    }
+    return pending;
+  }
+
+  /** The audit decision for the pending parts of one job. A failure of the audit step itself is reported and the reply goes out as it is. */
+  private async auditPending(job: AgentJob, segments: DeliverySegment[]): Promise<ReplyAuditDecision> {
+    const pending = segments.filter((segment) => segment.status === 'pending');
+    if (!this.auditReply || pending.length === 0) return { kind: 'pass' };
+    try {
+      const texts = await Promise.all(pending.map(async (segment) => this.redactText ? await this.redactText(segment.text, job.workspacePath) : segment.text));
+      return await this.auditReply(job, texts);
+    } catch (error) {
+      this.reportFailure('execute', error, 'failed', { jobId: job.jobId, ...(job.accountId ? { accountId: job.accountId } : {}) });
+      return { kind: 'pass' };
+    }
+  }
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown, outcome: 'failed' | 'unknown' = 'failed', identity?: import('@line-agent/contracts').DiagnosticIdentity): void {
     try { this.onDiagnostic?.(diagnosticFailure('delivery', stage, error, outcome), identity); } catch { /* Preserve durable delivery behavior. */ }
@@ -187,6 +219,9 @@ export class DeliveryService {
     const binding = await this.worker.binding(job.accountId);
     const acknowledged = !this.worker.waitModeAck || await this.worker.waitModeAck(job.accountId, 'ACTIVE_CONTROL', 0);
     if (!binding || binding.mode !== 'ACTIVE_CONTROL' || !acknowledged) return;
+    // The audit may wait up to its limit, so it runs before the account's send slot is taken.
+    const verdict = await this.verdictFor(job);
+    if (this.stopping) return;
     if (this.activeSendAccounts.has(job.accountId) || this.activeSendAccounts.size >= MAX_SEND_SCOPES) {
       if (this.deferredAccounts.size < MAX_QUEUED_RECOVERY_SCOPES) this.deferredAccounts.add(job.accountId);
       else this.globalRecoveryNeeded = true;
@@ -194,7 +229,11 @@ export class DeliveryService {
     }
     this.activeSendAccounts.add(job.accountId);
     try {
-      for (const segment of await this.repository.listDeliveries(jobId)) {
+      const segments = await this.repository.listDeliveries(jobId);
+      // A blocked reply goes out as one fixed text; its other parts are settled with the id of that text.
+      let blockHandled = false;
+      let blockMessageId: string | null = null;
+      for (const segment of segments) {
         if (this.stopping || segment.status !== 'pending') continue;
         if (!await this.canWriteLine(job.accountId)) return;
         const claimed = await this.repository.claimLineDelivery(jobId, segment.partIndex, binding.controlEpoch);
@@ -206,16 +245,27 @@ export class DeliveryService {
           await this.repository.markDeliveryUnknown(jobId, segment.partIndex);
           continue;
         }
+        if (verdict.kind === 'block' && blockHandled) {
+          if (blockMessageId) await this.repository.markDeliverySent(jobId, segment.partIndex, blockMessageId);
+          else await this.repository.markDeliveryUnknown(jobId, segment.partIndex);
+          continue;
+        }
+        if (verdict.kind === 'block') blockHandled = true;
         const requestId = randomUUID();
-        const mentions = await this.mentionsFor(claimed.accountId, claimed.chatType, claimed.chatId, claimed.text);
+        let text = verdict.kind === 'block' ? verdict.text : claimed.text;
+        if (this.redactText && verdict.kind === 'pass') {
+          try { text = await this.redactText(claimed.text, job.workspacePath); } catch (error) { this.reportFailure('execute', error, 'failed', { accountId: claimed.accountId }); }
+        }
+        const mentions = await this.mentionsFor(claimed.accountId, claimed.chatType, claimed.chatId, text);
         try {
           const result = await this.worker.send({ type: 'sendText', accountId: claimed.accountId,
             chatType: claimed.chatType, chatId: claimed.chatId, workerInstanceId: fresh.workerInstanceId,
-            controlEpoch: fresh.controlEpoch, requestId, text: claimed.text, replyToMessageId: null,
+            controlEpoch: fresh.controlEpoch, requestId, text, replyToMessageId: null,
             ...(mentions.length > 0 ? { mentions } : {}) }, this.controller.signal);
           if (result.requestId === requestId && result.accountId === claimed.accountId
             && result.workerInstanceId === fresh.workerInstanceId && result.controlEpoch === fresh.controlEpoch
             && result.status === 'sent' && result.messageId) {
+            if (verdict.kind === 'block') blockMessageId = result.messageId;
             await this.repository.markDeliverySent(jobId, segment.partIndex, result.messageId);
           } else {
             this.reportFailure('response', undefined, 'unknown', { jobId, accountId: claimed.accountId, requestId, workerInstanceId: fresh.workerInstanceId });
@@ -226,6 +276,7 @@ export class DeliveryService {
           await this.repository.markDeliveryUnknown(jobId, segment.partIndex);
         }
       }
+      this.verdicts.delete(jobId);
     } finally {
       this.activeSendAccounts.delete(job.accountId);
       this.drainDeferredAccounts();
@@ -251,6 +302,7 @@ export class DeliveryService {
   async shutdown(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.verdicts.clear();
     this.controller.abort();
     for (const queued of this.queuedRecoveries.values()) queued.resolve();
     this.queuedRecoveries.clear();

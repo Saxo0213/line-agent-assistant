@@ -114,7 +114,7 @@ describe('new_messages through the schedule tools', () => {
 
   it('describes the two kinds, the new_messages rules and the llm rule in the tool definitions', () => {
     const description = CREATE_SCHEDULE_TOOL_DEFINITION.description;
-    for (const needle of ['two kinds', 'Program: message', 'new_messages', 'uses no LLM', 'then="llm"', 'Agent: custom, summary, keyword_digest', 'must use new_messages, not custom', 'too many messages means summarize']) {
+    for (const needle of ['two kinds', 'Program: message', 'new_messages', 'uses no LLM', 'then="llm"', 'Agent: custom, summary, keyword_digest', 'use new_messages', 'too many messages means summarize']) {
       expect(description).toContain(needle);
     }
     expect(LIST_SCHEDULES_TOOL_DEFINITION.description).toContain('execution');
@@ -137,10 +137,10 @@ describe('new_messages through the schedule tools', () => {
     expect(AgentScheduleCreateInputSchema.safeParse({ title: 't', provider: 'claude', recurrence, task: example }).success).toBe(true);
   });
 
-  it('puts the same guidance in Traditional Chinese into the MCP skill and keeps it under the size limit', async () => {
+  it('puts the same guidance in English into the MCP skill and keeps it under the size limit', async () => {
     const skill = await readFile(fileURLToPath(new URL('../../../../../skills/linejs-mcp/SKILL.md', import.meta.url)), 'utf8');
     expect(Buffer.byteLength(skill, 'utf8')).toBeLessThan(MCP_SKILL_MAX_BYTES);
-    for (const needle of ['程式排程與 Agent 排程', '`execution`', '`mayUseLlm`', '`new_messages`', '不要用 `custom`', '`then: "llm"`', '`messageFilter`', '`chat.keywordHits`', '`run.listedChars`']) {
+    for (const needle of ['Two types of schedule: program and Agent', '`execution`', '`mayUseLlm`', '`new_messages`', 'use `new_messages`', '`then: "llm"`', '`messageFilter`', '`chat.keywordHits`', '`run.listedChars`']) {
       expect(skill).toContain(needle);
     }
   });

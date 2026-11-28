@@ -19,12 +19,12 @@ export const PROJECT_FOLDER_TEXT = {
   removedAll: (count: number) => `已解除本聊天室全部專案資料夾（${count} 個）`,
   list: (rows: ReadonlyArray<{ path: string; mode: ProjectFolderMode }>) =>
     ['本聊天室的專案資料夾：', ...rows.map((row, index) => `${index + 1}. ${row.path}（${modeLabel(row.mode)}）`)].join('\n'),
-  none: '本聊天室沒有綁定專案資料夾',
-  notBound: '本聊天室沒有綁定這個資料夾',
-  notFound: '路徑不存在或不是資料夾',
+  none: '本聊天室的專案資料夾：0 個。輸入 /folder <路徑> 即可綁定。',
+  notBound: '請輸入 /folder 清單中的路徑。',
+  notFound: '請提供已存在的資料夾路徑',
   notAbsolute: '請提供完整的絕對路徑，例如 D:\\公司\\專案',
-  forbidden: '此路徑不允許綁定',
-  unsupportedChars: '路徑含有不支援的字元：( ) [ ] { } * ? ! ^ # " ` < > |',
+  forbidden: '此路徑受系統保護，請改選其他資料夾。',
+  unsupportedChars: '路徑請避開這些字元：( ) [ ] { } * ? ! ^ # " ` < > |',
   usage: '用法：/folder <絕對路徑>（唯讀）、/folder rw <絕對路徑>（讀寫）、/folder（列出）、/folder off [絕對路徑]（解除）',
   failed: '專案資料夾設定失敗，請稍後再試',
 } as const;

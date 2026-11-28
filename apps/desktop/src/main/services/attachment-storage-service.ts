@@ -128,7 +128,7 @@ export class AttachmentStorageService {
     try {
       if (command.action === 'temp_show') {
         const status = await this.getStatus(key);
-        if (status.folders.length === 0 && !status.defaultFolder) return '本聊天室尚未設定第二儲存位置';
+        if (status.folders.length === 0 && !status.defaultFolder) return '本聊天室的第二儲存位置：0 個。';
         const progress = (entry: { queued: number; claimed: number; completed: number; failed: number }) =>
           `複製進度：佇列 ${entry.queued}、處理中 ${entry.claimed}、完成 ${entry.completed}、失敗 ${entry.failed}`;
         const lines = [`本聊天室第二儲存位置（分類資料夾 ${status.folders.length} 個）：`];
@@ -141,7 +141,7 @@ export class AttachmentStorageService {
       }
       if (command.action === 'temp_retry') {
         const count = await this.retryFailed(key);
-        return count ? `已排入 ${count} 個失敗附件重試` : '目前沒有失敗的第二份附件';
+        return count ? `已排入 ${count} 個失敗附件重試` : '失敗的第二份附件：0 個';
       }
       if (command.action === 'temp_off') {
         const result = await this.removeAllFolders(key);

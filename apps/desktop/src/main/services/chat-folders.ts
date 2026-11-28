@@ -131,6 +131,8 @@ export class ChatFolderService {
         if (++visited > MAX_STAT_ENTRIES) break;
         if (entry.isSymbolicLink()) continue;
         const full = join(directory, entry.name);
+        // The Git boundary of the chat rules is not user content.
+        if (entry.isDirectory() && entry.name === '.git' && directory === path) continue;
         if (entry.isDirectory()) pending.push(full);
         else if (entry.isFile()) {
           if (entry.name === CHAT_METADATA_FILE) continue;

@@ -351,6 +351,7 @@ async function initializeServices(): Promise<void> {
     attachmentBrokerHelperPath: path.join(path.dirname(workerEntry), 'native', 'AttachmentBroker.exe'),
     freeModeJudgeDirectory: path.join(app.getPath('userData'), 'free-mode-judge'),
     attachmentClassifierDirectory: path.join(app.getPath('userData'), 'attachment-classifier'),
+    replyAuditDirectory: path.join(app.getPath('userData'), 'reply-audit'), appVersion: app.getVersion(),
     chatResourceDiagnosticsDirectory: app.getPath('userData'),
     projectFolderProtectedPaths: [app.getPath('userData'), app.getAppPath(), path.dirname(process.execPath), process.resourcesPath,
       ...(process.env.LOCALAPPDATA ? [path.join(process.env.LOCALAPPDATA, 'LineAgentAssistant'), path.join(process.env.LOCALAPPDATA, 'LINEJS')] : [])]

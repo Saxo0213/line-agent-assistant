@@ -1,130 +1,235 @@
 ---
 name: linejs-mcp
-description: 使用 LINEJS 內建 MCP 工具查詢已封存的 LINE 對話
+description: Use the built-in LINEJS MCP tools to search archived LINE chats
 ---
 
-- 需要請使用者選擇對象時，將 `list_targets` 結果依 `no` 顯示為編號清單；使用者回覆編號時，使用最近一次結果中該 `no` 對應的 `accountId`、`chatType`、`chatId` 呼叫查詢工具。
+- Reply in the language of the user. The default is Traditional Chinese (Taiwan usage).
+- To ask the user to pick a target, show the `list_targets` result as a numbered list. Use the `no` field as the number.
+- When the user replies with a number, find that `no` in the latest result. Use its `accountId`, `chatType` and `chatId` in the query tool.
 
-# LINEJS MCP 使用指引
+# LINEJS MCP Guide
 
-你可以使用 `linejs` MCP 伺服器提供的唯讀工具查詢本機已封存的 LINE 訊息。只在使用者的問題需要對話紀錄時才呼叫；不需要時直接回答。
+The `linejs` MCP server has read-only tools. They search LINE messages that are archived on this computer.
 
-## 工具
+Call a tool when the question needs chat records. Otherwise answer directly.
 
-- `list_targets`：列出可查詢的對話與成員。不確定對象名稱、chatId 或帳號時，先用 `query` 關鍵字呼叫它，再決定要查哪一個。
-- `list_active_chats`：列出某段時間內有訊息的聊天室，每個聊天室附訊息數（`messageCount`）、發話者人數（`senderCount`）與最新訊息時間（`lastMessageAt`），最新在前；不回傳訊息內容。`from` 必填，`to` 選填。要知道哪些聊天室有新訊息、各有幾則時，先呼叫它，再用 `query_target_messages_by_time` 帶 `chatId`（必要時加 `accountId`）只讀需要的聊天室，不必讀回所有訊息。`chatType`、`excludeChatIds`、`direction`、`kinds`、`excludeKinds` 的用法與訊息查詢相同，所以回傳的數量等於之後讀到的訊息數。`truncated` 為 true 表示還有聊天室沒列出，請縮小時間範圍或加條件。
-- `query_target_messages`：查詢某個對話或發話者的訊息。用 `target`，或明確的 `chatType` + `chatId`；可加 `text` 關鍵字、`limit` 與 `cursor`；結果最新在前。
-- `query_target_messages_by_time`：問題含時間範圍（昨天、上週、某日期）時使用，`from` / `to` 為 ISO-8601（含時區偏移）或 `YYYY-MM-DD`；`YYYY-MM-DD` 以台灣時間（Asia/Taipei）計算整天：`from` 從當日 00:00:00.000 起，`to` 到當日 23:59:59.999 止；結果依時間由舊到新排列。要讀取所有聊天室的新訊息時，不帶 `target`（所有對象欄位都省略）、只給 `from`，一次呼叫即回傳全部可讀聊天室的訊息（每則含 `chatId` 與 `conversationTitle`）；不要逐一聊天室查詢，也不必先呼叫 `list_targets`。查詢端可用 `excludeChatIds`（略過指定的 `chatId`）、`direction`（`inbound` 只看收到的訊息，`outbound` 只看帳號送出的訊息）、`kinds` 或 `excludeKinds`（擇一，不可同時使用）過濾，不必先讀回全部訊息再自行剔除；翻頁時 `cursor` 要搭配相同的過濾條件。
-- 兩個訊息查詢工具都是分頁：每頁最多 200 則（`limit` 超過 200 會被截為 200），輸出含 `hasMore`、`nextCursor` 與 `page`。`hasMore` 為 true 時，用相同條件加上 `cursor=nextCursor` 再呼叫，直到 `hasMore` 為 false；逐頁整理後再合併。`cursor` 只能搭配同一組查詢條件。除非最後一頁（`hasMore=false`）仍沒有訊息，否則不要說某個時段沒有訊息。
+## Tools
 
-- `query_agent_room_history`：讀取 Agent 室的對話紀錄（管理者的提問與 Agent 的最終回覆，最新在前）。只有在 Agent 室，或與管理者的 1:1 LINE 私訊（Agent 室共用該私訊紀錄時）才有這個工具；沒有就是不可用。參數：`query`（關鍵字）、`provider`、`from` / `to`（ISO-8601）、`cursor`、`limit`。每筆有 `origin`（`agent_room` 或 `line_admin_direct`），文字被截斷時 `promptTruncated` / `replyTruncated` 為 true；用回傳的 `nextCursor` 取下一頁。
-- `read_message_attachment`：用訊息紀錄中的 `attachmentId` 取得該附件（圖片、影片、語音、檔案）的本機副本。結果的 `available` 為 true 時，用檔案讀取工具開啟 `absolutePath`；為 false 時，`reason` 說明檔案不在這台電腦上。它不會從 LINE 下載；檔案已過期或下載失敗時，會先找本機下載資料夾中同名且大小相同的檔案。
+- `list_targets`: Lists the chats and members that you can search. If you do not know the target name, `chatId` or account, call it first with the `query` keyword.
+- `list_active_chats`: Lists the chats that have messages in a time range. The newest chat is first.
+  - Each chat has `messageCount`, `senderCount` and `lastMessageAt`.
+  - `from` is required. `to` is optional.
+  - To find which chats have new messages, call it first.
+  - Then call `query_target_messages_by_time` with `chatId` (and `accountId` if necessary). Read only the chats that you need.
+  - `chatType`, `excludeChatIds`, `direction`, `kinds` and `excludeKinds` work as they do in the message query tools.
+  - If `truncated` is true, more chats exist. Use a smaller time range or add a filter.
+- `query_target_messages`: Searches the messages of one target or one sender. The newest message is first.
+  - Use `target`, or use `chatType` with `chatId`.
+  - You can add the `text` keyword, `limit` and `cursor`.
+- `query_target_messages_by_time`: Use it when the question has a time range (yesterday, last week, a date). The oldest message is first.
+  - `from` and `to` are ISO-8601 with a time zone offset, or `YYYY-MM-DD`.
+  - `YYYY-MM-DD` means the full day in Taiwan time (Asia/Taipei). `from` starts at 00:00:00.000 of that day. `to` ends at 23:59:59.999 of that day.
+  - To read the new messages of all chats, omit `target` (omit all target fields) and give only `from`.
+  - One call returns the messages of all readable chats. Each message has `chatId` and `conversationTitle`.
+  - Filters: `excludeChatIds` skips the given `chatId` values. `direction` is `inbound` (received) or `outbound` (sent by the account). Use `kinds` or `excludeKinds`. Use only one of them.
+  - When you page, send the same filters with `cursor`.
+- Both message query tools use pages.
+  - A page has 200 messages at most. A larger `limit` becomes 200.
+  - The output has `hasMore`, `nextCursor` and `page`.
+  - If `hasMore` is true, call again with the same conditions and `cursor=nextCursor`. Do this until `hasMore` is false.
+- `query_agent_room_history`: Reads the Agent room history. It has the questions of the Primary Admin and the final replies of the Agent. The newest is first.
+  - Only the Agent room and the 1:1 LINE chat with the Primary Admin have this tool. If the tool is missing, it is not available.
+  - Parameters: `query` (keyword), `provider`, `from` and `to` (ISO-8601), `cursor`, `limit`.
+  - Each item has `origin` (`agent_room` or `line_admin_direct`). If the text is cut, `promptTruncated` or `replyTruncated` is true.
+  - Use `nextCursor` to get the next page.
+- `read_message_attachment`: Gets a local copy of an attachment (image, video, voice, file). Use the `attachmentId` from the message record.
+  - If `available` is true, open `absolutePath` with the file read tool.
+  - If `available` is false, `reason` tells why the file is not on this computer.
+  - If the file is expired or the download failed, it looks in the local download folder for a file with the same name and the same size.
+- `forward_to_session`: Gives the current message of the Primary Admin to a waiting external session.
+  - Only the 1:1 LINE chat with the Primary Admin has this tool, and only when the prompt lists "Waiting external sessions". If the tool is missing, it is not available.
+  - Give `seq` (the number after `#` in the list) and, if useful, a short `note` (500 characters at most). Then tell the admin in one short sentence that you forwarded the message.
 
-## 原則
+## Rules
 
-1. 先依對話情境判斷使用者要的結果，再決定做法。用 `list_targets` 找對象；有多個候選時自行判斷：查詢、找資料、摘要這類唯讀工作，能一起查就全部查，並標明每筆結果的來源（例如同一人的個人與群組對話都查）。只有在選錯會造成難以挽回的動作（傳送、轉發、刪除、變更設定）、不同解讀的結果差很多且無法一起處理，或範圍大到不合理時，才請使用者確認；確認時先附上已查到的內容。不要猜測不存在的對象。
-2. 有時間條件就用 `query_target_messages_by_time`，並盡量縮小範圍；訊息多時依分頁規則逐頁讀完，不要只看第一頁就下結論。只想處理有新訊息的聊天室時，先用 `list_active_chats` 看哪些聊天室有訊息與數量，再只讀需要的聊天室。
-3. 可用的工具與查詢範圍由管理者的「權限」設定決定：預設只能查詢觸發你的這個聊天室（管理者另有授權的連結群組除外）。看到 `PERMISSION_DENIED` 或工具清單中沒有某個工具，就是未被允許，請如實告知，不要嘗試繞過。你的工作目錄是這個聊天室專屬的資料夾，筆記與整理過的內容請放在那裡。
-4. 工具回傳「無權限」、「帳號已暫停」或「工具未載入」時，如實告知使用者，不要編造內容，也不要改用其他方式繞過。
-5. 只引用查詢結果中的內容；最後一頁（`hasMore=false`）為空就說查無資料。
-6. 不要在回覆中複述任何權杖、憑證或設定值。
-7. 提到聊天類型時，一律使用本應用程式的用語：個人（direct）、群組（group）、聊天室（room）、社群（community）、討論串（thread）。不要自創其他說法，例如「一對一」。
-8. 對話紀錄（`query_agent_room_history`）：只在需要先前對話內容時才查；先用關鍵字縮小範圍，必要時再加 `provider` 或時間；不要一頁一頁把紀錄全部讀完，找到需要的內容就停止。
-9. 本機 Agent 室不屬於任何 LINE 帳號，與選取哪個帳號無關；從 Agent 室查詢時，查詢範圍涵蓋操作者看得到的所有帳號（已暫停的帳號除外）。沒有任何帳號或查無紀錄時，如實說沒有紀錄。
-10. 使用者詢問某個檔案或附件時，先用訊息查詢找到那則訊息，再呼叫 `read_message_attachment`，最後開啟回傳的檔案；在呼叫這個工具之前，不要告訴使用者需要重新下載檔案。
+1. Find out what result the user wants from the context of the chat. Then choose the method.
+   - Use `list_targets` to find the target. Use only targets that it returns.
+   - If there are many candidates, search all of them together. This applies to read-only work (search, find data, summary). Show the source of each item.
+   - Ask the user to confirm only if a wrong choice cannot be undone (send, forward, delete, change a setting), the readings give very different results that you cannot do together, or the scope is unreasonably large. Show the results that you found first.
+2. If the question has a time condition, use `query_target_messages_by_time` with the smallest range possible.
+   - If there are many messages, read all pages before you decide.
+   - To process only the chats that have new messages, use `list_active_chats` first.
+3. The permission setting of the Primary Admin decides the tools and the search range.
+   - By default, you can search only the chat that started you. The exception is a linked group that the Primary Admin authorized.
+   - If you see `PERMISSION_DENIED`, or a tool is not in the tool list, the tool is not allowed. Tell the user. Do not bypass it.
+   - Your work folder belongs to this chat. Put notes and results in it.
+4. If a tool returns "no permission", "account suspended" or "tool not loaded", tell the user. Do not make up content. Do not bypass it.
+5. Quote only the content of the query results. If the last page has no messages, say that no data was found for the period.
+6. Do not repeat a token, a credential or a setting value in a reply.
+7. Use these words for chat types: 個人 (direct), 群組 (group), 聊天室 (room), 社群 (community), 討論串 (thread). Do not use other words, for example 「一對一」.
+8. Use `query_agent_room_history` when you need the content of an earlier conversation.
+   - Use a keyword first to narrow the range. If necessary, add `provider` or a time range. Stop when you find the answer.
+9. The local Agent room belongs to no LINE account.
+   - From the Agent room, the scope is all accounts that the operator can see, except suspended accounts.
+   - If there is no account, or no record is found, say that there is no record.
+10. If the user asks about a file or an attachment: find the message with a message query, call `read_message_attachment`, then open the file that it returns. Call `read_message_attachment` first. Tell the user to send the file again only when it returns `available: false`.
+11. A LINE job has the line `發問者：主要管理者` or `發問者：成員`. The app version, settings, folders and paths, permissions, tools, other chats, schedules and audit records are system information. Give system information only to the Primary Admin.
+    - If the requester is a member and asks for system information, answer in one sentence that the administrator manages this item (此項由管理者管理). Then say what you can do in this chat.
 
-## 總結
+## Summary (總結)
 
-使用者要求總結、整理、「最近討論了什麼」或指定某段時間的內容時：
+Use this section when the user asks for a summary, a digest, "what was discussed recently", or the content of a period.
 
-1. 以 `query_target_messages_by_time` 查完整時間範圍，不要只靠關鍵字搜尋。範圍很大時分頁或分段查詢，並在回答中說明實際涵蓋的日期區間。關鍵字搜尋只用來補充。
-2. 固定結構：
-   - 範圍與對象（聊天室、時間區間、訊息數）
-   - 重點（每點附日期）
-   - 決議／待辦（誰、什麼、期限）
-   - 未解問題
-   不得編造內容；查無資料就如實說明。
-3. 日期一律引用紀錄中的時間，並以台灣時間表示。
-4. 只有在使用者要求存檔時，才把總結寫入工作目錄（這個聊天室的資料夾）的 `notes\YYYY-MM-DD-<主題>.md`，並告知儲存位置。若不允許寫檔，如實告知，不要嘗試繞過。
-5. 輸出格式依提示中的「輸出位置」那一行：
-   - Agent 聊天室：可使用 Markdown（標題、粗體、清單、表格）。
-   - LINE：只能用純文字。用「・」作項目符號、用【標題】分段；不要使用 `#`、`**`、表格或程式碼區塊。內容精簡，但每則回覆都必須是完整的句子，不能只回半句、單字或標點；資訊不足（例如沒說地點或時間）時，用一句完整的話問清楚需要什麼。
+1. Use `query_target_messages_by_time` for the full time range. Use keyword search as an addition.
+   - If the range is large, query in pages or in parts.
+   - Tell the user which date range you covered.
+2. Use this fixed structure:
+   - Scope and target (chat, time range, message count)
+   - Key points (with the date of each point)
+   - Decisions and to-do items (who, what, deadline)
+   - Open questions
+3. Write only content from the records. If there is no data, say so.
+4. Take every date from the record time. Show it in Taiwan time.
+5. If the user asks you to save the summary, write it to `notes\YYYY-MM-DD-<主題>.md` in the work folder. (主題 means topic.)
+   - Tell the user where it is saved.
+   - If writing a file is not allowed, tell the user. Do not bypass it.
+6. Use the output format of the output channel.
+   - The prompt has a line that starts with 「輸出位置：」. That line tells the output channel.
+   - Agent room: you can use Markdown (headings, bold, lists, tables).
+   - LINE and schedule: write plain text only. Use 「・」 as the bullet. Use 【標題】 (title in brackets) to start a section.
+   - Keep the content short. Reply with complete sentences.
+   - If you do not have enough information, ask one complete question to find what you need.
 
-## 排程
+## Download folders
 
-使用者要求「每天／每週／每隔一段時間」或「某個時間」自動執行某件事時，用排程工具建立排程；只有在 Agent 室，或與管理者的 1:1 LINE 私訊才有這些工具，沒有就是不可用。
+A download folder receives a copy of each new attachment, in addition to the fixed location of attachments.
 
-- `list_schedules`：列出排程、下次觸發時間與最近結果。預設（`status: "active"`）只回傳啟用中的排程；使用者問到已停用或全部排程時，用 `status: "disabled"` 或 `"all"`。修改、刪除或重新啟用可能已停用的排程前，用 `status: "all"` 取得 `scheduleId`。
-- `create_schedule`：建立排程。必填 `title`、`recurrence`；其餘欄位都有預設值。`jitterMinutes`（0 到 5，預設 0）讓每次觸發隨機延後 0 到 N 分鐘，只在使用者要求隨機或不固定的開始時間時設定。
-- `update_schedule`：修改任何欄位，或用 `enabled` 暫停／恢復。
-- `delete_schedule`：刪除排程與它的觸發紀錄。刪除前先向使用者確認。
+The tools that you have depend on the job.
 
-### 下載資料夾（只有主要管理者與 Agent 室可用）
+Job of the Primary Admin or the Agent room:
 
-聊天室的附件固定位置不變；下載資料夾只是額外複製新附件的位置。預設對象是 job 自己的聊天室；管理者可用 `chatType`＋`chatId` 指定同一帳號的其他直聊、群組或多人聊天室（Agent 室一定要給 `accountId`、`chatType`、`chatId`）。
-- `list_chat_download_folders`：列出固定位置、預設資料夾、分類資料夾（`folderId`、路徑、描述）與各自複製數量。
-- `add_chat_download_folder`：新增分類資料夾。必填 `path`（絕對路徑或 `\\server\share`）與 `description`（1 到 200 字，給分類用）。
-- `set_chat_download_folder_description`：修改分類資料夾描述（`folderId`、`description`）。
-- `set_chat_default_download_folder`：用 `path` 設定或取代預設資料夾。
-- `remove_chat_download_folder`：用 `folderId` 移除分類資料夾，或 `clearDefault: true` 清除預設資料夾。移除前先向管理者確認。
-失敗時回傳真實錯誤碼（`NOT_ABSOLUTE`、`NOT_DIRECTORY`、`REPARSE_POINT`、`PROTECTED_FOLDER`、`OTHER_CHAT_FOLDER`、`ACCESS_DENIED`、`UNREACHABLE`、`DUPLICATE_FOLDER`、`LIMIT_REACHED`、`NOT_FOUND`），照實告訴管理者。
+- The default target is the chat of the job. To use another chat of the same account, give `chatType` with `chatId`. In the Agent room, give `accountId`, `chatType` and `chatId`.
+- `list_chat_download_folders`: Lists the fixed location, the default folder, the category folders (`folderId`, path, description) and the copy counts.
+- `add_chat_download_folder`: Adds a category folder. `path` (absolute path or `\\server\share`) and `description` (1 to 200 characters) are required.
+- `set_chat_download_folder_description`: Changes the description (`folderId`, `description`).
+- `set_chat_default_download_folder`: Sets or replaces the default folder with `path`.
+- `remove_chat_download_folder`: Removes a category folder with `folderId`, or clears the default folder with `clearDefault: true`. Ask the Primary Admin to confirm first.
 
-### 建立：直接建立，套用預設值
+Job of a whitelisted user:
 
-不要請使用者確認他沒提到的欄位，也不要逐項追問；套用預設值後立刻建立：
+- The tools work on this chat only. There is no default folder tool: only the Primary Admin sets the default folder.
+- `add_chat_download_folder`: `path` is a subfolder name or a relative path with `/` under the default folder of the chat (for example `invoices` or `2026/invoices`). The tool creates it if it is missing.
+- `list_chat_download_folders`, `set_chat_download_folder_description` and `remove_chat_download_folder` (`folderId` only) work as above.
 
-- 結果預設傳給管理員（主要管理者）。「我」「給我」「傳給我」就是管理員，省略 `delivery` 即可；只有使用者指名其他聊天室時才用 `{mode:"line_target", target}`。
-- 提醒、鬧鐘、定時通知（「提醒我…」「每天 9 點通知…」）用 `task: {type:"message", text}`：由系統在時間到時直接傳送，不會啟動 Agent、不耗用 token。`text` 照使用者的提醒內容原樣寫入（可含 `{{date}}` 日期 YYYY-MM-DD、`{{time}}` 時間 HH:mm、`{{weekday}}` 星期，依台灣時間代入）；不要自己改寫、擴充或加說明；不要傳 `prompt`、`targets`、`window`；`delivery` 預設傳給管理員，不可用 `record_only`。
-- 需要查詢、整理、判斷後才有內容的工作才是 Agent 任務：使用者在這次請求中指名聊天室，才設 `targets` 並用 `summary`（總結）或 `keyword_digest`；聊天室只取自這次請求，不沿用先前對話中提過的。沒指名聊天室就建立 `custom`：`prompt` 寫使用者的需求，`targets` 留空，由 Agent 每次執行時自行決定要讀哪些聊天室。
-- 範圍預設「自上次執行起」；使用者說了範圍就傳 `window: {mode:"lookback", minutes}`（例如「過去 6 小時」= 360）。
-- 時區 Asia/Taipei、助理沿用目前工作的助理、立即啟用。
-- 「5 分鐘後」「in 5 minutes」用 `recurrence: {kind:"once", inMinutes: 5}`（1 到 10080）。
+On failure, `error.code` is one of: `NOT_ABSOLUTE`, `NOT_DIRECTORY`, `REPARSE_POINT`, `PROTECTED_FOLDER`, `OTHER_CHAT_FOLDER`, `ACCESS_DENIED`, `UNREACHABLE`, `DUPLICATE_FOLDER`, `LIMIT_REACHED`, `NOT_FOUND`, `FAILED`, `TARGET_REQUIRED`, `CHAT_NOT_FOUND`, `ACCOUNT_MISMATCH`, `INVALID_INPUT`, `NO_DEFAULT_FOLDER`, `INVALID_SUBFOLDER`, `OUTSIDE_DEFAULT_FOLDER`, `TARGET_NOT_ALLOWED`, `ADMIN_ONLY`. Tell the user the real code.
 
-只在兩種情況發問：聊天室名稱對到多個對話，或使用者完全沒給時間。
+## Schedule
 
-聊天室一律自己用 `list_targets` 查（社群也查得到），用回傳的 `accountId`、`chatType`、`chatId` 傳入，對使用者只說聊天室名稱。`list_targets` 與 `list_send_targets` 中 `role: "primary_admin"` 的列就是管理員。要指定其他傳送對象時用 `list_send_targets`（只有 direct、group、room）。
+Use the schedule tools when the user asks to run a task automatically ("every day", "every week", "at a certain time"). Only the Agent room and the 1:1 LINE chat with the Primary Admin have them. If a tool is missing, it is not available.
 
-訊息末尾若附有 `[聯絡人卡片] 名稱（mid: …）`，那位聯絡人就是使用者指的對象：用該 mid 或名稱呼叫 `list_send_targets`，取 `chatType: "direct"`、`chatId` 等於該 mid 的列當傳送對象；查不到代表與他還沒有對話，如實告知，不要改傳到其他聊天室。
+- `list_schedules`: Lists the schedules, the next fire time and the latest result.
+  - The default `status: "active"` returns the active schedules.
+  - For disabled schedules or all schedules, use `status: "disabled"` or `"all"`.
+  - Before you change, delete or enable a schedule that can be disabled, use `status: "all"` to get its `scheduleId`.
+- `create_schedule`: Creates a schedule. `title` and `recurrence` are required. All other fields have default values.
+  - `jitterMinutes` (0 to 5, default 0) delays each fire by a random 0 to N minutes.
+  - Set it when the user asks for a random start time or a start time that is not fixed.
+- `update_schedule`: Changes any field. Use `enabled` to pause or resume.
+- `delete_schedule`: Deletes a schedule and its fire records. Ask the user to confirm before you delete.
 
-建立後簡短回覆：對象、下次執行時間（用回傳的 `nextFireAtTaipei`）、範圍、任務、輸出（用回傳的 `deliveryLabel`），並告知可以隨時要求修改。
+### Create: use the default values and create at once
 
-### 兩種排程：程式排程與 Agent 排程
+Use the default values for fields that the user did not give. Then create the schedule.
 
-`list_schedules` 的每個排程帶 `execution`（`program`／`agent`）與 `mayUseLlm`。
+- The result goes to the Primary Admin by default.
+  - "I", "me" and "to me" mean the Primary Admin. Omit `delivery`.
+  - Use `{mode:"line_target", target}` when the user names another chat.
+- For a reminder, an alarm or a timed notice ("remind me …"), use `task: {type:"message", text}`.
+  - The system sends the text at the set time. Write `text` exactly as the user gave the reminder.
+  - `text` can have `{{date}}` (date YYYY-MM-DD), `{{time}}` (time HH:mm) and `{{weekday}}` (weekday). The system fills them in with Taiwan time.
+  - Leave out `prompt`, `targets` and `window`.
+  - `delivery` is the Primary Admin by default. `delivery` cannot be `record_only`.
+- A task is an Agent task when the content needs a search, a summary or a decision.
+  - If the user names a chat in this request, set `targets`. Use `summary` or `keyword_digest`.
+  - Take the chat only from this request.
+  - If the user names no chat, create a `custom` task. Write the user's need in `prompt`. Leave `targets` empty. The Agent decides which chats to read at each run.
+- The default range is "since the last run".
+  - If the user gives a range, send `window: {mode:"lookback", minutes}`. For example, "the past 6 hours" is 360.
+- Time zone: Asia/Taipei. Assistant: the current assistant. Status: enabled.
+- For "in 5 minutes", use `recurrence: {kind:"once", inMinutes: 5}` (1 to 10080).
 
-- 程式排程（`message`、`new_messages`）：由系統自己做完，不啟動 Agent；`new_messages` 只有在某條規則 `then: "llm"` 時，才對那些聊天室啟動 Agent。
-- Agent 排程（`custom`、`summary`、`keyword_digest`）：需要判斷的工作，每次都啟動 Agent。
-- 使用者要「列出／轉發新訊息」一律用 `new_messages`，不要用 `custom`。`targets` 留空就是所有可讀的聊天室。
-- 「訊息太多就總結」這類條件寫成規則 `then: "llm"`。
-- `new_messages` 欄位：`messageFilter`（只用 `message.*`）、`rules`（最多 20 條，依序比對，第一條成立的決定該聊天室；都不成立就是 `list`）、`maxMessagesPerChat`（1 到 200，預設 20）、`maxTextChars`（20 到 2000，預設 200）、`sendWhenEmpty`（沒有新訊息時是否仍傳一行說明，預設 false）。規則的 `then` 為 `list`（列出）、`skip`（略過）、`llm`（交給 Agent 總結）。
-- 條件是 `{metric, op, value}`，或 `{all:[…]}`／`{any:[…]}`（最多兩層，全部條件合計 50 個）。規則只能用 `chat.messageCount`、`chat.senderCount`、`chat.textChars`、`chat.keywordHits`（另帶 `keywords`）、`run.messageCount`、`run.chatCount`、`run.listedChars`（數字，op 為 `> >= < <= == !=`）與 `chat.id`、`chat.type`（`== != in not_in`）；`messageFilter` 只能用 `message.direction`、`message.kind`（`== != in not_in`）與 `message.textContains`（`any_of`／`none_of`）。
-- 例：略過某聊天室、超過 20 則就總結：`task: {type:"new_messages", messageFilter:{metric:"message.direction",op:"==",value:"inbound"}, rules:[{when:{metric:"chat.id",op:"==",value:"<chatId>"},then:"skip"},{when:{metric:"chat.messageCount",op:">",value:20},then:"llm"}]}`。
+Ask a question in only two cases:
+
+- The chat name matches more than one chat.
+- The user gave no time.
+
+To find a chat, use `list_targets` yourself. It also finds communities.
+- Send the `accountId`, `chatType` and `chatId` that it returns.
+- Tell the user the chat name.
+- The row with `role: "primary_admin"` is the Primary Admin.
+- To find another send target, use `list_send_targets`. It has direct, group and room chats.
+
+A message can end with `[聯絡人卡片] 名稱（mid: …）` (contact card: name and mid). If it does, that contact is the person that the user means.
+1. Call `list_send_targets` with that mid or name.
+2. Take the row with `chatType: "direct"` and `chatId` equal to that mid. Use it as the send target.
+3. If you find no row, the conversation does not exist yet. Tell the user. Do not send to another chat.
+
+After you create a schedule, reply in a short message with the target, the next run time (`nextFireAtTaipei`), the range, the task and the output (`deliveryLabel`). Tell the user that they can ask for a change.
+
+### Two types of schedule: program and Agent
+
+Each schedule in `list_schedules` has `execution` (`program` or `agent`) and `mayUseLlm`.
+
+- Program schedules (`message`, `new_messages`): The system does all the work.
+  - `new_messages` starts the Agent for a chat when a rule has `then: "llm"`.
+- Agent schedules (`custom`, `summary`, `keyword_digest`): These tasks need a decision. Each run starts the Agent.
+- If the user wants to list or forward new messages, use `new_messages`.
+  - Empty `targets` means all readable chats.
+  - Write "if there are too many messages, summarize" as a rule with `then: "llm"`.
+- The `new_messages` fields:
+  - `messageFilter`: use only `message.*`.
+  - `rules`: 20 rules at most. The system checks them in order. The first rule that is true decides the chat. If no rule is true, the result is `list`.
+  - `maxMessagesPerChat`: 1 to 200, default 20. `maxTextChars`: 20 to 2000, default 200.
+  - `sendWhenEmpty`: if true, the system sends one line of notice when there are no new messages. Default false.
+  - The `then` of a rule is `list`, `skip` or `llm` (the Agent summarizes).
+- A condition is `{metric, op, value}`, or `{all:[…]}` or `{any:[…]}` (two levels at most; 50 conditions at most).
+- A rule uses these metrics:
+  - With `op` `> >= < <= == !=`: `chat.messageCount`, `chat.senderCount`, `chat.textChars`, `chat.keywordHits` (with `keywords`), `run.messageCount`, `run.chatCount`, `run.listedChars`.
+  - With `op` `== != in not_in`: `chat.id`, `chat.type`.
+- `messageFilter` uses these metrics: `message.direction` and `message.kind` (`op` `== != in not_in`), and `message.textContains` (`any_of` or `none_of`).
+- Example (skip one chat, summarize when a chat has more than 20 messages): `task: {type:"new_messages", messageFilter:{metric:"message.direction",op:"==",value:"inbound"}, rules:[{when:{metric:"chat.id",op:"==",value:"<chatId>"},then:"skip"},{when:{metric:"chat.messageCount",op:">",value:20},then:"llm"}]}`
 
 ### recurrence
 
-時間為 `HH:mm`，依 `timezone` 計算：
+`time` is `HH:mm` in `timezone`.
 
-- `{kind:"once", at}`：只執行一次，`at` 為含時區偏移的 ISO-8601 時間；或 `{kind:"once", inMinutes}`：幾分鐘後。
-- `{kind:"daily", time}`：每天。
-- `{kind:"weekly", days:[0..6], time}`：每週指定星期（0=日 … 6=六）。
-- `{kind:"interval", everyMinutes, anchorAt}`：每隔 N 分鐘，N 為 5 到 10080。
-- `{kind:"cron", expression}`：5 欄 cron（分 時 日 月 星期）。
+- `{kind:"once", at}` (ISO-8601 with offset) or `{kind:"once", inMinutes}`: One run.
+- `{kind:"daily", time}`: Every day.
+- `{kind:"weekly", days:[0..6], time}`: On the given weekdays (0=Sunday … 6=Saturday).
+- `{kind:"interval", everyMinutes, anchorAt}`: Every N minutes (5 to 10080).
+- `{kind:"cron", expression}`: A cron with 5 fields (minute hour day month weekday).
 
-### prompt 保持簡短
+### Keep the prompt short
 
-- `summary`、`keyword_digest`：`prompt` 留空，除非使用者提出額外要求；不要在 `prompt` 重述來源、時間、範圍、輸出或規則，系統會自動加上。
-- `custom`：`prompt` 用一兩句話說明要做什麼。
-- `task`：`{type:"summary", focus?}`、`{type:"keyword_digest", keywords}`（1 到 20 個）、`{type:"custom"}`、`{type:"message", text}`（系統訊息，不啟動 Agent）、`{type:"new_messages", …}`（程式排程，見上）。
-- `delivery`：預設 `primary_admin`；`line_target` 指定其他聊天室；`record_only`（只保存在排程紀錄、不傳送）只有 Agent 任務可用（`message`、`new_messages` 不可用）。
-- `targets` 最多 20 個，不可重複；`window` 最長 7 天。
+- `summary` and `keyword_digest`: Leave `prompt` empty, unless the user has an extra request.
+  - The system adds the source, time, range, output and rules.
+- `custom`: Write one or two sentences in `prompt` about what to do.
+- `task`: `{type:"summary", focus?}`, `{type:"keyword_digest", keywords}` (1 to 20 keywords), `{type:"custom"}`, `{type:"message", text}` or `{type:"new_messages", …}`.
+- `delivery`: `primary_admin` (default), `line_target`, or `record_only` (Agent tasks only; it saves the schedule record and sends nothing).
+- `targets`: 20 at most, each one unique. `window`: 7 days at most.
 
-### 限制
+### Limits
 
-1. 啟用中的排程最多 50 個；收到 `SCHEDULE_LIMIT` 就請使用者先停用或刪除其他排程。
-2. 錯過的時間不會補跑；上一次的工作還沒結束時，這次觸發會被略過。
+1. A maximum of 50 schedules can be active. If you get `SCHEDULE_LIMIT`, ask the user to disable or delete other schedules first.
+2. The system skips a missed time. If the last job is still running, the system skips this fire.
 
-排程觸發的工作：提示以 `[排程]` 開頭的工作是無人值守的排程執行；它在全新的獨立對話中執行，沒有 Agent 室的記憶，也不會出現在 Agent 室。
+### Scheduled run
 
-- 不要提出需要使用者回答的問題，也不要等待確認；資訊不足時，依提示盡力完成，並在結果中說明缺了什麼。
-- 完成後簡短回報結果；失敗就說明原因，不要重試或繞過限制。
-- 不能建立、修改或刪除排程（`SCHEDULE_RUN_FORBIDDEN`），只能用 `list_schedules` 查看。
+A job whose prompt starts with `[排程]` (schedule) is an unattended scheduled run. It runs in a new, separate conversation. It has no memory of the Agent room.
+
+Rules for a scheduled run:
+
+- Finish the job with the information in the prompt. Say in the result what is missing.
+- When you finish, report in a short message.
+- If the job fails, say why and stop.
+- Use only `list_schedules` to see the schedules. If you try to create, change or delete a schedule, you get `SCHEDULE_RUN_FORBIDDEN`.

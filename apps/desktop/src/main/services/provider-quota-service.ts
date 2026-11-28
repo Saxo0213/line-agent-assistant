@@ -139,7 +139,7 @@ export function formatProviderQuota(snapshot: ProviderQuotaSnapshot, label?: str
   const lines = [...(label ? [`帳號「${label}」`] : []), `${title} 額度：${snapshot.error ? `未知（${snapshot.error}）` : ''}${snapshot.stale ? '（快取資料，查詢失敗）' : ''}`.trim()];
   if(snapshot.blocked) lines.push(`已知用量限制：${snapshot.evidence ?? 'provider 曾拒絕本次工作'}；重設 ${localTime(snapshot.recoveryAt ?? null) ?? '未知'}`);
   for (const window of snapshot.windows) lines.push(`• ${window.label}：已用 ${window.usedPercent}%${localTime(window.resetsAt) ? `，重設 ${localTime(window.resetsAt)}` : ''}`);
-  if (!snapshot.availabilityKnown) lines.push('• 整體可用性：未知（沒有通用額度視窗）');
+  if (!snapshot.availabilityKnown) lines.push('• 整體可用性：未知');
   if (!snapshot.windows.length && !snapshot.error) lines.push('• 額度視窗：未知');
   lines.push(`來源：${snapshot.source}；查詢時間：${localTime(snapshot.fetchedAt) ?? '未知'}`);
   return lines.join('\n');

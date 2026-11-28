@@ -27,7 +27,10 @@ export function AvatarPlaceholder({ kind, className }: { kind: 'person' | 'group
   </span>;
 }
 
-const visibleAttachments = new Map<Element, (visible: boolean) => void>();
+/** An inline image taller than twice the 240 x 320 box shows as a cropped top strip (see `.inline-attachment-image.tall`). */
+const TALL_IMAGE_RATIO = (320 / 240) * 2;
+
+const visibleAttachments =new Map<Element, (visible: boolean) => void>();
 let attachmentObserver: IntersectionObserver | null = null;
 const refreshedAccountAvatars = new Map<string, { version: number; ownMid: string }>();
 const accountAvatarListeners = new Set<() => void>();
@@ -81,6 +84,7 @@ export function LineMediaImage(props: Props) {
 function LineMediaImageRequest({ enabled, target, fallback, fallbackKind, accessibleFallback, className, alt = '', title }: Props) {
   const [failed, setFailed] = useState(false);
   const [visible, setVisible] = useState(false);
+  const [tall, setTall] = useState(false);
   const sentinel = useRef<HTMLSpanElement>(null);
   const url = target ? lineMediaUrl(target) : null;
 
@@ -91,7 +95,11 @@ function LineMediaImageRequest({ enabled, target, fallback, fallbackKind, access
 
   if (target?.type === 'attachment') return <span ref={sentinel} className="inline-attachment-image-container" aria-label={alt}>
     {enabled && visible && url && !failed
-      ? <img className={className} src={url} alt={alt} onError={() => setFailed(true)} />
+      ? <img className={tall ? `${className} tall` : className} src={url} alt={alt} onError={() => setFailed(true)}
+        onLoad={(event) => {
+          const { naturalWidth, naturalHeight } = event.currentTarget;
+          setTall(naturalWidth > 0 && naturalHeight / naturalWidth > TALL_IMAGE_RATIO);
+        }} />
       : <span className="inline-attachment-image-placeholder">{fallback ?? 'Image'}</span>}
   </span>;
   if (enabled && url && !failed) return <img className={className} src={url} alt={alt} title={title} onError={() => setFailed(true)} />;

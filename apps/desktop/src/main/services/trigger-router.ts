@@ -98,6 +98,9 @@ function textWithoutOwnMention(envelope: InboundEnvelope, ownMid: string | null)
 /** `/權限` and `/permissions` (exact text). The dialogue lives in the Primary Administrator's direct chat only. */
 export const PERMISSION_COMMAND_PATTERN = /^(\/權限|\/permissions)$/i;
 
+/** `/help`, `/說明` and `/指令` (exact text, mention already removed). */
+const HELP_COMMAND_PATTERN = /^(?:\/help|\/說明|\/指令)$/i;
+
 /** True for a group/room text that is `/權限` or `/permissions` (with or without an Agent mention). */
 export function isPermissionCommandText(envelope: InboundEnvelope, ownMid: string | null): boolean {
   return envelope.chatType !== 'direct' && envelope.text !== null && PERMISSION_COMMAND_PATTERN.test(textWithoutOwnMention(envelope, ownMid));
@@ -132,6 +135,44 @@ export function parsePersonaCommand(text: string): PersonaCommand | null {
 /** True for a group/room text that is a `/persona` command, with or without an Agent mention. */
 export function isPersonaCommandText(envelope: InboundEnvelope, ownMid: string | null): boolean {
   return envelope.chatType !== 'direct' && envelope.text !== null && parsePersonaCommand(textWithoutOwnMention(envelope, ownMid)) !== null;
+}
+
+/** `/rules`: the Primary Administrator's per-chat Agent rules (group/room). `bad_name` is a malformed rule file name, `usage` a malformed command. */
+export type RulesCommand =
+  | { type: 'rules'; action: 'show' | 'clear' | 'usage' | 'bad_name' }
+  | { type: 'rules'; action: 'set'; text: string }
+  | { type: 'rules'; action: 'add'; name: string; text: string }
+  | { type: 'rules'; action: 'remove'; name: string };
+
+/**
+ * Parses `/rules`, `/rules clear`, `/rules remove <name>`, `/rules add <name> <text>` and `/rules <text>` (already trimmed, mention removed).
+ * A rule file name is 1 to 32 letters, digits, `_` or `-`.
+ */
+export function parseRulesCommand(text: string): RulesCommand | null {
+  const match = /^\/rules(?:\s+([\s\S]*))?$/i.exec(text.trim());
+  if (!match) return null;
+  const argument = (match[1] ?? '').trim();
+  if (argument === '') return { type: 'rules', action: 'show' };
+  if (/^clear$/i.test(argument)) return { type: 'rules', action: 'clear' };
+  const nameOk = (name: string) => /^[\p{L}\p{N}_-]{1,32}$/u.test(name);
+  const remove = /^remove(?:\s+([\s\S]*))?$/i.exec(argument);
+  if (remove) {
+    const name = (remove[1] ?? '').trim();
+    return !name ? { type: 'rules', action: 'usage' } : nameOk(name) ? { type: 'rules', action: 'remove', name } : { type: 'rules', action: 'bad_name' };
+  }
+  const add = /^add(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/i.exec(argument);
+  if (add) {
+    const name = add[1] ?? '';
+    const body = (add[2] ?? '').trim();
+    if (!name || !body) return { type: 'rules', action: 'usage' };
+    return nameOk(name) ? { type: 'rules', action: 'add', name, text: body } : { type: 'rules', action: 'bad_name' };
+  }
+  return { type: 'rules', action: 'set', text: argument };
+}
+
+/** True for a group/room text that is a `/rules` command, with or without an Agent mention. */
+export function isRulesCommandText(envelope: InboundEnvelope, ownMid: string | null): boolean {
+  return envelope.chatType !== 'direct' && envelope.text !== null && parseRulesCommand(textWithoutOwnMention(envelope, ownMid)) !== null;
 }
 
 export type FolderMode = 'READ' | 'READ_WRITE';
@@ -216,11 +257,14 @@ export type TriggerDecision =
   | { type: 'agent_quota' }
   /** `/權限` in a group or room, sent by a served sender: reply with the fixed hint, never route to the Agent. */
   | { type: 'permission_hint' }
+  /** `/help`, `/說明` or `/指令` from the Primary Administrator in the one-to-one chat: reply with the command list. No Agent job. */
+  | { type: 'help' }
   /** Primary Administrator's `/model` or `/model <argument>`: show, set or clear this chat's Claude model. No Agent job. */
   | { type: 'agent_model'; command: ModelCommand }
   | FreeCommand
   | FolderCommand
   | PersonaCommand
+  | RulesCommand
   | { type: 'free_message' };
 
 /** Bare `/agent claude|codex|default` (already trimmed, mention removed); anything with content is a prompt instead. */
@@ -252,6 +296,9 @@ export function routeTrigger(envelope: InboundEnvelope, context: TriggerContext)
   if (group) {
     const persona = parsePersonaCommand(textWithoutOwnMention(envelope, context.ownMid));
     if (persona && (context.primaryAdmin ?? context.senderIsPrimaryAdmin)) return persona;
+    // `/rules` follows the same gate as `/persona`.
+    const rules = parseRulesCommand(textWithoutOwnMention(envelope, context.ownMid));
+    if (rules && (context.primaryAdmin ?? context.senderIsPrimaryAdmin)) return rules;
   }
   // `/權限` works only in the Primary Administrator's direct chat. A served sender gets the hint; anyone else gets nothing here.
   if (group && PERMISSION_COMMAND_PATTERN.test(textWithoutOwnMention(envelope, context.ownMid))) {
@@ -300,6 +347,8 @@ function routeNormalTrigger(envelope: InboundEnvelope, context: TriggerContext):
   if (text === '/stop') return { type: 'stop' };
   if (text === '/new') return { type: 'new' };
   if (text === '/status') return { type: 'status' };
+  // `/help` is a command only for the Primary Administrator in the one-to-one chat; anywhere else it is ordinary text.
+  if (envelope.chatType === 'direct' && (context.primaryAdmin ?? context.senderIsPrimaryAdmin) && HELP_COMMAND_PATTERN.test(text)) return { type: 'help' };
   const switchCommand = parseAgentSwitch(text);
   if (switchCommand) {
     if (context.primaryAdmin ?? context.senderIsPrimaryAdmin) return { type: 'agent_provider', provider: switchCommand.provider };

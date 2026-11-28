@@ -78,8 +78,8 @@ describe('Agent status reply localization', () => {
 
 describe('stop and new acknowledgements', () => {
   it.each([
-    ['stop', true, 'zh-TW', '已停止 Agent 工作'], ['stop', false, 'zh-TW', '目前沒有進行中的 Agent 工作'],
-    ['stop', true, 'en', 'Agent work stopped'], ['stop', false, 'ja', '実行中の Agent 作業はありません'],
+    ['stop', true, 'zh-TW', '已停止 Agent 工作'], ['stop', false, 'zh-TW', 'Agent 目前閒置'],
+    ['stop', true, 'en', 'Agent work stopped'], ['stop', false, 'ja', 'Agent は待機中です'],
     ['new', false, 'zh-TW', '已開始新的 Agent 對話'], ['new', false, 'ko', '새 Agent 대화를 시작했습니다'],
   ] as const)('acknowledges /%s (cancelled %s, %s) without exposing ids', async (action, cancelled, locale, expected) => {
     const commands: LineWorkerCommand[] = [];
@@ -345,7 +345,7 @@ describe('LineService group mention authorization fast path', () => {
     it('answers a bare /persona with the effective values and changes nothing', async () => {
       const h = await run({ primary: true }, groupMessage({ messageId: 'persona-4', text: '/persona' }));
       expect(h.personaChanges).toEqual([]);
-      expect(sentTexts(h.commands)[0]).toMatch(/^Agent persona \(default\): \(none, neutral tone\)\nReply liveliness \(default\): Normal$/);
+      expect(sentTexts(h.commands)[0]).toMatch(/^Agent persona \(default\): \(neutral tone\)\nReply liveliness \(default\): Normal$/);
     });
     it('does not execute for a non-administrator: no change, no confirmation', async () => {
       const h = await run({ primary: false }, groupMessage({ messageId: 'persona-5', text: '/persona 活潑' }));
@@ -2080,7 +2080,7 @@ database('LineService transaction and worker identity', () => {
       await service.idleRoomEffects();
       expect(sent()).toEqual([expect.objectContaining({ type: 'sendText', chatType: 'group', chatId: 'permission-room',
         replyToMessageId: 'permission-group-list',
-        text: '/權限 只能在與 Agent 的一對一聊天使用；要把成員加入白名單，請用 /新增使用者。' })]);
+        text: '請在與 Agent 的一對一聊天輸入 /權限；要新增白名單成員，請輸入 /新增使用者。' })]);
       expect(await routeOf('permission-group-list')).toEqual({ action: 'ignore', jobs: 0 });
       expect(kicked).toEqual([]);
     });

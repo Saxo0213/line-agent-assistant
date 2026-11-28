@@ -11,8 +11,9 @@ export const claudePermissionPromptToolName=`mcp__${LINEJS_MCP_SERVER}__request_
 /**
  * Fixed tool catalog exposed to built-in Agents. The server still hides query_agent_room_history outside the Agent room,
  * and the send and schedule tools from every principal except the Primary Admin and the desktop operator.
+ * forward_to_session is offered only to a job of the Primary Admin in the direct chat of the Agent account.
  */
-export const LINEJS_MCP_TOOLS=['list_targets','query_target_messages','query_target_messages_by_time','list_active_chats','list_chat_albums','get_chat_album','read_message_attachment','query_agent_room_history','list_send_targets','send_to_target','list_schedules','create_schedule','update_schedule','delete_schedule','list_chat_download_folders','add_chat_download_folder','set_chat_download_folder_description','set_chat_default_download_folder','remove_chat_download_folder'] as const;
+export const LINEJS_MCP_TOOLS=['list_targets','query_target_messages','query_target_messages_by_time','list_active_chats','list_chat_albums','get_chat_album','read_message_attachment','query_agent_room_history','list_send_targets','send_to_target','list_schedules','create_schedule','update_schedule','delete_schedule','list_chat_download_folders','add_chat_download_folder','set_chat_download_folder_description','set_chat_default_download_folder','remove_chat_download_folder','forward_to_session'] as const;
 /** Claude's qualified MCP tool names. */
 export const claudeMcpToolNames=()=>LINEJS_MCP_TOOLS.map(tool=>`mcp__${LINEJS_MCP_SERVER}__${tool}`);
 

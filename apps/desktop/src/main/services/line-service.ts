@@ -4,7 +4,7 @@ import { isWritableChatType, diagnosticFailure, InboundEnvelopeSchema, normalize
 import type { AccountRepository, AdminRepository, AgentJobStatusProjection, FriendWhitelistRepository, MessageRepository, RoutingDecision, SettingsRepository } from '@line-agent/database';
 import type { ExternalMonitorAgentReceipt } from '@line-agent/database';
 import { bridgeNativeEnvelope, normalizedFallbackOrder, routeKeyFor, type AccountSource } from '@line-agent/database';
-import { hasOwnMention, isAgentSwitchText, isFolderCommandText, isFreeCommandText, isPermissionCommandText, isPersonaCommandText, routeTrigger, composeMentionOnlyPrompt, MENTION_CONTEXT_MAX_MESSAGES, type MentionContextMessage, type FolderCommand, type FreeCommand, type PersonaCommand, type TriggerDecision } from './trigger-router.js';
+import { hasOwnMention, isAgentSwitchText, isFolderCommandText, isFreeCommandText, isPermissionCommandText, isPersonaCommandText, isRulesCommandText, routeTrigger, composeMentionOnlyPrompt, MENTION_CONTEXT_MAX_MESSAGES, type MentionContextMessage, type FolderCommand, type FreeCommand, type PersonaCommand, type RulesCommand, type TriggerDecision } from './trigger-router.js';
 import { executePersonaCommand } from './agent-persona.js';
 import { modelReply, normalizeModelForProvider, type ModelCommand } from './model-command.js';
 import { classifyRoomControl, ownMentionBody, sanitizeRoomControlEnvelope } from './room-control.js';
@@ -14,10 +14,11 @@ import type { WorkspaceInspection } from './workspace-authority.js';
 import type { AgentReaction } from './agent-service.js';
 import { claimed as permissionTicketClaimed, type PermissionCommandService, type PermissionTicket } from './permission-command.js';
 import type { Locale } from '../../locale.js';
-import { linePrompt } from './line-prompts.js';
+import { linePrompt, lineHelpText } from './line-prompts.js';
 import { resolveChatProvider, resolveDefaultProvider } from './default-provider.js';
 import { formatProviderQuota, ProviderQuotaService, type ProviderQuotaSnapshot } from './provider-quota-service.js';
 import type { SystemTextResult } from './agent-line-send-service.js';
+import { sessionTag, type ExternalSessionRouting } from './external-session-service.js';
 
 import { pickWorkerBinding } from '../worker-binding-fields.js';
 export type BoundWorker = WorkerBinding & { mode: AccountMode };
@@ -54,6 +55,11 @@ export interface FreeModeControl {
   statusText(key: WritableConversationKey): string | null;
   handleCommand(key: WritableConversationKey & { chatType: 'group' | 'room' }, enabledBy: string, command: FreeCommand, sourceMessageId?: string): Promise<void>;
   addMessage(envelope: Extract<LineWorkerEvent, { type: 'batch' }>['envelopes'][number]): void;
+}
+
+/** `/rules` (per-chat Agent rules); implemented by ChatRulesService. It gives the reply text. */
+export interface ChatRulesControl {
+  execute(key: WritableConversationKey, command: RulesCommand, locale: string): Promise<string>;
 }
 
 /** `/folder` (docs/architecture/project-folders.md); implemented by ProjectFolderService. */
@@ -111,7 +117,7 @@ export class LineService {
     private readonly freeMode?: FreeModeControl,
     private readonly projectFolders?: ProjectFolderControl,
     private readonly sendSystemText?: (input: { runId: string; target: WritableConversationKey; text: string;
-      principalId: 'system:provider_quota' }) => Promise<SystemTextResult>,
+      principalId: 'system:provider_quota' | 'system:external_session' }) => Promise<SystemTextResult>,
     private readonly persistQuotaSnapshot?: (snapshot: import('./provider-quota-service.js').ProviderQuotaSnapshot) => Promise<void>,
     quotaService?: ProviderQuotaService,
     /** The stored quota state of one account source (the system source id equals the provider name). */
@@ -120,6 +126,10 @@ export class LineService {
     private readonly listQuotaSources?: () => Promise<AccountSource[]>,
     /** The route row of one session key for /quota. It gives null when the automatic failover switch is off. */
     private readonly loadQuotaRoute?: (routeKey: string) => Promise<{ provider: 'claude' | 'codex'; sourceId: string | null } | null>,
+    /** Sessions of external MCP clients: a quoted reply of the Primary Admin goes to its session. Without it no message is quote-routed. */
+    private readonly externalSessions?: ExternalSessionRouting,
+    /** `/rules` of the Primary Administrator in a group/room. Without it the command is an ordinary message. */
+    private readonly chatRules?: ChatRulesControl,
   ) { this.quotaService = quotaService ?? new ProviderQuotaService((provider, account) => this.agents.queryQuota!(provider, account)); }
 
   private reportFailure(stage: SafeDiagnostic['stage'], error?: unknown): void {
@@ -349,6 +359,37 @@ export class LineService {
     await this.worker.send({ type: 'sendText', ...binding, ...key, requestId: randomUUID(), text, replyToMessageId });
   }
 
+  /**
+   * Quoted reply of the Primary Admin to a message of an external session. An open session gets a quote reply (text and the ids of
+   * the attachments of the message) and the admin gets 「已轉給【label #n】。」. For a closed session the message already took the
+   * normal Agent route; the admin gets 「【label #n】已結束，訊息交給 Agent。」. A failure never reaches the ingest path.
+   */
+  private async applyExternalSessionQuote(envelope: InboundEnvelope, quote: { sessionKey: string; seq: number; label: string; closed: boolean }): Promise<void> {
+    const routing = this.externalSessions;
+    if (!routing) return;
+    const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
+    const tag = sessionTag(quote.label, quote.seq);
+    let text: string;
+    if (quote.closed) text = `${tag}已結束，訊息交給 Agent。`;
+    else {
+      try {
+        const attachmentIds: string[] = [];
+        for (const descriptor of envelope.attachments) {
+          const attachment = await this.messages.getAttachmentBySource(key, envelope.messageId, descriptor.id);
+          if (attachment) attachmentIds.push(attachment.attachmentId);
+        }
+        await routing.addQuoteReply({ sessionKey: quote.sessionKey, inboundMessageId: envelope.messageId, text: envelope.text ?? '', attachmentIds });
+        text = `已轉給${tag}。`;
+      } catch (error) {
+        this.reportFailure('persist', error);
+        text = `轉給${tag}失敗，請再回覆一次。`;
+      }
+    }
+    if (!this.sendSystemText) return;
+    try { await this.sendSystemText({ runId: randomUUID(), target: key, text, principalId: 'system:external_session' }); }
+    catch (error) { this.reportFailure('persist', error); }
+  }
+
   /** Primary Administrator's `/agent claude|codex|default`, or the usage hint for a served non-administrator. */
   private async applyAgentCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string, senderId: string, dispatch: AgentDispatch): Promise<void> {
     if (dispatch.type === 'agent_model') {
@@ -429,6 +470,14 @@ export class LineService {
     let text: string;
     try { text = await executePersonaCommand(this.settings, key, command, this.locale); }
     catch (error) { this.reportFailure('execute', error); text = linePrompt(this.locale, 'personaFailed'); }
+    await this.sendChatText(binding, key, text, messageId);
+  }
+
+  /** Primary Administrator's `/rules` in a group/room: executes it and answers with the result text. */
+  private async applyRulesCommand(binding: BoundWorker, key: WritableConversationKey, messageId: string, command: RulesCommand): Promise<void> {
+    let text: string;
+    try { text = await this.chatRules!.execute(key, command, this.locale); }
+    catch (error) { this.reportFailure('execute', error); text = linePrompt(this.locale, 'rulesFailed'); }
     await this.sendChatText(binding, key, text, messageId);
   }
 
@@ -933,13 +982,16 @@ export class LineService {
     const agentDispatches = new Map<string, AgentDispatch>();
       const quotaDispatches = new Set<string>();
     const permissionHintDispatches = new Set<string>();
+    const helpDispatches = new Set<string>();
     const primaryAdminMessageIds = new Set<string>();
     const noAutoReplyIds = new Set<string>();
     const folderDispatches = new Map<string, FolderCommand>();
     const folderAdminCommandIds = new Set<string>();
     const personaAdminCommandIds = new Set<string>();
     const personaDispatches = new Map<string, PersonaCommand>();
+    const rulesDispatches = new Map<string, RulesCommand>();
     const primaryAdminLookupFailedIds = new Set<string>();
+    const quoteDispatches = new Map<string, { sessionKey: string; seq: number; label: string; closed: boolean }>();
     let monitorLiveFallback = false;
     for (const [preparedIndex, { envelope, ownMid, control, sensitive }] of prepared.entries()) {
       const key: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
@@ -952,7 +1004,7 @@ export class LineService {
       const permissionClaimed = permissionTicketClaimed(permissionTicket);
       const shouldCheckGroupAuthorization = envelope.chatType !== 'direct' && control.type === 'none'
         && envelope.ingestion.source === 'live' && envelope.kind === 'text' && envelope.senderId !== ownMid
-        && !administrative.has(envelope.messageId) && (hasOwnMention(envelope, ownMid) || isFreeCommandText(envelope, ownMid) || isFolderCommandText(envelope, ownMid) || isPersonaCommandText(envelope, ownMid)
+        && !administrative.has(envelope.messageId) && (hasOwnMention(envelope, ownMid) || isFreeCommandText(envelope, ownMid) || isFolderCommandText(envelope, ownMid) || isPersonaCommandText(envelope, ownMid) || isRulesCommandText(envelope, ownMid)
           || isPermissionCommandText(envelope, ownMid) || (this.freeMode?.isActive(key) === true && isAgentSwitchText(envelope, ownMid)));
       let primaryAdminLookupFailed = false;
       const primaryAdmin = envelope.chatType === 'direct'
@@ -992,14 +1044,30 @@ export class LineService {
       const agentDispatch = routed.type === 'agent_provider' || routed.type === 'agent_usage' || routed.type === 'agent_model' ? routed : null;
       if (routed.type === 'agent_quota') quotaDispatches.add(envelope.messageId);
       if (routed.type === 'permission_hint' && !permissionClaimed && control.type === 'none' && !sensitive) permissionHintDispatches.add(envelope.messageId);
-      const decision: Exclude<TriggerDecision, FreeCommand | FolderCommand | PersonaCommand | { type: 'free_message' } | AgentDispatch> = routed.type === 'free' || routed.type === 'free_range' || routed.type === 'folder'
-        || routed.type === 'persona' || routed.type === 'free_message' || routed.type === 'agent_provider' || routed.type === 'agent_usage' || routed.type === 'agent_model'
-        || routed.type === 'agent_quota' || routed.type === 'permission_hint' ? { type: 'ignore' } : routed;
+      if (routed.type === 'help' && !permissionClaimed && control.type === 'none' && !sensitive) helpDispatches.add(envelope.messageId);
+      const routedDecision: Exclude<TriggerDecision, FreeCommand | FolderCommand | PersonaCommand | RulesCommand | { type: 'free_message' } | AgentDispatch> = routed.type === 'free' || routed.type === 'free_range' || routed.type === 'folder'
+        || routed.type === 'persona' || routed.type === 'rules' || routed.type === 'free_message' || routed.type === 'agent_provider' || routed.type === 'agent_usage' || routed.type === 'agent_model'
+        || routed.type === 'agent_quota' || routed.type === 'permission_hint' || routed.type === 'help' ? { type: 'ignore' } : routed;
       const authorization = !primaryAdmin && friendAuthorization ? {
         directGrantId: friendAuthorization.grantId,
         directGrantVersion: friendAuthorization.version,
       } : undefined;
       const routeIsClosed = existingRoutes.has(envelope.messageId) || (recovered && !recovered.receiptCurrent);
+      // A live message of the Primary Admin in the direct chat that quotes a message sent for an external session
+      // (docs/design/external-session-reply.md). Commands win: only a plain prompt (or a non-text message) is a candidate.
+      // An open session gets the message and no Agent job. A closed session leaves the normal Agent route and gets a notice.
+      let quotedSession: { sessionKey: string; seq: number; label: string; closed: boolean } | null = null;
+      if (this.externalSessions && envelope.chatType === 'direct' && directAdmin === true && !recovered && !routeIsClosed
+        && envelope.ingestion.source === 'live' && envelope.replyToMessageId !== null && envelope.senderId !== ownMid
+        && control.type === 'none' && !sensitive && !permissionClaimed && !administrative.has(envelope.messageId)
+        && (routed.type === 'prompt' || (routed.type === 'ignore' && envelope.kind !== 'text'))) {
+        try { quotedSession = await this.externalSessions.findQuoted(envelope.accountId, envelope.replyToMessageId); }
+        catch (error) { this.reportFailure('persist', error); }
+        // A closed session keeps the Agent route, which exists only for a prompt.
+        if (quotedSession?.closed && routed.type !== 'prompt') quotedSession = null;
+      }
+      if (quotedSession) quoteDispatches.set(envelope.messageId, quotedSession);
+      const decision: typeof routedDecision = quotedSession && !quotedSession.closed ? { type: 'ignore' } : routedDecision;
       // `/folder` is applied after ingestion like free mode; for storage and admission it is a plain ignored message.
       if (routed.type === 'folder') folderAdminCommandIds.add(envelope.messageId);
       if (routed.type === 'folder' && this.projectFolders && !routeIsClosed && !permissionClaimed && control.type === 'none'
@@ -1008,6 +1076,10 @@ export class LineService {
       if (routed.type === 'persona') personaAdminCommandIds.add(envelope.messageId);
       if (routed.type === 'persona' && !routeIsClosed && !permissionClaimed && control.type === 'none'
         && !administrative.has(envelope.messageId) && !sensitive) personaDispatches.set(envelope.messageId, routed);
+      // `/rules` is handled like `/persona`: it shares the admin-command id set, so it never reaches auto-reply or the Agent.
+      if (routed.type === 'rules') personaAdminCommandIds.add(envelope.messageId);
+      if (routed.type === 'rules' && this.chatRules && !routeIsClosed && !permissionClaimed && control.type === 'none'
+        && !administrative.has(envelope.messageId) && !sensitive) rulesDispatches.set(envelope.messageId, routed);
       actions.push({ key, decision: routeIsClosed ? { type: 'ignore' } : decision });
       if (freeDispatch && !routeIsClosed && !permissionClaimed && control.type === 'none' && !administrative.has(envelope.messageId) && !sensitive) {
         freeDispatches.set(envelope.messageId, freeDispatch);
@@ -1033,7 +1105,7 @@ export class LineService {
     // Configuration/dialogue effects retain their existing live receiver. Do not close their canonical route.
     if (recovered?.monitorReceipt && ((!existingRoutes.size && decisions.every((decision)=>!decision.eligible && !('workspaceFailure' in decision) && decision.action==='ignore'))
       || monitorLiveFallback || primaryAdminLookupFailedIds.size || permissionTickets.size || freeDispatches.size || folderDispatches.size
-      || personaDispatches.size || agentDispatches.size || quotaDispatches.size || administrative.size
+      || personaDispatches.size || rulesDispatches.size || agentDispatches.size || quotaDispatches.size || administrative.size
       || prepared.some(({ control, sensitive }) => control.type !== 'none' || sensitive))) return [];
     const admissionPromise = useIndependentIngest
       ? this.messages.admitLiveBatch(sourceBatch, decisions, recovered?.monitorReceipt)
@@ -1173,6 +1245,12 @@ export class LineService {
       this.scheduleRoomEffect(() => this.applyPersonaCommand(binding, personaKey, envelope.messageId, persona));
     }
     for (const { envelope } of admitted) {
+      const rules = rulesDispatches.get(envelope.messageId);
+      if (!rules || primaryAdminLookupFailedIds.has(envelope.messageId) || this.bindings.get(binding.workerInstanceId) !== binding) continue;
+      const rulesKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
+      this.scheduleRoomEffect(() => this.applyRulesCommand(binding, rulesKey, envelope.messageId, rules));
+    }
+    for (const { envelope } of admitted) {
       const dispatch = agentDispatches.get(envelope.messageId);
       if (!dispatch || primaryAdminLookupFailedIds.has(envelope.messageId) || this.bindings.get(binding.workerInstanceId) !== binding) continue;
       const agentKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
@@ -1189,6 +1267,17 @@ export class LineService {
         || primaryAdminLookupFailedIds.has(envelope.messageId) || this.bindings.get(binding.workerInstanceId) !== binding) continue;
       const hintKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
       this.scheduleRoomEffect(() => this.sendChatText(binding, hintKey, linePrompt(this.locale, 'permissionGroupHint'), envelope.messageId));
+    }
+    for (const { envelope } of admitted) {
+      if (!helpDispatches.has(envelope.messageId) || administrative.has(envelope.messageId)
+        || primaryAdminLookupFailedIds.has(envelope.messageId) || this.bindings.get(binding.workerInstanceId) !== binding) continue;
+      const helpKey: WritableConversationKey = { accountId: envelope.accountId, chatType: envelope.chatType, chatId: envelope.chatId };
+      this.scheduleRoomEffect(() => this.sendChatText(binding, helpKey, lineHelpText(this.locale), envelope.messageId));
+    }
+    for (const { envelope } of admitted) {
+      const quote = quoteDispatches.get(envelope.messageId);
+      if (!quote || this.bindings.get(binding.workerInstanceId) !== binding) continue;
+      this.scheduleRoomEffect(() => this.applyExternalSessionQuote(envelope, quote));
     }
     for (const attachmentId of attachmentIds) this.queueAttachmentDownload(attachmentId, liveAttachmentIds.has(attachmentId));
     for (const { control, envelope, ownMid } of admitted) {

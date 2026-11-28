@@ -94,7 +94,7 @@ describe('built-in Agent MCP launch', () => {
     const scheduleContext = vi.fn(async () => '【排程規則】CTX');
     const scheduled = fixture({ requestId: 'schedule:11111111-1111-4111-8111-111111111111:2026-10-01T01:00:00.000Z', scheduleContext });
     const request = await runWith(scheduled);
-    expect(scheduleContext).toHaveBeenCalledWith('schedule:11111111-1111-4111-8111-111111111111:2026-10-01T01:00:00.000Z');
+    expect(scheduleContext).toHaveBeenCalledWith('schedule:11111111-1111-4111-8111-111111111111:2026-10-01T01:00:00.000Z', 'job-mcp');
     expect(request.prompt).toBe(withMcpSkill(SKILL, withOutputChannel(withAgentRoomHistoryHint('summarise\n\n【排程規則】CTX'), 'ui')));
     expect(scheduled.job.prompt).toBe('summarise');
     const plain = fixture({ scheduleContext });

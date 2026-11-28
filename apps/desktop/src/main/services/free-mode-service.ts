@@ -30,7 +30,7 @@ export const FREE_MODE_NO_REPLY_MARKER = '[[NO_REPLY]]';
 export const FREE_MODE_TEXT = {
   on: (minutes: number) => `AGENT自動回覆${minutes}分鐘`,
   off: '自由模式已關閉',
-  notOn: '自由模式未開啟',
+  notOn: '自由模式目前關閉',
   ended: '自由模式已結束',
   range: `自由模式分鐘數須為 ${FREE_MODE_MIN_MINUTES} 到 ${FREE_MODE_MAX_MINUTES} 的整數`,
   remaining: (minutes: number) => `自由模式剩餘 ${minutes} 分鐘`,

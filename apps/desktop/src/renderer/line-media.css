@@ -450,6 +450,14 @@
   object-fit: contain;
 }
 
+/* Very tall image (for example a phone screenshot): fill the box and show the top. */
+.inline-attachment-image.tall {
+  width: 240px;
+  height: 320px;
+  object-fit: cover;
+  object-position: top;
+}
+
 .inline-attachment-image-container {
   display: block;
 }
